@@ -5,6 +5,8 @@ from src.compiler.amd64_machine_semantics import PagedByteMemory
 from src.compiler.machine_execution import MachineExecutionState
 from src.compiler.machine_system_tape import MachineSystemTape
 from src.compiler.machine_trace_ssa import lift_tape_lineage_to_trace_ssa
+from src.compiler.virtual_registry import VirtualRegistryEffect, VirtualRegistryState
+from src.compiler.virtual_memory import PAGE_READWRITE, VirtualMemoryEffect, VirtualMemoryState
 
 
 def _instruction(address: int):
@@ -81,3 +83,58 @@ def test_trace_ssa_can_slice_terminal_math_from_machine_bookkeeping():
         "retained_pure_operations": 0,
         "retained_effect_operations": 1,
     }
+
+
+def test_trace_ssa_catalogues_registry_as_a_distinct_effect_domain():
+    registry = VirtualRegistryState.create()
+    initial = MachineExecutionState(pc=0x100, virtual_registry=registry)
+    changed = replace(
+        initial,
+        virtual_registry=registry.apply(VirtualRegistryEffect(
+            "create_key", "hkey_current_user\\Software\\Turing",
+        )),
+    )
+    tape = MachineSystemTape(b"subject", 1)
+    tape.append(0, initial, position=0, event="load")
+    tape.append(0, changed, position=1, event="external_completion")
+    trace = lift_tape_lineage_to_trace_ssa(tape)
+    assert trace.operations[0].effect_domains == ("control", "registry")
+    assert "registry.state" in trace.final_values
+
+
+def test_trace_ssa_catalogues_virtual_memory_mapping_effects():
+    virtual_memory = VirtualMemoryState.create()
+    initial = MachineExecutionState(pc=0x100, virtual_memory=virtual_memory)
+    changed = replace(
+        initial,
+        virtual_memory=virtual_memory.apply(VirtualMemoryEffect(
+            "allocate", 0x10000000000, 4096, PAGE_READWRITE,
+        )),
+    )
+    tape = MachineSystemTape(b"subject", 1)
+    tape.append(0, initial, position=0, event="load")
+    tape.append(0, changed, position=1, event="external_completion")
+    trace = lift_tape_lineage_to_trace_ssa(tape)
+    assert trace.operations[0].effect_domains == ("control", "virtual_memory")
+    assert "virtual_memory.state" in trace.final_values
+
+
+def test_trace_ssa_catalogues_pipe_transport_as_a_distinct_effect_domain():
+    initial = MachineExecutionState(
+        pc=0x100,
+        system_state={"windows.pipe.1.writers": 1},
+        device_state={"pipe.1": b""},
+    )
+    changed = replace(
+        initial,
+        device_state={"pipe.1": b"payload"},
+        device_generations={"pipe.1": 1},
+    )
+    tape = MachineSystemTape(b"subject", 1)
+    tape.append(0, initial, position=0, event="load")
+    tape.append(0, changed, position=1, event="external_completion")
+
+    trace = lift_tape_lineage_to_trace_ssa(tape)
+
+    assert trace.operations[0].effect_domains == ("control", "device", "pipe")
+    assert "device.pipe.1" in trace.final_values

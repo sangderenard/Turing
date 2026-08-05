@@ -31,6 +31,8 @@ from .machine_reference_vocabulary import (
     VectorRegisterOperand,
     X86HighByteRegister,
 )
+from .virtual_registry import VirtualRegistryState
+from .virtual_memory import VirtualMemoryState
 
 
 MASK64 = (1 << 64) - 1
@@ -87,6 +89,21 @@ class PagedByteMemory(Mapping[int, int]):
         if size < 0:
             raise ValueError("mapped region size cannot be negative")
         return self.map_bytes(address, bytes(size))
+
+    def unmap(self, address: int, size: int) -> "PagedByteMemory":
+        if address % self.page_size or size < 0 or size % self.page_size:
+            raise ValueError("unmapped region must be page aligned")
+        pages = dict(self.pages)
+        for page in range(address // self.page_size, (address + size) // self.page_size):
+            pages.pop(page, None)
+        return PagedByteMemory(MappingProxyType(pages), self.page_size)
+
+    def read(self, address: int, size: int) -> bytes:
+        """Return one exact mapped byte range, including page crossings."""
+
+        if size < 0:
+            raise ValueError("memory read size cannot be negative")
+        return bytes(self[int(address) + index] for index in range(int(size)))
 
     def read_unsigned(self, address: int, width: int) -> int:
         if width not in (8, 16, 32, 64, 128):
@@ -145,13 +162,19 @@ def _data_width(instruction, operand_index: int) -> int:
         return operand.width
     name = instruction.token.name
     if isinstance(operand, VectorRegisterOperand):
-        match = re.search(r"(?:XMMM|RM|M)(128|64|32)(?:_|$)", name)
+        match = re.search(
+            r"(?:^|_)(?:XMMM|RM|M)(128|64|32)(?:_|$)", name,
+        )
         return int(match.group(1)) if match else operand.width
     if isinstance(operand, EffectiveAddressOperand):
-        memory_widths = re.findall(r"(?:RM|M)(128|64|32|16|8)(?:_|$)", name)
+        memory_widths = re.findall(
+            r"(?:^|_)(?:XMMM|RM|M)(128|64|32|16|8)(?:_|$)", name,
+        )
         if memory_widths:
-            return int(memory_widths[-1])
-    match = re.search(r"(?:RM|R|M)(128|64|32|16|8)(?:_|$)", name)
+            return int(memory_widths[0])
+    match = re.search(
+        r"(?:^|_)(?:XMMM|RM|R|M)(128|64|32|16|8)(?:_|$)", name,
+    )
     if match:
         return int(match.group(1))
     if isinstance(operand, ImmediateOperand):
@@ -825,7 +848,7 @@ def _pe_reserved_span(image, runtime_base: int) -> tuple[int, int]:
     return int(runtime_base), int(runtime_base) + max(header_size, image_size)
 
 
-def build_initial_machine_state(program, *, load_address: int | None = None, additional_images=(), import_targets=None, module_handle_targets=None, stack_top: int = 0x00007FFF00000000, stack_size: int = 1024 * 1024, teb_base: int = 0x00007FFE00000000, peb_base: int = 0x00007FFD00000000, system_arena_base: int = 0x00007FFC00000000, system_arena_size: int = 1024 * 1024, external_references=(), virtual_filesystem=None, environment_state=None) -> MachineExecutionState:
+def build_initial_machine_state(program, *, load_address: int | None = None, additional_images=(), import_targets=None, module_handle_targets=None, stack_top: int = 0x00007FFF00000000, stack_size: int = 1024 * 1024, teb_base: int = 0x00007FFE00000000, peb_base: int = 0x00007FFD00000000, system_arena_base: int = 0x00007FFC00000000, system_arena_size: int = 2 * 1024 * 1024, external_references=(), virtual_filesystem=None, environment_state=None) -> MachineExecutionState:
     """Map a linked PE image set plus a zeroed, ABI-aligned guest stack."""
 
     image = program.image
@@ -954,6 +977,9 @@ def build_initial_machine_state(program, *, load_address: int | None = None, add
     registers = [0] * 16
     registers[4] = rsp
     system_state = {
+        "machine.memory.page_size": memory.page_size,
+        "windows.system_arena.page_base": system_arena_base // memory.page_size,
+        "windows.system_arena.page_count": system_arena_size // memory.page_size,
         "windows.system_arena_base": system_arena_base,
         "windows.system_arena_limit": system_arena_base + system_arena_size,
         "windows.system_arena_cursor": arena_cursor,
@@ -1014,12 +1040,33 @@ def build_initial_machine_state(program, *, load_address: int | None = None, add
     else:
         system_state["windows.loader.tls_callbacks_complete"] = 1
         system_state["windows.loader.startup_calls_complete"] = 1
+    executable_pages: set[int] = set()
+    image_pages: set[int] = set()
+    for mapped_image, base in mapped_images:
+        begin, end = _pe_reserved_span(mapped_image, base)
+        image_pages.update(range(begin // 4096, (end + 4095) // 4096))
+        for section in getattr(mapped_image, "sections", ()):
+            if not bool(getattr(section, "executable", False)):
+                continue
+            section_begin = base + int(section.virtual_address)
+            section_size = max(int(section.virtual_size), int(section.raw_size))
+            if section_size:
+                executable_pages.update(range(
+                    section_begin // 4096,
+                    (section_begin + section_size + 4095) // 4096,
+                ))
+    virtual_memory = VirtualMemoryState.from_mapped_pages(
+        memory.pages, executable_pages=executable_pages,
+        image_pages=image_pages, page_size=memory.page_size,
+    )
     return MachineExecutionState(
         pc=pc,
         registers=tuple(registers),
         memory=memory,
         system_state=MappingProxyType(system_state),
         virtual_filesystem=virtual_filesystem,
+        virtual_registry=VirtualRegistryState.create(),
+        virtual_memory=virtual_memory,
         environment_state=MappingProxyType(dict(environment_state or {})),
         gs_base=teb_base,
         call_stack=call_stack,
@@ -1050,6 +1097,16 @@ def complete_external_call_state(
         written_registers.add(effect.register)
         registers[effect.register] = int(effect.value) & MASK64
     memory = _as_memory(state.memory)
+    virtual_memory = state.virtual_memory
+    if completion.virtual_memory_effects:
+        if virtual_memory is None:
+            raise RuntimeError("external completion requires installed virtual-memory metadata")
+        for effect in completion.virtual_memory_effects:
+            virtual_memory = virtual_memory.apply(effect)
+            if effect.operation == "allocate":
+                memory = memory.map_zeroes(effect.base, effect.size)
+            else:
+                memory = memory.unmap(effect.base, effect.size)
     for effect in completion.memory_writes:
         # ``map_bytes`` intentionally requires the destination page to exist
         # conceptually; verify every byte first so a host cannot manufacture a
@@ -1066,6 +1123,12 @@ def complete_external_call_state(
             raise RuntimeError("external completion requires an installed virtual filesystem")
         for effect in completion.filesystem_effects:
             virtual_filesystem = virtual_filesystem.apply(effect)
+    virtual_registry = state.virtual_registry
+    if completion.registry_effects:
+        if virtual_registry is None:
+            raise RuntimeError("external completion requires an installed virtual registry")
+        for effect in completion.registry_effects:
+            virtual_registry = virtual_registry.apply(effect)
     environment_state = dict(state.environment_state)
     for effect in completion.environment_writes:
         existing = next((key for key in environment_state if key.casefold() == effect.key.casefold()), None)
@@ -1087,6 +1150,31 @@ def complete_external_call_state(
         if item.request_id != completion.request_id
     )
     guest_calls = tuple(int(address) & MASK64 for address in completion.guest_calls)
+    transfer = completion.control_transfer
+    if transfer is not None:
+        if guest_calls or completion.terminate:
+            raise ValueError("nonlocal external transfer cannot also call or terminate")
+        return replace(
+            state,
+            pc=int(transfer.address) & MASK64,
+            registers=tuple(registers),
+            vector_registers=(
+                state.vector_registers
+                if transfer.vector_registers is None
+                else tuple(transfer.vector_registers)
+            ),
+            memory=memory,
+            system_state=MappingProxyType(system_state),
+            virtual_filesystem=virtual_filesystem,
+            virtual_registry=virtual_registry,
+            virtual_memory=virtual_memory,
+            environment_state=MappingProxyType(environment_state),
+            text_state=MappingProxyType(text_state),
+            device_state=MappingProxyType(device_state),
+            device_generations=MappingProxyType(device_generations),
+            call_stack=tuple(transfer.call_stack),
+            external_requests=pending,
+        )
     if guest_calls:
         # The original caller return is already at [RSP]. Push the remaining
         # callbacks in reverse order so ordinary RET semantics visit each and
@@ -1108,6 +1196,8 @@ def complete_external_call_state(
             memory=memory,
             system_state=MappingProxyType(system_state),
             virtual_filesystem=virtual_filesystem,
+            virtual_registry=virtual_registry,
+            virtual_memory=virtual_memory,
             environment_state=MappingProxyType(environment_state),
             text_state=MappingProxyType(text_state),
             device_state=MappingProxyType(device_state),
@@ -1128,6 +1218,8 @@ def complete_external_call_state(
         memory=memory,
         system_state=MappingProxyType(system_state),
         virtual_filesystem=virtual_filesystem,
+        virtual_registry=virtual_registry,
+        virtual_memory=virtual_memory,
         environment_state=MappingProxyType(environment_state),
         text_state=MappingProxyType(text_state),
         device_state=MappingProxyType(device_state),

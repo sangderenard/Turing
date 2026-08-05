@@ -14,24 +14,51 @@ AMD64 binaries are supported.
 | Capability-supplied DLL linking | Approved dependency bytes are decompiled, mapped, recursively resolved through exports/forwarders, and executed in one guest address space. Module bytes, bases, and per-IAT witnesses survive JSONL and segmented replay. |
 | Actual execution | `cmd.exe /c "echo hello"` halts with exit code zero; the interactive image accepts repeated terminal commands and returns to `ReadConsoleW`. |
 | Reversal and replay | Every instruction, external completion, shell input, shared-memory synchronization, and child deployment is an exact tape edge. JSONL and segmented cold reversal are tested. |
-| Bounded storage | Main execution keeps 4,096 states resident. Possible-world exact states and trace SSA use separate content-addressed parent/suffix DAGs with bounded chunk caches; dormant exact heads can seal and evict their mutable cursor/state, then append again from a cold tip. |
+| Bounded storage | Main execution keeps 4,096 states resident. Possible-world exact states and trace SSA use separate content-addressed parent/suffix DAGs with bounded chunk caches; dormant exact heads can seal and evict their mutable cursor/state, then append again from a cold tip. The latest compiled real `cmd.exe` run wrote 16,510 records directly into 66 immutable segments (8,570,148 bytes); cold reopen decoded only its final segment. |
 | Executable-code coherence | Guest or admitted capability writes to executable pages increment reversible page versions, invalidate translated blocks, and force decoding from current guest memory. Rewind restores both code and version state. |
 | Threads versus forks | Virtual cores use an explicit sequentially-consistent shared-memory schedule. Possible-world heads retain isolated memory and exact/SSA suffixes. |
-| External capture | Imports carry stable symbolic identities. The deterministic Windows port has no generic host-call fallback. Registered `CreateProcessW` targets create linked child tapes. |
+| External capture | Imports carry stable symbolic identities. The deterministic Windows port has no generic host-call fallback. Registered `CreateProcessW` targets create linked child tapes. Filesystem and registry operations use separate immutable capability-owned namespaces whose handles, contents, metadata, and effects survive exact replay. |
 | Observation | Complete `TMSNAP01` flips contain all 54 contiguous register cells and terminal/framebuffer outputs. Native OpenGL and HTML/WebGL displays consume the same ABI. |
 | Live HTML operation | A loopback-only host owns execution, streams immutable flips, and accepts bounded terminal input without exposing the machine object to request threads. |
 | Fail-closed behavior | Missing code, semantics, external capabilities, corrupt segments, invalid dependencies, and unsafe web mounts stop with structured diagnostics. |
 
-The focused machine/shell/tape/SSA/recompilation suite currently passes 243 tests. A copied
+The current broad machine/tape/SSA/recompilation/VFS/registry/virtual-memory and
+shell regression slice passes 247 tests; the focused pipe/nonlocal-control
+slice adds exact lifecycle, segmented-replay, child-routing, and SSA-domain
+coverage. A copied
 69,949-record real interactive tape continued for 7,756 events, produced the
 requested terminal output, retained exactly 4,096 hot states, and reopened at
 77,705 dependency-validated records.
 
+The fresh segmented `/c "echo hello"` proof restored absolute executor position
+16,509 and output `hello\r\n` from disk. Reversing once hydrated only positions
+16,384 through 16,509, returned to the non-halted 16,009-step predecessor, and
+one ordinary forward step reproduced the persisted halted state exactly.
+The registry-era proof deliberately stopped at a previously unhandled
+`MAXIMUM_ALLOWED` open, retained that amber frontier annotation, resumed to the
+same halt, and cold-reversed from 16,010 to 16,009 steps. One forward step
+reproduced the complete halted state, six-root empty virtual registry, and
+`hello\r\n` device output exactly.
+The following virtual-memory proof again halted at guest step 16,010 with 499
+capability completions and 15,459 authenticated Wasm-journalled instructions.
+Cold segmented reopen restored exit code zero and `hello\r\n` exactly without
+servicing another capability request.
+
 ## Not yet complete
 
-1. **General Windows import coverage.** The `cmd.exe` catalog contains 275
-   symbolic imports; the deterministic port currently admits 156 identities,
-   leaving 159 catalogued but unsupported. Most were not reached by the proven
+1. **General Windows import coverage.** The current system `cmd.exe` catalog
+   contains 286 symbolic imports; the deterministic port currently exposes 205
+   handler identities, matching 153 of those imports and leaving 133
+   catalogued but unsupported. The latest bounded
+   families add all seven mutex/semaphore/single-object-wait imports and all
+   fifteen file-L1 imports, followed by all seven remaining registry imports.
+   The virtual-memory tier adds all four memory-L1 imports (`VirtualAlloc`,
+   `VirtualFree`, `VirtualQuery`, and bounded current-process
+   `ReadProcessMemory`).
+   The pipe/control tier adds the six imported pipe/descriptor/duplication
+   identities plus `longjmp`; the same handlers also expose `CreatePipe` for
+   binaries that import it directly.
+   Most remaining imports were not reached by the proven
    command path. Another program can legitimately stop on them.
 2. **General AMD64 coverage.** The instruction families exercised by `cmd.exe`
    are implemented, and absent semantic handlers annotate the exact RIP, but
@@ -84,6 +111,17 @@ requested terminal output, retained exactly 4,096 hot states, and reopened at
    Register or witnessed-memory CMOV, carry-consuming SBB, arithmetic-right
    shift, rotate-left, and full-width unsigned MUL are also admitted. MUL
    computes the complete 128-bit product into RDX:RAX using exact 32-bit limbs.
+   CDQE/CQO and register or witnessed-memory BT/BTR/BTS/BTC are admitted too.
+   Register-indexed memory bit tests specialize the signed adjacent-bit-string
+   address adjustment as well as the modulo bit index; only CF changes, and
+   modifying forms retain one exact read-modify-write witness. Operand-width
+   parsing distinguishes memory width from a trailing immediate width such as
+   `BTR_RM32_IMM8`.
+   Exact-entry `REP STOSW` uses a bounded Wasm loop and an authenticated fill
+   descriptor. The descriptor records destination, word count, value,
+   direction, and final registers; immutable parent pages retain the prior
+   bytes for reversal, so the journal does not duplicate a 16 KiB before/after
+   payload or split one guest instruction into thousands of tape edges.
    Checkpoint ABI v2 also carries all sixteen 128-bit XMM registers as 32
    contiguous qwords. XMM XOR and aligned/unaligned vector loads/stores use
    exact 128-bit memory witnesses with independent low/high halves. The native
@@ -104,15 +142,23 @@ requested terminal output, retained exactly 4,096 hot states, and reopened at
    semantic-denial inventory was empty. After adding the bounded guest-metadata
    unwind path and authenticating runtime-discovered instructions during Wasm
    journal commit, the same real command now halts with exit code zero after
-   15,205 guest steps and 589 deterministic capability completions.
+   16,010 guest steps and 499 deterministic capability completions. It commits
+   15,459 instructions through authenticated Wasm journals. Its denial
+   inventory is now entirely intentional external/internal indirect control
+   boundaries and loader/termination sentinel returns; no ordinary semantic
+   denial remains on the proven route.
 5. **Guest-created thread lifecycle.** `CreateThread` activates a parked core
    within fixed snapshot capacity, allocates a private stack/TEB/TLS clone,
    runs thread-attach callbacks, shares process memory deterministically, and
    parks with an exit code on return. Thread-handle polling/blocking waits,
    exit-code reads, close, and reversible thread-detach callbacks are
    implemented. Suspended creation, forced termination, additional
-   synchronization objects, loader-lock contention, and capacity growth remain
-   incomplete.
+   synchronization objects beyond mutexes and semaphores, loader-lock
+   contention, and capacity growth remain incomplete. Named and unnamed mutexes
+   and semaphores now use shared reversible system-state keys; recursive mutex
+   ownership, count consumption/release, previous-count writes, zero-time
+   polling, and scheduler-yielding waits are exact tape effects. Unsupported
+   security descriptors and invalid creation shapes remain fail-closed.
 6. **Arbitrary host programs.** Host `exec`, ambient DLL loading, and ambient
    filesystem access remain deliberately prohibited. Broad compatibility must
    be gained through explicit virtual implementations, mapped guest modules, or
@@ -120,10 +166,11 @@ requested terminal output, retained exactly 4,096 hot states, and reopened at
 
 ## Highest-value next work
 
-1. Add suspended creation, forced-exit/process-detach behavior, broader
-   synchronization objects, and native first-use delay-helper behavior.
+1. Add suspended creation, forced-exit/process-detach behavior, events and
+   wait sets, and native first-use delay-helper behavior.
 2. Turn unsupported-import inventory into coherent capability families,
-   prioritizing file/process pipes, synchronization, and exception/unwind APIs.
+   prioritizing process lifecycle, console-screen operations, and the
+   remaining exception/unwind APIs.
 3. Extend specialized dynamic memory and indirect control beyond block-entry
    register-resolved cases, broaden calls/returns beyond block-entry boundaries,
    make compiled dispatch profitable for real `cmd.exe` workloads, then add an

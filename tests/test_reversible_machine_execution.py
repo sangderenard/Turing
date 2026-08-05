@@ -10,7 +10,7 @@ from src.compiler.machine_execution import (
     MachineVirtualMulticore,
     ReversibleMachineExecutor,
 )
-from src.compiler.amd64_machine_semantics import PagedByteMemory
+from src.compiler.amd64_machine_semantics import PagedByteMemory, default_effect_handlers
 from src.compiler.machine_execution_shader import (
     MACHINE_DISPLAY_REGISTERS,
     build_machine_register_shader,
@@ -18,6 +18,10 @@ from src.compiler.machine_execution_shader import (
 from src.compiler.machine_reference_vocabulary import (
     MachineSemanticToken,
     X86InstructionToken,
+)
+from src.compiler.virtual_registry import VirtualRegistryEffect, VirtualRegistryState
+from src.compiler.virtual_memory import (
+    PAGE_EXECUTE_READWRITE, VirtualMemoryEffect, VirtualMemoryState,
 )
 
 
@@ -164,6 +168,35 @@ def test_executable_page_write_invalidates_block_and_redecodes_guest_bytes():
     assert "machine.code_page.0x1.version" not in restored.system_state
 
 
+def test_dynamically_allocated_executable_page_decodes_and_versions_code():
+    base = 0x10000000000
+    program = SimpleNamespace(
+        image=SimpleNamespace(
+            image_base=base, entrypoint_rva=0, encoded=None, sections=(),
+        ),
+        functions=(),
+    )
+    executor = MachineExecutionOrchestrator(
+        program, effect_handlers=default_effect_handlers(),
+    )
+    empty = MachineExecutionState(
+        pc=base, memory=PagedByteMemory.empty(),
+        virtual_memory=VirtualMemoryState.create(),
+    )
+    allocated = replace(
+        empty, memory=empty.memory.map_zeroes(base, 4096).map_bytes(base, b"\x90"),
+        virtual_memory=empty.virtual_memory.apply(VirtualMemoryEffect(
+            "allocate", base, 4096, PAGE_EXECUTE_READWRITE,
+        )),
+    )
+    reconciled = executor.reconcile_external_state(empty, allocated)
+    key = f"machine.code_page.{base // 4096:#x}.version"
+    assert reconciled.system_state[key] == 1
+    result = executor.step(reconciled)
+    assert result.status is MachineExecutionStatus.RUNNING
+    assert result.state.pc == base + 1
+
+
 def test_external_executable_write_versions_page_and_clears_translation_cache():
     executor = _executor()
     source = replace(
@@ -227,7 +260,11 @@ def test_guest_threads_share_memory_in_deterministic_core_order_and_reverse_barr
         effect_handlers={int(MachineSemanticToken.INTEGER_ADD): accumulate},
     )
     shared = PagedByteMemory.empty().map_bytes(0x3000, b"\x00")
-    left = replace(MachineExecutionState(pc=0x2000), memory=shared)
+    registry = VirtualRegistryState.create()
+    left = replace(
+        MachineExecutionState(pc=0x2000), memory=shared,
+        virtual_registry=registry,
+    )
     right_registers = list(left.registers)
     right_registers[0] = 2
     left_registers = list(left.registers)
@@ -255,12 +292,23 @@ def test_guest_threads_share_memory_in_deterministic_core_order_and_reverse_barr
     machine.cores[0].commit_shell_effect(replace(
         machine.cores[0].state,
         memory=machine.cores[0].state.memory.map_bytes(0x3000, b"\x09"),
+        virtual_registry=registry.apply(VirtualRegistryEffect(
+            "create_key", "hkey_current_user\\Software\\Shared",
+        )),
     ))
     assert machine.synchronize_shared_memory(0) == (1,)
     assert [core.state.memory[0x3000] for core in machine.cores] == [9, 9]
+    assert all(
+        "hkey_current_user\\software\\shared" in core.state.virtual_registry.keys
+        for core in machine.cores
+    )
 
     synchronized_undo = machine.cycle_backward()
     assert [state.memory[0x3000] for state in synchronized_undo] == [3, 3]
+    assert all(
+        "hkey_current_user\\software\\shared" not in state.virtual_registry.keys
+        for state in synchronized_undo
+    )
     assert machine.last_shared_memory_commit is commit
 
     restored = machine.cycle_backward()

@@ -1,6 +1,9 @@
 import base64
 from pathlib import Path
+import socket
 import subprocess
+import sys
+import time
 
 import pytest
 
@@ -9,7 +12,8 @@ from src.compiler.machine_targets import emit
 from src.compiler.wasm_html_shell import emit_html_shell, shell_for_artifact
 from src.compiler.compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter
 from src.compiler.shell_io import (
-    ShellIOManifest, ShellIORequest, SystemPort, attach_shell_io,
+    ShellIOManifest, ShellIORequest, SystemPort, VirtualFileSystemContract,
+    VirtualMount, attach_shell_io,
 )
 
 
@@ -104,6 +108,124 @@ def test_html_renders_file_system_port_instead_of_numeric_parameter_fields():
 def test_html_rejects_host_system_external_reference_ports():
     with pytest.raises(ValueError, match="only to Turing bundles"):
         emit_html_shell(_file_port_api(domain="host_system"))
+
+
+def test_html_shell_hydrates_persistent_mounts_and_bridges_virtual_devices():
+    api = attach_shell_io(
+        CompiledProgramAPI(
+            "machine", "wasm", "run",
+            (EntryPoint("run", "run", "control", ()),),
+        ),
+        ShellIOManifest(
+            (
+                ShellIORequest.create("files"),
+                ShellIORequest.create("system_devices"),
+            ),
+            system_ports=(
+                SystemPort.create(
+                    "terminal_input", "device", "input",
+                    attributes={"device": "console.input"},
+                ),
+                SystemPort.create(
+                    "terminal_output", "device", "output",
+                    attributes={"device": "console.output"},
+                ),
+            ),
+            virtual_filesystem=VirtualFileSystemContract(mounts=(
+                VirtualMount.create("/", "memory", access="read_write"),
+                VirtualMount.create(
+                    "/database", "indexed_db", access="read_write",
+                    source="machine-runtime",
+                ),
+                VirtualMount.create(
+                    "/origin", "opfs", access="read_write",
+                    source="machine/runtime",
+                ),
+            )),
+        ),
+    )
+
+    html = emit_html_shell(api).html
+
+    assert 'indexedDB.open("turing-vfs:" + mount.source, 1)' in html
+    assert "navigator.storage.getDirectory()" in html
+    assert "systemPorts.ready = systemPorts.initializeVirtualFilesystem()" in html
+    assert "await systemPorts.ready" in html
+    assert "writeVirtualFileAsync(path, bytes)" in html
+    assert "registerDeviceHandler(name, handler)" in html
+    assert 'device === "console.input"' in html
+    assert "runtime.injectDeviceBytes(device, bytes, options)" in html
+
+
+@pytest.mark.skipif(
+    not Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe").exists(),
+    reason="Chrome is unavailable",
+)
+def test_persistent_virtual_mounts_execute_in_browser(tmp_path):
+    api = attach_shell_io(
+        CompiledProgramAPI(
+            "storage_probe", "wasm", "run",
+            (EntryPoint("run", "run", "control", ()),),
+        ),
+        ShellIOManifest(
+            (ShellIORequest.create("files"),),
+            virtual_filesystem=VirtualFileSystemContract(mounts=(
+                VirtualMount.create("/", "memory", access="read_write"),
+                VirtualMount.create(
+                    "/database", "indexed_db", access="read_write",
+                    source="browser-probe",
+                ),
+                VirtualMount.create(
+                    "/origin", "opfs", access="read_write",
+                    source="browser/probe",
+                ),
+            )),
+        ),
+    )
+    probe = r"""<script>
+(async () => {
+  try {
+    const ports = window.TuringSystemPorts;
+    await ports.ready;
+    await ports.writeVirtualFileAsync("/database/one.bin", new Uint8Array([1, 2, 3]));
+    await ports.writeVirtualFileAsync("/origin/two.bin", new Uint8Array([4, 5, 6]));
+    ports.virtualFiles.delete("/database/one.bin");
+    ports.virtualFiles.delete("/origin/two.bin");
+    await ports.hydrateIndexedDB(ports.virtualMount("/database/one.bin"));
+    await ports.hydrateOPFS(ports.virtualMount("/origin/two.bin"));
+    const left = Array.from(ports.readVirtualFile("/database/one.bin"));
+    const right = Array.from(ports.readVirtualFile("/origin/two.bin"));
+    document.body.textContent = JSON.stringify(left) === "[1,2,3]" &&
+      JSON.stringify(right) === "[4,5,6]" ? "PASS PERSISTENT VFS" : "FAIL VALUES";
+  } catch (error) { document.body.textContent = "FAIL " + String(error); }
+})();
+</script>"""
+    (tmp_path / "index.html").write_text(
+        emit_html_shell(api).html + probe, encoding="utf-8",
+    )
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    server = subprocess.Popen(
+        [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+        cwd=tmp_path, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(0.2)
+        completed = subprocess.run(
+            [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                "--headless=new", "--disable-gpu", "--no-sandbox",
+                "--virtual-time-budget=10000", "--dump-dom",
+                f"--user-data-dir={tmp_path / 'chrome-profile'}",
+                f"http://127.0.0.1:{port}/index.html",
+            ],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+    assert "PASS PERSISTENT VFS" in completed.stdout
 
 
 def test_published_webgl_shader_graduates_page_to_execution_surface():
@@ -943,4 +1065,8 @@ def test_machine_snapshot_liaison_has_bounded_live_transport_and_input_port():
     assert 'cache: "no-store"' in html
     assert "this.disconnect();" in html
     assert "async sendTerminalInput(value)" in html
+    assert "async sendControl(action, value = null)" in html
+    assert "async loadSubject(value)" in html
     assert 'String(options.inputEndpoint || "/input")' in html
+    assert 'String(options.controlEndpoint || "/control")' in html
+    assert 'String(options.subjectEndpoint || "/subject")' in html

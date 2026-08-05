@@ -14,6 +14,8 @@ from types import MappingProxyType
 from typing import Any, Callable, ClassVar, Mapping, Sequence
 
 from .virtual_filesystem import VirtualFileEffect, VirtualFileSystemState
+from .virtual_registry import VirtualRegistryEffect, VirtualRegistryState
+from .virtual_memory import VirtualMemoryEffect, VirtualMemoryState
 
 from .binary_structure_graph import (
     BinaryStructureGraph,
@@ -166,6 +168,25 @@ class MachineExternalDeviceWrite:
 
 
 @dataclass(frozen=True, slots=True)
+class MachineExternalControlTransfer:
+    """Replace control/shadow-stack state for a capability-owned nonlocal jump."""
+
+    address: int
+    call_stack: tuple[int, ...]
+    vector_registers: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.address <= 0:
+            raise ValueError("external control transfer needs a positive target")
+        object.__setattr__(self, "call_stack", tuple(int(item) for item in self.call_stack))
+        if self.vector_registers is not None:
+            vectors = tuple(int(item) for item in self.vector_registers)
+            if len(vectors) != 16:
+                raise ValueError("external control transfer needs all sixteen XMM registers")
+            object.__setattr__(self, "vector_registers", vectors)
+
+
+@dataclass(frozen=True, slots=True)
 class MachineExternalDeployment:
     """Durable identity of one child executor selected by a system port."""
 
@@ -228,9 +249,12 @@ class MachineExternalCallCompletion:
     register_writes: tuple[MachineExternalRegisterWrite, ...] = ()
     system_writes: tuple[MachineExternalStateWrite, ...] = ()
     filesystem_effects: tuple[VirtualFileEffect, ...] = ()
+    registry_effects: tuple[VirtualRegistryEffect, ...] = ()
+    virtual_memory_effects: tuple[VirtualMemoryEffect, ...] = ()
     environment_writes: tuple[MachineExternalEnvironmentWrite, ...] = ()
     text_writes: tuple[MachineExternalTextStateWrite, ...] = ()
     device_writes: tuple[MachineExternalDeviceWrite, ...] = ()
+    control_transfer: MachineExternalControlTransfer | None = None
     deployments: tuple[MachineExternalDeployment, ...] = ()
     guest_calls: tuple[int, ...] = ()
     thread_spawns: tuple[MachineExternalThreadSpawn, ...] = ()
@@ -252,6 +276,8 @@ class MachineExecutionState:
         default_factory=lambda: MappingProxyType({}),
     )
     virtual_filesystem: VirtualFileSystemState | None = None
+    virtual_registry: VirtualRegistryState | None = None
+    virtual_memory: VirtualMemoryState | None = None
     environment_state: Mapping[str, str] = field(
         default_factory=lambda: MappingProxyType({}),
     )
@@ -560,7 +586,13 @@ class MachineExecutionOrchestrator:
         static = self.instructions.get(target)
         if static is not None and self._instruction_bytes_match(state, static):
             return static
-        if target // 4096 not in self._executable_pages:
+        if (
+            target // 4096 not in self._executable_pages
+            and not (
+                state.virtual_memory is not None
+                and state.virtual_memory.is_executable(target)
+            )
+        ):
             return None
         raw = bytearray()
         for index in range(15):
@@ -595,6 +627,16 @@ class MachineExecutionOrchestrator:
         source: MachineExecutionState,
         result: MachineExecutionResult,
     ) -> MachineExecutionResult:
+        dynamic_executable_pages: set[int] = set()
+        for active_state in (source, result.state):
+            if active_state.virtual_memory is None:
+                continue
+            for region in active_state.virtual_memory.regions.values():
+                if region.executable:
+                    dynamic_executable_pages.update(range(
+                        region.base // 4096, (region.end + 4095) // 4096,
+                    ))
+        executable_pages = self._executable_pages | dynamic_executable_pages
         touched: set[int] = set()
         for address, before, after in _memory_changed_ranges(source.memory, result.state.memory):
             length = max(len(before or b""), len(after or b""))
@@ -602,7 +644,7 @@ class MachineExecutionOrchestrator:
                 continue
             touched.update(
                 page for page in range(address // 4096, (address + length - 1) // 4096 + 1)
-                if page in self._executable_pages
+                if page in executable_pages
             )
         if not touched:
             return result
@@ -750,9 +792,16 @@ class MachineExecutionOrchestrator:
                 and self.external_target_resolver is not None
                 and self.external_target_resolver(indirect_target) is not None
             )
+        executable_pages = set(self._executable_pages)
+        if state is not None and state.virtual_memory is not None:
+            for region in state.virtual_memory.regions.values():
+                if region.executable:
+                    executable_pages.update(range(
+                        region.base // 4096, (region.end + 4095) // 4096,
+                    ))
         return lower_machine_block_to_wasm(
             block, strict=strict,
-            executable_pages=self._executable_pages,
+            executable_pages=frozenset(executable_pages),
             specialization_state=state,
             maximum_instructions=maximum_instructions,
             resolved_indirect_target=indirect_target,
@@ -1920,6 +1969,9 @@ class MachineVirtualMulticore:
             return ()
         memory = self.cores[source_core].state.memory
         source_system = self.cores[source_core].state.system_state
+        source_filesystem = self.cores[source_core].state.virtual_filesystem
+        source_registry = self.cores[source_core].state.virtual_registry
+        source_virtual_memory = self.cores[source_core].state.virtual_memory
         shared_system = {
             key: value for key, value in source_system.items()
             if _shared_system_key(key)
@@ -1932,12 +1984,22 @@ class MachineVirtualMulticore:
             version_changed = any(
                 system_state.get(key) != value for key, value in shared_system.items()
             )
-            if _memory_equal(core.state.memory, memory) and not version_changed:
+            filesystem_changed = core.state.virtual_filesystem != source_filesystem
+            registry_changed = core.state.virtual_registry != source_registry
+            virtual_memory_changed = core.state.virtual_memory != source_virtual_memory
+            if (
+                _memory_equal(core.state.memory, memory)
+                and not version_changed and not filesystem_changed
+                and not registry_changed and not virtual_memory_changed
+            ):
                 continue
             system_state.update(shared_system)
             core.commit_shell_effect(replace(
                 core.state, memory=memory,
                 system_state=MappingProxyType(system_state),
+                virtual_filesystem=source_filesystem,
+                virtual_registry=source_registry,
+                virtual_memory=source_virtual_memory,
             ))
             synchronized.append(index)
         return tuple(synchronized)
@@ -1982,6 +2044,7 @@ __all__ = [
     "MachineExecutionOrchestrator",
     "MachineExternalCallRequest",
     "MachineExternalCallCompletion",
+    "MachineExternalControlTransfer",
     "MachineExternalDeployment",
     "MachineExternalMemoryWrite",
     "MachineExternalRegisterWrite",

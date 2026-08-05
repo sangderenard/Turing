@@ -52,6 +52,10 @@ def main() -> int:
     )
     parser.add_argument("--maximum-boundaries", type=int, default=1000)
     parser.add_argument(
+        "--rewind-to-position", type=int, metavar="POSITION",
+        help="on resume, move the primary read head backward to an exact tape position before branching",
+    )
+    parser.add_argument(
         "--output-tail-bytes", type=int, default=256, metavar="N",
         help="print up to N final bytes from the subject console device (zero disables)",
     )
@@ -59,6 +63,8 @@ def main() -> int:
     options = parser.parse_args()
     if options.output_tail_bytes < 0:
         parser.error("--output-tail-bytes cannot be negative")
+    if options.rewind_to_position is not None and options.new:
+        parser.error("--rewind-to-position requires a resumed tape")
     command = () if options.interactive else tuple(options.command or ("/c", "echo hello"))
 
     environment = {
@@ -98,6 +104,17 @@ def main() -> int:
         )
         if options.segmented:
             machine.begin_segmented_system_tape(options.tape)
+
+    if options.rewind_to_position is not None:
+        core = machine.machine.cores[0]
+        target = int(options.rewind_to_position)
+        if target < 0 or target > core.position:
+            parser.error(
+                f"rewind position must be between 0 and current position {core.position}"
+            )
+        while core.position > target:
+            core.step_backward()
+        print(f"rewound primary head to tape position {core.position}")
 
     program_registry = None
     if options.demo_card:

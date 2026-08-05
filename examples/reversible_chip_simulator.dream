@@ -125,15 +125,18 @@ precision highp float;
 in vec2 uv;
 out vec4 display_color;
 uniform highp usampler2D register_words;
+uniform highp usampler2D memory_pages;
 uniform sampler2D subject_output;
 uniform vec2 machine_shape;
+uniform float memory_page_count;
+uniform float memory_page_size;
 uniform float subject_available;
 uniform float gpu_active;
 
 void main() {
     vec3 chip = vec3(0.015, 0.02, 0.03);
-    if (uv.y >= 0.50 && machine_shape.x > 0.0 && machine_shape.y > 0.0) {
-        vec2 machine_uv = vec2(uv.x, (uv.y - 0.50) * 2.0);
+    if (uv.y >= 0.64 && machine_shape.x > 0.0 && machine_shape.y > 0.0) {
+        vec2 machine_uv = vec2(uv.x, (uv.y - 0.64) / 0.36);
         ivec2 cell = ivec2(clamp(floor(machine_uv * machine_shape), vec2(0.0), machine_shape - 1.0));
         uvec2 words = texelFetch(register_words, cell, 0).rg;
         float low_energy = log2(1.0 + float(words.x)) / 32.0;
@@ -142,6 +145,18 @@ void main() {
         vec2 grid = fract(machine_uv * machine_shape);
         float border = step(0.04, grid.x) * step(0.04, grid.y);
         chip = border * vec3(0.08 + low_energy, 0.14 + high_energy, 0.25 + 0.7 * occupied);
+    } else if (uv.y >= 0.50 && memory_page_count > 0.5) {
+        float page_slot = min(floor(uv.x * memory_page_count), memory_page_count - 1.0);
+        uvec4 page = texelFetch(memory_pages, ivec2(int(page_slot), 0), 0);
+        float occupancy = float(page.z) / max(memory_page_size, 1.0);
+        float executable = float((page.w & 2u) != 0u);
+        float managed = float((page.w & 8u) != 0u);
+        float stripe = step(0.08, fract(uv.x * memory_page_count));
+        chip = stripe * mix(
+            vec3(0.035, 0.06, 0.075),
+            vec3(0.12 + 0.55 * executable, 0.18 + 0.62 * managed, 0.16),
+            clamp(0.15 + occupancy, 0.0, 1.0)
+        );
     } else if (uv.y < 0.50 && subject_available > 0.5) {
         chip = texture(subject_output, vec2(uv.x, uv.y * 2.0)).rgb;
     }
@@ -215,8 +230,11 @@ function installTuringDisplay(liaison, interior) {
   }
   const registerTexture = texture(0, "register_words");
   const subjectTexture = texture(1, "subject_output");
+  const memoryTexture = texture(2, "memory_pages");
   const shapeLocation = gl.getUniformLocation(program, "machine_shape");
   const subjectLocation = gl.getUniformLocation(program, "subject_available");
+  const memoryCountLocation = gl.getUniformLocation(program, "memory_page_count");
+  const memorySizeLocation = gl.getUniformLocation(program, "memory_page_size");
   const activeLocation = gl.getUniformLocation(program, "gpu_active");
   const terminalCanvas = document.createElement("canvas");
   terminalCanvas.width = 1024;
@@ -247,6 +265,58 @@ function installTuringDisplay(liaison, interior) {
     pointerEvents: "none", zIndex: "2147483647",
   });
   if (displayHost !== liaison.canvas) displayHost.appendChild(registerHud);
+  const controls = document.createElement("div");
+  controls.dataset.turingMachineControls = "true";
+  controls.setAttribute("aria-label", "Reversible machine controls");
+  Object.assign(controls.style, {
+    position: "absolute", left: "12px", right: "12px", bottom: "62px",
+    display: "flex", flexWrap: "wrap", alignItems: "center", gap: "6px",
+    padding: "7px", color: "#d7ffe4", background: "rgba(3,8,12,0.88)",
+    border: "1px solid rgba(85,255,145,0.45)", borderRadius: "4px",
+    font: "11px ui-monospace,SFMono-Regular,Consolas,monospace",
+    zIndex: "2147483647",
+  });
+  const controlStatus = document.createElement("span");
+  controlStatus.textContent = "CONNECTING";
+  controlStatus.style.marginLeft = "auto";
+  const actions = [
+    ["⏮ STEP", "step_backward"], ["◀ REVERSE", "backward"],
+    ["Ⅱ PAUSE", "pause"], ["FORWARD ▶", "forward"], ["STEP ⏭", "step_forward"],
+  ];
+  for (const [label, action] of actions) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.dataset.machineAction = action;
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        await liaison.machineSnapshots.sendControl(action);
+        controlStatus.textContent = action.toUpperCase();
+      } catch (error) {
+        controlStatus.textContent = error instanceof Error ? error.message : String(error);
+      } finally { button.disabled = false; }
+    });
+    controls.appendChild(button);
+  }
+  const speedLabel = document.createElement("label");
+  speedLabel.textContent = " FLIPS/CYCLE ";
+  const speed = document.createElement("input");
+  speed.type = "range"; speed.min = "0"; speed.max = "7"; speed.step = "1"; speed.value = "5";
+  const speedValue = document.createElement("output");
+  const speeds = [1, 4, 16, 256, 4096, 65536, 1000000, 10000000];
+  const updateSpeed = async () => {
+    const value = speeds[Number(speed.value)];
+    speedValue.value = value.toLocaleString();
+    await liaison.machineSnapshots.sendControl("speed", value);
+  };
+  speed.addEventListener("change", () => updateSpeed().catch(error => {
+    controlStatus.textContent = error instanceof Error ? error.message : String(error);
+  }));
+  speedValue.value = speeds[Number(speed.value)].toLocaleString();
+  speedLabel.append(speed, speedValue);
+  controls.append(speedLabel, controlStatus);
+  if (displayHost !== liaison.canvas) displayHost.appendChild(controls);
   const terminalForm = document.createElement("form");
   terminalForm.dataset.turingTerminalInput = "true";
   terminalForm.setAttribute("aria-label", "Guest terminal input");
@@ -254,20 +324,22 @@ function installTuringDisplay(liaison, interior) {
     position: "absolute", left: "12px", right: "12px", bottom: "12px",
     display: "flex", gap: "6px", padding: "7px",
     background: "rgba(3,8,12,0.88)", border: "1px solid rgba(85,255,145,0.45)",
-    borderRadius: "4px", zIndex: "2147483647",
+    borderRadius: "4px", zIndex: "2147483647", height: "44px",
+    boxSizing: "border-box", alignItems: "center",
   });
   const terminalInput = document.createElement("input");
   terminalInput.type = "text";
   terminalInput.placeholder = "guest command (Enter sends CRLF)";
   terminalInput.autocomplete = "off";
   Object.assign(terminalInput.style, {
-    minWidth: "0", flex: "1", padding: "6px 8px", color: "#d7ffe4",
+    minWidth: "0", flex: "1", height: "30px", padding: "6px 8px", color: "#d7ffe4",
     background: "#05080a", border: "1px solid #287344",
     font: "13px ui-monospace,SFMono-Regular,Consolas,monospace",
   });
   const terminalSend = document.createElement("button");
   terminalSend.type = "submit";
   terminalSend.textContent = "SEND";
+  terminalSend.style.height = "30px";
   terminalForm.append(terminalInput, terminalSend);
   terminalForm.addEventListener("submit", async event => {
     event.preventDefault();
@@ -285,9 +357,35 @@ function installTuringDisplay(liaison, interior) {
       terminalInput.focus();
     }
   });
+  liaison.canvas.addEventListener("pointerdown", event => {
+    if (event.offsetY >= liaison.canvas.clientHeight * 0.5) {
+      queueMicrotask(() => terminalInput.focus({preventScroll: true}));
+    }
+  });
+  liaison.canvas.addEventListener("keydown", event => {
+    if (event.ctrlKey || event.altKey || event.metaKey) return;
+    if (event.key === "Enter") {
+      event.preventDefault();
+      terminalForm.requestSubmit();
+    } else if (event.key === "Backspace") {
+      event.preventDefault();
+      terminalInput.value = terminalInput.value.slice(0, -1);
+    } else if (event.key.length === 1) {
+      event.preventDefault();
+      terminalInput.value += event.key;
+    }
+  });
   if (displayHost !== liaison.canvas) displayHost.appendChild(terminalForm);
+  if (liaison.systemPorts?.descriptors.has("subject-binary")) {
+    liaison.systemPorts.registerFileHandler("subject-binary", async value => {
+      controlStatus.textContent = `LOADING ${value.name}`;
+      await liaison.machineSnapshots.loadSubject(value.bytes);
+      controlStatus.textContent = `LOADED ${value.name} · PAUSED`;
+    });
+  }
   let gpuActive = 0;
   let subjectAvailable = 0;
+  let memoryPageCount = 0;
 
   function uploadTerminal(payload) {
     if (!terminalContext) throw new Error("terminal raster context is unavailable");
@@ -326,6 +424,8 @@ function installTuringDisplay(liaison, interior) {
     const registerCount = view.getUint32(44, true);
     const registerStride = view.getUint32(48, true);
     const registerOffset = view.getUint32(52, true);
+    const direction = view.getInt32(24, true);
+    const transitions = view.getBigUint64(32, true);
     const packed = new Uint32Array(coreCount * registerCount * 2);
     for (let core = 0; core < coreCount; core++) {
       const source = registerOffset + core * registerStride;
@@ -334,6 +434,7 @@ function installTuringDisplay(liaison, interior) {
       ), core * registerCount * 2);
     }
     registerHud.replaceChildren();
+    controlStatus.textContent = `${direction < 0 ? "REVERSE" : direction > 0 ? "FORWARD" : "PAUSED"} · ${transitions.toLocaleString()} FLIPS`;
     for (let core = 0; core < coreCount; core++) {
       for (let register = 0; register < registerCount; register++) {
         const word = (core * registerCount + register) * 2;
@@ -353,6 +454,7 @@ function installTuringDisplay(liaison, interior) {
     if (shapeLocation !== null) gl.uniform2f(shapeLocation, registerCount, coreCount);
 
     subjectAvailable = 0;
+    memoryPageCount = 0;
     const descriptorOffset = view.getUint32(60, true);
     const outputCount = view.getUint32(64, true);
     for (let index = 0; index < outputCount; index++) {
@@ -363,19 +465,27 @@ function installTuringDisplay(liaison, interior) {
       const height = view.getUint32(descriptor + 12, true);
       const offset = Number(view.getBigUint64(descriptor + 24, true));
       const length = Number(view.getBigUint64(descriptor + 32, true));
-      if (kind === 2 && format === 2) {
+      if (kind === 5 && format === 5 && length >= width * 16) {
+        const pages = new Uint32Array(
+          bytes.buffer, bytes.byteOffset + offset, width * 4,
+        );
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, memoryTexture);
+        gl.texImage2D(
+          gl.TEXTURE_2D, 0, gl.RGBA32UI, width, 1, 0,
+          gl.RGBA_INTEGER, gl.UNSIGNED_INT, pages,
+        );
+        memoryPageCount = width;
+      } else if (kind === 2 && format === 2 && subjectAvailable === 0) {
         uploadTerminal(new Uint8Array(
           bytes.buffer, bytes.byteOffset + offset, length,
         ));
-        break;
-      }
-      if (kind === 3 && format === 3 && width * height * 4 <= length) {
+      } else if (kind === 3 && format === 3 && width * height * 4 <= length && subjectAvailable === 0) {
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D, subjectTexture);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE,
           new Uint8Array(bytes.buffer, bytes.byteOffset + offset, width * height * 4));
         subjectAvailable = 1;
-        break;
       }
     }
     gpuActive = 1;
@@ -393,6 +503,8 @@ function installTuringDisplay(liaison, interior) {
     }
     liaison.canvas.dataset.gpuActive = gpuActive ? "true" : "false";
     if (subjectLocation !== null) gl.uniform1f(subjectLocation, subjectAvailable);
+    if (memoryCountLocation !== null) gl.uniform1f(memoryCountLocation, memoryPageCount);
+    if (memorySizeLocation !== null) gl.uniform1f(memorySizeLocation, 4096);
     if (activeLocation !== null) gl.uniform1f(activeLocation, gpuActive);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gpuActive = 0;

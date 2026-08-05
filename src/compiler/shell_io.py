@@ -24,6 +24,7 @@ class ShellIOCapability(str, Enum):
     POINTER = "pointer"
     DISPLAY = "display_double_buffer"
     FILES = "files"
+    DEVICES = "system_devices"
     # Web pages resolve only other published Turing bundles. Host-system
     # references are deliberately a separate native-only capability.
     BUNDLE_REFERENCES = "bundle_references"
@@ -32,6 +33,7 @@ class ShellIOCapability(str, Enum):
 
 class SystemPortKind(str, Enum):
     FILE = "file"
+    DEVICE = "device"
     EXTERNAL_REFERENCE = "external_reference"
 
 
@@ -54,6 +56,8 @@ class VirtualMountKind(str, Enum):
     MEMORY = "memory"
     BUNDLE = "bundle"
     HOST_DIRECTORY = "host_directory"
+    INDEXED_DB = "indexed_db"
+    OPFS = "opfs"
 
 
 class VirtualMountAccess(str, Enum):
@@ -85,6 +89,15 @@ class VirtualMount:
             raise ValueError("virtual mount paths must not have a trailing slash")
         if self.kind is not VirtualMountKind.MEMORY and not self.source:
             raise ValueError(f"{self.kind.value} mounts require a source")
+        if self.kind in {VirtualMountKind.INDEXED_DB, VirtualMountKind.OPFS}:
+            source = str(self.source)
+            if source.startswith(("/", "\\")) or any(
+                part in {"", ".", ".."}
+                for part in source.replace("\\", "/").split("/")
+            ):
+                raise ValueError(
+                    f"{self.kind.value} mount sources must be relative namespace paths"
+                )
 
     def to_mapping(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -159,10 +172,17 @@ class SystemPort:
             raise ValueError(
                 f"system port {self.name!r} binds parameters without an entry point"
             )
-        if self.kind is SystemPortKind.FILE:
+        if self.kind in {SystemPortKind.FILE, SystemPortKind.DEVICE}:
             if self.external_domain is not None:
-                raise ValueError("file system ports do not have an external domain")
-            if self.direction in {SystemPortDirection.INPUT, SystemPortDirection.BIDIRECTIONAL}:
+                raise ValueError(
+                    f"{self.kind.value} system ports do not have an external domain"
+                )
+            if (
+                self.kind is SystemPortKind.FILE
+                and self.direction in {
+                    SystemPortDirection.INPUT, SystemPortDirection.BIDIRECTIONAL,
+                }
+            ):
                 required = {"data", "length"}
                 missing = required - set(field_names)
                 if missing:
@@ -198,6 +218,8 @@ class SystemPort:
     def capability(self) -> ShellIOCapability:
         if self.kind is SystemPortKind.FILE:
             return ShellIOCapability.FILES
+        if self.kind is SystemPortKind.DEVICE:
+            return ShellIOCapability.DEVICES
         if self.external_domain is ExternalReferenceDomain.BUNDLE:
             return ShellIOCapability.BUNDLE_REFERENCES
         return ShellIOCapability.HOST_REFERENCES
@@ -679,10 +701,14 @@ WEB_JAVASCRIPT_SHELL = ShellProfile(
         ShellIOCapability.POINTER,
         ShellIOCapability.DISPLAY,
         ShellIOCapability.FILES,
+        ShellIOCapability.DEVICES,
         ShellIOCapability.BUNDLE_REFERENCES,
     }),
     cost=1,
-    mount_kinds=frozenset({VirtualMountKind.MEMORY, VirtualMountKind.BUNDLE}),
+    mount_kinds=frozenset({
+        VirtualMountKind.MEMORY, VirtualMountKind.BUNDLE,
+        VirtualMountKind.INDEXED_DB, VirtualMountKind.OPFS,
+    }),
 )
 
 NATIVE_PROCESS_SHELL = ShellProfile(

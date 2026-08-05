@@ -1,4 +1,5 @@
 import struct
+import json
 from threading import get_ident, Thread
 from types import SimpleNamespace
 import time
@@ -10,8 +11,10 @@ import pytest
 from src.compiler.machine_execution import MachineExecutionState
 from src.compiler.machine_snapshot_host import (
     LiveMachineSnapshotController,
+    MachineControlQueue,
     MachineSnapshotMailbox,
     MachineTerminalInputQueue,
+    MachineSubjectQueue,
     build_machine_snapshot_server,
 )
 from src.compiler.machine_state_buffer import build_machine_state_snapshot
@@ -40,9 +43,12 @@ def test_mailbox_keeps_only_complete_monotonic_snapshot_flips():
 def test_loopback_host_serves_page_flips_and_bounded_terminal_messages():
     mailbox = MachineSnapshotMailbox()
     terminal = MachineTerminalInputQueue(maximum_messages=2)
+    controls = MachineControlQueue(maximum_messages=2)
+    subjects = MachineSubjectQueue(maximum_messages=2)
     server = build_machine_snapshot_server(
         "<html>machine</html>", mailbox, terminal,
         maximum_input_bytes=8,
+        control=controls, subjects=subjects,
     )
     worker = Thread(target=server.serve_forever, daemon=True)
     worker.start()
@@ -62,6 +68,20 @@ def test_loopback_host_serves_page_flips_and_bounded_terminal_messages():
         with urlopen(request, timeout=2) as response:
             assert response.status == 204
         assert terminal.drain() == (b"dir\r\n",)
+
+        control = Request(
+            root + "/control",
+            data=json.dumps({"action": "step_backward"}).encode(),
+            method="POST", headers={"Content-Type": "application/json"},
+        )
+        with urlopen(control, timeout=2) as response:
+            assert response.status == 204
+        assert controls.drain() == (("step_backward", None),)
+
+        subject = Request(root + "/subject", data=b"MZ\0\0", method="POST")
+        with urlopen(subject, timeout=2) as response:
+            assert response.status == 204
+        assert subjects.drain() == (b"MZ\0\0",)
 
         oversized = Request(root + "/input", data=b"123456789", method="POST")
         with pytest.raises(HTTPError) as raised:

@@ -90,6 +90,7 @@ class SubjectOutputKind(IntEnum):
     TERMINAL = 2
     FRAMEBUFFER = 3
     AUDIO = 4
+    MEMORY_PAGES = 5
 
 
 class SubjectOutputFormat(IntEnum):
@@ -97,6 +98,7 @@ class SubjectOutputFormat(IntEnum):
     UTF8 = 2
     RGBA8 = 3
     F32 = 4
+    PAGE_OCCUPANCY_V1 = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +141,29 @@ def machine_state_outputs(state) -> tuple[SubjectOutputBuffer, ...]:
             SubjectOutputKind.TERMINAL, SubjectOutputFormat.UTF8,
             bytes(console),
             generation=state.device_generations.get("console.output", 0),
+        ))
+    pages = getattr(state.memory, "pages", None)
+    if pages:
+        page_size = int(getattr(state.memory, "page_size", 4096))
+        records = bytearray()
+        virtual_memory = getattr(state, "virtual_memory", None)
+        for page_index, payload in sorted(pages.items()):
+            region = (
+                virtual_memory.region_at(int(page_index) * page_size)
+                if virtual_memory is not None else None
+            )
+            flags = 1
+            if region is not None:
+                flags |= int(region.executable) << 1
+                flags |= int(region.kind == 0x1000000) << 2
+                flags |= int(region.managed) << 3
+            occupied = len(payload) - payload.count(0)
+            records.extend(struct.pack("<QII", int(page_index), occupied, flags))
+        outputs.append(SubjectOutputBuffer(
+            SubjectOutputKind.MEMORY_PAGES,
+            SubjectOutputFormat.PAGE_OCCUPANCY_V1,
+            bytes(records), width=len(pages), height=1, channels=4,
+            row_stride=16 * len(pages), generation=int(state.steps),
         ))
     for name, data in state.device_state.items():
         if name == "console.output":

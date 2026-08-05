@@ -7,6 +7,7 @@ import pytest
 
 from src.compiler.machine_chip_layout import build_register_bank_layout
 from src.compiler.binary_machine_program import BinaryMachineProgram
+from src.compiler.amd64_machine_semantics import PagedByteMemory
 from src.compiler.machine_execution import (
     MachineExternalCallRequest,
     MachineExecutionOrchestrator,
@@ -551,6 +552,25 @@ def test_reversible_console_device_state_reaches_the_shader_snapshot_abi():
         assert descriptor.format is SubjectOutputFormat.UTF8
         assert descriptor.generation == 4
         assert bytes(snapshot.output_bytes(0)) == b"hello\r\n"
+
+
+def test_snapshot_exposes_page_aligned_memory_occupancy_for_the_shader():
+    state = replace(
+        _machine(1).cores[0].state,
+        memory=PagedByteMemory.empty().map_zeroes(0x4000, 4096).map_bytes(
+            0x4010, b"four",
+        ),
+        steps=9,
+    )
+    snapshot = MachineSnapshotView(memoryview(build_machine_state_snapshot((state,))))
+    descriptor = snapshot.output_descriptor(0)
+    assert descriptor.kind is SubjectOutputKind.MEMORY_PAGES
+    assert descriptor.format is SubjectOutputFormat.PAGE_OCCUPANCY_V1
+    assert (descriptor.width, descriptor.row_stride, descriptor.generation) == (1, 16, 9)
+    page_index, occupied, flags = struct.unpack("<QII", snapshot.output_bytes(0))
+    assert page_index == 4
+    assert occupied == 4
+    assert flags & 1
 
 
 def test_shell_console_input_is_a_reversible_taped_machine_effect():

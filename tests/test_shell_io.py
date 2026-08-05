@@ -211,6 +211,51 @@ def test_virtual_filesystem_mounts_are_shell_specific_and_serialized():
     ).outer_kind == "native_process"
 
 
+def test_web_shell_accepts_declared_indexeddb_and_opfs_mounts_only():
+    manifest = ShellIOManifest(
+        (ShellIORequest.create("files"),),
+        virtual_filesystem=VirtualFileSystemContract(mounts=(
+            VirtualMount.create("/", "memory", access="read_write"),
+            VirtualMount.create(
+                "/database", "indexed_db", access="read_write",
+                source="machine-runtime",
+            ),
+            VirtualMount.create(
+                "/origin", "opfs", access="read_write",
+                source="machine/runtime",
+            ),
+        )),
+    )
+
+    assert plan_shell_stack(
+        "wasm", manifest, (WEB_JAVASCRIPT_SHELL,),
+    ).outer_kind == "web_page"
+    assert [mount["kind"] for mount in manifest.to_mapping()["virtual_filesystem"]["mounts"]] == [
+        "memory", "indexed_db", "opfs",
+    ]
+    with pytest.raises(ValueError, match="relative namespace paths"):
+        VirtualMount.create("/escape", "opfs", source="../host")
+
+
+def test_system_device_ports_are_an_explicit_shell_capability():
+    manifest = ShellIOManifest(
+        (ShellIORequest.create("system_devices"),),
+        system_ports=(SystemPort.create(
+            "terminal_input", "device", "input",
+            attributes={"device": "console.input", "encoding": "utf-8"},
+        ),),
+    )
+
+    port = manifest.to_mapping()["system_ports"][0]
+    assert port["kind"] == "device"
+    assert port["attributes"]["device"] == "console.input"
+    assert plan_shell_stack(
+        "wasm", manifest, (WEB_JAVASCRIPT_SHELL,),
+    ).outer_kind == "web_page"
+    with pytest.raises(ValueError, match="no shell stack"):
+        plan_shell_stack("fortran", manifest, (NATIVE_PROCESS_SHELL,))
+
+
 def test_file_broker_declares_namespace_and_journal_operations():
     files = ShellIOABI().to_mapping()["files"]
     assert files["namespace"] == "utf8-posix-absolute"

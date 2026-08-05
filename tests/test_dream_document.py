@@ -8,6 +8,7 @@ from src.compiler.dream_document import (
     DreamDocumentError,
     DreamRuntime,
     embed_machine_snapshot,
+    embed_machine_snapshot_replay,
     embed_machine_snapshot_stream,
     emit_dream_html_shell,
     load_dream_document,
@@ -211,6 +212,19 @@ def test_machine_snapshot_embedding_rejects_unframed_state():
         embed_machine_snapshot(artifact, b"not-a-snapshot")
 
 
+def test_machine_snapshot_replay_embeds_static_forward_and_backward_controls():
+    artifact = HtmlShell("chip", "<html><body></body></html>", False)
+    frames = [b"TMSNAP01" + bytes(68), b"TMSNAP01" + bytes([1]) + bytes(67)]
+
+    embedded = embed_machine_snapshot_replay(artifact, frames)
+
+    assert 'id="turing-embedded-machine-replay"' in embedded.html
+    assert "embedded-replay" in embedded.html
+    assert 'action === "step_backward"' in embedded.html
+    assert "api.localReplay" in embedded.html
+    assert all(base64.b64encode(frame).decode("ascii") in embedded.html for frame in frames)
+
+
 def test_live_machine_snapshot_stream_boots_same_origin_transport():
     artifact = HtmlShell("chip", "<html><body></body></html>", False)
 
@@ -221,4 +235,6 @@ def test_live_machine_snapshot_stream_boots_same_origin_transport():
 
     assert 'id="turing-live-machine-snapshot"' in embedded.html
     assert 'TuringMachineSnapshots.connect("/state"' in embedded.html
-    assert 'inputEndpoint: "/terminal", interval: 8' in embedded.html
+    assert 'inputEndpoint: "/terminal"' in embedded.html
+    assert 'controlEndpoint: "/control"' in embedded.html
+    assert 'subjectEndpoint: "/subject", interval: 8' in embedded.html

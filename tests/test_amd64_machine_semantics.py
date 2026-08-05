@@ -23,6 +23,10 @@ from src.compiler.machine_execution import (
     MachineExternalDeviceWrite,
     ReversibleMachineExecutor,
 )
+from src.compiler.virtual_registry import VirtualRegistryEffect, VirtualRegistryState
+from src.compiler.virtual_memory import (
+    PAGE_EXECUTE_READWRITE, VirtualMemoryEffect, VirtualMemoryState,
+)
 from src.compiler.machine_reference_vocabulary import (
     DecodedInstruction,
     EffectiveAddressOperand,
@@ -359,7 +363,11 @@ def test_external_import_call_pauses_as_request_and_completion_is_reversible():
     registers[4] = 0x8000
     core = ReversibleMachineExecutor.create(
         executor,
-        MachineExecutionState(pc=0x1000, registers=tuple(registers), memory=memory),
+        MachineExecutionState(
+            pc=0x1000, registers=tuple(registers), memory=memory,
+            virtual_registry=VirtualRegistryState.create(),
+            virtual_memory=VirtualMemoryState.create(),
+        ),
     )
 
     waiting = core.step_forward()
@@ -376,6 +384,12 @@ def test_external_import_call_pauses_as_request_and_completion_is_reversible():
             request.request_id,
             result=73,
             memory_writes=(MachineExternalMemoryWrite(0x7000, b"ok"),),
+            registry_effects=(VirtualRegistryEffect(
+                "create_key", "hkey_current_user\\Software\\Turing",
+            ),),
+            virtual_memory_effects=(VirtualMemoryEffect(
+                "allocate", 0x10000000000, 4096, PAGE_EXECUTE_READWRITE,
+            ),),
         ),
     )
     core.commit_external_completion(completed)
@@ -383,7 +397,12 @@ def test_external_import_call_pauses_as_request_and_completion_is_reversible():
     assert core.state.registers[0] == 73
     assert core.state.registers[4] == 0x8000
     assert bytes((core.state.memory[0x7000], core.state.memory[0x7001])) == b"ok"
+    assert "hkey_current_user\\software\\turing" in core.state.virtual_registry.keys
+    assert core.state.memory[0x10000000000] == 0
+    assert core.state.virtual_memory.is_executable(0x10000000000)
     assert core.step_backward() == waiting.state
+    assert "hkey_current_user\\software\\turing" not in core.state.virtual_registry.keys
+    assert core.state.virtual_memory.regions == {}
 
 
 def test_external_completion_can_dispatch_ordered_guest_callbacks_before_return():

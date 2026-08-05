@@ -239,6 +239,127 @@ def static_gallery_items(destination: str | Path) -> list[dict[str, Any]]:
     return items
 
 
+def refresh_static_gallery(destination: str | Path) -> Path:
+    """Refresh the root shell's offline gallery from published manifests.
+
+    The loopback server discovers manifests dynamically, while GitHub Pages has
+    no server-side catalogue.  Keeping this small rewrite beside bundle
+    publication gives prebuilt and compiler-produced interiors the same public
+    discovery path.
+    """
+    root = resolve_publish_root(destination)
+    page = root / "index.html"
+    html = page.read_text(encoding="utf-8")
+    replacement = "const STATIC_GALLERY = " + json.dumps(
+        static_gallery_items(root), default=str,
+    ) + ";"
+    updated, count = re.subn(
+        r"const STATIC_GALLERY = \[.*?\];", lambda _match: replacement, html,
+        count=1, flags=re.DOTALL,
+    )
+    if count != 1:
+        raise ValueError(f"root shell has no unique STATIC_GALLERY marker: {page}")
+    page.write_text(updated, encoding="utf-8")
+    return page
+
+
+def publish_prebuilt_program_bundle(
+    *,
+    destination: str | Path,
+    slug: str,
+    title: str,
+    entrypoint: str,
+    html: str,
+    source_filename: str,
+    source: str | bytes,
+    artifacts: Mapping[str, str | bytes] | None = None,
+    runtime: Mapping[str, Any] | None = None,
+    refresh_gallery: bool = False,
+) -> ProgramBundle:
+    """Publish an already-assembled program interior through the common ABI.
+
+    This is the common seam for Dream documents, native-shell products, and
+    other programs whose HTML/runtime artifacts already exist.  It deliberately
+    shares the immutable version layout and manifest inventory used by compiled
+    Python bundles instead of introducing a second gallery format.
+    """
+    root = resolve_publish_root(destination)
+    page_slug = slugify(slug)
+    source_body = source.encode("utf-8") if isinstance(source, str) else bytes(source)
+    clean_html = "\n".join(line.rstrip() for line in html.splitlines())
+    if html.endswith(("\n", "\r")):
+        clean_html += "\n"
+    bodies: dict[str, bytes] = {
+        "index.html": clean_html.encode("utf-8"),
+        f"source/{source_filename}": source_body,
+    }
+    for relative, body in (artifacts or {}).items():
+        normalized = Path(relative).as_posix().lstrip("/")
+        if not normalized or normalized.startswith("../") or "/../" in normalized:
+            raise ValueError(f"bundle artifact escapes its version directory: {relative}")
+        if normalized in bodies or normalized == "bundle.json":
+            raise ValueError(f"duplicate or reserved bundle artifact: {relative}")
+        bodies[normalized] = body.encode("utf-8") if isinstance(body, str) else bytes(body)
+
+    identity = hashlib.sha256()
+    identity.update(BUILDER_VERSION.encode("utf-8"))
+    for relative, body in sorted(bodies.items()):
+        identity.update(relative.encode("utf-8"))
+        identity.update(b"\0")
+        identity.update(body)
+        identity.update(b"\0")
+    identity.update(json.dumps(runtime or {}, sort_keys=True, default=str).encode("utf-8"))
+    version_id = "v1-" + identity.hexdigest()[:16]
+    versions = root / "site" / "programs" / page_slug / "versions"
+    final_directory = versions / version_id
+    if final_directory.is_dir() and (final_directory / "bundle.json").is_file():
+        bundle = load_program_bundle(final_directory)
+        if refresh_gallery:
+            refresh_static_gallery(root)
+        return bundle
+
+    versions.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=".building-", dir=versions))
+    try:
+        for relative, body in bodies.items():
+            path = temporary / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(body)
+        route = f"/site/programs/{page_slug}/versions/{version_id}/index.html"
+        manifest = {
+            "schema": BUNDLE_SCHEMA,
+            "layout_version": BUNDLE_LAYOUT_VERSION,
+            "program": {
+                "slug": page_slug, "title": title, "entrypoint": entrypoint,
+            },
+            "version": {
+                "id": version_id,
+                "source_sha256": hashlib.sha256(source_body).hexdigest(),
+                "builder": BUILDER_VERSION,
+            },
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "page": {"path": "index.html", "url": route},
+            "source": {
+                "path": f"source/{source_filename}",
+                "filename": source_filename,
+            },
+            "compiler": {"backend": "prebuilt-program-interior"},
+            "runtime": dict(runtime or {}),
+            "artifacts": _artifact_inventory(temporary),
+        }
+        (temporary / "bundle.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8",
+        )
+        os.replace(temporary, final_directory)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    bundle = load_program_bundle(final_directory)
+    if refresh_gallery:
+        refresh_static_gallery(root)
+    return bundle
+
+
 def build_source_inspection_page(
     subject: str | Path | type | Any,
     destination: str | Path,

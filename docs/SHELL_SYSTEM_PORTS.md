@@ -36,11 +36,17 @@ the same lifecycle.
 
 The file broker operates inside a persistent virtual namespace rather than on
 ambient host paths. A manifest declares an absolute virtual current directory
-and explicit mounts. Mounts are `memory`, `bundle`, or `host_directory`, and
-each is read-only or read-write. Web shells accept only memory and bundle
-mounts. Native shells may accept a host-directory mount, but its source and
-virtual destination must both appear in the contract; no undeclared host path
-is visible to the program.
+and explicit mounts. Mounts are `memory`, `bundle`, `indexed_db`, `opfs`, or
+`host_directory`, and each is read-only or read-write. Web shells accept
+memory, bundle, IndexedDB, and origin-private-file-system mounts. IndexedDB and
+OPFS sources are relative namespace names, not host paths. They hydrate into
+the shell's synchronous virtual-file map before program execution; immediate
+writes update that map and `flushVirtualFilesystem()` is the asynchronous
+durability barrier. A real Chrome probe writes, evicts, and rehydrates exact
+bytes through both backends. Browsers still cannot materialize
+`host_directory`. Native shells may accept one, but its source and virtual
+destination must both appear in the contract; no undeclared host path is
+visible to the program.
 
 The shared namespace uses canonical UTF-8 POSIX paths. A Windows guest sees a
 stable projection (`/c/work` becomes `C:\work`), unrelated to the native
@@ -52,6 +58,67 @@ contents, metadata, and current directory along with registers and memory.
 Directory searches retain immutable VFS handles, match lists, and cursors, so
 `FindFirstFileW`/`FindFirstFileExW` followed by `FindNextFileW` can be resumed
 or reversed without consulting a changed host directory.
+
+Ordinary Win32 file handles are equally virtual. `CreateFileW` enforces the
+declared mount, creation disposition, access/share contract, bounded security
+attribute shape, and supported synchronous flags before returning a VFS handle.
+`ReadFile`, `WriteFile`, both file-pointer forms, truncation, size, flush,
+close, attributes, timestamps, and volume queries produce only guest-memory,
+device, or immutable VFS effects. Handle mode and cursor plus file creation,
+access, modification times and attribute masks survive JSONL and segmented
+tape checkpoints. Read-only mounts and attributes reject write admission;
+overlapped, delete-on-close, unbuffered, encrypted, or otherwise unmodelled
+shapes remain explicit fail-closed frontiers. `CloseHandle` accepts ordinary
+file handles but not enumeration handles, which retain their distinct
+`FindClose` lifecycle.
+
+## Virtual registry
+
+The Windows registry is another capability-owned immutable namespace, never a
+view of the host registry. It begins with only the predefined root keys unless
+the shell deliberately supplies additional virtual content. Keys retain typed
+binary values, case-insensitive identities, display names, last-write metadata,
+and access-bearing handles. Create/open, set/query, enumeration, value/key
+deletion, and close are explicit `VirtualRegistryEffect` values applied by the
+same external-completion journal as memory and VFS effects.
+
+Win32 buffer-size and error contracts remain observable: queries return the
+required byte count, short buffers report `ERROR_MORE_DATA`, enumeration
+reports `ERROR_NO_MORE_ITEMS`, nonempty key deletion is refused, and handles
+enforce their granted query/set/create/enumerate rights. `MAXIMUM_ALLOWED` is
+resolved against the virtual namespace rather than forwarded to Windows.
+Unsupported security descriptors and malformed shapes fail closed. Registry
+deletion of a still-open key remains an explicit deferred-deletion frontier
+rather than silently invalidating another guest handle. Registry
+state is process-shared across guest threads, private to possible-world forks,
+serialized in JSONL and segmented checkpoints, and catalogued as its own
+effect domain during tape-to-SSA lifting.
+
+## Virtual memory
+
+The Windows address-space catalog is reversible state too. Initial image,
+stack, TEB/PEB, and system-arena mappings are recorded as regions. Bounded
+`VirtualAlloc` reserve-and-commit creates new page-backed private regions;
+whole-region `VirtualFree(MEM_RELEASE)`, `VirtualQuery`, and current-process
+`ReadProcessMemory` operate only on that catalog. Dynamic executable pages are
+eligible for decoding and participate in page-version/cache invalidation, so
+rewind restores both bytes and executable-code coherence. Reserve-only,
+decommit, unsupported protections, partial release, overlapping requests, and
+remote-process reads fail closed rather than borrowing Windows behavior.
+
+## System devices
+
+`kind = device` names a byte-oriented shell boundary such as
+`console.input`, `console.output`, or a future declared sensor. Direction is
+enforced independently of its adapter. The HTML shell exposes
+`readDevice()`, `writeDevice()`, `publishDevice()`, subscriptions, and an
+explicit adapter registration point. If a machine runtime is present, input
+ports bind to its `injectDeviceBytes()` contract (with a console-input
+compatibility spelling). The binary runtime journals that injection as a tape
+edge; Win32 `ReadFile`/`ReadConsole` and output calls see constructed virtual
+handles and reversible device buffers, never browser or Windows device handles.
+This is the common seam where a shell may later install a permissioned real
+adapter without changing guest semantics.
 
 ## External references
 
@@ -117,6 +184,42 @@ errors must not redirect guest control flow. This distinction was required for
 real `cmd.exe` to continue from its failed `.COM` probe to the registered
 `.EXE` candidate.
 
+Synchronization objects are capabilities too, never host kernel handles.
+`CreateMutexExW`, `CreateSemaphoreExW`, `OpenSemaphoreW`, release operations,
+and both single-object wait forms operate on integer handle records in the
+shared reversible system state. Object names are case-insensitive and persist
+on the exact tape. A zero-time unavailable wait returns `WAIT_TIMEOUT`; a
+nonzero unavailable wait remains admitted but pending, allowing the shell's
+core scheduler to run a producer. Security descriptors, unsupported creation
+flags, and invalid count ranges fail closed instead of being silently ignored.
+
+## Virtual pipes and descriptor aliases
+
+Anonymous pipes are reversible byte devices, not host kernel objects.
+`CreatePipe` allocates typed read/write handles and a bounded `pipe.<id>`
+buffer. Empty reads remain pending while any writer is open, the final writer
+close produces deterministic EOF, writes with no readers report a broken pipe,
+and a full bounded buffer blocks until the guest consumes bytes.
+`DuplicateHandle` preserves endpoint reference counts. `ReadFile`, `WriteFile`,
+`FlushFileBuffers`, `GetFileType`, and `CloseHandle` all consult the same
+capability-owned endpoint state.
+
+MSVCRT `_pipe`, `_get_osfhandle`, `_open_osfhandle`, `_dup`, `_dup2`, and
+`_close` build descriptor aliases over those same handles; there is no second
+CRT-only transport. `STARTF_USESTDHANDLES` on a registered virtual child
+process validates inherited endpoint direction and routes the child tape's
+exact stdin/stdout/stderr through the selected pipe buffers. Pipe handles,
+descriptor bindings, endpoint counts, buffered bytes, and their generations
+survive JSONL or segmented replay. Tape-to-SSA lifting marks their changes with
+a distinct `pipe` effect domain in addition to the underlying system/device
+resources.
+
+The x64 CRT `_setjmp` capability also records its corresponding shadow-call
+stack in reversible system state. `longjmp` restores the jump buffer's
+nonvolatile GPRs, RSP/RIP, MXCSR/FPCSR, XMM6-XMM15, and that shadow stack as one
+nonlocal tape edge. This lets command-error recovery cross a pipe setup path
+without losing control-flow provenance.
+
 ## Live display context transport
 
 The native machine-program host and HTML interior display share a small
@@ -146,3 +249,5 @@ the executor or clock authority.
 - Missing required native file paths and oversized files fail before execution.
 - A virtual filesystem requires the `files` capability and a root mount.
 - HTML planning and emission reject `host_directory` mounts.
+- IndexedDB and OPFS mounts require explicit relative namespace sources.
+- Device ports require the `system_devices` capability and enforce direction.

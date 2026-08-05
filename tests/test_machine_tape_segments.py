@@ -71,3 +71,48 @@ def test_segment_store_rejects_tampered_content_before_resume(tmp_path):
         pass
     else:
         raise AssertionError("tampered tape segment was accepted")
+
+
+def test_graph_crop_is_independent_position_zero_state_with_origin_receipt(tmp_path):
+    tape = MachineSystemTape(b"binary-subject", 1, checkpoint_interval=2)
+    for position in range(6):
+        tape.append(
+            0, MachineExecutionState(
+                pc=0x1000 + position, steps=position,
+                system_state={"machine.memory.page_size": 4096},
+            ),
+            position=position, event="load" if position == 0 else "forward",
+        )
+    source = tape.write(tmp_path / "source.tape.jsonl")
+    store = SegmentedMachineTapeStore.import_jsonl(
+        source, tmp_path / "source.segmented", records_per_segment=2,
+    )
+
+    crop = store.crop(tmp_path / "crop.segmented", sequence=3)
+
+    assert crop.record_count == 1
+    assert crop.record(0)["event"] == "graph_crop_root"
+    assert crop.record(0)["position"] == 0
+    assert crop.record(0)["parent_sequence"] is None
+    assert crop.resume_state().pc == 0x1003
+    assert crop.resume_state().steps == 3
+    assert crop.origin_receipt["schema"] == "turing-machine-graph-crop-origin-v1"
+    assert crop.origin_receipt["source_sequences"] == [3]
+    assert len(crop.origin_receipt["state_digest"]) == 64
+
+    # The source can disappear and the cropped machine remains a complete root.
+    for path in sorted(store.root.rglob("*"), reverse=True):
+        if path.is_file():
+            path.unlink()
+        else:
+            path.rmdir()
+    store.root.rmdir()
+    reopened = SegmentedMachineTapeStore(crop.root)
+    assert reopened.resume_state() == crop.resume_state()
+    reopened.begin_append()
+    reopened.append(
+        0, replace(reopened.resume_state(), pc=0x2000, steps=4),
+        position=1, event="forward",
+    )
+    reopened.flush()
+    assert SegmentedMachineTapeStore(crop.root).resume_state().pc == 0x2000

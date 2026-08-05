@@ -25,6 +25,11 @@ from .shell_io import (
     VirtualFileSystemContract, VirtualMount, VirtualMountAccess, VirtualMountKind,
 )
 from .virtual_filesystem import VirtualFile, VirtualFileHandle, VirtualFileSystemState
+from .virtual_registry import (
+    VirtualRegistryHandle, VirtualRegistryKey, VirtualRegistryState,
+    VirtualRegistryValue,
+)
+from .virtual_memory import VirtualMemoryRegion, VirtualMemoryState
 from .machine_module_linker import MachineImportBinding
 
 
@@ -282,6 +287,8 @@ def _vfs_mapping(value: VirtualFileSystemState | None) -> dict[str, Any] | None:
             path: {
                 "data": _b64(entry.data), "directory": entry.directory,
                 "created_time": entry.created_time, "modified_time": entry.modified_time,
+                "accessed_time": entry.accessed_time,
+                "attributes": entry.attributes,
             }
             for path, entry in value.entries.items()
         },
@@ -311,6 +318,8 @@ def _vfs_from_mapping(value: Mapping[str, Any] | None) -> VirtualFileSystemState
         path: VirtualFile(
             path, _unb64(entry["data"]), bool(entry["directory"]),
             int(entry["created_time"]), int(entry["modified_time"]),
+            int(entry.get("accessed_time", 0)),
+            int(entry.get("attributes", 0)),
         )
         for path, entry in value["entries"].items()
     }
@@ -325,6 +334,99 @@ def _vfs_from_mapping(value: Mapping[str, Any] | None) -> VirtualFileSystemState
         contract, MappingProxyType(entries), str(value["current_directory"]),
         int(value["generation"]),
         MappingProxyType(handles), int(value.get("next_handle", 0x1000)),
+    )
+
+
+def _registry_mapping(value: VirtualRegistryState | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return {
+        "generation": value.generation,
+        "next_handle": value.next_handle,
+        "keys": {
+            path: {
+                "name": key.name,
+                "last_write_time": key.last_write_time,
+                "values": {
+                    name: {
+                        "name": item.name, "type": item.value_type,
+                        "data": _b64(item.data),
+                    }
+                    for name, item in key.values.items()
+                },
+            }
+            for path, key in value.keys.items()
+        },
+        "handles": {
+            str(handle): {"path": item.path, "access": item.access}
+            for handle, item in value.handles.items()
+        },
+    }
+
+
+def _registry_from_mapping(value: Mapping[str, Any] | None) -> VirtualRegistryState | None:
+    if value is None:
+        return None
+    keys = {
+        str(path): VirtualRegistryKey(
+            str(path), str(item["name"]), MappingProxyType({
+                str(name): VirtualRegistryValue(
+                    str(raw["name"]), int(raw["type"]), _unb64(raw["data"]),
+                )
+                for name, raw in item.get("values", {}).items()
+            }), int(item.get("last_write_time", 0)),
+        )
+        for path, item in value.get("keys", {}).items()
+    }
+    handles = {
+        int(handle): VirtualRegistryHandle(
+            int(handle), str(item["path"]), int(item["access"]),
+        )
+        for handle, item in value.get("handles", {}).items()
+    }
+    return VirtualRegistryState(
+        MappingProxyType(keys), MappingProxyType(handles),
+        int(value.get("next_handle", 0x4000)), int(value.get("generation", 0)),
+    )
+
+
+def _virtual_memory_mapping(value: VirtualMemoryState | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return {
+        "allocation_cursor": value.allocation_cursor,
+        "generation": value.generation,
+        "page_size": value.page_size,
+        "regions": {
+            str(base): {
+                "size": item.size,
+                "allocation_base": item.allocation_base,
+                "allocation_protect": item.allocation_protect,
+                "state": item.state,
+                "protect": item.protect,
+                "kind": item.kind,
+                "managed": item.managed,
+            }
+            for base, item in value.regions.items()
+        },
+    }
+
+
+def _virtual_memory_from_mapping(value: Mapping[str, Any] | None) -> VirtualMemoryState | None:
+    if value is None:
+        return None
+    regions = {
+        int(base): VirtualMemoryRegion(
+            int(base), int(item["size"]), int(item["allocation_base"]),
+            int(item["allocation_protect"]), int(item["state"]),
+            int(item["protect"]), int(item["kind"]),
+            bool(item.get("managed", False)),
+        )
+        for base, item in value.get("regions", {}).items()
+    }
+    return VirtualMemoryState(
+        MappingProxyType(regions), int(value.get("allocation_cursor", 0x10000000000)),
+        int(value.get("generation", 0)), int(value.get("page_size", 4096)),
     )
 
 
@@ -351,6 +453,12 @@ def encode_machine_state(
     vfs = _vfs_mapping(state.virtual_filesystem)
     if previous is not None and state.virtual_filesystem == previous.virtual_filesystem:
         vfs = "unchanged"
+    registry = _registry_mapping(state.virtual_registry)
+    if previous is not None and state.virtual_registry == previous.virtual_registry:
+        registry = "unchanged"
+    virtual_memory = _virtual_memory_mapping(state.virtual_memory)
+    if previous is not None and state.virtual_memory == previous.virtual_memory:
+        virtual_memory = "unchanged"
     return {
         "pc": state.pc, "registers": list(state.registers),
         "vector_registers": [str(value) for value in state.vector_registers],
@@ -367,6 +475,8 @@ def encode_machine_state(
         "device_generations": dict(state.device_generations),
         "memory": {"page_size": memory.page_size, "pages": pages, "removed": removed_pages},
         "virtual_filesystem": vfs,
+        "virtual_registry": registry,
+        "virtual_memory": virtual_memory,
     }
 
 
@@ -387,6 +497,18 @@ def decode_machine_state(
         pages[int(index)] = _unb64(data)
     raw_vfs = value.get("virtual_filesystem")
     vfs = previous.virtual_filesystem if raw_vfs == "unchanged" and previous else _vfs_from_mapping(raw_vfs)
+    raw_registry = value.get("virtual_registry")
+    registry = (
+        previous.virtual_registry
+        if raw_registry == "unchanged" and previous
+        else _registry_from_mapping(raw_registry)
+    )
+    raw_virtual_memory = value.get("virtual_memory")
+    virtual_memory = (
+        previous.virtual_memory
+        if raw_virtual_memory == "unchanged" and previous
+        else _virtual_memory_from_mapping(raw_virtual_memory)
+    )
     return MachineExecutionState(
         pc=int(value["pc"]), registers=tuple(int(item) for item in value["registers"]),
         vector_registers=tuple(int(item) for item in value["vector_registers"]),
@@ -396,6 +518,8 @@ def decode_machine_state(
             str(key): int(item) for key, item in value["system_state"].items()
         }),
         virtual_filesystem=vfs,
+        virtual_registry=registry,
+        virtual_memory=virtual_memory,
         environment_state=MappingProxyType({
             str(key): str(item) for key, item in value.get("environment_state", {}).items()
         }),

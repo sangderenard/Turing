@@ -16,6 +16,7 @@ from src.compiler.site_bundle import (
     build_source_inspection_bundle,
     build_source_inspection_page,
     discover_source_contract,
+    publish_prebuilt_program_bundle,
     resolve_publish_root,
     slugify,
 )
@@ -24,6 +25,42 @@ from src.compiler.ssa_fortran_backend import fortran_compiler
 
 def test_default_publish_root_is_the_parent_workspace():
     assert DEFAULT_PUBLISH_ROOT == TURING_REPOSITORY_ROOT.parent
+
+
+def test_prebuilt_program_uses_common_versioned_bundle_and_refreshes_gallery(tmp_path):
+    (tmp_path / "index.html").write_text(
+        '<script>const STATIC_GALLERY = [];</script>', encoding="utf-8",
+    )
+    bundle = publish_prebuilt_program_bundle(
+        destination=tmp_path,
+        slug="Dream Machine",
+        title="Dream Machine",
+        entrypoint="run",
+        html="<!doctype html><title>machine</title>",
+        source_filename="dream/machine.dream",
+        source="/* dream */",
+        artifacts={"subject/demo.pe": b"MZ\0\0"},
+        runtime={"snapshot_abi": "TMSNAP01"},
+        refresh_gallery=True,
+    )
+
+    assert bundle.directory.parent.name == "versions"
+    assert bundle.manifest["schema"] == BUNDLE_SCHEMA
+    assert bundle.manifest["runtime"]["snapshot_abi"] == "TMSNAP01"
+    assert (bundle.directory / "subject" / "demo.pe").read_bytes() == b"MZ\0\0"
+    assert all(item["sha256"] for item in bundle.manifest["artifacts"])
+    assert '"slug": "dream-machine"' in (tmp_path / "index.html").read_text()
+    assert publish_prebuilt_program_bundle(
+        destination=tmp_path,
+        slug="Dream Machine",
+        title="Dream Machine",
+        entrypoint="run",
+        html="<!doctype html><title>machine</title>",
+        source_filename="dream/machine.dream",
+        source="/* dream */",
+        artifacts={"subject/demo.pe": b"MZ\0\0"},
+        runtime={"snapshot_abi": "TMSNAP01"},
+    ).directory == bundle.directory
 
 
 def test_only_published_browser_shader_graduates_a_bundle_page():

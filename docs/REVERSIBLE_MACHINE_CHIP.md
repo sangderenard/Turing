@@ -261,6 +261,26 @@ declared order. The return code is preserved across cleanup calls, and the
 thread handle becomes signalled only after the final callback returns. Security
 attributes and suspended creation remain fail-closed or unsupported.
 
+Mutex and semaphore handles use the same shared reversible system-state plane.
+Named objects are case-insensitive mappings into that plane, so all guest
+threads see one owner/count while alternate possible-world heads retain their
+own suffix state. Recursive mutex acquisition and release, semaphore wait and
+bounded release, previous-count memory writes, `WaitForSingleObject`, and
+`WaitForSingleObjectEx` are journalled as ordinary exact completion effects.
+An unavailable zero-time wait returns `WAIT_TIMEOUT`; a nonzero wait yields to
+the virtual scheduler so another core can append the releasing edge. Dormant
+branches retain only their content-addressed segment IDs and live tip metadata,
+not an in-memory synchronization history.
+
+Process-wide virtual filesystem and registry states cross that same journalled
+core synchronization edge. Registry keys, typed binary values, handle access,
+enumeration order, and last-write generations are immutable machine state—not
+host observations. A completion on one guest thread becomes visible to its
+siblings; reversing the synchronization edge restores each prior view. Forked
+possible-world heads remain isolated and retain only their own segmented
+suffix. Trace SSA records registry changes under a distinct `registry` effect
+domain while exact tape state remains the replay authority.
+
 The active executor now applies the same distinction to its immediate reverse
 journal. Each core retains a configurable hot window (4,096 states by default).
 Advancing at its tip evicts the oldest resident state only after the exact tape
@@ -368,6 +388,24 @@ register or witnessed memory source; MOVSXD performs the 32→64 signed mapping
 inside Wasm. Dispatcher diagnostics include bounded semantic, decoded-token,
 and lowering-reason counts.
 
+CDQE and CQO now perform the implicit accumulator sign extensions in Wasm.
+BT/BTR/BTS/BTC accept register destinations and exact-entry witnessed memory;
+only CF changes. A register index on a memory bit string is interpreted as a
+signed quotient plus modulo bit index, so an index such as -1 selects bit 63 in
+the preceding 64-bit word. The index register and resulting address are both
+part of specialization provenance. Modifying forms journal the selected word
+as one exact read-modify-write edge. Memory-width inference is token-boundary
+aware, preventing the `IMM8` suffix in `BTR_RM32_IMM8` from turning a dword
+operation into an 8-bit operation.
+
+Exact-entry `REP STOSW` is represented as one bounded range-fill operation.
+The Wasm loop writes at most 32,768 words (64 KiB), then records a compact fill
+descriptor containing the original RDI, RCX count, AX word, direction, and
+the exact final RCX/RDI checkpoint. Reconstruction validates that descriptor
+against the parent state and rebuilds the changed immutable pages. The old
+pages already live in the parent tape node, so reversal needs neither 8,192
+micro-edges nor a second 16 KiB byte copy for the real command route.
+
 Immediate SHL, NEG/NOT, SETcc, and INC/DEC now share that scalar register or
 witnessed-memory path. Shift and unary flag results differentially match the
 reference interpreter; INC/DEC preserve incoming CF. XCHG swaps two registers
@@ -445,12 +483,13 @@ clock, virtual cores, device buffers, and observation slots. Subject code does
 not enter the emulator application's card or SSA representation.
 
 The real `cmd.exe /c "echo hello"` probe now completes. A cold graph-based
-resume reconstructs 16,537 state nodes, a halted AMD64 process at instruction
-step 16,010, and exit code 0. Its authoritative reversible device state is
+resume reconstructs the segmented dependency chain, a halted AMD64 process at
+instruction step 16,010, and exit code 0. Its authoritative reversible device state is
 exactly `hello\r\n`, generation 1. Publishing that cold-resumed state produces
 a `TERMINAL` / `UTF8` shader snapshot descriptor with the same generation and
 the same bytes. The path includes CRT startup and exit callbacks, virtual
-heap/environment/VFS state, locale and wide formatting, console synchronization,
+heap/environment/VFS/registry/virtual-memory state, locale and wide formatting,
+console synchronization,
 runtime-proven code dispatch, dynamic `GetProcAddress` links, and normal process
 termination. Unknown semantics and capabilities still stop at annotated
 boundaries; no arbitrary host-call fallback was added.
@@ -541,3 +580,62 @@ and 589 deterministic external completions. Wasm journal validation re-decodes
 runtime-discovered continuation instructions from current guest bytes, so the
 cleanup path retains the same instruction witnesses and reverse edges as
 statically catalogued code.
+
+The supported probe can create that proof directly rather than materializing a
+large JSONL history first:
+
+```powershell
+python examples/reversible_cmd_probe.py --new --segmented `
+  --machine-backend node-wasm `
+  --tape build/cmd-echo.segmented-tape /c "echo hello"
+```
+
+The current proof produced 16,510 records in 66 immutable segments (8,570,148
+bytes), with 15,459 of 16,010 guest instructions committed from authenticated
+Wasm journals and 499 deterministic capability completions. It halted with
+exit code zero and retained `hello\r\n`. Every
+remaining denial is an intentional indirect-control or lifecycle-return
+boundary; the ordinary semantic denial inventory is empty.
+Cold invocation of the same command without `--new` restored the halted tip at
+absolute position 16,509 and printed `subject_output_tail=b'hello\r\n'` without
+adding another state. Direct reverse decoded only the 125 records in the final
+segment, and replay reproduced the halted tip byte-for-byte. JSONL and segmented
+loaders now install the persisted absolute position as the executor's cold
+history base; resumed reversal therefore enters the taped prefix instead of
+mistaking the loaded tip for position zero.
+
+A separate real command-pipeline probe exercised the reversible anonymous-pipe
+and CRT-descriptor tier. `cmd.exe` created and closed `pipe.1`, crossed its
+MSVCRT `longjmp` error-recovery path, and halted normally at guest step 23,232
+with 539 deterministic completions and exit code 255 for an intentionally
+unresolved pipeline command. The segmented tape contains 23,773 records. Cold
+reopen restored its terminal and exit exactly; one backward step returned to
+the non-halted predecessor and one forward step reproduced the complete tip.
+The registered-card resolver still needs a pipeline-specific resolution proof,
+but pipe transport, endpoint lifecycle, nonlocal control, and exact replay no
+longer stop at an unsupported capability.
+
+## Common root-site bundle
+
+The Dream machine is published through the same immutable program-bundle
+contract as compiled Python interiors, rather than a demo-only directory:
+
+```powershell
+python examples/reversible_machine_web_host.py `
+  --publish-bundle C:\dev\Powershell --publish-only
+```
+
+`publish_prebuilt_program_bundle` owns content addressing, atomic version
+creation, artifact SHA-256 inventory, the `turing-program-bundle-v1` manifest,
+and refresh of the root shell's static gallery. The current public version
+contains the Dream source, the PE-generator source, and a project-authored
+2,048-byte PE32+ AMD64 subject whose entry bytes are `90 c3` (`NOP; RET`). No
+Windows system executable is copied into the repository.
+
+The static page embeds two full `TMSNAP01` generations produced by the real
+executor. Its standard forward, backward, pause, single-step, and speed controls
+therefore operate as a finite reversible replay on GitHub Pages. With the
+Python owner running, the same shell uses `/snapshot`, `/control`, `/subject`,
+and `/input` for unrestricted tape execution and admitted system activity.
+Static arbitrary-binary loading remains intentionally unavailable until the
+machine owner is lowered into a browser runtime.

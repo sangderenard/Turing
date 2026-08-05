@@ -566,6 +566,9 @@ const systemPorts = {
   fileHandlers: new Map(),
   listeners: new Map(),
   virtualFiles: new Map(),
+  deviceBuffers: new Map(),
+  deviceHandlers: new Map(),
+  pendingPersistence: Promise.resolve(),
   virtualFilesystem: VIRTUAL_FILESYSTEM,
   normalizeVirtualPath(path) {
     const raw = String(path || ".").replaceAll(String.fromCharCode(92), "/");
@@ -600,7 +603,162 @@ const systemPorts = {
     if (mount.access !== "read_write") throw new Error("virtual mount is read-only: " + mount.path);
     const value = bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(bytes);
     this.virtualFiles.set(normalized, value);
+    if (mount.kind === "indexed_db" || mount.kind === "opfs") {
+      this.pendingPersistence = this.pendingPersistence.then(() =>
+        this.persistVirtualFile(mount, normalized, value)
+      );
+    }
     return value;
+  },
+  relativeMountPath(mount, normalized) {
+    const prefix = mount.path === "/" ? "/" : mount.path + "/";
+    return normalized === mount.path ? "" : normalized.slice(prefix.length);
+  },
+  openIndexedDB(mount) {
+    if (!globalThis.indexedDB) throw new Error("IndexedDB is unavailable for " + mount.path);
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open("turing-vfs:" + mount.source, 1);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains("files")) {
+          request.result.createObjectStore("files");
+        }
+      };
+      request.onerror = () => reject(request.error || new Error("IndexedDB open failed"));
+      request.onsuccess = () => resolve(request.result);
+    });
+  },
+  indexedDBRequest(request) {
+    return new Promise((resolve, reject) => {
+      request.onerror = () => reject(request.error || new Error("IndexedDB request failed"));
+      request.onsuccess = () => resolve(request.result);
+    });
+  },
+  async opfsRoot(mount, create) {
+    if (!navigator.storage || typeof navigator.storage.getDirectory !== "function") {
+      throw new Error("OPFS is unavailable for " + mount.path);
+    }
+    let directory = await navigator.storage.getDirectory();
+    for (const part of String(mount.source).split("/")) {
+      directory = await directory.getDirectoryHandle(part, {create});
+    }
+    return directory;
+  },
+  async hydrateIndexedDB(mount) {
+    const database = await this.openIndexedDB(mount);
+    try {
+      const store = database.transaction("files", "readonly").objectStore("files");
+      const keysRequest = store.getAllKeys();
+      const valuesRequest = store.getAll();
+      const [keys, values] = await Promise.all([
+        this.indexedDBRequest(keysRequest), this.indexedDBRequest(valuesRequest),
+      ]);
+      keys.forEach((key, index) => {
+        const path = mount.path.replace(/\/$/, "") + "/" + String(key);
+        this.virtualFiles.set(this.normalizeVirtualPath(path), new Uint8Array(values[index]));
+      });
+    } finally { database.close(); }
+  },
+  async hydrateOPFS(mount) {
+    const root = await this.opfsRoot(mount, mount.access === "read_write");
+    const visit = async (directory, prefix) => {
+      for await (const [name, handle] of directory.entries()) {
+        const relative = prefix ? prefix + "/" + name : name;
+        if (handle.kind === "directory") await visit(handle, relative);
+        else {
+          const file = await handle.getFile();
+          const path = mount.path.replace(/\/$/, "") + "/" + relative;
+          this.virtualFiles.set(
+            this.normalizeVirtualPath(path), new Uint8Array(await file.arrayBuffer())
+          );
+        }
+      }
+    };
+    await visit(root, "");
+  },
+  async initializeVirtualFilesystem() {
+    for (const mount of (this.virtualFilesystem || {}).mounts || []) {
+      if (mount.kind === "indexed_db") await this.hydrateIndexedDB(mount);
+      else if (mount.kind === "opfs") await this.hydrateOPFS(mount);
+    }
+    return this;
+  },
+  async persistVirtualFile(mount, normalized, value) {
+    const relative = this.relativeMountPath(mount, normalized);
+    if (!relative) throw new Error("a mount root cannot be written as a file");
+    if (mount.kind === "indexed_db") {
+      const database = await this.openIndexedDB(mount);
+      try {
+        const transaction = database.transaction("files", "readwrite");
+        transaction.objectStore("files").put(value.slice().buffer, relative);
+        await new Promise((resolve, reject) => {
+          transaction.oncomplete = resolve;
+          transaction.onerror = () => reject(transaction.error || new Error("IndexedDB write failed"));
+          transaction.onabort = () => reject(transaction.error || new Error("IndexedDB write aborted"));
+        });
+      } finally { database.close(); }
+      return;
+    }
+    if (mount.kind === "opfs") {
+      let directory = await this.opfsRoot(mount, true);
+      const parts = relative.split("/");
+      const filename = parts.pop();
+      for (const part of parts) {
+        directory = await directory.getDirectoryHandle(part, {create: true});
+      }
+      const handle = await directory.getFileHandle(filename, {create: true});
+      const writable = await handle.createWritable();
+      await writable.write(value);
+      await writable.close();
+    }
+  },
+  async readVirtualFileAsync(path) {
+    await this.ready;
+    return this.readVirtualFile(path);
+  },
+  async writeVirtualFileAsync(path, bytes) {
+    await this.ready;
+    const value = this.writeVirtualFile(path, bytes);
+    await this.flushVirtualFilesystem();
+    return value;
+  },
+  async flushVirtualFilesystem() { await this.pendingPersistence; },
+  deviceDescriptor(name) {
+    const descriptor = this.descriptor(name);
+    if (descriptor.kind !== "device") throw new Error(name + " is not a device port");
+    return descriptor;
+  },
+  registerDeviceHandler(name, handler) {
+    this.deviceDescriptor(name);
+    this.deviceHandlers.set(name, handler);
+  },
+  readDevice(name) {
+    this.deviceDescriptor(name);
+    const value = this.deviceBuffers.get(name) || new Uint8Array();
+    return value.slice();
+  },
+  async writeDevice(name, bytes, {append = true} = {}) {
+    const descriptor = this.deviceDescriptor(name);
+    if (descriptor.direction === "output") throw new Error(name + " is output-only");
+    const value = bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(bytes);
+    const previous = append ? (this.deviceBuffers.get(name) || new Uint8Array()) : new Uint8Array();
+    const combined = new Uint8Array(previous.length + value.length);
+    combined.set(previous); combined.set(value, previous.length);
+    this.deviceBuffers.set(name, combined);
+    const handler = this.deviceHandlers.get(name);
+    if (handler) await handler(value, {append});
+    for (const listener of this.listeners.get(name) || []) listener(combined.slice());
+    return combined.slice();
+  },
+  publishDevice(name, bytes, {append = true} = {}) {
+    const descriptor = this.deviceDescriptor(name);
+    if (descriptor.direction === "input") throw new Error(name + " is input-only");
+    const value = bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(bytes);
+    const previous = append ? (this.deviceBuffers.get(name) || new Uint8Array()) : new Uint8Array();
+    const combined = new Uint8Array(previous.length + value.length);
+    combined.set(previous); combined.set(value, previous.length);
+    this.deviceBuffers.set(name, combined);
+    for (const listener of this.listeners.get(name) || []) listener(combined.slice());
+    return combined.slice();
   },
   descriptor(name) {
     const descriptor = this.descriptors.get(name);
@@ -650,6 +808,7 @@ const systemPorts = {
     return resolved || null;
   },
 };
+systemPorts.ready = systemPorts.initializeVirtualFilesystem();
 for (const port of SYSTEM_PORTS) {
   if (port.kind === "external_reference" && port.external_domain !== "bundle") {
     throw new Error("HTML shells accept external references only to Turing bundles");
@@ -2022,6 +2181,7 @@ async function runClassGraphMode() {
 }
 
 async function run() {
+  await systemPorts.ready;
   if (CLASS_GRAPH) { await runClassGraphMode(); return; }
   if (running) {            // the button is a toggle while a run is live
     running = false;
@@ -3092,10 +3252,28 @@ function wireSystemPorts() {
       systemPorts.registerFileHandler(filePorts[0].name, value => runtime.loadBinary(value.bytes));
     }
   }
+  if (runtime) for (const port of SYSTEM_PORTS.filter(port => port.kind === "device")) {
+    const device = String((port.attributes || {}).device || port.name);
+    if (port.direction !== "output") {
+      systemPorts.registerDeviceHandler(port.name, (bytes, options) => {
+        if (typeof runtime.injectDeviceBytes === "function") {
+          return runtime.injectDeviceBytes(device, bytes, options);
+        }
+        if (device === "console.input" && typeof runtime.injectConsoleInput === "function") {
+          return runtime.injectConsoleInput(bytes);
+        }
+        throw new Error("machine runtime cannot accept device " + device);
+      });
+    }
+  }
 }
 
 wireFilePicker();
 wireSystemPorts();
+systemPorts.ready.catch(error => {
+  setStatus("virtual filesystem initialization failed: " + String(error), "bad");
+  log("error", "virtual filesystem initialization failed", {error: String(error)});
+});
 wireTabs();
 wireCallableTabs();
 wirePythonCallables();
@@ -3398,6 +3576,8 @@ const machineSnapshots = {
     const transport = {
       endpoint: String(endpoint),
       inputEndpoint: String(options.inputEndpoint || "/input"),
+      controlEndpoint: String(options.controlEndpoint || "/control"),
+      subjectEndpoint: String(options.subjectEndpoint || "/subject"),
       interval: Math.max(4, Number(options.interval || 16)),
       controller,
       running: true,
@@ -3449,6 +3629,24 @@ const machineSnapshots = {
       headers: {"Content-Type": "application/octet-stream"},
     });
     if (!response.ok) throw new Error("terminal input returned HTTP " + response.status);
+  },
+  async sendControl(action, value = null) {
+    if (!this.transport) throw new Error("machine snapshot transport is not connected");
+    const response = await fetch(this.transport.controlEndpoint, {
+      method: "POST", cache: "no-store",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({action: String(action), value}),
+    });
+    if (!response.ok) throw new Error("machine control returned HTTP " + response.status);
+  },
+  async loadSubject(value) {
+    if (!this.transport) throw new Error("machine snapshot transport is not connected");
+    const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+    const response = await fetch(this.transport.subjectEndpoint, {
+      method: "POST", body: bytes, cache: "no-store",
+      headers: {"Content-Type": "application/octet-stream"},
+    });
+    if (!response.ok) throw new Error("machine subject load returned HTTP " + response.status);
   },
 };
 window.TuringMachineSnapshots = machineSnapshots;

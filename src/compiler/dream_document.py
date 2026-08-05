@@ -640,11 +640,95 @@ document.addEventListener("DOMContentLoaded", () => {{
     )
 
 
+def embed_machine_snapshot_replay(artifact, snapshots: tuple[bytes, ...] | list[bytes]):
+    """Embed a finite reversible tape for interaction on a static website.
+
+    The native owner remains the path for arbitrary binaries and external
+    calls.  This replay makes a published bundle genuinely controllable without
+    inventing server endpoints on GitHub Pages: forward/backward controls move
+    over snapshots produced by the real executor from the shipped subject.
+    """
+    from .wasm_html_shell import HtmlShell
+
+    payloads = tuple(bytes(snapshot) for snapshot in snapshots)
+    if not payloads or any(payload[:8] != b"TMSNAP01" for payload in payloads):
+        raise ValueError("embedded machine replay requires TMSNAP01 snapshots")
+    encoded = [base64.b64encode(payload).decode("ascii") for payload in payloads]
+    import json
+
+    bootstrap = f"""
+<script id="turing-embedded-machine-replay">
+document.addEventListener("DOMContentLoaded", () => {{
+  const api = window.TuringMachineSnapshots;
+  if (!api?.publish) throw new Error("machine snapshot liaison is unavailable");
+  api.disconnect();
+  const frames = {json.dumps(encoded)}.map(encoded => {{
+    const raw = atob(encoded);
+    return Uint8Array.from(raw, character => character.charCodeAt(0));
+  }});
+  let index = 0;
+  let direction = 0;
+  let timer = 0;
+  let generation = BigInt(api.generation || 0);
+  let interval = 120;
+  const publish = () => {{
+    const frame = frames[index].slice();
+    const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+    view.setBigUint64(16, ++generation, true);
+    view.setInt32(24, direction, true);
+    api.publish(frame);
+  }};
+  const stop = () => {{ if (timer) clearInterval(timer); timer = 0; }};
+  const step = delta => {{
+    index = Math.max(0, Math.min(frames.length - 1, index + delta));
+    if ((delta > 0 && index === frames.length - 1) || (delta < 0 && index === 0)) {{
+      direction = 0; stop();
+    }}
+    publish();
+  }};
+  const run = value => {{
+    direction = value; stop(); publish();
+    timer = setInterval(() => step(direction), interval);
+  }};
+  api.sendControl = async (action, value = null) => {{
+    if (action === "pause") {{ direction = 0; stop(); publish(); }}
+    else if (action === "step_forward") {{ direction = 0; stop(); step(1); }}
+    else if (action === "step_backward") {{ direction = 0; stop(); step(-1); }}
+    else if (action === "forward") run(1);
+    else if (action === "backward") run(-1);
+    else if (action === "speed") {{
+      interval = Math.max(16, Math.min(1000, 1000000 / Math.max(1, Number(value))));
+      if (direction) run(direction);
+    }} else throw new Error("unknown embedded replay control: " + action);
+  }};
+  api.sendTerminalInput = async value => document.dispatchEvent(new CustomEvent(
+    "turing-embedded-terminal-input", {{detail: String(value)}}
+  ));
+  api.loadSubject = async () => {{
+    throw new Error("arbitrary subject loading requires the native Python owner");
+  }};
+  api.localReplay = {{frames: frames.length, get index() {{ return index; }}}};
+  document.documentElement.dataset.machineTransport = "embedded-replay";
+  publish();
+}});
+</script>
+"""
+    if "</body>" not in artifact.html:
+        raise ValueError("generated HTML shell has no body terminator")
+    return HtmlShell(
+        artifact.name,
+        artifact.html.replace("</body>", bootstrap + "</body>", 1),
+        artifact.embedded,
+    )
+
+
 def embed_machine_snapshot_stream(
     artifact,
     *,
     snapshot_endpoint: str = "/snapshot",
     input_endpoint: str = "/input",
+    control_endpoint: str = "/control",
+    subject_endpoint: str = "/subject",
     interval_milliseconds: int = 16,
 ):
     """Connect a generated interior display to its same-origin native host."""
@@ -658,6 +742,8 @@ def embed_machine_snapshot_stream(
         raise ValueError("machine snapshot polling interval must be at least 4 ms")
     snapshot_json = json.dumps(str(snapshot_endpoint))
     input_json = json.dumps(str(input_endpoint))
+    control_json = json.dumps(str(control_endpoint))
+    subject_json = json.dumps(str(subject_endpoint))
     bootstrap = f"""
 <script id="turing-live-machine-snapshot">
 document.addEventListener("DOMContentLoaded", () => {{
@@ -665,8 +751,17 @@ document.addEventListener("DOMContentLoaded", () => {{
     throw new Error("the interior display did not install TuringMachineSnapshots");
   }}
   window.TuringMachineSnapshots.connect({snapshot_json}, {{
-    inputEndpoint: {input_json}, interval: {interval}
+    inputEndpoint: {input_json}, controlEndpoint: {control_json},
+    subjectEndpoint: {subject_json}, interval: {interval}
   }});
+  if (new URLSearchParams(location.search).get("snapshot-once") === "1") {{
+    let unsubscribe = () => {{}};
+    unsubscribe = window.TuringMachineSnapshots.subscribe(() => {{
+      unsubscribe();
+      window.TuringMachineSnapshots.disconnect();
+      document.documentElement.dataset.snapshotOnceReady = "true";
+    }});
+  }}
 }});
 </script>
 """

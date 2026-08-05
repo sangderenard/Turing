@@ -55,6 +55,8 @@ class VirtualFile:
     directory: bool = False
     created_time: int = 0
     modified_time: int = 0
+    accessed_time: int = 0
+    attributes: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", normalize_virtual_path(self.path))
@@ -73,9 +75,18 @@ class VirtualFileEffect:
     directory: bool = False
     handle: int = 0
     entries: tuple[str, ...] = ()
+    mode: str = ""
+    created_time: int | None = None
+    accessed_time: int | None = None
+    modified_time: int | None = None
+    attributes: int | None = None
 
     def __post_init__(self) -> None:
-        if self.operation not in {"create", "write", "mkdir", "remove", "rename", "chdir", "open", "advance", "close"}:
+        if self.operation not in {
+            "create", "write", "mkdir", "remove", "rename", "chdir",
+            "open", "advance", "seek", "truncate", "set_times",
+            "set_attributes", "close",
+        }:
             raise ValueError(f"unsupported virtual filesystem effect {self.operation!r}")
         object.__setattr__(self, "data", bytes(self.data))
         if self.offset < 0:
@@ -165,7 +176,10 @@ class VirtualFileSystemState:
     def apply(self, effect: VirtualFileEffect) -> "VirtualFileSystemState":
         path = normalize_virtual_path(effect.path, self.current_directory)
         mount = self._mount_for(path)
-        if effect.operation in {"create", "write", "mkdir", "remove", "rename"} and mount.access is VirtualMountAccess.READ_ONLY:
+        if effect.operation in {
+            "create", "write", "mkdir", "remove", "rename", "truncate",
+            "set_times", "set_attributes",
+        } and mount.access is VirtualMountAccess.READ_ONLY:
             raise PermissionError(f"virtual mount is read-only: {mount.path}")
         entries = dict(self.entries)
         handles = dict(self.handles)
@@ -210,7 +224,8 @@ class VirtualFileSystemState:
             if effect.handle <= 0 or effect.handle in handles:
                 raise ValueError("virtual open effect requires a fresh positive handle")
             handles[effect.handle] = VirtualFileHandle(
-                effect.handle, path, "enumeration" if effect.entries else "file",
+                effect.handle, path,
+                effect.mode or ("enumeration" if effect.entries else "file"),
                 effect.offset, tuple(effect.entries),
             )
         elif effect.operation == "advance":
@@ -218,6 +233,47 @@ class VirtualFileSystemState:
             if handle is None:
                 raise KeyError(f"unknown virtual handle {effect.handle}")
             handles[effect.handle] = replace(handle, position=handle.position + 1)
+        elif effect.operation == "seek":
+            handle = handles.get(effect.handle)
+            if handle is None:
+                raise KeyError(f"unknown virtual handle {effect.handle}")
+            handles[effect.handle] = replace(handle, position=effect.offset)
+        elif effect.operation == "truncate":
+            existing = entries.get(path)
+            if existing is None or existing.directory:
+                raise FileNotFoundError(path)
+            payload = existing.data[:effect.offset]
+            if effect.offset > len(payload):
+                payload += bytes(effect.offset - len(payload))
+            entries[path] = replace(
+                existing, data=payload, modified_time=self.generation + 1,
+            )
+        elif effect.operation == "set_times":
+            existing = entries.get(path)
+            if existing is None:
+                raise FileNotFoundError(path)
+            entries[path] = replace(
+                existing,
+                created_time=(
+                    existing.created_time if effect.created_time is None
+                    else effect.created_time
+                ),
+                accessed_time=(
+                    existing.accessed_time if effect.accessed_time is None
+                    else effect.accessed_time
+                ),
+                modified_time=(
+                    existing.modified_time if effect.modified_time is None
+                    else effect.modified_time
+                ),
+            )
+        elif effect.operation == "set_attributes":
+            existing = entries.get(path)
+            if existing is None:
+                raise FileNotFoundError(path)
+            if effect.attributes is None:
+                raise ValueError("set_attributes requires an attribute mask")
+            entries[path] = replace(existing, attributes=effect.attributes)
         elif effect.operation == "close":
             if effect.handle not in handles:
                 raise KeyError(f"unknown virtual handle {effect.handle}")

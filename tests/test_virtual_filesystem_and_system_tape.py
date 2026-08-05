@@ -7,9 +7,14 @@ from src.compiler.machine_execution import (
     MachineExecutionState, MachineExternalCallRequest, MachineExternalReference,
 )
 from src.compiler.machine_system_tape import MachineSystemTape
+from src.compiler.machine_tape_segments import SegmentedMachineTapeStore
 from src.compiler.shell_io import VirtualFileSystemContract, VirtualMount
 from src.compiler.virtual_filesystem import (
     VirtualFileEffect, VirtualFileSystemState, normalize_virtual_path,
+)
+from src.compiler.virtual_registry import VirtualRegistryEffect, VirtualRegistryState
+from src.compiler.virtual_memory import (
+    PAGE_EXECUTE_READWRITE, VirtualMemoryEffect, VirtualMemoryState,
 )
 
 
@@ -117,6 +122,106 @@ def test_system_tape_round_trips_checkpoints_memory_vfs_and_rewind(tmp_path):
     assert loaded.annotations[0].message == "this might be wrong"
     assert loaded.annotations[0].color == "#ff8800"
     assert loaded.annotations[0].metadata == (("reviewer", "human"),)
+
+
+def test_open_file_cursor_metadata_and_attributes_survive_tape_round_trip(tmp_path):
+    filesystem = _filesystem()
+    filesystem = filesystem.apply(VirtualFileEffect(
+        "open", "/work/input.txt", handle=filesystem.next_handle,
+        mode="file:c0000000:3",
+    ))
+    filesystem = filesystem.apply(VirtualFileEffect(
+        "seek", "/work/input.txt", handle=0x1000, offset=4,
+    ))
+    filesystem = filesystem.apply(VirtualFileEffect(
+        "set_times", "/work/input.txt", created_time=11,
+        accessed_time=22, modified_time=33,
+    ))
+    filesystem = filesystem.apply(VirtualFileEffect(
+        "set_attributes", "/work/input.txt", attributes=0x22,
+    ))
+    state = MachineExecutionState(pc=0x1000, virtual_filesystem=filesystem)
+    tape = MachineSystemTape(b"MZ", 1)
+    tape.append(0, state, position=0, event="file-state")
+    loaded = MachineSystemTape.read(tape.write(tmp_path / "file-state.jsonl"))
+    restored = loaded.resume_state().virtual_filesystem
+    assert restored.handles[0x1000].mode == "file:c0000000:3"
+    assert restored.handles[0x1000].position == 4
+    assert restored.stat("/work/input.txt").created_time == 11
+    assert restored.stat("/work/input.txt").accessed_time == 22
+    assert restored.stat("/work/input.txt").modified_time == 33
+    assert restored.stat("/work/input.txt").attributes == 0x22
+
+
+def test_virtual_registry_handles_values_and_metadata_round_trip_on_tape(tmp_path):
+    registry = VirtualRegistryState.create()
+    registry = registry.apply(VirtualRegistryEffect(
+        "create_key", "hkey_current_user\\Software\\Turing",
+    ))
+    registry = registry.apply(VirtualRegistryEffect(
+        "open", "hkey_current_user\\software\\turing",
+        handle=registry.next_handle, access=0xF003F,
+    ))
+    registry = registry.apply(VirtualRegistryEffect(
+        "set_value", "hkey_current_user\\software\\turing",
+        value_name="Mode", value_type=1, data="exact\0".encode("utf-16le"),
+    ))
+    state = MachineExecutionState(pc=0x1000, virtual_registry=registry)
+    tape = MachineSystemTape(b"MZ", 1)
+    tape.append(0, state, position=0, event="registry-state")
+    loaded = MachineSystemTape.read(tape.write(tmp_path / "registry-state.jsonl"))
+    restored = loaded.resume_state().virtual_registry
+    assert restored.handles[0x4000].access == 0xF003F
+    value = restored.keys[
+        "hkey_current_user\\software\\turing"
+    ].values["mode"]
+    assert value.name == "Mode"
+    assert value.value_type == 1
+    assert value.data == "exact\0".encode("utf-16le")
+
+
+def test_virtual_pipe_handles_and_buffer_round_trip_on_segmented_tape(tmp_path):
+    state = MachineExecutionState(
+        pc=0x1000,
+        system_state={
+            "windows.pipe.1.capacity": 4096,
+            "windows.pipe.1.readers": 1,
+            "windows.pipe.1.writers": 2,
+            "windows.handle.256.kind": 4,
+            "windows.handle.256.id": 1,
+            "windows.handle.256.end": 1,
+        },
+        device_state={"pipe.1": b"pending bytes"},
+    )
+    tape = MachineSystemTape(b"MZ", 1)
+    tape.append(0, state, position=0, event="pipe-state")
+    source = tape.write(tmp_path / "pipe.jsonl")
+    SegmentedMachineTapeStore.import_jsonl(
+        source, tmp_path / "pipe.segmented-tape", records_per_segment=1,
+    )
+    loaded = SegmentedMachineTapeStore(tmp_path / "pipe.segmented-tape")
+    restored = loaded.resume_state()
+    assert restored.system_state["windows.pipe.1.writers"] == 2
+    assert restored.system_state["windows.handle.256.end"] == 1
+    assert restored.device_state["pipe.1"] == b"pending bytes"
+
+
+def test_virtual_memory_regions_and_committed_pages_round_trip_on_tape(tmp_path):
+    virtual_memory = VirtualMemoryState.create().apply(VirtualMemoryEffect(
+        "allocate", 0x10000000000, 8192, PAGE_EXECUTE_READWRITE,
+    ))
+    memory = PagedByteMemory.empty().map_zeroes(0x10000000000, 8192)
+    memory = memory.map_bytes(0x10000000000, b"\x90\xc3")
+    state = MachineExecutionState(
+        pc=0x10000000000, memory=memory, virtual_memory=virtual_memory,
+    )
+    tape = MachineSystemTape(b"MZ", 1)
+    tape.append(0, state, position=0, event="virtual-memory-state")
+    loaded = MachineSystemTape.read(tape.write(tmp_path / "virtual-memory.jsonl"))
+    restored = loaded.resume_state()
+    assert restored.virtual_memory.is_executable(0x10000000000)
+    assert restored.virtual_memory.regions[0x10000000000].managed
+    assert bytes(restored.memory[0x10000000000 + i] for i in range(2)) == b"\x90\xc3"
 
 
 def test_tape_annotations_support_ranges_colors_and_superseding_notes():

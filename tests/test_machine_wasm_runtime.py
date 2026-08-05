@@ -555,6 +555,224 @@ def test_dynamic_memory_movsxd_sign_extends_with_a_read_witness():
         dispatcher.close()
 
 
+def _decoded_single_instruction_program(encoded: bytes, address: int):
+    instruction, end = X86ReferenceDecoder().decode_one(
+        memoryview(encoded), 0, base_address=address,
+    )
+    assert end == len(encoded)
+    return instruction, SimpleNamespace(
+        image=SimpleNamespace(image_base=address, entrypoint_rva=0),
+        functions=(SimpleNamespace(
+            report=SimpleNamespace(instructions=(instruction,)),
+        ),),
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
+def test_cdqe_compiled_journal_matches_reference_boundaries_and_wat():
+    instruction, program = _decoded_single_instruction_program(
+        bytes.fromhex("48 98"), 0xBF80,
+    )
+    assert instruction.semantic is MachineSemanticToken.SIGN_EXTEND_ACCUMULATOR
+    executor = MachineExecutionOrchestrator(
+        program, effect_handlers=default_effect_handlers(),
+    )
+    host = NodeMachineWasmHost()
+    try:
+        for source, result in (
+            (0xAAAAAAAA80000001, 0xFFFFFFFF80000001),
+            (0xFFFFFFFF7FFFFFFF, 0x000000007FFFFFFF),
+        ):
+            registers = [0] * 16
+            registers[0] = source
+            initial = MachineExecutionState(
+                pc=0xBF80, registers=tuple(registers), flags=0xA57,
+            )
+            expected = executor.step(initial).state
+            artifact = executor.recompile_block_wasm(0xBF80, initial, strict=True)
+            assert "SIGN_EXTEND_ACCUMULATOR" in artifact.wat
+            states = artifact.states_from_journal(host.execute(artifact, initial), initial)
+            assert states == (expected,)
+            assert states[0].registers[0] == result
+            assert states[0].flags == initial.flags
+    finally:
+        host.close()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
+def test_cqo_compiled_journal_matches_reference_sign_boundaries():
+    instruction, program = _decoded_single_instruction_program(
+        bytes.fromhex("48 99"), 0xBF88,
+    )
+    assert instruction.semantic is MachineSemanticToken.SIGN_EXTEND_ACCUMULATOR
+    executor = MachineExecutionOrchestrator(
+        program, effect_handlers=default_effect_handlers(),
+    )
+    host = NodeMachineWasmHost()
+    try:
+        for source, result in ((1 << 63, (1 << 64) - 1), ((1 << 63) - 1, 0)):
+            registers = [0] * 16
+            registers[0], registers[2] = source, 0x123456789ABCDEF0
+            initial = MachineExecutionState(
+                pc=0xBF88, registers=tuple(registers), flags=0xA57,
+            )
+            expected = executor.step(initial).state
+            artifact = executor.recompile_block_wasm(0xBF88, initial, strict=True)
+            states = artifact.states_from_journal(host.execute(artifact, initial), initial)
+            assert states == (expected,)
+            assert states[0].registers[2] == result
+            assert states[0].flags == initial.flags
+    finally:
+        host.close()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
+def test_bt_register_compiled_journal_preserves_every_flag_except_carry():
+    instruction, program = _decoded_single_instruction_program(
+        bytes.fromhex("48 0f a3 c1"), 0xBF90,
+    )
+    assert instruction.semantic is MachineSemanticToken.BIT_TEST
+    executor = MachineExecutionOrchestrator(
+        program, effect_handlers=default_effect_handlers(),
+    )
+    registers = [0] * 16
+    registers[0] = 65
+    registers[1] = 2
+    initial = MachineExecutionState(
+        pc=0xBF90, registers=tuple(registers), flags=0xA56,
+    )
+    expected = executor.step(initial).state
+    machine = MachineVirtualMulticore.create(
+        executor, core_count=1, initial_states=(initial,),
+    )
+    dispatcher = MachineWasmBlockDispatcher(NodeMachineWasmHost())
+    try:
+        results = dispatcher.execute(machine.cores[0], 1)
+        assert results is not None and results[0].state == expected
+        assert machine.cores[0].state.flags == (initial.flags | 1)
+        assert machine.cores[0].state.registers == initial.registers
+        assert machine.cores[0].step_backward() == initial
+    finally:
+        dispatcher.close()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
+def test_bt_memory_signed_register_index_specializes_adjacent_bit_string():
+    instruction, program = _decoded_single_instruction_program(
+        bytes.fromhex("48 0f a3 0b"), 0xBF98,
+    )
+    executor = MachineExecutionOrchestrator(
+        program, effect_handlers=default_effect_handlers(),
+    )
+    address = 0xE8F8
+    registers = [0] * 16
+    registers[1], registers[3] = (1 << 64) - 1, 0xE900
+    memory = PagedByteMemory.empty().map_zeroes(address, 8).write_unsigned(
+        address, 64, 1 << 63,
+    )
+    initial = MachineExecutionState(
+        pc=0xBF98, registers=tuple(registers), memory=memory, flags=0xA56,
+    )
+    expected = executor.step(initial).state
+    machine = MachineVirtualMulticore.create(
+        executor, core_count=1, initial_states=(initial,),
+    )
+    dispatcher = MachineWasmBlockDispatcher(NodeMachineWasmHost())
+    try:
+        artifact = executor.recompile_block_wasm(0xBF98, initial, strict=True)
+        assert (artifact.guest_memory_base, artifact.guest_memory_size) == (
+            address, 8,
+        )
+        assert dict(artifact.specialization_guard["registers"])[1] == (1 << 64) - 1
+        results = dispatcher.execute(machine.cores[0], 1)
+        assert results is not None and results[0].state == expected
+        assert machine.cores[0].state.flags == (initial.flags | 1)
+        assert machine.cores[0].step_backward() == initial
+    finally:
+        dispatcher.close()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
+def test_btr_memory_compiled_journal_is_exact_witnessed_rmw_and_reverses():
+    instruction, program = _decoded_single_instruction_program(
+        bytes.fromhex("41 0f ba 30 1f"), 0xBFA0,
+    )
+    assert instruction.semantic is MachineSemanticToken.BIT_TEST_RESET
+    executor = MachineExecutionOrchestrator(
+        program, effect_handlers=default_effect_handlers(),
+    )
+    address = 0xE800
+    registers = [0] * 16
+    registers[8] = address
+    memory = PagedByteMemory.empty().map_zeroes(address, 4).write_unsigned(
+        address, 32, 0xFFFFFFFF,
+    )
+    initial = MachineExecutionState(
+        pc=0xBFA0, registers=tuple(registers), memory=memory, flags=0xA56,
+    )
+    expected = executor.step(initial).state
+    machine = MachineVirtualMulticore.create(
+        executor, core_count=1, initial_states=(initial,),
+    )
+    host = NodeMachineWasmHost()
+    dispatcher = MachineWasmBlockDispatcher(host)
+    try:
+        results = dispatcher.execute(machine.cores[0], 1)
+        assert results is not None and results[0].state == expected
+        assert machine.cores[0].state.memory.read_unsigned(address, 32) == 0x7FFFFFFF
+        artifact = executor.recompile_block_wasm(0xBFA0, initial, strict=True)
+        journal = host.execute(artifact, initial)
+        tampered = bytearray(journal)
+        struct.pack_into("<Q", tampered, JOURNAL_EFFECT_OFFSET + 24, 0xFFFFFFFE)
+        with pytest.raises(ValueError, match="memory-read witness mismatch"):
+            artifact.states_from_journal(bytes(tampered), initial)
+        assert machine.cores[0].step_backward() == initial
+    finally:
+        dispatcher.close()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
+@pytest.mark.parametrize(("direction_flag", "destination"), ((False, 0xE900), (True, 0xE906)))
+def test_rep_stosw_compiled_fill_descriptor_matches_reference_and_tamper_closes(
+    direction_flag, destination,
+):
+    instruction, program = _decoded_single_instruction_program(
+        bytes.fromhex("66 f3 ab"), 0xBFB0,
+    )
+    assert instruction.semantic is MachineSemanticToken.STRING_STORE
+    executor = MachineExecutionOrchestrator(
+        program, effect_handlers=default_effect_handlers(),
+    )
+    registers = [0] * 16
+    registers[0], registers[1], registers[7] = 0xBEEF, 4, destination
+    memory = PagedByteMemory.empty().map_zeroes(0xE900, 8).map_bytes(
+        0xE900, bytes.fromhex("00 11 22 33 44 55 66 77"),
+    )
+    initial = MachineExecutionState(
+        pc=0xBFB0, registers=tuple(registers), memory=memory,
+        flags=(1 << 10) if direction_flag else 0,
+    )
+    expected = executor.step(initial).state
+    machine = MachineVirtualMulticore.create(
+        executor, core_count=1, initial_states=(initial,),
+    )
+    host = NodeMachineWasmHost()
+    dispatcher = MachineWasmBlockDispatcher(host)
+    try:
+        results = dispatcher.execute(machine.cores[0], 1)
+        assert results is not None and results[0].state == expected
+        assert machine.cores[0].state.memory.read_unsigned(0xE900, 64) == 0xBEEFBEEFBEEFBEEF
+        artifact = executor.recompile_block_wasm(0xBFB0, initial, strict=True)
+        journal = host.execute(artifact, initial)
+        tampered = bytearray(journal)
+        struct.pack_into("<Q", tampered, JOURNAL_EFFECT_OFFSET + 16, 3)
+        with pytest.raises(ValueError, match="fill descriptor mismatch"):
+            artifact.states_from_journal(bytes(tampered), initial)
+        assert machine.cores[0].step_backward() == initial
+    finally:
+        dispatcher.close()
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
 def test_scalar_shift_unary_set_and_register_exchange_match_reference_and_reverse():
     encoded = bytes.fromhex(

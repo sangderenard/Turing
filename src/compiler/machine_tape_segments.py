@@ -111,6 +111,7 @@ class SegmentedMachineTapeStore:
             MachineTapeAnnotation.from_mapping(item)
             for item in manifest.get("annotations", ())
         ]
+        self.origin_receipt = MappingProxyType(dict(manifest.get("origin_receipt", {})))
         self._cached_digest: str | None = None
         self._cached_records: tuple[dict[str, Any], ...] = ()
         self._tail_records: list[dict[str, Any]] = []
@@ -453,7 +454,116 @@ class SegmentedMachineTapeStore:
         }
         if self._runtime_dispatch_indexed:
             result["runtime_dispatch_targets"] = list(self.runtime_dispatch_targets)
+        if self.origin_receipt:
+            result["origin_receipt"] = dict(self.origin_receipt)
         return result
+
+    def crop(
+        self,
+        root: str | Path,
+        *,
+        sequence: int | None = None,
+    ) -> "SegmentedMachineTapeStore":
+        """Seal selected core states as position-zero roots in a new tape.
+
+        Unlike a branch, a crop intentionally carries no executable ancestry.
+        It retains a content-addressed receipt so provenance can be audited
+        without keeping the source segments available at runtime.
+        """
+
+        self.flush()
+        target = Path(root)
+        if target.exists():
+            raise FileExistsError(f"refusing to replace existing graph crop {target}")
+        target.mkdir(parents=True)
+        (target / "segments").mkdir()
+        subject = self.subject_binary
+        (target / "subject.bin").write_bytes(subject)
+        module_mappings = []
+        if self.linked_modules:
+            (target / "modules").mkdir()
+            for module in self.linked_modules:
+                (target / "modules" / f"{module.digest}.bin").write_bytes(module.binary)
+                module_mappings.append(_module_mapping(module, include_binary=False))
+
+        source_manifest = (self.root / "manifest.json").read_bytes()
+        source_sequences = tuple(
+            self.latest_sequence(core, limit=sequence)
+            for core in range(self.core_count)
+        )
+        states = tuple(
+            self.resume_state(core, sequence=source_sequence)
+            for core, source_sequence in enumerate(source_sequences)
+        )
+        encoded_states = tuple(encode_machine_state(state, None) for state in states)
+        state_digest = sha256(json.dumps(
+            encoded_states, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        receipt = {
+            "schema": "turing-machine-graph-crop-origin-v1",
+            "source_manifest_digest": sha256(source_manifest).hexdigest(),
+            "source_subject_digest": self.subject_digest,
+            "source_sequences": list(source_sequences),
+            "source_positions": [
+                int(self.record(item)["position"]) for item in source_sequences
+            ],
+            "state_digest": state_digest,
+        }
+        records = [{
+            "sequence": core,
+            "core": core,
+            "position": 0,
+            "event": "graph_crop_root",
+            "checkpoint": True,
+            "parent_sequence": None,
+            "dependencies": [],
+            "metadata": {"origin_receipt": receipt},
+            "state": encoded_states[core],
+        } for core in range(self.core_count)]
+        payload = {
+            "schema": SEGMENT_SCHEMA,
+            "version": 1,
+            "parent_digest": None,
+            "records": records,
+        }
+        encoded_segment = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        digest = sha256(encoded_segment).hexdigest()
+        with gzip.open(target / "segments" / f"{digest}.json.gz", "wb", compresslevel=6) as stream:
+            stream.write(encoded_segment)
+        descriptor = MachineTapeSegmentDescriptor(
+            digest, 0, self.core_count - 1, self.core_count, None,
+            tuple(range(self.core_count)),
+            tuple((core, core, core) for core in range(self.core_count)),
+        )
+        manifest = {
+            "schema": SEGMENT_STORE_SCHEMA,
+            "version": 1,
+            "core_count": self.core_count,
+            "checkpoint_interval": self.checkpoint_interval,
+            "record_count": self.core_count,
+            "subject_digest": sha256(subject).hexdigest(),
+            "external_references": [{
+                "reference_id": item.reference_id,
+                "target_address": item.target_address,
+                "domain": item.domain,
+                "library": item.library,
+                "symbol": item.symbol,
+            } for item in self.external_references],
+            "linked_modules": module_mappings,
+            "import_bindings": [
+                _binding_mapping(binding) for binding in self.import_bindings
+            ],
+            "annotations": [],
+            "runtime_dispatch_targets": list(self.runtime_dispatch_targets),
+            "origin_receipt": receipt,
+            "segments": [descriptor.to_mapping()],
+        }
+        (target / "manifest.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8",
+        )
+        return type(self)(target)
 
     def flush(self) -> Path:
         if self._tail_records:

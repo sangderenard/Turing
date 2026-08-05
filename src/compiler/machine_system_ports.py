@@ -21,11 +21,20 @@ from .machine_execution import (
     MachineExternalEnvironmentWrite,
     MachineExternalTextStateWrite,
     MachineExternalDeviceWrite,
+    MachineExternalControlTransfer,
 )
 from .virtual_filesystem import (
     VirtualFileEffect, normalize_virtual_path, virtual_path_to_windows,
 )
-from .virtual_process import VirtualProgramRegistry, split_windows_command_line
+from .virtual_process import (
+    VirtualProgramInvocation, VirtualProgramRegistry, VirtualProgramResult,
+    split_windows_command_line,
+)
+from .virtual_registry import VirtualRegistryEffect, VirtualRegistryState
+from .virtual_memory import (
+    MEM_COMMIT, MEM_FREE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+    PAGE_READWRITE, VirtualMemoryEffect,
+)
 
 
 ExternalCapabilityHandler = Callable[
@@ -76,7 +85,7 @@ class CapabilityGatedExternalPort:
             return "terminal_input"
         if symbol == "readfile" and "file" in library:
             return "terminal_input"
-        if symbol == "waitforsingleobject":
+        if symbol in {"waitforsingleobject", "waitforsingleobjectex"}:
             return "thread_wait"
         return None
 
@@ -751,9 +760,69 @@ def _msvcrt_setjmp(request, state):
         value = int(state.vector_registers[register]) & ((1 << 128) - 1)
         offset = 96 + (register - 6) * 16
         payload[offset:offset + 16] = value.to_bytes(16, "little")
+    saved_stack = state.call_stack[:-1] if state.call_stack else ()
+    stack_writes = (
+        MachineExternalStateWrite(f"windows.setjmp.{buffer}.depth", len(saved_stack)),
+        *(MachineExternalStateWrite(
+            f"windows.setjmp.{buffer}.stack.{index}", address,
+        ) for index, address in enumerate(saved_stack)),
+    )
     return MachineExternalCallCompletion(
         request.request_id, result=0,
         memory_writes=(MachineExternalMemoryWrite(buffer, payload),),
+        system_writes=stack_writes,
+    )
+
+
+def _msvcrt_longjmp(request, state):
+    """Restore one `_JUMP_BUFFER` and its tape-owned shadow call stack."""
+
+    buffer = int(request.arguments[0])
+    value = int(request.arguments[1]) & 0xFFFFFFFF
+    depth_key = f"windows.setjmp.{buffer}.depth"
+    if depth_key not in state.system_state:
+        return None
+    try:
+        words = tuple(_read_guest_unsigned(state.memory, buffer + index * 8, 8)
+                      for index in range(11))
+        mxcsr = _read_guest_unsigned(state.memory, buffer + 88, 4)
+        fpcsr = _read_guest_unsigned(state.memory, buffer + 92, 2)
+        vectors = list(state.vector_registers)
+        for register in range(6, 16):
+            offset = buffer + 96 + (register - 6) * 16
+            vectors[register] = int.from_bytes(
+                bytes(state.memory[offset + index] for index in range(16)), "little",
+            )
+    except (KeyError, OverflowError):
+        return None
+    depth = int(state.system_state[depth_key])
+    try:
+        call_stack = tuple(int(state.system_state[
+            f"windows.setjmp.{buffer}.stack.{index}"
+        ]) for index in range(depth))
+    except KeyError:
+        return None
+    target = int(words[10])
+    if not target:
+        return None
+    register_writes = tuple(
+        MachineExternalRegisterWrite(index, value)
+        for index, value in (
+            (3, words[1]), (4, words[2]), (5, words[3]),
+            (6, words[4]), (7, words[5]), (12, words[6]),
+            (13, words[7]), (14, words[8]), (15, words[9]),
+        )
+    )
+    return MachineExternalCallCompletion(
+        request.request_id, result=value or 1,
+        register_writes=register_writes,
+        system_writes=(
+            MachineExternalStateWrite("amd64.mxcsr", mxcsr),
+            MachineExternalStateWrite("amd64.fpcsr", fpcsr),
+        ),
+        control_transfer=MachineExternalControlTransfer(
+            target, call_stack, tuple(vectors),
+        ),
     )
 
 
@@ -924,14 +993,401 @@ def _windows_create_thread(request, state):
 
 def _windows_close_handle(request, state):
     handle = request.arguments[0]
-    key = f"windows.handle.{handle}.kind"
-    if not state.system_state.get(key, 0):
+    if state.virtual_filesystem is not None and handle in state.virtual_filesystem.handles:
+        if _file_handle_fields(state.virtual_filesystem.handles[handle]) is None:
+            return MachineExternalCallCompletion(request.request_id, result=0)
+        return MachineExternalCallCompletion(
+            request.request_id, result=1,
+            filesystem_effects=(VirtualFileEffect("close", "/", handle=handle),),
+        )
+    writes = _close_virtual_handle_writes(state, int(handle))
+    if writes is None:
         return MachineExternalCallCompletion(request.request_id, result=0)
     return MachineExternalCallCompletion(
         request.request_id,
         result=1,
-        system_writes=(MachineExternalStateWrite(key, 0),),
+        system_writes=writes,
     )
+
+
+_WINDOWS_HANDLE_THREAD = 1
+_WINDOWS_HANDLE_MUTEX = 2
+_WINDOWS_HANDLE_SEMAPHORE = 3
+_WINDOWS_HANDLE_PIPE = 4
+_ERROR_FILE_NOT_FOUND = 2
+_ERROR_INVALID_HANDLE = 6
+_ERROR_ALREADY_EXISTS = 183
+_ERROR_NOT_OWNER = 288
+_ERROR_TOO_MANY_POSTS = 298
+_WAIT_OBJECT_0 = 0
+_WAIT_TIMEOUT = 258
+_WAIT_FAILED = 0xFFFFFFFF
+
+
+def _pipe_endpoint(state: MachineExecutionState, handle: int) -> tuple[int, int] | None:
+    prefix = f"windows.handle.{int(handle)}"
+    if int(state.system_state.get(f"{prefix}.kind", 0)) != _WINDOWS_HANDLE_PIPE:
+        return None
+    pipe_id = int(state.system_state.get(f"{prefix}.id", 0))
+    endpoint = int(state.system_state.get(f"{prefix}.end", 0))
+    return (pipe_id, endpoint) if pipe_id > 0 and endpoint in (1, 2) else None
+
+
+def _close_virtual_handle_writes(
+    state: MachineExecutionState, handle: int,
+) -> tuple[MachineExternalStateWrite, ...] | None:
+    prefix = f"windows.handle.{int(handle)}"
+    kind = int(state.system_state.get(f"{prefix}.kind", 0))
+    if not kind:
+        return None
+    writes = [MachineExternalStateWrite(f"{prefix}.kind", 0)]
+    endpoint = _pipe_endpoint(state, int(handle))
+    if endpoint is not None:
+        pipe_id, end = endpoint
+        counter = "readers" if end == 1 else "writers"
+        key = f"windows.pipe.{pipe_id}.{counter}"
+        count = int(state.system_state.get(key, 0))
+        if count <= 0:
+            return None
+        writes.append(MachineExternalStateWrite(key, count - 1))
+    return tuple(writes)
+
+
+def _validate_pipe_security(state: MachineExecutionState, pointer: int) -> bool:
+    if not pointer:
+        return True
+    try:
+        length = _read_guest_unsigned(state.memory, int(pointer), 4)
+        descriptor = _read_guest_unsigned(state.memory, int(pointer) + 8, 8)
+        inherit = _read_guest_unsigned(state.memory, int(pointer) + 16, 4)
+    except (KeyError, OverflowError):
+        return False
+    return length == 24 and descriptor == 0 and inherit in (0, 1)
+
+
+def _new_pipe_effects(
+    state: MachineExecutionState, capacity: int, *, inheritable: int = 0,
+) -> tuple[int, int, int, tuple[MachineExternalStateWrite, ...]]:
+    pipe_id = int(state.system_state.get("windows.pipe.next_id", 1))
+    read_handle = _allocate_windows_handle(state)
+    write_handle = read_handle + 1
+    effective_capacity = int(capacity) or 4096
+    writes = (
+        MachineExternalStateWrite("windows.next_handle", write_handle + 1),
+        MachineExternalStateWrite("windows.pipe.next_id", pipe_id + 1),
+        MachineExternalStateWrite(f"windows.pipe.{pipe_id}.capacity", effective_capacity),
+        MachineExternalStateWrite(f"windows.pipe.{pipe_id}.readers", 1),
+        MachineExternalStateWrite(f"windows.pipe.{pipe_id}.writers", 1),
+        MachineExternalStateWrite(f"windows.handle.{read_handle}.kind", _WINDOWS_HANDLE_PIPE),
+        MachineExternalStateWrite(f"windows.handle.{read_handle}.id", pipe_id),
+        MachineExternalStateWrite(f"windows.handle.{read_handle}.end", 1),
+        MachineExternalStateWrite(f"windows.handle.{read_handle}.inherit", int(bool(inheritable))),
+        MachineExternalStateWrite(f"windows.handle.{write_handle}.kind", _WINDOWS_HANDLE_PIPE),
+        MachineExternalStateWrite(f"windows.handle.{write_handle}.id", pipe_id),
+        MachineExternalStateWrite(f"windows.handle.{write_handle}.end", 2),
+        MachineExternalStateWrite(f"windows.handle.{write_handle}.inherit", int(bool(inheritable))),
+    )
+    return pipe_id, read_handle, write_handle, writes
+
+
+def _create_pipe(maximum_bytes: int) -> ExternalCapabilityHandler:
+    def handler(request, state):
+        read_pointer, write_pointer, security, capacity = request.arguments
+        if (
+            not read_pointer or not write_pointer
+            or int(capacity) > int(maximum_bytes)
+            or not _validate_pipe_security(state, int(security))
+        ):
+            return None
+        try:
+            state.memory.read(int(read_pointer), 8)
+            state.memory.read(int(write_pointer), 8)
+        except KeyError:
+            return MachineExternalCallCompletion(request.request_id, result=0)
+        inherit = (
+            _read_guest_unsigned(state.memory, int(security) + 16, 4)
+            if security else 0
+        )
+        _pipe_id, read_handle, write_handle, writes = _new_pipe_effects(
+            state, int(capacity), inheritable=inherit,
+        )
+        return MachineExternalCallCompletion(
+            request.request_id, result=1,
+            memory_writes=(
+                MachineExternalMemoryWrite(
+                    int(read_pointer), int(read_handle).to_bytes(8, "little"),
+                ),
+                MachineExternalMemoryWrite(
+                    int(write_pointer), int(write_handle).to_bytes(8, "little"),
+                ),
+            ),
+            system_writes=writes,
+        )
+    return handler
+
+
+def _duplicate_handle(request, state):
+    source_process, source_handle, target_process, output = request.arguments
+    desired_access = int(request.stack_arguments[0]) & 0xFFFFFFFF if request.stack_arguments else 0
+    inherit = int(request.stack_arguments[1]) & 0xFFFFFFFF if len(request.stack_arguments) > 1 else 0
+    options = int(request.stack_arguments[2]) & 0xFFFFFFFF if len(request.stack_arguments) > 2 else 0
+    current_process = (1 << 64) - 1
+    endpoint = _pipe_endpoint(state, int(source_handle))
+    remote_child_close = (
+        bool(state.system_state.get(f"windows.process.{source_process}.complete", 0))
+        and target_process == 0 and output == 0 and endpoint is not None
+        and desired_access == 0 and inherit == 0 and options == 0x1
+    )
+    if remote_child_close:
+        return MachineExternalCallCompletion(
+            request.request_id, result=1,
+            system_writes=(MachineExternalStateWrite(
+                f"windows.process.{source_process}.remote_handle.{source_handle}.closed", 1,
+            ),),
+        )
+    if (
+        source_process != current_process or target_process != current_process
+        or not output or endpoint is None or inherit not in (0, 1)
+        or options & ~0x3 or not (options & 0x2) or desired_access
+    ):
+        return None
+    new_handle = _allocate_windows_handle(state)
+    pipe_id, end = endpoint
+    counter = "readers" if end == 1 else "writers"
+    counter_key = f"windows.pipe.{pipe_id}.{counter}"
+    writes: list[MachineExternalStateWrite] = [
+        MachineExternalStateWrite("windows.next_handle", new_handle + 1),
+        MachineExternalStateWrite(f"windows.handle.{new_handle}.kind", _WINDOWS_HANDLE_PIPE),
+        MachineExternalStateWrite(f"windows.handle.{new_handle}.id", pipe_id),
+        MachineExternalStateWrite(f"windows.handle.{new_handle}.end", end),
+        MachineExternalStateWrite(f"windows.handle.{new_handle}.inherit", inherit),
+        MachineExternalStateWrite(
+            counter_key, int(state.system_state.get(counter_key, 0)) + 1,
+        ),
+    ]
+    if options & 0x1:
+        closed = _close_virtual_handle_writes(state, int(source_handle))
+        if closed is None:
+            return None
+        writes.extend(closed)
+    return MachineExternalCallCompletion(
+        request.request_id, result=1,
+        memory_writes=(MachineExternalMemoryWrite(
+            int(output), int(new_handle).to_bytes(8, "little"),
+        ),),
+        system_writes=tuple(writes),
+    )
+
+
+def _signed_u32(value: int) -> int:
+    value = int(value) & 0xFFFFFFFF
+    return value - (1 << 32) if value & 0x80000000 else value
+
+
+def _sync_name(state: MachineExecutionState, pointer: int) -> str | None:
+    if not pointer:
+        return ""
+    return _read_utf16(state.memory, int(pointer))
+
+
+def _sync_name_key(name: str) -> str:
+    # Windows kernel-object names are case insensitive. Keeping the mapping in
+    # reversible system state makes named objects visible to every virtual core.
+    return f"windows.sync.name.{name.casefold()}"
+
+
+def _allocate_windows_handle(state: MachineExecutionState) -> int:
+    return int(state.system_state.get("windows.next_handle", 0x100))
+
+
+def _create_mutex(thread_id: int) -> ExternalCapabilityHandler:
+    def handler(request, state):
+        attributes, name_pointer, flags, access = request.arguments
+        if attributes or flags & ~1:
+            return None
+        name = _sync_name(state, int(name_pointer))
+        if name is None:
+            return None
+        if name:
+            existing = int(state.system_state.get(_sync_name_key(name), 0))
+            if existing and int(state.system_state.get(
+                f"windows.handle.{existing}.kind", 0,
+            )):
+                if int(state.system_state.get(
+                    f"windows.handle.{existing}.kind", 0,
+                )) != _WINDOWS_HANDLE_MUTEX:
+                    return MachineExternalCallCompletion(
+                        request.request_id, result=0,
+                        system_writes=(MachineExternalStateWrite(
+                            f"windows.thread.{thread_id}.last_error",
+                            _ERROR_INVALID_HANDLE,
+                        ),),
+                    )
+                return MachineExternalCallCompletion(
+                    request.request_id, result=existing,
+                    system_writes=(MachineExternalStateWrite(
+                        f"windows.thread.{thread_id}.last_error",
+                        _ERROR_ALREADY_EXISTS,
+                    ),),
+                )
+        handle = _allocate_windows_handle(state)
+        initially_owned = bool(flags & 1)
+        writes = [
+            MachineExternalStateWrite("windows.next_handle", handle + 1),
+            MachineExternalStateWrite(
+                f"windows.handle.{handle}.kind", _WINDOWS_HANDLE_MUTEX,
+            ),
+            MachineExternalStateWrite(f"windows.handle.{handle}.access", int(access)),
+            MachineExternalStateWrite(
+                f"windows.handle.{handle}.owner", thread_id if initially_owned else 0,
+            ),
+            MachineExternalStateWrite(
+                f"windows.handle.{handle}.recursion", 1 if initially_owned else 0,
+            ),
+            MachineExternalStateWrite(f"windows.thread.{thread_id}.last_error", 0),
+        ]
+        if name:
+            writes.append(MachineExternalStateWrite(_sync_name_key(name), handle))
+        return MachineExternalCallCompletion(
+            request.request_id, result=handle, system_writes=tuple(writes),
+        )
+    return handler
+
+
+def _release_mutex(thread_id: int) -> ExternalCapabilityHandler:
+    def handler(request, state):
+        handle = int(request.arguments[0])
+        owner = int(state.system_state.get(f"windows.handle.{handle}.owner", 0))
+        recursion = int(state.system_state.get(
+            f"windows.handle.{handle}.recursion", 0,
+        ))
+        if (
+            int(state.system_state.get(f"windows.handle.{handle}.kind", 0))
+            != _WINDOWS_HANDLE_MUTEX
+            or owner != thread_id or recursion <= 0
+        ):
+            return MachineExternalCallCompletion(
+                request.request_id, result=0,
+                system_writes=(MachineExternalStateWrite(
+                    f"windows.thread.{thread_id}.last_error", _ERROR_NOT_OWNER,
+                ),),
+            )
+        writes = [MachineExternalStateWrite(
+            f"windows.handle.{handle}.recursion", recursion - 1,
+        )]
+        if recursion == 1:
+            writes.append(MachineExternalStateWrite(
+                f"windows.handle.{handle}.owner", 0,
+            ))
+        return MachineExternalCallCompletion(
+            request.request_id, result=1, system_writes=tuple(writes),
+        )
+    return handler
+
+
+def _create_semaphore(thread_id: int) -> ExternalCapabilityHandler:
+    def handler(request, state):
+        attributes, initial_raw, maximum_raw, name_pointer = request.arguments
+        flags = int(request.stack_arguments[0]) if request.stack_arguments else 0
+        access = int(request.stack_arguments[1]) if len(request.stack_arguments) > 1 else 0
+        initial = _signed_u32(initial_raw)
+        maximum = _signed_u32(maximum_raw)
+        if attributes or flags or maximum <= 0 or initial < 0 or initial > maximum:
+            return None
+        name = _sync_name(state, int(name_pointer))
+        if name is None:
+            return None
+        if name:
+            existing = int(state.system_state.get(_sync_name_key(name), 0))
+            if existing and int(state.system_state.get(
+                f"windows.handle.{existing}.kind", 0,
+            )):
+                if int(state.system_state.get(
+                    f"windows.handle.{existing}.kind", 0,
+                )) != _WINDOWS_HANDLE_SEMAPHORE:
+                    return MachineExternalCallCompletion(
+                        request.request_id, result=0,
+                        system_writes=(MachineExternalStateWrite(
+                            f"windows.thread.{thread_id}.last_error",
+                            _ERROR_INVALID_HANDLE,
+                        ),),
+                    )
+                return MachineExternalCallCompletion(
+                    request.request_id, result=existing,
+                    system_writes=(MachineExternalStateWrite(
+                        f"windows.thread.{thread_id}.last_error",
+                        _ERROR_ALREADY_EXISTS,
+                    ),),
+                )
+        handle = _allocate_windows_handle(state)
+        writes = [
+            MachineExternalStateWrite("windows.next_handle", handle + 1),
+            MachineExternalStateWrite(
+                f"windows.handle.{handle}.kind", _WINDOWS_HANDLE_SEMAPHORE,
+            ),
+            MachineExternalStateWrite(f"windows.handle.{handle}.count", initial),
+            MachineExternalStateWrite(f"windows.handle.{handle}.maximum", maximum),
+            MachineExternalStateWrite(f"windows.handle.{handle}.access", access),
+            MachineExternalStateWrite(f"windows.thread.{thread_id}.last_error", 0),
+        ]
+        if name:
+            writes.append(MachineExternalStateWrite(_sync_name_key(name), handle))
+        return MachineExternalCallCompletion(
+            request.request_id, result=handle, system_writes=tuple(writes),
+        )
+    return handler
+
+
+def _open_semaphore(thread_id: int) -> ExternalCapabilityHandler:
+    def handler(request, state):
+        access, inherit, name_pointer = request.arguments[:3]
+        name = _sync_name(state, int(name_pointer))
+        if inherit not in (0, 1) or not name:
+            return None
+        handle = int(state.system_state.get(_sync_name_key(name), 0))
+        kind = int(state.system_state.get(f"windows.handle.{handle}.kind", 0))
+        if kind != _WINDOWS_HANDLE_SEMAPHORE:
+            return MachineExternalCallCompletion(
+                request.request_id, result=0,
+                system_writes=(MachineExternalStateWrite(
+                    f"windows.thread.{thread_id}.last_error",
+                    _ERROR_INVALID_HANDLE if handle and kind else _ERROR_FILE_NOT_FOUND,
+                ),),
+            )
+        return MachineExternalCallCompletion(request.request_id, result=handle)
+    return handler
+
+
+def _release_semaphore(thread_id: int) -> ExternalCapabilityHandler:
+    def handler(request, state):
+        handle, release_raw, previous_pointer = request.arguments[:3]
+        handle = int(handle)
+        release_count = _signed_u32(release_raw)
+        count = int(state.system_state.get(f"windows.handle.{handle}.count", 0))
+        maximum = int(state.system_state.get(f"windows.handle.{handle}.maximum", 0))
+        if (
+            int(state.system_state.get(f"windows.handle.{handle}.kind", 0))
+            != _WINDOWS_HANDLE_SEMAPHORE
+            or release_count <= 0 or count + release_count > maximum
+        ):
+            return MachineExternalCallCompletion(
+                request.request_id, result=0,
+                system_writes=(MachineExternalStateWrite(
+                    f"windows.thread.{thread_id}.last_error", _ERROR_TOO_MANY_POSTS,
+                ),),
+            )
+        memory_writes = (() if not previous_pointer else (
+            MachineExternalMemoryWrite(
+                int(previous_pointer), int(count).to_bytes(4, "little"),
+            ),
+        ))
+        return MachineExternalCallCompletion(
+            request.request_id, result=1, memory_writes=memory_writes,
+            system_writes=(MachineExternalStateWrite(
+                f"windows.handle.{handle}.count", count + release_count,
+            ),),
+        )
+    return handler
 
 
 def _set_thread_ui_language(default_language: int) -> ExternalCapabilityHandler:
@@ -960,6 +1416,110 @@ def _heap_set_information(request, state):
             ),
         ),
     )
+
+
+def _virtual_alloc(request, state):
+    requested, size, allocation_type, protection = request.arguments
+    virtual_memory = state.virtual_memory
+    if virtual_memory is None or not size:
+        return None
+    # The first bounded tier owns complete reserve+commit allocations. Partial
+    # commit, reset, large pages, physical pages and top-down placement remain
+    # explicit frontiers rather than approximate mappings.
+    if allocation_type != MEM_RESERVE | MEM_COMMIT:
+        return None
+    if protection not in (PAGE_READWRITE, PAGE_EXECUTE_READWRITE):
+        return None
+    aligned_size = (int(size) + virtual_memory.page_size - 1) & -virtual_memory.page_size
+    requested_base = int(requested) & -0x10000 if requested else 0
+    base = virtual_memory.choose_base(aligned_size, requested_base)
+    if base is None:
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    return MachineExternalCallCompletion(
+        request.request_id, result=base,
+        virtual_memory_effects=(VirtualMemoryEffect(
+            "allocate", base, aligned_size, int(protection),
+        ),),
+    )
+
+
+def _virtual_free(request, state):
+    address, size, free_type = request.arguments[:3]
+    virtual_memory = state.virtual_memory
+    if virtual_memory is None:
+        return None
+    # MEM_RELEASE requires dwSize==0 and the original allocation base. Partial
+    # MEM_DECOMMIT needs region splitting and is intentionally not fabricated.
+    if free_type != 0x8000 or size:
+        return None
+    region = virtual_memory.regions.get(int(address))
+    if region is None or not region.managed:
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    return MachineExternalCallCompletion(
+        request.request_id, result=1,
+        virtual_memory_effects=(VirtualMemoryEffect(
+            "release", region.base, region.size,
+        ),),
+    )
+
+
+def _virtual_query(request, state):
+    address, output, capacity = request.arguments[:3]
+    virtual_memory = state.virtual_memory
+    if virtual_memory is None or capacity < 48:
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    target = int(address)
+    region = virtual_memory.region_at(target)
+    if region is None:
+        base = target & -virtual_memory.page_size
+        later = [item.base for item in virtual_memory.regions.values() if item.base > base]
+        end = min(later, default=0x00007FFF00000000)
+        allocation_base = allocation_protect = protect = kind = 0
+        state_value = MEM_FREE
+        size = max(virtual_memory.page_size, end - base)
+    else:
+        base = region.base
+        allocation_base = region.allocation_base
+        allocation_protect = region.allocation_protect
+        size = region.size
+        state_value = region.state
+        protect = region.protect
+        kind = region.kind
+    payload = bytearray(48)
+    payload[0:8] = int(base).to_bytes(8, "little")
+    payload[8:16] = int(allocation_base).to_bytes(8, "little")
+    payload[16:20] = int(allocation_protect).to_bytes(4, "little")
+    payload[24:32] = int(size).to_bytes(8, "little")
+    payload[32:36] = int(state_value).to_bytes(4, "little")
+    payload[36:40] = int(protect).to_bytes(4, "little")
+    payload[40:44] = int(kind).to_bytes(4, "little")
+    return MachineExternalCallCompletion(
+        request.request_id, result=48,
+        memory_writes=(MachineExternalMemoryWrite(int(output), bytes(payload)),),
+    )
+
+
+def _read_process_memory(maximum_bytes: int) -> ExternalCapabilityHandler:
+    def handler(request, state):
+        process, source, destination, size = request.arguments
+        read_output = int(request.stack_arguments[0]) if request.stack_arguments else 0
+        # Only the current-process pseudo handle is meaningful without an
+        # explicit virtual child address-space capability.
+        if process != (1 << 64) - 1 or size > maximum_bytes:
+            return None
+        try:
+            payload = bytes(state.memory[int(source) + index] for index in range(int(size)))
+        except KeyError:
+            return MachineExternalCallCompletion(request.request_id, result=0)
+        writes = [MachineExternalMemoryWrite(int(destination), payload)]
+        if read_output:
+            writes.append(MachineExternalMemoryWrite(
+                read_output, int(size).to_bytes(8, "little"),
+            ))
+        return MachineExternalCallCompletion(
+            request.request_id, result=1, memory_writes=tuple(writes),
+        )
+    return handler
 
 
 def _get_process_heap(request, state):
@@ -1019,7 +1579,10 @@ def _heap_alloc(request, state):
             address = int(key[len(prefix):-len(suffix)])
         except ValueError:
             continue
-        available = int(state.system_state.get(f"{prefix}{address}.size", 0))
+        available = int(state.system_state.get(
+            f"{prefix}{address}.capacity",
+            state.system_state.get(f"{prefix}{address}.size", 0),
+        ))
         if available >= capacity:
             reusable.append((available, address))
     if reusable:
@@ -1034,13 +1597,42 @@ def _heap_alloc(request, state):
             memory_writes=writes,
             system_writes=(
                 MachineExternalStateWrite(f"{prefix}{address}.size", size),
+                MachineExternalStateWrite(f"{prefix}{address}.capacity", _available),
                 MachineExternalStateWrite(f"{prefix}{address}.active", 1),
             ),
         )
     cursor = (int(state.system_state.get("windows.system_arena_cursor", 0)) + 15) & -16
     limit = int(state.system_state.get("windows.system_arena_limit", 0))
     if not cursor or cursor + capacity > limit:
-        return MachineExternalCallCompletion(request.request_id, result=0)
+        virtual_memory = state.virtual_memory
+        if virtual_memory is None:
+            return MachineExternalCallCompletion(request.request_id, result=0)
+        managed_capacity = (
+            (capacity + virtual_memory.page_size - 1) & -virtual_memory.page_size
+        )
+        managed_base = virtual_memory.choose_base(managed_capacity)
+        if managed_base is None:
+            return MachineExternalCallCompletion(request.request_id, result=0)
+        return MachineExternalCallCompletion(
+            request.request_id, result=managed_base,
+            virtual_memory_effects=(VirtualMemoryEffect(
+                "allocate", managed_base, managed_capacity, PAGE_READWRITE,
+            ),),
+            system_writes=(
+                MachineExternalStateWrite(
+                    f"windows.heap.allocation.{managed_base}.size", size,
+                ),
+                MachineExternalStateWrite(
+                    f"windows.heap.allocation.{managed_base}.capacity", managed_capacity,
+                ),
+                MachineExternalStateWrite(
+                    f"windows.heap.allocation.{managed_base}.active", 1,
+                ),
+                MachineExternalStateWrite(
+                    f"windows.heap.allocation.{managed_base}.managed", 1,
+                ),
+            ),
+        )
     writes = (
         (MachineExternalMemoryWrite(cursor, bytes(capacity)),)
         if flags & 0x8 else ()
@@ -1052,6 +1644,7 @@ def _heap_alloc(request, state):
         system_writes=(
             MachineExternalStateWrite("windows.system_arena_cursor", cursor + capacity),
             MachineExternalStateWrite(f"windows.heap.allocation.{cursor}.size", size),
+            MachineExternalStateWrite(f"windows.heap.allocation.{cursor}.capacity", capacity),
             MachineExternalStateWrite(f"windows.heap.allocation.{cursor}.active", 1),
         ),
     )
@@ -1197,10 +1790,290 @@ def _msvcrt_realloc(request, state):
     )
 
 
-def _empty_registry_open_key(request, state):
-    # ERROR_FILE_NOT_FOUND. The virtual registry is intentionally empty unless
-    # a future shell capability supplies an explicit registry image.
-    return MachineExternalCallCompletion(request.request_id, result=2)
+_REGISTRY_MAXIMUM_ALLOWED = 0x02000000
+_REGISTRY_ACCESS_MASK = 0xF003F | 0x0100 | 0x0200 | _REGISTRY_MAXIMUM_ALLOWED
+
+
+def _registry_granted_access(requested: int) -> int:
+    requested = int(requested)
+    if requested & _REGISTRY_MAXIMUM_ALLOWED:
+        return (requested & (0x0100 | 0x0200)) | 0xF003F
+    return requested
+
+
+def _registry_state(state: MachineExecutionState) -> VirtualRegistryState:
+    return state.virtual_registry or VirtualRegistryState.create()
+
+
+def _registry_name(memory, pointer: int) -> str | None:
+    return "" if not pointer else _read_utf16(memory, int(pointer))
+
+
+def _registry_access(registry: VirtualRegistryState, handle: int, required: int) -> bool:
+    return bool(registry.access_for_handle(handle) & required == required)
+
+
+def _registry_effects_valid(
+    registry: VirtualRegistryState,
+    effects: tuple[VirtualRegistryEffect, ...],
+) -> bool:
+    try:
+        candidate = registry
+        for effect in effects:
+            candidate = candidate.apply(effect)
+        return True
+    except (FileNotFoundError, KeyError, OSError, ValueError):
+        return False
+
+
+def _registry_open_key(request, state):
+    handle, subkey_pointer, options, desired_access = request.arguments
+    output = int(request.stack_arguments[0]) if request.stack_arguments else 0
+    registry = _registry_state(state)
+    subkey = _registry_name(state.memory, int(subkey_pointer))
+    if options or desired_access & ~_REGISTRY_ACCESS_MASK or not output:
+        return None
+    if subkey is None:
+        return MachineExternalCallCompletion(request.request_id, result=2)
+    path = registry.resolve(int(handle), subkey)
+    if path is None or path not in registry.keys:
+        return MachineExternalCallCompletion(request.request_id, result=2)
+    opened = registry.next_handle
+    effect = VirtualRegistryEffect(
+        "open", path, handle=opened,
+        access=_registry_granted_access(desired_access),
+    )
+    return MachineExternalCallCompletion(
+        request.request_id, result=0,
+        memory_writes=(MachineExternalMemoryWrite(
+            output, int(opened).to_bytes(8, "little"),
+        ),),
+        registry_effects=(effect,),
+    )
+
+
+def _registry_create_key(request, state):
+    handle, subkey_pointer, reserved, class_pointer = request.arguments
+    options = int(request.stack_arguments[0]) if request.stack_arguments else -1
+    desired_access = int(request.stack_arguments[1]) if len(request.stack_arguments) > 1 else 0
+    security = int(request.stack_arguments[2]) if len(request.stack_arguments) > 2 else 0
+    output = int(request.stack_arguments[3]) if len(request.stack_arguments) > 3 else 0
+    disposition_output = int(request.stack_arguments[4]) if len(request.stack_arguments) > 4 else 0
+    registry = _registry_state(state)
+    subkey = _registry_name(state.memory, int(subkey_pointer))
+    if (
+        reserved or options not in (0, 1) or desired_access & ~_REGISTRY_ACCESS_MASK
+        or not output or subkey is None or not subkey
+    ):
+        return None
+    if class_pointer and _read_utf16(state.memory, int(class_pointer)) is None:
+        return None
+    if security:
+        try:
+            length = _read_guest_unsigned(state.memory, security, 4)
+            descriptor = _read_guest_unsigned(state.memory, security + 8, 8)
+            inherit = _read_guest_unsigned(state.memory, security + 16, 4)
+        except KeyError:
+            return None
+        if length != 24 or descriptor or inherit not in (0, 1):
+            return None
+    base = registry.path_for_handle(int(handle))
+    path = registry.resolve(int(handle), subkey)
+    if base is None or path is None or not _registry_access(registry, int(handle), 0x4):
+        return MachineExternalCallCompletion(request.request_id, result=5)
+    existed = path in registry.keys
+    opened = registry.next_handle
+    effects = (
+        VirtualRegistryEffect("create_key", base + "\\" + subkey),
+        VirtualRegistryEffect(
+            "open", path, handle=opened,
+            access=_registry_granted_access(desired_access),
+        ),
+    )
+    if not _registry_effects_valid(registry, effects):
+        return MachineExternalCallCompletion(request.request_id, result=5)
+    writes = [MachineExternalMemoryWrite(
+        output, int(opened).to_bytes(8, "little"),
+    )]
+    if disposition_output:
+        writes.append(MachineExternalMemoryWrite(
+            disposition_output, (2 if existed else 1).to_bytes(4, "little"),
+        ))
+    return MachineExternalCallCompletion(
+        request.request_id, result=0, memory_writes=tuple(writes),
+        registry_effects=effects,
+    )
+
+
+def _registry_close_key(request, state):
+    handle = int(request.arguments[0])
+    registry = _registry_state(state)
+    if (handle & 0xFFFFFFFF) in (0x80000000, 0x80000001, 0x80000002,
+                                 0x80000003, 0x80000004, 0x80000005):
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    if handle not in registry.handles:
+        return MachineExternalCallCompletion(request.request_id, result=6)
+    return MachineExternalCallCompletion(
+        request.request_id, result=0,
+        registry_effects=(VirtualRegistryEffect(
+            "close", registry.handles[handle].path, handle=handle,
+        ),),
+    )
+
+
+def _registry_set_value(maximum_bytes: int) -> ExternalCapabilityHandler:
+    def handler(request, state):
+        handle, name_pointer, reserved, value_type = request.arguments
+        data_pointer = int(request.stack_arguments[0]) if request.stack_arguments else 0
+        size = int(request.stack_arguments[1]) if len(request.stack_arguments) > 1 else 0
+        registry = _registry_state(state)
+        name = _registry_name(state.memory, int(name_pointer))
+        path = registry.path_for_handle(int(handle))
+        if reserved or value_type not in range(12) or size > maximum_bytes or name is None:
+            return None
+        if path is None:
+            return MachineExternalCallCompletion(request.request_id, result=6)
+        if not _registry_access(registry, int(handle), 0x2):
+            return MachineExternalCallCompletion(request.request_id, result=5)
+        if size and not data_pointer:
+            return MachineExternalCallCompletion(request.request_id, result=87)
+        try:
+            data = bytes(state.memory[data_pointer + index] for index in range(size))
+        except KeyError:
+            return MachineExternalCallCompletion(request.request_id, result=87)
+        return MachineExternalCallCompletion(
+            request.request_id, result=0,
+            registry_effects=(VirtualRegistryEffect(
+                "set_value", path, value_name=name,
+                value_type=int(value_type), data=data,
+            ),),
+        )
+    return handler
+
+
+def _registry_query_value(request, state):
+    handle, name_pointer, reserved, type_output = request.arguments
+    data_output = int(request.stack_arguments[0]) if request.stack_arguments else 0
+    size_pointer = int(request.stack_arguments[1]) if len(request.stack_arguments) > 1 else 0
+    registry = _registry_state(state)
+    name = _registry_name(state.memory, int(name_pointer))
+    path = registry.path_for_handle(int(handle))
+    if reserved or name is None or not size_pointer:
+        return None
+    if path is None:
+        return MachineExternalCallCompletion(request.request_id, result=6)
+    if not _registry_access(registry, int(handle), 0x1):
+        return MachineExternalCallCompletion(request.request_id, result=5)
+    value = registry.keys[path].values.get(name.casefold())
+    if value is None:
+        return MachineExternalCallCompletion(request.request_id, result=2)
+    try:
+        capacity = _read_guest_unsigned(state.memory, size_pointer, 4)
+    except KeyError:
+        return MachineExternalCallCompletion(request.request_id, result=87)
+    writes = [MachineExternalMemoryWrite(
+        size_pointer, len(value.data).to_bytes(4, "little"),
+    )]
+    if type_output:
+        writes.append(MachineExternalMemoryWrite(
+            int(type_output), int(value.value_type).to_bytes(4, "little"),
+        ))
+    result = 0
+    if data_output:
+        if capacity < len(value.data):
+            result = 234
+        else:
+            writes.append(MachineExternalMemoryWrite(int(data_output), value.data))
+    return MachineExternalCallCompletion(
+        request.request_id, result=result, memory_writes=tuple(writes),
+    )
+
+
+def _registry_delete_value(request, state):
+    handle, name_pointer = request.arguments[:2]
+    registry = _registry_state(state)
+    name = _registry_name(state.memory, int(name_pointer))
+    path = registry.path_for_handle(int(handle))
+    if name is None:
+        return None
+    if path is None:
+        return MachineExternalCallCompletion(request.request_id, result=6)
+    if not _registry_access(registry, int(handle), 0x2):
+        return MachineExternalCallCompletion(request.request_id, result=5)
+    if name.casefold() not in registry.keys[path].values:
+        return MachineExternalCallCompletion(request.request_id, result=2)
+    return MachineExternalCallCompletion(
+        request.request_id, result=0,
+        registry_effects=(VirtualRegistryEffect(
+            "delete_value", path, value_name=name,
+        ),),
+    )
+
+
+def _registry_enum_key(request, state):
+    handle, index, name_output, name_size_pointer = request.arguments
+    reserved = int(request.stack_arguments[0]) if request.stack_arguments else 0
+    class_output = int(request.stack_arguments[1]) if len(request.stack_arguments) > 1 else 0
+    class_size = int(request.stack_arguments[2]) if len(request.stack_arguments) > 2 else 0
+    last_write_output = int(request.stack_arguments[3]) if len(request.stack_arguments) > 3 else 0
+    registry = _registry_state(state)
+    path = registry.path_for_handle(int(handle))
+    if reserved or class_output or class_size or not name_output or not name_size_pointer:
+        return None
+    if path is None:
+        return MachineExternalCallCompletion(request.request_id, result=6)
+    if not _registry_access(registry, int(handle), 0x8):
+        return MachineExternalCallCompletion(request.request_id, result=5)
+    children = registry.children(path)
+    if index >= len(children):
+        return MachineExternalCallCompletion(request.request_id, result=259)
+    child = children[int(index)]
+    try:
+        capacity = _read_guest_unsigned(state.memory, int(name_size_pointer), 4)
+    except KeyError:
+        return MachineExternalCallCompletion(request.request_id, result=87)
+    writes = [MachineExternalMemoryWrite(
+        int(name_size_pointer), len(child.name).to_bytes(4, "little"),
+    )]
+    if capacity <= len(child.name):
+        return MachineExternalCallCompletion(
+            request.request_id, result=234, memory_writes=tuple(writes),
+        )
+    writes.append(MachineExternalMemoryWrite(
+        int(name_output), child.name.encode("utf-16le") + b"\x00\x00",
+    ))
+    if last_write_output:
+        writes.append(MachineExternalMemoryWrite(
+            last_write_output, int(child.last_write_time).to_bytes(8, "little"),
+        ))
+    return MachineExternalCallCompletion(
+        request.request_id, result=0, memory_writes=tuple(writes),
+    )
+
+
+def _registry_delete_key(request, state):
+    handle, subkey_pointer, desired_access, reserved = request.arguments
+    registry = _registry_state(state)
+    subkey = _registry_name(state.memory, int(subkey_pointer))
+    path = None if subkey is None else registry.resolve(int(handle), subkey)
+    if reserved or desired_access & ~(0x0100 | 0x0200) or not subkey:
+        return None
+    if path is None or path not in registry.keys:
+        return MachineExternalCallCompletion(request.request_id, result=2)
+    if not _registry_access(registry, int(handle), 0x4):
+        return MachineExternalCallCompletion(request.request_id, result=5)
+    if any(item.path == path for item in registry.handles.values()):
+        # Windows marks open keys for deferred deletion. This bounded model
+        # refuses that shape rather than silently closing another guest handle.
+        return None
+    effect = VirtualRegistryEffect("delete_key", path)
+    try:
+        registry.apply(effect)
+    except OSError:
+        return MachineExternalCallCompletion(request.request_id, result=145)
+    return MachineExternalCallCompletion(
+        request.request_id, result=0, registry_effects=(effect,),
+    )
 
 
 def _get_cp_info(request, state):
@@ -1328,10 +2201,194 @@ def _set_console_control_handler(request, state):
 
 def _get_osfhandle(request, state):
     descriptors = {0: 0x200, 1: 0x201, 2: 0x202}
+    descriptor = int(request.arguments[0])
+    prefix = f"windows.crt.fd.{descriptor}"
+    if int(state.system_state.get(f"{prefix}.bound", 0)):
+        handle = (
+            int(state.system_state.get(f"{prefix}.handle", 0))
+            if int(state.system_state.get(f"{prefix}.open", 0))
+            else (1 << 64) - 1
+        )
+    else:
+        handle = descriptors.get(descriptor, (1 << 64) - 1)
     return MachineExternalCallCompletion(
         request.request_id,
-        result=descriptors.get(request.arguments[0], (1 << 64) - 1),
+        result=handle,
     )
+
+
+def _crt_pipe(maximum_bytes: int) -> ExternalCapabilityHandler:
+    def handler(request, state):
+        descriptors, capacity, mode = request.arguments[:3]
+        # _O_TEXT, _O_BINARY and _O_NOINHERIT affect CRT translation and
+        # inheritance. This byte-exact pipe admits binary/default mode only.
+        if not descriptors or int(capacity) > int(maximum_bytes) or int(mode) not in (0, 0x8000):
+            return None
+        try:
+            state.memory.read(int(descriptors), 8)
+        except KeyError:
+            return MachineExternalCallCompletion(request.request_id, result=-1)
+        _pipe_id, read_handle, write_handle, pipe_writes = _new_pipe_effects(
+            state, int(capacity), inheritable=1,
+        )
+        read_fd = int(state.system_state.get("windows.crt.next_fd", 3))
+        write_fd = read_fd + 1
+        return MachineExternalCallCompletion(
+            request.request_id, result=0,
+            memory_writes=(MachineExternalMemoryWrite(
+                int(descriptors), struct.pack("<ii", read_fd, write_fd),
+            ),),
+            system_writes=(*pipe_writes,
+                MachineExternalStateWrite("windows.crt.next_fd", write_fd + 1),
+                MachineExternalStateWrite(f"windows.crt.fd.{read_fd}.open", 1),
+                MachineExternalStateWrite(f"windows.crt.fd.{read_fd}.bound", 1),
+                MachineExternalStateWrite(f"windows.crt.fd.{read_fd}.handle", read_handle),
+                MachineExternalStateWrite(f"windows.crt.fd.{write_fd}.open", 1),
+                MachineExternalStateWrite(f"windows.crt.fd.{write_fd}.bound", 1),
+                MachineExternalStateWrite(f"windows.crt.fd.{write_fd}.handle", write_handle),
+            ),
+        )
+    return handler
+
+
+def _crt_open_osfhandle(request, state):
+    handle, flags = int(request.arguments[0]), int(request.arguments[1])
+    if flags not in (0, 0x8000) or (
+        handle not in (0x200, 0x201, 0x202) and _pipe_endpoint(state, handle) is None
+    ):
+        return MachineExternalCallCompletion(request.request_id, result=-1)
+    descriptor = int(state.system_state.get("windows.crt.next_fd", 3))
+    return MachineExternalCallCompletion(
+        request.request_id, result=descriptor,
+        system_writes=(
+            MachineExternalStateWrite("windows.crt.next_fd", descriptor + 1),
+            MachineExternalStateWrite(f"windows.crt.fd.{descriptor}.open", 1),
+            MachineExternalStateWrite(f"windows.crt.fd.{descriptor}.bound", 1),
+            MachineExternalStateWrite(f"windows.crt.fd.{descriptor}.handle", handle),
+        ),
+    )
+
+
+def _crt_close(request, state):
+    descriptor = int(request.arguments[0])
+    prefix = f"windows.crt.fd.{descriptor}"
+    bound = int(state.system_state.get(f"{prefix}.bound", 0))
+    if bound and not int(state.system_state.get(f"{prefix}.open", 0)):
+        return MachineExternalCallCompletion(request.request_id, result=-1)
+    if not bound and descriptor not in (0, 1, 2):
+        return MachineExternalCallCompletion(request.request_id, result=-1)
+    handle = int(state.system_state.get(
+        f"{prefix}.handle", {0: 0x200, 1: 0x201, 2: 0x202}.get(descriptor, 0),
+    ))
+    writes = [
+        MachineExternalStateWrite(f"{prefix}.bound", 1),
+        MachineExternalStateWrite(f"{prefix}.open", 0),
+    ]
+    if handle not in (0x200, 0x201, 0x202):
+        closed = _close_virtual_handle_writes(state, handle)
+        if closed is None:
+            return None
+        writes.extend(closed)
+    return MachineExternalCallCompletion(
+        request.request_id, result=0, system_writes=tuple(writes),
+    )
+
+
+def _crt_duplicate(request, state, *, exact_target: bool) -> MachineExternalCallCompletion | None:
+    source_fd = int(request.arguments[0])
+    target_fd = int(request.arguments[1]) if exact_target else int(
+        state.system_state.get("windows.crt.next_fd", 3)
+    )
+    if source_fd == target_fd:
+        return MachineExternalCallCompletion(
+            request.request_id, result=0 if exact_target else target_fd,
+        )
+    source_prefix = f"windows.crt.fd.{source_fd}"
+    source_bound = int(state.system_state.get(f"{source_prefix}.bound", 0))
+    source_handle = int(state.system_state.get(
+        f"{source_prefix}.handle",
+        {0: 0x200, 1: 0x201, 2: 0x202}.get(source_fd, 0),
+    ))
+    if not source_handle or (
+        (source_bound or source_fd not in (0, 1, 2))
+        and not int(state.system_state.get(f"{source_prefix}.open", 0))
+    ):
+        return MachineExternalCallCompletion(request.request_id, result=-1)
+    writes: list[MachineExternalStateWrite] = []
+    old_handle = None
+    target_prefix = f"windows.crt.fd.{target_fd}"
+    target_bound = int(state.system_state.get(f"{target_prefix}.bound", 0))
+    if target_bound and int(state.system_state.get(f"{target_prefix}.open", 0)):
+        old_handle = int(state.system_state.get(f"windows.crt.fd.{target_fd}.handle", 0))
+        writes.append(MachineExternalStateWrite(f"windows.crt.fd.{target_fd}.open", 0))
+    elif not target_bound and target_fd in (0, 1, 2):
+        old_handle = {0: 0x200, 1: 0x201, 2: 0x202}[target_fd]
+    new_handle = int(source_handle)
+    source_endpoint = _pipe_endpoint(state, new_handle)
+    if source_endpoint is not None:
+        new_handle = _allocate_windows_handle(state)
+        pipe_id, end = source_endpoint
+        counter = "readers" if end == 1 else "writers"
+        counter_key = f"windows.pipe.{pipe_id}.{counter}"
+        delta = 1
+        old_endpoint = _pipe_endpoint(state, old_handle) if old_handle else None
+        if old_endpoint == source_endpoint:
+            delta -= 1
+        elif old_endpoint is not None:
+            old_pipe, old_end = old_endpoint
+            old_counter = "readers" if old_end == 1 else "writers"
+            old_key = f"windows.pipe.{old_pipe}.{old_counter}"
+            writes.append(MachineExternalStateWrite(
+                old_key, int(state.system_state.get(old_key, 0)) - 1,
+            ))
+        writes.extend((
+            MachineExternalStateWrite("windows.next_handle", new_handle + 1),
+            MachineExternalStateWrite(f"windows.handle.{new_handle}.kind", _WINDOWS_HANDLE_PIPE),
+            MachineExternalStateWrite(f"windows.handle.{new_handle}.id", pipe_id),
+            MachineExternalStateWrite(f"windows.handle.{new_handle}.end", end),
+            MachineExternalStateWrite(
+                f"windows.handle.{new_handle}.inherit",
+                int(state.system_state.get(f"windows.handle.{source_handle}.inherit", 0)),
+            ),
+            MachineExternalStateWrite(
+                counter_key, int(state.system_state.get(counter_key, 0)) + delta,
+            ),
+        ))
+        if old_handle and old_handle != source_handle:
+            writes.append(MachineExternalStateWrite(f"windows.handle.{old_handle}.kind", 0))
+    else:
+        old_endpoint = _pipe_endpoint(state, old_handle) if old_handle else None
+        if old_endpoint is not None:
+            old_pipe, old_end = old_endpoint
+            old_counter = "readers" if old_end == 1 else "writers"
+            old_key = f"windows.pipe.{old_pipe}.{old_counter}"
+            writes.extend((
+                MachineExternalStateWrite(
+                    old_key, int(state.system_state.get(old_key, 0)) - 1,
+                ),
+                MachineExternalStateWrite(f"windows.handle.{old_handle}.kind", 0),
+            ))
+        elif old_handle not in (None, 0x200, 0x201, 0x202):
+            return None
+    writes.extend((
+        MachineExternalStateWrite(f"windows.crt.fd.{target_fd}.open", 1),
+        MachineExternalStateWrite(f"windows.crt.fd.{target_fd}.bound", 1),
+        MachineExternalStateWrite(f"windows.crt.fd.{target_fd}.handle", new_handle),
+    ))
+    if not exact_target:
+        writes.append(MachineExternalStateWrite("windows.crt.next_fd", target_fd + 1))
+    return MachineExternalCallCompletion(
+        request.request_id, result=0 if exact_target else target_fd,
+        system_writes=tuple(writes),
+    )
+
+
+def _crt_dup(request, state):
+    return _crt_duplicate(request, state, exact_target=False)
+
+
+def _crt_dup2(request, state):
+    return _crt_duplicate(request, state, exact_target=True)
 
 
 def _get_console_mode(request, state):
@@ -1469,6 +2526,7 @@ def _create_virtual_process(
     registry: VirtualProgramRegistry,
     *,
     current_directory: str,
+    maximum_device_bytes: int,
 ) -> ExternalCapabilityHandler:
     """Resolve CreateProcessW only to a declared Turing program executor."""
 
@@ -1488,6 +2546,71 @@ def _create_virtual_process(
         )
         if not process_information:
             return MachineExternalCallCompletion(request.request_id, result=0)
+        inherit_handles = bool(request.stack_arguments[0]) if request.stack_arguments else False
+        startup_pointer = (
+            int(request.stack_arguments[4]) if len(request.stack_arguments) > 4 else 0
+        )
+        stdin_handle, stdout_handle, stderr_handle = 0x200, 0x201, 0x202
+        startup_flags = 0
+        if startup_pointer:
+            try:
+                startup_size = _read_guest_unsigned(state.memory, startup_pointer, 4)
+                startup_flags = _read_guest_unsigned(state.memory, startup_pointer + 60, 4)
+            except (KeyError, OverflowError):
+                return None
+            if startup_size < 104 or startup_flags & ~0x101:
+                return None
+            if startup_flags & 0x100:
+                if not inherit_handles:
+                    return None
+                try:
+                    stdin_handle = _read_guest_unsigned(state.memory, startup_pointer + 80, 8)
+                    stdout_handle = _read_guest_unsigned(state.memory, startup_pointer + 88, 8)
+                    stderr_handle = _read_guest_unsigned(state.memory, startup_pointer + 96, 8)
+                except (KeyError, OverflowError):
+                    return None
+        if inherit_handles and not (startup_flags & 0x100):
+            # cmd's pipeline implementation duplicates inheritable OS handles
+            # into its CRT descriptors and launches child cmd.exe instances
+            # without STARTF_USESTDHANDLES.  Preserve those explicit virtual
+            # descriptor bindings; never consult ambient host descriptors.
+            inherited = []
+            for descriptor, fallback in enumerate((0x200, 0x201, 0x202)):
+                if int(state.system_state.get(
+                    f"windows.crt.fd.{descriptor}.open", 0,
+                )):
+                    inherited.append(int(state.system_state.get(
+                        f"windows.crt.fd.{descriptor}.handle", fallback,
+                    )))
+                else:
+                    inherited.append(fallback)
+            stdin_handle, stdout_handle, stderr_handle = inherited
+
+        def admitted_pipe(handle: int, endpoint: int) -> tuple[int, int] | None:
+            if handle in (0x200, 0x201, 0x202):
+                return (0, endpoint)
+            found = _pipe_endpoint(state, int(handle))
+            if (
+                found is None or found[1] != endpoint
+                or not int(state.system_state.get(f"windows.handle.{handle}.inherit", 0))
+            ):
+                return None
+            return found
+
+        stdin_endpoint = admitted_pipe(int(stdin_handle), 1)
+        stdout_endpoint = admitted_pipe(int(stdout_handle), 2)
+        stderr_endpoint = admitted_pipe(int(stderr_handle), 2)
+        if None in (stdin_endpoint, stdout_endpoint, stderr_endpoint):
+            return None
+        standard_input = state.device_state.get("console.input", b"")
+        input_device = None
+        if stdin_endpoint[0]:
+            input_device = f"pipe.{stdin_endpoint[0]}"
+            standard_input = state.device_state.get(input_device, b"")
+            if not standard_input and int(state.system_state.get(
+                f"windows.pipe.{stdin_endpoint[0]}.writers", 0,
+            )):
+                return None
         filesystem = state.virtual_filesystem
         active_directory = (
             filesystem.current_directory if filesystem is not None else current_directory
@@ -1495,6 +2618,13 @@ def _create_virtual_process(
         path_entries = tuple(
             item for item in state.environment_state.get("PATH", "").split(";") if item
         )
+        shell_command = _virtual_cmd_command(requested, child_arguments)
+        if shell_command is not None:
+            command_text, command_arguments = shell_command
+            command_tokens = split_windows_command_line(command_text)
+            if command_tokens and command_tokens[0].casefold() != "echo":
+                requested = command_tokens[0]
+                child_arguments = command_tokens[1:]
         deployment = registry.launch(
             requested,
             child_arguments,
@@ -1502,7 +2632,7 @@ def _create_virtual_process(
             current_directory=active_directory,
             path_search=path_entries,
             environment=state.environment_state,
-            standard_input=state.device_state.get("console.input", b""),
+            standard_input=standard_input,
         )
         if deployment is None:
             return None
@@ -1511,11 +2641,28 @@ def _create_virtual_process(
         process_id = 0x10000 + int(request.request_id)
         thread_id = 0x20000 + int(request.request_id)
         result = deployment.result
-        device_writes = tuple(
-            MachineExternalDeviceWrite("console.output", payload)
-            for payload in (result.standard_output, result.standard_error)
-            if payload
-        )
+        device_writes: list[MachineExternalDeviceWrite] = []
+        if input_device and standard_input:
+            device_writes.append(MachineExternalDeviceWrite(
+                input_device, b"", append=False,
+            ))
+        for payload, endpoint, console_device in (
+            (result.standard_output, stdout_endpoint, "console.output"),
+            (result.standard_error, stderr_endpoint, "console.error"),
+        ):
+            if not payload:
+                continue
+            device = console_device if not endpoint[0] else f"pipe.{endpoint[0]}"
+            if endpoint[0] and not int(state.system_state.get(
+                f"windows.pipe.{endpoint[0]}.readers", 0,
+            )):
+                return None
+            capacity = int(state.system_state.get(
+                f"windows.pipe.{endpoint[0]}.capacity", maximum_device_bytes,
+            )) if endpoint[0] else maximum_device_bytes
+            if len(state.device_state.get(device, b"")) + len(payload) > capacity:
+                return None
+            device_writes.append(MachineExternalDeviceWrite(device, payload))
         return MachineExternalCallCompletion(
             request.request_id,
             result=1,
@@ -1538,7 +2685,7 @@ def _create_virtual_process(
                     f"windows.process.{handle}.executor", deployment.program.executor_reference,
                 ),
             ),
-            device_writes=device_writes,
+            device_writes=tuple(device_writes),
             deployments=(MachineExternalDeployment(
                 deployment.deployment_id,
                 "card-set-executor",
@@ -1555,6 +2702,38 @@ def _create_virtual_process(
     return handler
 
 
+def _virtual_cmd_command(
+    requested: str, arguments: tuple[str, ...],
+) -> tuple[str, tuple[str, ...]] | None:
+    """Extract a /C command from an explicitly launched cmd.exe child."""
+
+    if normalize_virtual_path(requested, "/").rsplit("/", 1)[-1].casefold() != "cmd.exe":
+        return None
+    for index, argument in enumerate(arguments):
+        folded = argument.casefold()
+        if folded == "/c":
+            return " ".join(arguments[index + 1:]).strip(), arguments
+        if folded.startswith("/c"):
+            suffix = argument[2:]
+            return " ".join((suffix, *arguments[index + 1:])).strip(), arguments
+    return None
+
+
+def _virtual_cmd_builtin(invocation: VirtualProgramInvocation) -> VirtualProgramResult:
+    """Deterministic, deliberately small executor for admitted cmd built-ins."""
+
+    extracted = _virtual_cmd_command(invocation.requested_path, invocation.arguments)
+    command = extracted[0] if extracted is not None else ""
+    tokens = split_windows_command_line(command)
+    if tokens and tokens[0].casefold() == "echo":
+        # Preserve the command tail rather than re-quoting its parsed tokens.
+        tail = command[len(tokens[0]):].lstrip()
+        return VirtualProgramResult(
+            0, (tail + "\r\n").encode("utf-8"), execution_units=max(1, len(tokens)),
+        )
+    return VirtualProgramResult(1, standard_error=b"unsupported virtual cmd builtin\r\n")
+
+
 def _wait_for_virtual_process(request, state):
     handle = request.arguments[0]
     complete = state.system_state.get(f"windows.process.{handle}.complete")
@@ -1563,7 +2742,7 @@ def _wait_for_virtual_process(request, state):
     )
 
 
-def _wait_for_virtual_object(request, state):
+def _wait_for_virtual_object(request, state, *, thread_id: int = 1):
     handle = int(request.arguments[0])
     timeout = int(request.arguments[1] & 0xFFFFFFFF)
     def completed(result: int):
@@ -1575,17 +2754,44 @@ def _wait_for_virtual_object(request, state):
             ),),
         )
     kind = int(state.system_state.get(f"windows.handle.{handle}.kind", 0))
-    if kind == 1:
-        thread_id = int(state.system_state.get(f"windows.handle.{handle}.id", 0))
-        if not thread_id:
+    if kind == _WINDOWS_HANDLE_THREAD:
+        target_thread_id = int(state.system_state.get(f"windows.handle.{handle}.id", 0))
+        if not target_thread_id:
             return completed(0xFFFFFFFF)
-        active = int(state.system_state.get(f"windows.thread.{thread_id}.active", 0))
+        active = int(state.system_state.get(f"windows.thread.{target_thread_id}.active", 0))
         if not active:
             return completed(0)
         return (
             completed(258)
             if timeout == 0 else None
         )
+    if kind == _WINDOWS_HANDLE_MUTEX:
+        owner_key = f"windows.handle.{handle}.owner"
+        recursion_key = f"windows.handle.{handle}.recursion"
+        owner = int(state.system_state.get(owner_key, 0))
+        if owner in (0, thread_id):
+            recursion = int(state.system_state.get(recursion_key, 0))
+            return MachineExternalCallCompletion(
+                request.request_id, result=_WAIT_OBJECT_0,
+                system_writes=(
+                    MachineExternalStateWrite(owner_key, thread_id),
+                    MachineExternalStateWrite(recursion_key, recursion + 1),
+                    MachineExternalStateWrite("windows.thread.waiting_request", 0),
+                ),
+            )
+        return completed(_WAIT_TIMEOUT) if timeout == 0 else None
+    if kind == _WINDOWS_HANDLE_SEMAPHORE:
+        count_key = f"windows.handle.{handle}.count"
+        count = int(state.system_state.get(count_key, 0))
+        if count > 0:
+            return MachineExternalCallCompletion(
+                request.request_id, result=_WAIT_OBJECT_0,
+                system_writes=(
+                    MachineExternalStateWrite(count_key, count - 1),
+                    MachineExternalStateWrite("windows.thread.waiting_request", 0),
+                ),
+            )
+        return completed(_WAIT_TIMEOUT) if timeout == 0 else None
     complete = state.system_state.get(f"windows.process.{handle}.complete")
     if complete is not None:
         return completed(0 if complete else 258) if complete or timeout == 0 else None
@@ -1855,13 +3061,79 @@ def _read_console(*, wide: bool, maximum_bytes: int) -> ExternalCapabilityHandle
     return handler
 
 
-def _read_file(maximum_bytes: int) -> ExternalCapabilityHandler:
-    """Implement the standard-input subset of ReadFile as a blocking port."""
+def _read_file(maximum_bytes: int, thread_id: int = 1) -> ExternalCapabilityHandler:
+    """Read a standard-input device or a declared virtual-file handle."""
 
     def handler(request, state):
         handle, destination, count, read = request.arguments[:4]
         overlapped = request.stack_arguments[0] if request.stack_arguments else 0
-        if handle != 0x200 or overlapped or count > maximum_bytes:
+        if overlapped or count > maximum_bytes:
+            return MachineExternalCallCompletion(request.request_id, result=0)
+        filesystem = state.virtual_filesystem
+        file_handle = filesystem.handles.get(handle) if filesystem is not None else None
+        if file_handle is not None:
+            if not file_handle.mode.startswith("file:"):
+                return MachineExternalCallCompletion(request.request_id, result=0)
+            access = int(file_handle.mode.split(":", 2)[1], 16)
+            if not access & (0x80000000 | 0x1):
+                return MachineExternalCallCompletion(
+                    request.request_id, result=0,
+                    system_writes=(MachineExternalStateWrite(
+                        f"windows.thread.{thread_id}.last_error", 5,
+                    ),),
+                )
+            try:
+                consumed = filesystem.read(
+                    file_handle.path, offset=file_handle.position,
+                    length=int(count),
+                )
+            except (FileNotFoundError, PermissionError):
+                return MachineExternalCallCompletion(request.request_id, result=0)
+            writes = [MachineExternalMemoryWrite(destination, consumed)]
+            if read:
+                writes.append(MachineExternalMemoryWrite(
+                    read, len(consumed).to_bytes(4, "little"),
+                ))
+            return MachineExternalCallCompletion(
+                request.request_id, result=1, memory_writes=tuple(writes),
+                filesystem_effects=(VirtualFileEffect(
+                    "seek", file_handle.path, handle=int(handle),
+                    offset=file_handle.position + len(consumed),
+                ),),
+            )
+        endpoint = _pipe_endpoint(state, int(handle))
+        if endpoint is not None:
+            pipe_id, end = endpoint
+            if end != 1:
+                return MachineExternalCallCompletion(
+                    request.request_id, result=0,
+                    system_writes=(MachineExternalStateWrite(
+                        f"windows.thread.{thread_id}.last_error", 5,
+                    ),),
+                )
+            available = bytes(state.device_state.get(f"pipe.{pipe_id}", b""))
+            if not available:
+                if int(state.system_state.get(f"windows.pipe.{pipe_id}.writers", 0)):
+                    return None
+                writes = (() if not read else (MachineExternalMemoryWrite(
+                    int(read), (0).to_bytes(4, "little"),
+                ),))
+                return MachineExternalCallCompletion(
+                    request.request_id, result=1, memory_writes=writes,
+                )
+            consumed = available[:int(count)]
+            writes = [MachineExternalMemoryWrite(int(destination), consumed)]
+            if read:
+                writes.append(MachineExternalMemoryWrite(
+                    int(read), len(consumed).to_bytes(4, "little"),
+                ))
+            return MachineExternalCallCompletion(
+                request.request_id, result=1, memory_writes=tuple(writes),
+                device_writes=(MachineExternalDeviceWrite(
+                    f"pipe.{pipe_id}", available[len(consumed):], append=False,
+                ),),
+            )
+        if handle != 0x200:
             return MachineExternalCallCompletion(request.request_id, result=0)
         available = bytes(state.device_state.get("console.input", b""))
         if not available:
@@ -1882,6 +3154,348 @@ def _read_file(maximum_bytes: int) -> ExternalCapabilityHandler:
     return handler
 
 
+def _file_handle_mode(access: int, share: int) -> str:
+    return f"file:{int(access) & 0xFFFFFFFF:08x}:{int(share) & 0x7:x}"
+
+
+def _file_handle_fields(handle) -> tuple[int, int] | None:
+    parts = handle.mode.split(":")
+    if len(parts) != 3 or parts[0] != "file":
+        return None
+    try:
+        return int(parts[1], 16), int(parts[2], 16)
+    except ValueError:
+        return None
+
+
+def _vfs_effects_valid(filesystem, effects: tuple[VirtualFileEffect, ...]) -> bool:
+    try:
+        candidate = filesystem
+        for effect in effects:
+            candidate = candidate.apply(effect)
+        return True
+    except (FileNotFoundError, KeyError, OSError, PermissionError, ValueError):
+        return False
+
+
+def _create_file(thread_id: int) -> ExternalCapabilityHandler:
+    def handler(request, state):
+        path_pointer, access, share, security = request.arguments
+        disposition = int(request.stack_arguments[0]) if request.stack_arguments else 0
+        flags = int(request.stack_arguments[1]) if len(request.stack_arguments) > 1 else 0
+        template = int(request.stack_arguments[2]) if len(request.stack_arguments) > 2 else 0
+        filesystem = state.virtual_filesystem
+        path = _read_utf16(state.memory, int(path_pointer))
+        if filesystem is None or path is None or template:
+            return None
+        if security:
+            try:
+                length = _read_guest_unsigned(state.memory, int(security), 4)
+                descriptor = _read_guest_unsigned(state.memory, int(security) + 8, 8)
+                inherit = _read_guest_unsigned(state.memory, int(security) + 16, 4)
+            except (KeyError, OverflowError):
+                return None
+            if length != 24 or descriptor or inherit not in (0, 1):
+                return None
+        # Attributes and cache hints have no observable timing in this virtual
+        # filesystem. Delete-on-close, overlapped, encryption and unbuffered IO
+        # need additional state and remain explicit frontiers.
+        admitted_flags = 0x00000001 | 0x00000002 | 0x00000004 | 0x00000080
+        admitted_flags |= 0x02000000 | 0x08000000 | 0x10000000 | 0x80000000
+        if flags & ~admitted_flags or share & ~0x7 or disposition not in range(1, 6):
+            return None
+        normalized = normalize_virtual_path(path, filesystem.current_directory)
+        try:
+            entry = filesystem.stat(normalized)
+            exists = True
+        except FileNotFoundError:
+            entry = None
+            exists = False
+        except PermissionError:
+            exists = False
+            entry = None
+        error = 0
+        if disposition == 1 and exists:  # CREATE_NEW
+            error = 80
+        elif disposition == 3 and not exists:  # OPEN_EXISTING
+            error = 2
+        elif disposition == 5 and not exists:  # TRUNCATE_EXISTING
+            error = 2
+        if error:
+            return MachineExternalCallCompletion(
+                request.request_id, result=(1 << 64) - 1,
+                system_writes=(MachineExternalStateWrite(
+                    f"windows.thread.{thread_id}.last_error", error,
+                ),),
+            )
+        if entry is not None and entry.directory:
+            if not flags & 0x02000000 or access & (0x40000000 | 0x2 | 0x4):
+                return MachineExternalCallCompletion(
+                    request.request_id, result=(1 << 64) - 1,
+                    system_writes=(MachineExternalStateWrite(
+                        f"windows.thread.{thread_id}.last_error", 5,
+                    ),),
+                )
+        requested_read = bool(access & (0x80000000 | 0x1))
+        requested_write = bool(access & (0x40000000 | 0x2 | 0x4))
+        if requested_write and entry is not None and (
+            entry.attributes & 0x1
+            or not _vfs_effects_valid(filesystem, (
+                VirtualFileEffect("write", normalized, b"", offset=0),
+            ))
+        ):
+            return MachineExternalCallCompletion(
+                request.request_id, result=(1 << 64) - 1,
+                system_writes=(MachineExternalStateWrite(
+                    f"windows.thread.{thread_id}.last_error", 5,
+                ),),
+            )
+        for open_handle in filesystem.handles.values():
+            if normalize_virtual_path(open_handle.path) != normalized:
+                continue
+            fields = _file_handle_fields(open_handle)
+            if fields is None:
+                continue
+            open_access, open_share = fields
+            open_read = bool(open_access & (0x80000000 | 0x1))
+            open_write = bool(open_access & (0x40000000 | 0x2 | 0x4))
+            if (
+                requested_read and not open_share & 1
+                or requested_write and not open_share & 2
+                or open_read and not share & 1
+                or open_write and not share & 2
+            ):
+                return MachineExternalCallCompletion(
+                    request.request_id, result=(1 << 64) - 1,
+                    system_writes=(MachineExternalStateWrite(
+                        f"windows.thread.{thread_id}.last_error", 32,
+                    ),),
+                )
+        effects: list[VirtualFileEffect] = []
+        if not exists and disposition in (1, 2, 4):
+            effects.append(VirtualFileEffect("create", normalized))
+        elif exists and disposition in (2, 5) and entry is not None and not entry.directory:
+            effects.append(VirtualFileEffect("truncate", normalized, offset=0))
+        handle = filesystem.next_handle
+        effects.append(VirtualFileEffect(
+            "open", normalized, handle=handle,
+            mode=_file_handle_mode(int(access), int(share)),
+        ))
+        if not _vfs_effects_valid(filesystem, tuple(effects)):
+            return MachineExternalCallCompletion(
+                request.request_id, result=(1 << 64) - 1,
+                system_writes=(MachineExternalStateWrite(
+                    f"windows.thread.{thread_id}.last_error", 5,
+                ),),
+            )
+        already_exists = exists and disposition in (2, 4)
+        return MachineExternalCallCompletion(
+            request.request_id, result=handle, filesystem_effects=tuple(effects),
+            system_writes=(MachineExternalStateWrite(
+                f"windows.thread.{thread_id}.last_error",
+                183 if already_exists else 0,
+            ),),
+        )
+    return handler
+
+
+def _write_file(maximum_bytes: int, thread_id: int = 1) -> ExternalCapabilityHandler:
+    def handler(request, state):
+        handle, source, count, written = request.arguments
+        overlapped = request.stack_arguments[0] if request.stack_arguments else 0
+        if overlapped or count > maximum_bytes:
+            return None
+        try:
+            payload = bytes(state.memory[int(source) + index] for index in range(int(count)))
+        except KeyError:
+            return MachineExternalCallCompletion(request.request_id, result=0)
+        if handle in (0x201, 0x202):
+            writes = (() if not written else (MachineExternalMemoryWrite(
+                int(written), int(count).to_bytes(4, "little"),
+            ),))
+            return MachineExternalCallCompletion(
+                request.request_id, result=1, memory_writes=writes,
+                device_writes=(MachineExternalDeviceWrite(
+                    "console.output" if handle == 0x201 else "console.error", payload,
+                ),),
+            )
+        endpoint = _pipe_endpoint(state, int(handle))
+        if endpoint is not None:
+            pipe_id, end = endpoint
+            if end != 2:
+                return MachineExternalCallCompletion(
+                    request.request_id, result=0,
+                    system_writes=(MachineExternalStateWrite(
+                        f"windows.thread.{thread_id}.last_error", 5,
+                    ),),
+                )
+            if not int(state.system_state.get(f"windows.pipe.{pipe_id}.readers", 0)):
+                return MachineExternalCallCompletion(
+                    request.request_id, result=0,
+                    system_writes=(MachineExternalStateWrite(
+                        f"windows.thread.{thread_id}.last_error", 109,
+                    ),),
+                )
+            available = bytes(state.device_state.get(f"pipe.{pipe_id}", b""))
+            capacity = int(state.system_state.get(f"windows.pipe.{pipe_id}.capacity", 0))
+            if len(available) + len(payload) > capacity:
+                return None
+            writes = (() if not written else (MachineExternalMemoryWrite(
+                int(written), len(payload).to_bytes(4, "little"),
+            ),))
+            return MachineExternalCallCompletion(
+                request.request_id, result=1, memory_writes=writes,
+                device_writes=(MachineExternalDeviceWrite(f"pipe.{pipe_id}", payload),),
+            )
+        filesystem = state.virtual_filesystem
+        file_handle = filesystem.handles.get(handle) if filesystem is not None else None
+        fields = _file_handle_fields(file_handle) if file_handle is not None else None
+        if fields is None or not fields[0] & (0x40000000 | 0x2 | 0x4):
+            return MachineExternalCallCompletion(
+                request.request_id, result=0,
+                system_writes=(MachineExternalStateWrite(
+                    f"windows.thread.{thread_id}.last_error", 5,
+                ),),
+            )
+        access, _share = fields
+        offset = (
+            len(filesystem.stat(file_handle.path).data)
+            if access & 0x4 and not access & (0x40000000 | 0x2)
+            else file_handle.position
+        )
+        effects = (
+            VirtualFileEffect("write", file_handle.path, payload, offset=offset),
+            VirtualFileEffect(
+                "seek", file_handle.path, handle=int(handle),
+                offset=offset + len(payload),
+            ),
+        )
+        if not _vfs_effects_valid(filesystem, effects):
+            return MachineExternalCallCompletion(request.request_id, result=0)
+        writes = (() if not written else (MachineExternalMemoryWrite(
+            int(written), len(payload).to_bytes(4, "little"),
+        ),))
+        return MachineExternalCallCompletion(
+            request.request_id, result=1, memory_writes=writes,
+            filesystem_effects=effects,
+        )
+    return handler
+
+
+def _flush_file_buffers(request, state):
+    handle = int(request.arguments[0])
+    endpoint = _pipe_endpoint(state, handle)
+    if endpoint is not None:
+        pipe_id, end = endpoint
+        if end != 2:
+            return MachineExternalCallCompletion(request.request_id, result=0)
+        return (
+            MachineExternalCallCompletion(request.request_id, result=1)
+            if not state.device_state.get(f"pipe.{pipe_id}", b"") else None
+        )
+    admitted = handle in (0x201, 0x202) or (
+        state.virtual_filesystem is not None
+        and handle in state.virtual_filesystem.handles
+        and _file_handle_fields(state.virtual_filesystem.handles[handle]) is not None
+    )
+    return MachineExternalCallCompletion(request.request_id, result=int(admitted))
+
+
+def _file_handle(request, state):
+    filesystem = state.virtual_filesystem
+    return (
+        None if filesystem is None
+        else filesystem.handles.get(int(request.arguments[0]))
+    )
+
+
+def _set_file_pointer_ex(request, state):
+    handle = _file_handle(request, state)
+    if handle is None or _file_handle_fields(handle) is None:
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    distance = int(request.arguments[1]) & ((1 << 64) - 1)
+    if distance & (1 << 63):
+        distance -= 1 << 64
+    method = int(request.arguments[3])
+    if method == 0:
+        position = distance
+    elif method == 1:
+        position = handle.position + distance
+    elif method == 2:
+        position = len(state.virtual_filesystem.stat(handle.path).data) + distance
+    else:
+        return None
+    if position < 0:
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    output = int(request.arguments[2])
+    writes = (() if not output else (MachineExternalMemoryWrite(
+        output, int(position).to_bytes(8, "little"),
+    ),))
+    return MachineExternalCallCompletion(
+        request.request_id, result=1, memory_writes=writes,
+        filesystem_effects=(VirtualFileEffect(
+            "seek", handle.path, handle=handle.handle, offset=position,
+        ),),
+    )
+
+
+def _set_file_pointer(request, state):
+    handle = _file_handle(request, state)
+    if handle is None or _file_handle_fields(handle) is None:
+        return MachineExternalCallCompletion(request.request_id, result=0xFFFFFFFF)
+    low = int(request.arguments[1]) & 0xFFFFFFFF
+    high_pointer = int(request.arguments[2])
+    try:
+        high = (
+            _read_guest_unsigned(state.memory, high_pointer, 4)
+            if high_pointer else (0xFFFFFFFF if low & 0x80000000 else 0)
+        )
+    except KeyError:
+        return MachineExternalCallCompletion(request.request_id, result=0xFFFFFFFF)
+    distance = (int(high) << 32) | low
+    forwarded = replace(
+        request, arguments=(request.arguments[0], distance, 0, request.arguments[3]),
+    )
+    completion = _set_file_pointer_ex(forwarded, state)
+    if completion is None or not completion.result:
+        return MachineExternalCallCompletion(request.request_id, result=0xFFFFFFFF)
+    position = completion.filesystem_effects[0].offset
+    writes = (() if not high_pointer else (MachineExternalMemoryWrite(
+        high_pointer, (position >> 32).to_bytes(4, "little"),
+    ),))
+    return MachineExternalCallCompletion(
+        request.request_id, result=position & 0xFFFFFFFF,
+        memory_writes=writes, filesystem_effects=completion.filesystem_effects,
+    )
+
+
+def _set_end_of_file(request, state):
+    handle = _file_handle(request, state)
+    fields = _file_handle_fields(handle) if handle is not None else None
+    if fields is None or not fields[0] & (0x40000000 | 0x2 | 0x4):
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    effect = VirtualFileEffect("truncate", handle.path, offset=handle.position)
+    if not _vfs_effects_valid(state.virtual_filesystem, (effect,)):
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    return MachineExternalCallCompletion(
+        request.request_id, result=1, filesystem_effects=(effect,),
+    )
+
+
+def _get_file_size(request, state):
+    handle = _file_handle(request, state)
+    if handle is None or _file_handle_fields(handle) is None:
+        return MachineExternalCallCompletion(request.request_id, result=0xFFFFFFFF)
+    size = len(state.virtual_filesystem.stat(handle.path).data)
+    high_pointer = int(request.arguments[1])
+    writes = (() if not high_pointer else (MachineExternalMemoryWrite(
+        high_pointer, (size >> 32).to_bytes(4, "little"),
+    ),))
+    return MachineExternalCallCompletion(
+        request.request_id, result=size & 0xFFFFFFFF, memory_writes=writes,
+    )
+
+
 def _set_console_mode(request, state):
     handle, mode = request.arguments[:2]
     if handle not in (0x200, 0x201, 0x202):
@@ -1896,9 +3510,18 @@ def _set_console_mode(request, state):
 
 
 def _get_file_type(request, state):
+    handle = int(request.arguments[0])
+    if _pipe_endpoint(state, handle) is not None:
+        return MachineExternalCallCompletion(request.request_id, result=3)
+    if (
+        state.virtual_filesystem is not None
+        and handle in state.virtual_filesystem.handles
+        and _file_handle_fields(state.virtual_filesystem.handles[handle]) is not None
+    ):
+        return MachineExternalCallCompletion(request.request_id, result=1)
     return MachineExternalCallCompletion(
         request.request_id,
-        result=2 if request.arguments[0] in (0x200, 0x201, 0x202) else 0,
+        result=2 if handle in (0x200, 0x201, 0x202) else 0,
     )
 
 
@@ -2125,8 +3748,207 @@ def _get_file_attributes(request, state):
         entry = state.virtual_filesystem.stat(path)
     except (FileNotFoundError, PermissionError):
         return MachineExternalCallCompletion(request.request_id, result=0xFFFFFFFF)
-    attributes = 0x10 if entry.directory else 0x80
+    attributes = entry.attributes or (0x10 if entry.directory else 0x80)
     return MachineExternalCallCompletion(request.request_id, result=attributes)
+
+
+def _get_file_attributes_ex(request, state):
+    path = _read_utf16(state.memory, request.arguments[0])
+    info_level = int(request.arguments[1])
+    output = int(request.arguments[2])
+    if path is None or state.virtual_filesystem is None or info_level != 0:
+        return None
+    try:
+        entry = state.virtual_filesystem.stat(path)
+    except (FileNotFoundError, PermissionError):
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    attributes = entry.attributes or (0x10 if entry.directory else 0x80)
+    payload = bytearray(36)
+    payload[0:4] = int(attributes).to_bytes(4, "little")
+    payload[4:12] = int(entry.created_time).to_bytes(8, "little")
+    payload[12:20] = int(entry.accessed_time).to_bytes(8, "little")
+    payload[20:28] = int(entry.modified_time).to_bytes(8, "little")
+    size = 0 if entry.directory else len(entry.data)
+    payload[28:32] = (size >> 32).to_bytes(4, "little")
+    payload[32:36] = (size & 0xFFFFFFFF).to_bytes(4, "little")
+    return MachineExternalCallCompletion(
+        request.request_id, result=1,
+        memory_writes=(MachineExternalMemoryWrite(output, bytes(payload)),),
+    )
+
+
+def _set_file_attributes(request, state):
+    path = _read_utf16(state.memory, request.arguments[0])
+    attributes = int(request.arguments[1]) & 0xFFFFFFFF
+    filesystem = state.virtual_filesystem
+    # Archive, hidden, normal, not-content-indexed, offline, read-only, system,
+    # and temporary are representable metadata. Directory/reparse/compression
+    # changes require structural operations and stay fail-closed.
+    admitted = 0x1 | 0x2 | 0x4 | 0x20 | 0x80 | 0x100 | 0x1000 | 0x2000
+    if path is None or filesystem is None or not attributes or attributes & ~admitted:
+        return None
+    try:
+        entry = filesystem.stat(path)
+    except (FileNotFoundError, PermissionError):
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    if entry.directory:
+        return None
+    effect = VirtualFileEffect("set_attributes", path, attributes=attributes)
+    if not _vfs_effects_valid(filesystem, (effect,)):
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    return MachineExternalCallCompletion(
+        request.request_id, result=1, filesystem_effects=(effect,),
+    )
+
+
+def _set_file_time(request, state):
+    handle = _file_handle(request, state)
+    if handle is None or _file_handle_fields(handle) is None:
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    values: list[int | None] = []
+    for pointer in request.arguments[1:4]:
+        if not pointer:
+            values.append(None)
+            continue
+        try:
+            values.append(_read_guest_unsigned(state.memory, int(pointer), 8))
+        except KeyError:
+            return MachineExternalCallCompletion(request.request_id, result=0)
+    effect = VirtualFileEffect(
+        "set_times", handle.path, created_time=values[0],
+        accessed_time=values[1], modified_time=values[2],
+    )
+    if not _vfs_effects_valid(state.virtual_filesystem, (effect,)):
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    return MachineExternalCallCompletion(
+        request.request_id, result=1, filesystem_effects=(effect,),
+    )
+
+
+def _compare_file_time(request, state):
+    try:
+        left = _read_guest_unsigned(state.memory, int(request.arguments[0]), 8)
+        right = _read_guest_unsigned(state.memory, int(request.arguments[1]), 8)
+    except KeyError:
+        return None
+    result = -1 if left < right else 1 if left > right else 0
+    return MachineExternalCallCompletion(request.request_id, result=result)
+
+
+def _file_time_to_local_file_time(request, state):
+    # The deterministic bootstrap locale has a zero virtual UTC offset. A shell
+    # that models timezone transitions can replace this exact capability.
+    try:
+        value = _read_guest_unsigned(state.memory, int(request.arguments[0]), 8)
+    except KeyError:
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    return MachineExternalCallCompletion(
+        request.request_id, result=1,
+        memory_writes=(MachineExternalMemoryWrite(
+            int(request.arguments[1]), int(value).to_bytes(8, "little"),
+        ),),
+    )
+
+
+def _get_volume_path_name(request, state):
+    source, output, capacity = request.arguments[:3]
+    value = _read_utf16(state.memory, int(source))
+    filesystem = state.virtual_filesystem
+    if value is None or filesystem is None:
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    normalized = normalize_virtual_path(value, filesystem.current_directory)
+    parts = normalized.strip("/").split("/")
+    root = (
+        virtual_path_to_windows("/" + parts[0])
+        if parts and len(parts[0]) == 1 and parts[0].isalpha()
+        else "C:\\"
+    )
+    if capacity < len(root) + 1:
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    return MachineExternalCallCompletion(
+        request.request_id, result=1,
+        memory_writes=(MachineExternalMemoryWrite(
+            int(output), root.encode("utf-16le") + b"\x00\x00",
+        ),),
+    )
+
+
+def _get_volume_information(request, state):
+    root_pointer, label_output, label_capacity, serial_output = request.arguments
+    maximum_component_output = (
+        int(request.stack_arguments[0]) if request.stack_arguments else 0
+    )
+    flags_output = int(request.stack_arguments[1]) if len(request.stack_arguments) > 1 else 0
+    filesystem_output = int(request.stack_arguments[2]) if len(request.stack_arguments) > 2 else 0
+    filesystem_capacity = int(request.stack_arguments[3]) if len(request.stack_arguments) > 3 else 0
+    root = "C:\\" if not root_pointer else _read_utf16(state.memory, int(root_pointer))
+    if root is None or state.virtual_filesystem is None:
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    try:
+        normalized = normalize_virtual_path(root, state.virtual_filesystem.current_directory)
+        parts = normalized.strip("/").split("/")
+        mount_root = "/" + parts[0] if parts and len(parts[0]) == 1 else "/"
+        state.virtual_filesystem.stat(mount_root)
+    except (FileNotFoundError, PermissionError):
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    label = "Turing VFS"
+    filesystem_name = "TURINGFS"
+    if label_output and label_capacity <= len(label):
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    if filesystem_output and filesystem_capacity <= len(filesystem_name):
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    writes: list[MachineExternalMemoryWrite] = []
+    if label_output:
+        writes.append(MachineExternalMemoryWrite(
+            int(label_output), label.encode("utf-16le") + b"\x00\x00",
+        ))
+    if serial_output:
+        writes.append(MachineExternalMemoryWrite(
+            int(serial_output), (0x5455524E).to_bytes(4, "little"),
+        ))
+    if maximum_component_output:
+        writes.append(MachineExternalMemoryWrite(
+            maximum_component_output, (255).to_bytes(4, "little"),
+        ))
+    if flags_output:
+        # FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK.
+        writes.append(MachineExternalMemoryWrite(
+            flags_output, (0x6).to_bytes(4, "little"),
+        ))
+    if filesystem_output:
+        writes.append(MachineExternalMemoryWrite(
+            filesystem_output, filesystem_name.encode("utf-16le") + b"\x00\x00",
+        ))
+    return MachineExternalCallCompletion(
+        request.request_id, result=1, memory_writes=tuple(writes),
+    )
+
+
+def _get_disk_free_space_ex(request, state):
+    root = _read_utf16(state.memory, int(request.arguments[0]))
+    filesystem = state.virtual_filesystem
+    if root is None or filesystem is None:
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    try:
+        filesystem.stat(root)
+    except (FileNotFoundError, PermissionError):
+        return MachineExternalCallCompletion(request.request_id, result=0)
+    used = sum(len(entry.data) for entry in filesystem.entries.values())
+    total = 1 << 40
+    free = max(0, total - used)
+    writes = []
+    for pointer, value in (
+        (request.arguments[1], free),
+        (request.arguments[2], total),
+        (request.arguments[3], free),
+    ):
+        if pointer:
+            writes.append(MachineExternalMemoryWrite(
+                int(pointer), int(value).to_bytes(8, "little"),
+            ))
+    return MachineExternalCallCompletion(
+        request.request_id, result=1, memory_writes=tuple(writes),
+    )
 
 
 def _set_current_directory(request, state):
@@ -2191,6 +4013,22 @@ def _windows_find_data(filesystem, path: str) -> bytes:
     return bytes(payload)
 
 
+def _windows_existing_virtual_path(filesystem, path: str) -> str | None:
+    """Resolve an admitted VFS path with Windows case-insensitive semantics.
+
+    The shared virtual filesystem remains case-sensitive for native and web
+    shells.  Windows handlers add case folding at their ABI boundary.
+    """
+
+    normalized = normalize_virtual_path(path, filesystem.current_directory)
+    folded = normalized.casefold()
+    return next(
+        (entry.path for entry in filesystem.entries.values()
+         if entry.path.casefold() == folded),
+        None,
+    )
+
+
 def _find_first_file(request, state, *, thread_id: int = 1):
     pattern_value = _read_utf16(state.memory, request.arguments[0])
     output = request.arguments[1]
@@ -2205,8 +4043,9 @@ def _find_first_file(request, state, *, thread_id: int = 1):
     pattern_path = normalize_virtual_path(pattern_value, filesystem.current_directory)
     directory, pattern = pattern_path.rsplit("/", 1)
     directory = directory or "/"
+    admitted_directory = _windows_existing_virtual_path(filesystem, directory)
     try:
-        candidates = filesystem.list(directory)
+        candidates = filesystem.list(admitted_directory) if admitted_directory else ()
     except (FileNotFoundError, NotADirectoryError, PermissionError):
         candidates = ()
     matches = tuple(
@@ -2466,9 +4305,15 @@ def deterministic_windows_bootstrap_port(
             ),
             "GetModuleFileNameW": _get_module_filename(module_virtual_path),
         },
+        "api-ms-win-core-string-obsolete-l1-1-0.dll": {
+            # The obsolete Win32 spelling has the same ordinal comparison
+            # contract as wcscmp; cmd still imports it on current Windows.
+            "lstrcmpW": _msvcrt_wide_compare(),
+        },
         "msvcrt.dll": {
             "__set_app_type": _return_value(0),
             "_setjmp": _msvcrt_setjmp,
+            "longjmp": _msvcrt_longjmp,
             "_local_unwind": _msvcrt_local_unwind,
             "_vsnwprintf": _msvcrt_vsnwprintf(maximum_device_bytes // 2),
             "_initterm": _msvcrt_initterm,
@@ -2505,6 +4350,11 @@ def deterministic_windows_bootstrap_port(
                 )
             },
             "_get_osfhandle": _get_osfhandle,
+            "_pipe": _crt_pipe(maximum_device_bytes),
+            "_open_osfhandle": _crt_open_osfhandle,
+            "_close": _crt_close,
+            "_dup": _crt_dup,
+            "_dup2": _crt_dup2,
             "time": _msvcrt_time(file_time),
             "srand": _msvcrt_srand,
             "rand": _msvcrt_rand,
@@ -2528,9 +4378,15 @@ def deterministic_windows_bootstrap_port(
         },
         "api-ms-win-core-handle-l1-1-0.dll": {
             "CloseHandle": _windows_close_handle,
+            "DuplicateHandle": _duplicate_handle,
+        },
+        "api-ms-win-core-namedpipe-l1-1-0.dll": {
+            "CreatePipe": _create_pipe(maximum_device_bytes),
         },
         "api-ms-win-core-synch-l1-2-0.dll": {
-            "WaitForSingleObject": _wait_for_virtual_object,
+            "WaitForSingleObject": lambda request, state: _wait_for_virtual_object(
+                request, state, thread_id=thread_id,
+            ),
         },
         "api-ms-win-core-heap-l1-1-0.dll": {
             "HeapSetInformation": _heap_set_information,
@@ -2549,8 +4405,21 @@ def deterministic_windows_bootstrap_port(
             "GlobalUnlock": _return_value(1),
             "GlobalSize": _global_size,
         },
+        "api-ms-win-core-memory-l1-1-0.dll": {
+            "VirtualAlloc": _virtual_alloc,
+            "VirtualFree": _virtual_free,
+            "VirtualQuery": _virtual_query,
+            "ReadProcessMemory": _read_process_memory(maximum_device_bytes),
+        },
         "api-ms-win-core-registry-l1-1-0.dll": {
-            "RegOpenKeyExW": _empty_registry_open_key,
+            "RegOpenKeyExW": _registry_open_key,
+            "RegCloseKey": _registry_close_key,
+            "RegSetValueExW": _registry_set_value(maximum_device_bytes),
+            "RegCreateKeyExW": _registry_create_key,
+            "RegEnumKeyExW": _registry_enum_key,
+            "RegDeleteKeyExW": _registry_delete_key,
+            "RegDeleteValueW": _registry_delete_value,
+            "RegQueryValueExW": _registry_query_value,
         },
         "api-ms-win-core-console-l1-1-0.dll": {
             "GetConsoleCP": _return_value(input_code_page),
@@ -2591,6 +4460,17 @@ def deterministic_windows_bootstrap_port(
             "FormatMessageW": _format_cmd_system_message,
         },
         "api-ms-win-core-synch-l1-1-0.dll": {
+            "CreateMutexExW": _create_mutex(thread_id),
+            "CreateSemaphoreExW": _create_semaphore(thread_id),
+            "OpenSemaphoreW": _open_semaphore(thread_id),
+            "ReleaseMutex": _release_mutex(thread_id),
+            "ReleaseSemaphore": _release_semaphore(thread_id),
+            "WaitForSingleObject": lambda request, state: _wait_for_virtual_object(
+                request, state, thread_id=thread_id,
+            ),
+            "WaitForSingleObjectEx": lambda request, state: _wait_for_virtual_object(
+                request, state, thread_id=thread_id,
+            ),
             "InitializeCriticalSection": _initialize_critical_section,
             "EnterCriticalSection": _enter_critical_section(thread_id),
             "LeaveCriticalSection": _leave_critical_section(thread_id),
@@ -2619,9 +4499,24 @@ def deterministic_windows_bootstrap_port(
             ),
         },
         "api-ms-win-core-file-l1-1-0.dll": {
-            "ReadFile": _read_file(maximum_device_bytes),
+            "CreateFileW": _create_file(thread_id),
+            "ReadFile": _read_file(maximum_device_bytes, thread_id),
+            "WriteFile": _write_file(maximum_device_bytes, thread_id),
+            "FlushFileBuffers": _flush_file_buffers,
             "GetFullPathNameW": _get_full_path_name,
             "GetFileAttributesW": _get_file_attributes,
+            "GetFileAttributesExW": _get_file_attributes_ex,
+            "SetFileAttributesW": _set_file_attributes,
+            "SetEndOfFile": _set_end_of_file,
+            "SetFilePointerEx": _set_file_pointer_ex,
+            "SetFilePointer": _set_file_pointer,
+            "SetFileTime": _set_file_time,
+            "GetFileSize": _get_file_size,
+            "CompareFileTime": _compare_file_time,
+            "FileTimeToLocalFileTime": _file_time_to_local_file_time,
+            "GetVolumeInformationW": _get_volume_information,
+            "GetVolumePathNameW": _get_volume_path_name,
+            "GetDiskFreeSpaceExW": _get_disk_free_space_ex,
             "SetCurrentDirectoryW": _set_current_directory,
             "CreateDirectoryW": _create_directory,
             "RemoveDirectoryW": _delete_virtual_path(directory=True),
@@ -2646,9 +4541,13 @@ def deterministic_windows_bootstrap_port(
             "SetConsoleInputExeNameW": _set_console_input_exe_name,
             "GetConsoleInputExeNameW": _get_console_input_exe_name,
             "IsDebuggerPresent": _return_value(0),
-            "WaitForSingleObject": _wait_for_virtual_object,
+            "WaitForSingleObject": lambda request, state: _wait_for_virtual_object(
+                request, state, thread_id=thread_id,
+            ),
             "GetExitCodeThread": _get_thread_exit_code,
             "CloseHandle": _windows_close_handle,
+            "DuplicateHandle": _duplicate_handle,
+            "CreatePipe": _create_pipe(maximum_device_bytes),
         },
         "ntdll.dll": {
             "RtlCreateUnicodeStringFromAsciiz": _rtl_create_unicode_string_from_ascii,
@@ -2661,20 +4560,38 @@ def deterministic_windows_bootstrap_port(
         },
     }
     if program_registry is not None:
+        module_is_cmd = (
+            normalize_virtual_path(module_virtual_path, "/")
+            .rsplit("/", 1)[-1].casefold() == "cmd.exe"
+        )
+        if module_is_cmd and program_registry.resolve(
+            module_virtual_path, current_directory=current_directory,
+        ) is None:
+            program_registry.register(
+                module_virtual_path,
+                bundle_reference="bundle:system/windows-cmd@virtual",
+                executor_reference="virtual-cmd-builtins:v1",
+                executor=_virtual_cmd_builtin,
+            )
         create_process = _create_virtual_process(
             program_registry, current_directory=current_directory,
+            maximum_device_bytes=maximum_device_bytes,
         )
         api_sets["api-ms-win-core-processthreads-l1-1-0.dll"].update({
             "CreateProcessW": create_process,
             "GetExitCodeProcess": _get_virtual_process_exit_code,
         })
         api_sets.setdefault("api-ms-win-core-synch-l1-2-0.dll", {}).update({
-            "WaitForSingleObject": _wait_for_virtual_object,
+            "WaitForSingleObject": lambda request, state: _wait_for_virtual_object(
+                request, state, thread_id=thread_id,
+            ),
         })
         api_sets["kernel32.dll"].update({
             "CreateProcessW": create_process,
             "GetExitCodeProcess": _get_virtual_process_exit_code,
-            "WaitForSingleObject": _wait_for_virtual_object,
+            "WaitForSingleObject": lambda request, state: _wait_for_virtual_object(
+                request, state, thread_id=thread_id,
+            ),
         })
     handlers = {
         (library, symbol): handler

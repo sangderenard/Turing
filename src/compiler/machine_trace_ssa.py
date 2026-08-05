@@ -226,10 +226,23 @@ def _changed_resources(
             if left.get(key) != right.get(key):
                 changed[f"{domain}.{key}"] = right.get(key, "<deleted>")
                 domains.add(domain)
+                if (
+                    domain == "device" and str(key).startswith("pipe.")
+                    or domain == "system" and str(key).startswith("windows.pipe.")
+                ):
+                    domains.add("pipe")
     if before.virtual_filesystem != after.virtual_filesystem:
         generation = -1 if after.virtual_filesystem is None else after.virtual_filesystem.generation
         changed["filesystem.state"] = generation
         domains.add("filesystem")
+    if before.virtual_registry != after.virtual_registry:
+        generation = -1 if after.virtual_registry is None else after.virtual_registry.generation
+        changed["registry.state"] = generation
+        domains.add("registry")
+    if before.virtual_memory != after.virtual_memory:
+        generation = -1 if after.virtual_memory is None else after.virtual_memory.generation
+        changed["virtual_memory.state"] = generation
+        domains.add("virtual_memory")
     if before.external_requests != after.external_requests:
         changed["external.pending"] = tuple(
             f"{item.reference.library}!{item.reference.symbol}"
