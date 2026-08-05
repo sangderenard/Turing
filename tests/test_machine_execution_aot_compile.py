@@ -18,10 +18,15 @@ from types import SimpleNamespace
 
 from src.common.tensors.accelerator_backends.aot_compile import compile_ast_aot
 from src.compiler import machine_execution as me
-from src.compiler.amd64_machine_semantics import condition_holds, default_effect_handlers
-from src.compiler.machine_execution import MachineExecutionOrchestrator, MachineExecutionState
+from src.compiler.amd64_machine_semantics import (
+    condition_holds, default_effect_handlers, indirect_target,
+)
+from src.compiler.machine_execution import (
+    MachineExecutionOrchestrator, MachineExecutionState, MachineExecutionStatus,
+    MachineExternalReference,
+)
 from src.compiler.machine_reference_vocabulary import (
-    MachineSemanticToken, RelativeAddressOperand,
+    MachineSemanticToken, RegisterOperand, RelativeAddressOperand, X86Register,
 )
 
 _STEP_SOURCE = textwrap.dedent(inspect.getsource(MachineExecutionOrchestrator.step))
@@ -43,6 +48,42 @@ def test_step_dispatch_compiles_for_a_plain_instruction():
     )
     executor = MachineExecutionOrchestrator(program, effect_handlers=default_effect_handlers())
     state = MachineExecutionState(pc=0x2000)
+
+    compilation = compile_ast_aot(
+        _STEP_SOURCE, "step", {"self": executor, "state": state},
+        python_bindings=_STEP_BINDINGS, precompile_only=True,
+    )
+    assert compilation.control_shortfalls == ()
+
+
+def test_step_dispatch_compiles_through_an_external_call_boundary():
+    # Exercises _step_decoded's INDIRECT_CALL branch, which resolves an
+    # external target via self.indirect_target_handler and
+    # self.external_target_resolver, and constructs a real
+    # MachineExternalCallRequest -- this is the exact WAITING_EXTERNAL
+    # boundary machine_tape_forwarding.py forwards completions across, now
+    # proven reachable through the same compiled dispatch as everything
+    # else here, not just interpreted.
+    target = 0xFFFF800000000100
+    instruction = SimpleNamespace(
+        address=0xBC00, encoded=b"\xff\xd0",
+        semantic=MachineSemanticToken.INDIRECT_CALL,
+        token=SimpleNamespace(name="CALL_RM64"),
+        operands=(RegisterOperand(X86Register.RAX, 64),),
+    )
+    program = SimpleNamespace(
+        image=SimpleNamespace(image_base=0xBC00, entrypoint_rva=0),
+        functions=(SimpleNamespace(report=SimpleNamespace(instructions=(instruction,))),),
+    )
+    reference = MachineExternalReference(1, target, "windows", "demo.dll", "Run")
+    executor = MachineExecutionOrchestrator(
+        program, effect_handlers=default_effect_handlers(),
+        indirect_target_handler=indirect_target,
+        external_target_resolver=lambda candidate: reference if candidate == target else None,
+    )
+    registers = [0] * 16
+    registers[0], registers[4] = target, 0xD008
+    state = MachineExecutionState(pc=0xBC00, registers=tuple(registers))
 
     compilation = compile_ast_aot(
         _STEP_SOURCE, "step", {"self": executor, "state": state},
