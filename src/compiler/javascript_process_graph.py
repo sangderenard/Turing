@@ -7,6 +7,17 @@ Handler vocabulary GLSL and sympy already lower into (see
 javascript_source_tables.py's module docstring), so a JS expression and an
 equivalent Python/sympy expression land on identical canonical node types.
 
+Nodes are built with the exact schema symbolic_process_graph.py's
+``make_node`` uses (``type``/``op``/``label``/``attributes``/``constant``/
+``tensor``/``bit_quanta``/``parents``/``children``, edges running operand
+-> consumer) because that schema is what ``process_graph_to_ssa_instrs``
+actually requires -- not an approximation of it. A hand-rolled node shape
+that merely carries the right Handler *name* but not this schema fails in
+the real AOT/SSA pipeline with ``KeyError: 'children'`` before it ever
+reaches scheduling; this module is written and tested against the real
+pipeline to rule that out (see test_javascript_process_graph.py's
+``test_from_javascript_lowers_through_the_real_aot_ssa_pipeline``).
+
 `ingest_javascript_expression` is the from-javascript direction: one ESTree
 expression (as produced by vendor/js_ast_parse.js) becomes canonical
 Handler-tagged ProcessGraph nodes. `javascript_source_from_graph` is the
@@ -20,7 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from ..transmogrifier.ssa_registry import Handler
 from .javascript_source_tables import (
@@ -50,7 +61,7 @@ class JavaScriptExpressionShortfall:
 @dataclass
 class JavaScriptExpressionLowering:
     graph: Any
-    root: str
+    root: int
     shortfalls: tuple[JavaScriptExpressionShortfall, ...]
 
     @property
@@ -73,106 +84,141 @@ def _callee_spelling(callee: dict | None) -> str:
 def ingest_javascript_expression(
     graph: Any, node: dict, *, owner: str,
 ) -> JavaScriptExpressionLowering:
-    """Translate one ESTree expression into canonical Handler-tagged nodes."""
+    """Translate one ESTree expression into canonical Handler-tagged nodes.
+
+    Node shape matches symbolic_process_graph.py's ``make_node`` exactly --
+    the real schema the AOT/SSA pipeline consumes -- not a parallel one.
+    """
 
     shortfalls: list[JavaScriptExpressionShortfall] = []
-    counter = [0]
+    identifiers: dict[str, int] = {}
+    next_id = [
+        max((item for item in graph.G if isinstance(item, int)), default=-1) + 1
+    ]
 
-    def next_id() -> str:
-        counter[0] += 1
-        return f"{owner}:expr:{counter[0]}"
+    def make_node(
+        node_type: str,
+        operation: str | None,
+        label: str,
+        parents: Sequence[tuple[int, str]],
+        *,
+        attributes: Mapping[str, Any] | None = None,
+        constant: Any = None,
+    ) -> int:
+        node_id = next_id[0]
+        next_id[0] += 1
+        attributes = dict(attributes or {})
+        attributes.setdefault("source_language", "javascript")
+        parents = list(parents)
+        graph.G.add_node(
+            node_id,
+            type=node_type,
+            op=operation,
+            label=label,
+            attributes=attributes,
+            constant=constant,
+            tensor={},
+            bit_quanta={},
+            parents=parents,
+            children=[],
+        )
+        for parent_id, role in parents:
+            graph.G.add_edge(parent_id, node_id)
+            graph.G.nodes[parent_id].setdefault("children", []).append(
+                (node_id, role)
+            )
+        return node_id
 
-    def unsupported(node_id: str, spelling: str, code: str, message: str) -> None:
+    def unsupported(spelling: str, code: str, message: str) -> int:
         shortfalls.append(JavaScriptExpressionShortfall(code, message))
-        graph.G.add_node(node_id, type="Unsupported", spelling=spelling)
+        return make_node(
+            "Unsupported", None, spelling, (),
+            attributes={"spelling": spelling},
+        )
 
-    def lower(expr: dict) -> str:
+    def lower(expr: dict) -> int:
         kind = expr.get("type")
         if kind in ("BinaryExpression", "LogicalExpression"):
             operator = expr.get("operator")
             handler = JAVASCRIPT_BINARY_TO_SSA.get(operator)
-            node_id = next_id()
             if handler is None:
                 reason = (
                     "has no exact Handler equivalent"
                     if operator in JAVASCRIPT_UNSUPPORTED_BINARY
                     else "is not a recognized JS binary operator"
                 )
-                unsupported(
-                    node_id, operator, "unsupported-binary-operator",
+                return unsupported(
+                    operator, "unsupported-binary-operator",
                     f"{operator!r} {reason}",
                 )
-                return node_id
             left = lower(expr["left"])
             right = lower(expr["right"])
-            graph.G.add_node(node_id, type=handler.name, operation=handler.name)
-            graph.G.add_edge(node_id, left, role="left")
-            graph.G.add_edge(node_id, right, role="right")
-            return node_id
+            return make_node(
+                handler.name, handler.name, handler.name,
+                [(left, "left"), (right, "right")],
+            )
         if kind == "UnaryExpression":
             operator = expr.get("operator")
             handler = JAVASCRIPT_UNARY_TO_SSA.get(operator)
-            node_id = next_id()
             if handler is None:
                 reason = (
                     "has no exact Handler equivalent"
                     if operator in JAVASCRIPT_UNSUPPORTED_UNARY
                     else "is not a recognized JS unary operator"
                 )
-                unsupported(
-                    node_id, operator, "unsupported-unary-operator",
+                return unsupported(
+                    operator, "unsupported-unary-operator",
                     f"{operator!r} {reason}",
                 )
-                return node_id
             operand = lower(expr["argument"])
-            graph.G.add_node(node_id, type=handler.name, operation=handler.name)
-            graph.G.add_edge(node_id, operand, role="operand")
-            return node_id
+            return make_node(
+                handler.name, handler.name, handler.name,
+                [(operand, "operand")],
+            )
         if kind == "CallExpression":
             callee_spelling = _callee_spelling(expr.get("callee"))
             canonical = JAVASCRIPT_DIRECT_CALLS.get(callee_spelling)
-            node_id = next_id()
             arguments = [lower(argument) for argument in expr.get("arguments", ())]
+            parents = [
+                (argument, f"arg{index}")
+                for index, argument in enumerate(arguments)
+            ]
             if canonical is None:
                 shortfalls.append(JavaScriptExpressionShortfall(
                     "unresolved-call",
                     f"{callee_spelling!r} is not in JAVASCRIPT_DIRECT_CALLS",
                 ))
-                graph.G.add_node(
-                    node_id, type="Call", operation=Handler.Call.name,
-                    callee=callee_spelling,
+                return make_node(
+                    "Call", Handler.Call.name, callee_spelling, parents,
+                    attributes={"callee": callee_spelling},
                 )
-            else:
-                graph.G.add_node(
-                    node_id, type="Call", operation=Handler.Call.name,
-                    callee=canonical,
-                )
-            for argument in arguments:
-                graph.G.add_edge(node_id, argument, role="argument")
-            return node_id
+            return make_node(
+                "Call", Handler.Call.name, canonical, parents,
+                attributes={"callee": canonical},
+            )
         if kind == "Identifier":
-            node_id = expr["name"]
-            if node_id not in graph.G:
-                graph.G.add_node(
-                    node_id, type="Load", operation=Handler.Load.name,
-                    binding_name=node_id,
-                )
+            name = expr["name"]
+            if name in identifiers:
+                return identifiers[name]
+            node_id = make_node(
+                "Input", Handler.Load.name, name, (),
+                attributes={"binding_name": name},
+            )
+            identifiers[name] = node_id
             return node_id
         if kind == "Literal":
-            node_id = next_id()
-            graph.G.add_node(
-                node_id, type="Const", operation=Handler.Const.name,
-                value=expr.get("value"),
+            value = expr.get("value")
+            return make_node(
+                "Constant", Handler.Const.name, repr(value), (),
+                attributes={"value": value}, constant=value,
             )
-            return node_id
-        node_id = next_id()
-        unsupported(
-            node_id, kind, "unsupported-node-type",
+        return unsupported(
+            kind, "unsupported-node-type",
             f"{kind!r} has no ProcessGraph translation",
         )
-        return node_id
 
     root = lower(node)
+    graph.roots = [root]
     return JavaScriptExpressionLowering(graph, root, tuple(shortfalls))
 
 
@@ -188,48 +234,41 @@ def _javascript_literal_spelling(value: Any) -> str:
     return repr(value)
 
 
-def javascript_source_from_graph(graph: Any, node_id: str) -> str:
+def javascript_source_from_graph(graph: Any, node_id: int) -> str:
     """Render one canonical Handler-tagged ProcessGraph node back to JS.
 
     The inverse of ingest_javascript_expression's binary/unary/call/const/
-    load cases, using SSA_TO_JAVASCRIPT_BINARY/UNARY -- the same tables
-    whose reverse direction validate_invertible_tables() already proves
-    bijective.
+    load cases, reading the same ``parents`` list ``make_node`` populates,
+    using SSA_TO_JAVASCRIPT_BINARY/UNARY -- the same tables whose reverse
+    direction validate_invertible_tables() already proves bijective.
     """
 
     data = graph.G.nodes[node_id]
     node_type = data.get("type")
-    if node_type == "Const":
-        return _javascript_literal_spelling(data.get("value"))
-    if node_type == "Load":
-        return str(data.get("binding_name", node_id))
+    if node_type == "Constant":
+        return _javascript_literal_spelling(data["attributes"].get("value"))
+    if node_type == "Input":
+        return str(data["attributes"].get("binding_name", node_id))
     if node_type == "Call":
-        callee = data.get("callee", "")
+        callee = data["attributes"].get("callee", "")
         spelling = _REVERSE_DIRECT_CALLS.get(callee, callee)
+        by_role = {role: parent for parent, role in data["parents"]}
         arguments = [
-            javascript_source_from_graph(graph, target)
-            for _, target, edge in graph.G.out_edges(node_id, data=True)
-            if edge.get("role") == "argument"
+            javascript_source_from_graph(graph, by_role[role])
+            for role in sorted(by_role, key=lambda item: int(item[3:]))
         ]
         return f"{spelling}({', '.join(arguments)})"
     try:
         handler = Handler[node_type]
     except KeyError as error:
         raise ValueError(f"cannot render node type {node_type!r} to javascript") from error
+    by_role = {role: parent for parent, role in data["parents"]}
     if handler in SSA_TO_JAVASCRIPT_UNARY:
-        operand = next(
-            target for _, target, edge in graph.G.out_edges(node_id, data=True)
-            if edge.get("role") == "operand"
-        )
-        rendered = javascript_source_from_graph(graph, operand)
+        rendered = javascript_source_from_graph(graph, by_role["operand"])
         return f"{SSA_TO_JAVASCRIPT_UNARY[handler]}({rendered})"
     if handler in SSA_TO_JAVASCRIPT_BINARY:
-        edges = {
-            edge.get("role"): target
-            for _, target, edge in graph.G.out_edges(node_id, data=True)
-        }
-        left = javascript_source_from_graph(graph, edges["left"])
-        right = javascript_source_from_graph(graph, edges["right"])
+        left = javascript_source_from_graph(graph, by_role["left"])
+        right = javascript_source_from_graph(graph, by_role["right"])
         return f"({left} {SSA_TO_JAVASCRIPT_BINARY[handler]} {right})"
     raise ValueError(f"cannot render Handler {handler} to javascript")
 

@@ -15,6 +15,7 @@ from src.compiler.javascript_source_tables import (
     SSA_TO_JAVASCRIPT_UNARY,
     validate_invertible_tables,
 )
+from src.compiler.ssa_builder import process_graph_to_ssa_instrs
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 from src.transmogrifier.ssa_registry import Handler
 
@@ -54,6 +55,32 @@ def test_from_javascript_produces_canonical_handler_nodes(source):
     assert lowering.complete, lowering.shortfalls
     root_type = graph.G.nodes[lowering.root]["type"]
     assert root_type in {handler.name for handler in Handler}
+
+
+@pytest.mark.parametrize("source", [
+    "a + b",
+    "a - b * c",
+    "(a + b) * (c - d)",
+    "-a",
+    "!flag",
+    "a === b",
+    "Math.sqrt(a)",
+])
+def test_from_javascript_lowers_through_the_real_aot_ssa_pipeline(source):
+    # Regression guard: an earlier version of ingest_javascript_expression
+    # hand-rolled graph.G.add_node()/add_edge() with made-up attribute names
+    # and reported these same shortfall-free/round-trip results without ever
+    # running the output through the compiler. It failed immediately with
+    # KeyError: 'children' the first time it was actually asked to schedule.
+    # This test is the thing that would have caught that.
+    expression = _parse_expression(source)
+    graph = ProcessGraph(materialize_memory=False)
+    lowering = ingest_javascript_expression(graph, expression, owner="probe")
+    assert lowering.complete, lowering.shortfalls
+
+    graph.scheduler = type(graph.scheduler)(graph)
+    instrs = process_graph_to_ssa_instrs(graph, schedule="asap")
+    assert len(instrs) > 0
 
 
 @pytest.mark.parametrize("source", [
