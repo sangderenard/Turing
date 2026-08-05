@@ -458,6 +458,30 @@ def _normalize_lexical_values(
             expression,
             (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
         ):
+            # Comprehensions and generator expressions have owned their own
+            # scope since Python 3.0: a `for x in ...` target inside one is
+            # never visible outside it, even when an outer variable of the
+            # same name already exists or gets bound later. (The one
+            # exception, a `:=` walrus target, deliberately leaks to the
+            # enclosing scope per PEP 572 -- that goes through bind_target,
+            # not bind_loop_target, and is untouched here.) Without this,
+            # a comprehension's `for` target silently overwrote (or was
+            # later mistaken for) an unrelated same-named binding elsewhere
+            # in the function -- for example `tuple(f(x) for x in seq)`
+            # followed later by an ordinary `for x in other:` picking up
+            # the comprehension's already-evaporated node as its own
+            # "before this loop" value, and crashing much later with
+            # "missing ProcessGraph input" once that node was removed.
+            comprehension_target_names = {
+                name
+                for generator in expression.generators
+                for name in loop_target_names(generator.target)
+            }
+            shadowed_bindings = {
+                name: environment[name]
+                for name in comprehension_target_names
+                if name in environment
+            }
             for generator in expression.generators:
                 resolve_expression(generator)
             if isinstance(expression, ast.DictComp):
@@ -488,6 +512,11 @@ def _normalize_lexical_values(
                             "materializer_node_id": node_id,
                         })
                         attributes["loop_iteration_outputs"] = tuple(outputs)
+            for name in comprehension_target_names:
+                if name in shadowed_bindings:
+                    environment[name] = shadowed_bindings[name]
+                else:
+                    environment.pop(name, None)
             return node_id if node_id in graph.G else None
         if isinstance(expression, ast.comprehension):
             resolve_expression(expression.iter)
@@ -906,7 +935,33 @@ def _normalize_lexical_values(
             and isinstance(expression.args[0], ast.GeneratorExp)
             and node_id in graph.G
         ):
+            # This re-resolves generator_expression.elt, which the
+            # (ListComp, SetComp, DictComp, GeneratorExp) branch above
+            # already resolved once, inside its own scoped push/pop of the
+            # generator's `for` target names. resolve_expression() is not
+            # memoized for Name lookups -- it re-reads `environment` on
+            # every call -- so this second, unscoped pass through the same
+            # `elt` subtree re-looks-up the target name(s) (e.g. `address`
+            # in `tuple(f(address) for address in xs)`) after that first
+            # pass already popped them, silently creating a fresh
+            # "external input" binding for what should be, and already
+            # was, a properly loop-scoped local. That stray rebinding then
+            # leaked into whatever unrelated code came later in the
+            # function and happened to reuse the same name. Same
+            # push/pop discipline as above, applied to this second walk.
             generator_expression = expression.args[0]
+            comprehension_target_names = {
+                name
+                for generator in generator_expression.generators
+                for name in loop_target_names(generator.target)
+            }
+            shadowed_bindings = {
+                name: environment[name]
+                for name in comprehension_target_names
+                if name in environment
+            }
+            for generator in generator_expression.generators:
+                bind_loop_target(generator.target)
             value_id = resolve_expression(generator_expression.elt)
             for generator in generator_expression.generators:
                 generator_id = id(generator)
@@ -929,6 +984,11 @@ def _normalize_lexical_values(
                     "materializer_node_id": node_id,
                 })
                 attributes["loop_iteration_outputs"] = tuple(outputs)
+            for name in comprehension_target_names:
+                if name in shadowed_bindings:
+                    environment[name] = shadowed_bindings[name]
+                else:
+                    environment.pop(name, None)
         return node_id if node_id in graph.G else None
 
     def bind_target(

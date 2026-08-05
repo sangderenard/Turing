@@ -877,3 +877,108 @@ def convert(value):
         and (data.get("attributes") or {}).get("binding_name") == "numeric"
         for _node_id, data in function_graph.G.nodes(data=True)
     )
+
+
+def test_generator_expression_target_does_not_leak_into_later_same_named_loop():
+    # A comprehension/generator-expression `for` target has owned its own
+    # scope since Python 3.0 -- it is never visible outside the
+    # comprehension, unlike a bare `for` statement's target. Before this was
+    # fixed, `environment["address"]` set while resolving
+    # `tuple(... for address in xs)` was never undone, so the *unrelated*
+    # `for address in ys:` statement two lines later picked up the
+    # comprehension's own (later-evaporated) node as its "value of address
+    # before this loop" -- surfacing much later, once that node was deleted,
+    # as an unrelated "missing ProcessGraph input" KeyError with no mention
+    # of a comprehension anywhere nearby.
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def repro(xs, ys):
+    tagged = tuple(int(address) for address in xs)
+    total = 0
+    for address in ys:
+        total = total + address
+    return total, tagged
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("repro").graph
+
+    for_loops = [
+        (node_id, data)
+        for node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    ]
+    assert len(for_loops) == 1
+    _node_id, loop_data = for_loops[0]
+    attributes = loop_data.get("attributes") or {}
+    # The real `for address in ys:` has nothing bound before it -- the
+    # comprehension's own `address` must not appear as its "initial" value.
+    assert "address" not in attributes.get("loop_target_initials", {})
+
+
+def test_generator_expression_materialization_pass_also_does_not_leak_target():
+    # Same as above but for tuple()/list() around the generator expression,
+    # which topological_reducer.py resolves the generator's `elt` a second
+    # time (to attach loop_iteration_outputs metadata) through a separate,
+    # originally-unscoped code path -- fixing only the first pass left this
+    # second one still leaking.
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def repro(xs, ys):
+    tagged = tuple(int(address) & 1 for address in xs)
+    total = 0
+    for address in ys:
+        total = total + address
+    return total, tagged
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("repro").graph
+
+    for_loops = [
+        (node_id, data)
+        for node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    ]
+    assert len(for_loops) == 1
+    _node_id, loop_data = for_loops[0]
+    attributes = loop_data.get("attributes") or {}
+    assert "address" not in attributes.get("loop_target_initials", {})
+
+
+def test_generator_target_leak_no_longer_crashes_the_real_aot_pipeline():
+    # End-to-end regression for the bug these two tests isolate: compiling
+    # the exact repro shape through the real compiler entrypoint (not just
+    # the reducer) used to fail with a bare `KeyError` from deep inside
+    # capture, referencing a node number with no readable connection to a
+    # comprehension five lines above the code that actually failed.
+    from src.common.tensors.accelerator_backends.aot_compile import (
+        compile_ast_aot,
+    )
+
+    source = """
+def repro(xs, ys, flag):
+    tagged = tuple(int(address) for address in xs)
+    total = 0
+    for address in ys:
+        total = total + address
+    if flag:
+        return total + len(tagged)
+    return total
+"""
+    for xs, ys, flag in [
+        ((), (), True),
+        ((1, 2), (), True),
+        ((), (3, 4), True),
+        ((1, 2), (3, 4), False),
+    ]:
+        compile_ast_aot(
+            source, "repro", {"xs": xs, "ys": ys, "flag": flag},
+            precompile_only=True,
+        )
