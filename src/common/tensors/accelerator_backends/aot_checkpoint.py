@@ -26,12 +26,30 @@ def _new_rlock():
     return threading.RLock()
 
 
+def _restore_sympy_global_parameters(state: Mapping[str, Any]):
+    """Return SymPy's process singleton with its thread-local state restored."""
+
+    from sympy.core.parameters import global_parameters
+
+    global_parameters.__dict__.update(dict(state))
+    return global_parameters
+
+
 class _CheckpointPickler(cloudpickle.CloudPickler):
     """Snapshot compiler state while recreating synchronization handles."""
 
     dispatch_table = cloudpickle.CloudPickler.dispatch_table.copy()
     dispatch_table[type(threading.Lock())] = lambda _lock: (_new_lock, ())
     dispatch_table[type(threading.RLock())] = lambda _lock: (_new_rlock, ())
+    try:
+        from sympy.core.parameters import global_parameters
+
+        dispatch_table[type(global_parameters)] = lambda parameters: (
+            _restore_sympy_global_parameters,
+            (dict(parameters.__dict__),),
+        )
+    except ImportError:
+        pass
 
 
 def _stable_value(value: Any) -> Any:

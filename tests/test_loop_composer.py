@@ -23,6 +23,7 @@ from src.compiler.loop_composer import (
     planned_collection_bindings,
 )
 from src.compiler.glsl_deployment_strategy import (
+    propagate_bound_planner_specializations,
     strategize_shell_deployment,
 )
 from src.compiler.loop_ir import (
@@ -262,6 +263,72 @@ def test_literal_callsite_specialization_precedes_single_loop_reduction():
     assert evaporated.loop.iterable_constant == (1, 2, 3)
 
 
+def test_first_class_function_parameter_becomes_a_parametric_callsite_edge():
+    module = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.build_from_ast(ast.parse(
+            "def apply(value, operation):\n"
+            "    return operation(value)\n"
+            "\n"
+            "def increment(value):\n"
+            "    return value + 1\n"
+            "\n"
+            "def root(value):\n"
+            "    return apply(value, increment)\n"
+        ))
+    reduce_abstract_tensor_topology(module)
+
+    deployment_type = strategize_shell_deployment(module)
+    deployment = deployment_type()
+    root = next(
+        shell
+        for shell in deployment.function_shells.values()
+        if shell.process_graph.G.graph.get("function_name") == "root"
+    )
+    apply = next(
+        shell
+        for shell in root.callsite_function_shells.values()
+        if shell.process_graph.G.graph.get("function_name") == "apply"
+    )
+    callback = next(iter(apply.callsite_function_shells.values()))
+
+    assert callback.process_graph.G.graph.get("function_name") == "increment"
+    assert any(
+        (data.get("attributes") or {}).get("callee_resolution")
+        == "bound-function-parameter"
+        for _node_id, data in apply.process_graph.G.nodes(data=True)
+    )
+
+
+def test_mutable_public_parameter_is_not_a_planner_specialization():
+    module = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.build_from_ast(ast.parse(
+            "def parse_and_run(source):\n"
+            "    return consume(source)\n"
+            "\n"
+            "def consume(source):\n"
+            "    return len(source)\n"
+        ))
+    reduce_abstract_tensor_topology(module)
+
+    propagate_bound_planner_specializations(
+        module,
+        "parse_and_run",
+        {"source": "sample only"},
+        mutable_parameters=("source",),
+    )
+
+    entry = module.function_table.entry("parse_and_run").graph
+    child = module.function_table.entry("consume").graph
+    assert "source" not in entry.G.graph.get(
+        "planner_specializations", {}
+    )
+    assert "source" not in child.G.graph.get(
+        "planner_specializations", {}
+    )
+
+
 def test_loop_composer_keeps_larger_range_in_glsl_source():
     graph = _function_graph(
         "def kernel(x):\n"
@@ -437,6 +504,30 @@ def test_static_iterable_is_an_explicit_constant_loop_definition():
     assert plan.semantic.body_closure is not None
     assert reduction.control_program.static_iterable_bindings
     assert not reduction.control_program.iterable_bindings
+
+
+def test_enumerate_resident_iterable_exports_projected_bindings():
+    graph = _function_graph(
+        "def kernel(field):\n"
+        "    for index, value in enumerate(field):\n"
+        "        field[index] = value + 1\n"
+        "    return field\n",
+        "kernel",
+    )
+    plan, = _glsl_composer().compose(graph)
+    reduction, = analyze_shader_loop_reductions(
+        graph, (plan,), (plan.loop.body_nodes,)
+    )
+
+    assert reduction.collapsible
+    assert reduction.control_program is not None
+    bindings = reduction.control_program.projected_iterable_bindings
+    assert len(bindings) == 2
+    assert bindings[0][3] == "induction"
+    assert bindings[1][3] is None
+    assert reduction.control_program.root.stop == (
+        f"__iterable_extent_{bindings[0][0]}__"
+    )
 
 
 def test_materialized_closure_iterable_binds_resident_source_identities():

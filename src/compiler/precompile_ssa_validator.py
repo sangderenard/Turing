@@ -116,6 +116,7 @@ PRECOMPILE_TO_SSA: dict[str, Handler] = {
     "reshape": Handler.Call,
     "view": Handler.Call,
     "broadcast_to": Handler.Call,
+    "repeat": Handler.Call,
     "mean": Handler.Call,
     "zeros_like": Handler.Fill,
     "bitand": Handler.And,

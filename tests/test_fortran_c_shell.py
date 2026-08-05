@@ -77,6 +77,7 @@ def test_ast_c_shell_uses_captured_early_return_identity(tmp_path):
         "first": pytest.approx(0.1),
         "sum": pytest.approx(0.1),
     }
+    assert "source_name: dt" in artifact.api_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(
@@ -205,6 +206,69 @@ end module two_extent_fortran
 
     assert "int32_t, int32_t, double *" in artifact.c_source_path.read_text()
     assert payload["outputs"]["y"] == {"first": 1.0, "sum": 36.0}
+
+
+@pytest.mark.skipif(
+    fortran_compiler() is None,
+    reason="no Fortran compiler installed",
+)
+def test_c_shell_converts_multidimensional_row_major_arenas_at_boundary(tmp_path):
+    source = """
+module layout_fortran
+  use, intrinsic :: iso_c_binding
+  implicit none
+contains
+  subroutine alter_cell(extent_2, extent_3, x, y) bind(C, name="alter_cell")
+    integer(c_int), value :: extent_2
+    integer(c_int), value :: extent_3
+    real(c_double), intent(in) :: x(extent_2, extent_3)
+    real(c_double), intent(out) :: y(extent_2, extent_3)
+    y = x
+    y(1, 2) = y(1, 2) + 100.0_c_double
+  end subroutine alter_cell
+end module layout_fortran
+"""
+    parameters = (
+        Parameter(
+            "extent_2", "extent", "int32", "int32_t",
+            "c_int32", "value",
+        ),
+        Parameter(
+            "extent_3", "extent", "int32", "int32_t",
+            "c_int32", "value",
+        ),
+        Parameter(
+            "x", "input", "float64", "double", "c_double",
+            "reference", (2, 3), "extent_2", "x",
+        ),
+        Parameter(
+            "y", "output", "float64", "double", "c_double",
+            "reference", (2, 3), "extent_2", "y",
+        ),
+    )
+    module = FortranModule(
+        "layout_fortran",
+        source,
+        api=CompiledProgramAPI(
+            "layout_fortran", "fortran", "alter_cell",
+            (EntryPoint(
+                "alter_cell", "alter_cell", "control", parameters,
+            ),),
+        ),
+    )
+    values = np.arange(6.0).reshape(2, 3)
+
+    artifact = compile_fortran_module_c_shell(
+        module, {"x": values}, tmp_path, name="layout_native",
+    )
+    artifact.run()
+    result = np.fromfile(artifact.final_outputs_path, dtype=np.float64)
+
+    expected = values.copy()
+    expected[0, 1] += 100.0
+    np.testing.assert_array_equal(result.reshape(2, 3), expected)
+    c_source = artifact.c_source_path.read_text(encoding="utf-8")
+    assert "logical_index" in c_source
 
 
 def test_generated_c_shell_uses_win32_rgb_blit_from_shared_io_contract():

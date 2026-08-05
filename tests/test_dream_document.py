@@ -247,7 +247,9 @@ def test_machine_wasm_bootstrap_authenticates_the_browser_journal():
     assert "TuringRecompiledMachineBlock" in embedded.html
     assert "recompiledMachineProjection" in embedded.html
     assert "api.localReplay.replaceFrames(projected)" in embedded.html
-    assert 'get("recompiled-step") === "1"' in embedded.html
+    assert 'get("recompiled-step") || 0' in embedded.html
+    assert "Math.min(requestedSteps, projected.length - 1)" in embedded.html
+    assert "index < boundedSteps" in embedded.html
     assert 'api.sendControl("step_forward")' in embedded.html
     assert "journal_effect_offset" in embedded.html
 

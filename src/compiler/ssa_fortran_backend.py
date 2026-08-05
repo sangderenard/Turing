@@ -28,7 +28,9 @@ common case here.
 
 from __future__ import annotations
 
+import math
 import shutil
+import struct
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -194,7 +196,7 @@ _COMPARISON = frozenset(
 _SHAPE_ONLY = frozenset(
     {
         "slice", "reshape", "view", "broadcast_to", "permute", "pad", "stack",
-        "concat", "gather", "scatter", "index_set",
+        "concat", "gather", "scatter", "index_set", "repeat",
     }
 )
 
@@ -425,6 +427,11 @@ def _literal(value: Any) -> str:
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
+        if math.isnan(value):
+            return "ieee_value(0.0_c_double, ieee_quiet_nan)"
+        if math.isinf(value):
+            direction = "ieee_positive_inf" if value > 0 else "ieee_negative_inf"
+            return f"ieee_value(0.0_c_double, {direction})"
         text = repr(float(value))
         if "e" in text or "E" in text:
             mantissa, _, exponent = text.partition("e")
@@ -435,6 +442,33 @@ def _literal(value: Any) -> str:
             text += ".0"
         return f"{text}_c_double"
     raise FortranEmissionError(f"cannot express literal {value!r} in Fortran")
+
+
+def _llvm_literal(value: str) -> Any:
+    """Decode the scalar spelling retained by the LLVM-to-SSA importer."""
+
+    dtype, separator, token = str(value).strip().partition(" ")
+    if not separator:
+        raise FortranEmissionError(f"malformed LLVM literal {value!r}")
+    token = token.strip()
+    if dtype.startswith("i"):
+        if token in {"true", "false"}:
+            return token == "true"
+        return int(token, 0)
+    if dtype in {"half", "float", "double"}:
+        if token.casefold().startswith("0x"):
+            bits = token[2:]
+            if len(bits) == 8:
+                return struct.unpack(">f", bytes.fromhex(bits))[0]
+            if len(bits) == 16:
+                return struct.unpack(">d", bytes.fromhex(bits))[0]
+            raise FortranEmissionError(
+                f"unsupported LLVM floating bit pattern {token!r}"
+            )
+        return float(token)
+    raise FortranEmissionError(
+        f"unsupported LLVM literal type {dtype!r} in {value!r}"
+    )
 
 
 class _FunctionEmitter:
@@ -647,7 +681,8 @@ class _FunctionEmitter:
             consumer.attributes.get("tensor_operation") or consumer.op
         )
         if operation in (
-            "slice", "gather", "scatter", "index_set", "pad", "cumsum"
+            "slice", "gather", "scatter", "index_set", "pad", "cumsum",
+            "repeat",
         ):
             return True
         if consumer.res is None:
@@ -691,6 +726,12 @@ class _FunctionEmitter:
         rank = len(shape)
 
         reduction_axis = attributes.get("dim", attributes.get("axis"))
+        if operation == "extent" and len(args) == 1:
+            source_rank = len(instr.args[0].shape)
+            dim = int(attributes.get("dim", 0))
+            if source_rank == 0 or not (-source_rank <= dim < source_rank):
+                return None
+            return f"size({args[0]}, {(dim % source_rank) + 1})"
         if (
             operation in _REDUCTION
             and reduction_axis is not None
@@ -715,6 +756,17 @@ class _FunctionEmitter:
                 extents = ", ".join(str(int(size)) for size in shape)
                 return f"reshape({reduced}, [{extents}])"
             return reduced
+
+        if (
+            operation in _REDUCTION
+            and len(args) == 1
+            and len(instr.args[0].shape) == 0
+        ):
+            # Reducing a scalar is the identity.  NumPy permits it (and may
+            # retain a singleton result shape); Fortran's reduction
+            # intrinsics require an array argument, while scalar assignment
+            # already broadcasts into a singleton destination.
+            return args[0]
 
         if operation in ("reshape", "view") and len(args) == 1:
             # A reshape is defined by row-major element order, but Fortran
@@ -761,6 +813,47 @@ class _FunctionEmitter:
             if source_shape == target_shape:
                 return args[0]
             return _broadcast(args[0], source_shape, target_shape)
+
+        if operation == "repeat" and len(args) == 1:
+            source_shape = tuple(map(int, instr.args[0].shape))
+            target_shape = tuple(map(int, shape))
+            if len(source_shape) != len(target_shape):
+                return None
+            raw_repeats = attributes.get("repeats", 1)
+            dim = attributes.get("dim")
+            if dim is not None and not isinstance(raw_repeats, (tuple, list)):
+                repeat_counts = [1] * rank
+                repeat_counts[int(dim) % rank] = int(raw_repeats)
+            else:
+                repeat_counts = list(map(int, (
+                    raw_repeats
+                    if isinstance(raw_repeats, (tuple, list))
+                    else (raw_repeats,)
+                )))
+                if len(repeat_counts) != rank:
+                    return None
+            if any(count <= 0 for count in repeat_counts):
+                return None
+            if any(
+                target != source * count
+                for source, target, count in zip(
+                    source_shape, target_shape, repeat_counts
+                )
+            ):
+                return None
+            subscripts = []
+            for source_extent, target_extent, count in zip(
+                source_shape, target_shape, repeat_counts
+            ):
+                if count == 1:
+                    subscripts.append(":")
+                    continue
+                index = self._loop_variable()
+                subscripts.append(
+                    f"[(mod({index} - 1, {source_extent}) + 1, "
+                    f"{index} = 1, {target_extent})]"
+                )
+            return f"{args[0]}({', '.join(subscripts)})"
 
         if operation in {
             "Fill", "fill", "zeros", "zeros_like", "empty", "empty_like",
@@ -860,6 +953,8 @@ class _FunctionEmitter:
             operation = (
                 producer.attributes.get("tensor_operation") or producer.op
             )
+            if producer.op in ("Const", "const"):
+                return self._instruction_is_logical(producer)
             if operation in _SHAPE_ONLY and producer.args:
                 return self._is_logical(producer.args[0])
             if (
@@ -1477,7 +1572,10 @@ class _FunctionEmitter:
                         )
                 else:
                     return None
-            if _element_count(tuple(instr.args[1].shape)) == 1:
+            if (
+                tuple(instr.args[1].shape)
+                and _element_count(tuple(instr.args[1].shape)) == 1
+            ):
                 value = f"sum({value})"
             return [
                 f"    {target} = {base}",
@@ -1572,6 +1670,8 @@ class _FunctionEmitter:
         constant = instr.attributes.get("constant", None)
 
         if op in ("Const", "const"):
+            if constant is None and "llvm_literal" in instr.attributes:
+                return _literal(_llvm_literal(instr.attributes["llvm_literal"]))
             if constant is None and "values" in instr.attributes:
                 # An array constant carries its elements under "values", not
                 # the scalar "constant" key.  Reading only "constant" here
@@ -2065,6 +2165,66 @@ def emit_module(
         module.functions if isinstance(module, IRModule) else dict(module)
     )
     named_outputs = dict(outputs or {})
+    for function_name, function in functions.items():
+        if function_name in named_outputs:
+            continue
+        declared = tuple(function.metadata.get("named_outputs") or ())
+        if not declared:
+            continue
+        values = {
+            int(value.id): value
+            for value in function.args
+        }
+        values.update({
+            int(instruction.res.id): instruction.res
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        })
+        resolved = tuple(
+            values[int(value_id)]
+            for _name, value_id in declared
+            if int(value_id) in values
+        )
+        if resolved:
+            named_outputs[function_name] = resolved
+    roots = {
+        str(name)
+        for name in named_outputs
+        if str(name) in functions
+    }
+    roots.update(
+        str(name)
+        for name, function in functions.items()
+        if function.metadata.get("named_outputs")
+        or function.metadata.get("control_ir")
+    )
+    if roots:
+        reachable = set()
+        pending = list(sorted(roots))
+        while pending:
+            function_name = pending.pop()
+            if function_name in reachable or function_name not in functions:
+                continue
+            reachable.add(function_name)
+            function = functions[function_name]
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.op not in {"Call", "call"}:
+                        continue
+                    # A canonical tensor operation is emitted as a native
+                    # Fortran expression.  Its C/LLVM helper name is retained
+                    # for those targets, but is not a Fortran call edge.
+                    if instruction.attributes.get("tensor_operation"):
+                        continue
+                    callee = instruction.attributes.get("callee")
+                    if callee in functions and callee not in reachable:
+                        pending.append(str(callee))
+        functions = {
+            name: function
+            for name, function in functions.items()
+            if name in reachable
+        }
     # Two passes: a subroutine that calls another must pass exactly the
     # extents that one declares, and those are only known once it has been
     # emitted. The first pass is discarded apart from its signatures.

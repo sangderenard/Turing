@@ -389,6 +389,46 @@ def test_closure_aggregate_fields_use_one_native_loop_body():
     assert artifact.source.count(f"switch (int({induction}))") == 2
 
 
+def test_projected_resident_rows_share_the_control_shader_abi():
+    program = _program(
+        [20, 21],
+        [("add", 22, [20, 21], {})],
+        {"result": 22},
+        [20, 21, 22, 99],
+    )
+    program.meta[99] = Meta((6,), "float32", "glsl")
+    induction = "iteration_9"
+    control = ControlProgram(
+        LoopBlock(
+            induction,
+            "0",
+            "__iterable_extent_99__",
+            "1",
+            StatementBlock(("__scheduled_region_3__",)),
+        ),
+        region_indices=(3,),
+        projected_iterable_bindings=(
+            (99, 20, induction, 0),
+            (99, 21, induction, 1),
+        ),
+    )
+
+    artifact = build_control_shader_artifact(
+        control,
+        {3: CapturedFusedProgram(program, {})},
+        device_resident=True,
+    )
+
+    assert {99, 20, 21}.issubset(artifact.slot_value_ids)
+    iterable_slot = artifact.slot_value_ids.index(99)
+    assert (
+        f"int(u_extent_control[{iterable_slot}]) / 2"
+        in artifact.source
+    )
+    assert f"uint({induction}) * 2u + 0u" in artifact.source
+    assert f"uint({induction}) * 2u + 1u" in artifact.source
+
+
 def test_static_loop_target_is_present_in_artifact_slot_abi():
     program = _program(
         [10],

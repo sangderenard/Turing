@@ -66,6 +66,7 @@ def compose_hierarchical_control(
     all_closure_iterables: list[
         tuple[int, int, str, tuple[int, ...]]
     ] = []
+    all_projected_iterables: list[tuple[int, int, str, object]] = []
     all_recursion_regions: list[RecursionRegion] = []
     all_deployment_regions = []
     next_recursion_region = 0
@@ -197,6 +198,11 @@ def compose_hierarchical_control(
                 for iterable, _target, _induction, _sources
                 in local.closure_iterable_bindings
             )
+            local_iterable_ids.update(
+                int(iterable)
+                for iterable, _target, _induction, _projection
+                in local.projected_iterable_bindings
+            )
             for local_iterable_id in local_iterable_ids:
                 local_marker = (
                     f"__iterable_extent_{local_iterable_id}__"
@@ -252,6 +258,16 @@ def compose_hierarchical_control(
             )
             for iterable, target, induction, sources
             in local.closure_iterable_bindings
+        )
+        all_projected_iterables.extend(
+            (
+                value(iterable),
+                value(target),
+                global_induction(induction),
+                projection,
+            )
+            for iterable, target, induction, projection
+            in local.projected_iterable_bindings
         )
 
         calls_before: dict[int, list[CallBlock]] = {}
@@ -536,6 +552,9 @@ def compose_hierarchical_control(
         collection_bindings=tuple(dict.fromkeys(all_collections)),
         closure_iterable_bindings=tuple(
             dict.fromkeys(all_closure_iterables)
+        ),
+        projected_iterable_bindings=tuple(
+            dict.fromkeys(all_projected_iterables)
         ),
         recursion_regions=tuple(dict.fromkeys(all_recursion_regions)),
         deployment_regions=tuple(all_deployment_regions),

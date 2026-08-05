@@ -29,10 +29,12 @@ from .machine_reference_vocabulary import (
 from .wasm_binary import (
     CodeBuilder,
     OP_I32_ADD,
+    OP_I32_EQ,
     OP_I32_EQZ,
     OP_I32_AND,
     OP_I32_OR,
     OP_I32_XOR,
+    OP_I32_MUL,
     OP_I64_ADD,
     OP_I64_AND,
     OP_I64_EQZ,
@@ -136,6 +138,10 @@ class MachineBlockWasmArtifact:
             guard["termination_requested"]
         ):
             raise ValueError("machine Wasm specialization termination mismatch")
+        if "direction_flag" in guard and bool(int(state.flags) & (1 << 10)) != bool(
+            guard["direction_flag"]
+        ):
+            raise ValueError("machine Wasm specialization direction flag mismatch")
 
     def pack_state(self, state) -> bytes:
         self._validate_specialization(state)
@@ -198,17 +204,48 @@ class MachineBlockWasmArtifact:
                 raise ValueError("compiled machine journal call-stack witness mismatch")
             memory = active_state.memory
             if effect_kind:
-                if effect_kind not in (1, 2) or effect_width not in (8, 16, 32, 64, 128):
-                    raise ValueError("compiled machine journal has invalid memory effect")
-                if effect_width < 128 and (before_high or after_high):
-                    raise ValueError("compiled scalar memory effect has nonzero high halves")
-                observed = memory.read_unsigned(effect_address, effect_width)
-                if observed != before:
-                    raise ValueError("compiled machine journal memory-read witness mismatch")
-                if effect_kind == 1 and after != before:
-                    raise ValueError("compiled machine journal read changed guest memory")
-                if effect_kind == 2:
-                    memory = memory.write_unsigned(effect_address, effect_width, after)
+                if effect_kind == 3:
+                    if witness.semantic != MachineSemanticToken.STRING_STORE.name:
+                        raise ValueError("compiled machine journal has invalid fill effect")
+                    count = int(active_state.registers[1])
+                    destination = int(active_state.registers[7]) & MASK64
+                    value = int(active_state.registers[0]) & 0xFFFF
+                    direction = -2 if int(active_state.flags) & (1 << 10) else 2
+                    if (
+                        effect_address != destination
+                        or effect_width != count
+                        or before_low != value
+                        or before_high != (direction & MASK64)
+                        or after_low or after_high
+                    ):
+                        raise ValueError("compiled machine journal fill descriptor mismatch")
+                    expected_registers = list(active_state.registers)
+                    expected_registers[1] = 0
+                    expected_registers[7] = (destination + count * direction) & MASK64
+                    if tuple(values[:REGISTER_COUNT]) != tuple(expected_registers):
+                        raise ValueError("compiled machine journal fill register mismatch")
+                    if values[REGISTER_COUNT + 1] != int(active_state.flags):
+                        raise ValueError("compiled machine journal fill changed flags")
+                    if count:
+                        first = min(destination, destination + (count - 1) * direction)
+                        raw = int(value).to_bytes(2, "little") * count
+                        # Reading every prior byte authenticates that the exact
+                        # specialized span is mapped before the immutable page
+                        # replacement is constructed.
+                        bytes(memory[first + offset] for offset in range(len(raw)))
+                        memory = memory.map_bytes(first, raw)
+                else:
+                    if effect_kind not in (1, 2) or effect_width not in (8, 16, 32, 64, 128):
+                        raise ValueError("compiled machine journal has invalid memory effect")
+                    if effect_width < 128 and (before_high or after_high):
+                        raise ValueError("compiled scalar memory effect has nonzero high halves")
+                    observed = memory.read_unsigned(effect_address, effect_width)
+                    if observed != before:
+                        raise ValueError("compiled machine journal memory-read witness mismatch")
+                    if effect_kind == 1 and after != before:
+                        raise ValueError("compiled machine journal read changed guest memory")
+                    if effect_kind == 2:
+                        memory = memory.write_unsigned(effect_address, effect_width, after)
             call_stack = active_state.call_stack
             if stack_kind:
                 if len(call_stack) != expected_depth:
@@ -262,6 +299,17 @@ _EXTEND_SEMANTICS = {
     MachineSemanticToken.SIGN_EXTEND,
     MachineSemanticToken.ZERO_EXTEND,
 }
+_ACCUMULATOR_EXTEND_SEMANTICS = {
+    MachineSemanticToken.SIGN_EXTEND_ACCUMULATOR,
+}
+_BIT_TEST_SEMANTICS = {
+    MachineSemanticToken.BIT_TEST,
+    MachineSemanticToken.BIT_TEST_RESET,
+    MachineSemanticToken.BIT_TEST_COMPLEMENT,
+}
+_STRING_STORE_SEMANTICS = {
+    MachineSemanticToken.STRING_STORE,
+}
 _VECTOR_SEMANTICS = {
     MachineSemanticToken.VECTOR_MOVE,
     MachineSemanticToken.VECTOR_XOR,
@@ -287,6 +335,9 @@ _SCALAR_MISC_SEMANTICS = {
     MachineSemanticToken.CONDITIONAL_MOVE,
     MachineSemanticToken.INTEGER_MULTIPLY_UNSIGNED,
     MachineSemanticToken.EXCHANGE,
+    *_ACCUMULATOR_EXTEND_SEMANTICS,
+    *_BIT_TEST_SEMANTICS,
+    *_STRING_STORE_SEMANTICS,
 }
 
 
@@ -572,9 +623,14 @@ def _operand_data_width(instruction: Any, operand_index: int) -> int:
         return int(operand.width)
     name = str(getattr(getattr(instruction, "token", None), "name", ""))
     if isinstance(operand, EffectiveAddressOperand):
-        widths = re.findall(r"(?:XMMM|RM|M)(128|64|32|16|8)(?:_|$)", name)
+        widths = re.findall(
+            r"(?:^|_)(?:XMMM|RM|M)(128|64|32|16|8)(?:_|$)", name,
+        )
         if widths:
-            return int(widths[-1])
+            # The first memory-designated width belongs to this effective
+            # operand. In particular, a trailing ``IMM8`` is not a memory
+            # width merely because its spelling also contains ``M8``.
+            return int(widths[0])
     if isinstance(operand, ImmediateOperand):
         return int(operand.width)
     widths = [
@@ -589,21 +645,42 @@ def _specialized_memory_address(
     instruction: Any, operand: Any, state: Any | None,
 ) -> int | None:
     static = _static_memory_address(instruction, operand)
-    if static is not None or not isinstance(operand, EffectiveAddressOperand):
+    if not isinstance(operand, EffectiveAddressOperand):
         return static
-    if state is None:
-        return None
-    base = int(instruction.address) + len(instruction.encoded) if operand.rip_relative else 0
-    prefixes = tuple(getattr(instruction, "legacy_prefixes", ()))
-    if 0x64 in prefixes:
-        base += int(state.fs_base)
-    if 0x65 in prefixes:
-        base += int(state.gs_base)
-    if operand.base is not None:
-        base += int(state.registers[int(operand.base)])
-    if operand.index is not None:
-        base += int(state.registers[int(operand.index)]) * int(operand.scale)
-    return (base + int(operand.displacement)) & MASK64
+    if static is not None:
+        address = int(static)
+    else:
+        if state is None:
+            return None
+        address = int(instruction.address) + len(instruction.encoded) if operand.rip_relative else 0
+        prefixes = tuple(getattr(instruction, "legacy_prefixes", ()))
+        if 0x64 in prefixes:
+            address += int(state.fs_base)
+        if 0x65 in prefixes:
+            address += int(state.gs_base)
+        if operand.base is not None:
+            address += int(state.registers[int(operand.base)])
+        if operand.index is not None:
+            address += int(state.registers[int(operand.index)]) * int(operand.scale)
+        address += int(operand.displacement)
+    # Register-indexed memory BT/BTS/BTR/BTC extends the effective address
+    # across adjacent bit strings. Its signed quotient is part of the exact
+    # block-entry specialization, not merely a modulo bit index.
+    if (
+        instruction.semantic in _BIT_TEST_SEMANTICS
+        and operand is instruction.operands[0]
+        and len(instruction.operands) > 1
+        and isinstance(instruction.operands[1], RegisterOperand)
+    ):
+        if state is None:
+            return None
+        source = instruction.operands[1]
+        source_width = int(source.width)
+        raw = int(state.registers[int(source.register)]) & ((1 << source_width) - 1)
+        signed = raw - (1 << source_width) if raw & (1 << (source_width - 1)) else raw
+        width = _operand_data_width(instruction, 0)
+        address += (signed // width) * (width // 8)
+    return address & MASK64
 
 
 def _dynamic_memory_guard(instruction: Any, state: Any) -> dict[str, Any]:
@@ -614,6 +691,15 @@ def _dynamic_memory_guard(instruction: Any, state: Any) -> dict[str, Any]:
         for register in (operand.base, operand.index)
         if register is not None
     }
+    if (
+        instruction.semantic in _BIT_TEST_SEMANTICS
+        and instruction.operands
+        and isinstance(instruction.operands[0], EffectiveAddressOperand)
+        and len(instruction.operands) > 1
+        and isinstance(instruction.operands[1], RegisterOperand)
+    ):
+        register = int(instruction.operands[1].register)
+        registers[register] = int(state.registers[register])
     guard: dict[str, Any] = {"registers": tuple(sorted(registers.items()))}
     prefixes = tuple(getattr(instruction, "legacy_prefixes", ()))
     if 0x64 in prefixes:
@@ -892,6 +978,175 @@ def _emit_extend(
     else:
         builder.local_get(result_local)
     builder.i64_store()
+    return None
+
+
+def _emit_accumulator_extend(
+    builder: CodeBuilder,
+    instruction: Any,
+    *,
+    result_local: int,
+) -> str | None:
+    name = str(instruction.token.name)
+    if name == "CDQE":
+        _load_register(builder, 0, 0)
+        builder.i64_const(0xFFFFFFFF).raw(OP_I64_AND)
+        builder.i64_const(1 << 31).raw(OP_I64_XOR)
+        builder.i64_const(1 << 31).raw(OP_I64_SUB)
+        builder.local_set(result_local)
+        _address(builder, 0, 0)
+        builder.local_get(result_local).i64_store()
+        return None
+    if name == "CQO":
+        _address(builder, 0, 2 * 8)
+        builder.i64_const(-1).i64_const(0)
+        _load_register(builder, 0, 0)
+        builder.i64_const(_signed_i64(1 << 63)).raw(
+            OP_I64_AND, OP_I64_EQZ, OP_I32_EQZ, OP_SELECT,
+        ).i64_store()
+        return None
+    return f"unsupported accumulator sign-extension form {name}"
+
+
+def _emit_bit_test(
+    builder: CodeBuilder,
+    instruction: Any,
+    *,
+    left_local: int,
+    right_local: int,
+    result_local: int,
+    flags_local: int,
+    guest_base: int,
+    guest_size: int,
+    specialization_state: Any | None,
+    effect_kind_local: int,
+    effect_address_local: int,
+    effect_width_local: int,
+    effect_before_local: int,
+    effect_after_local: int,
+    executable_pages: frozenset[int],
+) -> str | None:
+    operands = tuple(getattr(instruction, "operands", ()))
+    if len(operands) < 2 or not isinstance(
+        operands[0], (RegisterOperand, EffectiveAddressOperand),
+    ) or not isinstance(operands[1], (RegisterOperand, ImmediateOperand)):
+        return "bit test requires a register/memory destination and register/immediate index"
+    destination, source = operands[:2]
+    width = _operand_data_width(instruction, 0)
+    if width not in (32, 64):
+        return f"unsupported bit-test width {width}"
+    reason = _emit_arithmetic_operand(
+        builder, instruction, 0, width,
+        guest_base=guest_base, guest_size=guest_size,
+        specialization_state=specialization_state,
+        effect_kind_local=effect_kind_local,
+        effect_address_local=effect_address_local,
+        effect_width_local=effect_width_local,
+        effect_before_local=effect_before_local,
+        effect_after_local=effect_after_local,
+    )
+    if reason is not None:
+        return reason
+    builder.local_set(left_local)
+    reason = _emit_operand(builder, source, int(source.width))
+    if reason is not None:
+        return reason
+    builder.i64_const(width - 1).raw(OP_I64_AND).local_set(right_local)
+
+    # Only CF is architecturally defined by this family. Preserve every other
+    # flag exactly, including undefined bits, to match reversible replay.
+    _address(builder, 0, FLAGS_OFFSET)
+    builder.i64_load().i64_const(_signed_i64(MASK64 ^ (1 << CF))).raw(
+        OP_I64_AND,
+    ).local_set(flags_local)
+    builder.local_get(flags_local)
+    builder.local_get(left_local).local_get(right_local).raw(OP_I64_SHR_U)
+    builder.i64_const(1).raw(OP_I64_AND, OP_I64_OR).local_set(flags_local)
+    _address(builder, 0, FLAGS_OFFSET)
+    builder.local_get(flags_local).i64_store()
+
+    name = str(instruction.token.name)
+    if name.startswith("BT_"):
+        return None
+    builder.i64_const(1).local_get(right_local).raw(OP_I64_SHL)
+    if name.startswith("BTR_"):
+        builder.i64_const(-1).raw(OP_I64_XOR)
+        builder.local_get(left_local).raw(OP_I64_AND)
+    elif name.startswith("BTS_"):
+        builder.local_get(left_local).raw(OP_I64_OR)
+    elif name.startswith("BTC_"):
+        builder.local_get(left_local).raw(OP_I64_XOR)
+    else:
+        return f"unsupported bit-test operation {name}"
+    if width < 64:
+        builder.i64_const((1 << width) - 1).raw(OP_I64_AND)
+    builder.local_set(result_local)
+    return _emit_result_destination(
+        builder, instruction, destination, width,
+        result_local=result_local, guest_base=guest_base, guest_size=guest_size,
+        specialization_state=specialization_state,
+        effect_kind_local=effect_kind_local,
+        effect_address_local=effect_address_local,
+        effect_width_local=effect_width_local,
+        effect_after_local=effect_after_local,
+        executable_pages=executable_pages,
+    )
+
+
+def _emit_string_store(
+    builder: CodeBuilder,
+    instruction: Any,
+    *,
+    counter_local: int,
+    result_local: int,
+    guest_base: int,
+    guest_size: int,
+    specialization_state: Any | None,
+    effect_kind_local: int,
+    effect_address_local: int,
+    effect_width_local: int,
+    effect_before_local: int,
+    effect_before_high_local: int,
+) -> str | None:
+    if str(instruction.token.name) != "REP_STOSW":
+        return "unsupported string-store form"
+    if specialization_state is None:
+        return "REP STOSW requires exact block-entry specialization"
+    count = int(specialization_state.registers[1])
+    destination = int(specialization_state.registers[7]) & MASK64
+    value = int(specialization_state.registers[0]) & 0xFFFF
+    direction = -2 if int(specialization_state.flags) & (1 << 10) else 2
+    if count < 0 or count * 2 > MAXIMUM_GUEST_WINDOW_BYTES:
+        return "REP STOSW span exceeds the bounded guest mirror"
+    if count:
+        final_address = destination + (count - 1) * direction
+        if not 0 <= final_address <= MASK64:
+            return "REP STOSW span wraps the guest address space"
+        low = min(destination, final_address)
+        if not guest_base <= low or low + count * 2 > guest_base + guest_size:
+            return "REP STOSW span exceeds the compiled mirror window"
+
+    builder.i64_const(3).local_set(effect_kind_local)
+    builder.i64_const(_signed_i64(destination)).local_set(effect_address_local)
+    builder.i64_const(count).local_set(effect_width_local)
+    builder.i64_const(value).local_set(effect_before_local)
+    builder.i64_const(_signed_i64(direction & MASK64)).local_set(effect_before_high_local)
+    _load_register(builder, 0, 0)
+    builder.i64_const(0xFFFF).raw(OP_I64_AND).local_set(result_local)
+    builder.i32_const(0).local_set(counter_local)
+    builder.block().loop()
+    builder.local_get(counter_local).i32_const(count).raw(OP_I32_EQ).br_if(1)
+    _address(builder, 2, destination - guest_base)
+    builder.local_get(counter_local).i32_const(direction).raw(
+        OP_I32_MUL, OP_I32_ADD,
+    )
+    builder.local_get(result_local).i64_store_width(16)
+    builder.local_get(counter_local).i32_const(1).raw(OP_I32_ADD).local_set(counter_local)
+    builder.br(0).end().end()
+    _emit_scalar_store(builder, 0, 1 * 8, 0)
+    _emit_scalar_store(
+        builder, 0, 7 * 8, (destination + count * direction) & MASK64,
+    )
     return None
 
 
@@ -2012,6 +2267,111 @@ def _wat_extend(
     )]
 
 
+def _wat_accumulator_extend(instruction: Any) -> list[str]:
+    name = str(instruction.token.name)
+    rax = f"(i64.load {_wat_address('state', 0)})"
+    if name == "CDQE":
+        value = (
+            f"(i64.sub (i64.xor (i64.and {rax} (i64.const 4294967295)) "
+            "(i64.const 2147483648)) (i64.const 2147483648))"
+        )
+        return [_wat_store("state", 0, value)]
+    if name == "CQO":
+        sign = (
+            f"(i32.eqz (i64.eqz (i64.and {rax} "
+            f"(i64.const {_signed_i64(1 << 63)}))))"
+        )
+        return [_wat_store(
+            "state", 2 * 8,
+            f"(select (i64.const -1) (i64.const 0) {sign})",
+        )]
+    return []
+
+
+def _wat_bit_test(
+    instruction: Any, guest_base: int, specialization_state: Any | None,
+) -> list[str]:
+    destination, source = tuple(instruction.operands)[:2]
+    width = _operand_data_width(instruction, 0)
+    source_lines, value = _wat_arithmetic_operand(
+        instruction, 0, width, guest_base, specialization_state,
+    )
+    if isinstance(source, RegisterOperand):
+        index = f"(i64.load {_wat_address('state', int(source.register) * 8)})"
+    else:
+        index = f"(i64.const {_signed_i64(int(source.value))})"
+    index = f"(i64.and {index} (i64.const {width - 1}))"
+    old_flags = f"(i64.load {_wat_address('state', FLAGS_OFFSET)})"
+    keep_cf_clear = _signed_i64(MASK64 ^ (1 << CF))
+    flags = (
+        f"(i64.or (i64.and {old_flags} (i64.const {keep_cf_clear})) "
+        f"(i64.and (i64.shr_u {value} {index}) (i64.const 1)))"
+    )
+    lines = [
+        *source_lines,
+        f"    (local.set $left {value})",
+        f"    (local.set $right {index})",
+        _wat_store("state", FLAGS_OFFSET, flags),
+    ]
+    name = str(instruction.token.name)
+    if name.startswith("BT_"):
+        return lines
+    mask = "(i64.shl (i64.const 1) (local.get $right))"
+    if name.startswith("BTR_"):
+        result = f"(i64.and (local.get $left) (i64.xor {mask} (i64.const -1)))"
+    elif name.startswith("BTS_"):
+        result = f"(i64.or (local.get $left) {mask})"
+    elif name.startswith("BTC_"):
+        result = f"(i64.xor (local.get $left) {mask})"
+    else:
+        return lines
+    if width < 64:
+        result = f"(i64.and {result} (i64.const {(1 << width) - 1}))"
+    lines.extend([
+        f"    (local.set $result {result})",
+        *_wat_result_destination(
+            instruction, destination, width, "(local.get $result)",
+            guest_base, specialization_state,
+        ),
+    ])
+    return lines
+
+
+def _wat_string_store(
+    instruction: Any, guest_base: int, specialization_state: Any,
+) -> list[str]:
+    count = int(specialization_state.registers[1])
+    destination = int(specialization_state.registers[7]) & MASK64
+    value = f"(i64.and (i64.load {_wat_address('state', 0)}) (i64.const 65535))"
+    direction = -2 if int(specialization_state.flags) & (1 << 10) else 2
+    guest_address = (
+        f"(i32.add {_wat_guest_address(destination, guest_base)} "
+        f"(i32.mul (local.get $counter) (i32.const {direction})))"
+    )
+    return [
+        "    (local.set $effect_kind (i64.const 3))",
+        f"    (local.set $effect_address (i64.const {_signed_i64(destination)}))",
+        f"    (local.set $effect_width (i64.const {count}))",
+        f"    (local.set $effect_before {value})",
+        f"    (local.set $effect_before_high (i64.const {_signed_i64(direction & MASK64)}))",
+        f"    (local.set $result {value})",
+        "    (local.set $counter (i32.const 0))",
+        "    (block",
+        "      (loop",
+        f"        (br_if 1 (i32.eq (local.get $counter) (i32.const {count})))",
+        f"        (i64.store16 {guest_address} (local.get $result))",
+        "        (local.set $counter (i32.add (local.get $counter) (i32.const 1)))",
+        "        (br 0)",
+        "      )",
+        "    )",
+        _wat_store("state", 1 * 8, "(i64.const 0)"),
+        _wat_store(
+            "state", 7 * 8,
+            f"(i64.const {_signed_i64((destination + count * direction) & MASK64)})",
+        ),
+    ]
+
+
 def _wat_flag(flags: str, condition: str, bit: int) -> str:
     return (
         f"(i64.or {flags} (i64.mul (i64.extend_i32_u {condition}) "
@@ -2690,6 +3050,7 @@ def _wat_for(
         '    (local $left i64) (local $right i64)',
         '    (local $result i64) (local $flags i64)',
         '    (local $high i64) (local $work i64)',
+        '    (local $counter i32)',
         '    (local $effect_kind i64) (local $effect_address i64)',
         '    (local $effect_width i64) (local $effect_before i64) (local $effect_before_high i64)',
         '    (local $effect_after i64) (local $effect_after_high i64)',
@@ -2718,6 +3079,16 @@ def _wat_for(
             lines.extend(_wat_effective_address(instruction, specialization_state))
         elif instruction.semantic in _EXTEND_SEMANTICS:
             lines.extend(_wat_extend(
+                instruction, guest_base, specialization_state,
+            ))
+        elif instruction.semantic in _ACCUMULATOR_EXTEND_SEMANTICS:
+            lines.extend(_wat_accumulator_extend(instruction))
+        elif instruction.semantic in _BIT_TEST_SEMANTICS:
+            lines.extend(_wat_bit_test(
+                instruction, guest_base, specialization_state,
+            ))
+        elif instruction.semantic in _STRING_STORE_SEMANTICS:
+            lines.extend(_wat_string_store(
                 instruction, guest_base, specialization_state,
             ))
         elif instruction.semantic in _UNARY_SEMANTICS:
@@ -2853,6 +3224,26 @@ def lower_machine_block_to_wasm(
         prior_ranges = tuple(memory_ranges)
         prior_guard = dict(specialization_guard)
         if (
+            operation_index == 0
+            and specialization_state is not None
+            and instruction.semantic in _STRING_STORE_SEMANTICS
+        ):
+            count = int(specialization_state.registers[1])
+            destination = int(specialization_state.registers[7]) & MASK64
+            direction = -2 if int(specialization_state.flags) & (1 << 10) else 2
+            if 0 <= count and count * 2 <= MAXIMUM_GUEST_WINDOW_BYTES:
+                final_address = destination + (count - 1) * direction if count else destination
+                if 0 <= final_address <= MASK64:
+                    low = min(destination, final_address)
+                    memory_ranges.append((low, low + count * 2))
+            guarded_registers = dict(specialization_guard.get("registers", ()))
+            for register in (0, 1, 7):
+                guarded_registers[register] = int(specialization_state.registers[register])
+            specialization_guard["registers"] = tuple(sorted(guarded_registers.items()))
+            specialization_guard["direction_flag"] = bool(
+                int(specialization_state.flags) & (1 << 10)
+            )
+        if (
             instruction.semantic in _MOV_SEMANTICS
             or instruction.semantic in _ARITHMETIC_SEMANTICS
             or instruction.semantic in _EXTEND_SEMANTICS
@@ -2952,6 +3343,7 @@ def lower_machine_block_to_wasm(
     flags_local = builder.declare_local("i64")
     high_local = builder.declare_local("i64")
     work_local = builder.declare_local("i64")
+    counter_local = builder.declare_local("i32")
     effect_kind_local = builder.declare_local("i64")
     effect_address_local = builder.declare_local("i64")
     effect_width_local = builder.declare_local("i64")
@@ -3028,6 +3420,36 @@ def lower_machine_block_to_wasm(
                 effect_width_local=effect_width_local,
                 effect_before_local=effect_before_local,
                 effect_after_local=effect_after_local,
+            )
+        elif semantic in _ACCUMULATOR_EXTEND_SEMANTICS:
+            reason = _emit_accumulator_extend(
+                builder, instruction, result_local=result_local,
+            )
+        elif semantic in _BIT_TEST_SEMANTICS:
+            reason = _emit_bit_test(
+                builder, instruction,
+                left_local=left_local, right_local=right_local,
+                result_local=result_local, flags_local=flags_local,
+                guest_base=guest_base, guest_size=guest_size,
+                specialization_state=(specialization_state if index == 0 else None),
+                effect_kind_local=effect_kind_local,
+                effect_address_local=effect_address_local,
+                effect_width_local=effect_width_local,
+                effect_before_local=effect_before_local,
+                effect_after_local=effect_after_local,
+                executable_pages=executable_pages,
+            )
+        elif semantic in _STRING_STORE_SEMANTICS:
+            reason = _emit_string_store(
+                builder, instruction,
+                counter_local=counter_local, result_local=result_local,
+                guest_base=guest_base, guest_size=guest_size,
+                specialization_state=(specialization_state if index == 0 else None),
+                effect_kind_local=effect_kind_local,
+                effect_address_local=effect_address_local,
+                effect_width_local=effect_width_local,
+                effect_before_local=effect_before_local,
+                effect_before_high_local=effect_before_high_local,
             )
         elif semantic in _UNARY_SEMANTICS:
             reason = _emit_unary(

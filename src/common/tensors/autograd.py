@@ -967,6 +967,25 @@ class Autograd:
             self._no_grad_depth -= 1
 
     @contextmanager
+    def forward_observation(self) -> Generator[None, None, None]:
+        """Preserve forward tensor result types without recording a tape.
+
+        Compiler discovery records one representative occurrence of a planned
+        region, then executes later loop occurrences only to obtain concrete
+        source-control values.  Those later executions must retain the same
+        tensor/scalar result types as the recorded occurrence without adding
+        duplicate tape nodes.
+        """
+
+        previous_capture_all = self.capture_all
+        self.capture_all = True
+        try:
+            with self.no_grad():
+                yield
+        finally:
+            self.capture_all = previous_capture_all
+
+    @contextmanager
     def forward_capture(
         self,
         tape: GradTape | None = None,

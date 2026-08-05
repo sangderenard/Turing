@@ -837,9 +837,15 @@ document.addEventListener("DOMContentLoaded", async () => {{
       }}
       api.localReplay.replaceFrames(projected);
       status.recompiledMachineProjection = "ready";
-      if (new URLSearchParams(location.search).get("recompiled-step") === "1") {{
-        await api.sendControl("step_forward");
-        status.recompiledMachineStep = "ready";
+      const requestedSteps = Number(
+        new URLSearchParams(location.search).get("recompiled-step") || 0,
+      );
+      if (Number.isInteger(requestedSteps) && requestedSteps > 0) {{
+        const boundedSteps = Math.min(requestedSteps, projected.length - 1);
+        for (let index = 0; index < boundedSteps; index++) {{
+          await api.sendControl("step_forward");
+        }}
+        status.recompiledMachineStep = String(boundedSteps);
       }}
     }} else {{
       status.recompiledMachineProjection = effectful ? "effectful" : "unavailable";

@@ -163,6 +163,149 @@ def test_empty_array_constant_has_a_typed_fortran_constructor():
     assert "reshape([real(c_double) ::], [0, 3])" in module.source
 
 
+def test_imported_llvm_scalar_literals_emit_fortran_constants():
+    zero = SSAValue(0, "i32", ())
+    positive_infinity = SSAValue(1, "float64", ())
+    function = Function(
+        "llvm_constants",
+        [],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr(
+                        "Const", [], zero,
+                        attributes={"llvm_literal": "i32 0"},
+                    ),
+                    Instr(
+                        "Const", [], positive_infinity,
+                        attributes={
+                            "llvm_literal": "double 0x7FF0000000000000"
+                        },
+                    ),
+                ],
+            )
+        },
+    )
+
+    module = emit_module(
+        {function.name: function},
+        outputs={function.name: [zero, positive_infinity]},
+    )
+
+    assert module.complete, [item.format() for item in module.shortfalls]
+    assert "ieee_value(0.0_c_double, ieee_positive_inf)" in module.source
+
+
+def test_fortran_module_omits_helpers_replaced_by_native_tensor_ops():
+    argument = SSAValue(0, "float64", (4,))
+    result = SSAValue(1, "float64", (4,))
+    public = Function(
+        "public_numeric",
+        [argument],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [Instr("add", [argument], result, attributes={"right_scalar": 1})],
+            )
+        },
+        metadata={"named_outputs": (("result", 1),)},
+    )
+    dead_helper = Function(
+        "llvm_helper_replaced_by_native_expression",
+        [argument],
+        {"entry": BasicBlock("entry", [Instr("einsum", [argument], result)])},
+    )
+
+    module = emit_module(
+        {public.name: public, dead_helper.name: dead_helper},
+        outputs={public.name: [result]},
+    )
+
+    assert module.complete, [item.format() for item in module.shortfalls]
+    assert tuple(item.name for item in module.subroutines) == (public.name,)
+
+
+def test_fortran_module_derives_outputs_from_ssa_metadata():
+    argument = SSAValue(0, "float64", (4,))
+    result = SSAValue(1, "float64", (4,))
+    function = Function(
+        "metadata_outputs",
+        [argument],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [Instr("add", [argument], result, attributes={"right_scalar": 1})],
+            )
+        },
+        metadata={"named_outputs": (("result", 1),)},
+    )
+
+    module = emit_module({function.name: function})
+
+    assert module.complete, [item.format() for item in module.shortfalls]
+    assert "intent(out) :: t1(extent_4)" in module.source
+
+
+def test_scalar_reduction_is_identity_and_logical_arithmetic_is_numeric():
+    logical = SSAValue(0, "bool", ())
+    numeric = SSAValue(1, "bool", ())
+    reduced = SSAValue(2, "float64", (1,))
+    function = Function(
+        "scalar_numpy_semantics",
+        [],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("Const", [], logical, attributes={"value": True}),
+                    Instr(
+                        "add", [logical], numeric,
+                        attributes={"right_scalar": 0},
+                    ),
+                    Instr(
+                        "Call", [numeric], reduced,
+                        attributes={"tensor_operation": "sum"},
+                    ),
+                ],
+            )
+        },
+        metadata={"named_outputs": (("result", 2),)},
+    )
+
+    module = emit_module({function.name: function})
+
+    assert module.complete, [item.format() for item in module.shortfalls]
+    assert "sum(" not in module.source
+    assert ".true._c_bool +" not in module.source
+
+
+def test_index_set_accepts_a_scalar_value_without_reducing_it():
+    base = SSAValue(0, "float64", (5,))
+    value = SSAValue(1, "float64", ())
+    result = SSAValue(2, "float64", (5,))
+    function = Function(
+        "scalar_index_set",
+        [base, value],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [Instr(
+                    "Call", [base, value], result,
+                    attributes={"tensor_operation": "index_set", "slices": 0},
+                )],
+            )
+        },
+        metadata={"named_outputs": (("result", 2),)},
+    )
+
+    module = emit_module({function.name: function})
+
+    assert module.complete, [item.format() for item in module.shortfalls]
+    assert "sum(t1)" not in module.source
+    assert "t2(1) = t1" in module.source
+
+
 def test_ieee_classification_ops_emit_logical_fortran_expressions():
     value = SSAValue(0, "float64", (4,))
     isnan = SSAValue(1, "bool", (4,))

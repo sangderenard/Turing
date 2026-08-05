@@ -26,8 +26,9 @@ from .fortran_c_shell import (
 
 NATIVE_VOXEL_SOURCE = """
 def fluid_advance(state, dt):
+    previous_mass = np.sum(state.S)
     voxel_substep(state, dt)
-    metrics = state.compute_metrics(0.0)
+    metrics = state.compute_metrics(previous_mass)
     return True, metrics
 
 
@@ -54,8 +55,11 @@ def native_voxel_frame(
     dt_out = dt_next + 0.0
 
     pressure_magnitude = np.abs(state.pr)
-    pressure_scale = np.maximum(np.max(pressure_magnitude), 1.0e-12)
-    darkness = 1.0 - 0.72 * pressure_magnitude / pressure_scale
+    pressure_floor = state.p.rho0 * 9.81 * state.dx
+    pressure_scale = np.maximum(np.max(pressure_magnitude), pressure_floor)
+    darkness = 1.0 - 0.58 * np.minimum(
+        pressure_magnitude / pressure_scale, 1.0
+    )
     dye = np.minimum(np.maximum(state.S, 0.0), 1.0)
     red = ((10.0 + 55.0 * dye) * darkness).reshape((-1,))
     green = ((28.0 + 190.0 * dye) * darkness).reshape((-1,))
@@ -95,13 +99,9 @@ def _initial_state(width: int, height: int) -> VoxelMACFluid:
         ny=int(width),
         nz=1,
         dx=0.025,
-        gravity=(0.0, -9.81, 0.0),
-        nu=0.0,
-        thermal_diffusivity=0.0,
-        solute_diffusivity=0.0,
-        pressure_tol=2.0e-3,
-        pressure_maxiter=1,
-        visc_maxiter=0,
+        # Display rows are the solver's first axis. Positive x is therefore
+        # visually downward, so this aligns gravity with the native window.
+        gravity=(9.81, 0.0, 0.0),
     )
     state = VoxelMACFluid(params)
     row = (np.arange(height, dtype=np.float64) + 0.5) / float(height)
@@ -110,8 +110,8 @@ def _initial_state(width: int, height: int) -> VoxelMACFluid:
     plume = np.exp(
         -((xx - 0.5) ** 2 / 0.022 + (yy - 0.82) ** 2 / 0.006)
     )
-    ripple = 0.16 * (1.0 + np.sin(10.0 * np.pi * xx))
-    state.S[:, :, 0] = np.minimum(plume * (0.82 + ripple), 1.0)
+    state.S[:, :, 0] = np.minimum(0.82 * plume, 1.0)
+    state.T[:, :, 0] += 8.0 * plume
     return state
 
 
@@ -135,12 +135,12 @@ def compile_native_voxel_fluid(
         "native_voxel_frame",
         {
             "state": _initial_state(width, height),
-            "targets": Targets(cfl=1.5, div_max=5.0, mass_max=5.0),
-            "controller": STController(dt_min=1.0e-6, dt_max=0.08),
+            "targets": Targets(cfl=0.5, div_max=1.0e-2, mass_max=1.0e-3),
+            "controller": STController(dt_min=1.0e-6, dt_max=0.025),
             "frame_duration": np.asarray(
                 [float(frame_duration)], dtype=np.float64
             ),
-            "dt_initial": np.asarray([0.05], dtype=np.float64),
+            "dt_initial": np.asarray([0.01], dtype=np.float64),
         },
         output,
         python_bindings={
@@ -156,6 +156,7 @@ def compile_native_voxel_fluid(
             "state.pr": "pressure_out",
             "state.T": "temperature_out",
             "state.S": "salinity_out",
+            "dt_initial": "dt_out",
         },
         display={
             "width": int(width),
@@ -166,6 +167,7 @@ def compile_native_voxel_fluid(
         name="native_voxel_fluid",
         standalone=True,
         checkpoint=output / "aot-checkpoint",
+        mutable_parameters=("dt_initial",),
         progress=lambda message: print(
             f"{time.perf_counter() - started:9.3f}s {message}", flush=True
         ),

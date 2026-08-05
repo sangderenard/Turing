@@ -5,6 +5,8 @@ import numpy as np
 
 from src.common.tensors.accelerator_backends.aot_compile import compile_ast_aot
 from src.common.tensors.abstraction import AbstractTensor
+from src.common.tensors.autograd import GradTape, autograd
+from src.compiler.glsl_deployment_strategy import _walk_planned_shells
 from src.compiler.precompile_to_ssa import lower_fused_program_to_ssa
 from src.compiler.ssa_fortran_backend import emit_module
 
@@ -117,6 +119,48 @@ def kernel(field):
         for step in program.steps
     }
     assert "where" not in operations
+    _assert_fortran_complete(compilation)
+
+
+def test_scalar_index_records_zero_rank_slice_during_compiler_capture():
+    field = AbstractTensor.get_tensor(np.arange(4.0))
+    tape = GradTape()
+
+    with autograd.forward_capture(tape):
+        field._tape = tape
+        selected = field[2]
+    with autograd.forward_observation():
+        repeated = [field[0], field[1]]
+    packed = AbstractTensor.get_tensor([selected, *repeated])
+    runtime_scalar = field[3]
+
+    assert selected.shape == ()
+    assert [value.shape for value in repeated] == [(), ()]
+    assert packed.shape == (3,)
+    assert not isinstance(runtime_scalar, AbstractTensor)
+    assert [node.op for node in tape._nodes.values()] == ["slice"]
+
+
+def test_existing_tensor_normalizer_becomes_process_graph_alias():
+    source = """
+def kernel(field):
+    resident = AbstractTensor.get_tensor(field)
+    field[0] = resident[0] + 1.0
+    return field
+"""
+    compilation = _compile(
+        source,
+        "kernel",
+        {"field": AbstractTensor.get_tensor(np.arange(4.0))},
+        python_bindings={"AbstractTensor": AbstractTensor},
+    )
+
+    aliases = {
+        int(result): int(parent)
+        for shell in _walk_planned_shells(compilation.deployment)
+        for result, parent in shell.compiled_process_graph_aliases.items()
+    }
+    assert aliases
     _assert_fortran_complete(compilation)
 
 

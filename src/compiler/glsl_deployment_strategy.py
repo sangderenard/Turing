@@ -33,9 +33,11 @@ import numpy as np
 from .deployment_fifo import DeploymentFIFO
 from .control_source import (
     ControlProgram,
+    LoopBlock,
     SequenceBlock,
     StreamPublishBlock,
     ValidationBlock,
+    WhileBlock,
     overlay_scheduled_control,
     project_control_regions,
 )
@@ -63,6 +65,7 @@ from .process_graph_fusion import (
     reduce_scheduled_shader_regions,
 )
 from .shell_reference_tables import build_shell_reference_tables
+from ..transmogrifier.function_table import FunctionReference
 from ..common.tensors.abstraction import AbstractTensor
 from ..common.tensors.accelerator_backends.glsl_fused_network import (
     GLSLFusedProgramNetwork,
@@ -165,8 +168,44 @@ def _observe_process_graph_node(
         return result
     tape = context["tape"]
     capture_id = id(result)
+    aliased_parents = tuple(
+        int(parent_id)
+        for parent_id, parent_value in zip(parent_ids, parent_values)
+        if result is parent_value
+    )
+    if len(aliased_parents) == 1 and int(node_id) != aliased_parents[0]:
+        # The result is literally an existing explicit operand.  Its tape
+        # entry therefore belongs to that pre-existing value; this operation
+        # did not publish a new primitive result.  Record the ProcessGraph
+        # endpoint as an SSA alias before primitive ownership is considered,
+        # otherwise the same tape identity is incorrectly assigned both to
+        # the call result and to its input socket.
+        context["value_aliases"][int(node_id)] = aliased_parents[0]
+        return result
     if capture_id in tape._nodes:
         primitive = tape._nodes[capture_id]
+        self_parent_slots = tuple(
+            int(slot)
+            for primitive_id, slot in primitive.parents
+            if int(primitive_id) == int(capture_id)
+        )
+        graph = context.get("graph")
+        graph_node = (
+            graph.G.nodes[int(node_id)]
+            if graph is not None and int(node_id) in graph.G
+            else {}
+        )
+        if (
+            self_parent_slots
+            and len(parent_ids) == 1
+            and graph_node.get("type") not in {"Store", "IndexedStore"}
+        ):
+            # An identity-preserving tensor adapter can be recorded by the
+            # tape under the same object ID as its operand.  Such a node is a
+            # self-edge in object-keyed tape space, not a numerical kernel.
+            # The ProcessGraph supplies the unambiguous SSA relationship.
+            context["value_aliases"][int(node_id)] = int(parent_ids[0])
+            return result
         existing_owner = primitive.ctx.get("process_graph_node_id")
         if existing_owner is not None:
             # A structural Store, call return, or other pass-through node may
@@ -179,7 +218,6 @@ def _observe_process_graph_node(
             int(node_id), []
         ).append(int(capture_id))
         primitive.ctx["process_graph_node_id"] = int(node_id)
-        graph = context.get("graph")
         collection_owners = context.get("collection_owner_ids", frozenset())
 
         def collection_source(value_id: int) -> int | None:
@@ -1358,6 +1396,12 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         )
         control_values.update(
             int(value_id)
+            for iterable, target, _induction, _projection
+            in control.projected_iterable_bindings
+            for value_id in (iterable, target)
+        )
+        control_values.update(
+            int(value_id)
             for source, collection, _induction, _start
             in control.collection_bindings
             for value_id in (source, collection)
@@ -1477,6 +1521,12 @@ def _refresh_hierarchy_control_captures(
         values.update(
             int(value_id)
             for iterable, target, _induction in control.iterable_bindings
+            for value_id in (iterable, target)
+        )
+        values.update(
+            int(value_id)
+            for iterable, target, _induction, _projection
+            in control.projected_iterable_bindings
             for value_id in (iterable, target)
         )
         values.update(
@@ -1694,6 +1744,32 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         for _source, collection, _induction, _start
         in control.collection_bindings
     }
+    loop_carried_update_endpoints: set[tuple[int, int]] = set()
+
+    def collect_loop_carried_updates(
+        closure_id: int,
+        block: Any,
+    ) -> None:
+        carried = (
+            block.carried_aliases
+            if isinstance(block, (LoopBlock, WhileBlock))
+            else ()
+        )
+        loop_carried_update_endpoints.update(
+            (int(closure_id), int(updated))
+            for updated, _initial in carried
+        )
+        if isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                collect_loop_carried_updates(closure_id, child)
+        elif isinstance(block, LoopBlock):
+            collect_loop_carried_updates(closure_id, block.body)
+        elif isinstance(block, WhileBlock):
+            collect_loop_carried_updates(closure_id, block.condition)
+            collect_loop_carried_updates(closure_id, block.body)
+
+    for closure_id, control in controls.items():
+        collect_loop_carried_updates(int(closure_id), control.root)
     control_alias_sources = {
         (int(closure_id), int(updated)): (
             int(closure_id),
@@ -1703,6 +1779,8 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         for updated, initial in control.value_aliases
         if (int(closure_id), int(updated))
         not in collection_owner_endpoints
+        and (int(closure_id), int(updated))
+        not in loop_carried_update_endpoints
     }
     for closure_id, owner in shells.items():
         selected_returns = tuple(getattr(
@@ -2979,6 +3057,20 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         return result
 
     def canonical_global(closure_id: int, local_id: int) -> int:
+        if (int(closure_id), int(local_id)) in loop_carried_update_endpoints:
+            # A loop backedge is a cut in the projection graph.  Structural
+            # leaf resolution walks value/alias/call edges as if the program
+            # were acyclic, so it happily fuses the two endpoints of a cycle:
+            # a LoopResult carries its value edge through to the very update
+            # it publishes, and a caller result, local copy, or IndexedStore
+            # correlated with the same source name resolves to that same leaf.
+            # Both endpoints then land on one global and the header Phi
+            # degenerates to Phi(x, x), leaving no body producer to find.
+            # Storage reuse across the backedge stays an arena decision; the
+            # update keeps its own SSA identity here so the pair survives to
+            # Phi construction.  Same exclusion the alias table already
+            # applies, extended to the projection that assigns identity.
+            return global_value(closure_id, local_id)
         projected = leaves(closure_id, local_id)
         if len(projected) == 1 and () in projected:
             return global_value(*projected[()])
@@ -6578,11 +6670,15 @@ def _coordinate_scheduled_capture_impl(
                 graph.G.nodes[candidate].get("op")
                 or graph.G.nodes[candidate].get("type")
             ) == "IndexedStore"
+            and any(
+                str(role) == "base"
+                and isinstance(values.get(int(parent)), (dict, list, set))
+                for parent, role in (
+                    graph.G.nodes[candidate].get("parents") or ()
+                )
+            )
             for candidate in deployment_nodes
             if candidate in graph.G
-        ) and any(
-            isinstance(value, (dict, list, set))
-            for value in inputs.values()
         )
         has_structural_container_call = any(
             isinstance(expression := graph.G.nodes[candidate].get("expr_obj"), ast.Call)
@@ -6611,11 +6707,17 @@ def _coordinate_scheduled_capture_impl(
                 graph.G.nodes[candidate].get("op")
                 or graph.G.nodes[candidate].get("type")
             ) == "Indexed"
+            and any(
+                str(role) == "base"
+                and isinstance(
+                    values.get(int(parent)), (dict, list, tuple, set)
+                )
+                for parent, role in (
+                    graph.G.nodes[candidate].get("parents") or ()
+                )
+            )
             for candidate in deployment_nodes
             if candidate in graph.G
-        ) and any(
-            isinstance(value, (dict, list, tuple, set))
-            for value in inputs.values()
         )
         if (
             has_structural_store
@@ -6807,6 +6909,10 @@ def _coordinate_scheduled_capture_impl(
                                     if len(indices) == 1
                                     else tuple(indices)
                                 )
+                                if isinstance(
+                                    base, (dict, list, tuple, set)
+                                ):
+                                    index = coordinator_index(index)
                                 result = base[index]
                             elif isinstance(expression, ast.BinOp):
                                 operands = [
@@ -6862,7 +6968,7 @@ def _coordinate_scheduled_capture_impl(
                 # this one discovery invocation; they cannot add tape nodes.
                 capture_context = autograd.forward_capture(discovery_tape)
             else:
-                capture_context = autograd.no_grad()
+                capture_context = autograd.forward_observation()
             region_nodes_before = (
                 set(discovery_tape._nodes)
                 if capture and discovery_tape is not None
@@ -7278,6 +7384,23 @@ def _coordinate_scheduled_capture_impl(
             return evaluate_node(int(node))
         return evaluate_reduced_control_expression(source)
 
+    def coordinator_index(value: Any) -> Any:
+        """Project tensor scalars into Python container index semantics."""
+
+        if isinstance(value, AbstractTensor):
+            if tuple(value.shape) == ():
+                return value.item()
+            return value
+        if isinstance(value, tuple):
+            return tuple(coordinator_index(item) for item in value)
+        if isinstance(value, slice):
+            return slice(
+                coordinator_index(value.start),
+                coordinator_index(value.stop),
+                coordinator_index(value.step),
+            )
+        return value
+
     def evaluate_node(node_id: int) -> Any:
         if node_id in values:
             cached_data = graph.G.nodes[node_id]
@@ -7578,6 +7701,8 @@ def _coordinate_scheduled_capture_impl(
                         else tuple(indices)
                     )
                 value = evaluate_node(by_role["value"][0])
+                if isinstance(base, (dict, list, tuple, set)):
+                    index = coordinator_index(index)
                 base[index] = value
                 result = base
             elif node_type == "Indexed":
@@ -7594,6 +7719,8 @@ def _coordinate_scheduled_capture_impl(
                     if str(role) == "index"
                 ]
                 index = indices[0] if len(indices) == 1 else tuple(indices)
+                if isinstance(base, (dict, list, tuple, set)):
+                    index = coordinator_index(index)
                 result = base[index]
             elif isinstance(expression, ast.BoolOp):
                 if isinstance(expression.op, ast.And):
@@ -9862,6 +9989,8 @@ def _coordinate_scheduled_capture_impl(
                 index = evaluate_reduced_control_expression(
                     slice_expression
                 )
+            if isinstance(base, (dict, list, tuple, set)):
+                index = coordinator_index(index)
             return base[index]
         if (
             isinstance(expression, ast.Attribute)
@@ -10070,12 +10199,12 @@ def _coordinate_scheduled_capture_impl(
                     test = evaluate_reduced_control_expression(
                         statement.test
                     )
-                except (KeyError, TypeError):
+                except (KeyError, TypeError) as error:
                     raise RuntimeError(
                         "generator branch test was not retained in "
                         f"{graph.G.graph.get('function_name', '?')}: "
                         f"{ast.dump(statement.test, include_attributes=False)}"
-                    ) from None
+                    ) from error
                 if discovery_session is not None:
                     history = discovery_session.setdefault(
                         "source_branch_history", []
@@ -11020,6 +11149,9 @@ def _source_static_value(graph: Any, node_id: int, visiting=None) -> bool:
     data = graph.G.nodes[node_id]
     if data.get("type") in {"Constant", "Const", "const", "StaticReference"}:
         return True
+    if data.get("type") == "Input":
+        name = (data.get("attributes") or {}).get("binding_name")
+        return name in (graph.G.graph.get("planner_specializations") or {})
     expression = data.get("expr_obj")
     if isinstance(expression, (ast.Tuple, ast.List, ast.Set, ast.Dict)):
         return all(
@@ -11042,6 +11174,21 @@ def _source_static_literal(
     data = graph.G.nodes[node_id]
     if data.get("type") in {"Constant", "Const", "const"}:
         return _constant_value(data)
+    if data.get("type") == "StaticReference":
+        attributes = data.get("attributes") or {}
+        reference = attributes.get(
+            "first_class_function_ref",
+            attributes.get("function_ref"),
+        )
+        if reference is not None:
+            return FunctionReference(int(reference))
+        raise ValueError("static reference is not a graph-backed function")
+    if data.get("type") == "Input":
+        name = (data.get("attributes") or {}).get("binding_name")
+        specializations = graph.G.graph.get("planner_specializations") or {}
+        if name in specializations:
+            return specializations[name]
+        raise ValueError("input has no source-static planner binding")
     expression = data.get("expr_obj")
     parents = tuple(data.get("parents") or ())
     nested = visiting | {node_id}
@@ -11135,10 +11282,44 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
             )[parameter] = first
 
 
+def _resolve_bound_function_references(graph: Any) -> None:
+    """Turn a specialized callable parameter into an ordinary call edge.
+
+    A first-class source function is represented by its opaque function-table
+    address.  When that address crosses a function parameter (for example the
+    dt system's ``advance`` callback), the call remains parametric, but this
+    specialized card invocation can still link it to the selected callee.
+    No Python callable is retained or executed to establish the edge.
+    """
+
+    specializations = graph.G.graph.get("planner_specializations") or {}
+    for _node_id, data in graph.G.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if (
+            attributes.get("callee_ref") is not None
+            or attributes.get("method_ref") is not None
+        ):
+            continue
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Name)
+        ):
+            continue
+        bound = specializations.get(expression.func.id)
+        if not isinstance(bound, FunctionReference):
+            continue
+        attributes = dict(attributes)
+        attributes["callee_ref"] = int(bound.address)
+        attributes["callee_resolution"] = "bound-function-parameter"
+        data["attributes"] = attributes
+
+
 def propagate_bound_planner_specializations(
     graph: Any,
     entrypoint: str,
     bindings: Mapping[str, Any],
+    mutable_parameters: Iterable[str] = (),
 ) -> None:
     """Carry safe structural feed values through the linked call graph.
 
@@ -11195,10 +11376,18 @@ def propagate_bound_planner_specializations(
                     return getattr(owner, node.func.attr)()
         raise ValueError("expression is not a safe structural binding")
 
+    mutable = frozenset(map(str, mutable_parameters))
     entry = function_table.entry(reference.address).graph
     if entry is None:
         return
-    queue: list[tuple[Any, dict[str, Any]]] = [(entry, dict(bindings))]
+    queue: list[tuple[Any, dict[str, Any]]] = [(
+        entry,
+        {
+            str(name): value
+            for name, value in bindings.items()
+            if str(name) not in mutable
+        },
+    )]
     visited: set[tuple[int, tuple[str, ...]]] = set()
     while queue:
         current, environment = queue.pop(0)
@@ -11469,6 +11658,7 @@ def strategize_shell_deployment(
     }
     graph.G.graph["deployment_schedule_preference"] = schedule_preference
 
+    _resolve_bound_function_references(graph)
     _propagate_callsite_planner_specializations(graph)
     canonical_value_ids = bool(
         graph.G.graph.get("canonical_value_ids")
@@ -13227,8 +13417,22 @@ class ProcessGraphGLSLDeployment:
             # their ProcessGraph IDs as external shell inputs.
             planned_region_id_map: dict[int, int] = {}
 
+            def compiled_alias_identity(graph_id: int) -> int:
+                current = int(graph_id)
+                seen = set()
+                while (
+                    current not in seen
+                    and current in self.compiled_process_graph_aliases
+                ):
+                    seen.add(current)
+                    current = int(
+                        self.compiled_process_graph_aliases[current]
+                    )
+                return current
+
             def add_planned_id(primitive_id: int, graph_id: int) -> None:
                 primitive_id = int(primitive_id)
+                graph_id = compiled_alias_identity(graph_id)
                 graph_id = endpoint_identity.get(
                     int(graph_id), int(graph_id)
                 )
@@ -13242,6 +13446,9 @@ class ProcessGraphGLSLDeployment:
                         f"{region_index}: primitive={primitive_id}, "
                         f"first={previous}, second={graph_id}, "
                         f"function={self.process_graph.G.graph.get('function_name', '?')!r}, "
+                        f"primitive_node={tape._nodes.get(primitive_id)!r}, "
+                        f"capture_rows={region_planned_capture_ids!r}, "
+                        f"input_rows={region_planned_input_ids!r}, "
                         f"first_node={dict(self.process_graph.G.nodes[previous]) if previous in self.process_graph.G else None!r}, "
                         f"second_node={dict(self.process_graph.G.nodes[graph_id]) if graph_id in self.process_graph.G else None!r}"
                     )
@@ -13254,6 +13461,31 @@ class ProcessGraphGLSLDeployment:
                 region_planned_input_ids
             ):
                 for primitive_id, graph_id in positional_inputs:
+                    previous = planned_region_id_map.get(int(primitive_id))
+                    previous_node = (
+                        self.process_graph.G.nodes[int(previous)]
+                        if previous is not None
+                        and int(previous) in self.process_graph.G
+                        else {}
+                    )
+                    if (
+                        int(primitive_id) == int(_result_capture_id)
+                        and previous is not None
+                        and int(previous) != int(graph_id)
+                        and previous_node.get("type")
+                        not in {"Store", "IndexedStore"}
+                    ):
+                        # Object-keyed capture represents an identity adapter
+                        # with the same transient ID at its input and result.
+                        # Keep that transient ID wired to the real input and
+                        # publish the planned result endpoint as an SSA alias.
+                        self.compiled_process_graph_aliases[
+                            int(previous)
+                        ] = int(graph_id)
+                        planned_region_id_map[int(primitive_id)] = int(
+                            graph_id
+                        )
+                        continue
                     add_planned_id(primitive_id, graph_id)
             live_result_ids = tuple(
                 value_id

@@ -2588,6 +2588,59 @@ def analyze_shader_loop_reductions(
         # this graph, so every backend receives an identity-derived induction
         # symbol while the source name remains diagnostic metadata only.
         induction_name = f"iteration_{int(loop.node_id)}"
+        projected_iterable_bindings = ()
+        if (
+            loop.stop is None
+            and loop.stop_node is None
+            and loop.iterable_node is not None
+            and len(loop.target_bindings) > 1
+            and loop.iterable_constant is None
+        ):
+            iterable_id = int(loop.iterable_node)
+            iterable_data = graph.G.nodes[iterable_id]
+            reference = (iterable_data.get("attributes") or {}).get(
+                "static_python_reference"
+            )
+            if reference == "enumerate":
+                source_id = next(
+                    (
+                        int(parent)
+                        for parent, role in iterable_data.get("parents", ())
+                        if str(role) in {"arg", "args", "arg:0", "arg0"}
+                    ),
+                    None,
+                )
+                if source_id is not None and len(loop.target_bindings) == 2:
+                    projected_iterable_bindings = (
+                        (
+                            source_id,
+                            int(loop.target_bindings[0][1]),
+                            induction_name,
+                            "induction",
+                        ),
+                        (
+                            source_id,
+                            int(loop.target_bindings[1][1]),
+                            induction_name,
+                            None,
+                        ),
+                    )
+            else:
+                projected_iterable_bindings = tuple(
+                    (
+                        iterable_id,
+                        int(target_id),
+                        induction_name,
+                        int(position),
+                    )
+                    for position, (_name, target_id)
+                    in enumerate(loop.target_bindings)
+                )
+        iterable_extent_id = (
+            int(projected_iterable_bindings[0][0])
+            if projected_iterable_bindings
+            else loop.iterable_node
+        )
         dynamic_bounds = tuple(
             (
                 name,
@@ -2689,6 +2742,7 @@ def analyze_shader_loop_reductions(
                 and (
                     len(loop.target_bindings) == 1
                     or loop.iterable_constant is not None
+                    or bool(projected_iterable_bindings)
                 )
             )
         ):
@@ -2701,6 +2755,16 @@ def analyze_shader_loop_reductions(
                 blockers.append(type(expression).__name__)
         blockers = list(dict.fromkeys(blockers))
 
+        # ``identity_table`` groups every value ever correlated with a source
+        # name.  That class is scope-free: for one carried name it holds the
+        # caller result, a local copy, an IndexedStore, the loop's LoopResult
+        # port and a nested callee's parameter alongside the real body update.
+        # Offering all of them as backedge candidates emits several pairs per
+        # binding, and only the one produced inside the loop can ever satisfy
+        # the header Phi.  Restrict the candidates to the loop body's induced
+        # subgraph, which is the graph-level statement of "this version was
+        # written by this cycle"; the lexical update stays authoritative.
+        body_scope = frozenset(map(int, loop.body_nodes))
         carried_aliases = tuple(dict.fromkeys(
             (
                 int(alias),
@@ -2709,6 +2773,7 @@ def analyze_shader_loop_reductions(
             for name, initial, updated in loop.carried_bindings
             for alias in (*tuple(identity_table.get(name, ())), updated)
             if int(alias) != int(initial)
+            and (int(alias) == int(updated) or int(alias) in body_scope)
         ))
         body_items: list[tuple[int, object]] = [
             (
@@ -2797,7 +2862,7 @@ def analyze_shader_loop_reductions(
                         is IterableAccess.CLOSURE_AGGREGATE
                         and plan.semantic.domain.source_value_ids
                     )
-                    else f"__iterable_extent_{loop.iterable_node}__"
+                    else f"__iterable_extent_{iterable_extent_id}__"
                     if loop.stop_node is None and loop.iterable_node is not None
                     and bool(loop.target_bindings)
                     and loop.iterable_constant is None
@@ -2964,6 +3029,9 @@ def analyze_shader_loop_reductions(
                         and len(loop.target_bindings) == 1
                     )
                     else (),
+                    projected_iterable_bindings=(
+                        projected_iterable_bindings
+                    ),
                     recursion_regions=tuple(
                         region
                         for region in recursion_regions

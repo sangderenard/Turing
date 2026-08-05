@@ -610,15 +610,20 @@ class _ControlSSABuilder:
     def indexed_load(
         self,
         source: SSAValue,
-        index: SSAValue,
+        index: SSAValue | tuple[SSAValue, ...] | list[SSAValue],
         result_id: int,
         *,
         attributes: dict[str, Any],
     ) -> SSAValue:
         address = self.fresh_value(dtype="ptr")
+        indices = (
+            tuple(index)
+            if isinstance(index, (tuple, list))
+            else (index,)
+        )
         self.emit(
             Handler.GetElementPtr,
-            [source, index],
+            [source, *indices],
             address,
             attributes=attributes,
         )
@@ -786,6 +791,25 @@ class _ControlSSABuilder:
         location: str,
     ) -> SSAValue:
         spelling = str(expression).strip()
+        iterable_extent = re.fullmatch(
+            r"__iterable_extent_(\d+)__", spelling
+        )
+        if iterable_extent is not None:
+            iterable_id = int(iterable_extent.group(1))
+            source = self.external_value(iterable_id)
+            extent = self.fresh_value(dtype="int")
+            self.emit(
+                Handler.Call,
+                [source],
+                extent,
+                attributes={
+                    "tensor_operation": "extent",
+                    "dim": 0,
+                    "binding": "iterable_extent",
+                    "source_value_id": iterable_id,
+                },
+            )
+            return extent
         value_match = re.fullmatch(r"value_(\d+)", spelling)
         if value_match is not None:
             return self.external_value(int(value_match.group(1)))
@@ -1193,6 +1217,30 @@ class _ControlSSABuilder:
                 attributes={
                     "binding": "iterable",
                     "induction": loop.induction,
+                },
+            )
+        for iterable_id, target_id, induction_name, projection in (
+            self.program.projected_iterable_bindings
+        ):
+            if induction_name != loop.induction:
+                continue
+            restored_values[int(target_id)] = self.external_values.get(
+                int(target_id)
+            )
+            if projection == "induction":
+                self.external_values[int(target_id)] = induction
+                continue
+            indices = [induction]
+            if projection is not None:
+                indices.append(self.constant_value(int(projection)))
+            self.indexed_load(
+                self.external_value(iterable_id),
+                indices,
+                target_id,
+                attributes={
+                    "binding": "projected_iterable",
+                    "induction": loop.induction,
+                    "projection": projection,
                 },
             )
         for iterable_id, target_id, induction_name, values in (

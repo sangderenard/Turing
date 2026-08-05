@@ -23,6 +23,7 @@ from src.compiler.precompile_to_ssa import (
     lower_fused_program_to_ssa,
     lower_precompile_and_control_to_ssa,
 )
+from src.compiler.ssa_fortran_backend import emit_module
 from src.compiler.shell_reference_tables import (
     ClassNavigationMember,
     ClassNavigationRecord,
@@ -44,6 +45,58 @@ def _program(*steps):
             for value_id in value_ids
         },
     )
+
+
+def test_repeat_lowers_as_native_fortran_axis_tiling():
+    program = FusedProgram(
+        version=1,
+        feeds={0},
+        steps=[
+            OpStep(
+                0,
+                "slice",
+                [0],
+                {
+                    "slice_kind": "axis",
+                    "dim": 1,
+                    "start": 0,
+                    "step": 1,
+                    "count": 1,
+                },
+                1,
+            ),
+            OpStep(
+                1,
+                "repeat",
+                [1],
+                {"repeats": 2, "dim": 0},
+                2,
+            ),
+        ],
+        outputs={"result": 2},
+        meta={
+            0: Meta((3, 1, 4), "float32", "cpu"),
+            1: Meta((3, 1, 4), "float32", "cpu"),
+            2: Meta((6, 1, 4), "float32", "cpu"),
+        },
+    )
+
+    function, shortfalls = lower_fused_program_to_ssa(program)
+    output = next(
+        instruction.res
+        for instruction in function.blocks["entry"].instrs
+        if instruction.res is not None and instruction.res.id == 2
+    )
+    module = emit_module(
+        {function.name: function},
+        outputs={function.name: [output]},
+    )
+
+    assert shortfalls == ()
+    assert module.complete, [item.format() for item in module.shortfalls]
+    assert "mod(" in module.source
+    assert "= 1, 6" in module.source
+    assert "1:1, :)([" not in module.source
 
 
 def test_numerical_tensor_ops_call_real_imported_llvm_algorithms():
@@ -309,6 +362,47 @@ def test_loop_collection_binding_is_indexed_store_after_region_publication():
     assert body[store_index].args[0].id == 12
     assert body[store_index].attributes["binding"] == (
         "collection_publication"
+    )
+
+
+def test_projected_enumerate_binding_lowers_extent_counter_and_element():
+    control = ControlProgram(
+        LoopBlock(
+            "iteration_9",
+            "0",
+            "__iterable_extent_40__",
+            "1",
+            StatementBlock(("__scheduled_region_4__",)),
+        ),
+        region_indices=(4,),
+        projected_iterable_bindings=(
+            (40, 41, "iteration_9", "induction"),
+            (40, 42, "iteration_9", None),
+        ),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_callees={4: "numerical_region_4"},
+        region_signatures={4: ((41, 42), ())},
+        region_value_meta={
+            40: Meta((4,), "float64", "cpu"),
+            41: Meta((), "int32", "cpu"),
+            42: Meta((), "float64", "cpu"),
+        },
+    )
+
+    assert shortfalls == ()
+    assert any(
+        instruction.attributes.get("tensor_operation") == "extent"
+        for instruction in function.blocks["entry"].instrs
+    )
+    body = function.blocks["loop_body"].instrs
+    assert any(
+        instruction.attributes.get("binding") == "projected_iterable"
+        and instruction.op == "Load"
+        for instruction in body
     )
 
 

@@ -133,6 +133,19 @@ def test_axis_reduction_backward_restores_the_reduced_dimension(backend):
     np.testing.assert_allclose(gradient.tolist(), expected)
 
 
+def test_numpy_reduction_protocol_keywords_reach_abstract_tensor_methods():
+    values = np.arange(24.0).reshape(2, 3, 4)
+    with AbstractTensor.use_backend("numpy"):
+        source = AbstractTensor.tensor(values)
+        summed = np.sum(source, axis=1, keepdims=True)
+        maximum = np.max(source, axis=2, keepdims=True)
+        mean = np.mean(source, axis=0)
+
+    np.testing.assert_allclose(summed.tolist(), values.sum(axis=1, keepdims=True))
+    np.testing.assert_allclose(maximum.tolist(), values.max(axis=2, keepdims=True))
+    np.testing.assert_allclose(mean.tolist(), values.mean(axis=0))
+
+
 @pytest.mark.parametrize("backend", ["numpy", "c"])
 def test_mod_backward_matches_floor_quotient_semantics(backend):
     autograd.tape = GradTape()

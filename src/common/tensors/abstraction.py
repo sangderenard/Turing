@@ -542,25 +542,87 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement log_softmax_()")
 
     # --- Basic layout ---
-    def mean(self, dim=None, keepdim: bool = False):
+    def _normalize_reduction_call(
+        self,
+        operation: str,
+        dim,
+        keepdim: bool,
+        *,
+        axis=None,
+        dtype=None,
+        out=None,
+        keepdims=None,
+    ):
+        """Normalize NumPy and tensor-dialect reduction spellings.
+
+        NumPy reduction dispatch calls an object's method with ``axis``,
+        ``dtype``, ``out``, and ``keepdims`` keywords.  The tensor dialect
+        historically exposed the equivalent ``dim`` and ``keepdim`` names.
+        Keeping the normalization here lets captured programs accept either
+        surface without teaching every backend about both ABIs.
+        """
+        if axis is not None:
+            if dim is not None and dim != axis:
+                raise TypeError(
+                    f"{operation}() received conflicting dim={dim!r} and axis={axis!r}"
+                )
+            dim = axis
+        if keepdims is not None:
+            if keepdim is not False and bool(keepdim) != bool(keepdims):
+                raise TypeError(
+                    f"{operation}() received conflicting keepdim and keepdims values"
+                )
+            keepdim = bool(keepdims)
+        if out is not None:
+            raise TypeError(
+                f"{operation}() does not support an out arena; alias the returned tensor instead"
+            )
+        source = self if dtype is None else self.to_dtype(dtype)
+        return source, dim, keepdim
+
+    def mean(
+        self,
+        dim=None,
+        keepdim: bool = False,
+        *,
+        axis=None,
+        dtype=None,
+        out=None,
+        keepdims=None,
+    ):
         """Return the mean of the tensor along the specified dimension(s)."""
-        finalize = AbstractTensor._pre_autograd(
-            "mean", [self], params={"axis": dim, "keepdim": keepdim}
+        source, dim, keepdim = self._normalize_reduction_call(
+            "mean", dim, keepdim, axis=axis, dtype=dtype, out=out, keepdims=keepdims
         )
-        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.mean_(dim=dim, keepdim=keepdim)
+        finalize = AbstractTensor._pre_autograd(
+            "mean", [source], params={"axis": dim, "keepdim": keepdim}
+        )
+        result = type(source)(track_time=source.track_time, tape=getattr(source, "_tape", None))
+        result.data = source.mean_(dim=dim, keepdim=keepdim)
         result = finalize(result)
         if getattr(result.data, "shape", ()) == ():
             return AbstractScalar.__new__(AbstractScalar, result)
         return result
 
-    def sum(self, dim=None, keepdim: bool = False):
+    def sum(
+        self,
+        dim=None,
+        keepdim: bool = False,
+        *,
+        axis=None,
+        dtype=None,
+        out=None,
+        keepdims=None,
+    ):
         """Return the sum of the tensor along the specified dimension(s)."""
-        finalize = AbstractTensor._pre_autograd(
-            "sum", [self], params={"axis": dim, "keepdim": keepdim}
+        source, dim, keepdim = self._normalize_reduction_call(
+            "sum", dim, keepdim, axis=axis, dtype=dtype, out=out, keepdims=keepdims
         )
-        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.sum_(dim=dim, keepdim=keepdim)
+        finalize = AbstractTensor._pre_autograd(
+            "sum", [source], params={"axis": dim, "keepdim": keepdim}
+        )
+        result = type(source)(track_time=source.track_time, tape=getattr(source, "_tape", None))
+        result.data = source.sum_(dim=dim, keepdim=keepdim)
         result = finalize(result)
         if getattr(result.data, "shape", ()) == ():
             return AbstractScalar.__new__(AbstractScalar, result)
@@ -575,13 +637,25 @@ class AbstractTensor:
         result.data = self.cumsum_(dim)
         return finalize(result)
 
-    def min(self, dim=None, keepdim: bool = False):
+    def min(
+        self,
+        dim=None,
+        keepdim: bool = False,
+        *,
+        axis=None,
+        dtype=None,
+        out=None,
+        keepdims=None,
+    ):
         """Return the minimum of the tensor along the specified dimension(s)."""
-        finalize = AbstractTensor._pre_autograd(
-            "min", [self], params={"axis": dim, "keepdim": keepdim}
+        source, dim, keepdim = self._normalize_reduction_call(
+            "min", dim, keepdim, axis=axis, dtype=dtype, out=out, keepdims=keepdims
         )
-        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.min_(dim=dim, keepdim=keepdim)
+        finalize = AbstractTensor._pre_autograd(
+            "min", [source], params={"axis": dim, "keepdim": keepdim}
+        )
+        result = type(source)(track_time=source.track_time, tape=getattr(source, "_tape", None))
+        result.data = source.min_(dim=dim, keepdim=keepdim)
         result = finalize(result)
         if getattr(result.data, "shape", ()) == ():
             return AbstractScalar.__new__(AbstractScalar, result)
@@ -2539,6 +2613,23 @@ class AbstractTensor:
         if isinstance(result, self.tensor_type):
             wrapped = type(self)(track_time=getattr(self, "track_time", False), tape=getattr(self, "_tape", None))
             wrapped.data = result
+            return finalize(wrapped)
+        if getattr(AbstractTensor.autograd, "capture_all", False):
+            # Backends commonly return a native scalar for an integer index
+            # (NumPy's ``np.float64`` is the usual example).  Compiler forward
+            # observation preserves the backend and scalar rank in a fresh
+            # wrapper so the recorded occurrence and later no-grad loop
+            # occurrences agree on result type and shape.  Ordinary Python
+            # execution retains the backend's native scalar behavior.
+            wrapped = type(self)(
+                track_time=getattr(self, "track_time", False),
+                tape=getattr(self, "_tape", None),
+            )
+            wrapped.data = self.tensor_from_list_(
+                result,
+                dtype=getattr(result, "dtype", None),
+                device=self.get_device(),
+            )
             return finalize(wrapped)
         return result
 

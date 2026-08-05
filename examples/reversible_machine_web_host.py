@@ -38,7 +38,7 @@ from src.compiler.site_bundle import publish_prebuilt_program_bundle
 from src.compiler.shell_io import VirtualFileSystemContract, VirtualMount
 from src.compiler.virtual_filesystem import VirtualFileEffect, VirtualFileSystemState
 from src.compiler.virtual_process import VirtualProgramRegistry, VirtualProgramResult
-from examples.reversible_demo_subject import build_reversible_demo_subject
+from examples.reversible_demo_subject import DEMO_ENTRY_CODE, build_reversible_demo_subject
 
 
 def _new_machine(
@@ -205,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
                 "path": "subject/reversible-demo-amd64.pe",
                 "format": "PE32+", "isa": "AMD64",
                 "sha256": sha256(demo_subject).hexdigest(),
-                "entry_code_hex": demo_subject[0x400:0x402].hex(),
+                "entry_code_hex": DEMO_ENTRY_CODE.hex(),
                 "license": "project-authored fixture",
             },
             "recompiled_machine_block": {

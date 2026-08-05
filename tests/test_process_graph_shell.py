@@ -19,6 +19,8 @@ from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.process_graph_shell import emit_process_graph_shell, schedule_table
 from src.compiler.glsl_deployment_strategy import _control_partition_keys
+from src.compiler.control_source import CallBlock, LoopBlock, SequenceBlock
+from src.compiler.precompile_to_ssa import lower_precompile_and_control_to_ssa
 from src.compiler.wasm_class_modules import partition_reduced_program
 
 
@@ -254,6 +256,26 @@ def test_configured_parameter_constants_apply_before_graph_reduction():
         )
 
 
+def test_mutable_parameter_must_survive_in_executable_abi():
+    numerical = compile_ast_aot(
+        "def kernel(x):\n    return x + 1\n",
+        "kernel",
+        {"x": np.array([3.0])},
+        precompile_only=True,
+        mutable_parameters=("x",),
+    )
+    assert numerical.public_input_value_ids == {"x": 0}
+
+    with pytest.raises(RuntimeError, match="specialized out"):
+        compile_ast_aot(
+            "def kernel(source):\n    return len(source)\n",
+            "kernel",
+            {"source": "discovery sample"},
+            precompile_only=True,
+            mutable_parameters=("source",),
+        )
+
+
 def test_schedule_table_is_built_fresh_from_real_compiled_ir():
     """Not a fixture: pulled from compile_ast_aot's own compiled_shell_program,
     cut into chunks, run through the real ProcessGraph/ILPScheduler, same as
@@ -422,7 +444,10 @@ def entry(value):
 
     assert "aot: saving frontend checkpoint" in first_progress
     assert "aot: saving compiled-plan checkpoint" in first_progress
+    assert "aot: saving captured-program checkpoint" in first_progress
     assert "aot: resumed compiled-plan checkpoint" in second_progress
+    assert "aot: resumed captured-program checkpoint" in second_progress
+    assert "aot: capturing fused programs" not in second_progress
     assert not any(
         "building process graph" in message for message in second_progress
     )
@@ -983,6 +1008,30 @@ def entry(mapping, key):
     assert compilation.outputs == {}
 
 
+def test_zero_rank_tensor_key_uses_python_mapping_semantics():
+    source = """
+def entry(mapping, key, observed):
+    observed.append(mapping[key])
+    return observed
+"""
+    observed = []
+
+    compilation = compile_ast_aot(
+        source,
+        "entry",
+        {
+            "mapping": {2: "selected"},
+            "key": np.asarray(2),
+            "observed": observed,
+        },
+        backend="fortran",
+        precompile_only=True,
+    )
+
+    assert observed == ["selected"]
+    assert compilation.outputs == {}
+
+
 def test_imported_module_remains_structural_across_nested_function():
     source = """
 def make_symbol(name, observed):
@@ -1484,3 +1533,57 @@ def entry(seed):
     )
 
     assert compilation.outputs == {}
+
+
+def test_nested_retained_loop_preserves_distinct_backedge_ssa_identity():
+    source = """
+def iterate(values):
+    total = values
+    for index in range(12):
+        total = total + values
+    return total
+
+def entry(values):
+    return iterate(values)
+"""
+    compilation = compile_ast_aot(
+        source,
+        "entry",
+        {"values": np.asarray([1.0, 2.0], dtype=np.float64)},
+        backend="fortran",
+        precompile_only=True,
+    )
+
+    loops = []
+
+    def visit(block):
+        if isinstance(block, LoopBlock):
+            loops.append(block)
+            visit(block.body)
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                visit(child)
+        elif isinstance(block, CallBlock):
+            visit(block.callee)
+
+    visit(compilation.shell_control_program.root)
+    assert loops
+    assert all(
+        updated != initial
+        for loop in loops
+        for updated, initial in loop.carried_aliases
+    )
+
+    lowered = lower_precompile_and_control_to_ssa(
+        compilation.compiled_shell_program,
+        compilation.shell_control_program,
+        region_programs=dict(compilation.region_programs),
+        identity_table=compilation.identity_table,
+        function_outputs=compilation.function_outputs,
+        function_parameters=compilation.function_parameters,
+    )
+    assert not tuple(
+        shortfall
+        for shortfall in lowered.shortfalls
+        if shortfall.name == "loop_carried"
+    )

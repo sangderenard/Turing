@@ -100,7 +100,7 @@ import inspect
 import io
 import types
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from collections.abc import Iterable
 from typing import Any, Callable, Mapping
 
@@ -471,6 +471,37 @@ def compile_ast_aot(
     expanded_python_bindings = _expand_python_static_bindings(
         python_bindings
     )
+
+    def mutable_feed_signature(value: Any) -> Mapping[str, Any]:
+        """Describe a runtime feed without fingerprinting its sample value."""
+
+        signature: dict[str, Any] = {
+            "runtime_type": (
+                f"{type(value).__module__}.{type(value).__qualname__}"
+            ),
+        }
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            try:
+                signature["shape"] = tuple(map(int, shape))
+            except (TypeError, ValueError):
+                pass
+        dtype = getattr(value, "dtype", None)
+        if dtype is not None:
+            signature["dtype"] = str(dtype)
+        device = getattr(value, "device", None)
+        if device is not None:
+            signature["device"] = str(device)
+        return signature
+
+    checkpoint_feeds = {
+        str(name): (
+            mutable_feed_signature(value)
+            if str(name) in mutable_parameters
+            else value
+        )
+        for name, value in feeds.items()
+    }
     checkpoint_store = None
     frontend_implementation = callable_digest(
         ProcessGraph.build_from_ast,
@@ -493,6 +524,10 @@ def compile_ast_aot(
         _control_partition_keys,
         frontend_implementation,
     )
+    capture_implementation = callable_digest(
+        compile_ast_aot,
+        planning_implementation,
+    )
     if checkpoint:
         binding_values = tuple(
             value
@@ -505,7 +540,7 @@ def compile_ast_aot(
             {
                 "source": source,
                 "entrypoint": entrypoint,
-                "feeds": dict(feeds),
+                "feeds": checkpoint_feeds,
                 "backend": backend,
                 "remove_loops": bool(remove_loops),
                 "unroll_limit": int(unroll_limit),
@@ -612,7 +647,10 @@ def compile_ast_aot(
         reduce_abstract_tensor_topology(graph)
         _report("aot: propagating bound planner specializations")
         propagate_bound_planner_specializations(
-            graph, entrypoint, feeds
+            graph,
+            entrypoint,
+            feeds,
+            mutable_parameters=mutable_parameters,
         )
         _report("aot: building map dependency regions")
         dependency_regions = build_map_dependency_regions(graph, entrypoint)
@@ -702,6 +740,22 @@ def compile_ast_aot(
                 finally:
                     for planned_shell, bindings in saved_static_bindings:
                         planned_shell.static_python_bindings = bindings
+        if checkpoint_store is not None and resume and precompile_only:
+            _report("aot: loading captured-program checkpoint")
+            captured_compilation = checkpoint_store.load(
+                "captured_program",
+                capture_implementation,
+            )
+            if isinstance(captured_compilation, AOTCompilation):
+                _report("aot: resumed captured-program checkpoint")
+                return replace(
+                    captured_compilation,
+                    deployment=deployment,
+                )
+            _report(
+                "aot: captured-program checkpoint unavailable "
+                f"({checkpoint_store.last_load_status})"
+            )
         reference = graph.function_table.reference(entrypoint)
         if reference is None:
             raise ValueError(
@@ -1090,13 +1144,49 @@ def compile_ast_aot(
         )
         for index, program in region_programs.items()
     }
+    executable_value_ids = {
+        int(value_id)
+        for program in region_programs.values()
+        for value_id in (
+            *tuple(program.feeds),
+            *tuple(step.result_id for step in program.steps),
+            *tuple(program.outputs.values()),
+        )
+    }
+    for parameter in function_parameters:
+        history = tuple(map(int, identity_table.get(parameter, ())))
+        live = tuple(
+            value_id
+            for value_id in history
+            if value_id in executable_value_ids
+        )
+        if live:
+            public_input_value_ids.setdefault(parameter, live[0])
+    elided_mutable_parameters = tuple(
+        parameter
+        for parameter in mutable_parameters
+        if parameter in function_parameters
+        and parameter not in public_input_value_ids
+        and not any(
+            str(name).startswith(f"{parameter}.")
+            for name in public_input_value_ids
+        )
+    )
+    if elided_mutable_parameters:
+        raise RuntimeError(
+            "mutable runtime parameters were specialized out of the "
+            "executable AST program: "
+            f"{elided_mutable_parameters!r}; their ProcessGraph identities "
+            "exist, but no retained control/numerical SSA value consumes "
+            "them"
+        )
     shell = DualIRShell(
         compiled_shell_program=compiled_shell_program,
         shell_control_program=shell_control_program,
         map_ir=map_ir,
         name=entrypoint,
     )
-    return AOTCompilation(
+    compilation = AOTCompilation(
         entrypoint=entrypoint,
         outputs=outputs,
         compiled_shell_program=compiled_shell_program,
@@ -1120,6 +1210,20 @@ def compile_ast_aot(
         constant_map=constant_map,
         mutable_parameters=mutable_parameters,
     )
+    if checkpoint_store is not None and precompile_only:
+        _report("aot: saving captured-program checkpoint")
+        try:
+            checkpoint_store.store(
+                "captured_program",
+                capture_implementation,
+                replace(compilation, deployment=None),
+            )
+        except Exception as error:
+            _report(
+                "aot: captured-program checkpoint skipped "
+                f"({type(error).__name__}: {error})"
+            )
+    return compilation
 
 
 __all__ = [

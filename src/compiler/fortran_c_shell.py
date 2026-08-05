@@ -124,6 +124,46 @@ def _source_name(parameter: Any) -> str:
     return str(parameter.source_name or parameter.name)
 
 
+def _fortran_storage_index(
+    parameter: Any,
+    extents: Mapping[str, int],
+    linear_index: str,
+) -> str:
+    """Map one C-row-major logical index to Fortran array storage.
+
+    The API shape is semantic and remains in Python/NumPy dimension order.
+    A ``bind(C)`` Fortran dummy with that shape stores its first dimension
+    fastest, so the outer shell must perform this boundary permutation once.
+    Resident feedback arenas stay in Fortran order and require no copies.
+    """
+
+    shape = tuple(
+        int(extents.get(f"extent_{int(size)}", size))
+        for size in tuple(parameter.shape or ())
+    )
+    if len(shape) <= 1:
+        return linear_index
+    terms = []
+    for dimension, size in enumerate(shape):
+        c_stride = 1
+        for following in shape[dimension + 1:]:
+            c_stride *= int(following)
+        fortran_stride = 1
+        for preceding in shape[:dimension]:
+            fortran_stride *= int(preceding)
+        coordinate = (
+            f"(({linear_index}) / {c_stride}) % {size}"
+            if c_stride != 1
+            else f"({linear_index}) % {size}"
+        )
+        terms.append(
+            coordinate
+            if fortran_stride == 1
+            else f"({coordinate}) * {fortran_stride}"
+        )
+    return " + ".join(terms)
+
+
 def _c_string(value: str) -> str:
     return json.dumps(str(value))
 
@@ -317,13 +357,30 @@ def emit_fortran_c_shell_source(
             f"    if (!slots[{index}]) return 3;",
         ))
         if parameter.role == "input" and parameter.name not in system_parameters:
-            input_read_lines.extend((
-                f"    if (fread(slots[{index}], sizeof({c_type}), {count}, state) "
-                f"!= {count}) {{",
-                f"        fprintf(stderr, \"short initial state at {_c_string(_source_name(parameter))[1:-1]}\\n\");",
-                "        return 4;",
-                "    }",
-            ))
+            if len(tuple(parameter.shape or ())) <= 1:
+                input_read_lines.extend((
+                    f"    if (fread(slots[{index}], sizeof({c_type}), {count}, state) "
+                    f"!= {count}) {{",
+                    f"        fprintf(stderr, \"short initial state at {_c_string(_source_name(parameter))[1:-1]}\\n\");",
+                    "        return 4;",
+                    "    }",
+                ))
+            else:
+                storage_index = _fortran_storage_index(
+                    parameter, extents, "logical_index"
+                )
+                input_read_lines.extend((
+                    "    { size_t logical_index;",
+                    f"      for (logical_index = 0; logical_index < {count}; ++logical_index) {{",
+                    f"        {c_type} element;",
+                    f"        if (fread(&element, sizeof({c_type}), 1, state) != 1) {{",
+                    f"          fprintf(stderr, \"short initial state at {_c_string(_source_name(parameter))[1:-1]}\\n\");",
+                    "          return 4;",
+                    "        }",
+                    f"        (({c_type} *)slots[{index}])[{storage_index}] = element;",
+                    "      }",
+                    "    }",
+                ))
 
     file_load_lines = []
     for port in file_ports:
@@ -382,9 +439,22 @@ def emit_fortran_c_shell_source(
             f"      printf(\"{separator}\\\"{_source_name(parameter)}\\\":{{\\\"first\\\":%.17g,\\\"sum\\\":%.17g}}\",",
             f"             (double)(({parameter.c_type} *)slots[{slot}])[0], sum); }}",
         ))
-        output_write_lines.append(
-            f"    fwrite(slots[{slot}], sizeof({parameter.c_type}), {count}, outputs_file);"
-        )
+        if len(tuple(parameter.shape or ())) <= 1:
+            output_write_lines.append(
+                f"    fwrite(slots[{slot}], sizeof({parameter.c_type}), {count}, outputs_file);"
+            )
+        else:
+            storage_index = _fortran_storage_index(
+                parameter, extents, "logical_index"
+            )
+            output_write_lines.extend((
+                "    { size_t logical_index;",
+                f"      for (logical_index = 0; logical_index < {count}; ++logical_index) {{",
+                f"        const {parameter.c_type} *element = &(({parameter.c_type} *)slots[{slot}])[{storage_index}];",
+                f"        fwrite(element, sizeof({parameter.c_type}), 1, outputs_file);",
+                "      }",
+                "    }",
+            ))
 
     display_source = ""
     display_open_lines: list[str] = []
@@ -815,6 +885,8 @@ def compile_ast_fortran_c_shell(
     standalone: bool = True,
     progress: Callable[[str], None] | None = None,
     checkpoint: bool | str | Path = False,
+    mutable_parameters: tuple[str, ...] | list[str] | set[str] = (),
+    retain_card_program: bool = True,
 ) -> FortranCShellExecutable:
     """Compile Python AST through the registered Fortran target and C shell.
 
@@ -848,6 +920,7 @@ def compile_ast_fortran_c_shell(
         python_bindings=dict(python_bindings or {}),
         progress=progress,
         checkpoint=checkpoint,
+        mutable_parameters=tuple(mutable_parameters),
     )
     hierarchical_outputs = dict(compilation.public_output_value_ids)
     hierarchical_inputs = dict(compilation.public_input_value_ids)
@@ -996,6 +1069,52 @@ def compile_ast_fortran_c_shell(
                 + "; ".join(emitted.shortfalls)
             )
         module = emitted.module
+
+    # Hierarchical lowering can promote a region-private feed into the public
+    # control ABI after ``parameter_names`` was recorded.  Its SSA identity is
+    # still present in the graph identity table, so restore the authored feed
+    # name here.  Stateful shells can then declare feedback by program name
+    # instead of depending on an unstable ``t<ID>`` spelling.
+    feed_names_by_value_id: dict[int, str] = {}
+    ambiguous_feed_ids: set[int] = set()
+    candidate_feed_names = {
+        str(name)
+        for name in compilation.identity_table
+        if str(name).split(".", 1)[0] in feeds
+    }
+    candidate_feed_names.update(map(str, feeds))
+    for feed_name in candidate_feed_names:
+        for value_id in compilation.identity_table.get(feed_name, ()):
+            value_id = int(value_id)
+            previous = feed_names_by_value_id.get(value_id)
+            if previous is not None and previous != str(feed_name):
+                ambiguous_feed_ids.add(value_id)
+            else:
+                feed_names_by_value_id[value_id] = str(feed_name)
+    if feed_names_by_value_id:
+        entry_points = []
+        for described_entry in module.api.entry_points:
+            described_parameters = []
+            for parameter in described_entry.parameters:
+                source_name = parameter.source_name
+                if source_name is None and parameter.name.startswith("t"):
+                    try:
+                        value_id = int(parameter.name[1:])
+                    except ValueError:
+                        value_id = -1
+                    if value_id not in ambiguous_feed_ids:
+                        source_name = feed_names_by_value_id.get(value_id)
+                described_parameters.append(
+                    replace(parameter, source_name=source_name)
+                )
+            entry_points.append(replace(
+                described_entry,
+                parameters=tuple(described_parameters),
+            ))
+        module = replace(
+            module,
+            api=replace(module.api, entry_points=tuple(entry_points)),
+        )
     if display is not None:
         options = dict(display)
         channels = tuple(
@@ -1120,6 +1239,43 @@ def compile_ast_fortran_c_shell(
             # rather than allocating a copy-only output.  Point feedback at
             # that shared slot so the C shell preserves the alias contract.
             resolved_feedback[input_name] = input_name
+    if retain_card_program:
+        from .parametric_card_program import build_parametric_card_program
+
+        card_public_inputs = dict(hierarchical_inputs)
+        if not card_public_inputs:
+            for parameter in entry.parameters:
+                if parameter.role != "input" or not parameter.name.startswith("t"):
+                    continue
+                try:
+                    value_id = int(parameter.name[1:])
+                except ValueError:
+                    continue
+                card_public_inputs[
+                    str(parameter.source_name or parameter.name)
+                ] = value_id
+        card_public_outputs = dict(hierarchical_outputs)
+        if not card_public_outputs:
+            card_public_outputs = {
+                str(output_name): int(value_id)
+                for output_name, value_id in program.outputs.items()
+            }
+        card_program = build_parametric_card_program(
+            compilation,
+            feedback=resolved_feedback,
+            public_inputs=card_public_inputs,
+            public_outputs=card_public_outputs,
+        )
+        module = replace(
+            module,
+            api=replace(
+                module.api,
+                metadata={
+                    **dict(module.api.metadata or {}),
+                    "card_program": card_program.to_mapping(),
+                },
+            ),
+        )
     return compile_fortran_module_c_shell(
         module,
         native_inputs,

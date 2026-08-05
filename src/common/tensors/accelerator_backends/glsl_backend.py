@@ -1746,6 +1746,27 @@ def compose_control_shader(
             all_slot_ids.append(int(iterable_id))
             all_slot_meta.append(None)
             base += 1
+    for iterable_id, target_id, _induction, _projection in (
+        control_program.projected_iterable_bindings
+    ):
+        for value_id in (int(iterable_id), int(target_id)):
+            if value_id in all_slot_ids:
+                continue
+            all_slot_ids.append(value_id)
+            value_meta = next(
+                (
+                    (program.meta or {}).get(value_id)
+                    for captured in captured_regions.values()
+                    for program in (
+                        tuple(getattr(captured, "stages", ()) or ())
+                        or (captured.program,)
+                    )
+                    if (program.meta or {}).get(value_id) is not None
+                ),
+                None,
+            )
+            all_slot_meta.append(value_meta)
+            base += 1
     for _iterable_id, target_id, _induction, values in (
         control_program.static_iterable_bindings
     ):
@@ -2114,6 +2135,7 @@ def compose_control_shader(
             stop = block.stop
             static_bindings = []
             closure_bindings = []
+            projected_inductions = []
             for iterable_id, target_id, induction in (
                 control_program.iterable_bindings
             ):
@@ -2164,6 +2186,86 @@ def compose_control_shader(
                     return child
 
                 body = bind_iterable(body)
+            projected_rows = {
+                int(iterable_id): 1 + max(
+                    int(projection)
+                    for candidate_iterable, _target, candidate_induction, projection
+                    in control_program.projected_iterable_bindings
+                    if int(candidate_iterable) == int(iterable_id)
+                    and candidate_induction == block.induction
+                    and isinstance(projection, int)
+                )
+                for iterable_id, _target, induction, _projection
+                in control_program.projected_iterable_bindings
+                if induction == block.induction
+                and any(
+                    int(candidate_iterable) == int(iterable_id)
+                    and candidate_induction == block.induction
+                    and isinstance(projection, int)
+                    for candidate_iterable, _candidate_target,
+                    candidate_induction, projection
+                    in control_program.projected_iterable_bindings
+                )
+            }
+            for iterable_id, target_id, induction, projection in (
+                control_program.projected_iterable_bindings
+            ):
+                if induction != block.induction:
+                    continue
+                iterable_slot = all_slot_ids.index(int(iterable_id))
+                stop = stop.replace(
+                    f"__iterable_extent_{int(iterable_id)}__",
+                    (
+                        f"int(u_extent_control[{iterable_slot}])"
+                        if int(iterable_id) not in projected_rows
+                        else f"int(u_extent_control[{iterable_slot}]) / "
+                        f"{projected_rows[int(iterable_id)]}"
+                    ),
+                )
+                target_slots = tuple(
+                    index
+                    for index, value_id in enumerate(all_slot_ids)
+                    if int(value_id) == int(target_id)
+                )
+                if projection == "induction":
+                    projected_inductions.extend(target_slots)
+                    continue
+                row_width = projected_rows.get(int(iterable_id), 1)
+                field_offset = 0 if projection is None else int(projection)
+                replacement = (
+                    f"arena[u_slot[{iterable_slot}] + "
+                    f"uint({block.induction}) * {row_width}u + "
+                    f"{field_offset}u]"
+                )
+
+                def bind_projected(child):
+                    if isinstance(child, StatementBlock):
+                        lines = []
+                        for line in child.lines:
+                            for target_slot in target_slots:
+                                line = line.replace(
+                                    f"arena[u_slot[{target_slot}] + (gid)]",
+                                    replacement,
+                                ).replace(
+                                    f"arena[u_slot[{target_slot}] + (0)]",
+                                    replacement,
+                                )
+                            lines.append(line)
+                        return StatementBlock(tuple(lines))
+                    if isinstance(child, SequenceBlock):
+                        return SequenceBlock(tuple(
+                            bind_projected(item) for item in child.blocks
+                        ))
+                    if isinstance(child, CallBlock):
+                        return CallBlock(
+                            child.callsite_id,
+                            bind_projected(child.callee),
+                            child.argument_bindings,
+                            child.result_bindings,
+                        )
+                    return child
+
+                body = bind_projected(body)
             for _iterable_id, target_id, induction, values in (
                 control_program.static_iterable_bindings
             ):
@@ -2211,6 +2313,13 @@ def compose_control_shader(
                     "iteration counts"
                 )
             commits = []
+            for target_slot in projected_inductions:
+                commits.append(
+                    f"arena[u_slot[{target_slot}]] = "
+                    f"uint(int({block.induction}));"
+                )
+            if projected_inductions:
+                commits.append("memoryBarrierBuffer();")
             for updated, initial in block.carried_aliases:
                 try:
                     initial_slot = all_slot_ids.index(int(initial))
@@ -3308,6 +3417,13 @@ def build_control_shader_artifact(
         if iterable_id not in slot_value_ids:
             slot_value_ids.append(iterable_id)
 
+    for iterable_id, target_id, _induction, _projection in (
+        control_program.projected_iterable_bindings
+    ):
+        for value_id in (int(iterable_id), int(target_id)):
+            if value_id not in slot_value_ids:
+                slot_value_ids.append(value_id)
+
     for _iterable_id, target_id, _induction, _values in (
         control_program.static_iterable_bindings
     ):
@@ -3376,6 +3492,16 @@ def build_control_shader_artifact(
         for iterable_id, _target_id, _induction, _sources
         in control_program.closure_iterable_bindings
     }
+    projected_targets = {
+        int(target_id)
+        for _iterable_id, target_id, _induction, _projection
+        in control_program.projected_iterable_bindings
+    }
+    projected_aggregates = {
+        int(iterable_id)
+        for iterable_id, _target_id, _induction, _projection
+        in control_program.projected_iterable_bindings
+    }
     external = tuple(dict.fromkeys(
         int(value_id)
         for program in programs
@@ -3386,6 +3512,8 @@ def build_control_shader_artifact(
         and int(value_id) not in collection_targets
         and int(value_id) not in closure_targets
         and int(value_id) not in closure_aggregates
+        and int(value_id) not in projected_targets
+        and int(value_id) not in projected_aggregates
         and int(value_id) not in aliases
     ))
     if terminal_outputs is not None:
@@ -3471,6 +3599,18 @@ def build_control_shader_artifact(
             ),
         }
         for value_id in (int(target_id), *map(int, source_ids)):
+            slot_contract_diagnostics.setdefault(value_id, []).append(row)
+    for iterable_id, target_id, induction, projection in (
+        control_program.projected_iterable_bindings
+    ):
+        row = {
+            "kind": "projected-iterable",
+            "iterable": int(iterable_id),
+            "target": int(target_id),
+            "induction": str(induction),
+            "projection": projection,
+        }
+        for value_id in (int(iterable_id), int(target_id)):
             slot_contract_diagnostics.setdefault(value_id, []).append(row)
     for publication in _control_stream_publications(control_program.root):
         row = {
