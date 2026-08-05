@@ -105,9 +105,85 @@ def test_html_renders_file_system_port_instead_of_numeric_parameter_fields():
     assert "bundle · decoder-bundle :: decode" in html
 
 
-def test_html_rejects_host_system_external_reference_ports():
-    with pytest.raises(ValueError, match="only to Turing bundles"):
-        emit_html_shell(_file_port_api(domain="host_system"))
+def test_html_accepts_host_system_external_reference_ports():
+    # Host-system capability ports are the general support structure for a
+    # compiled executor living inside this page by simulation: the shell
+    # (not the program) owns whatever handler actually resolves each named
+    # capability. Only "bundle" and "host_system" domains are accepted.
+    html = emit_html_shell(_file_port_api(domain="host_system")).html
+    assert "registerHostCapability(name, handler)" in html
+    assert "resolveHostCapability(name, request)" in html
+    assert "host_system · " in html
+
+
+def test_html_still_rejects_other_external_reference_domains():
+    with pytest.raises(ValueError, match="Turing bundles or"):
+        emit_html_shell(_file_port_api(domain="guest_binary"))
+
+
+@pytest.mark.skipif(
+    not Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe").exists(),
+    reason="Chrome is not installed",
+)
+def test_host_system_capability_registers_and_resolves_in_a_real_browser(tmp_path):
+    html = emit_html_shell(_file_port_api(domain="host_system")).html
+    injected = html.replace(
+        "</body>",
+        """
+<script>
+window.TuringSystemPorts.registerHostCapability("decoder", async (request) => {
+  return { echoed: request.value * 2 };
+});
+window.TuringSystemPorts.resolveHostCapability("decoder", { value: 21 }).then(result => {
+  document.body.setAttribute("data-test-result", "RESOLVED " + JSON.stringify(result));
+}).catch(error => {
+  document.body.setAttribute("data-test-result", "ERROR " + error.message);
+});
+</script>
+</body>""",
+    )
+    page = tmp_path / "host_capability.html"
+    page.write_text(injected, encoding="utf-8")
+    completed = subprocess.run(
+        [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            "--headless=new", "--disable-gpu", "--no-sandbox",
+            "--virtual-time-budget=5000", "--dump-dom", page.as_uri(),
+        ],
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert 'data-test-result="RESOLVED {&quot;echoed&quot;:42}"' in completed.stdout
+
+
+@pytest.mark.skipif(
+    not Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe").exists(),
+    reason="Chrome is not installed",
+)
+def test_required_host_system_capability_fails_closed_without_a_handler(tmp_path):
+    html = emit_html_shell(_file_port_api(domain="host_system")).html
+    injected = html.replace(
+        "</body>",
+        """
+<script>
+window.TuringSystemPorts.resolveHostCapability("decoder", { value: 1 }).then(result => {
+  document.body.setAttribute("data-test-result", "RESOLVED " + JSON.stringify(result));
+}).catch(error => {
+  document.body.setAttribute("data-test-result", "ERROR " + error.message);
+});
+</script>
+</body>""",
+    )
+    page = tmp_path / "host_capability_unregistered.html"
+    page.write_text(injected, encoding="utf-8")
+    completed = subprocess.run(
+        [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            "--headless=new", "--disable-gpu", "--no-sandbox",
+            "--virtual-time-budget=5000", "--dump-dom", page.as_uri(),
+        ],
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert 'data-test-result="ERROR required host-system capability has no simulation registered: decoder"' in completed.stdout
 
 
 def test_html_shell_hydrates_persistent_mounts_and_bridges_virtual_devices():

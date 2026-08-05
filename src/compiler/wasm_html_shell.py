@@ -558,11 +558,18 @@ const HAS_STATE_FEEDBACK = STATE_FEEDBACK_PAIRS.length > 0;
 
 // Named system ports carry non-numerical shell resources outside the ordinary
 // elementwise feed UI. Files are byte-exact. Web external references are
-// intentionally limited to other registered Turing bundles.
+// limited to other registered Turing bundles, or a named host-simulated
+// capability the default shell (not the program) resolves -- the general
+// support structure for letting a compiled executor live inside this page
+// by simulation: the program declares which named capabilities it needs
+// (bundle.json is the same document either way), the shell owns whatever
+// handler actually simulates each one, and a request the shell has no
+// handler for fails closed instead of the executor silently proceeding.
 const systemPorts = {
   descriptors: new Map(SYSTEM_PORTS.map(port => [port.name, port])),
   files: new Map(),
   bundles: new Map(),
+  hostCapabilities: new Map(),
   fileHandlers: new Map(),
   listeners: new Map(),
   virtualFiles: new Map(),
@@ -807,11 +814,50 @@ const systemPorts = {
     if (!resolved && !port.optional) throw new Error("required bundle is not registered: " + identity);
     return resolved || null;
   },
+  // The general host-system-capability channel. registerHostCapability is
+  // called by the default shell's own bootstrap code (never by a program's
+  // bespoke script) to install the simulation for one declared capability
+  // port; resolveHostCapability is what a compiled executor's own
+  // (possibly Wasm) coordinator calls per request. The completion shape is
+  // deliberately left up to the registered handler -- there is no fixed
+  // wire format asserted here yet, since no compiled coordinator ABI this
+  // is meant to serve has been finalized. What is fixed: an unregistered
+  // *required* capability fails closed rather than letting the executor
+  // guess, the same discipline resolveBundle already uses.
+  registerHostCapability(name, handler) {
+    const port = this.descriptor(name);
+    if (port.kind !== "external_reference" || port.external_domain !== "host_system") {
+      throw new Error(name + " is not a host-system capability port");
+    }
+    if (typeof handler !== "function") {
+      throw new Error("host capability handler for " + name + " must be a function");
+    }
+    this.hostCapabilities.set(name, handler);
+  },
+  async resolveHostCapability(name, request) {
+    const port = this.descriptor(name);
+    if (port.kind !== "external_reference" || port.external_domain !== "host_system") {
+      throw new Error(name + " is not a host-system capability port");
+    }
+    const handler = this.hostCapabilities.get(name);
+    if (!handler) {
+      if (port.optional) return null;
+      throw new Error("required host-system capability has no simulation registered: " + name);
+    }
+    return await handler(request);
+  },
 };
 systemPorts.ready = systemPorts.initializeVirtualFilesystem();
 for (const port of SYSTEM_PORTS) {
-  if (port.kind === "external_reference" && port.external_domain !== "bundle") {
-    throw new Error("HTML shells accept external references only to Turing bundles");
+  if (
+    port.kind === "external_reference"
+    && port.external_domain !== "bundle"
+    && port.external_domain !== "host_system"
+  ) {
+    throw new Error(
+      "HTML shells accept external references only to Turing bundles or "
+      + "declared host-system capability simulations"
+    );
   }
 }
 for (const mount of (VIRTUAL_FILESYSTEM || {}).mounts || []) {
@@ -4444,12 +4490,16 @@ def _system_port_rows(shell_io: Mapping[str, Any] | None) -> str:
         elif kind == "external_reference":
             domain = str(port.get("external_domain", ""))
             attributes = dict(port.get("attributes") or {})
-            bundle = str(attributes.get("bundle", "unbound bundle"))
-            export = str(attributes.get("export", "default"))
+            if domain == "host_system":
+                description = str(attributes.get("description", "shell-simulated"))
+            else:
+                bundle = str(attributes.get("bundle", "unbound bundle"))
+                export = str(attributes.get("export", "default"))
+                description = bundle + " :: " + export
             rows.append(
                 '<div class="row system-port" data-system-port="' + _escape(name) + '">'
                 '<div class="name">' + _escape(name) + '</div><div class="meta grow">'
-                + _escape(domain + " · " + bundle + " :: " + export)
+                + _escape(domain + " · " + description)
                 + '</div></div>'
             )
     return "\n".join(rows)
@@ -5011,10 +5061,11 @@ def emit_html_shell(
     for port in dict(shell_io_mapping.get("requirements") or {}).get("system_ports", ()):
         if (
             port.get("kind") == "external_reference"
-            and port.get("external_domain") != "bundle"
+            and port.get("external_domain") not in {"bundle", "host_system"}
         ):
             raise ValueError(
-                "HTML shells accept external references only to Turing bundles"
+                "HTML shells accept external references only to Turing bundles or "
+                "declared host-system capability simulations"
             )
     shell_name = name or f"{mapping['module']}_shell"
 
