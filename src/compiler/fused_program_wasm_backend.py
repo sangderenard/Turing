@@ -88,7 +88,61 @@ _TYPES: dict[str, tuple[str, int, str, str]] = {
     "float32": ("f32", 4, "f32.load", "f32.store"),
     "f32": ("f32", 4, "f32.load", "f32.store"),
     "float": ("f32", 4, "f32.load", "f32.store"),
+    # Integer working types. Until these existed this module could only
+    # compile a program whose *own* arithmetic was floating point --
+    # integers were supported solely as separate memory buffers to convert
+    # in and out of (``_MEMORY_DTYPE_OPS`` below). That is fine for a
+    # numeric kernel and wrong for a program that is genuinely integral:
+    # a decoder, a register file, a state machine. Such a program has no
+    # meaningful f64 working type -- ``//`` and ``%`` are not float
+    # operations, bit masks are not float operations, and a 64-bit value
+    # does not survive f64's 2**53 exact-integer range. WebAssembly has
+    # native i32/i64 arithmetic; this simply stops pretending it does not.
+    "int64": ("i64", 8, "i64.load", "i64.store"),
+    "i64": ("i64", 8, "i64.load", "i64.store"),
+    "long": ("i64", 8, "i64.load", "i64.store"),
+    "int32": ("i32", 4, "i32.load", "i32.store"),
+    "i32": ("i32", 4, "i32.load", "i32.store"),
+    "int": ("i32", 4, "i32.load", "i32.store"),
 }
+
+# Which working types are integral. Everything that differs between the two
+# families keys off this rather than re-parsing the type name at each site.
+_INTEGER_VALUE_TYPES = frozenset({"i32", "i64"})
+
+
+def _is_integer_type(value_type: str) -> bool:
+    return str(value_type) in _INTEGER_VALUE_TYPES
+
+
+# The saturating bounds of each integer working type. A min/max reduction's
+# fold identity is spelled as an infinity (``_REDUCE_FOLD``), which has no
+# integer literal -- but the *meaning* of that identity, "a value no operand
+# can beat", is exactly the type's extreme, so an integral fold uses that
+# rather than refusing or overflowing on int(float("inf")).
+_INTEGER_BOUNDS: dict[str, tuple[int, int]] = {
+    "i32": (-(2 ** 31), 2 ** 31 - 1),
+    "i64": (-(2 ** 63), 2 ** 63 - 1),
+}
+
+
+def _typed_constant(value_type: str, value: Any) -> str:
+    """One scalar literal, spelled for its working type.
+
+    ``f64.const 0`` and ``i64.const 0.0`` are both invalid WAT, so the
+    literal's spelling has to follow the type rather than the Python value's
+    own repr.
+    """
+
+    if _is_integer_type(value_type):
+        numeric = float(value)
+        low, high = _INTEGER_BOUNDS[str(value_type)]
+        if numeric == float("inf"):
+            return f"{value_type}.const {high}"
+        if numeric == float("-inf"):
+            return f"{value_type}.const {low}"
+        return f"{value_type}.const {int(numeric)}"
+    return f"{value_type}.const {float(value)!r}"
 
 # A parameter whose real dtype is not the module's f32/f64 working type
 # still gets loaded and stored at its own byte width and WASM memory
@@ -164,6 +218,58 @@ _UNARY_INSTRUCTION = {
     "trunc": "trunc",
     "round": "nearest",
 }
+
+# Integer counterparts. WebAssembly's integer instruction set is not the
+# float one with a different prefix, so these cannot be derived from the
+# tables above:
+#
+#   * division and remainder need an explicit signedness (``div_s``), where
+#     float division does not. Signed is correct here because every dtype
+#     this module maps to an integer working type is signed; ``uint8`` is a
+#     memory dtype (``_MEMORY_DTYPE_OPS``) that loads zero-extended into a
+#     non-negative i32, never a working type of its own.
+#   * ``min``/``max`` genuinely do not exist for integers in WebAssembly --
+#     they are lowered from a comparison plus ``select`` in
+#     ``_integer_binary_instructions`` rather than listed here.
+#   * ``mod``/``floordiv`` become expressible for the first time. They sit in
+#     ``_NO_WASM_INSTRUCTION`` below, whose comment already anticipated this
+#     exact unlock ("mod/floordiv await an integer-remainder lowering"); the
+#     integer working type is that lowering, so they are filtered back out
+#     of the unsupported set when the working type is integral.
+_INTEGER_BINARY_INSTRUCTION = {
+    "add": "add",
+    "sub": "sub",
+    "mul": "mul",
+    "truediv": "div_s",
+    "floordiv": "div_s",
+    "mod": "rem_s",
+}
+
+_INTEGER_COMPARISON_INSTRUCTION = {
+    "less": "lt_s",
+    "less_equal": "le_s",
+    "greater": "gt_s",
+    "greater_equal": "ge_s",
+    "equal": "eq",
+    "not_equal": "ne",
+}
+
+# Integer ops this module reaches by composition rather than one opcode.
+_INTEGER_COMPOSED_BINARY = frozenset({"minimum", "maximum"})
+
+# Boolean connectives over integers. WebAssembly has bitwise and/or, which
+# are *not* these: `2 & 1` is 0 while `bool(2) and bool(1)` is true. So each
+# operand is first reduced to a 0/1 truth value with ``eqz`` (which tests
+# "is zero", so the sense is inverted once and corrected by De Morgan) and
+# the connective is then applied to those. This keeps a predicate mask
+# exactly 0/1, which is what every other backend reports for these ops and
+# what ``select``-style lowerings downstream assume.
+_INTEGER_LOGICAL_BINARY = frozenset({"logical_and", "logical_or"})
+_INTEGER_LOGICAL_UNARY = frozenset({"logical_not"})
+
+# Float rounding that is the identity on an integer, so an integral program
+# asking for it is satisfied by doing nothing rather than being refused.
+_INTEGER_IDENTITY_UNARY = frozenset({"floor", "ceil", "trunc", "round"})
 
 # Comparisons return i32 0/1 in WebAssembly, so the result is converted back
 # to the value type -- every other backend in this repository reports a
@@ -712,7 +818,7 @@ def _emit_reduction_body_wat(
         op = plan.reduce_op[reduction.result_id]
         fold, identity = _REDUCE_FOLD[op]
         accumulator = names[reduction.result_id]
-        body.append(f"      {value_type}.const {identity!r}")
+        body.append(f"      {_typed_constant(value_type, identity)}")
         body.append(f"      local.set {accumulator}")
         body.append("      i32.const 0")
         body.append("      local.set $k")
@@ -729,7 +835,17 @@ def _emit_reduction_body_wat(
             emit_step(step)
         body.append(f"          local.get {accumulator}")
         body.append(f"          local.get {names[reduction.input_ids[0]]}")
-        body.append(f"          {value_type}.{fold}")
+        if _is_integer_type(value_type) and fold in {"min", "max"}:
+            # No integer min/max instruction; fold by compare-and-select
+            # over the same two operands (see _INTEGER_COMPOSED_BINARY).
+            body.append(f"          local.get {accumulator}")
+            body.append(f"          local.get {names[reduction.input_ids[0]]}")
+            body.append(
+                f"          {value_type}.{'lt_s' if fold == 'min' else 'gt_s'}"
+            )
+            body.append("          select")
+        else:
+            body.append(f"          {value_type}.{fold}")
         body.append(f"          local.set {accumulator}")
         body.append("          local.get $k")
         body.append("          i32.const 1")
@@ -740,8 +856,11 @@ def _emit_reduction_body_wat(
         body.append("      )")
         if op == "mean":
             body.append(f"      local.get {accumulator}")
-            body.append(f"      {value_type}.const {float(axis_k)!r}")
-            body.append(f"      {value_type}.div")
+            body.append(f"      {_typed_constant(value_type, axis_k)}")
+            body.append(
+                f"      {value_type}."
+                f"{'div_s' if _is_integer_type(value_type) else 'div'}"
+            )
             body.append(f"      local.set {accumulator}")
 
     for step in plan.post_steps:
@@ -893,6 +1012,48 @@ def emit_wasm_module(
         ])
         return instructions
 
+    def gather_address(table_id: int, index_local: str) -> list[str] | None:
+        """``table[index]`` -- the table's base plus a *computed* offset.
+
+        ``element_address`` walks with the loop cursor ``$i``; this walks
+        with a value the program computed, which is the whole difference
+        between an elementwise read and a table lookup.
+        """
+
+        source_id = resolve_view_source(program.meta, int(table_id))
+        label = feed_label.get(source_id)
+        if label is None:
+            return None
+        byte_width, typed_load, _store, wasm_kind = _memory_ops(source_id)
+        offset, _stride = view_offset_stride(program.meta, int(table_id))
+        # Address arithmetic is i32, so a wider index is narrowed for the
+        # address only -- the index value itself keeps its own type.
+        if value_type == "i64":
+            narrow = ["      i32.wrap_i64"]
+        elif value_type == "i32":
+            narrow = []
+        else:
+            narrow = [f"      {_FROM_WORKING_TYPE[(value_type, 'i32')]}"]
+        instructions = [f"      local.get {label}"]
+        if offset:
+            instructions.extend([
+                f"      i32.const {offset * byte_width}",
+                "      i32.add",
+            ])
+        instructions.extend([
+            f"      local.get {index_local}",
+            *narrow,
+            f"      i32.const {byte_width}",
+            "      i32.mul",
+            "      i32.add",
+            f"      {typed_load}",
+        ])
+        if wasm_kind is not None:
+            conversion = _TO_WORKING_TYPE.get((wasm_kind, value_type))
+            if conversion is not None:
+                instructions.append(f"      {conversion}")
+        return instructions
+
     # Allocate stable locals before emitting either reduction or output passes.
     for index, feed_id in enumerate(feed_ids):
         local = f"$v{len(names)}"
@@ -938,6 +1099,7 @@ def emit_wasm_module(
                 element_bytes,
                 static_data["constants"],
                 shortfalls,
+                gather_address,
             )
             if instructions is None:
                 continue
@@ -1095,11 +1257,12 @@ def _step_instructions(
     element_bytes: int,
     constant_entries: Mapping[int, Mapping[str, Any]],
     shortfalls: list[WasmShortfall],
+    gather_address: Any = None,
 ) -> list[str] | None:
     op = step.op_name
     constant = _constant_scalar(step)
     if constant is not None:
-        return [f"      {value_type}.const {constant!r}"]
+        return [f"      {_typed_constant(value_type, constant)}"]
     if op == "tensor_from_list":
         entry = constant_entries.get(step.result_id)
         if entry is None:
@@ -1112,7 +1275,18 @@ def _step_instructions(
             "      i32.add",
             f"      {value_type}.load",
         ]
-    if op in _NO_WASM_INSTRUCTION:
+    integral = _is_integer_type(value_type)
+    if op in _NO_WASM_INSTRUCTION and not (
+        integral
+        and (
+            op in _INTEGER_BINARY_INSTRUCTION
+            or op in _INTEGER_LOGICAL_BINARY
+            or op in _INTEGER_LOGICAL_UNARY
+        )
+    ):
+        # mod/floordiv and the boolean connectives are only unsupported for
+        # a *float* working type; an integral program reaches them through
+        # rem_s/div_s and eqz below.
         shortfalls.append(
             WasmShortfall(
                 step.step_id,
@@ -1133,6 +1307,22 @@ def _step_instructions(
 
     if op == "sign":
         # sign(x) = (x>0) - (x<0): exact, using the comparison opcodes WASM has.
+        if integral:
+            # An integer comparison already yields i32 0/1. For an i64
+            # working type that still has to widen before the subtraction;
+            # for i32 the comparison result is already the working type.
+            widen = ["      i64.extend_i32_u"] if value_type == "i64" else []
+            return [
+                f"      local.get {left}",
+                f"      {_typed_constant(value_type, 0)}",
+                f"      {value_type}.gt_s",
+                *widen,
+                f"      local.get {left}",
+                f"      {_typed_constant(value_type, 0)}",
+                f"      {value_type}.lt_s",
+                *widen,
+                f"      {value_type}.sub",
+            ]
         return [
             f"      local.get {left}",
             f"      {value_type}.const 0.0",
@@ -1164,6 +1354,45 @@ def _step_instructions(
                 f"      local.get {left}"]
 
     if op in ELEMENTWISE_UNARY:
+        if integral:
+            if op in _INTEGER_IDENTITY_UNARY:
+                # Rounding an integer is the integer.
+                return [f"      local.get {left}"]
+            if op in _INTEGER_LOGICAL_UNARY:
+                # not(x) is exactly "x is zero", which eqz answers directly.
+                widen = (
+                    ["      i64.extend_i32_u"] if value_type == "i64" else []
+                )
+                return [
+                    f"      local.get {left}",
+                    f"      {value_type}.eqz",
+                    *widen,
+                ]
+            if op == "neg":
+                # No i32.neg/i64.neg exists; negation is 0 - x.
+                return [
+                    f"      {_typed_constant(value_type, 0)}",
+                    f"      local.get {left}",
+                    f"      {value_type}.sub",
+                ]
+            if op == "abs":
+                # No integer abs either: select between x and -x on x < 0.
+                return [
+                    f"      local.get {left}",
+                    f"      {_typed_constant(value_type, 0)}",
+                    f"      local.get {left}",
+                    f"      {value_type}.sub",
+                    f"      local.get {left}",
+                    f"      {_typed_constant(value_type, 0)}",
+                    f"      {value_type}.lt_s",
+                    "      select",
+                ]
+            shortfalls.append(WasmShortfall(
+                step.step_id, op,
+                f"no integer instruction for this unary operation on "
+                f"{value_type}; it is defined only for floating point",
+            ))
+            return None
         instruction = _UNARY_INSTRUCTION.get(op)
         if instruction is None:
             shortfalls.append(
@@ -1171,6 +1400,73 @@ def _step_instructions(
             )
             return None
         return [f"      local.get {left}", f"      {value_type}.{instruction}"]
+
+    if op == "gather" and len(step.input_ids) == 2:
+        # table[index]: a read at a *computed* offset rather than at the
+        # elementwise walk's own cursor. This is what a table-driven decoder
+        # is made of -- an opcode byte selecting a row of an encoding table --
+        # so without it a state machine's every table lookup is a shortfall.
+        index_local = names.get(step.input_ids[1])
+        if index_local is None:
+            shortfalls.append(WasmShortfall(
+                step.step_id, op, "gather index was never produced",
+            ))
+            return None
+        if int(step.attrs.get("dim", 0)) != 0:
+            shortfalls.append(WasmShortfall(
+                step.step_id, op,
+                f"only dim=0 gather is lowered; got dim="
+                f"{step.attrs.get('dim')}",
+            ))
+            return None
+        instructions = (
+            None if gather_address is None
+            else gather_address(step.input_ids[0], index_local)
+        )
+        if instructions is None:
+            shortfalls.append(WasmShortfall(
+                step.step_id, op,
+                "gather source is not an addressable feed buffer",
+            ))
+            return None
+        return instructions
+
+    if op == "where" and len(step.input_ids) == 3:
+        # Ternary select: (condition, if_true, if_false). WebAssembly's own
+        # `select` is exactly this, so a predicated program -- which is what
+        # a branchless state machine compiles to, every update guarded by a
+        # mask rather than a jump -- needs no control flow to express.
+        #
+        # `select` pops (val1, val2, condition) and keeps val1 when the
+        # condition is a non-zero *i32*, so a wider or floating working type
+        # is first reduced to that. i64 goes through eqz twice rather than
+        # i32.wrap_i64: wrapping a value whose low 32 bits happen to be zero
+        # would silently invert the test, and nothing here guarantees a mask
+        # is only ever 0/1.
+        condition, if_true, if_false = (
+            names.get(value_id) for value_id in step.input_ids
+        )
+        if None in (condition, if_true, if_false):
+            shortfalls.append(WasmShortfall(
+                step.step_id, op, "an operand was never produced",
+            ))
+            return None
+        if value_type == "i32":
+            narrow: list[str] = []          # already an i32 truth value
+        elif value_type == "i64":
+            narrow = ["      i64.eqz", "      i32.eqz"]
+        else:
+            narrow = [
+                f"      {_typed_constant(value_type, 0)}",
+                f"      {value_type}.ne",
+            ]
+        return [
+            f"      local.get {if_true}",
+            f"      local.get {if_false}",
+            f"      local.get {condition}",
+            *narrow,
+            "      select",
+        ]
 
     if op not in ELEMENTWISE_BINARY:
         shortfalls.append(
@@ -1182,7 +1478,7 @@ def _step_instructions(
         right_source = [f"      local.get {names[step.input_ids[1]]}"]
     elif "right_scalar" in step.attrs:
         right_source = [
-            f"      {value_type}.const {float(step.attrs['right_scalar'])!r}"
+            f"      {_typed_constant(value_type, step.attrs['right_scalar'])}"
         ]
     else:
         shortfalls.append(
@@ -1193,6 +1489,49 @@ def _step_instructions(
     operands = [f"      local.get {left}", *right_source]
     if step.attrs.get("reverse", False):
         operands = [*right_source, f"      local.get {left}"]
+
+    if integral:
+        instruction = _INTEGER_BINARY_INSTRUCTION.get(op)
+        if instruction is not None:
+            return [*operands, f"      {value_type}.{instruction}"]
+        if op in _INTEGER_LOGICAL_BINARY:
+            # Truth-value connectives, not bitwise ones. eqz gives "is zero",
+            # so De Morgan applies: a&&b == !(!a || !b), a||b == !(!a && !b).
+            combine = "or" if op == "logical_and" else "and"
+            widen = ["      i64.extend_i32_u"] if value_type == "i64" else []
+            return [
+                operands[0],
+                f"      {value_type}.eqz",
+                operands[1],
+                f"      {value_type}.eqz",
+                f"      i32.{combine}",
+                "      i32.eqz",
+                *widen,
+            ]
+        if op in _INTEGER_COMPOSED_BINARY:
+            # WebAssembly has no integer min/max, so compare and select.
+            # ``select`` pops (val1, val2, condition) and yields val1 when
+            # the condition is non-zero, so the operands are pushed twice:
+            # once as the candidate pair, once to compute the predicate.
+            keep_left = "lt_s" if op == "minimum" else "gt_s"
+            return [
+                *operands,
+                *operands,
+                f"      {value_type}.{keep_left}",
+                "      select",
+            ]
+        comparison = _INTEGER_COMPARISON_INSTRUCTION.get(op)
+        if comparison is not None:
+            # An integer comparison already produces i32 0/1. Only an i64
+            # working type needs a widening; i32 is already the value type.
+            widen = ["      i64.extend_i32_u"] if value_type == "i64" else []
+            return [*operands, f"      {value_type}.{comparison}", *widen]
+        shortfalls.append(WasmShortfall(
+            step.step_id, op,
+            f"no integer instruction registered for this operation on "
+            f"{value_type}",
+        ))
+        return None
 
     instruction = _BINARY_INSTRUCTION.get(op)
     if instruction is not None:
@@ -1374,6 +1713,8 @@ def _assemble(
             return
         left = locals_for[step.input_ids[0]]
 
+        integral = _is_integer_type(value_type)
+
         def push_right() -> None:
             if len(step.input_ids) == 2:
                 builder.local_get(locals_for[step.input_ids[1]])
@@ -1382,6 +1723,16 @@ def _assemble(
 
         if step.op_name == "sign":
             # sign(x) = (x>0) - (x<0): exact, no table.
+            if integral:
+                for comparison in ("gt_s", "lt_s"):
+                    builder.local_get(left)
+                    builder.value_const(0.0)
+                    builder.op(comparison)
+                    if value_type == "i64":
+                        builder.op("extend_i32_u")
+                builder.op("sub")
+                builder.local_set(local)
+                return
             builder.local_get(left)
             builder.value_const(0.0)
             builder.op("gt")
@@ -1415,6 +1766,24 @@ def _assemble(
             builder.local_set(local)
             return
 
+        if step.op_name == "where" and len(step.input_ids) == 3:
+            # See the WAT emitter for why the condition is narrowed this way.
+            condition, if_true, if_false = (
+                locals_for[value_id] for value_id in step.input_ids
+            )
+            builder.local_get(if_true)
+            builder.local_get(if_false)
+            builder.local_get(condition)
+            if value_type == "i64":
+                builder.op("eqz")
+                builder.raw(0x45)  # i32.eqz
+            elif value_type != "i32":
+                builder.value_const(0.0)
+                builder.op("ne")
+            builder.select()
+            builder.local_set(local)
+            return
+
         if step.op_name in _LUT_OPS:
             entry = tables["entries"][step.op_name]
             _emit_lut(
@@ -1422,8 +1791,34 @@ def _assemble(
                 entry["lower"], entry["upper"], entry["periodic"],
             )
         elif step.op_name in ELEMENTWISE_UNARY:
-            builder.local_get(left)
-            builder.op(_UNARY_INSTRUCTION[step.op_name])
+            if integral and step.op_name in _INTEGER_IDENTITY_UNARY:
+                builder.local_get(left)  # rounding an integer is the integer
+            elif integral and step.op_name in _INTEGER_LOGICAL_UNARY:
+                builder.local_get(left)
+                builder.op("eqz")
+                if value_type == "i64":
+                    builder.op("extend_i32_u")
+            elif integral and step.op_name == "neg":
+                builder.value_const(0.0)  # no integer neg: 0 - x
+                builder.local_get(left)
+                builder.op("sub")
+            elif integral and step.op_name == "abs":
+                builder.local_get(left)
+                builder.value_const(0.0)
+                builder.local_get(left)
+                builder.op("sub")
+                builder.local_get(left)
+                builder.value_const(0.0)
+                builder.op("lt_s")
+                builder.select()
+            elif integral:
+                raise WasmEmissionError(
+                    f"no integer instruction for unary {step.op_name!r} on "
+                    f"{value_type}; it is defined only for floating point"
+                )
+            else:
+                builder.local_get(left)
+                builder.op(_UNARY_INSTRUCTION[step.op_name])
         elif step.attrs.get("reverse", False):
             push_right()
             builder.local_get(left)
@@ -1432,12 +1827,49 @@ def _assemble(
             push_right()
 
         if step.op_name in ELEMENTWISE_BINARY:
-            instruction = _BINARY_INSTRUCTION.get(step.op_name)
-            if instruction is not None:
-                builder.op(instruction)
+            if integral:
+                instruction = _INTEGER_BINARY_INSTRUCTION.get(step.op_name)
+                if instruction is not None:
+                    builder.op(instruction)
+                elif step.op_name in _INTEGER_LOGICAL_BINARY:
+                    # Operands are already on the stack in order; reduce each
+                    # to a truth value and combine by De Morgan (see the WAT
+                    # emitter for the full explanation).
+                    combine_and = step.op_name == "logical_or"
+                    builder.op("eqz")          # top operand -> "is zero"
+                    swap = builder.declare_local("i32")
+                    builder.local_set(swap)
+                    builder.op("eqz")          # lower operand -> "is zero"
+                    builder.local_get(swap)
+                    builder.raw(0x71 if combine_and else 0x72)  # i32.and/or
+                    builder.raw(0x45)  # i32.eqz
+                    if value_type == "i64":
+                        builder.op("extend_i32_u")
+                elif step.op_name in _INTEGER_COMPOSED_BINARY:
+                    # No integer min/max: re-push the pair and select.
+                    if step.attrs.get("reverse", False):
+                        push_right()
+                        builder.local_get(left)
+                    else:
+                        builder.local_get(left)
+                        push_right()
+                    builder.op(
+                        "lt_s" if step.op_name == "minimum" else "gt_s"
+                    )
+                    builder.select()
+                else:
+                    builder.op(
+                        _INTEGER_COMPARISON_INSTRUCTION[step.op_name]
+                    )
+                    if value_type == "i64":
+                        builder.op("extend_i32_u")
             else:
-                builder.op(_COMPARISON_INSTRUCTION[step.op_name])
-                builder.op("convert_i32_u")
+                instruction = _BINARY_INSTRUCTION.get(step.op_name)
+                if instruction is not None:
+                    builder.op(instruction)
+                else:
+                    builder.op(_COMPARISON_INSTRUCTION[step.op_name])
+                    builder.op("convert_i32_u")
         builder.local_set(local)
 
     plan = _plan_axis_reductions(program, live, feed_ids, [])
@@ -1511,7 +1943,15 @@ def _assemble(
                 emit_reduction_step(step)
             builder.local_get(accumulator)
             builder.local_get(locals_for[reduction.input_ids[0]])
-            builder.op(fold)
+            if _is_integer_type(value_type) and fold in {"min", "max"}:
+                # No integer min/max instruction; compare and select over the
+                # same operand pair (matches the WAT emitter's fold above).
+                builder.local_get(accumulator)
+                builder.local_get(locals_for[reduction.input_ids[0]])
+                builder.op("lt_s" if fold == "min" else "gt_s")
+                builder.select()
+            else:
+                builder.op(fold)
             builder.local_set(accumulator)
             builder.local_get(k_local)
             builder.i32_const(1)
@@ -1523,7 +1963,7 @@ def _assemble(
             if op == "mean":
                 builder.local_get(accumulator)
                 builder.value_const(float(axis_k))
-                builder.op("div")
+                builder.op("div_s" if _is_integer_type(value_type) else "div")
                 builder.local_set(accumulator)
         for step in plan.post_steps:
             emit_reduction_step(step)

@@ -116,6 +116,40 @@ _OPCODES: dict[str, dict[str, int]] = {
         "eq": 0x5B, "ne": 0x5C, "lt": 0x5D, "gt": 0x5E, "le": 0x5F, "ge": 0x60,
         "convert_i32_u": 0xB3,
     },
+    # Integer working types. The binary assembler and the WAT text emitter
+    # are two independent emitters of one program, so an integer working
+    # type has to exist in both or a program emits as readable text and
+    # refuses to assemble.
+    #
+    # The integer set is not the float set renumbered: division and the
+    # ordered comparisons carry an explicit signedness (``div_s``,
+    # ``lt_s``), remainder exists where float has none, and there is
+    # deliberately no ``min``/``max``/``abs``/``neg``/``sqrt`` or rounding
+    # family -- WebAssembly has no integer form of those, and the callers in
+    # fused_program_wasm_backend.py compose them (compare + select, 0 - x)
+    # rather than pretending an opcode exists here.
+    "i64": {
+        "load": 0x29, "store": 0x37, "const": 0x42,
+        "add": 0x7C, "sub": 0x7D, "mul": 0x7E,
+        "div_s": 0x7F, "div_u": 0x80, "rem_s": 0x81, "rem_u": 0x82,
+        "and": 0x83, "or": 0x84, "xor": 0x85,
+        "shl": 0x86, "shr_s": 0x87, "shr_u": 0x88,
+        "eqz": 0x50, "eq": 0x51, "ne": 0x52,
+        "lt_s": 0x53, "lt_u": 0x54, "gt_s": 0x55, "gt_u": 0x56,
+        "le_s": 0x57, "le_u": 0x58, "ge_s": 0x59, "ge_u": 0x5A,
+        "extend_i32_s": 0xAC, "extend_i32_u": 0xAD,
+    },
+    "i32": {
+        "load": 0x28, "store": 0x36, "const": 0x41,
+        "add": 0x6A, "sub": 0x6B, "mul": 0x6C,
+        "div_s": 0x6D, "div_u": 0x6E, "rem_s": 0x6F, "rem_u": 0x70,
+        "and": 0x71, "or": 0x72, "xor": 0x73,
+        "shl": 0x74, "shr_s": 0x75, "shr_u": 0x76,
+        "eqz": 0x45, "eq": 0x46, "ne": 0x47,
+        "lt_s": 0x48, "lt_u": 0x49, "gt_s": 0x4A, "gt_u": 0x4B,
+        "le_s": 0x4C, "le_u": 0x4D, "ge_s": 0x4E, "ge_u": 0x4F,
+        "wrap_i64": 0xA7,
+    },
 }
 
 # Structural and integer opcodes, which do not vary with the value type.
@@ -258,6 +292,23 @@ class CodeBuilder:
 
     def value_const(self, value: float) -> "CodeBuilder":
         opcode = self.opcodes["const"]
+        if self.value_type in ("i32", "i64"):
+            # Integer constants are LEB128, not a fixed-width IEEE payload.
+            # An infinite fold identity (see _REDUCE_FOLD) saturates to the
+            # type's extreme, matching the WAT emitter's _typed_constant.
+            numeric = float(value)
+            low, high = (
+                (-(2 ** 31), 2 ** 31 - 1) if self.value_type == "i32"
+                else (-(2 ** 63), 2 ** 63 - 1)
+            )
+            if numeric == float("inf"):
+                integral = high
+            elif numeric == float("-inf"):
+                integral = low
+            else:
+                integral = int(numeric)
+            self.code += bytes([opcode]) + sleb(integral)
+            return self
         packed = (
             struct.pack("<f", value)
             if self.value_type == "f32"
@@ -277,10 +328,21 @@ class CodeBuilder:
         self.code += bytes(opcodes)
         return self
 
+    def select(self) -> "CodeBuilder":
+        """``select``: pop (val1, val2, condition), keep val1 if condition.
+
+        Not value-type-specific, which is why it is a method rather than an
+        entry in ``_OPCODES``. Used to compose the integer operations
+        WebAssembly has no instruction for (min/max/abs).
+        """
+
+        self.code += bytes([OP_SELECT])
+        return self
+
     def load(self, *, align: int | None = None, offset: int = 0) -> "CodeBuilder":
         # Alignment is expressed as a power of two; a natural alignment of 8
         # bytes is 3, of 4 bytes is 2.
-        natural = 3 if self.value_type == "f64" else 2
+        natural = 3 if self.value_type in ("f64", "i64") else 2
         self.code += (
             bytes([self.opcodes["load"]])
             + uleb(natural if align is None else align)
@@ -333,7 +395,7 @@ class CodeBuilder:
         return self
 
     def store(self, *, align: int | None = None, offset: int = 0) -> "CodeBuilder":
-        natural = 3 if self.value_type == "f64" else 2
+        natural = 3 if self.value_type in ("f64", "i64") else 2
         self.code += (
             bytes([self.opcodes["store"]])
             + uleb(natural if align is None else align)
