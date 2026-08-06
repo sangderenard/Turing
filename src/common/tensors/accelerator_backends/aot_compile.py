@@ -585,6 +585,13 @@ def compile_ast_aot(
     # re-deriving them, which is a known gap, not a silent wrong answer.
     class_navigation = None
     dependency_regions = None
+    # Defensive default only -- every traced path assigns a real map_ir
+    # before use (compiled-plan/frontend checkpoint resume, or fresh build
+    # inside _lower_process_graph_to_compilation). Kept for the same reason
+    # as the two defaults above: crossing a function boundary now, so an
+    # untraced edge case fails loud (None reaching somewhere that expects a
+    # mapping) rather than as an UnboundLocalError with a confusing frame.
+    map_ir = None
     # The entrypoint's own FunctionDef node, found unambiguously in this
     # call's own freshly-parsed source below (module.body has exactly one
     # top-level function named `entrypoint`, by construction). Used later to
@@ -673,6 +680,94 @@ def compile_ast_aot(
                     "aot: source-graph checkpoint skipped "
                     f"({type(error).__name__}: {error})"
                 )
+
+    # Everything from here on operates on ``graph`` (a built ProcessGraph)
+    # and ``entrypoint_node_id`` (the entrypoint's own node identity)
+    # generically -- nothing below re-touches Python syntax. This is the one
+    # permitted higher (ProcessGraph) -> lower (SSA/FusedProgram/
+    # ControlProgram/DualIRShell) crossing point every language's ingestion
+    # is meant to converge on (see PROCESS_GRAPH_LOWERING_SEAM_HANDOFF.md and
+    # GRAPH_DESCRIPTION_LAYER_SURVEY.md's "two convergence layers" section).
+    # Lateral transformations at the same level (SSA rewriting, binary
+    # relifting) are unaffected by this rule and continue to happen wherever
+    # they already do. Raising (lower -> higher, e.g. a hypothetical
+    # SSA->ProcessGraph decompilation) is a deliberately separate, deferred
+    # question -- do not fold it into this function.
+    return _lower_process_graph_to_compilation(
+        graph, entrypoint_node_id, entrypoint, feeds,
+        backend=backend,
+        remove_loops=remove_loops,
+        unroll_limit=unroll_limit,
+        profiling=profiling,
+        precompile_only=precompile_only,
+        expanded_python_bindings=expanded_python_bindings,
+        bake_mode=bake_mode,
+        schedule_preference=schedule_preference,
+        constant_map=constant_map,
+        mutable_parameters=mutable_parameters,
+        progress=progress,
+        checkpoint_store=checkpoint_store,
+        checkpoint_feeds=checkpoint_feeds,
+        frontend_implementation=frontend_implementation,
+        source_graph_implementation=source_graph_implementation,
+        planning_implementation=planning_implementation,
+        capture_implementation=capture_implementation,
+        deployment=deployment,
+        frontend_ready=frontend_ready,
+        class_navigation=class_navigation,
+        dependency_regions=dependency_regions,
+        map_ir=map_ir,
+        resume=resume,
+    )
+
+
+def _lower_process_graph_to_compilation(
+    graph: Any,
+    entrypoint_node_id: int | None,
+    entrypoint: str,
+    feeds: Mapping[str, Any],
+    *,
+    backend: str,
+    remove_loops: bool,
+    unroll_limit: int,
+    profiling: bool,
+    precompile_only: bool,
+    expanded_python_bindings: Mapping[str, Any],
+    bake_mode: str,
+    schedule_preference: str,
+    constant_map: Mapping[str, Any],
+    mutable_parameters: tuple[str, ...],
+    progress: "Callable[[str], None] | None",
+    checkpoint_store: Any,
+    checkpoint_feeds: Mapping[str, Any],
+    frontend_implementation: str,
+    source_graph_implementation: str,
+    planning_implementation: str,
+    capture_implementation: str,
+    deployment: Any,
+    frontend_ready: bool,
+    class_navigation: Any,
+    dependency_regions: Any,
+    map_ir: Mapping[str, Any] | None,
+    resume: bool,
+) -> AOTCompilation:
+    """Lower an already-built ``ProcessGraph`` into a real ``AOTCompilation``.
+
+    This is the shared "higher -> lower" seam every language's ingestion
+    converges on -- see the comment at this function's one call site in
+    ``compile_ast_aot`` for the full rule. Nothing here is Python-specific:
+    ``graph`` is a built ``ProcessGraph`` regardless of the language that
+    produced it, and ``entrypoint_node_id`` is the entrypoint's own node
+    identity in that graph (an ``ast.FunctionDef`` for Python, a
+    ``pycparser`` ``FuncDef`` for the C++-like shell, resolved by whichever
+    ingestion wrapper called this function -- never re-derived here by
+    name, which is exactly the bug ``FunctionTable.reference_by_source_node``
+    exists to route around).
+    """
+
+    def _report(message: str) -> None:
+        if progress is not None:
+            progress(message)
 
     if not frontend_ready:
         _report("aot: reducing abstract tensor topology")
@@ -1281,11 +1376,107 @@ def compile_ast_aot(
     return compilation
 
 
+def compile_cpp_shell_aot(
+    source: str,
+    entrypoint: str,
+    feeds: Mapping[str, Any],
+    *,
+    backend: str = "c",
+    remove_loops: bool = False,
+    unroll_limit: int = 8,
+    profiling: bool = False,
+    precompile_only: bool = False,
+    python_bindings: Mapping[str, Any] | None = None,
+    bake_mode: str = "whole_program",
+    schedule_preference: str = "alap",
+    constant_map: Mapping[str, Any] | None = None,
+    mutable_parameters: tuple[str, ...] | list[str] | set[str] = (),
+    progress: "Callable[[str], None] | None" = None,
+) -> AOTCompilation:
+    """Compile a narrow C++-like shell entrypoint via the same shared
+    lowering path Python's ``compile_ast_aot`` uses.
+
+    The second, proving half of ``PROCESS_GRAPH_LOWERING_SEAM_HANDOFF.md``:
+    this wrapper's only job is language-specific ingestion (``desugar_cpp_shell``
+    -> ``pycparser`` -> ``role_schemas`` -> a built ``ProcessGraph``, plus the
+    entrypoint's own node identity) before handing off to the exact same
+    ``_lower_process_graph_to_compilation`` Python uses. No checkpoint
+    support yet (unlike ``compile_ast_aot``) -- this is deliberately the
+    minimal wrapper needed to prove the join, not full parity.
+    """
+
+    from pycparser import c_ast, c_parser
+
+    from ....compiler.cpp_shell_desugar import desugar_cpp_shell
+    from ....transmogrifier.graph.oop_language_translations import (
+        install_c_role_schemas,
+    )
+
+    bake_mode = normalize_aot_bake_mode(bake_mode)
+    schedule_preference = normalize_aot_schedule_preference(
+        schedule_preference
+    )
+    constant_map = dict(constant_map or {})
+    mutable_parameters = tuple(dict.fromkeys(map(str, mutable_parameters)))
+    expanded_python_bindings = _expand_python_static_bindings(
+        python_bindings
+    )
+
+    desugared = desugar_cpp_shell(source)
+    tree = c_parser.CParser().parse(desugared)
+    entrypoint_function_def = next(
+        (
+            node for node in tree.ext
+            if isinstance(node, c_ast.FuncDef)
+            and node.decl.name == entrypoint
+        ),
+        None,
+    )
+    entrypoint_node_id = (
+        id(entrypoint_function_def)
+        if entrypoint_function_def is not None
+        else None
+    )
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = dict(expanded_python_bindings)
+    install_c_role_schemas(graph)
+    graph.build_graph(tree)
+
+    return _lower_process_graph_to_compilation(
+        graph, entrypoint_node_id, entrypoint, feeds,
+        backend=backend,
+        remove_loops=remove_loops,
+        unroll_limit=unroll_limit,
+        profiling=profiling,
+        precompile_only=precompile_only,
+        expanded_python_bindings=expanded_python_bindings,
+        bake_mode=bake_mode,
+        schedule_preference=schedule_preference,
+        constant_map=constant_map,
+        mutable_parameters=mutable_parameters,
+        progress=progress,
+        checkpoint_store=None,
+        checkpoint_feeds={},
+        frontend_implementation="",
+        source_graph_implementation="",
+        planning_implementation="",
+        capture_implementation="",
+        deployment=None,
+        frontend_ready=False,
+        class_navigation=None,
+        dependency_regions=None,
+        map_ir=None,
+        resume=False,
+    )
+
+
 __all__ = [
     "AOT_BAKE_MODES",
     "AOT_SCHEDULE_PREFERENCES",
     "AOTCompilation",
     "compile_ast_aot",
+    "compile_cpp_shell_aot",
     "normalize_aot_bake_mode",
     "normalize_aot_schedule_preference",
     "project_public_numerical_program",

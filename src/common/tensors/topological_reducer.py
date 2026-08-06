@@ -9,7 +9,7 @@ from dataclasses import MISSING, dataclass, fields, is_dataclass
 import importlib
 import logging
 import types
-from typing import Any
+from typing import Any, Callable
 
 import networkx as nx
 
@@ -17,7 +17,7 @@ from ...transmogrifier.function_table import (
     ExternalFunctionTable,
     FunctionTable,
 )
-from ...transmogrifier.ssa_registry import ast_ssa_name_map
+from ...transmogrifier.ssa_registry import ast_ssa_name_map, c_ssa_name_map
 
 
 logger = logging.getLogger(__name__)
@@ -31,11 +31,286 @@ class _StaticPythonReference:
     path: str
 
 
+# The export table: which graph node types are runnable definitions
+# (functions/methods), and how to read each one's own name off it. Python's
+# three cases are the built-in defaults; a foreign language's ingestion
+# (oop_language_translations.py's install_c_role_schemas, for C's
+# pycparser.c_ast.FuncDef, say) extends this the same way role_schemas
+# itself is extended -- registering its own node-type name and a callable
+# to read that type's own name field, rather than this reducer growing an
+# isinstance branch per language. This is the frontend-side half of
+# FunctionTable already being "shared function references for ProcessGraph
+# and SSA compilation" (function_table.py's own docstring) -- the table was
+# already meant to be language-neutral; only *populating* it was Python-AST-
+# specific until this registry existed.
+_RUNNABLE_DEFINITION_NAME_EXTRACTORS: dict[str, Callable[[Any], str]] = {
+    "FunctionDef": lambda node: str(node.name),
+    "AsyncFunctionDef": lambda node: str(node.name),
+    "Lambda": lambda node: (
+        f"<lambda:{getattr(node, 'lineno', 0)}:"
+        f"{getattr(node, 'col_offset', 0)}>"
+    ),
+}
+
+
+def register_runnable_definition_type(
+    type_name: str, name_extractor: Callable[[Any], str],
+) -> None:
+    """Register a foreign language's function/method-definition node type.
+
+    ``type_name`` is ``type(node).__name__`` for that language's own
+    function-definition node class (``"FuncDef"`` for ``pycparser``, say).
+    ``name_extractor`` reads that node's own name (``pycparser.c_ast.FuncDef``
+    keeps it at ``node.decl.name``, not ``node.name``, so this cannot be one
+    generic ``.name`` access across languages). Idempotent: re-registering
+    the same type name overwrites, it does not duplicate or error.
+    """
+
+    _RUNNABLE_DEFINITION_NAME_EXTRACTORS[str(type_name)] = name_extractor
+
+
+def is_runnable_definition(node: Any) -> bool:
+    """Is ``node`` a registered function/method-definition node, in any
+    registered language -- the export-table membership test."""
+
+    return type(node).__name__ in _RUNNABLE_DEFINITION_NAME_EXTRACTORS
+
+
+def runnable_definition_name(node: Any) -> str:
+    """The name of a registered function/method-definition node."""
+
+    return _RUNNABLE_DEFINITION_NAME_EXTRACTORS[type(node).__name__](node)
+
+
+# Same export-table pattern, for the two other node shapes call/return
+# ownership walking needs to recognize: a call, and a return-shaped node.
+# "Return" is deliberately one shared key for every registered language
+# rather than a per-language key -- pycparser's own Return node is *also*
+# literally named "Return" (not a naming collision to route around, an
+# actual shared vocabulary word both languages use for the same construct).
+#
+# The returned value itself is read from the graph's own dependency
+# structure (a node's "value"/"expr" parent-edge role -- role_schemas'
+# Return: {"up": {"value": 1}} for Python, {"up": {"expr": 1}} for C), never
+# from the raw source node's own attributes. This is deliberate, not
+# incidental: everywhere else this session resolved a value this way
+# (ShellMemoryReference.base_node_id, _resolve_reference_node in
+# glsl_deployment_strategy.py) it went through the graph's own parents/role
+# edges, not getattr on expr_obj -- the graph is the abstract, language-
+# neutral representation; the raw node is not, and reaching back into it
+# here would just reintroduce a second, Python-shaped assumption
+# (node.value vs node.expr) into code meant to be language-neutral.
+_CALL_SHAPED_TYPE_NAMES: set[str] = {"Call"}
+_RETURN_VALUE_ROLES: set[str] = {"value", "expr"}
+
+
+def register_call_shaped_type(type_name: str) -> None:
+    """Register a foreign language's call-expression node type name."""
+
+    _CALL_SHAPED_TYPE_NAMES.add(str(type_name))
+
+
+def register_return_value_role(role: str) -> None:
+    """Register a foreign language's own parent-edge role name for "this is
+    the value a return-shaped node returns" (role_schemas' own "up" key for
+    that language's Return-equivalent node)."""
+
+    _RETURN_VALUE_ROLES.add(str(role))
+
+
+def source_child_nodes(node: Any) -> tuple[Any, ...]:
+    """Every direct child of a source node, in any registered language.
+
+    The one traversal primitive a language must supply. Python spells it
+    ``ast.iter_child_nodes``; pycparser spells it ``node.children()``
+    (yielding ``(role_name, child)`` pairs). Neither understands the other:
+    ``ast.NodeVisitor.generic_visit`` requires ``node._fields``, which
+    pycparser nodes do not have, which is why walking a C body with an
+    ``ast`` visitor raises ``AttributeError: 'Decl' object has no attribute
+    '_fields'`` rather than simply finding nothing.
+
+    Dispatch is on the protocol the node actually implements, not on a
+    registered type name, because that is what genuinely varies -- and it
+    means a third frontend whose nodes are ``ast``-shaped or
+    ``children()``-shaped needs no registration here at all.
+    """
+
+    if isinstance(node, ast.AST):
+        return tuple(ast.iter_child_nodes(node))
+    children = getattr(node, "children", None)
+    if callable(children):
+        return tuple(child for _role, child in children())
+    return ()
+
+
+def source_body_statements(definition: Any) -> tuple[Any, ...]:
+    """The ordered statements making up a function definition's body.
+
+    Python keeps them directly on ``FunctionDef.body``; C wraps them in a
+    ``Compound`` whose ``block_items`` holds the list (and which may be
+    ``None`` for an empty body).
+    """
+
+    body = getattr(definition, "body", None)
+    if body is None:
+        return ()
+    if isinstance(body, list):
+        return tuple(body)
+    block_items = getattr(body, "block_items", None)
+    if block_items is not None:
+        return tuple(block_items)
+    # A lambda-style single-expression body is itself the only statement.
+    return (body,)
+
+
+def source_walk(node: Any) -> tuple[Any, ...]:
+    """``ast.walk`` for any registered language, via ``source_child_nodes``.
+
+    Callers filter the result with ``isinstance`` against the constructs
+    they care about. That stays correct for a foreign language rather than
+    merely not crashing: C genuinely has no ``ast.ExceptHandler`` and no
+    Python-style ``for``, so a scan for those legitimately finds nothing,
+    which is the right answer and not a silent gap.
+    """
+
+    collected: list[Any] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        collected.append(current)
+        stack.extend(source_child_nodes(current))
+    return tuple(collected)
+
+
+def function_parameter_names(definition: Any) -> tuple[str, ...]:
+    """A function definition's declared parameter names, in order.
+
+    Genuinely per-language grammar rather than shared vocabulary, so this
+    is one of the few places a language really must be taught its own
+    shape: Python hangs them off ``FunctionDef.args`` as ``arg`` nodes
+    across three lists (positional-only, ordinary, keyword-only), while C
+    reaches ``FuncDef -> decl -> type -> args.params`` to a list of
+    ``Decl`` nodes whose ``.name`` is a plain string.
+    """
+
+    arguments = getattr(definition, "args", None)
+    if arguments is not None and hasattr(arguments, "posonlyargs"):
+        return tuple(
+            argument.arg
+            for argument in (
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+            )
+        )
+    declaration = getattr(definition, "decl", None)
+    if declaration is not None:
+        parameter_list = getattr(getattr(declaration, "type", None), "args", None)
+        return tuple(
+            str(parameter.name)
+            for parameter in (getattr(parameter_list, "params", None) or ())
+            if getattr(parameter, "name", None) is not None
+        )
+    return ()
+
+
+def _record_owned_calls_and_returns(
+    graph: Any,
+    owner_reference: Any,
+    function_node_id: int,
+    call_owners: dict[int, Any],
+    function_return_values: dict[int, list[int]],
+) -> None:
+    """Walk ``graph.G`` (not the raw source tree) to find every call/return
+    belonging to the function at ``function_node_id``, stopping at any
+    nested function/method-definition boundary -- the graph-based,
+    language-neutral replacement for a source-tree ``ast.NodeVisitor`` walk,
+    which cannot walk a foreign language's own node types at all (a
+    ``pycparser`` node has no ``_fields`` attribute Python's
+    ``ast.NodeVisitor.generic_visit`` requires). Bounded, not
+    ``nx.ancestors``' full transitive closure: a nested definition's own
+    calls/returns belong to *it*, not this enclosing function, the same
+    rule the original visitor's ``visit_FunctionDef`` returning ``None``
+    (not recursing) enforced.
+    """
+
+    visited: set[int] = set()
+    stack = list(graph.G.predecessors(function_node_id))
+    while stack:
+        node_id = stack.pop()
+        if node_id in visited or node_id not in graph.G:
+            continue
+        visited.add(node_id)
+        data = graph.G.nodes[node_id]
+        expression = data.get("expr_obj")
+        if node_id != function_node_id and is_runnable_definition(expression):
+            # A nested definition owns its own calls/returns; do not
+            # descend into it from here.
+            continue
+        node_type = str(data.get("type"))
+        if node_type in _CALL_SHAPED_TYPE_NAMES:
+            call_owners[node_id] = owner_reference
+        if node_type == "Return":
+            # The returned value's own node id, read off the Return node's
+            # graph-native parent edges (role "value" for Python, "expr" for
+            # C) -- never off the raw source node's attributes. Already a
+            # graph node id (an "up" edge's producer), not a raw object,
+            # so it needs no id()/wrapping before use.
+            value_node_id = next(
+                (
+                    parent_id
+                    for parent_id, role in (data.get("parents") or ())
+                    if str(role) in _RETURN_VALUE_ROLES
+                ),
+                None,
+            )
+            if value_node_id is not None:
+                function_return_values.setdefault(
+                    function_node_id, [],
+                ).append(value_node_id)
+        stack.extend(graph.G.predecessors(node_id))
+
+
+# Source-language node type name -> the canonical SSA vocabulary spelling it
+# universalizes to. The point of routing through the registry rather than
+# hardcoding strings here is that a second language's own spelling for the
+# same construct lands on the *same* canonical type: C's ``FuncCall`` and
+# Python's ``Call`` both become "Call", so downstream passes see one
+# vocabulary instead of one per frontend. Extend by registering the foreign
+# spelling in ssa_registry.py (c_ssa_equivalents, say) and naming its node
+# type here -- not by adding a branch downstream.
 _AST_PROCESS_GRAPH_ALIASES = {
     "Name": ast_ssa_name_map["name"].value,
     "Assign": ast_ssa_name_map["assign"].value,
     "Call": ast_ssa_name_map["call"].value,
+    # C (pycparser c_ast), joining the same canonical spellings above.
+    # StructRef is C's field read (``self->value``), the same reading
+    # Python's ``attribute:load`` has -- both are Load.
+    "ID": c_ssa_name_map["id"].value,
+    "Assignment": c_ssa_name_map["assignment"].value,
+    "FuncCall": c_ssa_name_map["funccall"].value,
+    "StructRef": c_ssa_name_map["structref"].value,
 }
+
+# C node types that exist only to spell out a *type*, carrying no runtime
+# value of their own. Python's grammar has no equivalent (it is untyped at
+# the syntax level), which is why this set has no Python counterpart --
+# these are stripped for the same reason ast.Nonlocal/ast.Global are:
+# compile-time syntax, not operations. ``Decl`` is deliberately NOT here --
+# it carries both the declared name and its initializer, so it is a real
+# binding event, not type machinery.
+_C_COMPILE_TIME_SYNTAX = frozenset({
+    "TypeDecl",
+    "FuncDecl",
+    "PtrDecl",
+    "ArrayDecl",
+    "IdentifierType",
+    "ParamList",
+    "Typedef",
+    "Struct",
+    "Union",
+    "Enum",
+})
 
 _BITOPS_TO_EXECUTABLE = {
     "Xor": "bitxor",
@@ -59,6 +334,51 @@ def _qualified_handler(prefix: str, operator: ast.AST) -> str:
     if handler is None:
         raise KeyError(f"no existing operator alias for {spelling!r}")
     return _BITOPS_TO_EXECUTABLE.get(handler.value, handler.value)
+
+
+def _c_qualified_handler(prefix: str, operator: str) -> str:
+    """``_qualified_handler`` for C, whose operators are strings not classes.
+
+    Python spells an operator as a child *node class* (``ast.Add``, hence
+    ``binop:add``); pycparser spells it as a plain string attribute on the
+    parent (``BinaryOp.op == '+'``, hence ``binaryop:+``). Two surface
+    spellings, one canonical Handler -- which is the whole point of the
+    registry, and why this returns the identical vocabulary
+    ``_qualified_handler`` does rather than a parallel C-flavored one.
+    """
+
+    spelling = f"{prefix}:{str(operator).lower()}"
+    handler = c_ssa_name_map.get(spelling)
+    if handler is None:
+        raise KeyError(f"no existing C operator alias for {spelling!r}")
+    return _BITOPS_TO_EXECUTABLE.get(handler.value, handler.value)
+
+
+def _c_constant_value(expression: Any) -> Any:
+    """A ``pycparser`` Constant's real Python value.
+
+    pycparser keeps every literal as the *source text* plus a type name
+    (``Constant(type='int', value='10')`` -- the value is the string "10",
+    not the integer 10). Downstream compiler stages treat ``data["constant"]``
+    as a real value, so the conversion has to happen here, at the one place
+    C literals are canonicalized, rather than being re-derived (or silently
+    left as a string) at each consumer.
+    """
+
+    raw = str(getattr(expression, "value", ""))
+    kind = str(getattr(expression, "type", ""))
+    if "char" in kind:
+        return raw.strip("'")
+    if "string" in kind:
+        return raw.strip('"')
+    if "float" in kind or "double" in kind:
+        return float(raw.rstrip("fFlL"))
+    if "int" in kind:
+        # C integer literals carry base prefixes and width/sign suffixes that
+        # Python's int() will not accept directly (0x1FUL, 10u, 07).
+        text = raw.rstrip("uUlL")
+        return int(text, 0) if text else 0
+    return raw
 
 
 def _replace_inputs(
@@ -172,23 +492,16 @@ def _normalize_lexical_values(
     first_class_function_nodes: dict[int, int] = {}
     static_constant_nodes: dict[str, int] = {}
     static_attribute_values: dict[tuple[int, str], int] = {}
-    parameter_names = {
-        argument.arg
-        for argument in (
-            *statement.args.posonlyargs,
-            *statement.args.args,
-            *statement.args.kwonlyargs,
-        )
-    }
+    parameter_names = set(function_parameter_names(statement))
     exception_local_names = {
         target.id
         for handler in (
             node
-            for node in ast.walk(statement)
+            for node in source_walk(statement)
             if isinstance(node, ast.ExceptHandler)
         )
         for body_node in handler.body
-        for assignment in ast.walk(body_node)
+        for assignment in source_walk(body_node)
         if isinstance(assignment, (ast.Assign, ast.AnnAssign, ast.AugAssign))
         for target in (
             (*assignment.targets,)
@@ -210,7 +523,7 @@ def _normalize_lexical_values(
             )
         return ()
 
-    for loop in ast.walk(statement):
+    for loop in source_walk(statement):
         if not (
             isinstance(loop, ast.For)
             and isinstance(loop.iter, ast.Call)
@@ -228,7 +541,7 @@ def _normalize_lexical_values(
                     for name in target_name_nodes(loop.target.elts[0])
                 )
     scalar_loop_binding_ids: set[int] = set()
-    for body_statement in statement.body:
+    for body_statement in source_body_statements(statement):
         if not isinstance(body_statement, ast.Return):
             continue
         returned = body_statement.value
@@ -837,7 +1150,7 @@ def _normalize_lexical_values(
 
         # A named callee already represented by a function-table reference is
         # not a runtime value.  Its arguments still are.
-        children = tuple(ast.iter_child_nodes(expression))
+        children = tuple(source_child_nodes(expression))
         if isinstance(expression, ast.Call):
             call_data = (
                 graph.G.nodes[id(expression)]
@@ -1289,7 +1602,7 @@ def _normalize_lexical_values(
                     body_statement.target.slice,
                     include_attributes=False,
                 )
-                for candidate in ast.walk(body_statement.value):
+                for candidate in source_walk(body_statement.value):
                     if not isinstance(candidate, ast.Subscript):
                         continue
                     if ast.dump(
@@ -1562,7 +1875,7 @@ def _normalize_lexical_values(
             state_effect_calls = tuple(
                 expression_statement.value
                 for nested_statement in body_statement.body
-                for expression_statement in ast.walk(nested_statement)
+                for expression_statement in source_walk(nested_statement)
                 if (
                     isinstance(expression_statement, ast.Expr)
                     and isinstance(expression_statement.value, ast.Call)
@@ -1590,7 +1903,7 @@ def _normalize_lexical_values(
                 body_member_ids = {
                     id(member)
                     for nested in body_statement.body
-                    for member in ast.walk(nested)
+                    for member in source_walk(nested)
                 }
                 direct_loop_target_names = (
                     set(loop_target_names(body_statement.target))
@@ -1718,7 +2031,7 @@ def _normalize_lexical_values(
             return id(body_statement)
         if isinstance(body_statement, ast.Expr):
             return resolve_expression(body_statement.value)
-        for child in ast.iter_child_nodes(body_statement):
+        for child in source_child_nodes(body_statement):
             if isinstance(child, ast.expr):
                 resolve_expression(child)
         return id(body_statement) if id(body_statement) in graph.G else None
@@ -2020,10 +2333,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     function_definitions = {
         int(node_id): node_data.get("expr_obj")
         for node_id, node_data in graph.G.nodes(data=True)
-        if isinstance(
-            node_data.get("expr_obj"),
-            (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
-        )
+        if is_runnable_definition(node_data.get("expr_obj"))
     }
 
     class _DirectNestedFunctionVisitor(ast.NodeVisitor):
@@ -2079,49 +2389,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         for member in class_definition.body:
             if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 method_owners[id(member)] = class_definition.name
-    class _OwnedCallVisitor(ast.NodeVisitor):
-        def __init__(self, owner, function_node_id):
-            self.owner = owner
-            self.function_node_id = function_node_id
-
-        def visit_Call(self, node):
-            call_owners[id(node)] = self.owner
-            self.generic_visit(node)
-
-        def visit_Return(self, node):
-            if node.value is not None:
-                function_return_values.setdefault(
-                    self.function_node_id,
-                    [],
-                ).append(id(node.value))
-            self.generic_visit(node)
-
-        def visit_FunctionDef(self, node):
-            # Nested definitions receive their own table entry and ownership
-            # walk; do not assign their calls to the enclosing function.
-            return None
-
-        visit_AsyncFunctionDef = visit_FunctionDef
-
-        def visit_Lambda(self, node):
-            # A lambda owns a separate anonymous function subgraph.
-            return None
-
     for node_id, data in graph.G.nodes(data=True):
         statement = data.get("expr_obj")
-        if not isinstance(
-            statement,
-            (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
-        ):
+        if not is_runnable_definition(statement):
             continue
-        function_name = (
-            statement.name
-            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
-            else (
-                f"<lambda:{getattr(statement, 'lineno', 0)}:"
-                f"{getattr(statement, 'col_offset', 0)}>"
-            )
-        )
+        function_name = runnable_definition_name(statement)
         owner_name = method_owners.get(node_id)
 
         def lexical_qualified_name(definition_id: int) -> str:
@@ -2177,13 +2449,16 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             "function_ref"
         ] = reference.address
         function_nodes[node_id] = reference
-        visitor = _OwnedCallVisitor(reference, node_id)
         if isinstance(statement, ast.Lambda):
+            # A lambda's body is one expression, not a list of statements,
+            # and is itself the implicit return value -- no explicit
+            # Return-shaped node exists to walk to. Python-only construct;
+            # nothing here needs generalizing for another language.
             function_return_values[node_id] = [id(statement.body)]
-            visitor.visit(statement.body)
         else:
-            for body_statement in statement.body:
-                visitor.visit(body_statement)
+            _record_owned_calls_and_returns(
+                graph, reference, node_id, call_owners, function_return_values,
+            )
 
     def class_field_defaults(definition: ast.ClassDef) -> dict[str, Any]:
         """Retain literal class-field defaults as structural compiler facts."""
@@ -2242,7 +2517,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                             member,
                             (ast.FunctionDef, ast.AsyncFunctionDef),
                         )
-                        for target in ast.walk(member)
+                        for target in source_walk(member)
                         if isinstance(target, ast.Attribute)
                         and isinstance(target.ctx, ast.Store)
                         and isinstance(target.value, ast.Name)
@@ -2362,7 +2637,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             owner,
             (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
         )
-        for member in ast.walk(owner)
+        for member in source_walk(owner)
         if member is not owner
     }
     for _node_id, node_data in graph.G.nodes(data=True):
@@ -2473,6 +2748,100 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
 
     for node_id, data in list(graph.G.nodes(data=True)):
         expression = data.get("expr_obj")
+        # --- C (pycparser c_ast) canonicalization -------------------------
+        # Dispatched on the type *name*, never isinstance, so this module
+        # never imports pycparser (it is a frontend-optional dependency; a
+        # pure-Python compile must not require it to be installed).
+        #
+        # This is the same universalization the Python branches below
+        # perform, and it belongs here for the same reason: once a syntactic
+        # element is canonicalized into the shared operator vocabulary
+        # (Add/Load/Store/Call/Constant), no downstream pass needs to know
+        # which language it came from. Skipping it is precisely what let raw
+        # C node types survive all the way to the lexical-value pass.
+        c_type_name = type(expression).__name__
+        if expression is not None and c_type_name in _C_COMPILE_TIME_SYNTAX:
+            # Pure type machinery, with no runtime value of its own: the
+            # C counterpart of Python's Nonlocal/Global handling below.
+            _remove_node(graph, node_id)
+            continue
+        if c_type_name == "Decl" and not isinstance(expression, ast.AST):
+            # `int total = expr;` -- a declaration is not itself an
+            # operation. Its initializer is the value the declared name
+            # denotes, so the Decl collapses onto that value exactly the way
+            # Python's own Name-store nodes collapse onto their producer.
+            # A declaration with no initializer (`int total;`) names no
+            # value at all yet and carries no runtime effect of its own.
+            initializer = getattr(expression, "init", None)
+            if initializer is not None and id(initializer) in graph.G:
+                _redirect_value(graph, node_id, id(initializer))
+            else:
+                _remove_node(graph, node_id)
+            continue
+        if c_type_name == "Constant" and not isinstance(expression, ast.AST):
+            value = _c_constant_value(expression)
+            data["type"] = "Constant"
+            data["op"] = "const"
+            data["constant"] = value
+            data.setdefault("attributes", {})["value"] = value
+            continue
+        if c_type_name == "BinaryOp":
+            operation = _c_qualified_handler("binaryop", expression.op)
+            data["type"] = operation
+            data["op"] = operation
+            data.setdefault("attributes", {})["source_type"] = "BinaryOp"
+            # Only wire operands that are really present. An operand node may
+            # legitimately have been removed already (a collapsed `&x`, a
+            # stripped type node), and networkx's add_edge silently *creates*
+            # an unknown endpoint rather than raising -- which would leave a
+            # metadata-less phantom node that only surfaces much later, as a
+            # bare KeyError('type') inside scheduling.
+            _replace_inputs(
+                graph,
+                node_id,
+                tuple(
+                    (operand_id, role)
+                    for operand_id, role in (
+                        (id(expression.left), "lhs"),
+                        (id(expression.right), "rhs"),
+                    )
+                    if operand_id in graph.G
+                ),
+            )
+            continue
+        if c_type_name == "UnaryOp" and not isinstance(expression, ast.AST):
+            if str(expression.op) in {"+", "&", "*"}:
+                # Unary plus is a no-op conversion, the same reading Python's
+                # ast.UAdd gets below.
+                #
+                # Address-of and dereference are identity *in this value
+                # graph specifically*: a node here denotes a value, and the
+                # graph has no separate address space for `&x` to point
+                # into that `x` does not already name. The cpp shell emits
+                # `&obj` for every method receiver, and `obj`'s own node is
+                # already exactly the receiver the callee needs. These stay
+                # registered as GetElementPtr/Load in ssa_registry (their
+                # true meanings, which a real memory model would need) --
+                # collapsing them is a property of this representation, not
+                # a claim that C's & and * are no-ops. Revisit when pointer
+                # arithmetic or aliasing enters the shell's scope; today it
+                # is excluded by CPP_LIKE_SHELL_FOR_C_INTENT.md.
+                _redirect_value(graph, node_id, id(expression.expr))
+                continue
+            operation = _c_qualified_handler("unaryop", expression.op)
+            data["type"] = operation
+            data["op"] = operation
+            data.setdefault("attributes", {})["source_type"] = "UnaryOp"
+            _replace_inputs(
+                graph,
+                node_id,
+                tuple(
+                    (operand_id, "operand")
+                    for operand_id in (id(expression.expr),)
+                    if operand_id in graph.G
+                ),
+            )
+            continue
         if isinstance(expression, (ast.Nonlocal, ast.Global)):
             # Root whole-graph deployment regions are formed from this graph,
             # not only from the normalized per-function copies below.  Scope
@@ -3001,51 +3370,65 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         # Function ownership is already exact in the saved Python AST.  Use
         # that ownership directly: graph ancestry from only the return value
         # silently discarded assignments, calls, loops, and side effects.
+        #
+        # This deliberately still walks the raw ``ast`` tree, not
+        # ``graph.G`` -- unlike ``_record_owned_calls_and_returns`` above,
+        # which runs right after ingestion while the graph still mirrors the
+        # source tree 1:1. By the time this loop runs, earlier reduction
+        # passes have already restructured ``graph.G`` (edges no longer
+        # necessarily match the original AST parent/child shape), so a
+        # graph-native walk here would silently miss nodes a raw-tree walk
+        # still finds (confirmed empirically: a graph-based version of this
+        # walk lost the Return node itself for a plain `return (...)`
+        # function body). Generalizing *this* walk to a foreign language
+        # needs its own graph-native traversal designed against the
+        # post-reduction graph shape, not a drop-in swap -- tracked
+        # separately, not attempted here.
         owned_members: set[int] = set()
 
-        class _OwnedMemberVisitor(ast.NodeVisitor):
-            def generic_visit(self, member):
-                if id(member) in graph.G and not isinstance(
-                    member,
-                    (
-                        ast.arguments,
-                        ast.arg,
-                        ast.expr_context,
-                        ast.operator,
-                        ast.unaryop,
-                        ast.boolop,
-                        ast.cmpop,
-                        ast.keyword,
-                        ast.alias,
-                        ast.Import,
-                        ast.ImportFrom,
-                    ),
-                ):
+        def record_owned_member(member: Any) -> None:
+            if isinstance(member, ast.ClassDef):
+                # A class's body belongs to its own methods' entries.
+                return
+            if is_runnable_definition(member):
+                # A nested definition's body belongs to another
+                # function-table entry, not to this enclosing shell. A
+                # lambda is still itself a value the enclosing scope
+                # references, so it is owned without being descended into.
+                if isinstance(member, ast.Lambda) and id(member) in graph.G:
                     owned_members.add(id(member))
-                super().generic_visit(member)
+                return
+            if id(member) in graph.G and not isinstance(
+                member,
+                (
+                    ast.arguments,
+                    ast.arg,
+                    ast.expr_context,
+                    ast.operator,
+                    ast.unaryop,
+                    ast.boolop,
+                    ast.cmpop,
+                    ast.keyword,
+                    ast.alias,
+                    ast.Import,
+                    ast.ImportFrom,
+                ),
+            ):
+                owned_members.add(id(member))
+            for child in source_child_nodes(member):
+                record_owned_member(child)
 
-            def visit_FunctionDef(self, member):
-                # Its definition and body belong to another function-table
-                # entry, not to the enclosing shell.
-                return None
-
-            visit_AsyncFunctionDef = visit_FunctionDef
-
-            def visit_ClassDef(self, member):
-                return None
-
-            def visit_Lambda(self, member):
-                # Nested lambdas have their own function-table entries.
-                if id(member) in graph.G:
-                    owned_members.add(id(member))
-                return None
-
-        ownership = _OwnedMemberVisitor()
         if isinstance(statement, ast.Lambda):
-            ownership.generic_visit(statement.body)
+            # A lambda's body is one expression, and is the body itself
+            # rather than a list of statements -- descend into it directly
+            # instead of treating it as a nested-definition boundary.
+            for child in source_child_nodes(statement.body):
+                record_owned_member(child)
+            if id(statement.body) in graph.G:
+                owned_members.add(id(statement.body))
         else:
-            for body_member in statement.body:
-                ownership.visit(body_member)
+            for body_member in source_body_statements(statement):
+                record_owned_member(body_member)
         included = owned_members
         included = {
             member

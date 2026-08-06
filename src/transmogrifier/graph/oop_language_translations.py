@@ -47,6 +47,10 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from ..operator_defs import role_schemas
+from ...common.tensors.topological_reducer import (
+    register_call_shaped_type,
+    register_runnable_definition_type,
+)
 
 
 _NODE_CLASS_CACHE: dict[str, type] = {}
@@ -169,18 +173,32 @@ C_ROLE_SCHEMAS: dict[str, dict[str, dict[str, Any]]] = {
 
 
 def install_c_role_schemas(graph: Any) -> None:
-    """Set ``graph.role_schemas`` to a copy carrying ``C_ROLE_SCHEMAS``.
+    """Set ``graph.role_schemas`` to a copy carrying ``C_ROLE_SCHEMAS``, and
+    register ``pycparser.c_ast.FuncDef`` as a runnable definition type.
 
     Call once, on the specific ``ProcessGraph`` instance about to receive a
     ``pycparser`` ``FileAST`` (from ``desugar_cpp_shell`` output), *before*
-    ``graph.build_graph(...)``. See ``install_js_role_schemas`` for why this
-    sets a per-instance copy rather than mutating the shared
-    ``operator_defs.role_schemas`` dict -- the same class-of-bug applies
-    here (``Return``, ``UnaryOp`` collide with Python's entries under a
-    different shape).
+    ``graph.build_graph(...)``. See ``install_js_role_schemas`` for why
+    ``role_schemas`` gets a per-instance copy rather than a shared-dict
+    mutation -- the same class-of-bug applies there (``Return``, ``UnaryOp``
+    collide with Python's entries under a different shape).
+
+    The runnable-definition registration below (topological_reducer.py's
+    ``register_runnable_definition_type``, the export table
+    ``reduce_abstract_tensor_topology`` populates ``FunctionTable`` from) is
+    different: it *is* process-global, safely, because it is keyed by
+    ``type(node).__name__`` values no other registered language shares
+    (``"FuncDef"`` names nothing in Python's own ``ast`` module or in
+    ``JS_ROLE_SCHEMAS``) -- there is no name for two registrations to
+    collide over, unlike ``role_schemas``' broader, more collision-prone
+    namespace.
     """
 
     graph.role_schemas = {**role_schemas, **C_ROLE_SCHEMAS}
+    register_runnable_definition_type(
+        "FuncDef", lambda node: str(node.decl.name),
+    )
+    register_call_shaped_type("FuncCall")
 
 
 __all__ = [
