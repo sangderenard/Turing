@@ -279,6 +279,13 @@ class AOTCompilation:
     program_record_mode: str = "full"
     constant_map: Mapping[str, Any] = field(default_factory=dict)
     mutable_parameters: tuple[str, ...] = ()
+    # The real MapDependencyRegions/ClassNavigationTable objects
+    # (shell_reference_tables.py), not the flattened/buried copies that
+    # otherwise only survive inside map_ir. See
+    # GRAPH_DESCRIPTION_LAYER_SURVEY.md for why these are kept as typed
+    # fields instead of being reduced to another dict entry.
+    class_navigation: Any = None
+    dependency_regions: Any = None
 
 
 def _apply_parameter_constant_map(
@@ -573,6 +580,21 @@ def compile_ast_aot(
 
     graph = None if deployment is None else graph
     frontend_ready = graph is not None
+    # Only computed fresh below (not on a resumed frontend/compiled-plan
+    # checkpoint) -- a resumed compile carries these as None rather than
+    # re-deriving them, which is a known gap, not a silent wrong answer.
+    class_navigation = None
+    dependency_regions = None
+    # The entrypoint's own FunctionDef node, found unambiguously in this
+    # call's own freshly-parsed source below (module.body has exactly one
+    # top-level function named `entrypoint`, by construction). Used later to
+    # look the entrypoint's reference up by node identity
+    # (FunctionTable.reference_by_source_node) instead of by bare name
+    # (FunctionTable.reference) -- see that call site for why bare-name
+    # lookup is unsafe here. None on a resumed frontend/compiled-plan
+    # checkpoint, where this call never re-parses its own source; the
+    # bare-name lookup remains the fallback for that path specifically.
+    entrypoint_node_id = None
     if deployment is None and checkpoint_store is not None and resume:
         _report("aot: loading frontend checkpoint")
         graph = checkpoint_store.load(
@@ -608,6 +630,16 @@ def compile_ast_aot(
         module = _apply_parameter_constant_map(
             ast.parse(source), entrypoint, constant_map, mutable_parameters
         )
+        entrypoint_function_def = next(
+            (
+                node for node in module.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == entrypoint
+            ),
+            None,
+        )
+        if entrypoint_function_def is not None:
+            entrypoint_node_id = id(entrypoint_function_def)
     # This graph is a second, independent ProcessGraph build -- the caller
     # (site_bundle.build_program_bundle) already built and reduced one of
     # its own moments ago for telemetry/summarize_process_graph. They are
@@ -756,7 +788,25 @@ def compile_ast_aot(
                 "aot: captured-program checkpoint unavailable "
                 f"({checkpoint_store.last_load_status})"
             )
-        reference = graph.function_table.reference(entrypoint)
+        # FunctionTable.declare() binds every function under its own bare,
+        # unqualified name (FunctionTable._bindings), last writer wins --
+        # there is no collision detection there at all, only the qualified
+        # name (FunctionTable._qualified) is disambiguated. A whole-program
+        # discovery trace routinely declares more than one function sharing
+        # the entrypoint's bare name (a same-named method on a class the
+        # trace happens to reach), so looking the entrypoint up by name here
+        # silently returns whichever same-named function was declared last --
+        # not necessarily this compile's actual entrypoint. Resolve by the
+        # entrypoint's own source node identity instead (collision-proof by
+        # construction: two functions can share a name, never a source
+        # node); the bare-name lookup remains the fallback only for a
+        # resumed frontend/compiled-plan checkpoint, which never re-parses
+        # its own source and so has no node id to resolve by.
+        reference = (
+            graph.function_table.reference_by_source_node(entrypoint_node_id)
+            if entrypoint_node_id is not None
+            else None
+        ) or graph.function_table.reference(entrypoint)
         if reference is None:
             raise ValueError(
                 f"{entrypoint!r} is not a defined function in source"
@@ -1185,6 +1235,9 @@ def compile_ast_aot(
         shell_control_program=shell_control_program,
         map_ir=map_ir,
         name=entrypoint,
+        class_navigation=class_navigation,
+        dependency_regions=dependency_regions,
+        reference_tables=getattr(deployment, "reference_tables", None),
     )
     compilation = AOTCompilation(
         entrypoint=entrypoint,
@@ -1194,6 +1247,8 @@ def compile_ast_aot(
         deployment=deployment,
         shell=shell,
         map_ir=map_ir,
+        class_navigation=class_navigation,
+        dependency_regions=dependency_regions,
         region_programs=region_programs,
         region_feed_values=region_feed_values,
         identity_table=identity_table,

@@ -556,6 +556,38 @@ const STATE_FEEDBACK = (API.metadata || {}).state_feedback || {};
 const STATE_FEEDBACK_PAIRS = Object.entries(STATE_FEEDBACK);
 const HAS_STATE_FEEDBACK = STATE_FEEDBACK_PAIRS.length > 0;
 
+// A page's numeric feed UI was built around one uniform float type for the
+// whole program (the shader/fluid demos this shell first served). A
+// parameter's own `dtype` (compiled_program_api.Parameter -- already emitted
+// per parameter, just previously unread here) says what it actually is:
+// register/address/byte state is not floating point, and round-tripping it
+// through Float64Array would silently lose exactness. This resolves a
+// parameter's real element type to the matching JS typed-array constructor,
+// falling back to the page-wide float default for parameters that don't (or
+// can't) declare one, so existing pages are unaffected.
+function typedArrayForDtype(dtype) {
+  switch (String(dtype || "")) {
+    case "uint8": case "u8": case "bool": case "logical":
+      return Uint8Array;
+    case "int32": case "i32": case "int":
+      return Int32Array;
+    case "uint32": case "u32":
+      return Uint32Array;
+    case "int64": case "i64":
+      // Exact 64-bit integers (registers, addresses) need BigInt64Array, not
+      // a float array. Callers that read these values must expect BigInt
+      // elements, not plain numbers -- that boundary is deliberate, not an
+      // oversight, since a plain Number cannot hold every int64 exactly.
+      return BigInt64Array;
+    case "float32": case "f32": case "float":
+      return Float32Array;
+    case "float64": case "f64": case "double":
+      return Float64Array;
+    default:
+      return isF32 ? Float32Array : Float64Array;
+  }
+}
+
 // Named system ports carry non-numerical shell resources outside the ordinary
 // elementwise feed UI. Files are byte-exact. Web external references are
 // limited to other registered Turing bundles, or a named host-simulated
@@ -1231,7 +1263,7 @@ async function advanceFeedback(ticks = 1) {
   const reserved = runtime.api.metadata.reserved_bytes || 0;
   const required = reserved + (inputs.length + outputs.length) * count * elementBytes;
   if (required > memory.buffer.byteLength) memory.grow(Math.ceil((required - memory.buffer.byteLength) / 65536));
-  const View = runtime.api.metadata.value_type === "f32" ? Float32Array : Float64Array;
+  const View = typedArrayForDtype(runtime.api.metadata.value_type);
   const offsetsBytes = Array.from({length: inputs.length + outputs.length}, (_, i) => reserved + i * count * elementBytes);
   new View(memory.buffer, offsetsBytes[0], count).fill(feedbackState.travel);
   new View(memory.buffer, offsetsBytes[1], count).set(offsets.map(value => feedbackState.travel + value));
@@ -1279,7 +1311,7 @@ function wasmTileWorkerSource() {
     const manifest = configuredManifest;
     const inventory = configuredInventory;
     const elementBytes = Number(manifest.modules[0].element_bytes || 8);
-    const View = manifest.modules[0].value_type === "f32" ? Float32Array : Float64Array;
+    const View = typedArrayForDtype(manifest.modules[0].value_type);
     const fieldCount = (inventory.field_slots || []).length;
     let cursor = Math.ceil(Number(manifest.shared_static_bytes || 0) / 4) * 4;
     const inventoryOffset = cursor;
@@ -1839,7 +1871,7 @@ class ClassGraphRunner {
     residentOutputs = false
   ) {
     this.layout(count);
-    const View = this.manifest.modules[0].value_type === "f32" ? Float32Array : Float64Array;
+    const View = typedArrayForDtype(this.manifest.modules[0].value_type);
     for (const [logicalName, source] of Object.entries(logicalInputs)) {
       const identity = "in::" + logicalName;
       if (source && source.turingStorageReference === true) {
@@ -1943,7 +1975,7 @@ class ContiguousRunner {
     const instance = await this.instance();
     const memory = instance.exports[this.spec.memory_export || "memory"];
     const elementBytes = Number(this.spec.element_bytes || 8);
-    const View = this.spec.value_type === "f32" ? Float32Array : Float64Array;
+    const View = typedArrayForDtype(this.spec.value_type);
     let cursor = Math.ceil(Number(this.spec.reserved_bytes || 0) / elementBytes) * elementBytes;
     const offsets = {};
     for (const name of [...this.spec.inputs, ...this.spec.outputs]) {
@@ -2087,7 +2119,7 @@ window.TuringWasmRuntime = Object.freeze({
 
 function residentValues(value) {
   if (!value || value.turingStorageReference !== true) return value;
-  const View = value.valueType === "f32" ? Float32Array : Float64Array;
+  const View = typedArrayForDtype(value.valueType);
   return new View(value.memory.buffer, value.offset, value.count);
 }
 

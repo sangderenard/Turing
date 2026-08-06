@@ -125,7 +125,20 @@ PermissionEvaluator = Callable[[str, tuple[str, ...]], bool]
 
 @dataclass(frozen=True)
 class ClassNavigationMember:
-    """One dot-addressable class member in the navigation LUT."""
+    """One dot-addressable class member in the navigation LUT.
+
+    ``slot`` is a monotonic, per-class index for instance-storage
+    attributes (``kind == "attribute"`` and ``storage == "instance"``) --
+    the same shape ``ClassFieldSlot`` (``wasm_class_coordinator.py``)
+    already proves out for WebAssembly deployment, generated here instead
+    at the nexus (``build_class_navigation_table``, the frontend phase
+    every backend already goes through), so a class instance has a real,
+    addressable field layout the moment it exists, not only once a
+    backend-specific "class-graph manifest" happens to derive one later.
+    ``None`` for methods and for class-level (non-instance) attributes,
+    which are looked up through ``function_reference``/the function table
+    instead -- a slot addresses instance storage, not a callable.
+    """
 
     name: str
     identity: str
@@ -133,6 +146,7 @@ class ClassNavigationMember:
     storage: str | None
     function_reference: int | None
     permissions: tuple[str, ...]
+    slot: int | None = None
 
 
 @dataclass(frozen=True)
@@ -168,6 +182,7 @@ class ClassNavigationTable:
                             "storage": member.storage,
                             "function_reference": member.function_reference,
                             "permissions": list(member.permissions),
+                            "slot": member.slot,
                         }
                         for member in record.members
                     ],
@@ -269,14 +284,21 @@ def build_class_navigation_table(graph: Any) -> ClassNavigationTable:
             object_map.get("class_identity", object_map["class_name"])
         )
         members = []
+        next_instance_slot = 0
         for attribute in object_map.get("attributes", ()):
+            storage = str(attribute["storage"])
+            slot = None
+            if storage == "instance":
+                slot = next_instance_slot
+                next_instance_slot += 1
             members.append(ClassNavigationMember(
                 name=str(attribute["name"]),
                 identity=str(attribute["identity"]),
                 kind="attribute",
-                storage=str(attribute["storage"]),
+                storage=storage,
                 function_reference=None,
                 permissions=tuple(attribute.get("permissions", ())),
+                slot=slot,
             ))
         for method in object_map.get("methods", ()):
             identity = str(method["graph_identity"])

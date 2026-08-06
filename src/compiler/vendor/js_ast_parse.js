@@ -11,7 +11,7 @@ process.stdin.on("end", () => {
     try {
         const ast = acorn.parse(source, {
             ecmaVersion: "latest",
-            sourceType: "script",
+            sourceType: "module",
             locations: false,
         });
         process.stdout.write(JSON.stringify(ast, (key, value) => (

@@ -122,9 +122,36 @@ class FunctionTable:
         self._bindings[str(name)] = reference
 
     def reference(self, name: str) -> FunctionReference | None:
-        """Return the function reference bound to ``name``, if any."""
+        """Return the function reference bound to ``name``, if any.
+
+        ``name`` is bare and unqualified -- ``declare`` rebinds it, last
+        writer wins, every time *any* function shares that name (a method
+        of the same name on an unrelated class, say). There is no
+        collision detection here at all. Safe only when the caller knows
+        no other declared function shares ``name``; otherwise use
+        ``reference_by_source_node``.
+        """
 
         return self._bindings.get(str(name))
+
+    def reference_by_source_node(self, node_id: int) -> FunctionReference | None:
+        """Return the reference declared for a specific source AST node.
+
+        Keyed by ``id()`` of the exact node ``declare`` was called for --
+        the same identity every entry's ``metadata["source_node"]`` already
+        records (``topological_reducer.py``). Collision-proof by
+        construction: two functions can share a bare name, but never the
+        same source node. Use this whenever the caller already holds the
+        specific node (an entrypoint's own ``FunctionDef``, discovered
+        unambiguously from the caller's own freshly-parsed source) instead
+        of re-deriving a reference from a name other code may since have
+        rebound to something else entirely.
+        """
+
+        for reference, entry in self._entries.items():
+            if entry.metadata.get("source_node") == node_id:
+                return reference
+        return None
 
     def entry(
         self,

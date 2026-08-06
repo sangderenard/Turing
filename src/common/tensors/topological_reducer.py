@@ -1731,32 +1731,62 @@ def _normalize_lexical_values(
     if returned_values:
         graph.roots = list(dict.fromkeys(returned_values))
 
-    # A source-linked unbound method can arrive with its receiver Name absent
-    # from the owned subgraph even though the Attribute load itself is owned.
-    # Restore the ordinary parameter edge before lexical Name cleanup; an
-    # Attribute without its receiver is not a valid structural operation.
+    # A source-linked unbound method can arrive with its receiver absent from
+    # the owned subgraph even though the Attribute load itself is owned.
+    # Restore the ordinary edge before lexical Name cleanup; an Attribute
+    # without its receiver is not a valid structural operation. The receiver
+    # can be a parameter (``self`` bound directly at the call boundary) or an
+    # ordinary local (``machine = load_pe(...)``) -- both are recorded under
+    # the same name in ``environment`` by ``bind_target``, so there is no
+    # reason to restore only the parameter case and leave a local's receiver
+    # permanently unresolved. A chained access (``machine.runner.tick``) puts
+    # an Attribute (``machine.runner``), not a Name, in the receiver position
+    # of the outer Attribute (``.tick``); that inner Attribute is itself just
+    # another node this same loop repairs on its own matching iteration, so
+    # linking straight to its node id (when it is still a live node) is
+    # enough -- the two repairs do not need to happen in any particular
+    # order, since neither removes a node, only reattaches an edge.
     for node_id, data in list(graph.G.nodes(data=True)):
         expression = data.get("expr_obj")
         if not (
             isinstance(expression, ast.Attribute)
             and not data.get("parents")
-            and isinstance(expression.value, ast.Name)
-            and expression.value.id in parameter_names
+            and isinstance(expression.value, (ast.Name, ast.Attribute))
         ):
             continue
-        receiver = environment.get(expression.value.id)
-        if receiver is None:
-            receiver = input_value(
-                expression.value.id,
-                binding_kind="parameter",
-            )
+        if isinstance(expression.value, ast.Name):
+            receiver = environment.get(expression.value.id)
+            if receiver is None:
+                receiver = input_value(
+                    expression.value.id,
+                    binding_kind=(
+                        "parameter"
+                        if expression.value.id in parameter_names
+                        else "local"
+                    ),
+                )
+        else:
+            inner_id = id(expression.value)
+            if inner_id not in graph.G:
+                continue
+            receiver = inner_id
         _replace_inputs(graph, node_id, ((receiver, "value"),))
 
     # Any surviving lexical occurrence is either unused syntax or an unresolved
-    # source label.  It is not executable work in the reduced value graph.
+    # source label.  It is not executable work in the reduced value graph --
+    # but only when nothing still structurally depends on it. A Name node
+    # that still has a real successor (an Attribute load whose receiver is
+    # this exact node, say) is not unused syntax; removing it anyway does
+    # not erase that dependency, it just strips the successor's own record
+    # of it, leaving that successor orphaned for whatever later pass expects
+    # to find its receiver -- the exact "receiver Name absent" case the
+    # repair above this loop exists to patch after the fact. Checking
+    # liveness first means there is nothing left to repair.
     for node_id, data in list(graph.G.nodes(data=True)):
         expression = data.get("expr_obj")
         if isinstance(expression, ast.Name):
+            if graph.G.out_degree(node_id) > 0:
+                continue
             _remove_node(graph, node_id)
             continue
         if (

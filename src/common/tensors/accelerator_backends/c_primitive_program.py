@@ -13,6 +13,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from ..abstraction import tensor_identity
 from ..fused_ir import (
     ELEMENTWISE_BINARY,
     ELEMENTWISE_UNARY,
@@ -381,7 +382,7 @@ def compile_elementwise_tape(
     def is_dynamic_scalar(value):
         if not is_tensor(value) or tuple(value.shape) not in ((), (1,)):
             return False
-        identity = id(value)
+        identity = tensor_identity(value)
         if identity in dynamic_scalar_ids:
             return True
         if identity in dynamic_scalar_visiting:
@@ -405,9 +406,9 @@ def compile_elementwise_tape(
     def is_scalar(value):
         if isinstance(value, (int, float, bool)):
             return True
-        if not is_tensor(value) or id(value) in dynamic_scalar_ids:
+        if not is_tensor(value) or tensor_identity(value) in dynamic_scalar_ids:
             return False
-        node = tape._nodes.get(id(value))
+        node = tape._nodes.get(tensor_identity(value))
         return (
             node is not None
             and node.op == "tensor_from_list"
@@ -420,7 +421,7 @@ def compile_elementwise_tape(
         # A scalar created inside the observed expression is a compiler
         # constant, not a runtime scalar tensor. Read its authored constructor
         # payload rather than materializing the backend result with item().
-        node = tape._nodes.get(id(value))
+        node = tape._nodes.get(tensor_identity(value))
         if node is None or node.op != "tensor_from_list":
             raise ValueError("runtime tensor cannot become a scalar literal")
         data = (node.ctx.get("params") or {}).get("data")
@@ -438,7 +439,7 @@ def compile_elementwise_tape(
         if node is not None:
             dtype = node.ctx.get("result_dtype")
             device = node.ctx.get("result_device")
-        graph_node = tape.graph.nodes.get(id(value), {})
+        graph_node = tape.graph.nodes.get(tensor_identity(value), {})
         if dtype is None:
             dtype = graph_node.get("dtype", getattr(value, "dtype", None))
         if device is None:
@@ -453,7 +454,7 @@ def compile_elementwise_tape(
         )
 
     def lower(value):
-        identity = id(value)
+        identity = tensor_identity(value)
         if identity in lowered:
             return identity
         # Planner-declared region inputs are cut points into a whole-program
@@ -504,11 +505,11 @@ def compile_elementwise_tape(
         if not tensor_inputs:
             input_summary = tuple(
                 {
-                    "id": id(item),
+                    "id": tensor_identity(item),
                     "type": type(item).__name__,
                     "shape": tuple(item.shape) if is_tensor(item) else None,
                     "dynamic": is_dynamic_scalar(item) if is_tensor(item) else False,
-                    "recorded": id(item) in tape._nodes,
+                    "recorded": tensor_identity(item) in tape._nodes,
                 }
                 for item in inputs
             )
@@ -595,10 +596,10 @@ def compile_recorded_elementwise_tape(
 
     produced_ids = set(tape._nodes)
     consumed_ids = {
-        id(value)
+        tensor_identity(value)
         for node in tape._nodes.values()
         for value in node.ctx.get("inputs", ())
-        if id(value) in produced_ids
+        if tensor_identity(value) in produced_ids
     }
     terminal_ids = [
         result_id
@@ -744,12 +745,12 @@ def _compile_single_native_node(node, operation: str) -> CapturedFusedProgram:
     for value in node.ctx.get("inputs", ()):
         if not hasattr(value, "shape") or not hasattr(value, "dtype"):
             continue
-        value_id = id(value)
+        value_id = tensor_identity(value)
         input_ids.append(value_id)
         feeds[value_id] = value
         metadata[value_id] = _captured_meta(value)
 
-    result_id = id(result)
+    result_id = tensor_identity(result)
     metadata[result_id] = _captured_meta(result)
     attrs = dict(node.ctx.get("params") or {})
     kernel_kind = _CAPTURED_NATIVE_KERNELS.get(operation, operation)
@@ -779,7 +780,7 @@ def _compile_single_native_node(node, operation: str) -> CapturedFusedProgram:
                     "captured boolean indexed assignment requires destination "
                     "and value tensor inputs"
                 )
-            mask_id = id(index_storage)
+            mask_id = tensor_identity(index_storage)
             feeds[mask_id] = index_storage
             metadata[mask_id] = _captured_meta(index_storage)
             destination_id, value_id = input_ids
@@ -988,7 +989,7 @@ def compile_recorded_fused_tape(
             dependencies = set()
 
             def visit(value):
-                value_id = id(value)
+                value_id = tensor_identity(value)
                 if value_id in tape._nodes:
                     dependencies.add(value_id)
                     return
@@ -1010,7 +1011,7 @@ def compile_recorded_fused_tape(
             visit(node.ctx.get("params") or {})
             return dependencies
 
-        pending = [id(value) for value in requested_outputs.values()]
+        pending = [tensor_identity(value) for value in requested_outputs.values()]
         while pending:
             value_id = pending.pop()
             if value_id in required_ids:
@@ -1018,7 +1019,7 @@ def compile_recorded_fused_tape(
             if (
                 value_id in boundary_value_ids
                 and all(
-                    id(value) != value_id
+                    tensor_identity(value) != value_id
                     for value in requested_outputs.values()
                 )
             ):
@@ -1028,7 +1029,7 @@ def compile_recorded_fused_tape(
                 matching = {
                     name: value
                     for name, value in requested_outputs.items()
-                    if id(value) == value_id
+                    if tensor_identity(value) == value_id
                 }
                 if strict_outputs:
                     raise ValueError(
@@ -1055,7 +1056,7 @@ def compile_recorded_fused_tape(
         nodes = list(tape._nodes.values())
     if not nodes and passthrough_outputs:
         feeds = {
-            id(value): value for value in passthrough_outputs.values()
+            tensor_identity(value): value for value in passthrough_outputs.values()
         }
         metadata = {
             value_id: _captured_meta(value)
@@ -1066,7 +1067,7 @@ def compile_recorded_fused_tape(
             feeds=set(feeds),
             steps=[],
             outputs={
-                name: id(value)
+                name: tensor_identity(value)
                 for name, value in requested_outputs.items()
             },
             meta=metadata,
@@ -1090,8 +1091,8 @@ def compile_recorded_fused_tape(
         for index, node in enumerate(nodes):
             source = node.ctx["inputs"][0]
             result = node.ctx["result"]
-            source_id = id(source)
-            result_id = id(result)
+            source_id = tensor_identity(source)
+            result_id = tensor_identity(result)
             feeds[source_id] = source
             metadata[source_id] = Meta(
                 shape=tuple(source.shape),
@@ -1118,7 +1119,7 @@ def compile_recorded_fused_tape(
             program_outputs[f"result_{index}"] = result_id
         if requested_outputs is not None:
             program_outputs = {
-                name: id(value)
+                name: tensor_identity(value)
                 for name, value in requested_outputs.items()
             }
         program = FusedProgram(
@@ -1159,7 +1160,7 @@ def compile_recorded_fused_tape(
         captured = _compile_single_native_node(node, operations[0])
         if requested_outputs is not None:
             captured.program.outputs = {
-                name: id(value)
+                name: tensor_identity(value)
                 for name, value in requested_outputs.items()
             }
         if operations[0] != "slice":
@@ -1214,7 +1215,7 @@ def compile_recorded_fused_tape(
                     used_ids = {
                         source_id,
                         step.result_id,
-                        *(id(item) for item in index_tensors),
+                        *(tensor_identity(item) for item in index_tensors),
                     }
                     next_temp = -max(1, *(abs(value) for value in used_ids))
 
@@ -1244,7 +1245,7 @@ def compile_recorded_fused_tape(
                     for (axis, _item), index_tensor in zip(
                         active, index_tensors
                     ):
-                        index_id = id(index_tensor)
+                        index_id = tensor_identity(index_tensor)
                         captured.feeds[index_id] = index_tensor
                         program.feeds.add(index_id)
                         program.meta[index_id] = _captured_meta(index_tensor)
@@ -1384,7 +1385,7 @@ def compile_recorded_fused_tape(
                     "count": 1,
                 }
             elif hasattr(item, "shape") and hasattr(item, "dtype"):
-                index_id = id(item)
+                index_id = tensor_identity(item)
                 step.input_ids.append(index_id)
                 captured.feeds[index_id] = item
                 program.feeds.add(index_id)
@@ -1433,7 +1434,7 @@ def compile_recorded_fused_tape(
     class _TapeRegion:
         def __init__(self, source, region_nodes):
             self._nodes = {
-                id(node.ctx["result"]): node for node in region_nodes
+                tensor_identity(node.ctx["result"]): node for node in region_nodes
             }
             self.graph = source.graph
 
@@ -1466,7 +1467,7 @@ def compile_recorded_fused_tape(
     metadata: dict[int, Meta] = {}
     produced: set[int] = set()
     node_by_result = {
-        id(node.ctx["result"]): node
+        tensor_identity(node.ctx["result"]): node
         for node in nodes
     }
     result_by_storage = {
@@ -1479,7 +1480,7 @@ def compile_recorded_fused_tape(
     }
 
     def consumed_results(value):
-        value_id = id(value)
+        value_id = tensor_identity(value)
         if value_id in node_by_result:
             yield value_id
             return
@@ -1497,7 +1498,7 @@ def compile_recorded_fused_tape(
                 yield from consumed_results(item)
 
     for consumer in nodes:
-        consumer_id = id(consumer.ctx["result"])
+        consumer_id = tensor_identity(consumer.ctx["result"])
         for value in (
             *consumer.ctx.get("inputs", ()),
             consumer.ctx.get("params") or {},
@@ -1506,9 +1507,9 @@ def compile_recorded_fused_tape(
                 consumers_by_result[value_id].add(consumer_id)
     required_program_outputs = (
         {
-            id(value)
+            tensor_identity(value)
             for value in requested_outputs.values()
-            if id(value) in node_by_result
+            if tensor_identity(value) in node_by_result
         }
         if requested_outputs is not None
         else {
@@ -1522,7 +1523,7 @@ def compile_recorded_fused_tape(
         group_operations = tuple(str(node.op) for node in group)
         if all(is_elementwise(operation) for operation in group_operations):
             group_result_ids = {
-                id(node.ctx["result"]) for node in group
+                tensor_identity(node.ctx["result"]) for node in group
             }
             # A backend stage is a cut through one complete program, not an
             # independently discovered mini-program.  Any value consumed by a
@@ -1589,7 +1590,7 @@ def compile_recorded_fused_tape(
     # value, not two program inputs.  Normalize the raw-storage IDs back to
     # their producer IDs before deciding which feeds are external.
     storage_producers = {
-        _captured_storage_identity(result): id(result)
+        _captured_storage_identity(result): tensor_identity(result)
         for node in nodes
         for result in (node.ctx.get("result"),)
         if _captured_storage_identity(result) is not None
@@ -1646,22 +1647,22 @@ def compile_recorded_fused_tape(
         if value_id not in produced or value_id in in_place_feeds
     }
     external_feeds.update(
-        (id(value), value) for value in passthrough_outputs.values()
+        (tensor_identity(value), value) for value in passthrough_outputs.values()
     )
     metadata.update(
         {
-            id(value): _captured_meta(value)
+            tensor_identity(value): _captured_meta(value)
             for value in passthrough_outputs.values()
         }
     )
-    produced_ids = {id(node.ctx["result"]) for node in nodes}
+    produced_ids = {tensor_identity(node.ctx["result"]) for node in nodes}
     consumed_ids = {
-        id(value)
+        tensor_identity(value)
         for node in nodes
         for value in node.ctx.get("inputs", ())
         if (
-            id(value) in produced_ids
-            and id(value) != id(node.ctx["result"])
+            tensor_identity(value) in produced_ids
+            and tensor_identity(value) != tensor_identity(node.ctx["result"])
         )
     }
     if requested_outputs is None:
@@ -1678,7 +1679,7 @@ def compile_recorded_fused_tape(
         }
     else:
         program_outputs = {
-            name: id(value)
+            name: tensor_identity(value)
             for name, value in requested_outputs.items()
         }
     manifest = FusedProgram(

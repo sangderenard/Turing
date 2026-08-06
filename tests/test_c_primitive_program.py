@@ -3,6 +3,7 @@ import pytest
 
 from src.common.tensors.accelerator_backends.c_backend import CTensor
 from src.common.tensors import AbstractTensor
+from src.common.tensors.abstraction import tensor_identity
 from src.common.tensors.abstract_nn import ProgramRunner
 from src.common.tensors.accelerator_backends.c_primitive_program import (
     compile_elementwise_tape,
@@ -152,8 +153,8 @@ def test_one_element_tensor_is_not_frozen_as_a_binary_literal():
     captured = compile_elementwise_tape(tape, result)
     step = captured.program.steps[-1]
 
-    assert id(runtime_tensor) in captured.program.feeds
-    assert step.input_ids == [id(values), id(runtime_tensor)]
+    assert tensor_identity(runtime_tensor) in captured.program.feeds
+    assert step.input_ids == [tensor_identity(values), tensor_identity(runtime_tensor)]
     assert "right_scalar" not in step.attrs
 
 
@@ -167,9 +168,9 @@ def test_one_element_tensor_remains_the_input_to_a_unary_cast():
     captured = compile_elementwise_tape(tape, result)
     step = captured.program.steps[-1]
 
-    assert id(runtime_tensor) in captured.program.feeds
+    assert tensor_identity(runtime_tensor) in captured.program.feeds
     assert step.op_name == "fptosi"
-    assert step.input_ids == [id(runtime_tensor)]
+    assert step.input_ids == [tensor_identity(runtime_tensor)]
 
 
 def test_isolated_explicit_cast_retains_canonical_conversion_operation():
@@ -183,8 +184,8 @@ def test_isolated_explicit_cast_retains_canonical_conversion_operation():
     step = captured.execution_programs[-1].steps[-1]
 
     assert step.op_name == "sext"
-    assert step.input_ids == [id(runtime_tensor)]
-    assert captured.program.meta[id(result)].dtype == "int64"
+    assert step.input_ids == [tensor_identity(runtime_tensor)]
+    assert captured.program.meta[tensor_identity(result)].dtype == "int64"
 
 
 def test_requested_empty_tensor_output_may_pass_through_a_recorded_region():
@@ -202,9 +203,9 @@ def test_requested_empty_tensor_output_may_pass_through_a_recorded_region():
         outputs={"computed": computed, "empty": empty},
     )
 
-    assert captured.program.outputs["empty"] == id(empty)
-    assert id(empty) in captured.program.feeds
-    assert captured.program.meta[id(empty)].shape == (0,)
+    assert captured.program.outputs["empty"] == tensor_identity(empty)
+    assert tensor_identity(empty) in captured.program.feeds
+    assert captured.program.meta[tensor_identity(empty)].shape == (0,)
 
 
 def test_strict_requested_outputs_require_a_recorded_producer():

@@ -52,6 +52,16 @@ from ..common.tensors.fused_ir import (
     unroll_feed_axis_reductions,
     view_offset_stride,
 )
+from .wasm_binary import (
+    OP_F32_CONVERT_I32_S,
+    OP_F32_CONVERT_I64_S,
+    OP_F64_CONVERT_I32_S,
+    OP_F64_CONVERT_I64_S,
+    OP_I32_TRUNC_F32_S,
+    OP_I32_TRUNC_F64_S,
+    OP_I64_TRUNC_F32_S,
+    OP_I64_TRUNC_F64_S,
+)
 
 
 class WasmEmissionError(ValueError):
@@ -78,6 +88,61 @@ _TYPES: dict[str, tuple[str, int, str, str]] = {
     "float32": ("f32", 4, "f32.load", "f32.store"),
     "f32": ("f32", 4, "f32.load", "f32.store"),
     "float": ("f32", 4, "f32.load", "f32.store"),
+}
+
+# A parameter whose real dtype is not the module's f32/f64 working type
+# still gets loaded and stored at its own byte width and WASM memory
+# instruction -- not silently reinterpreted as the working type's bytes.
+# "bool"/"logical" are deliberately absent: that tag arises naturally on an
+# ordinary comparison op's result flowing through this module's own uniform
+# elementwise array (Meta.dtype records what an operation *produced*, not
+# only what a caller declared), and narrowing it to 1 byte here corrupts
+# that array's stride for every other value sharing it. This table exists
+# for a caller-declared, genuinely separate byte/integer buffer (a register
+# file, raw memory) -- not for a value this module computed for itself.
+# (byte_width, load_instruction, store_instruction, wasm_value_kind)
+_MEMORY_DTYPE_OPS: dict[str, tuple[int, str, str, str]] = {
+    "uint8": (1, "i32.load8_u", "i32.store8", "i32"),
+    "u8": (1, "i32.load8_u", "i32.store8", "i32"),
+    "int32": (4, "i32.load", "i32.store", "i32"),
+    "i32": (4, "i32.load", "i32.store", "i32"),
+    "int": (4, "i32.load", "i32.store", "i32"),
+    "int64": (8, "i64.load", "i64.store", "i64"),
+    "i64": (8, "i64.load", "i64.store", "i64"),
+}
+
+# Converting an integer parameter to/from the module's f32/f64 working type
+# for arithmetic. Signed conversion is correct even for the unsigned kinds
+# above (uint8/bool load already zero-extends to a non-negative i32, and a
+# non-negative i32/i64 converts identically whether treated as signed or
+# unsigned), so one conversion table covers both.
+_TO_WORKING_TYPE = {
+    ("i32", "f64"): "f64.convert_i32_s",
+    ("i32", "f32"): "f32.convert_i32_s",
+    ("i64", "f64"): "f64.convert_i64_s",
+    ("i64", "f32"): "f32.convert_i64_s",
+}
+_FROM_WORKING_TYPE = {
+    ("f64", "i32"): "i32.trunc_f64_s",
+    ("f32", "i32"): "i32.trunc_f32_s",
+    ("f64", "i64"): "i64.trunc_f64_s",
+    ("f32", "i64"): "i64.trunc_f32_s",
+}
+
+# Same conversions as raw opcodes, for the binary assembler below -- the WAT
+# text and the binary are two independent emitters describing one program;
+# both need the same conversions, one as mnemonic text, one as opcode bytes.
+_TO_WORKING_OPCODE = {
+    ("i32", "f64"): OP_F64_CONVERT_I32_S,
+    ("i32", "f32"): OP_F32_CONVERT_I32_S,
+    ("i64", "f64"): OP_F64_CONVERT_I64_S,
+    ("i64", "f32"): OP_F32_CONVERT_I64_S,
+}
+_FROM_WORKING_OPCODE = {
+    ("f64", "i32"): OP_I32_TRUNC_F64_S,
+    ("f32", "i32"): OP_I32_TRUNC_F32_S,
+    ("f64", "i64"): OP_I64_TRUNC_F64_S,
+    ("f32", "i64"): OP_I64_TRUNC_F32_S,
 }
 
 # Operations that are one native instruction, given the value type prefix.
@@ -779,15 +844,29 @@ def emit_wasm_module(
     for index, _ in enumerate(output_ids):
         parameters.append(f"$out{index}")
 
+    # A value whose real dtype isn't the module's f32/f64 working type is
+    # still loaded/stored at its own byte width and WASM instruction; only
+    # the arithmetic in between stays the working type (converted at the
+    # boundary), not the parameter's memory representation.
+    program_meta = program.meta or {}
+
+    def _memory_ops(value_id: int) -> tuple[int, str, str, str | None]:
+        meta = program_meta.get(int(value_id))
+        entry = _MEMORY_DTYPE_OPS.get(str(meta.dtype)) if meta and meta.dtype else None
+        if entry is None:
+            return element_bytes, load, store, None
+        width, typed_load, typed_store, wasm_kind = entry
+        return width, typed_load, typed_store, wasm_kind
+
     body: list[str] = []
     locals_declared: list[str] = ["(local $i i32)", "(local $addr i32)"]
 
-    def direct_element_address(pointer: str) -> list[str]:
-        # addr = pointer + i * element_bytes
+    def direct_element_address(pointer: str, byte_width: int = element_bytes) -> list[str]:
+        # addr = pointer + i * byte_width
         return [
             f"      local.get {pointer}",
             "      local.get $i",
-            f"      i32.const {element_bytes}",
+            f"      i32.const {byte_width}",
             "      i32.mul",
             "      i32.add",
         ]
@@ -798,8 +877,9 @@ def emit_wasm_module(
         # (fused_ir.Meta); default (0, 1) reproduces a plain contiguous read.
         source_id = resolve_view_source(program.meta, feed_id)
         offset, stride = view_offset_stride(program.meta, feed_id)
+        byte_width, *_ = _memory_ops(source_id)
         instructions = [f"      local.get {feed_label[source_id]}"]
-        byte_offset = offset * element_bytes
+        byte_offset = offset * byte_width
         if byte_offset:
             instructions.extend([
                 f"      i32.const {byte_offset}",
@@ -807,7 +887,7 @@ def emit_wasm_module(
             ])
         instructions.extend([
             "      local.get $i",
-            f"      i32.const {stride * element_bytes}",
+            f"      i32.const {stride * byte_width}",
             "      i32.mul",
             "      i32.add",
         ])
@@ -838,8 +918,13 @@ def emit_wasm_module(
         # Feeds are read once per iteration into locals, so a value used by
         # more than one step is loaded once rather than re-read from memory.
         for feed_id in feed_ids:
+            _, feed_load, _, feed_kind = _memory_ops(feed_id)
             target.extend(element_address(feed_id))
-            target.append(f"      {load}")
+            target.append(f"      {feed_load}")
+            if feed_kind is not None:
+                conversion = _TO_WORKING_TYPE.get((feed_kind, value_type))
+                if conversion is not None:
+                    target.append(f"      {conversion}")
             target.append(f"      local.set {names[feed_id]}")
 
     def evaluate_steps(target: list[str], steps: Sequence[OpStep]) -> None:
@@ -919,9 +1004,14 @@ def emit_wasm_module(
                     WasmShortfall(-1, "output", f"value {output_id} is never produced")
                 )
                 continue
-            body.extend(direct_element_address(f"$out{index}"))
+            out_width, _, out_store, out_kind = _memory_ops(output_id)
+            body.extend(direct_element_address(f"$out{index}", out_width))
             body.append(f"      local.get {target}")
-            body.append(f"      {store}")
+            if out_kind is not None:
+                conversion = _FROM_WORKING_TYPE.get((value_type, out_kind))
+                if conversion is not None:
+                    body.append(f"      {conversion}")
+            body.append(f"      {out_store}")
 
     parameter_text = " ".join(f"(param {p} i32)" for p in parameters)
     memory_import = next(
@@ -966,6 +1056,11 @@ def emit_wasm_module(
     source = "\n".join(lines)
 
     reserved = static_data["reserved_bytes"]
+    parameter_dtypes = {
+        value_id: meta.dtype
+        for value_id in (*parameter_feed_ids, *output_ids)
+        if (meta := program_meta.get(value_id)) is not None and meta.dtype
+    }
     api = _describe(name, function_name, parameter_feed_ids, output_ids, value_type,
                     element_bytes, reserved,
                     static_data_offset=static_data_offset,
@@ -974,7 +1069,8 @@ def emit_wasm_module(
                         if memory_import is not None else None
                     ),
                     input_names=labels,
-                    output_names=list(program.outputs.keys()))
+                    output_names=list(program.outputs.keys()),
+                    parameter_dtypes=parameter_dtypes)
     binary = None
     if not shortfalls:
         binary = _assemble(
@@ -1176,30 +1272,78 @@ def _assemble(
     for step in live:
         locals_for[step.result_id] = builder.declare_local(value_type)
 
-    def direct_element_address(pointer_param: int) -> None:
+    # Same boundary-typing rule as the WAT lowering above: a value whose
+    # real dtype isn't this module's f32/f64 working type is still
+    # loaded/stored at its own byte width and WASM instruction, converted
+    # to/from the working type only for the arithmetic in between.
+    program_meta = program.meta or {}
+
+    def _memory_ops(value_id: int) -> tuple[int, str | None]:
+        meta = program_meta.get(int(value_id))
+        dtype = str(meta.dtype) if meta and meta.dtype else None
+        entry = _MEMORY_DTYPE_OPS.get(dtype) if dtype else None
+        if entry is None:
+            return element_bytes, None
+        width, _load_text, _store_text, wasm_kind = entry
+        return width, wasm_kind
+
+    def _typed_load(width: int, wasm_kind: str | None) -> None:
+        if wasm_kind == "i32":
+            builder.i32_load_width(8 if width == 1 else 32)
+        elif wasm_kind == "i64":
+            builder.i64_load_width(64)
+        else:
+            builder.load()
+
+    def _typed_store(width: int, wasm_kind: str | None) -> None:
+        if wasm_kind == "i32":
+            builder.i32_store_width(8 if width == 1 else 32)
+        elif wasm_kind == "i64":
+            builder.i64_store_width(64)
+        else:
+            builder.store()
+
+    def _convert_to_working(wasm_kind: str | None) -> None:
+        if wasm_kind is None:
+            return
+        opcode = _TO_WORKING_OPCODE.get((wasm_kind, value_type))
+        if opcode is not None:
+            builder.raw(opcode)
+
+    def _convert_from_working(wasm_kind: str | None) -> None:
+        if wasm_kind is None:
+            return
+        opcode = _FROM_WORKING_OPCODE.get((value_type, wasm_kind))
+        if opcode is not None:
+            builder.raw(opcode)
+
+    def direct_element_address(pointer_param: int, byte_width: int = element_bytes) -> None:
         builder.local_get(pointer_param)
         builder.local_get(index_local)
-        builder.i32_const(element_bytes)
+        builder.i32_const(byte_width)
         builder.raw(0x6C)  # i32.mul
         builder.raw(0x6A)  # i32.add
 
     def element_address(feed_id: int) -> None:
         source_id = resolve_view_source(program.meta, feed_id)
         offset, stride = view_offset_stride(program.meta, feed_id)
+        byte_width, _ = _memory_ops(source_id)
         builder.local_get(feed_params[source_id])
-        byte_offset = offset * element_bytes
+        byte_offset = offset * byte_width
         if byte_offset:
             builder.i32_const(byte_offset)
             builder.raw(0x6A)  # i32.add
         builder.local_get(index_local)
-        builder.i32_const(stride * element_bytes)
+        builder.i32_const(stride * byte_width)
         builder.raw(0x6C)  # i32.mul
         builder.raw(0x6A)  # i32.add
 
     def load_feeds() -> None:
         for feed_id in feed_ids:
+            width, kind = _memory_ops(feed_id)
             element_address(feed_id)
-            builder.load()
+            _typed_load(width, kind)
+            _convert_to_working(kind)
             builder.local_set(locals_for[feed_id])
 
     def evaluate_steps(steps: Sequence[OpStep]) -> None:
@@ -1398,13 +1542,15 @@ def _assemble(
             for step in plan.grid_output_steps:
                 emit_reduction_step(step)
             for output_id, slot, klass in grid_slots:
+                grid_width, grid_kind = _memory_ops(output_id)
                 builder.local_get(output_params[slot])
                 push_class_index(klass)
-                builder.i32_const(element_bytes)
+                builder.i32_const(grid_width)
                 builder.raw(0x6C)  # i32.mul
                 builder.raw(0x6A)  # i32.add
                 builder.local_get(locals_for[output_id])
-                builder.store()
+                _convert_from_working(grid_kind)
+                _typed_store(grid_width, grid_kind)
             builder.local_get(k_local)
             builder.i32_const(1)
             builder.raw(0x6A)  # i32.add
@@ -1415,9 +1561,11 @@ def _assemble(
         for slot, output_id in enumerate(output_ids):
             if plan.value_class.get(output_id) in ("grid", "kaxis"):
                 continue  # written by the grid K-walk above
-            direct_element_address(output_params[slot])
+            out_width, out_kind = _memory_ops(output_id)
+            direct_element_address(output_params[slot], out_width)
             builder.local_get(locals_for[output_id])
-            builder.store()
+            _convert_from_working(out_kind)
+            _typed_store(out_width, out_kind)
         builder.local_get(index_local)
         builder.i32_const(1)
         builder.raw(0x6A)  # i32.add
@@ -1476,9 +1624,11 @@ def _assemble(
     evaluate_steps(live)
 
     for slot, output_id in enumerate(output_ids):
-        direct_element_address(output_params[slot])
+        out_width, out_kind = _memory_ops(output_id)
+        direct_element_address(output_params[slot], out_width)
         builder.local_get(locals_for[output_id])
-        builder.store()
+        _convert_from_working(out_kind)
+        _typed_store(out_width, out_kind)
 
     builder.local_get(index_local)
     builder.i32_const(1)
@@ -1796,10 +1946,34 @@ def _describe(
     shared_memory_import: Mapping[str, str] | None = None,
     input_names: Sequence[str] | None = None,
     output_names: Sequence[str] | None = None,
+    parameter_dtypes: Mapping[int, str] | None = None,
 ):
-    """The same calling-contract descriptor the Fortran path emits."""
+    """The same calling-contract descriptor the Fortran path emits.
 
-    from .compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter
+    Every value here is still stored and computed as ``value_type`` -- this
+    module's arithmetic is one uniform elementwise numeric type, and that is
+    unchanged. ``parameter_dtypes`` (keyed by feed/output value id, from the
+    same ``FusedProgram.meta`` the code generator already reads) only
+    corrects the *label* a caller sees for a parameter that logically holds
+    something else -- a byte buffer, a small integer counter -- so a reader
+    interprets the bytes it gets back correctly instead of assuming every
+    parameter is the module's numeric working type. A value that does not
+    survive its real dtype through this uniform-arithmetic path (anything
+    needing exact precision ``value_type`` cannot represent, such as a full
+    64-bit integer through float64 arithmetic) is not fixed by this label;
+    that is a real backend limitation, not a caller-facing one.
+    """
+
+    from .compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter, _C_TYPES
+
+    dtypes = {
+        int(key): str(value)
+        for key, value in (parameter_dtypes or {}).items()
+        if str(value) in _C_TYPES
+    }
+
+    def dtype_for(value_id: int) -> str:
+        return dtypes.get(int(value_id), value_type)
 
     parameters = [
         Parameter(
@@ -1812,12 +1986,12 @@ def _describe(
         )
     ]
     labels = list(input_names or [f"feed{i}" for i in range(len(feed_ids))])
-    for index, _ in enumerate(feed_ids):
+    for index, feed_id in enumerate(feed_ids):
         parameters.append(
             Parameter(
                 name=labels[index],
                 role="input",
-                dtype=value_type,
+                dtype=dtype_for(feed_id),
                 c_type="int32_t",
                 ctypes_name="c_int32",
                 # A WebAssembly parameter is always by value; what it holds
@@ -1827,7 +2001,7 @@ def _describe(
                 extent="count",
             )
         )
-    for index, _ in enumerate(output_ids):
+    for index, output_id in enumerate(output_ids):
         # A program that named its outputs gets to keep those names: the
         # caller reads them, and "red" carries information "out0" does not.
         parameters.append(
@@ -1835,7 +2009,7 @@ def _describe(
                 name=(output_names[index] if output_names and index < len(output_names)
                       else f"out{index}"),
                 role="output",
-                dtype=value_type,
+                dtype=dtype_for(output_id),
                 c_type="int32_t",
                 ctypes_name="c_int32",
                 passing="value",

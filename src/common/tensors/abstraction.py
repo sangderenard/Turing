@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque, NamedTuple, Iterable, TYPE_CHECKING
 import math
 import inspect
+import itertools
 from functools import wraps
 import time
 from collections import deque
@@ -218,11 +219,36 @@ def _register_all_conversions():
     PyTorchTensorOperations = BACKEND_REGISTRY.get("torch")
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
+_IDENTITY_COUNTER = itertools.count()
+
+
+def tensor_identity(value: Any) -> int:
+    """Return a stable identity token for ``value``.
+
+    ``id(value)`` is a memory address: once an object is freed, CPython is
+    free to hand that same address to a later, unrelated object. Any code
+    that uses ``id()`` as a durable cross-reference key (tape node keys,
+    ProcessGraph primitive-capture correlation, ...) can then silently
+    conflate two different values that happened not to be alive at the same
+    time. For an :class:`AbstractTensor`, a monotonic counter value is
+    assigned once, lazily, and cached on the instance itself -- so the token
+    lives exactly as long as the object and is never reused. Non-tensor
+    values fall back to ``id()`` since there is nowhere to cache a token.
+    """
+    if isinstance(value, AbstractTensor):
+        token = value.__dict__.get("_identity_token")
+        if token is None:
+            token = next(_IDENTITY_COUNTER)
+            value.__dict__["_identity_token"] = token
+        return token
+    return id(value)
+
+
 class AbstractTensor:
     _preferred_backend: str | None = None
     _preferred_device: Any = None
     inf: float = float('inf')
-    ninf: float = float('-inf')  
+    ninf: float = float('-inf')
     nan: float = float('nan')
 
     @staticmethod
@@ -3311,8 +3337,8 @@ def _wrap_with_autograd(name: str, func: Callable) -> Callable:
         # canonical node with normalized parameters. Do not overwrite that
         # node with the parameterless compatibility wrapper record.
         tape = getattr(result, "_tape", None)
-        existing = getattr(tape, "_nodes", {}).get(id(result))
-        previous = previous_nodes.get(id(tape), {}).get(id(result))
+        existing = getattr(tape, "_nodes", {}).get(tensor_identity(result))
+        previous = previous_nodes.get(id(tape), {}).get(tensor_identity(result))
         if (
             existing is not None
             and existing is not previous

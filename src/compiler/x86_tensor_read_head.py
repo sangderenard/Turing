@@ -473,27 +473,36 @@ class X86ReadHeadState:
         lanes = int(batch.octets.shape[0])
         zero = AbstractTensor.zeros((lanes,), dtype="int64", cls=type(batch.octets))
         negative = zero - 1
+        # Every field below starts at the same numeric value (0 or -1), but
+        # each is an independent state slot that later diverges under its
+        # own _select(...) updates.  Handing multiple fields a reference to
+        # the *same* tensor object -- rather than each its own tensor
+        # holding that value -- makes them indistinguishable primitives to
+        # anything that tracks value identity (the AOT discovery capture in
+        # particular), which then can't tell "two fields that start equal"
+        # from "one field read twice".  Cloning gives each field its own
+        # object without changing what value it starts at.
         return cls(
-            cursor=zero,
-            instruction_start=zero,
+            cursor=zero.clone(),
+            instruction_start=zero.clone(),
             phase=zero + int(ReadPhase.PREFIX),
             status=zero + int(ReadStatus.ACTIVE),
             failure=zero + int(ReadFailure.NONE),
-            token=negative,
-            opcode_map=zero,
-            opcode=negative,
-            rex=zero,
-            rex_present=zero,
-            legacy_prefixes=zero,
-            modrm=negative,
-            sib=negative,
-            displacement=zero,
-            immediate=zero,
-            relative_target=zero,
-            field_accumulator=zero,
+            token=negative.clone(),
+            opcode_map=zero.clone(),
+            opcode=negative.clone(),
+            rex=zero.clone(),
+            rex_present=zero.clone(),
+            legacy_prefixes=zero.clone(),
+            modrm=negative.clone(),
+            sib=negative.clone(),
+            displacement=zero.clone(),
+            immediate=zero.clone(),
+            relative_target=zero.clone(),
+            field_accumulator=zero.clone(),
             field_multiplier=zero + 1,
-            field_remaining=zero,
-            field_width=zero,
+            field_remaining=zero.clone(),
+            field_width=zero.clone(),
         )
 
 

@@ -66,7 +66,7 @@ from .process_graph_fusion import (
 )
 from .shell_reference_tables import build_shell_reference_tables
 from ..transmogrifier.function_table import FunctionReference
-from ..common.tensors.abstraction import AbstractTensor
+from ..common.tensors.abstraction import AbstractTensor, tensor_identity
 from ..common.tensors.accelerator_backends.glsl_fused_network import (
     GLSLFusedProgramNetwork,
 )
@@ -167,7 +167,7 @@ def _observe_process_graph_node(
     if context is None:
         return result
     tape = context["tape"]
-    capture_id = id(result)
+    capture_id = tensor_identity(result)
     aliased_parents = tuple(
         int(parent_id)
         for parent_id, parent_value in zip(parent_ids, parent_values)
@@ -290,7 +290,7 @@ def _observe_process_graph_node(
             for graph_id, parent_value in zip(
                 parent_ids, parent_values
             ):
-                primitive_id = id(parent_value)
+                primitive_id = tensor_identity(parent_value)
                 if primitive_id not in primitive_ids:
                     continue
                 exact.append((int(primitive_id), int(graph_id)))
@@ -7401,6 +7401,48 @@ def _coordinate_scheduled_capture_impl(
             )
         return value
 
+    def _resolve_reference_node(expression: ast.expr) -> int | None:
+        """Find the live graph node a reference-typed expression resolves to.
+
+        A bound-method call's receiver (``machine``, ``machine.runner``, ...)
+        is a reference value, not a tensor -- it has no numeric identity to
+        fall back on. The existing, narrower check this replaces
+        (``id(expression) in graph.G``) asks only "does this exact AST node
+        still happen to be a node in the graph", which silently fails
+        whenever an earlier reduction pass legitimately rebuilt or pruned
+        that specific node while the value it represents is still perfectly
+        live under its name. ``identity_table`` already tracks every SSA
+        version of every name for exactly this reason (it is the same
+        mechanism ``live_function_module_binding`` above uses); grounding
+        receiver resolution in it instead of a raw ``id()`` presence check
+        means a receiver resolves by what it *is*, not by whether one
+        specific AST node object happened to survive unchanged.
+        """
+
+        if isinstance(expression, ast.Name):
+            candidates = graph.G.graph.get("identity_table", {}).get(
+                expression.id, ()
+            )
+            for candidate in reversed(candidates):
+                if int(candidate) in graph.G:
+                    return int(candidate)
+            return None
+        if isinstance(expression, ast.Attribute):
+            if id(expression) in graph.G:
+                return id(expression)
+            base_node = _resolve_reference_node(expression.value)
+            if base_node is None:
+                return None
+            for successor in graph.G.successors(base_node):
+                successor_expr = graph.G.nodes[successor].get("expr_obj")
+                if (
+                    isinstance(successor_expr, ast.Attribute)
+                    and successor_expr.attr == expression.attr
+                ):
+                    return successor
+            return None
+        return None
+
     def evaluate_node(node_id: int) -> Any:
         if node_id in values:
             cached_data = graph.G.nodes[node_id]
@@ -8521,9 +8563,10 @@ def _coordinate_scheduled_capture_impl(
                         if (
                             receiver_parent is None
                             and isinstance(expression.func, ast.Attribute)
-                            and id(expression.func.value) in graph.G
                         ):
-                            receiver_parent = id(expression.func.value)
+                            receiver_parent = _resolve_reference_node(
+                                expression.func.value
+                            )
                         if receiver_parent is not None:
                             receiver_value = evaluate_node(receiver_parent)
                         elif args:

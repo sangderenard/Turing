@@ -1522,7 +1522,18 @@ def _static_iterable_expression(
         if isinstance(node, ast.Name) and node.id in specializations:
             return specializations[node.id]
         if isinstance(node, ast.Attribute) and not node.attr.startswith("_"):
-            return getattr(resolve(node.value), node.attr)
+            base = resolve(node.value)
+            try:
+                return getattr(base, node.attr)
+            except AttributeError as error:
+                # A statically-resolved base can be a real None (the base
+                # expression's own constant-propagated value at this point
+                # in the traced code, not a compiler artifact) -- that is
+                # exactly "not a compiler-known iterable literal" here, not
+                # a crash. Re-raising as ValueError keeps this function's
+                # own contract: every non-resolvable expression fails the
+                # same way, regardless of which branch decided it couldn't.
+                raise ValueError(str(error)) from error
         if isinstance(node, (ast.Tuple, ast.List)):
             values = [resolve(item) for item in node.elts]
             return tuple(values) if isinstance(node, ast.Tuple) else values

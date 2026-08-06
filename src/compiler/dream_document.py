@@ -60,6 +60,10 @@ DREAM_LANGUAGE_TRANSLATIONS: Mapping[str, DreamLanguageTranslation] = (
         "wgsl": DreamLanguageTranslation(
             "source", "DREAM_SOURCE_LANGUAGE_TRANSLATIONS", "shader-device", True,
         ),
+        "cpp": DreamLanguageTranslation(
+            "cpp-shell", "cpp_shell_desugar.desugar_cpp_shell",
+            "process-graph-aot", False,
+        ),
     })
 )
 
@@ -526,6 +530,20 @@ class DreamDocument:
                     block.payload, identity=block.identity,
                 )
                 mapping = _process_graph_mapping(graph, route="javascript-ast")
+            elif translation.route == "cpp-shell":
+                from pycparser import c_parser
+
+                from .cpp_shell_desugar import desugar_cpp_shell
+                from ..transmogrifier.graph.oop_language_translations import (
+                    install_c_role_schemas,
+                )
+
+                desugared = desugar_cpp_shell(block.payload)
+                tree = c_parser.CParser().parse(desugared)
+                graph = ProcessGraph(materialize_memory=False)
+                install_c_role_schemas(graph)
+                graph.build_graph(tree)
+                mapping = _process_graph_mapping(graph, route="cpp-shell")
             else:
                 mapping = _source_section_graph(block)
             if not translation.executable:

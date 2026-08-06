@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.common.tensors.abstraction import AbstractTensor
+from src.common.tensors.abstraction import AbstractTensor, tensor_identity
 from src.common.tensors.autograd import GradTape, autograd
 
 
@@ -13,7 +13,7 @@ def test_forward_capture_honors_an_explicit_empty_tape():
         with AbstractTensor.use_backend("numpy"):
             result = AbstractTensor.tensor([1.0]) + 1.0
 
-    assert id(result) in tape._nodes
+    assert tensor_identity(result) in tape._nodes
 
 
 def test_forward_capture_records_nondifferentiable_primitives():

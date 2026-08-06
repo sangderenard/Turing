@@ -143,10 +143,17 @@ OP_I32_OR = 0x72
 OP_I32_XOR = 0x73
 OP_I32_LOAD = 0x28
 OP_I64_LOAD = 0x29
+OP_I32_LOAD8_S = 0x2C
+OP_I32_LOAD8_U = 0x2D
+OP_I32_LOAD16_S = 0x2E
+OP_I32_LOAD16_U = 0x2F
 OP_I64_LOAD8_U = 0x31
 OP_I64_LOAD16_U = 0x33
 OP_I64_LOAD32_U = 0x35
+OP_I32_STORE = 0x36
 OP_I64_STORE = 0x37
+OP_I32_STORE8 = 0x3A
+OP_I32_STORE16 = 0x3B
 OP_I64_STORE8 = 0x3C
 OP_I64_STORE16 = 0x3D
 OP_I64_STORE32 = 0x3E
@@ -166,8 +173,12 @@ OP_I64_POPCNT = 0x7B
 OP_I64_EXTEND_I32_U = 0xAD
 OP_I32_GE_S = 0x4E
 OP_I32_TRUNC_F64_S = 0xAA
+OP_I64_TRUNC_F32_S = 0xAE
+OP_I64_TRUNC_F64_S = 0xB0
 OP_F64_CONVERT_I32_S = 0xB7
+OP_F64_CONVERT_I64_S = 0xB9
 OP_F32_CONVERT_I32_S = 0xB2
+OP_F32_CONVERT_I64_S = 0xB4
 OP_I32_TRUNC_F32_S = 0xA8
 EMPTY_BLOCK = 0x40
 
@@ -291,6 +302,20 @@ class CodeBuilder:
         opcode, alignment = {
             8: (OP_I64_LOAD8_U, 0), 16: (OP_I64_LOAD16_U, 1),
             32: (OP_I64_LOAD32_U, 2), 64: (OP_I64_LOAD, 3),
+        }[int(width)]
+        self.code += bytes([opcode]) + uleb(alignment) + uleb(offset)
+        return self
+
+    def i32_load_width(self, width: int, *, offset: int = 0) -> "CodeBuilder":
+        opcode, alignment = {
+            8: (OP_I32_LOAD8_U, 0), 32: (OP_I32_LOAD, 2),
+        }[int(width)]
+        self.code += bytes([opcode]) + uleb(alignment) + uleb(offset)
+        return self
+
+    def i32_store_width(self, width: int, *, offset: int = 0) -> "CodeBuilder":
+        opcode, alignment = {
+            8: (OP_I32_STORE8, 0), 32: (OP_I32_STORE, 2),
         }[int(width)]
         self.code += bytes([opcode]) + uleb(alignment) + uleb(offset)
         return self
