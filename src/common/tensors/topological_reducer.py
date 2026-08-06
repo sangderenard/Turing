@@ -381,12 +381,169 @@ def _c_constant_value(expression: Any) -> Any:
     return raw
 
 
+# The type given to a node standing in for something ingestion could not
+# translate. Mangled data is mangled data: it needs a real, named, *non*
+# operation rather than either a silent hole or a hard stop.
+#
+# This type name MUST NEVER be added to any operator table -- not
+# ``operator_defs.operator_signatures``' executable entries, not
+# ``graph_deep_compiler``'s ``op_table``, not ``ssa_webgpu_backend``'s
+# ``_BINARY``/``_UNARY``, not ``fused_ir``'s ``ELEMENTWISE_*``. Its safety is
+# structural, not a matter of anyone remembering to check: because no table
+# maps it, every backend that meets it already reports it through that
+# backend's own existing "no instruction for this" path. Nothing can quietly
+# treat it as zero, which is the one line this repository does not cross --
+# never silently produce a plausible wrong number.
+#
+# It is deliberately *one* generic type carrying free-text provenance, not a
+# taxonomy of failure kinds. A closed enum of defect categories would need a
+# central owner to admit every new construct a contributor or agent adds --
+# exactly the bottleneck ``role_schemas``,
+# ``_RUNNABLE_DEFINITION_NAME_EXTRACTORS`` and the ssa_registry spelling
+# tables exist to remove. ``operator_signatures`` falls back to 'Default'
+# for an unrecognized type, so a graph carrying these still finalizes and
+# stays walkable; the translation simply reports how far it got.
+UNTRANSLATED_NODE_TYPE = "Untranslated"
+
+
+# How completely the affected construct survived translation. This is an
+# ordered *scale*, not a taxonomy -- which is why it is a closed set where
+# ``reason`` is deliberately free text. A scale has rungs that mean
+# something relative to each other and can be compared and sorted; a
+# taxonomy of failure kinds would need a central owner to admit every new
+# construct a contributor or agent introduces, which is the bottleneck this
+# module keeps removing. Add a rung only if it is genuinely between or
+# beyond these, never to describe a new *kind* of failure.
+#
+# Nothing here is binary. A translation is not "worked" or "failed": it
+# reached some depth and stopped, and how far it reached is the useful
+# fact. ``complete`` on the backend artifacts is the cheapest summary of
+# this scale, not a replacement for it.
+TRANSLATION_ABSENT = "absent"      # nothing of the construct translated
+TRANSLATION_PARTIAL = "partial"    # some constituents translated, some not
+TRANSLATION_DEGRADED = "degraded"  # fully translated, reduced fidelity
+TRANSLATION_UNKNOWN = "unknown"    # not determinable at this pass
+
+TRANSLATION_GRADES = (
+    TRANSLATION_ABSENT,
+    TRANSLATION_PARTIAL,
+    TRANSLATION_DEGRADED,
+    TRANSLATION_UNKNOWN,
+)
+
+
+@dataclass(frozen=True)
+class GraphTranslationShortfall:
+    """One construct graph ingestion could not fully translate.
+
+    Same contract the backend shortfall records already use
+    (``WasmShortfall``, ``WGSLShortfall``): structured fields for the parts
+    worth querying across many programs, and one free-text ``reason`` so
+    reporting something new never requires extending a type. Recorded on
+    ``graph.G.graph["translation_shortfalls"]``, alongside the existing
+    ``state_machine_control_shortfalls``.
+
+    ``grade`` carries how far the translation got, and ``observed``/
+    ``expected`` the countable evidence behind that grade (operands
+    resolved out of operands required, say). A reader deciding whether a
+    specimen is solid enough to reason about needs the degree, not just the
+    fact -- and a caller aggregating across many programs needs the counts,
+    not a prose summary of them.
+    """
+
+    pass_name: str
+    node_id: int
+    operation: str
+    role: str
+    source_span: str
+    reason: str
+    grade: str = TRANSLATION_UNKNOWN
+    observed: int = 0
+    expected: int = 0
+
+    @property
+    def coverage(self) -> float | None:
+        """Fraction of the construct that translated, when countable."""
+
+        if self.expected <= 0:
+            return None
+        return self.observed / self.expected
+
+    def format(self) -> str:
+        where = f" at {self.source_span}" if self.source_span else ""
+        role = f" ({self.role})" if self.role else ""
+        ratio = (
+            f" [{self.observed}/{self.expected}]" if self.expected else ""
+        )
+        return (
+            f"{self.pass_name}: {self.operation}{role}{where} "
+            f"<{self.grade}{ratio}>: {self.reason}"
+        )
+
+
+def _source_span(expression: Any) -> str:
+    line = getattr(expression, "lineno", None)
+    if line is None:
+        return ""
+    column = getattr(expression, "col_offset", None)
+    return f"line {line}" + (f":{column}" if column is not None else "")
+
+
+def record_translation_shortfall(
+    graph: Any,
+    *,
+    pass_name: str,
+    node_id: int,
+    operation: str,
+    reason: str,
+    role: str = "",
+    source_span: str = "",
+    grade: str = TRANSLATION_UNKNOWN,
+    observed: int = 0,
+    expected: int = 0,
+) -> None:
+    """Accumulate one graph-level shortfall instead of raising.
+
+    Ingestion reports the way the backends already do -- a partial
+    translation is a real, inspectable result, not a failure. Raising here
+    would surface exactly one defect per run of a multi-minute build, when
+    the same run could have named every one of them.
+    """
+
+    existing = graph.G.graph.get("translation_shortfalls") or ()
+    graph.G.graph["translation_shortfalls"] = (
+        *existing,
+        GraphTranslationShortfall(
+            pass_name=str(pass_name),
+            node_id=int(node_id),
+            operation=str(operation),
+            role=str(role),
+            source_span=str(source_span),
+            reason=str(reason),
+            grade=str(grade),
+            observed=int(observed),
+            expected=int(expected),
+        ),
+    )
+
+
 def _replace_inputs(
     graph: Any,
     node_id: int,
     inputs: tuple[tuple[int, str], ...],
 ) -> None:
-    """Replace one wrapper's incoming topology with executable operands."""
+    """Replace one wrapper's incoming topology with executable operands.
+
+    An operand that is not in the graph is replaced by an explicit
+    ``UNTRANSLATED_NODE_TYPE`` node rather than passed to ``add_edge``.
+    NetworkX *creates* an absent endpoint rather than raising, which turned
+    a missing operand into a node with no ``type``, no ``expr_obj`` and no
+    ``label`` -- invisible here and fatal thousands of nodes later, as a
+    bare ``KeyError('type')`` naming nothing. The placeholder keeps the
+    consuming operation's arity intact (an operation silently short an
+    operand is a *wrong* program, not a smaller one) while making it
+    honestly inexecutable.
+    """
 
     for predecessor in tuple(graph.G.predecessors(node_id)):
         graph.G.remove_edge(predecessor, node_id)
@@ -397,12 +554,99 @@ def _replace_inputs(
             )
             if child_id != node_id
         ]
-    graph.G.nodes[node_id]["parents"] = list(inputs)
+    consumer = graph.G.nodes[node_id] if node_id in graph.G else {}
+    expected = len(inputs)
+    present = sum(1 for operand, _role in inputs if operand in graph.G)
+    # The grade describes the *construct*, not the individual operand: an
+    # operation with one of two operands resolved is partially translated,
+    # even though each absent operand is individually absent.
+    grade = TRANSLATION_ABSENT if present == 0 else TRANSLATION_PARTIAL
+    resolved: list[tuple[int, str]] = []
     for predecessor, role in inputs:
+        if predecessor not in graph.G:
+            predecessor = _untranslated_operand(
+                graph,
+                consumer_id=node_id,
+                consumer=consumer,
+                role=role,
+                absent_id=predecessor,
+                grade=grade,
+                observed=present,
+                expected=expected,
+            )
+        resolved.append((predecessor, role))
+    graph.G.nodes[node_id]["parents"] = list(resolved)
+    for predecessor, role in resolved:
         graph.G.add_edge(predecessor, node_id, role=role)
         children = graph.G.nodes[predecessor].setdefault("children", [])
         if node_id not in {child_id for child_id, _role in children}:
             children.append((node_id, role))
+
+
+def _untranslated_operand(
+    graph: Any,
+    *,
+    consumer_id: int,
+    consumer: Any,
+    role: str,
+    absent_id: int,
+    grade: str = TRANSLATION_UNKNOWN,
+    observed: int = 0,
+    expected: int = 0,
+) -> int:
+    """Materialize one explicit stand-in for an operand that never arrived."""
+
+    expression = consumer.get("expr_obj") if hasattr(consumer, "get") else None
+    operation = str(consumer.get("type") or type(expression).__name__)
+    span = _source_span(expression)
+    label = f"untranslated[{operation}.{role}]"
+    placeholder_id = id(label)
+    while placeholder_id in graph.G:
+        # ``id`` of a fresh string is unique among live objects, but this
+        # label is not retained, so a later identical label could reuse the
+        # address. Step off any collision rather than silently aliasing two
+        # unrelated stand-ins onto one node.
+        placeholder_id += 1
+    graph.G.add_node(
+        placeholder_id,
+        label=label,
+        type=UNTRANSLATED_NODE_TYPE,
+        op=UNTRANSLATED_NODE_TYPE.lower(),
+        expr_obj=None,
+        extra_args={},
+        domain_node=None,
+        store_id=None,
+        parents=[],
+        children=[],
+        attributes={
+            "untranslated": True,
+            "consumer_node": int(consumer_id),
+            "consumer_operation": operation,
+            "operand_role": str(role),
+            "absent_node_id": int(absent_id),
+            "source_span": span,
+            "translation_grade": str(grade),
+            "translated_operands": int(observed),
+            "expected_operands": int(expected),
+        },
+    )
+    record_translation_shortfall(
+        graph,
+        pass_name="process-graph-operands",
+        node_id=consumer_id,
+        operation=operation,
+        role=role,
+        source_span=span,
+        grade=grade,
+        observed=observed,
+        expected=expected,
+        reason=(
+            "operand was never ingested as a graph node; a non-operation "
+            "stands in its place so the translation reports rather than "
+            "computes"
+        ),
+    )
+    return placeholder_id
 
 
 def _remove_node(graph: Any, node_id: int) -> None:
@@ -2790,22 +3034,17 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             data["type"] = operation
             data["op"] = operation
             data.setdefault("attributes", {})["source_type"] = "BinaryOp"
-            # Only wire operands that are really present. An operand node may
-            # legitimately have been removed already (a collapsed `&x`, a
-            # stripped type node), and networkx's add_edge silently *creates*
-            # an unknown endpoint rather than raising -- which would leave a
-            # metadata-less phantom node that only surfaces much later, as a
-            # bare KeyError('type') inside scheduling.
+            # Absent operands are handled uniformly by _replace_inputs, which
+            # substitutes an explicit non-operation and records a shortfall.
+            # Filtering them out here instead would drop the operand
+            # silently, leaving an operation short an argument -- a wrong
+            # program rather than an honestly incomplete one.
             _replace_inputs(
                 graph,
                 node_id,
-                tuple(
-                    (operand_id, role)
-                    for operand_id, role in (
-                        (id(expression.left), "lhs"),
-                        (id(expression.right), "rhs"),
-                    )
-                    if operand_id in graph.G
+                (
+                    (id(expression.left), "lhs"),
+                    (id(expression.right), "rhs"),
                 ),
             )
             continue
@@ -2835,11 +3074,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             _replace_inputs(
                 graph,
                 node_id,
-                tuple(
-                    (operand_id, "operand")
-                    for operand_id in (id(expression.expr),)
-                    if operand_id in graph.G
-                ),
+                ((id(expression.expr), "operand"),),
             )
             continue
         if isinstance(expression, (ast.Nonlocal, ast.Global)):
