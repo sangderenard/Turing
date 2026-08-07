@@ -2346,6 +2346,20 @@ def _normalize_lexical_values(
                     }
                     if len(values) == 1:
                         environment[name] = values.pop()
+                    elif id(body_statement) in graph.G:
+                        # The branches genuinely disagree (a body assignment
+                        # vs. a handler's fallback) -- exactly the case
+                        # ``ast.If`` resolves with a ``Phi``.  A Try node has
+                        # no single test expression to point a Phi at, but it
+                        # doesn't need one: this Try's own graph node already
+                        # evaluates to "whichever arm actually ran" (see
+                        # ``evaluate_node``'s ``ast.Try`` handling, which
+                        # re-runs body/handlers and keeps the last value) --
+                        # so binding the name straight to the Try node's own
+                        # id gives every later reference the same on-demand
+                        # resolution a Phi would, without inventing a second
+                        # node or a synthetic "did-raise" boolean.
+                        environment[name] = id(body_statement)
             for nested in body_statement.orelse:
                 reduce_statement(nested)
             for nested in body_statement.finalbody:

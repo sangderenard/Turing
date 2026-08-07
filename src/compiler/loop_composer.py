@@ -2420,9 +2420,17 @@ def analyze_shader_loop_reductions(
             (graph.G.graph.get("recursion_table") or {}).items()
         )
     )
+    # ``ast.Try`` is deliberately absent here.  A Try node is ordinary,
+    # already-evaluable dataflow -- ``topological_reducer.py``'s ``ast.Try``
+    # reduction resolves a name whose branches disagree straight to the
+    # Try node's own id (mirroring how an ``ast.If``'s differing branches
+    # become a ``Phi``), and ``evaluate_node``'s own ``ast.Try`` handling
+    # already knows how to run body/handlers and return whichever arm's
+    # value applies.  What remains forbidden is control divergence with no
+    # such resolution: ``raise`` has no continuation value to merge, and
+    # ``with``/``async with``/``await`` have no reduction at all yet.
     forbidden = (
         ast.Raise,
-        ast.Try,
         ast.With,
         ast.AsyncWith,
         ast.Await,

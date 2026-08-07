@@ -39,7 +39,7 @@ def kernel(x):
             assert data["type"] == original_type
 
 
-def test_annotated_assignments_use_one_ingestion_operator_in_classes_and_functions():
+def test_annotated_assignments_use_one_ingestion_operator_in_functions_only():
     graph = ProcessGraph(materialize_memory=False)
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(ast.parse(
@@ -53,16 +53,25 @@ class Example:
 """
         ))
 
-    assert not any(
-        isinstance(data.get("expr_obj"), ast.AnnAssign)
+    # A class body's own ``AnnAssign`` is its field schema -- the class-table
+    # builder (topological_reducer.py's ``class_field_defaults``/``fields``)
+    # reads it directly off the untouched ``ClassDef`` AST, so it must
+    # survive ingestion unnormalized.  Only a method body's local-variable
+    # annotation is executable code, and that one is normalized to ``Assign``
+    # the same way it always was.
+    class_body_ann_assigns = [
+        data
         for _node_id, data in graph.G.nodes(data=True)
-    )
+        if isinstance(data.get("expr_obj"), ast.AnnAssign)
+    ]
+    assert len(class_body_ann_assigns) == 1
+
     assignments = [
         data
         for _node_id, data in graph.G.nodes(data=True)
         if isinstance(data.get("expr_obj"), ast.Assign)
     ]
-    assert len(assignments) == 2
+    assert len(assignments) == 1
 
     reduce_abstract_tensor_topology(graph)
 
