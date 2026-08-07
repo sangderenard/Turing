@@ -22,5 +22,5 @@ build_program_bundle(
     source_filename="machine_fork_exploration.py",
     entrypoint="explore_forking_paths",
     python_package="src.compiler",
-    probes={"forest": forest, "root_head_id": 0},
+    probes={"forest": forest, "root_head_id": {"literal": 0}},
 )

@@ -546,7 +546,25 @@ def _map_ir_from_ast(tree):
 
 
 class _RuntimeAnnAssignNormalizer(ast.NodeTransformer):
-    """Translate annotation syntax to the ordinary assignment operator."""
+    """Translate annotation syntax to the ordinary assignment operator.
+
+    Only inside executable bodies. A class body's own ``AnnAssign`` is its
+    field schema -- name, type, default -- which the class-table builder
+    reads directly off the untouched ``ClassDef`` AST later. Recursing into
+    it here would silently erase every locally-defined dataclass's field
+    list (``fields``/``field_defaults``) before anything ever reads it, so
+    ``visit_ClassDef`` normalizes each method body without touching the
+    class's own direct-child statements.
+    """
+
+    def visit_ClassDef(self, node):
+        node.body = [
+            self.visit(member)
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            else member
+            for member in node.body
+        ]
+        return node
 
     def visit_AnnAssign(self, node):
         node = self.generic_visit(node)
@@ -1683,6 +1701,24 @@ class ProcessGraph:
             data["attributes"] = special.attributes
             data["extra_args"] = special.attributes
             data["constant"] = special.constant
+            if special.type == "GetAttr" and isinstance(node, ast.Attribute):
+                # The GetAttr shortcut classifies this node without walking
+                # the normal schema-descent below -- but the receiver
+                # (``node.value``) is still this node's real operand.  A
+                # bare-Name receiver was tolerated without this (resolved on
+                # demand elsewhere, by lexical lookup), but a compound
+                # receiver -- another attribute access, a call, ... -- has
+                # no such fallback: skipping this recursion left it with no
+                # graph node at all, so nothing downstream could ever wire
+                # its own receiver to it.
+                self.build_graph(
+                    node.value,
+                    consumer_id=nid,
+                    producer_role="output",
+                    consumer_role="value",
+                    store_id=store_id,
+                    progress=progress,
+                )
             if producer_id is not None:
                 self.connect(producer_id, nid, producer_role, consumer_role, store_id)
             if consumer_id is not None:

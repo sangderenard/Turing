@@ -1099,6 +1099,55 @@ def _entrypoint_parameters(source: str, entrypoint: str) -> tuple[str, ...]:
     )
 
 
+_ABSTRACT_TENSOR_RANDOM_METHODS = frozenset(
+    {
+        "random", "randint", "uniform", "choice", "shuffle", "sample",
+        "gauss", "standard_normal",
+    }
+)
+
+_RANDOM_SOURCE_IMPORT_NAME = "_AbstractTensor_random_source"
+
+
+def _stdlib_random_module_aliases(module: ast.Module) -> frozenset[str]:
+    """Local names this module binds to the stdlib ``random`` module.
+
+    Only reads this module's own top-level ``import`` statements -- never
+    follows an alias into whatever it points at -- so there is nothing to
+    recurse through even if some other name in the file happens to shadow
+    or re-import ``random`` again.
+    """
+
+    aliases: set[str] = set()
+    for node in module.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "random":
+                    aliases.add(alias.asname or alias.name)
+    return frozenset(aliases)
+
+
+def _stdlib_random_attribute(
+    expression: ast.expr | None, random_aliases: frozenset[str]
+) -> str | None:
+    """``attr`` if ``expression`` is literally ``<random alias>.attr``.
+
+    A single fixed-depth structural check -- no execution, no walking into
+    what the name might transitively resolve to -- so it always terminates;
+    that is the whole "recursion check" this needs, since the shape it is
+    matching (``random.random``, ``random.uniform``, ...) is never more
+    than one attribute access deep in real source.
+    """
+
+    if (
+        isinstance(expression, ast.Attribute)
+        and isinstance(expression.value, ast.Name)
+        and expression.value.id in random_aliases
+    ):
+        return expression.attr
+    return None
+
+
 def _synthesize_state_defaults(
     source: str, entrypoint: str, unconfigured: Iterable[str],
 ) -> tuple[str, frozenset[str]]:
@@ -1117,6 +1166,18 @@ def _synthesize_state_defaults(
     compiler; ``ast.unparse`` only prints a tree. A type with no
     zero-argument constructor is a real, honestly reportable fact once the
     compiler traces the call -- not something this guesses a workaround for.
+
+    One shape is special-cased ahead of the blind ``T()`` rule: a parameter
+    whose own real default is a stdlib ``random.<name>`` reference (for
+    example ``random_source: Callable[[], float] = random.random``) is not
+    a constructible type at all -- ``Callable[[], float]()`` is not valid
+    Python. Obtaining a random value is never an arbitrary synthesizable
+    value either: it has to stay a real, tracked operation rather than a
+    number frozen from whichever draw discovery happened to observe. So
+    this redirects the guard to ``AbstractTensor``'s own random generator
+    (a complete, deterministic Xoroshiro128** PRNG -- see
+    ``abstraction_methods/random.py``) instead of leaving the stdlib
+    reference in place or trying to construct the annotation.
     """
 
     module = ast.parse(source)
@@ -1131,8 +1192,30 @@ def _synthesize_state_defaults(
         return source, frozenset()
 
     wanted = set(unconfigured)
+
+    positional = [*function.args.posonlyargs, *function.args.args]
+    positional_defaults = function.args.defaults
+    default_offset = len(positional) - len(positional_defaults)
+    default_map: dict[str, ast.expr] = {
+        arg.arg: positional_defaults[index - default_offset]
+        for index, arg in enumerate(positional)
+        if index >= default_offset
+    }
+    default_map.update(
+        {
+            arg.arg: default
+            for arg, default in zip(
+                function.args.kwonlyargs, function.args.kw_defaults
+            )
+            if default is not None
+        }
+    )
+
+    random_aliases = _stdlib_random_module_aliases(module)
+
     rewritten: set[str] = set()
     guards: list[ast.stmt] = []
+    needs_random_import = False
     for argument in (
         *function.args.posonlyargs,
         *function.args.args,
@@ -1140,6 +1223,19 @@ def _synthesize_state_defaults(
     ):
         if argument.arg not in wanted or argument.annotation is None:
             continue
+
+        attribute = _stdlib_random_attribute(
+            default_map.get(argument.arg), random_aliases
+        )
+        if attribute in _ABSTRACT_TENSOR_RANDOM_METHODS:
+            needs_random_import = True
+            guards.append(ast.parse(
+                f"if {argument.arg} is None:\n    {argument.arg} = "
+                f"{_RANDOM_SOURCE_IMPORT_NAME}.random.{attribute}\n",
+            ).body[0])
+            rewritten.add(argument.arg)
+            continue
+
         guards.append(ast.parse(
             f"if {argument.arg} is None:\n    {argument.arg} = "
             f"{ast.unparse(argument.annotation)}()\n",
@@ -1148,6 +1244,29 @@ def _synthesize_state_defaults(
 
     if not rewritten:
         return source, frozenset()
+
+    if needs_random_import:
+        import_statement = ast.parse(
+            "from ..common.tensors.abstraction import "
+            f"AbstractTensor as {_RANDOM_SOURCE_IMPORT_NAME}\n"
+        ).body[0]
+        insert_at = 0
+        for index, statement in enumerate(module.body):
+            if (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Constant)
+                and isinstance(statement.value.value, str)
+            ):
+                insert_at = index + 1
+                continue
+            if (
+                isinstance(statement, ast.ImportFrom)
+                and statement.module == "__future__"
+            ):
+                insert_at = index + 1
+                continue
+            break
+        module.body.insert(insert_at, import_statement)
 
     # Discovery always supplies an explicit feed for every parameter, so the
     # signature does not need a `= None` default; only the body needs the
