@@ -7741,6 +7741,8 @@ def _coordinate_scheduled_capture_impl(
                             f"{type(receiver).__name__}; parent={parent}, "
                             f"parents={parents!r}"
                         ) from exc
+                if node_type == "GetAttr":
+                    shell.reference_operator_sequence.append(int(node_id))
             elif isinstance(expression, ast.Slice):
                 parts = {
                     str(role): evaluate_node(parent)
@@ -9510,6 +9512,7 @@ def _coordinate_scheduled_capture_impl(
                     value,
                 )
                 result = value
+                shell.reference_operator_sequence.append(int(node_id))
             elif node_type == "DelAttr":
                 by_role = {
                     str(role): parent for parent, role in parents
@@ -12115,6 +12118,15 @@ class ProcessGraphGLSLDeployment:
         self.compiled_shell_program = None
         self.compiled_region_indices = ()
         self.captured_region_programs = {}
+        # A reference operator (SetAttr/GetAttr) has an unambiguous identity
+        # from its own graph node id -- no tensor primitive to correlate,
+        # no ambiguity the tape machinery above exists to resolve.  Recorded
+        # here, in exact execution order, as each one runs: not a strategy,
+        # not a region to score for launch profitability, just what happened,
+        # in the order it happened -- the sequential memory operations this
+        # represents have real causality that reordering or fusing would
+        # break.
+        self.reference_operator_sequence = []
         self._capture_invocations = 0
         # Which source parameter each captured input tensor came from, by
         # object identity. Feeds are identified downstream by id(), and
@@ -12585,6 +12597,68 @@ class ProcessGraphGLSLDeployment:
                 target.compiled_region_indices,
                 target.compiled_tapes,
             ))
+            if target.reference_operator_sequence:
+                # Package exactly what happened, in the order it happened --
+                # no fusion, no launch-cost strategy, no tape correlation
+                # (a reference operator's own graph node id is already an
+                # unambiguous identity; nothing dynamic needs resolving).
+                # Reordering or batching these would break the causality of
+                # the sequential memory operations they represent.
+                seen_node_ids: set[int] = set()
+                ordered_node_ids = [
+                    node_id
+                    for node_id in target.reference_operator_sequence
+                    if not (
+                        node_id in seen_node_ids
+                        or seen_node_ids.add(node_id)
+                    )
+                ]
+                reference_steps = [
+                    OpStep(
+                        step_id=index,
+                        op_name=str(
+                            target.process_graph.G.nodes[node_id].get("op")
+                            or target.process_graph.G.nodes[node_id].get(
+                                "type"
+                            )
+                        ),
+                        input_ids=[
+                            int(parent)
+                            for parent, _role in (
+                                target.process_graph.G.nodes[node_id].get(
+                                    "parents"
+                                )
+                                or ()
+                            )
+                        ],
+                        attrs=dict(
+                            target.process_graph.G.nodes[node_id].get(
+                                "attributes"
+                            )
+                            or {}
+                        ),
+                        result_id=int(node_id),
+                    )
+                    for index, node_id in enumerate(ordered_node_ids)
+                ]
+                reference_program = FusedProgram(
+                    version=1,
+                    feeds=set(),
+                    steps=reference_steps,
+                    outputs={},
+                )
+                next_index = (
+                    max(target.compiled_region_indices, default=-1) + 1
+                )
+                target.captured_region_programs[next_index] = (
+                    CapturedFusedProgram(
+                        program=reference_program,
+                        feeds={},
+                    )
+                )
+                target.compiled_region_indices = (
+                    *target.compiled_region_indices, next_index,
+                )
             if target is self and precompile_only:
                 # SSA and other IR consumers stop at the Turing precompile
                 # boundary.  They need the complete numerical manifest,
@@ -14785,6 +14859,9 @@ class ProcessGraphGLSLDeployment:
         "AbstractTensor": AbstractTensor,
         "autograd": autograd,
         "np": np,
+        "OpStep": OpStep,
+        "FusedProgram": FusedProgram,
+        "CapturedFusedProgram": CapturedFusedProgram,
     }
     exec(
         compile(
