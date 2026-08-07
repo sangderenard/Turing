@@ -166,6 +166,29 @@ def _observe_process_graph_node(
     context = _planned_capture_context.get()
     if context is None:
         return result
+    if not isinstance(result, AbstractTensor):
+        # This must be checked before the identity-aliasing logic below:
+        # ``result is parent_value`` is only a meaningful alias signal for a
+        # tensor, where object identity means shared storage.  For a plain
+        # Python value it can be a pure CPython implementation detail --
+        # small integers are interned, so ``0 + 1`` and the literal ``1``
+        # operand satisfy ``is`` by cache coincidence, not because they are
+        # the same computation.  Treating that as an alias would silently
+        # drop the operation instead of recording it.
+        #
+        # Generated numeric-kernel code runs real Python operators, and this
+        # observer is its only per-operation hook -- but everything below is
+        # tape-primitive correlation, which exists to resolve which of
+        # several possible dynamically-dispatched tensor primitives this
+        # call produced.  A plain value has no such ambiguity: its own
+        # graph node id already is its unambiguous identity, and it will
+        # never enter ``tape._nodes`` no matter how long this waits.  Record
+        # it directly, in exact execution order, the same way a reference
+        # operator (SetAttr/GetAttr) already is.
+        shell = context.get("shell")
+        if shell is not None:
+            shell.reference_operator_sequence.append(int(node_id))
+        return result
     tape = context["tape"]
     capture_id = tensor_identity(result)
     aliased_parents = tuple(
@@ -181,20 +204,6 @@ def _observe_process_graph_node(
         # otherwise the same tape identity is incorrectly assigned both to
         # the call result and to its input socket.
         context["value_aliases"][int(node_id)] = aliased_parents[0]
-        return result
-    if not isinstance(result, AbstractTensor):
-        # Generated numeric-kernel code runs real Python operators, and this
-        # observer is its only per-operation hook -- but everything below is
-        # tape-primitive correlation, which exists to resolve which of
-        # several possible dynamically-dispatched tensor primitives this
-        # call produced.  A plain value has no such ambiguity: its own
-        # graph node id already is its unambiguous identity, and it will
-        # never enter ``tape._nodes`` no matter how long this waits.  Record
-        # it directly, in exact execution order, the same way a reference
-        # operator (SetAttr/GetAttr) already is.
-        shell = context.get("shell")
-        if shell is not None:
-            shell.reference_operator_sequence.append(int(node_id))
         return result
     if capture_id in tape._nodes:
         primitive = tape._nodes[capture_id]
@@ -12632,7 +12641,8 @@ class ProcessGraphGLSLDeployment:
                 ordered_node_ids = [
                     node_id
                     for node_id in target.reference_operator_sequence
-                    if not (
+                    if node_id in target.process_graph.G
+                    and not (
                         node_id in seen_node_ids
                         or seen_node_ids.add(node_id)
                     )
