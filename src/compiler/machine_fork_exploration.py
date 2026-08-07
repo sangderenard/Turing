@@ -44,6 +44,14 @@ from .machine_path_forest import (
 )
 from .machine_reference_vocabulary import MachineSemanticToken
 
+# explore_forking_paths' two while loops are the exploration itself, not an
+# incidental iteration this compiler is free to dissolve into per-iteration
+# dispatch: `remove_loops` defaults to True (the common case for numeric
+# kernels with no meaningful loop identity), which forces native_while off
+# and makes every loop here a DISPATCH-strategy loop -- unbakeable for a
+# whole_program target regardless of what state-effect classification does.
+TURING_PAGE = {"remove_loops": False}
+
 
 @dataclass(frozen=True)
 class ForkExplorationPolicy:

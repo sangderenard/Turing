@@ -2508,14 +2508,26 @@ def _normalize_lexical_values(
                         if str(role).startswith("arg")
                     )
                     environment[name] = initial
+                    argument_expression = (
+                        call.args[0] if len(call.args) == 1 else None
+                    )
                     state_effects.append({
                         "state_name": name,
                         "operator": call.func.attr,
                         "effect_mode": (
                             "indexed_publication"
                             if (
-                                call.func.attr == "append"
-                                and len(argument_ids) == 1
+                                len(argument_ids) == 1
+                                and (
+                                    call.func.attr == "append"
+                                    or (
+                                        call.func.attr == "extend"
+                                        and isinstance(
+                                            argument_expression,
+                                            (ast.GeneratorExp, ast.ListComp),
+                                        )
+                                    )
+                                )
                             )
                             else "opaque"
                         ),
