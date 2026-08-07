@@ -1253,8 +1253,21 @@ def _normalize_lexical_values(
                 )
 
         if isinstance(expression, ast.Call):
-            callee = resolve_expression(expression.func)
             node_id = id(expression)
+            if (
+                isinstance(expression.func, ast.Name)
+                and expression.func.id
+                in (graph.G.graph.get("class_definitions") or ())
+                and node_id in graph.G
+            ):
+                # A source-local class construction, already known from
+                # ``map_ir`` at ingestion -- no python_bindings/static
+                # reference resolution needed or wanted for this: the
+                # class isn't external, it's right here in the source.
+                graph.G.nodes[node_id].setdefault(
+                    "attributes", {},
+                )["class_ref"] = expression.func.id
+            callee = resolve_expression(expression.func)
             if isinstance(callee, int) and callee in graph.G:
                 callee_reference = (
                     graph.G.nodes[callee].get("attributes") or {}
@@ -1673,6 +1686,15 @@ def _normalize_lexical_values(
                 static_attribute_values[
                     (id(static_receiver.value), target.attr)
                 ] = value
+            # A plain-named receiver (``counter.value = ...``) gets its own
+            # identity binding the same way a bare ``ast.Name`` target does
+            # above -- the field write is already a real, correctly wired
+            # SetAttr node; it was just never named, so it never reached
+            # ``identity_table`` for anything downstream to select by name.
+            if isinstance(target.value, ast.Name):
+                identity_bindings.setdefault(
+                    f"{target.value.id}.{target.attr}", []
+                ).append(node_id)
             return
         if isinstance(target, ast.Subscript):
             if isinstance(value, _StaticPythonReference):

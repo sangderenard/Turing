@@ -1864,6 +1864,16 @@ class ProcessGraph:
             self.G.graph["map_ir"]["selected_class_identities"] = tuple(
                 dict.fromkeys(retained_identities)
             )
+        # A name being a locally-defined class is a fact about the source,
+        # known the moment ``map_ir`` sees its ``ClassDef`` -- not something
+        # later passes should rediscover (or, absent that, fall through to
+        # treating the name as an unresolved external). Publish it here,
+        # once, so every later stage that creates or resolves a call to
+        # this name reads the same authoritative answer.
+        self.G.graph["class_definitions"] = frozenset(
+            str(item["class_name"])
+            for item in self.G.graph["map_ir"].get("objects", ())
+        )
         from ...compiler.state_machine_ast import plan_marked_state_machines
         state_machine_plans, state_machine_shortfalls = (
             plan_marked_state_machines(tree)

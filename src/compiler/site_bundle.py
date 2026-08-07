@@ -1089,6 +1089,80 @@ def _entrypoint_parameters(source: str, entrypoint: str) -> tuple[str, ...]:
     )
 
 
+def _synthesize_state_defaults(
+    source: str, entrypoint: str, unconfigured: Iterable[str],
+) -> tuple[str, frozenset[str]]:
+    """An unconfigured, annotated parameter -> real ``T()`` construction.
+
+    Detects the case directly: this parameter has no probe/config value at
+    all, and it has a written type. Nothing here touches ``state_feedback``
+    or any other parameter -- an ordinary, unannotated numeric-kernel
+    parameter with no configured value is untouched and keeps its existing
+    numeric-probe default, exactly as before. Only a parameter that is both
+    unconfigured *and* annotated is rewritten.
+
+    The rewrite is real source text -- ``if x is None: x = T()`` inserted
+    at the top of the function body -- traced by the ordinary compiler the
+    same way any other call is. Nothing here executes Python outside the
+    compiler; ``ast.unparse`` only prints a tree. A type with no
+    zero-argument constructor is a real, honestly reportable fact once the
+    compiler traces the call -- not something this guesses a workaround for.
+    """
+
+    module = ast.parse(source)
+    function = next(
+        (
+            node for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == entrypoint
+        ),
+        None,
+    )
+    if function is None:
+        return source, frozenset()
+
+    wanted = set(unconfigured)
+    rewritten: set[str] = set()
+    guards: list[ast.stmt] = []
+    for argument in (
+        *function.args.posonlyargs,
+        *function.args.args,
+        *function.args.kwonlyargs,
+    ):
+        if argument.arg not in wanted or argument.annotation is None:
+            continue
+        guards.append(ast.parse(
+            f"if {argument.arg} is None:\n    {argument.arg} = "
+            f"{ast.unparse(argument.annotation)}()\n",
+        ).body[0])
+        rewritten.add(argument.arg)
+
+    if not rewritten:
+        return source, frozenset()
+
+    # Discovery always supplies an explicit feed for every parameter, so the
+    # signature does not need a `= None` default; only the body needs the
+    # guard to replace the `None` fed in with a real instance.
+    function.body = [*guards, *function.body]
+    ast.fix_missing_locations(module)
+    return ast.unparse(module), frozenset(rewritten)
+
+
+def _feed_value(contract: "SourceContract", name: str, synthesized: frozenset[str]) -> Any:
+    """One parameter's real compile feed: a numeric probe, or real ``None``.
+
+    A name in ``synthesized`` needs literal ``None`` to reach the compiler,
+    so ``_synthesize_state_defaults``'s own ``if x is None: x = T()`` guard
+    actually fires when traced. Routing it through ``_probe_value`` instead
+    would silently turn it into a numeric zeros array, and the guard would
+    never see the ``None`` it exists to check for. Every other name is
+    completely unaffected -- the ordinary numeric-probe path, unchanged.
+    """
+
+    if name in synthesized:
+        return None
+    return _probe_value(contract.feeds.get(name), contract.probe_size)
+
+
 def _content_version(
     source: str,
     contract: SourceContract,
@@ -1684,51 +1758,6 @@ def _synthesise_entry(
     return ("\n".join(hoisted) + "\n\n" if hoisted else "") + definition
 
 
-def _execute_module_scope(
-    source: str,
-    source_filename: str,
-    *,
-    progress: Callable[[str], None] | None = None,
-) -> dict[str, Any]:
-    """Run the program's module-level statements and return its globals.
-
-    A compiled entrypoint routinely refers to names its own module bound
-    above it -- a configured object, a lookup table, a constant built once
-    at import. Those are *definitions*, established before anything runs,
-    not runtime inputs. Without executing module scope they reach the
-    compiler as unbound externals, and the build fails asking to be fed a
-    value the program already computed for itself (``missing ProcessGraph
-    input 'HEAD' ... binding_kind='external'``).
-
-    This is the compile-time setup phase: statements run top to bottom,
-    definitions are accepted, and the resulting namespace becomes the
-    entrypoint's static bindings. It is what ``import`` does, on a module
-    this function is compiling anyway.
-
-    A module that fails to execute is not fatal here. Its namespace is
-    simply whatever bound before the failure, and compilation proceeds to
-    report what it cannot resolve -- a partial result that names the gap,
-    rather than a stop that hides every other finding behind the first one.
-    """
-
-    namespace: dict[str, Any] = {
-        "__name__": "__turing_program__",
-        "__file__": str(source_filename),
-        "__builtins__": __builtins__,
-    }
-    try:
-        exec(compile(source, str(source_filename), "exec"), namespace)
-    except Exception as error:  # noqa: BLE001 - reported, never swallowed
-        if progress is not None:
-            progress(
-                f"module scope stopped early ({type(error).__name__}: "
-                f"{error}); continuing with the names bound so far"
-            )
-    else:
-        if progress is not None:
-            progress(f"module scope bound {len(namespace)} names")
-    namespace.pop("__builtins__", None)
-    return namespace
 
 
 def build_program_bundle(
@@ -1750,6 +1779,7 @@ def build_program_bundle(
     schedule_preference: str | None = None,
     progress_sink: Callable[[Any], None] | None = None,
     force_new_version: bool = False,
+    python_package: str | None = None,
 ) -> ProgramBundle:
     """Compile source and atomically publish its complete versioned bundle.
 
@@ -1833,11 +1863,33 @@ def build_program_bundle(
         f"discovered contract for {contract.entrypoint!r}",
         path="contract", slug=contract.slug,
     )
-    program_bindings = _execute_module_scope(
-        source,
-        source_filename,
-        progress=lambda message: channel.log(message, path="module-scope"),
+    # A parameter with no probe/config value at all, and a written type,
+    # gets a real instance of that type constructed on entry -- detected
+    # directly, touching nothing else. Ordinary numeric-kernel parameters
+    # (unannotated, or already configured) are completely unaffected.
+    unconfigured = (
+        set(_entrypoint_parameters(source, contract.entrypoint))
+        - set(contract.feeds)
+        - set(contract.constant_map)
     )
+    source, synthesized = _synthesize_state_defaults(
+        source, contract.entrypoint, unconfigured,
+    )
+    if synthesized:
+        channel.log(
+            f"synthesized default construction for {sorted(synthesized)!r}",
+            path="contract",
+        )
+        # The object survives to the next call the same way any other
+        # persistent state does: fed back from an equally-named output. It
+        # is the constructed object itself that has to be returned whole
+        # (`return counter`), not a value derived from it (`return
+        # counter.value`) -- only the whole object carries next call's
+        # accumulated state forward.
+        contract = replace(
+            contract,
+            state_feedback={**contract.state_feedback, **{n: n for n in synthesized}},
+        )
     contract_shader_configuration = {
         **dict(contract.shader_configuration),
         **dict(shader_configuration or {}),
@@ -1896,7 +1948,7 @@ def build_program_bundle(
 
         parameter_names = _entrypoint_parameters(source, contract.entrypoint)
         feeds = {
-            name: _probe_value(contract.feeds.get(name), contract.probe_size)
+            name: _feed_value(contract, name, synthesized)
             for name in parameter_names
         }
         with contextlib.redirect_stdout(compile_log), contextlib.redirect_stderr(compile_log):
@@ -1910,6 +1962,7 @@ def build_program_bundle(
             channel.log("build process graph starting", path="process_graph")
             with channel.timed("build process graph", path="process_graph"):
                 graph = ProcessGraph(materialize_memory=False)
+                graph.python_package = python_package
                 channel.log("process_graph: build_from_ast starting", path="process_graph")
                 graph.build_from_ast(
                     ast.parse(source),
@@ -1934,7 +1987,7 @@ def build_program_bundle(
                     remove_loops=contract.remove_loops,
                     unroll_limit=contract.unroll_limit,
                     precompile_only=True,
-                    python_bindings={**globals(), **program_bindings},
+                    python_bindings=globals(),
                     bake_mode=contract.bake_mode,
                     schedule_preference=contract.schedule_preference,
                     constant_map=contract.constant_map,
@@ -1956,6 +2009,38 @@ def build_program_bundle(
                     "control lowering; emitting the discovery-time numerical "
                     f"trace would not be the source program ({details})"
                 )
+            if synthesized:
+                # A synthesized state parameter's whole-object name never
+                # resolves to one scalar terminal -- ``counter``'s identity
+                # is a multi-node mutation history, not a value.  Its real,
+                # addressable fields do exist now (``counter.value``, one
+                # unambiguous node each -- see the SetAttr identity binding
+                # topological_reducer.py's ``bind_target`` records), so swap
+                # each synthesized whole-object output name for its real
+                # field names before the numerical projector -- unmodified,
+                # already correct for ordinary named outputs -- selects
+                # terminals by name.
+                updated_outputs: list[str] = []
+                updated_state_feedback = dict(contract.state_feedback)
+                for name in aot.function_outputs:
+                    if name not in synthesized:
+                        updated_outputs.append(name)
+                        continue
+                    fields = tuple(
+                        candidate for candidate in aot.identity_table
+                        if candidate.startswith(f"{name}.")
+                    )
+                    if not fields:
+                        raise ValueError(
+                            f"synthesized state parameter {name!r} has no "
+                            "discovered fields to publish as compiled outputs"
+                        )
+                    updated_outputs.extend(fields)
+                    updated_state_feedback.pop(name, None)
+                    for field in fields:
+                        updated_state_feedback[field] = field
+                aot = replace(aot, function_outputs=tuple(updated_outputs))
+                contract = replace(contract, state_feedback=updated_state_feedback)
             # This extraction is deliberately late in compilation.  ``aot``
             # already represents Python AST -> ProcessGraph -> planned
             # control/map/numerical compilation.  ``program`` is only the
@@ -2037,7 +2122,7 @@ def build_program_bundle(
                     remove_loops=contract.remove_loops,
                     unroll_limit=contract.unroll_limit,
                     precompile_only=True,
-                    python_bindings={**globals(), **program_bindings},
+                    python_bindings=globals(),
                     bake_mode=contract.bake_mode,
                     schedule_preference=contract.schedule_preference,
                     progress=lambda message: channel.log(message, path="presentation"),
@@ -2103,7 +2188,7 @@ def build_program_bundle(
             remove_loops=True,
             unroll_limit=contract.unroll_limit,
             precompile_only=True,
-            python_bindings={**globals(), **program_bindings},
+            python_bindings=globals(),
         )
         passthrough_program = project_public_numerical_program(passthrough_aot)
         passthrough_module = emit_webgl_fragment_module(
