@@ -2058,11 +2058,19 @@ def build_program_bundle(
                 # rather than publish a page whose state is unnavigable,
                 # exactly as the whole-program control bake above refuses an
                 # incomplete lowering instead of baking the discovery trace.
-                navigable_regions = (
-                    aot.shell_control_program is not None
-                    and aot.shell_control_program.region_indices
-                    and aot.region_programs
-                )
+                #
+                # ``shell_control_program.region_indices`` names planned
+                # GPU-shader-dispatch regions specifically -- a tensor-shaped
+                # concept, populated by shader-region planning before
+                # discovery runs.  Class-shaped state with no tensor content
+                # (a plain field write like ``counter.value``) is never
+                # planned as one of those regions and never will be; requiring
+                # it here would be the same category error as flattening it
+                # -- forcing tensor-shaped machinery onto content that was
+                # never tensor-shaped.  ``aot.region_programs`` is the real
+                # signal: it holds whatever was actually captured, tensor
+                # region or plain reference-operator sequence alike.
+                navigable_regions = bool(aot.region_programs)
                 if not navigable_regions:
                     raise RuntimeError(
                         "WebAssembly emission refused a final fused reduction "

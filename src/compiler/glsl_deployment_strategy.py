@@ -182,6 +182,20 @@ def _observe_process_graph_node(
         # the call result and to its input socket.
         context["value_aliases"][int(node_id)] = aliased_parents[0]
         return result
+    if not isinstance(result, AbstractTensor):
+        # Generated numeric-kernel code runs real Python operators, and this
+        # observer is its only per-operation hook -- but everything below is
+        # tape-primitive correlation, which exists to resolve which of
+        # several possible dynamically-dispatched tensor primitives this
+        # call produced.  A plain value has no such ambiguity: its own
+        # graph node id already is its unambiguous identity, and it will
+        # never enter ``tape._nodes`` no matter how long this waits.  Record
+        # it directly, in exact execution order, the same way a reference
+        # operator (SetAttr/GetAttr) already is.
+        shell = context.get("shell")
+        if shell is not None:
+            shell.reference_operator_sequence.append(int(node_id))
+        return result
     if capture_id in tape._nodes:
         primitive = tape._nodes[capture_id]
         self_parent_slots = tuple(
@@ -6990,6 +7004,7 @@ def _coordinate_scheduled_capture_impl(
                 planned_capture = {
                     "tape": discovery_tape,
                     "graph": graph,
+                    "shell": shell,
                     "node_capture_ids": {},
                     "step_input_ids": {},
                     "collection_materializations": (
@@ -8102,6 +8117,15 @@ def _coordinate_scheduled_capture_impl(
                         f"parents={parents!r}"
                     )
                 result = binary(operands[0], operands[1])
+                if not isinstance(result, AbstractTensor):
+                    # A tensor-bearing structural op still enters the tape
+                    # (see _observe_process_graph_node); this branch runs for
+                    # plain values too, and a plain value never touches the
+                    # tape at all.  Record it the same way a reference
+                    # operator is recorded, in exact order, so an arithmetic
+                    # step feeding a field write is a real internal step
+                    # instead of looking like a phantom external input.
+                    shell.reference_operator_sequence.append(int(node_id))
             elif isinstance(expression, ast.Call):
                 if (
                     isinstance(expression.func, ast.Attribute)
@@ -12613,6 +12637,26 @@ class ProcessGraphGLSLDeployment:
                         or seen_node_ids.add(node_id)
                     )
                 ]
+                def _reference_step_input_ids(node_id: int) -> list[int]:
+                    node_data = target.process_graph.G.nodes[node_id]
+                    ids = [
+                        int(parent)
+                        for parent, _role in (node_data.get("parents") or ())
+                    ]
+                    # ``parents`` wires the receiver object (``counter``),
+                    # never the field's own ``Input`` node -- ``field_ref``
+                    # (see ``bind_target``/``resolve_expression``) is the
+                    # only edge that actually points at it, stamped as an
+                    # attribute rather than a parent, so it has to be pulled
+                    # in explicitly here or the field's real identity never
+                    # becomes a dependency of this step at all.
+                    field_ref = (node_data.get("attributes") or {}).get(
+                        "field_ref"
+                    )
+                    if field_ref is not None:
+                        ids.append(int(field_ref))
+                    return ids
+
                 reference_steps = [
                     OpStep(
                         step_id=index,
@@ -12622,15 +12666,7 @@ class ProcessGraphGLSLDeployment:
                                 "type"
                             )
                         ),
-                        input_ids=[
-                            int(parent)
-                            for parent, _role in (
-                                target.process_graph.G.nodes[node_id].get(
-                                    "parents"
-                                )
-                                or ()
-                            )
-                        ],
+                        input_ids=_reference_step_input_ids(node_id),
                         attrs=dict(
                             target.process_graph.G.nodes[node_id].get(
                                 "attributes"
@@ -12641,11 +12677,33 @@ class ProcessGraphGLSLDeployment:
                     )
                     for index, node_id in enumerate(ordered_node_ids)
                 ]
+                reference_result_ids = {
+                    step.result_id for step in reference_steps
+                }
+                reference_feeds = {
+                    input_id
+                    for step in reference_steps
+                    for input_id in step.input_ids
+                    if input_id not in reference_result_ids
+                }
+                reference_feed_origins = {
+                    feed_id: {"binding_name": binding_name}
+                    for feed_id in reference_feeds
+                    if (
+                        binding_name := (
+                            target.process_graph.G.nodes.get(feed_id, {})
+                            .get("attributes", {})
+                            .get("binding_name")
+                        )
+                    )
+                    is not None
+                }
                 reference_program = FusedProgram(
                     version=1,
-                    feeds=set(),
+                    feeds=reference_feeds,
                     steps=reference_steps,
                     outputs={},
+                    extras={"capture_feed_origins": reference_feed_origins},
                 )
                 next_index = (
                     max(target.compiled_region_indices, default=-1) + 1

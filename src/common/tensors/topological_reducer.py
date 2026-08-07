@@ -2541,6 +2541,17 @@ def _normalize_lexical_values(
     for value_id, data in graph.G.nodes(data=True):
         data["value_id"] = value_id
         attributes = data.get("attributes") or {}
+        if "field_ref" in attributes:
+            # A SetAttr/GetAttr's field_ref (see bind_target,
+            # resolve_expression) is a bare node-id reference stored inside
+            # attributes, not a parents/edge relationship -- relabel_nodes
+            # above rewrote the graph's edges but has no way to know this
+            # particular attribute value is also a node id needing the same
+            # translation. Drop it rather than leave it stale if its target
+            # did not survive reduction.
+            attributes["field_ref"] = mapping.get(attributes["field_ref"])
+            if attributes["field_ref"] is None:
+                del attributes["field_ref"]
         if "loop_carried_bindings" in attributes:
             attributes["loop_carried_bindings"] = {
                 name: (mapping[initial], mapping[updated])
