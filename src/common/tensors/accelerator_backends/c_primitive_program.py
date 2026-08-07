@@ -785,6 +785,16 @@ def _compile_single_native_node(node, operation: str) -> CapturedFusedProgram:
                 device=None,
             )
             attrs["dynamic_shape_input_id"] = size_origin_id
+            # A frozen ``size``/``shape`` sitting beside the real operand
+            # is not a harmless fallback -- it is a silently wrong answer
+            # for any consumer that doesn't yet know to look for
+            # ``dynamic_shape_input_id``, since it only ever holds what
+            # this one discovery trace happened to observe.  A consumer
+            # that isn't ready for a dynamic shape must fail loudly on
+            # the missing key, not quietly compile a fixed-size buffer
+            # that is wrong for every other real run.
+            attrs.pop("size", None)
+            attrs.pop("shape", None)
     kernel_kind = _CAPTURED_NATIVE_KERNELS.get(operation, operation)
     lowered_operation = operation
 
@@ -944,7 +954,8 @@ def _compile_single_native_node(node, operation: str) -> CapturedFusedProgram:
             attrs.get("shape", tuple(result.shape))
         )
     if kernel_kind == "fill":
-        attrs["shape"] = tuple(result.shape)
+        if "dynamic_shape_input_id" not in attrs:
+            attrs["shape"] = tuple(result.shape)
         attrs["fill_value"] = {
             "empty": 0,
             "empty_like": 0,
