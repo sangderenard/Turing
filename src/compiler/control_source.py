@@ -283,6 +283,13 @@ class ControlProgram:
     # is where an evaporated/unrolled loop can condense instead of becoming
     # indistinguishable straight-line work.
     deployment_regions: tuple[ControlDeploymentRegion, ...] = ()
+    # (resident iterable value id, target value id, induction, projection).
+    # Projection is ``"induction"`` for enumerate's counter, ``None`` for
+    # the whole resident element, or a zero-based integer field within a
+    # destructured resident tuple/row.
+    projected_iterable_bindings: tuple[
+        tuple[int, int, str, object], ...
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -694,6 +701,7 @@ def compose_region_code(
         closure_iterable_bindings=program.closure_iterable_bindings,
         recursion_regions=program.recursion_regions,
         deployment_regions=program.deployment_regions,
+        projected_iterable_bindings=program.projected_iterable_bindings,
     )
 
 
@@ -941,6 +949,11 @@ def project_control_regions(
             if region.region_id in active_recursion_regions
         ),
         tuple(projected_deployments),
+        tuple(
+            binding
+            for binding in program.projected_iterable_bindings
+            if str(binding[2]) in active_inductions
+        ),
     )
 
 
@@ -962,6 +975,7 @@ def overlay_scheduled_control(
     static_iterable_bindings = []
     collection_bindings = []
     closure_iterable_bindings = []
+    projected_iterable_bindings = []
     recursion_regions = []
     deployment_regions = []
     controls = tuple(controls)
@@ -1150,6 +1164,9 @@ def overlay_scheduled_control(
         closure_iterable_bindings.extend(
             control.closure_iterable_bindings
         )
+        projected_iterable_bindings.extend(
+            control.projected_iterable_bindings
+        )
         recursion_regions.extend(control.recursion_regions)
         deployment_base = len(deployment_regions)
         deployment_regions.extend(
@@ -1191,6 +1208,9 @@ def overlay_scheduled_control(
         ),
         recursion_regions=tuple(dict.fromkeys(recursion_regions)),
         deployment_regions=tuple(deployment_regions),
+        projected_iterable_bindings=tuple(
+            dict.fromkeys(projected_iterable_bindings)
+        ),
     )
 
 

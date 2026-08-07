@@ -17,8 +17,11 @@ inlined definitions without losing the source correlation.
 from __future__ import annotations
 
 import ast
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+from ..transmogrifier.graph.graph_express2 import instance_attribute_slot
 
 
 @dataclass(frozen=True)
@@ -124,7 +127,20 @@ PermissionEvaluator = Callable[[str, tuple[str, ...]], bool]
 
 @dataclass(frozen=True)
 class ClassNavigationMember:
-    """One dot-addressable class member in the navigation LUT."""
+    """One dot-addressable class member in the navigation LUT.
+
+    ``slot`` is a monotonic, per-class index for instance-storage
+    attributes (``kind == "attribute"`` and ``storage == "instance"``) --
+    the same shape ``ClassFieldSlot`` (``wasm_class_coordinator.py``)
+    already proves out for WebAssembly deployment, generated here instead
+    at the nexus (``build_class_navigation_table``, the frontend phase
+    every backend already goes through), so a class instance has a real,
+    addressable field layout the moment it exists, not only once a
+    backend-specific "class-graph manifest" happens to derive one later.
+    ``None`` for methods and for class-level (non-instance) attributes,
+    which are looked up through ``function_reference``/the function table
+    instead -- a slot addresses instance storage, not a callable.
+    """
 
     name: str
     identity: str
@@ -132,6 +148,7 @@ class ClassNavigationMember:
     storage: str | None
     function_reference: int | None
     permissions: tuple[str, ...]
+    slot: int | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +184,7 @@ class ClassNavigationTable:
                             "storage": member.storage,
                             "function_reference": member.function_reference,
                             "permissions": list(member.permissions),
+                            "slot": member.slot,
                         }
                         for member in record.members
                     ],
@@ -215,12 +233,38 @@ class ClassNavigationTable:
         class_identity: str,
         member_name: str,
         evaluator: PermissionEvaluator,
+        *,
+        receiver_kind: str = "instance",
     ) -> ClassNavigationMember:
         """Resolve ``class_identity.member_name`` after permission checks."""
 
         record = self.class_record(class_identity)
         self._require(evaluator, record.identity, record.permissions)
         matches = [item for item in record.members if item.name == member_name]
+        if len(matches) > 1 and receiver_kind == "instance":
+            # A plain Python method is a non-data descriptor.  An instance
+            # field of the same name therefore shadows it after assignment
+            # (a common adapter pattern: ``self.nodes = ...`` alongside a
+            # class-level ``nodes`` method).  Keep both navigation records so
+            # class-level inspection remains possible, but resolve ordinary
+            # object dots with Python's instance precedence.
+            instance_fields = [
+                item
+                for item in matches
+                if item.kind == "attribute" and item.storage == "instance"
+            ]
+            if len(instance_fields) == 1:
+                matches = instance_fields
+        elif len(matches) > 1 and receiver_kind == "class":
+            matches = [
+                item
+                for item in matches
+                if not (item.kind == "attribute" and item.storage == "instance")
+            ]
+        elif receiver_kind not in {"instance", "class"}:
+            raise ValueError(
+                "receiver_kind must be either 'instance' or 'class'"
+            )
         if len(matches) != 1:
             raise KeyError(
                 f"unknown or ambiguous member {class_identity}.{member_name}"
@@ -238,16 +282,28 @@ def build_class_navigation_table(graph: Any) -> ClassNavigationTable:
         raise ValueError("class navigation requires a function table")
     records = []
     for object_map in (graph.G.graph.get("map_ir") or {}).get("objects", ()):
-        class_identity = str(object_map["class_name"])
+        class_identity = str(
+            object_map.get("class_identity", object_map["class_name"])
+        )
         members = []
-        for attribute in object_map.get("attributes", ()):
+        attribute_list = tuple(object_map.get("attributes", ()))
+        for attribute in attribute_list:
+            storage = str(attribute["storage"])
+            slot = (
+                instance_attribute_slot(
+                    attribute_list, str(attribute["name"])
+                )
+                if storage == "instance"
+                else None
+            )
             members.append(ClassNavigationMember(
                 name=str(attribute["name"]),
                 identity=str(attribute["identity"]),
                 kind="attribute",
-                storage=str(attribute["storage"]),
+                storage=storage,
                 function_reference=None,
                 permissions=tuple(attribute.get("permissions", ())),
+                slot=slot,
             ))
         for method in object_map.get("methods", ()):
             identity = str(method["graph_identity"])
@@ -267,9 +323,13 @@ def build_class_navigation_table(graph: Any) -> ClassNavigationTable:
                 function_reference=reference,
                 permissions=tuple(method.get("permissions", ())),
             ))
-        names = [member.name for member in members]
-        if len(names) != len(set(names)):
-            raise ValueError(f"class {class_identity!r} has ambiguous member names")
+        member_slots = [
+            (member.name, member.kind, member.storage) for member in members
+        ]
+        if len(member_slots) != len(set(member_slots)):
+            raise ValueError(
+                f"class {class_identity!r} has duplicate member slots"
+            )
         constructors = tuple(
             member.function_reference
             for constructor_name in ("__new__", "__init__")
@@ -285,7 +345,17 @@ def build_class_navigation_table(graph: Any) -> ClassNavigationTable:
         ))
     identities = [record.identity for record in records]
     if len(identities) != len(set(identities)):
-        raise ValueError("class navigation contains duplicate class identities")
+        duplicates = tuple(
+            sorted(
+                identity
+                for identity, count in Counter(identities).items()
+                if count > 1
+            )
+        )
+        raise ValueError(
+            "class navigation contains duplicate class identities: "
+            f"{duplicates!r}"
+        )
     return ClassNavigationTable(tuple(records))
 
 
@@ -322,9 +392,19 @@ def build_map_dependency_regions(graph: Any, entrypoint: str) -> MapDependencyRe
     mapped: set[int] = set()
     bindings: list[tuple[str, int]] = []
     map_ir = graph.G.graph.get("map_ir") or {}
+    selected_classes = (
+        set(map(str, map_ir["selected_class_identities"]))
+        if "selected_class_identities" in map_ir
+        else None
+    )
     for mapped_graph in map_ir.get("graphs", ()):
         identity = mapped_graph.get("identity")
         if not identity:
+            continue
+        if (
+            selected_classes is not None
+            and str(identity).rsplit(".", 1)[0] not in selected_classes
+        ):
             continue
         try:
             mapped_entry = function_table.entry(str(identity))

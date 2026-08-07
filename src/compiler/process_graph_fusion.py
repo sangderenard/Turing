@@ -19,6 +19,7 @@ from typing import Any, Iterable, Mapping
 import networkx as nx
 
 from ..common.tensors.fused_ir import (
+    AXIS_REDUCTION_FOLDS,
     FusedProgram,
     Meta,
     OpStep,
@@ -131,7 +132,9 @@ def extract_clean_process_subgraph(
             return frozenset(isolate_metadata(item) for item in value)
         return value
 
-    included = set(node_ids)
+    included = {
+        int(node_id) for node_id in node_ids if int(node_id) in graph.G
+    }
     extracted = copy.copy(graph)
     extracted.G = graph.G.subgraph(included).copy()
     extracted.G.graph = isolate_metadata(dict(graph.G.graph))
@@ -928,14 +931,44 @@ def fused_program_to_process_graph(program: FusedProgram) -> ProcessGraph:
                 ),
             )
             continue
-        if step.op_name == "sum":
+        if step.op_name in AXIS_REDUCTION_FOLDS:
             add_node(
                 step.result_id,
                 _node_payload(
-                    "sum",
+                    step.op_name,
                     parents=tuple(
                         (value_id, "operand") for value_id in step.input_ids
                     ),
+                    attributes=copy.deepcopy(dict(step.attrs)),
+                    meta=metadata.get(step.result_id),
+                ),
+            )
+            continue
+        if step.op_name in {"reshape", "broadcast_to"}:
+            add_node(
+                step.result_id,
+                _node_payload(
+                    step.op_name,
+                    parents=tuple(
+                        (value_id, "operand") for value_id in step.input_ids
+                    ),
+                    attributes=copy.deepcopy(dict(step.attrs)),
+                    meta=metadata.get(step.result_id),
+                ),
+            )
+            continue
+        if step.op_name == "where":
+            if len(step.input_ids) != 3:
+                raise ValueError(
+                    f"where step {step.step_id} needs condition, true, and false inputs"
+                )
+            add_node(
+                step.result_id,
+                _node_payload(
+                    "where",
+                    parents=tuple(zip(
+                        step.input_ids, ("condition", "true", "false")
+                    )),
                     attributes=copy.deepcopy(dict(step.attrs)),
                     meta=metadata.get(step.result_id),
                 ),
@@ -1169,7 +1202,7 @@ def dispatch_region_to_fused_program(
     for node_id in region.node_ids:
         data = graph.G.nodes[node_id]
         raw_op = _operation(graph, node_id)
-        reduction = raw_op == "sum"
+        reduction = raw_op in AXIS_REDUCTION_FOLDS
         op = raw_op if reduction else canonical_elementwise_op(raw_op)[0]
         parents = list(data.get("parents") or ())
         value_parents: list[int] = []
@@ -1205,7 +1238,7 @@ def dispatch_region_to_fused_program(
         )
         if scalar_parent is not None:
             if reduction:
-                raise ValueError("sum cannot consume a scalar constant operand")
+                raise ValueError(f"{op} cannot consume a scalar constant operand")
             if len(value_parents) != 1:
                 raise ValueError(f"{op} has an invalid scalar operand layout")
             attrs["right_scalar"] = scalar_parent[1]

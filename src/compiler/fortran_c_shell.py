@@ -9,20 +9,30 @@ the ordinary AST/Control/SSA pipeline emitted.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 from typing import Any, Mapping
+from typing import Callable
 
 import numpy as np
 
 from ..common.tensors.accelerator_backends.profiled_c_shell import _C_SOURCE
+from .fortran_toolchain import (
+    aggressive_c_flags,
+    aggressive_fortran_flags,
+    standalone_fortran_link_flags,
+    standalone_runtime_shim_sources,
+)
 from .ssa_fortran_backend import FortranEmissionError, fortran_compiler
 
 
 _NUMPY_DTYPES = {
+    "uint8": np.dtype("uint8"),
+    "u8": np.dtype("uint8"),
     "bool": np.dtype("bool"),
     "logical": np.dtype("bool"),
     "float": np.dtype("float32"),
@@ -50,22 +60,23 @@ class FortranCShellExecutable:
     final_outputs_path: Path
     entrypoint: str
 
-    def run(self, *, frames: int = 1) -> subprocess.CompletedProcess[str]:
-        if frames < 1:
-            raise ValueError("native C shell needs at least one frame")
-        environment = dict(os.environ)
-        compiler = fortran_compiler()
-        if compiler is not None:
-            environment["PATH"] = (
-                str(Path(compiler).parent)
-                + os.pathsep
-                + environment.get("PATH", "")
-            )
+    def run(
+        self,
+        *,
+        frames: int = 1,
+        files: Mapping[str, str | Path] | None = None,
+        capture_output: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        if frames < 0:
+            raise ValueError("native C shell frame count cannot be negative")
+        arguments = [str(self.executable_path), str(frames)]
+        for name, path in sorted(dict(files or {}).items()):
+            arguments.extend(("--file-" + _identifier(name).replace("_", "-"), str(Path(path).resolve())))
         return subprocess.run(
-            [str(self.executable_path), str(frames)],
+            arguments,
             cwd=str(self.directory),
-            env=environment,
-            capture_output=True,
+            env=dict(os.environ),
+            capture_output=capture_output,
             text=True,
             check=True,
         )
@@ -112,6 +123,46 @@ def _element_count(parameter: Any, extents: Mapping[str, int]) -> int:
 
 def _source_name(parameter: Any) -> str:
     return str(parameter.source_name or parameter.name)
+
+
+def _fortran_storage_index(
+    parameter: Any,
+    extents: Mapping[str, int],
+    linear_index: str,
+) -> str:
+    """Map one C-row-major logical index to Fortran array storage.
+
+    The API shape is semantic and remains in Python/NumPy dimension order.
+    A ``bind(C)`` Fortran dummy with that shape stores its first dimension
+    fastest, so the outer shell must perform this boundary permutation once.
+    Resident feedback arenas stay in Fortran order and require no copies.
+    """
+
+    shape = tuple(
+        int(extents.get(f"extent_{int(size)}", size))
+        for size in tuple(parameter.shape or ())
+    )
+    if len(shape) <= 1:
+        return linear_index
+    terms = []
+    for dimension, size in enumerate(shape):
+        c_stride = 1
+        for following in shape[dimension + 1:]:
+            c_stride *= int(following)
+        fortran_stride = 1
+        for preceding in shape[:dimension]:
+            fortran_stride *= int(preceding)
+        coordinate = (
+            f"(({linear_index}) / {c_stride}) % {size}"
+            if c_stride != 1
+            else f"({linear_index}) % {size}"
+        )
+        terms.append(
+            coordinate
+            if fortran_stride == 1
+            else f"({coordinate}) * {fortran_stride}"
+        )
+    return " + ".join(terms)
 
 
 def _c_string(value: str) -> str:
@@ -169,7 +220,49 @@ def _display_configuration(module: Any, entry: Any) -> dict[str, Any] | None:
         "height": height,
         "title": str(attributes.get("title", "Turing native display")),
         "channels": tuple(channels),
+        "frame_delay_ms": max(0, int(attributes.get("frame_delay_ms", 0))),
     }
+
+
+def _system_file_configurations(module: Any, entry: Any) -> tuple[dict[str, Any], ...]:
+    metadata = dict(getattr(module.api, "metadata", {}) or {})
+    requirements = dict((metadata.get("shell_io") or {}).get("requirements") or {})
+    parameters = {parameter.name: parameter for parameter in entry.parameters}
+    configurations = []
+    for port in requirements.get("system_ports", ()):
+        if port.get("kind") != "file" or port.get("direction") not in {
+            "input", "bidirectional",
+        }:
+            continue
+        if str(port.get("entry_point")) != str(entry.name):
+            continue
+        fields = {
+            str(field.get("name")): str(field.get("parameter"))
+            for field in port.get("fields", ())
+        }
+        if set(fields) < {"data", "length"}:
+            raise ValueError(f"native file port {port.get('name')!r} lacks data/length fields")
+        data = parameters.get(fields["data"])
+        length = parameters.get(fields["length"])
+        if data is None or length is None:
+            raise ValueError(f"native file port {port.get('name')!r} has unknown parameters")
+        if str(data.c_type) != "uint8_t" or data.passing != "reference":
+            raise ValueError("native file data parameter must be a uint8 reference")
+        if str(length.c_type) not in {"int32_t", "int64_t"}:
+            raise ValueError("native file length parameter must be int32 or int64")
+        attributes = dict(port.get("attributes") or {})
+        capacity = int(attributes.get("maximum_bytes", _element_count(data, _extent_values(entry, None))))
+        if capacity < 1:
+            raise ValueError("native input file capacity must be positive")
+        configurations.append({
+            "name": str(port["name"]),
+            "flag": "--file-" + _identifier(str(port["name"])).replace("_", "-"),
+            "data": data,
+            "length": length,
+            "capacity": capacity,
+            "optional": bool(port.get("optional")),
+        })
+    return tuple(configurations)
 
 
 def emit_fortran_c_shell_source(
@@ -205,6 +298,12 @@ def emit_fortran_c_shell_source(
         parameter.name: index for index, parameter in enumerate(values)
     }
     display = _display_configuration(module, entry)
+    file_ports = _system_file_configurations(module, entry)
+    system_parameters = {
+        parameter.name
+        for port in file_ports
+        for parameter in (port["data"], port["length"])
+    }
     if display is not None:
         expected_pixels = int(display["width"]) * int(display["height"])
         for parameter_name in display["channels"]:
@@ -252,21 +351,58 @@ def emit_fortran_c_shell_source(
     input_read_lines = []
     for index, parameter in enumerate(values):
         c_type = str(parameter.c_type)
-        count = _element_count(parameter, extents)
+        file_port = next((port for port in file_ports if port["data"].name == parameter.name), None)
+        count = int(file_port["capacity"]) if file_port else _element_count(parameter, extents)
         allocation_lines.extend((
             f"    slots[{index}] = calloc({count}, sizeof({c_type}));",
             f"    if (!slots[{index}]) return 3;",
         ))
-        if parameter.role == "input":
-            input_read_lines.extend((
-                f"    if (fread(slots[{index}], sizeof({c_type}), {count}, state) "
-                f"!= {count}) {{",
-                f"        fprintf(stderr, \"short initial state at {_c_string(_source_name(parameter))[1:-1]}\\n\");",
-                "        return 4;",
-                "    }",
-            ))
+        if parameter.role == "input" and parameter.name not in system_parameters:
+            if len(tuple(parameter.shape or ())) <= 1:
+                input_read_lines.extend((
+                    f"    if (fread(slots[{index}], sizeof({c_type}), {count}, state) "
+                    f"!= {count}) {{",
+                    f"        fprintf(stderr, \"short initial state at {_c_string(_source_name(parameter))[1:-1]}\\n\");",
+                    "        return 4;",
+                    "    }",
+                ))
+            else:
+                storage_index = _fortran_storage_index(
+                    parameter, extents, "logical_index"
+                )
+                input_read_lines.extend((
+                    "    { size_t logical_index;",
+                    f"      for (logical_index = 0; logical_index < {count}; ++logical_index) {{",
+                    f"        {c_type} element;",
+                    f"        if (fread(&element, sizeof({c_type}), 1, state) != 1) {{",
+                    f"          fprintf(stderr, \"short initial state at {_c_string(_source_name(parameter))[1:-1]}\\n\");",
+                    "          return 4;",
+                    "        }",
+                    f"        (({c_type} *)slots[{index}])[{storage_index}] = element;",
+                    "      }",
+                    "    }",
+                ))
+
+    file_load_lines = []
+    for port in file_ports:
+        data_slot = slot_by_parameter[port["data"].name]
+        length_slot = slot_by_parameter[port["length"].name]
+        variable = _identifier("file_" + port["name"])
+        file_load_lines.extend((
+            f"    const char *{variable} = turing_argument_value(argc, argv, {_c_string(port['flag'])});",
+            *(
+                (f"    if ({variable} == NULL) {{ fprintf(stderr, \"missing {port['flag']}\\n\"); return 8; }}",)
+                if not port["optional"] else ()
+            ),
+            f"    if ({variable} != NULL) {{",
+            "        size_t loaded_bytes = 0;",
+            f"        if (!turing_read_file({variable}, (uint8_t *)slots[{data_slot}], {port['capacity']}, &loaded_bytes)) return 9;",
+            f"        *(({port['length'].c_type} *)slots[{length_slot}]) = ({port['length'].c_type})loaded_bytes;",
+            "    }",
+        ))
 
     feedback_lines = []
+    feedback_finalize_lines = []
     for input_name, output_name in feedback.items():
         input_slot = slot_by_name[input_name]
         output_slot = slot_by_name[output_name]
@@ -281,10 +417,16 @@ def emit_fortran_c_shell_source(
                 f"state feedback {input_name!r}->{output_name!r} has "
                 "incompatible storage"
             )
-        feedback_lines.append(
-            f"        memcpy(slots[{input_slot}], slots[{output_slot}], "
-            f"{_element_count(input_parameter, extents)} * sizeof({input_parameter.c_type}));"
+        swap = (
+            f"{{ void *feedback_arena = slots[{input_slot}]; "
+            f"slots[{input_slot}] = slots[{output_slot}]; "
+            f"slots[{output_slot}] = feedback_arena; }}"
         )
+        feedback_lines.append(f"        {swap}")
+        # After the last frame the latest value is in the input address. Swap
+        # once more so the public output name still denotes the final result
+        # for serialization and caller inspection.
+        feedback_finalize_lines.append(f"    {swap}")
 
     output_lines = []
     output_write_lines = []
@@ -298,9 +440,22 @@ def emit_fortran_c_shell_source(
             f"      printf(\"{separator}\\\"{_source_name(parameter)}\\\":{{\\\"first\\\":%.17g,\\\"sum\\\":%.17g}}\",",
             f"             (double)(({parameter.c_type} *)slots[{slot}])[0], sum); }}",
         ))
-        output_write_lines.append(
-            f"    fwrite(slots[{slot}], sizeof({parameter.c_type}), {count}, outputs_file);"
-        )
+        if len(tuple(parameter.shape or ())) <= 1:
+            output_write_lines.append(
+                f"    fwrite(slots[{slot}], sizeof({parameter.c_type}), {count}, outputs_file);"
+            )
+        else:
+            storage_index = _fortran_storage_index(
+                parameter, extents, "logical_index"
+            )
+            output_write_lines.extend((
+                "    { size_t logical_index;",
+                f"      for (logical_index = 0; logical_index < {count}; ++logical_index) {{",
+                f"        const {parameter.c_type} *element = &(({parameter.c_type} *)slots[{slot}])[{storage_index}];",
+                f"        fwrite(element, sizeof({parameter.c_type}), 1, outputs_file);",
+                "      }",
+                "    }",
+            ))
 
     display_source = ""
     display_open_lines: list[str] = []
@@ -455,15 +610,86 @@ static void turing_display_close(void) {
             f"            (const double *)slots[{blue_slot}]);",
             "        turing_display_messages();",
         ]
+        if int(display["frame_delay_ms"]) > 0:
+            display_present_lines.append(
+                f"        Sleep({int(display['frame_delay_ms'])});"
+            )
         display_close_lines = ["    turing_display_close();"]
 
     source = "\n".join((
         _C_SOURCE,
         "",
+        "#include <stdbool.h>",
         "#include <stdio.h>",
         "#include <stdlib.h>",
         "#include <string.h>",
         "",
+        r'''#if defined(_WIN32)
+/* GCC 16's MinGW static libgfortran uses the POSIX strndup entry point, while
+ * the Windows CRT does not export it. Keep the standalone runtime archive
+ * resolvable without introducing another redistributable DLL. */
+char *strndup(const char *source, size_t maximum) {
+    size_t length = 0;
+    char *copy;
+    while (length < maximum && source[length] != '\0') ++length;
+    copy = (char *)malloc(length + 1);
+    if (copy == NULL) return NULL;
+    memcpy(copy, source, length);
+    copy[length] = '\0';
+    return copy;
+}
+#endif
+''',
+        r'''static FILE *turing_open_artifact(
+    const char *executable, const char *filename, const char *mode
+) {
+    char path[4096];
+    const char *slash = strrchr(executable, '/');
+    const char *backslash = strrchr(executable, '\\');
+    const char *separator = slash;
+    size_t directory_length;
+    if (backslash != NULL && (separator == NULL || backslash > separator)) {
+        separator = backslash;
+    }
+    if (separator == NULL) return fopen(filename, mode);
+    directory_length = (size_t)(separator - executable + 1);
+    if (directory_length + strlen(filename) + 1 > sizeof(path)) return NULL;
+    memcpy(path, executable, directory_length);
+    strcpy(path + directory_length, filename);
+    return fopen(path, mode);
+}
+''',
+
+        *(r'''static const char *turing_argument_value(int argc, char **argv, const char *flag) {
+    int index;
+    for (index = 2; index + 1 < argc; ++index) {
+        if (strcmp(argv[index], flag) == 0) return argv[index + 1];
+    }
+    return NULL;
+}
+
+static int turing_read_file(
+    const char *path, uint8_t *destination, size_t capacity, size_t *length
+) {
+    FILE *file = fopen(path, "rb");
+    long size;
+    if (file == NULL) { perror(path); return 0; }
+    if (fseek(file, 0, SEEK_END) != 0 || (size = ftell(file)) < 0 ||
+        fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file); return 0;
+    }
+    if ((unsigned long long)size > (unsigned long long)capacity) {
+        fprintf(stderr, "input file exceeds compiled port capacity: %s\n", path);
+        fclose(file); return 0;
+    }
+    if (fread(destination, 1, (size_t)size, file) != (size_t)size) {
+        fclose(file); return 0;
+    }
+    fclose(file);
+    *length = (size_t)size;
+    return 1;
+}
+''' if file_ports else "",),
         display_source,
         f"extern void {entry.symbol}({', '.join(prototype_arguments)});",
         "",
@@ -480,10 +706,11 @@ static void turing_display_close(void) {
         "    TuringLaunchProfile profile = {0};",
         "    TuringLaunchStats stats = {0};",
         "    int frame;",
-        f"    FILE *state = fopen({_c_string(initial_state_filename)}, \"rb\");",
+        f"    FILE *state = turing_open_artifact(argv[0], {_c_string(initial_state_filename)}, \"rb\");",
         "    if (frames < 0) return 2;",
         "    if (!state) { perror(\"initial state\"); return 2; }",
         *allocation_lines,
+        *file_load_lines,
         *input_read_lines,
         "    fclose(state);",
         *display_open_lines,
@@ -492,15 +719,16 @@ static void turing_display_close(void) {
         *display_message_lines,
         "        if (turing_profiled_launch_ex(turing_fortran_compute, slots,",
         "                &profile, &stats, NULL, NULL, 3) != 1) return 5;",
-        *feedback_lines,
         *display_present_lines,
+        *feedback_lines,
         "    }",
         *display_close_lines,
+        *feedback_finalize_lines,
         "    printf(\"{\\\"status\\\":%d,\\\"frames\\\":%d,\\\"shell_ns_total\\\":%llu,\\\"outputs\\\":{\",",
         "           profile.status, frame, stats.shell_ns_total);",
         *output_lines,
         "    printf(\"}}\\n\");",
-        f"    {{ FILE *outputs_file = fopen({_c_string(final_outputs_filename)}, \"wb\");",
+        f"    {{ FILE *outputs_file = turing_open_artifact(argv[0], {_c_string(final_outputs_filename)}, \"wb\");",
         "      if (!outputs_file) { perror(\"final outputs\"); return 6; }",
         *output_write_lines,
         "      fclose(outputs_file); }",
@@ -521,6 +749,7 @@ def compile_fortran_module_c_shell(
     state_feedback: Mapping[str, str] | None = None,
     extent_overrides: Mapping[str, int] | None = None,
     name: str = "turing_fortran_c_shell",
+    standalone: bool = True,
 ) -> FortranCShellExecutable:
     """Compile generated Fortran plus the generic profiled C main."""
 
@@ -537,9 +766,16 @@ def compile_fortran_module_c_shell(
     extents = _extent_values(entry, extent_overrides)
     values = tuple(item for item in entry.parameters if item.role != "extent")
     input_parameters = tuple(item for item in values if item.role == "input")
+    file_ports = _system_file_configurations(module, entry)
+    system_parameters = {
+        parameter.name
+        for port in file_ports
+        for parameter in (port["data"], port["length"])
+    }
     missing = {
         _source_name(parameter)
         for parameter in input_parameters
+        if parameter.name not in system_parameters
         if _source_name(parameter) not in inputs
     }
     if missing:
@@ -547,6 +783,8 @@ def compile_fortran_module_c_shell(
 
     state_bytes = bytearray()
     for parameter in input_parameters:
+        if parameter.name in system_parameters:
+            continue
         source_name = _source_name(parameter)
         dtype = _NUMPY_DTYPES.get(str(parameter.dtype).casefold())
         if dtype is None:
@@ -588,11 +826,23 @@ def compile_fortran_module_c_shell(
     environment["PATH"] = (
         str(Path(compiler).parent) + os.pathsep + environment.get("PATH", "")
     )
+    fortran_flags = aggressive_fortran_flags(compiler)
+    c_flags = aggressive_c_flags(compiler)
+    try:
+        link_flags = (
+            standalone_fortran_link_flags(compiler)
+            if standalone else ("-flto",)
+        )
+    except ValueError as error:
+        raise FortranEmissionError(str(error)) from error
     commands = (
-        [compiler, "-O3", "-c", str(fortran_path), "-o", str(fortran_object)],
-        [gcc, "-O3", "-std=c11", "-c", str(c_path), "-o", str(c_object)],
+        [compiler, *fortran_flags, "-c", str(fortran_path), "-o", str(fortran_object)],
+        [gcc, *c_flags, "-std=c11", "-c", str(c_path), "-o", str(c_object)],
         [
-            compiler, str(c_object), str(fortran_object), "-o", str(executable),
+            compiler, str(c_object), str(fortran_object),
+            *standalone_runtime_shim_sources(compiler, output, standalone),
+            "-o", str(executable),
+            *link_flags,
             *(
                 ["-mwindows", "-lgdi32", "-luser32"]
                 if _display_configuration(module, entry) else []
@@ -624,8 +874,425 @@ def compile_fortran_module_c_shell(
     )
 
 
+def compile_ast_fortran_c_shell(
+    source: str,
+    entrypoint: str,
+    feeds: Mapping[str, Any],
+    directory: str | Path,
+    *,
+    python_bindings: Mapping[str, Any] | None = None,
+    output_names: tuple[str, ...] | list[str] | None = None,
+    state_feedback: Mapping[str, str] | None = None,
+    display: Mapping[str, Any] | None = None,
+    name: str | None = None,
+    standalone: bool = True,
+    progress: Callable[[str], None] | None = None,
+    checkpoint: bool | str | Path = False,
+    mutable_parameters: tuple[str, ...] | list[str] | set[str] = (),
+    retain_card_program: bool = True,
+) -> FortranCShellExecutable:
+    """Compile Python AST through the registered Fortran target and C shell.
+
+    This is the application-neutral native entrypoint.  It accepts authored
+    Python, runs the ordinary ProcessGraph/AOT compiler, projects that
+    compiler's public numerical program, and only then selects Fortran.
+    Dotted aggregate feed names such as ``state.u`` are resolved from the
+    caller's object without flattening or copying its arena in Python source.
+    """
+
+    from ..common.tensors.accelerator_backends.aot_compile import (
+        compile_ast_aot,
+        project_public_numerical_program,
+    )
+    from .machine_targets import get_target
+    from .shell_io import (
+        ShellIOBinding,
+        ShellIOCapability,
+        ShellIOManifest,
+        ShellIORequest,
+        attach_shell_io,
+    )
+
+    compilation = compile_ast_aot(
+        source,
+        entrypoint,
+        dict(feeds),
+        backend="c",
+        precompile_only=True,
+        bake_mode="whole_program",
+        python_bindings=dict(python_bindings or {}),
+        progress=progress,
+        checkpoint=checkpoint,
+        mutable_parameters=tuple(mutable_parameters),
+    )
+    hierarchical_outputs = dict(compilation.public_output_value_ids)
+    hierarchical_inputs = dict(compilation.public_input_value_ids)
+    if output_names is not None and hierarchical_outputs:
+        names = tuple(map(str, output_names))
+        if set(hierarchical_outputs) <= set(names):
+            pass
+        elif len(names) != len(hierarchical_outputs):
+            raise ValueError(
+                f"received {len(names)} output names for "
+                f"{len(hierarchical_outputs)} hierarchical outputs"
+            )
+        else:
+            hierarchical_outputs = {
+                output_name: value_id
+                for output_name, value_id in zip(
+                    names, hierarchical_outputs.values()
+                )
+            }
+
+    artifact_name = str(name or entrypoint)
+    module = None
+    if hierarchical_outputs and compilation.region_programs:
+        from ..transmogrifier.ssa import IRModule
+        from .precompile_to_ssa import lower_precompile_and_control_to_ssa
+        from .precompile_ssa_validator import (
+            validate_precompile_ssa_compatibility,
+        )
+        from .ssa_fortran_backend import emit_module
+
+        identity_table = {
+            **dict(compilation.identity_table),
+            **{
+                source_name: (int(value_id),)
+                for source_name, value_id in hierarchical_inputs.items()
+            },
+            **{
+                source_name: (int(value_id),)
+                for source_name, value_id in hierarchical_outputs.items()
+            },
+        }
+        numerical_seed = next(
+            (
+                candidate
+                for candidate in compilation.region_programs.values()
+                if validate_precompile_ssa_compatibility(
+                    candidate
+                ).valid_precompile
+            ),
+            None,
+        )
+        if numerical_seed is None:
+            raise FortranEmissionError(
+                "hierarchical AST program has no structurally valid "
+                "numerical region"
+            )
+        lowering = lower_precompile_and_control_to_ssa(
+            numerical_seed,
+            compilation.shell_control_program,
+            region_programs=dict(compilation.region_programs),
+            numerical_name=f"{artifact_name}_discovery",
+            control_name=artifact_name,
+            identity_table=identity_table,
+            function_outputs=tuple(hierarchical_outputs),
+            function_parameters=tuple(hierarchical_inputs),
+        )
+        if lowering.shortfalls or not lowering.validation.valid_precompile:
+            raise FortranEmissionError(
+                lowering.shortfall_report()
+                + f"; format_issues={lowering.validation.format_issues!r}"
+            )
+        functions = {
+            function_name: function
+            for function_name, function in lowering.module.functions.items()
+            if function_name == artifact_name
+            or function_name.startswith("numerical_region_")
+        }
+
+        def returned_values(function: Any) -> tuple[Any, ...]:
+            returns = tuple(
+                instruction.args
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"Ret", "ret", "Return", "return"}
+            )
+            return tuple(returns[-1]) if returns else ()
+
+        module = emit_module(
+            IRModule(functions),
+            name=f"{artifact_name}_fortran",
+            outputs={
+                function_name: returned_values(function)
+                for function_name, function in functions.items()
+            },
+        )
+        if not module.complete:
+            raise FortranEmissionError(
+                "Fortran target could not emit hierarchical AST program: "
+                + "; ".join(item.format() for item in module.shortfalls)
+            )
+
+    program = project_public_numerical_program(compilation)
+    if module is None and output_names is not None:
+        names = tuple(map(str, output_names))
+        if len(names) != len(program.outputs):
+            metadata = program.meta or {}
+            output_summary = tuple(
+                (
+                    output_name,
+                    tuple(getattr(metadata.get(value_id), "shape", ()) or ()),
+                )
+                for output_name, value_id in program.outputs.items()
+            )
+            declared = {
+                output_name: tuple(
+                    compilation.identity_table.get(output_name, ())
+                )
+                for output_name in compilation.function_outputs
+            }
+            available = {
+                *map(int, program.feeds),
+                *(int(step.result_id) for step in program.steps),
+                *map(int, program.outputs.values()),
+            }
+            raise ValueError(
+                f"received {len(names)} output names for "
+                f"{len(program.outputs)} compiled outputs; "
+                f"declared={declared!r}; "
+                f"declared_available={{{', '.join(f'{key!r}: {tuple(value in available for value in values)!r}' for key, values in declared.items())}}}; "
+                f"first={output_summary[:16]!r}; last={output_summary[-16:]!r}"
+            )
+        program = replace(
+            program,
+            outputs={
+                output_name: value_id
+                for output_name, value_id in zip(
+                    names, program.outputs.values()
+                )
+            },
+        )
+    if module is None:
+        emitted = get_target("fortran").emit(program, name=artifact_name)
+        if not emitted.complete or emitted.module is None:
+            raise FortranEmissionError(
+                "Fortran target could not emit compiled AST program: "
+                + "; ".join(emitted.shortfalls)
+            )
+        module = emitted.module
+
+    # Hierarchical lowering can promote a region-private feed into the public
+    # control ABI after ``parameter_names`` was recorded.  Its SSA identity is
+    # still present in the graph identity table, so restore the authored feed
+    # name here.  Stateful shells can then declare feedback by program name
+    # instead of depending on an unstable ``t<ID>`` spelling.
+    feed_names_by_value_id: dict[int, str] = {}
+    ambiguous_feed_ids: set[int] = set()
+    candidate_feed_names = {
+        str(name)
+        for name in compilation.identity_table
+        if str(name).split(".", 1)[0] in feeds
+    }
+    candidate_feed_names.update(map(str, feeds))
+    for feed_name in candidate_feed_names:
+        for value_id in compilation.identity_table.get(feed_name, ()):
+            value_id = int(value_id)
+            previous = feed_names_by_value_id.get(value_id)
+            if previous is not None and previous != str(feed_name):
+                ambiguous_feed_ids.add(value_id)
+            else:
+                feed_names_by_value_id[value_id] = str(feed_name)
+    if feed_names_by_value_id:
+        entry_points = []
+        for described_entry in module.api.entry_points:
+            described_parameters = []
+            for parameter in described_entry.parameters:
+                source_name = parameter.source_name
+                if source_name is None and parameter.name.startswith("t"):
+                    try:
+                        value_id = int(parameter.name[1:])
+                    except ValueError:
+                        value_id = -1
+                    if value_id not in ambiguous_feed_ids:
+                        source_name = feed_names_by_value_id.get(value_id)
+                described_parameters.append(
+                    replace(parameter, source_name=source_name)
+                )
+            entry_points.append(replace(
+                described_entry,
+                parameters=tuple(described_parameters),
+            ))
+        module = replace(
+            module,
+            api=replace(module.api, entry_points=tuple(entry_points)),
+        )
+    if display is not None:
+        options = dict(display)
+        channels = tuple(
+            map(str, options.pop("channels", ("red", "green", "blue")))
+        )
+        if channels != ("red", "green", "blue"):
+            raise ValueError(
+                "native rgb_f64_planar display requires red, green, blue"
+            )
+        manifest = ShellIOManifest(
+            requests=(ShellIORequest.create(
+                ShellIOCapability.DISPLAY,
+                attributes={
+                    "pixel_format": "rgb_f64_planar",
+                    **options,
+                },
+            ),),
+            bindings=tuple(
+                ShellIOBinding(
+                    f"display.{channel}", artifact_name, channel
+                )
+                for channel in channels
+            ),
+        )
+        module = replace(module, api=attach_shell_io(module.api, manifest))
+
+    def resolve_source_name(source_name: str) -> Any:
+        if source_name in feeds:
+            return feeds[source_name]
+        root, *attributes = source_name.split(".")
+        if root not in feeds:
+            raise KeyError(source_name)
+        value = feeds[root]
+        for attribute in attributes:
+            value = getattr(value, attribute)
+        return value
+
+    native_inputs: dict[str, Any] = {}
+    public_input_names_by_id = {
+        int(value_id): str(source_name)
+        for source_name, value_id in (
+            compilation.public_input_value_ids or {}
+        ).items()
+    }
+
+    def resolve_compiled_value(value_id: int) -> Any:
+        visited = set()
+        current = int(value_id)
+        while current not in visited:
+            visited.add(current)
+            if current in compilation.region_feed_values:
+                return compilation.region_feed_values[current]
+            source_name = public_input_names_by_id.get(current)
+            if source_name is not None:
+                return resolve_source_name(source_name)
+            alias = compilation.hierarchical_value_aliases.get(current)
+            if alias is None:
+                break
+            current = int(alias)
+        raise KeyError(value_id)
+
+    entry = module.api.entry_point(artifact_name)
+    for parameter in entry.parameters:
+        if parameter.role != "input":
+            continue
+        source_name = str(parameter.source_name or parameter.name)
+        try:
+            native_inputs[source_name] = resolve_source_name(source_name)
+        except (AttributeError, KeyError) as error:
+            if parameter.name.startswith("t"):
+                try:
+                    value_id = int(parameter.name[1:])
+                except ValueError:
+                    value_id = -1
+                try:
+                    native_inputs[source_name] = resolve_compiled_value(
+                        value_id
+                    )
+                except (AttributeError, KeyError):
+                    pass
+                else:
+                    continue
+            raise ValueError(
+                f"compiled input {source_name!r} ({parameter.shape!r}) "
+                "has no value in feeds or the captured region cache; "
+                f"endpoint={compilation.hierarchical_value_diagnostics.get(value_id)!r}"
+            ) from error
+    resolved_feedback = dict(state_feedback or {})
+    abi_source_names = {
+        str(parameter.source_name or parameter.name)
+        for parameter in entry.parameters
+        if parameter.role != "extent"
+    }
+
+    def canonical_hierarchy_value(value_id: int) -> int:
+        visited = set()
+        current = int(value_id)
+        while current not in visited:
+            visited.add(current)
+            alias = compilation.hierarchical_value_aliases.get(current)
+            if alias is None:
+                return current
+            current = int(alias)
+        return current
+
+    for input_name, output_name in tuple(resolved_feedback.items()):
+        if output_name in abi_source_names or input_name not in abi_source_names:
+            continue
+        input_id = compilation.public_input_value_ids.get(input_name)
+        output_id = compilation.public_output_value_ids.get(output_name)
+        if output_id is None:
+            history = tuple(compilation.identity_table.get(output_name, ()))
+            output_id = history[-1] if history else None
+        if (
+            input_id is not None
+            and output_id is not None
+            and canonical_hierarchy_value(int(input_id))
+            == canonical_hierarchy_value(int(output_id))
+        ):
+            # The declared function output is the same preallocated arena as
+            # its input.  Fortran correctly publishes one inout ABI parameter
+            # rather than allocating a copy-only output.  Point feedback at
+            # that shared slot so the C shell preserves the alias contract.
+            resolved_feedback[input_name] = input_name
+    if retain_card_program:
+        from .parametric_card_program import build_parametric_card_program
+
+        card_public_inputs = dict(hierarchical_inputs)
+        if not card_public_inputs:
+            for parameter in entry.parameters:
+                if parameter.role != "input" or not parameter.name.startswith("t"):
+                    continue
+                try:
+                    value_id = int(parameter.name[1:])
+                except ValueError:
+                    continue
+                card_public_inputs[
+                    str(parameter.source_name or parameter.name)
+                ] = value_id
+        card_public_outputs = dict(hierarchical_outputs)
+        if not card_public_outputs:
+            card_public_outputs = {
+                str(output_name): int(value_id)
+                for output_name, value_id in program.outputs.items()
+            }
+        card_program = build_parametric_card_program(
+            compilation,
+            feedback=resolved_feedback,
+            public_inputs=card_public_inputs,
+            public_outputs=card_public_outputs,
+        )
+        module = replace(
+            module,
+            api=replace(
+                module.api,
+                metadata={
+                    **dict(module.api.metadata or {}),
+                    "card_program": card_program.to_mapping(),
+                },
+            ),
+        )
+    return compile_fortran_module_c_shell(
+        module,
+        native_inputs,
+        directory,
+        entrypoint=artifact_name,
+        state_feedback=resolved_feedback,
+        name=artifact_name,
+        standalone=standalone,
+    )
+
+
 __all__ = [
     "FortranCShellExecutable",
     "compile_fortran_module_c_shell",
+    "compile_ast_fortran_c_shell",
     "emit_fortran_c_shell_source",
 ]

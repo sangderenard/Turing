@@ -1,4 +1,14 @@
-"""GLSL deployment-strategy stage for ProcessGraphs."""
+"""Deployment-strategy stage for ProcessGraphs.
+
+Despite the module's filename, ``strategize_shell_deployment`` (formerly
+``strategize_glsl_deployment``) is not GLSL-specific: it is the single
+compilation choke point every backend passes through -- c, python, glsl,
+fortran-via-precompile_only, webgl, and (once registered) webgpu all
+funnel through this one control-planning stage before diverging into
+backend-specific emission later in the pipeline. See
+``accelerator_backends/aot_compile.py`` for the full pipeline this stage
+sits in.
+"""
 
 from __future__ import annotations
 
@@ -7,13 +17,15 @@ import builtins
 import copy
 import gc
 import operator
+import sys
 import time
 import traceback
 from collections import deque
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
 from typing import Any, Iterable, Mapping
+from types import ModuleType
 
 import networkx as nx
 import numpy as np
@@ -21,9 +33,11 @@ import numpy as np
 from .deployment_fifo import DeploymentFIFO
 from .control_source import (
     ControlProgram,
+    LoopBlock,
     SequenceBlock,
     StreamPublishBlock,
     ValidationBlock,
+    WhileBlock,
     overlay_scheduled_control,
     project_control_regions,
 )
@@ -38,6 +52,7 @@ from .hierarchical_plan import (
 from .loop_composer import (
     LoopBackendCapabilities,
     LoopComposer,
+    LoopStrategy,
     _destructure_loop_target,
     analyze_shader_loop_reductions,
     bind_control_deployments_to_regions,
@@ -50,7 +65,8 @@ from .process_graph_fusion import (
     reduce_scheduled_shader_regions,
 )
 from .shell_reference_tables import build_shell_reference_tables
-from ..common.tensors.abstraction import AbstractTensor
+from ..transmogrifier.function_table import FunctionReference
+from ..common.tensors.abstraction import AbstractTensor, tensor_identity
 from ..common.tensors.accelerator_backends.glsl_fused_network import (
     GLSLFusedProgramNetwork,
 )
@@ -80,7 +96,10 @@ from ..common.tensors.fused_ir import (
     OpStep,
     ordered_feed_ids,
 )
-from ..common.tensors.operator_catalog import ACCESSOR_OPERATORS
+from ..common.tensors.operator_catalog import (
+    ACCESSOR_OPERATORS,
+    CREATION_OPERATORS,
+)
 from ..transmogrifier.graph.graph_deep_compiler import GraphDeepCompiler
 from ..transmogrifier.operator_defs import (
     abstract_tensor_funcs,
@@ -150,10 +169,69 @@ def _observe_process_graph_node(
     context = _planned_capture_context.get()
     if context is None:
         return result
+    if not isinstance(result, AbstractTensor):
+        # This must be checked before the identity-aliasing logic below:
+        # ``result is parent_value`` is only a meaningful alias signal for a
+        # tensor, where object identity means shared storage.  For a plain
+        # Python value it can be a pure CPython implementation detail --
+        # small integers are interned, so ``0 + 1`` and the literal ``1``
+        # operand satisfy ``is`` by cache coincidence, not because they are
+        # the same computation.  Treating that as an alias would silently
+        # drop the operation instead of recording it.
+        #
+        # Generated numeric-kernel code runs real Python operators, and this
+        # observer is its only per-operation hook -- but everything below is
+        # tape-primitive correlation, which exists to resolve which of
+        # several possible dynamically-dispatched tensor primitives this
+        # call produced.  A plain value has no such ambiguity: its own
+        # graph node id already is its unambiguous identity, and it will
+        # never enter ``tape._nodes`` no matter how long this waits.  Record
+        # it directly, in exact execution order, the same way a reference
+        # operator (SetAttr/GetAttr) already is.
+        shell = context.get("shell")
+        if shell is not None:
+            shell.reference_operator_sequence.append(int(node_id))
+        return result
     tape = context["tape"]
-    capture_id = id(result)
+    capture_id = tensor_identity(result)
+    aliased_parents = tuple(
+        int(parent_id)
+        for parent_id, parent_value in zip(parent_ids, parent_values)
+        if result is parent_value
+    )
+    if len(aliased_parents) == 1 and int(node_id) != aliased_parents[0]:
+        # The result is literally an existing explicit operand.  Its tape
+        # entry therefore belongs to that pre-existing value; this operation
+        # did not publish a new primitive result.  Record the ProcessGraph
+        # endpoint as an SSA alias before primitive ownership is considered,
+        # otherwise the same tape identity is incorrectly assigned both to
+        # the call result and to its input socket.
+        context["value_aliases"][int(node_id)] = aliased_parents[0]
+        return result
     if capture_id in tape._nodes:
         primitive = tape._nodes[capture_id]
+        self_parent_slots = tuple(
+            int(slot)
+            for primitive_id, slot in primitive.parents
+            if int(primitive_id) == int(capture_id)
+        )
+        graph = context.get("graph")
+        graph_node = (
+            graph.G.nodes[int(node_id)]
+            if graph is not None and int(node_id) in graph.G
+            else {}
+        )
+        if (
+            self_parent_slots
+            and len(parent_ids) == 1
+            and graph_node.get("type") not in {"Store", "IndexedStore"}
+        ):
+            # An identity-preserving tensor adapter can be recorded by the
+            # tape under the same object ID as its operand.  Such a node is a
+            # self-edge in object-keyed tape space, not a numerical kernel.
+            # The ProcessGraph supplies the unambiguous SSA relationship.
+            context["value_aliases"][int(node_id)] = int(parent_ids[0])
+            return result
         existing_owner = primitive.ctx.get("process_graph_node_id")
         if existing_owner is not None:
             # A structural Store, call return, or other pass-through node may
@@ -166,7 +244,37 @@ def _observe_process_graph_node(
             int(node_id), []
         ).append(int(capture_id))
         primitive.ctx["process_graph_node_id"] = int(node_id)
-        graph = context.get("graph")
+        tensor_op = (graph_node.get("attributes") or {}).get("tensor")
+        if tensor_op in CREATION_OPERATORS and graph is not None:
+            # The first positional argument is the size. Its role varies by
+            # which ingestion path resolved this call -- "args" (generic
+            # schema descent, taken here since a static class reference like
+            # ``AbstractTensor.zeros`` doesn't go through the ordinary
+            # receiver-argument rewiring), "arg0", or "arg:0" (other call
+            # shapes) -- so match any arg-prefixed role instead of guessing
+            # one spelling, and take the first by parent id for determinism.
+            size_parent_id = min(
+                (
+                    int(parent)
+                    for parent, role in (graph_node.get("parents") or ())
+                    if str(role).lower().startswith("arg")
+                ),
+                default=None,
+            )
+            if (
+                size_parent_id is not None
+                and size_parent_id in graph.G
+                and not _source_static_value(graph, size_parent_id)
+            ):
+                # The size argument is itself computed (not a literal), so
+                # this result's shape is only what this one discovery trace
+                # happened to observe, not a compile-time fact.  Record the
+                # real origin (see Meta.shape_source_ids) instead of letting
+                # it silently freeze into a fixed number downstream.
+                dimensions = len(tuple(getattr(result, "shape", ()) or ()))
+                primitive.ctx["shape_source_ids"] = tuple(
+                    size_parent_id for _ in range(dimensions)
+                )
         collection_owners = context.get("collection_owner_ids", frozenset())
 
         def collection_source(value_id: int) -> int | None:
@@ -239,7 +347,7 @@ def _observe_process_graph_node(
             for graph_id, parent_value in zip(
                 parent_ids, parent_values
             ):
-                primitive_id = id(parent_value)
+                primitive_id = tensor_identity(parent_value)
                 if primitive_id not in primitive_ids:
                     continue
                 exact.append((int(primitive_id), int(graph_id)))
@@ -1345,6 +1453,12 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         )
         control_values.update(
             int(value_id)
+            for iterable, target, _induction, _projection
+            in control.projected_iterable_bindings
+            for value_id in (iterable, target)
+        )
+        control_values.update(
+            int(value_id)
             for source, collection, _induction, _start
             in control.collection_bindings
             for value_id in (source, collection)
@@ -1464,6 +1578,12 @@ def _refresh_hierarchy_control_captures(
         values.update(
             int(value_id)
             for iterable, target, _induction in control.iterable_bindings
+            for value_id in (iterable, target)
+        )
+        values.update(
+            int(value_id)
+            for iterable, target, _induction, _projection
+            in control.projected_iterable_bindings
             for value_id in (iterable, target)
         )
         values.update(
@@ -1681,6 +1801,32 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         for _source, collection, _induction, _start
         in control.collection_bindings
     }
+    loop_carried_update_endpoints: set[tuple[int, int]] = set()
+
+    def collect_loop_carried_updates(
+        closure_id: int,
+        block: Any,
+    ) -> None:
+        carried = (
+            block.carried_aliases
+            if isinstance(block, (LoopBlock, WhileBlock))
+            else ()
+        )
+        loop_carried_update_endpoints.update(
+            (int(closure_id), int(updated))
+            for updated, _initial in carried
+        )
+        if isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                collect_loop_carried_updates(closure_id, child)
+        elif isinstance(block, LoopBlock):
+            collect_loop_carried_updates(closure_id, block.body)
+        elif isinstance(block, WhileBlock):
+            collect_loop_carried_updates(closure_id, block.condition)
+            collect_loop_carried_updates(closure_id, block.body)
+
+    for closure_id, control in controls.items():
+        collect_loop_carried_updates(int(closure_id), control.root)
     control_alias_sources = {
         (int(closure_id), int(updated)): (
             int(closure_id),
@@ -1690,7 +1836,81 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         for updated, initial in control.value_aliases
         if (int(closure_id), int(updated))
         not in collection_owner_endpoints
+        and (int(closure_id), int(updated))
+        not in loop_carried_update_endpoints
     }
+    for closure_id, owner in shells.items():
+        selected_returns = tuple(getattr(
+            owner, "_captured_return_value_ids", ()
+        ))
+        output_names = tuple(
+            owner.process_graph.G.graph.get("function_outputs", ())
+        )
+        if len(selected_returns) != 1 or len(output_names) != 1:
+            continue
+        selected = int(selected_returns[0])
+        identities = owner.process_graph.G.graph.get(
+            "identity_table", {}
+        ) or {}
+        for output_id in identities.get(output_names[0], ()):
+            output_id = int(output_id)
+            if output_id == selected:
+                continue
+            # A statically selected early return is the sole producer of a
+            # single-output invocation.  Normalization may still correlate
+            # the function output with a later, unexecuted return expression;
+            # collapse that stale endpoint before global value projection so
+            # it cannot veto the caller-argument redirect.
+            control_alias_sources[(int(closure_id), output_id)] = (
+                int(closure_id), selected
+            )
+    for call in calls.values():
+        child_id = int(call.callee.closure_id)
+        child_owner = shells[child_id]
+        selected_returns = tuple(getattr(
+            child_owner, "_captured_return_value_ids", ()
+        ))
+        if len(selected_returns) != 1 or len(call.result_bindings) != 1:
+            continue
+        callee_result, _caller_result = call.result_bindings[0]
+        selected = int(selected_returns[0])
+        if int(callee_result) != selected:
+            control_alias_sources[(child_id, int(callee_result))] = (
+                child_id, selected
+            )
+    for closure_id, owner in shells.items():
+        parameter_inputs: dict[str, list[int]] = {}
+        for local_id, data in owner.process_graph.G.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            if (
+                data.get("type") != "Input"
+                or attributes.get("binding_kind") != "parameter"
+            ):
+                continue
+            name = attributes.get("binding_name") or data.get("label")
+            if name is not None:
+                parameter_inputs.setdefault(str(name), []).append(
+                    int(local_id)
+                )
+        for local_ids in parameter_inputs.values():
+            bound = [
+                local_id
+                for local_id in local_ids
+                if (int(closure_id), int(local_id)) in argument_sources
+            ]
+            if len(bound) != 1:
+                continue
+            canonical = int(bound[0])
+            for local_id in local_ids:
+                if int(local_id) == canonical:
+                    continue
+                # AST normalization may retain multiple Input occurrences for
+                # one source parameter while PlanCall binds only its canonical
+                # occurrence.  They are the same lexical SSA source; route
+                # every duplicate through the explicit argument edge.
+                control_alias_sources[(
+                    int(closure_id), int(local_id)
+                )] = (int(closure_id), canonical)
     shell._profiler.trace(
         path=shell.profile_path,
         section="hierarchical-artifact",
@@ -1985,6 +2205,33 @@ def _build_hierarchical_glsl_artifact(shell: Any):
             if endpoint in synthetic_static_values:
                 return synthetic_static_values[endpoint]
             root, path = rooted
+            root_owner = shells.get(int(root[0]))
+            root_graph = (
+                None if root_owner is None
+                else root_owner.process_graph.G
+            )
+            root_data = (
+                None
+                if root_graph is None or int(root[1]) not in root_graph
+                else root_graph.nodes[int(root[1])]
+            )
+            root_name = (
+                None
+                if root_data is None
+                else (root_data.get("attributes") or {}).get(
+                    "binding_name"
+                )
+            )
+            static_fields = (
+                {}
+                if root_owner is None
+                else getattr(
+                    root_owner, "_capture_input_static_fields", {}
+                )
+            )
+            static_key = (str(root_name), tuple(map(str, path)))
+            if root_name is not None and static_key in static_fields:
+                return static_fields[static_key]
             projected = leaves(*root)
             target = projected.get(tuple(path))
             if target is not None and target != endpoint:
@@ -2321,6 +2568,17 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     # this does not inspect or specialize the captured value.
                     if value_meta(projected[()]) is not None:
                         return True
+                argument_data = graph.nodes[int(argument)]
+                argument_name = (
+                    argument_data.get("attributes") or {}
+                ).get("binding_name")
+                if (
+                    argument_data.get("type") == "Input"
+                    and argument_name in getattr(
+                        owner, "_capture_tensor_input_names", ()
+                    )
+                ):
+                    return True
         if not (
             isinstance(expression, ast.Compare)
             and len(expression.ops) == 1
@@ -2461,6 +2719,29 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     ),
                     None,
                 )
+                control_parent = next((
+                    parent
+                    for parent, role in parents
+                    if role == "control"
+                ), None)
+                if (
+                    data.get("type") == "LoopResult"
+                    and control_parent is not None
+                    and getattr(
+                        owner, "_captured_loop_iterations", {}
+                    ).get(int(control_parent)) == 0
+                ):
+                    binding_name = attributes.get("binding_name")
+                    control_attributes = (
+                        graph.nodes[int(control_parent)].get("attributes")
+                        or {}
+                    )
+                    carried = (
+                        control_attributes.get("loop_carried_bindings")
+                        or {}
+                    ).get(binding_name)
+                    if carried is not None:
+                        value_parent = int(carried[0])
                 if (
                     value_parent is not None
                     and key not in collection_owner_endpoints
@@ -2597,6 +2878,21 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                             selected_role = (
                                 "body" if predicate else "orelse"
                             )
+                if selected_role is None:
+                    test_id = next((
+                        parent
+                        for parent, role in parents
+                        if role == "test"
+                    ), None)
+                    predicate = (
+                        None
+                        if test_id is None
+                        else static_predicate(key[0], test_id)
+                    )
+                    if predicate is not None:
+                        selected_role = (
+                            "body" if predicate else "orelse"
+                        )
                 selected = next((
                     parent
                     for parent, role in parents
@@ -2780,7 +3076,22 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                 call := calls.get(key)
             ) is not None:
                 child_id = int(call.callee.closure_id)
-                child = shells[child_id].process_graph.G
+                child_owner = shells[child_id]
+                child = child_owner.process_graph.G
+                selected_returns = tuple(
+                    getattr(
+                        child_owner,
+                        "_captured_return_value_ids",
+                        (),
+                    )
+                )
+                if len(selected_returns) == 1:
+                    result = dict(leaves(
+                        child_id, int(selected_returns[0])
+                    ))
+                    resolved_leaves[key] = result
+                    resolving.remove(key)
+                    return result
                 output_names = tuple(
                     child.graph.get("function_outputs", ())
                 )
@@ -2803,6 +3114,20 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         return result
 
     def canonical_global(closure_id: int, local_id: int) -> int:
+        if (int(closure_id), int(local_id)) in loop_carried_update_endpoints:
+            # A loop backedge is a cut in the projection graph.  Structural
+            # leaf resolution walks value/alias/call edges as if the program
+            # were acyclic, so it happily fuses the two endpoints of a cycle:
+            # a LoopResult carries its value edge through to the very update
+            # it publishes, and a caller result, local copy, or IndexedStore
+            # correlated with the same source name resolves to that same leaf.
+            # Both endpoints then land on one global and the header Phi
+            # degenerates to Phi(x, x), leaving no body producer to find.
+            # Storage reuse across the backedge stays an arena decision; the
+            # update keeps its own SSA identity here so the pair survives to
+            # Phi construction.  Same exclusion the alias table already
+            # applies, extended to the projection that assigns identity.
+            return global_value(closure_id, local_id)
         projected = leaves(closure_id, local_id)
         if len(projected) == 1 and () in projected:
             return global_value(*projected[()])
@@ -3565,6 +3890,63 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     in owner.compiled_feed_meta.items()
                 }
             ),
+            "captured_return_value_ids": (
+                ()
+                if owner is None
+                else tuple(sorted(getattr(
+                    owner, "_captured_return_value_ids", ()
+                )))
+            ),
+            "hierarchy_call": (
+                int(closure_id), int(local_id)
+            ) in calls,
+            "call_result_bindings": tuple(
+                getattr(
+                    calls.get((int(closure_id), int(local_id))),
+                    "result_bindings",
+                    (),
+                )
+            ),
+            "argument_source": argument_sources.get((
+                int(closure_id), int(local_id)
+            )),
+            "control_alias_source": control_alias_sources.get((
+                int(closure_id), int(local_id)
+            )),
+            "parent_details": (
+                ()
+                if graph is None
+                else tuple(
+                    (
+                        int(parent),
+                        str(role),
+                        graph.nodes[int(parent)].get("type"),
+                        graph.nodes[int(parent)].get("label"),
+                        dict(
+                            graph.nodes[int(parent)].get("attributes") or {}
+                        ),
+                    )
+                    for parent, role in (data.get("parents") or ())
+                    if int(parent) in graph
+                )
+            ),
+            "capture_input_types": (
+                {}
+                if owner is None
+                else {
+                    str(name): tuple(sorted(types))
+                    for name, types in getattr(
+                        owner, "_capture_input_type_names", {}
+                    ).items()
+                }
+            ),
+            "captured_source_branches": (
+                ()
+                if owner is None
+                else tuple(getattr(
+                    owner, "_captured_source_branches", ()
+                ))
+            ),
             "expr": (
                 None
                 if not isinstance(data.get("expr_obj"), ast.AST)
@@ -3591,6 +3973,85 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         global_id: tuple(details)
         for global_id, details in endpoint_details.items()
     }
+    # Preserve source provenance through graph-inert tensor accommodation.
+    # A common example is ``x if isinstance(x, AbstractTensor) else
+    # AbstractTensor.tensor(x)``: both arms name the same semantic input, but
+    # the IfExp owns a private ProcessGraph endpoint.  It must not become a
+    # fabricated native ABI input merely because tensor discovery selected
+    # one arm.  This is derived exclusively from scoped graph edges and the
+    # hierarchy value table, never from observed values or wrapper identity.
+    transparent_cache: dict[tuple[int, int], int | None] = {}
+
+    def transparent_origin(
+        closure_id: int,
+        local_id: int,
+        visiting: frozenset[tuple[int, int]] = frozenset(),
+    ) -> int | None:
+        endpoint = (int(closure_id), int(local_id))
+        if endpoint in transparent_cache:
+            return transparent_cache[endpoint]
+        if endpoint in visiting:
+            return None
+        owner = shells.get(endpoint[0])
+        graph = None if owner is None else owner.process_graph.G
+        if graph is None or endpoint[1] not in graph:
+            return None
+        data = graph.nodes[endpoint[1]]
+        parents = {
+            str(role): int(parent)
+            for parent, role in (data.get("parents") or ())
+        }
+        next_visiting = visiting | {endpoint}
+        origin = None
+        if data.get("type") == "Input":
+            origin = composed_global(*endpoint)
+        elif isinstance(data.get("expr_obj"), ast.IfExp):
+            body = parents.get("body")
+            orelse = parents.get("orelse")
+            body_origin = (
+                None if body is None else transparent_origin(
+                    endpoint[0], body, next_visiting
+                )
+            )
+            orelse_origin = (
+                None if orelse is None else transparent_origin(
+                    endpoint[0], orelse, next_visiting
+                )
+            )
+            if body_origin is not None and body_origin == orelse_origin:
+                origin = body_origin
+        elif isinstance(data.get("expr_obj"), ast.Call):
+            expression = data["expr_obj"]
+            function = expression.func
+            is_tensor_accommodation = (
+                isinstance(function, ast.Attribute)
+                and function.attr == "tensor"
+                and isinstance(function.value, ast.Name)
+                and function.value.id == "AbstractTensor"
+            )
+            if is_tensor_accommodation:
+                argument = next((
+                    int(parent)
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"arg", "args", "arg:0", "arg0"}
+                ), None)
+                if argument is not None:
+                    origin = transparent_origin(
+                        endpoint[0], argument, next_visiting
+                    )
+        transparent_cache[endpoint] = origin
+        return origin
+
+    hierarchical_value_aliases = {}
+    for global_id, details in shell.hierarchical_endpoint_details.items():
+        for detail in details:
+            origin = transparent_origin(
+                int(detail["closure"]), int(detail["local"])
+            )
+            if origin is not None and int(origin) != int(global_id):
+                hierarchical_value_aliases[int(global_id)] = int(origin)
+                break
+    shell.hierarchical_value_aliases = hierarchical_value_aliases
     root_parameter_names = {
         str((data.get("attributes") or {}).get("binding_name"))
         for _node_id, data in shell.process_graph.G.nodes(data=True)
@@ -3687,6 +4148,8 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         if value_id in resident_values
     }
     shell.hierarchical_public_output_ids = set(terminals.values())
+    shell.hierarchical_terminal_outputs = dict(terminals)
+    shell.hierarchical_specialized_values = dict(specialized_values)
     stream_outputs = {}
     for plan in shell.loop_plans:
         for statement_id, published_value_id, _count_id in (
@@ -3812,6 +4275,11 @@ def _diagnostic_value_summary(value: Any) -> str:
     if isinstance(value, type):
         return f"type:{value.__module__}.{value.__qualname__}"
     shape = getattr(value, "shape", None)
+    if callable(shape):
+        # Namespace objects may export an operation called ``shape``.  Mirror
+        # the runtime tensorization rule so failure reporting cannot mask the
+        # original exception while trying to iterate that function.
+        shape = None
     dtype = getattr(value, "dtype", None)
     device = getattr(value, "device", None)
     prefix = type(value).__name__
@@ -4008,6 +4476,17 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
             str(data.get("label", "")).startswith("unpack[")
             or graph.G.nodes[indexed_base].get("type")
             in {"Tuple", "List", "Set", "Dict"}
+            or any(
+                parent in graph.G
+                and graph.G.nodes[parent].get("type")
+                in {"Const", "const", "Constant"}
+                and isinstance(
+                    _constant_value(graph.G.nodes[parent]),
+                    (str, bytes),
+                )
+                for parent, role in parents
+                if str(role) == "index"
+            )
         )
     )
     compares_none = (
@@ -4085,15 +4564,29 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
     # Loop-target initializers are coordinator state setup.  Their values may
     # use ordinary tensor operations, but emitting them as an independent GPU
     # region duplicates work before the retained loop owns the binding.
-    loop_target_initializer = any(
-        node_id in set(
-            (candidate.get("attributes") or {})
-            .get("loop_target_initials", {})
-            .values()
-        )
-        for _candidate_id, candidate in graph.G.nodes(data=True)
-        if isinstance(candidate.get("expr_obj"), (ast.For, ast.While))
+    loop_target_initializers = getattr(
+        graph,
+        "_dispatch_loop_target_initializers",
+        None,
     )
+    if loop_target_initializers is None:
+        loop_target_initializers = frozenset(
+            int(initializer)
+            for _candidate_id, candidate in graph.G.nodes(data=True)
+            if isinstance(
+                candidate.get("expr_obj"),
+                (ast.For, ast.While),
+            )
+            for initializer in (
+                (candidate.get("attributes") or {})
+                .get("loop_target_initials", {})
+                .values()
+            )
+        )
+        graph._dispatch_loop_target_initializers = (
+            loop_target_initializers
+        )
+    loop_target_initializer = node_id in loop_target_initializers
     return (
         bool(
             (data.get("attributes") or {}).get(
@@ -4135,6 +4628,8 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
             "Call",
             "StaticReference",
             "SetAttr",
+            "DelAttr",
+            "DelItem",
             "Phi",
             "LoopExit",
             "LoopStateTransition",
@@ -4277,6 +4772,9 @@ def _dispatch_subgraph(
     }
     included = selected | boundary
     subgraph = extract_clean_process_subgraph(graph, included)
+    subgraph.python_bindings = dict(
+        getattr(graph, "python_bindings", {}) or {}
+    )
     for child in included:
         roles = {
             parent: role
@@ -4480,6 +4978,64 @@ def _control_partition_keys(
         callsite: nx.descendants(graph.G, callsite)
         for callsite in callsites
     }
+    comprehension_owners = tuple(dict.fromkeys(
+        int(node_id)
+        for plan in plans
+        if isinstance(
+            graph.G.nodes[int(plan.loop.node_id)].get("expr_obj"),
+            ast.comprehension,
+        )
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(
+            data.get("expr_obj"),
+            (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+        )
+        and any(
+            int(parent) == int(plan.loop.node_id)
+            and str(role) == "generators"
+            for parent, role in data.get("parents", ())
+        )
+    ))
+    comprehension_descendants = {
+        owner: nx.descendants(graph.G, owner)
+        for owner in comprehension_owners
+    }
+    expression_nodes = {
+        id(data.get("expr_obj")): int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.AST)
+    }
+    comprehension_body_members = {}
+    for owner in comprehension_owners:
+        aggregate = graph.G.nodes[owner].get("expr_obj")
+        body_roots = (
+            (aggregate.key, aggregate.value)
+            if isinstance(aggregate, ast.DictComp)
+            else (aggregate.elt,)
+        )
+        comprehension_body_members[owner] = frozenset(
+            expression_nodes[id(member)]
+            for body_root in body_roots
+            for member in ast.walk(body_root)
+            if id(member) in expression_nodes
+        )
+    loop_control_frontiers = tuple(
+        (
+            int(plan.loop.node_id),
+            int(control_id),
+            int(getattr(expression, "end_lineno", expression.lineno)),
+            frozenset(map(int, plan.loop.body_nodes)),
+        )
+        for plan in plans
+        for control_id in plan.loop.body_nodes
+        if control_id in graph.G
+        for expression in (graph.G.nodes[control_id].get("expr_obj"),)
+        if isinstance(expression, ast.If)
+        and any(
+            isinstance(member, (ast.Break, ast.Continue))
+            for member in ast.walk(expression)
+        )
+    )
     return {
         node_id: (
             tuple(
@@ -4489,9 +5045,31 @@ def _control_partition_keys(
             ),
             tuple(sorted(branches.get(node_id, ()))),
             tuple(
+                owner
+                for owner in comprehension_owners
+                if node_id in comprehension_body_members[owner]
+            ),
+            tuple(
                 callsite
                 for callsite in callsites
                 if node_id in call_descendants[callsite]
+            ),
+            tuple(
+                owner
+                for owner in comprehension_owners
+                if node_id in comprehension_descendants[owner]
+            ),
+            tuple(
+                (loop_id, control_id)
+                for loop_id, control_id, end_line, body in loop_control_frontiers
+                if node_id in body
+                and int(
+                    getattr(
+                        graph.G.nodes[node_id].get("expr_obj"),
+                        "lineno",
+                        -1,
+                    )
+                ) > end_line
             ),
         )
         for node_id in node_ids
@@ -4597,6 +5175,29 @@ def _compiler_input_name(label: str) -> str:
     else:
         prefix = "float"
     return f"{prefix}{name}"
+
+
+def _graph_source_binding_name(graph: Any, node_id: int) -> str | None:
+    """Recover a dotted public-input path for a numerical boundary node."""
+
+    data = graph.G.nodes[int(node_id)]
+    if data.get("type") == "Input":
+        return str(data.get("label"))
+    if data.get("type") != "Attribute":
+        return None
+    parent = next(
+        (
+            int(candidate)
+            for candidate, role in (data.get("parents") or ())
+            if str(role) == "value"
+        ),
+        None,
+    )
+    attribute = getattr(data.get("expr_obj"), "attr", None)
+    if parent is None or attribute is None:
+        return None
+    root = _graph_source_binding_name(graph, parent)
+    return None if root is None else f"{root}.{attribute}"
 
 
 def _bind_capture_tape(
@@ -4958,6 +5559,13 @@ def _project_captured_program(
         if allowed_result_ids is None
         else {int(value) for value in allowed_result_ids}
     )
+    synthetic_results = {
+        int(value_id)
+        for program in (captured.program, *captured.execution_programs)
+        for value_id in (
+            (program.extras or {}).get("synthetic_result_ids", ())
+        )
+    }
     all_steps = [
         step
         for program in captured.execution_programs
@@ -5008,6 +5616,7 @@ def _project_captured_program(
             or (
                 allowed_results is not None
                 and value_id not in allowed_results
+                and value_id not in synthetic_results
                 and not is_region_output
             )
             or value_id in selected
@@ -5025,6 +5634,7 @@ def _project_captured_program(
                 and (
                     allowed_results is None
                     or input_id in allowed_results
+                    or input_id in synthetic_results
                 )
             ):
                 pending.append((input_id, False))
@@ -5141,6 +5751,25 @@ def _resolve_binding_name(shell: Any, captured: Any, feed_id: int):
         direct = names.get(feed_id)
         if direct:
             return direct
+        for aggregate_map in (
+            getattr(candidate, "compiled_aggregate_feed_paths", ()) or ()
+        ):
+            for capture_id, graph_input_id, path in aggregate_map:
+                if int(capture_id) != int(feed_id):
+                    continue
+                graph = getattr(candidate, "process_graph", None)
+                if graph is None or int(graph_input_id) not in graph.G:
+                    continue
+                root = _compiler_input_name(
+                    graph.G.nodes[int(graph_input_id)]["label"]
+                )
+                suffix = "".join(
+                    f".{part}" if isinstance(part, str)
+                    and part.isidentifier()
+                    else f"[{part!r}]"
+                    for part in path
+                )
+                return root + suffix
     if storage is None:
         return None
     for candidate in candidates:
@@ -5264,6 +5893,14 @@ def _constant_value(data: dict[str, Any]) -> Any:
     raise KeyError("constant ProcessGraph node has no literal payload")
 
 
+class _SourceReturnSignal(Exception):
+    """Internal non-error transfer for a compiled Python ``return``."""
+
+    def __init__(self, value: Any):
+        super().__init__()
+        self.value = value
+
+
 def _call_arguments(
     parents: tuple[tuple[int, str], ...],
     values: dict[int, Any],
@@ -5331,9 +5968,18 @@ def _static_python_value(bindings: dict[str, Any], path: str) -> Any:
     try:
         value = bindings[parts[0]]
     except KeyError as exc:
-        raise KeyError(
-            f"static Python reference {path!r} has no retained binding"
-        ) from exc
+        candidates = []
+        for module in tuple(sys.modules.values()):
+            namespace = getattr(module, "__dict__", None)
+            if isinstance(namespace, dict) and parts[0] in namespace:
+                candidates.append(namespace[parts[0]])
+        identities = {id(candidate): candidate for candidate in candidates}
+        if len(identities) != 1:
+            raise KeyError(
+                f"static Python reference {path!r} has no retained binding"
+            ) from exc
+        value = next(iter(identities.values()))
+        bindings[parts[0]] = value
     for part in parts[1:]:
         value = getattr(value, part)
     return value
@@ -5341,6 +5987,19 @@ def _static_python_value(bindings: dict[str, Any], path: str) -> Any:
 
 def _tensorize_graph_input(value: Any, *, device: Any) -> Any:
     """Move array-shaped public inputs onto the selected AbstractTensor backend."""
+
+    def has_array_protocol(candidate: Any) -> bool:
+        return (
+            isinstance(candidate, np.ndarray)
+            or callable(getattr(candidate, "__array__", None))
+            or hasattr(candidate, "__cuda_array_interface__")
+            or callable(getattr(candidate, "__dlpack__", None))
+            or (
+                getattr(candidate, "dtype", None) is not None
+                and getattr(candidate, "shape", None) is not None
+                and not callable(getattr(candidate, "shape", None))
+            )
+        )
 
     if isinstance(value, AbstractTensor):
         return value
@@ -5364,8 +6023,52 @@ def _tensorize_graph_input(value: Any, *, device: Any) -> Any:
         # calls through.  Its ``shape`` attribute is the unbound descriptor of
         # its instances, not the extent of an array-shaped input.
         return value
+    if isinstance(value, ModuleType):
+        return value
+    fields = getattr(value, "__dict__", None)
+    if isinstance(fields, dict) and not callable(value):
+        replacements = {}
+        for name, field_value in fields.items():
+            if isinstance(field_value, (type, ModuleType)) or callable(
+                field_value
+            ):
+                continue
+            if isinstance(field_value, AbstractTensor):
+                continue
+            if isinstance(field_value, np.dtype):
+                continue
+            field_shape = getattr(field_value, "shape", None)
+            if (
+                field_shape is None
+                or callable(field_shape)
+                or not has_array_protocol(field_value)
+            ):
+                continue
+            replacements[str(name)] = AbstractTensor.tensor(
+                field_value,
+                device=device,
+            )
+        if replacements:
+            # Discovery must not rewrite the caller's live Python object. A
+            # shallow structural copy retains its scalar configuration and
+            # the preallocated storage beneath each tensor wrapper, while
+            # method assignments describe arena state on the capture copy.
+            resident = copy.copy(value)
+            for name, field_value in replacements.items():
+                setattr(resident, name, field_value)
+            return resident
     shape = getattr(value, "shape", None)
-    if shape is None:
+    if shape is None or callable(shape):
+        # Imported scientific modules can export a public function named
+        # ``shape`` (SymPy is one example).  Attribute presence alone is not
+        # an array protocol: a callable shape describes an operation supplied
+        # by the namespace, not the resident extent of the namespace object.
+        # Keep such coordinator values intact so nested closures can continue
+        # to call module constructors such as ``sympy.Symbol``.
+        return value
+    if not has_array_protocol(value):
+        # Domain objects may expose a structural ``shape`` through dynamic
+        # attribute routing.  Shape alone is not an upload protocol.
         return value
     return AbstractTensor.tensor(value, device=device)
 
@@ -5398,11 +6101,118 @@ def _coordinate_scheduled_capture_impl(
         shell._execute_invocations += 1
     graph = shell.process_graph
     supplied = dict(initial_values)
+    live_binding_unavailable = object()
+
+    def live_function_module_binding(name: str) -> Any:
+        """Read a callee global from its owning live Python module.
+
+        Static bindings describe the namespace at planning time.  A program
+        may deliberately populate module globals later (lazy imports are the
+        usual case), so a compiled callee must consult its own module at the
+        source-ordered point where the name is first read.  The function
+        table's qualified identity keeps this lookup lexical and prevents
+        globals from unrelated discovered modules from being merged.
+        """
+
+        function_table = getattr(graph, "function_table", None)
+        function_reference = graph.G.graph.get("function_ref")
+        if function_table is None or function_reference is None:
+            return live_binding_unavailable
+        try:
+            qualified_name = str(
+                function_table.entry(int(function_reference)).qualified_name
+            )
+        except (KeyError, TypeError, ValueError):
+            return live_binding_unavailable
+        qualified_candidates = [qualified_name]
+        method_owner = graph.G.graph.get("method_owner")
+        if method_owner is not None:
+            map_ir = graph.G.graph.get("map_ir") or {}
+            for object_schema in map_ir.get("objects", ()):
+                if str(object_schema.get("class_name")) == str(method_owner):
+                    qualified_candidates.append(
+                        str(object_schema.get("class_identity", ""))
+                    )
+        for qualified_candidate in qualified_candidates:
+            components = qualified_candidate.split(".")
+            for stop in range(len(components), 0, -1):
+                module = sys.modules.get(".".join(components[:stop]))
+                if module is None:
+                    continue
+                namespace = vars(module)
+                return namespace.get(name, live_binding_unavailable)
+        return live_binding_unavailable
+
     values: dict[int, Any] = {
         int(key): value
         for key, value in supplied.items()
         if isinstance(key, int)
     }
+    function_identities = graph.G.graph.get("identity_table", {}) or {}
+
+    def record_static_input_fields(
+        binding_name: str,
+        value: Any,
+        path: tuple[str, ...] = (),
+        visiting: frozenset[int] = frozenset(),
+    ) -> None:
+        if value is None or isinstance(
+            value, (bool, int, float, str, bytes)
+        ):
+            shell._capture_input_static_fields[
+                (str(binding_name), tuple(path))
+            ] = value
+            return
+        identity = id(value)
+        if identity in visiting or len(path) >= 8:
+            return
+        fields = getattr(value, "__dict__", None)
+        if not isinstance(fields, dict) or callable(value):
+            return
+        next_visiting = visiting | {identity}
+        for field_name, field_value in fields.items():
+            record_static_input_fields(
+                binding_name,
+                field_value,
+                (*path, str(field_name)),
+                next_visiting,
+            )
+
+    def bound_target_names(target: ast.AST | None) -> tuple[str, ...]:
+        if target is None:
+            return ()
+        if isinstance(target, ast.Name):
+            return (target.id,)
+        if isinstance(target, ast.Starred):
+            return bound_target_names(target.value)
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return tuple(
+                name
+                for item in target.elts
+                for name in bound_target_names(item)
+            )
+        return ()
+
+    source_with_bindings = frozenset(
+        name
+        for statement in graph.G.graph.get("function_body", ())
+        for member in ast.walk(statement)
+        if isinstance(member, ast.With)
+        for item in member.items
+        for name in bound_target_names(item.optional_vars)
+    )
+
+    def has_deferred_local_definition(name: str, input_id: int) -> bool:
+        """Whether source execution, rather than invocation, defines name."""
+
+        return name in source_with_bindings or any(
+            int(identity) != int(input_id)
+            and int(identity) in graph.G
+            and str(graph.G.nodes[int(identity)].get("type"))
+            not in {"Input", "input"}
+            for identity in function_identities.get(name, ())
+        )
+
     for node_id, data in graph.G.nodes(data=True):
         if str(data.get("type")) not in {"Input", "input"}:
             continue
@@ -5417,6 +6227,14 @@ def _coordinate_scheduled_capture_impl(
                 (data.get("attributes") or {}).get("binding_kind")
             )
             if binding_kind in {"loop", "exception"}:
+                continue
+            live_binding = live_function_module_binding(name)
+            if (
+                binding_kind == "external"
+                and live_binding is not live_binding_unavailable
+            ):
+                values[node_id] = live_binding
+                shell.static_python_bindings[name] = live_binding
                 continue
             class_descriptor = graph.G.graph.get(
                 "class_table",
@@ -5434,13 +6252,52 @@ def _coordinate_scheduled_capture_impl(
             ):
                 values[node_id] = shell.static_python_bindings[name]
                 continue
+            if (
+                binding_kind == "external"
+                and name not in supplied
+                and has_deferred_local_definition(name, node_id)
+            ):
+                # Control-flow normalization can retain an Input-shaped
+                # occurrence before its assignment producer (notably a
+                # local assigned inside ``try``).  It is a Python local, not
+                # an invocation requirement; its use will resolve from the
+                # source frame after the defining statement executes.
+                continue
             if name not in supplied:
                 raise KeyError(
                     f"missing ProcessGraph input {name!r} in "
                     f"{graph.G.graph.get('function_name', '?')} at node "
                     f"{node_id}; binding_kind={binding_kind!r}"
                 )
-            values[node_id] = supplied[name]
+            supplied_value = supplied[name]
+            supplied_shape = getattr(supplied_value, "shape", None)
+            if (
+                isinstance(supplied_value, AbstractTensor)
+                or isinstance(supplied_value, np.ndarray)
+                or callable(getattr(supplied_value, "__array__", None))
+                or (
+                    supplied_shape is not None
+                    and not callable(supplied_shape)
+                    and getattr(supplied_value, "dtype", None) is not None
+                )
+            ):
+                # Public array parameters enter the selected capture device
+                # at the function boundary.  Deferring this until the first
+                # numerical region lets an enclosing structural call observe
+                # NumPy while its callee observes AbstractTensor, changing
+                # source branches such as dt_system._restore_type and baking
+                # an incidental host conversion into the graph.
+                values[node_id] = _tensorize_graph_input(
+                    supplied_value, device=device
+                )
+            else:
+                values[node_id] = supplied_value
+            shell._capture_input_type_names.setdefault(
+                str(name), set()
+            ).add(type(values[node_id]).__qualname__)
+            if isinstance(values[node_id], AbstractTensor):
+                shell._capture_tensor_input_names.add(str(name))
+            record_static_input_fields(str(name), values[node_id])
             # Keep the name against both the object and the storage under
             # it. The object is wrapped into an AbstractTensor before it is
             # ever used, so object identity alone does not survive to the
@@ -5454,7 +6311,10 @@ def _coordinate_scheduled_capture_impl(
             except AttributeError:
                 pass
 
-    inert_nodes = _inert_routing_nodes(graph)
+    # Source execution can prove a graph-inert expression live at runtime
+    # (for example the selected arm of an IfExp), so this coordinator view is
+    # intentionally mutable even though the planner returns a frozenset.
+    inert_nodes = set(_inert_routing_nodes(graph))
     regions = tuple(
         zip(
             shell.deep_compilers,
@@ -5463,6 +6323,7 @@ def _coordinate_scheduled_capture_impl(
         )
     )
     region_for_node: dict[int, int] = {}
+    coordinator_override_nodes: set[int] = set()
     for region_index, (_compiler, subgraph, _ephemeral) in enumerate(regions):
         if region_index in shell.coordinator_region_indices:
             continue
@@ -5472,6 +6333,45 @@ def _coordinate_scheduled_capture_impl(
                     f"ProcessGraph node {node_id} belongs to two dispatches"
                 )
             region_for_node[node_id] = region_index
+        deployment_nodes = tuple(
+            subgraph.G.graph.get("deployment_nodes", ())
+        )
+        if any(
+            graph.G.nodes[node_id].get("type") == "Indexed"
+            and any(
+                parent in graph.G
+                and graph.G.nodes[parent].get("type")
+                in {"Const", "const", "Constant"}
+                and isinstance(
+                    _constant_value(graph.G.nodes[parent]),
+                    (str, bytes),
+                )
+                for parent, role in (
+                    graph.G.nodes[node_id].get("parents") or ()
+                )
+                if str(role) == "index"
+            )
+            for node_id in deployment_nodes
+            if node_id in graph.G
+        ):
+            coordinator_override_nodes.update(deployment_nodes)
+        if any(
+            graph.G.nodes[node_id].get("type") == "IndexedStore"
+            and any(
+                isinstance(values.get(int(parent)), (dict, list, set))
+                for parent, role in (
+                    graph.G.nodes[node_id].get("parents") or ()
+                )
+                if str(role) == "base"
+            )
+            for node_id in deployment_nodes
+            if node_id in graph.G
+        ):
+            # A fused region cannot clone or shader-store a Python container.
+            # Runtime input type is authoritative during discovery; route the
+            # whole coupled region through coordinator mutation so no sibling
+            # dispatch claims the same structural store first.
+            coordinator_override_nodes.update(deployment_nodes)
 
     controlled_nodes = {
         parent
@@ -5484,6 +6384,42 @@ def _coordinate_scheduled_capture_impl(
         id(data.get("expr_obj")): node_id
         for node_id, data in graph.G.nodes(data=True)
         if isinstance(data.get("expr_obj"), ast.AST)
+    }
+    function_body = tuple(graph.G.graph.get("function_body", ()))
+    source_returns: list[ast.Return] = []
+    nonlocal_names: set[str] = set()
+
+    class _CurrentFunctionReturnVisitor(ast.NodeVisitor):
+        def visit_Return(self, statement):
+            if statement.value is not None:
+                source_returns.append(statement)
+
+        def visit_Nonlocal(self, statement):
+            nonlocal_names.update(map(str, statement.names))
+
+        def visit_FunctionDef(self, statement):
+            return None
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Lambda(self, statement):
+            return None
+
+        def visit_ClassDef(self, statement):
+            return None
+
+    return_visitor = _CurrentFunctionReturnVisitor()
+    for body_statement in function_body:
+        return_visitor.visit(body_statement)
+    ordered_return_values = tuple(
+        (graph.G.graph.get("return_value_nodes", {}) or {}).values()
+    )
+    checkpoint_return_value_nodes = {
+        id(statement): int(value_node)
+        for statement, value_node in zip(
+            source_returns, ordered_return_values
+        )
+        if int(value_node) in graph.G
     }
     for _control_id, data in graph.G.nodes(data=True):
         expression = data.get("expr_obj")
@@ -5553,6 +6489,11 @@ def _coordinate_scheduled_capture_impl(
     }
     comprehension_owner_by_binding: dict[int, int] = {}
     comprehension_owner_by_generator: dict[int, int] = {}
+    loop_owner_by_binding = {
+        int(binding): int(plan.loop.node_id)
+        for plan in shell.loop_plans
+        for _name, binding in plan.loop.target_bindings
+    }
     for plan in shell.loop_plans:
         loop_expression = graph.G.nodes[
             plan.loop.node_id
@@ -5582,10 +6523,31 @@ def _coordinate_scheduled_capture_impl(
     loop_invalidated_nodes: dict[int, set[int]] = {}
     for plan in shell.loop_plans:
         controlled_nodes.add(plan.loop.node_id)
-        controlled_nodes.update(plan.loop.body_nodes)
-        invalidated = set(plan.loop.body_nodes)
-        for body_node in plan.loop.body_nodes:
+        # Lexical normalization can fold or remove a body node after the loop
+        # plan records its source identity.  The surviving graph is the
+        # executable authority; stale source ids must not be handed to
+        # NetworkX as traversal roots.
+        live_body_nodes = {
+            int(body_node)
+            for body_node in plan.loop.body_nodes
+            if int(body_node) in graph.G
+        }
+        controlled_nodes.update(live_body_nodes)
+        invalidated = set(live_body_nodes)
+        for body_node in live_body_nodes:
             invalidated.update(nx.descendants(graph.G, body_node))
+        # Retained-loop backedges make the graph cyclic.  A raw descendants
+        # walk can therefore wrap through the loop and reach invariant
+        # producers that dominate the control node.  Clearing those values
+        # replays effectful work performed before the loop (for example the
+        # dt system's completed superstep while iterating its attempt log).
+        # Body identities remain iteration-owned; other ancestors of the
+        # loop control are already-computed invariants.
+        invariant_ancestors = (
+            set(nx.ancestors(graph.G, plan.loop.node_id))
+            - live_body_nodes
+        )
+        invalidated.difference_update(invariant_ancestors)
         loop_invalidated_nodes[plan.loop.node_id] = invalidated
         # The planner loop owns the complete work cone fed by its body,
         # including numerical regions that consume the induction binding.
@@ -5734,10 +6696,98 @@ def _coordinate_scheduled_capture_impl(
         inputs: dict[str, Any] = {}
         for input_id in subgraph.G.graph["deployment_inputs"]:
             input_value = evaluate_node(input_id)
+            tensorized_input = _tensorize_graph_input(
+                input_value,
+                device=device,
+            )
+            if tensorized_input is not input_value:
+                # Object-field projections become numerical region feeds only
+                # after structural attribute evaluation.  Public inputs were
+                # tensorized earlier, but these late projections must join the
+                # same resident/tape path or ndarray methods execute invisibly
+                # in Python during discovery.
+                values[input_id] = tensorized_input
+                input_value = tensorized_input
+            source_binding = _graph_source_binding_name(graph, input_id)
+            if source_binding is not None:
+                shell._capture_input_names[id(input_value)] = source_binding
+                storage = _capture_storage_identity(input_value)
+                if storage is not None:
+                    shell._capture_input_storage[storage] = source_binding
             name = _compiler_input_name(
                 subgraph.G.nodes[input_id]["label"]
             )
             inputs[name] = input_value
+
+        deployment_nodes = tuple(
+            subgraph.G.graph.get("deployment_nodes", ())
+        )
+        has_structural_store = any(
+            str(
+                graph.G.nodes[candidate].get("op")
+                or graph.G.nodes[candidate].get("type")
+            ) == "IndexedStore"
+            and any(
+                str(role) == "base"
+                and isinstance(values.get(int(parent)), (dict, list, set))
+                for parent, role in (
+                    graph.G.nodes[candidate].get("parents") or ()
+                )
+            )
+            for candidate in deployment_nodes
+            if candidate in graph.G
+        )
+        has_structural_container_call = any(
+            isinstance(expression := graph.G.nodes[candidate].get("expr_obj"), ast.Call)
+            and isinstance(expression.func, ast.Attribute)
+            and (
+                any(
+                    str(role) in {"operand", "receiver"}
+                    and isinstance(values.get(int(parent)), (dict, list, set))
+                    for parent, role in (
+                        graph.G.nodes[candidate].get("parents") or ()
+                    )
+                )
+                or (
+                    isinstance(expression.func.value, ast.Name)
+                    and isinstance(
+                        source_binding_values.get(expression.func.value.id),
+                        (dict, list, set),
+                    )
+                )
+            )
+            for candidate in deployment_nodes
+            if candidate in graph.G
+        )
+        has_structural_indexed_read = any(
+            str(
+                graph.G.nodes[candidate].get("op")
+                or graph.G.nodes[candidate].get("type")
+            ) == "Indexed"
+            and any(
+                str(role) == "base"
+                and isinstance(
+                    values.get(int(parent)), (dict, list, tuple, set)
+                )
+                for parent, role in (
+                    graph.G.nodes[candidate].get("parents") or ()
+                )
+            )
+            for candidate in deployment_nodes
+            if candidate in graph.G
+        )
+        if (
+            has_structural_store
+            or has_structural_container_call
+            or has_structural_indexed_read
+        ):
+            shell.coordinator_region_indices.add(region_index)
+            coordinator_override_nodes.update(deployment_nodes)
+            active_nodes.difference_update(map(int, deployment_nodes))
+            for deployment_node in deployment_nodes:
+                evaluate_node(int(deployment_node))
+            completed_regions.add(region_index)
+            return
 
         operations = [
             str(subgraph.G.nodes[node_id].get("op") or
@@ -5916,6 +6966,10 @@ def _coordinate_scheduled_capture_impl(
                                     if len(indices) == 1
                                     else tuple(indices)
                                 )
+                                if isinstance(
+                                    base, (dict, list, tuple, set)
+                                ):
+                                    index = coordinator_index(index)
                                 result = base[index]
                             elif isinstance(expression, ast.BinOp):
                                 operands = [
@@ -5971,7 +7025,7 @@ def _coordinate_scheduled_capture_impl(
                 # this one discovery invocation; they cannot add tape nodes.
                 capture_context = autograd.forward_capture(discovery_tape)
             else:
-                capture_context = autograd.no_grad()
+                capture_context = autograd.forward_observation()
             region_nodes_before = (
                 set(discovery_tape._nodes)
                 if capture and discovery_tape is not None
@@ -5989,6 +7043,7 @@ def _coordinate_scheduled_capture_impl(
                 planned_capture = {
                     "tape": discovery_tape,
                     "graph": graph,
+                    "shell": shell,
                     "node_capture_ids": {},
                     "step_input_ids": {},
                     "collection_materializations": (
@@ -6223,6 +7278,13 @@ def _coordinate_scheduled_capture_impl(
                                 item,
                                 (*path, name),
                             )
+                    elif isinstance(getattr(value, "__dict__", None), dict):
+                        for name, item in vars(value).items():
+                            record_aggregate_paths(
+                                graph_input_id,
+                                item,
+                                (*path, str(name)),
+                            )
 
                 for input_id in subgraph.G.graph["deployment_inputs"]:
                     name = _compiler_input_name(
@@ -6297,15 +7359,165 @@ def _coordinate_scheduled_capture_impl(
             defaults = graph.G.graph.get("parameter_defaults") or {}
             if expression.id in defaults:
                 return defaults[expression.id]
+            if expression.id in supplied:
+                value = supplied[expression.id]
+                if value is None or isinstance(
+                    value,
+                    (list, tuple, dict, set),
+                ):
+                    return value
         if isinstance(expression, ast.Attribute):
             return getattr(
                 evaluate_static_expression(expression.value),
                 expression.attr,
             )
+        if (
+            isinstance(expression, ast.Call)
+            and not expression.args
+            and not expression.keywords
+        ):
+            function = evaluate_static_expression(expression.func)
+            if callable(function):
+                return function()
+        if (
+            isinstance(expression, ast.Compare)
+            and len(expression.ops) == 1
+            and len(expression.comparators) == 1
+            and isinstance(expression.ops[0], (ast.Is, ast.IsNot))
+        ):
+            left = evaluate_static_expression(expression.left)
+            right = evaluate_static_expression(expression.comparators[0])
+            result = left is right
+            return not result if isinstance(expression.ops[0], ast.IsNot) else result
         raise KeyError(ast.unparse(expression))
+
+    def evaluate_source_container_item(
+        source: ast.AST,
+        fallback_node: int | None = None,
+    ) -> Any:
+        """Evaluate a container element at its exact lexical source point."""
+
+        if isinstance(source, ast.Name):
+            if source.id in source_binding_values:
+                return source_binding_values[source.id]
+            if source.id in supplied:
+                return supplied[source.id]
+        if isinstance(source, ast.Dict):
+            result = {}
+            for key, value in zip(source.keys, source.values):
+                item = evaluate_source_container_item(
+                    value, expression_nodes.get(id(value))
+                )
+                if key is None:
+                    result.update(dict(item))
+                else:
+                    result[evaluate_source_container_item(
+                        key, expression_nodes.get(id(key))
+                    )] = item
+            return result
+        if isinstance(source, (ast.Tuple, ast.List, ast.Set)):
+            items = [
+                evaluate_source_container_item(
+                    item, expression_nodes.get(id(item))
+                )
+                for item in source.elts
+            ]
+            if isinstance(source, ast.Tuple):
+                return tuple(items)
+            if isinstance(source, ast.Set):
+                return set(items)
+            return items
+        if isinstance(source, (ast.IfExp, ast.BoolOp)) or (
+            isinstance(source, ast.Compare)
+            and len(source.ops) == 1
+            and isinstance(source.ops[0], (ast.Is, ast.IsNot))
+        ):
+            return evaluate_reduced_control_expression(source)
+        node = (
+            fallback_node
+            if fallback_node is not None
+            else expression_nodes.get(id(source))
+        )
+        if node is not None:
+            return evaluate_node(int(node))
+        return evaluate_reduced_control_expression(source)
+
+    def coordinator_index(value: Any) -> Any:
+        """Project tensor scalars into Python container index semantics."""
+
+        if isinstance(value, AbstractTensor):
+            if tuple(value.shape) == ():
+                return value.item()
+            return value
+        if isinstance(value, tuple):
+            return tuple(coordinator_index(item) for item in value)
+        if isinstance(value, slice):
+            return slice(
+                coordinator_index(value.start),
+                coordinator_index(value.stop),
+                coordinator_index(value.step),
+            )
+        return value
+
+    def _resolve_reference_node(expression: ast.expr) -> int | None:
+        """Find the live graph node a reference-typed expression resolves to.
+
+        A bound-method call's receiver (``machine``, ``machine.runner``, ...)
+        is a reference value, not a tensor -- it has no numeric identity to
+        fall back on. The existing, narrower check this replaces
+        (``id(expression) in graph.G``) asks only "does this exact AST node
+        still happen to be a node in the graph", which silently fails
+        whenever an earlier reduction pass legitimately rebuilt or pruned
+        that specific node while the value it represents is still perfectly
+        live under its name. ``identity_table`` already tracks every SSA
+        version of every name for exactly this reason (it is the same
+        mechanism ``live_function_module_binding`` above uses); grounding
+        receiver resolution in it instead of a raw ``id()`` presence check
+        means a receiver resolves by what it *is*, not by whether one
+        specific AST node object happened to survive unchanged.
+        """
+
+        if isinstance(expression, ast.Name):
+            candidates = graph.G.graph.get("identity_table", {}).get(
+                expression.id, ()
+            )
+            for candidate in reversed(candidates):
+                if int(candidate) in graph.G:
+                    return int(candidate)
+            return None
+        if isinstance(expression, ast.Attribute):
+            if id(expression) in graph.G:
+                return id(expression)
+            base_node = _resolve_reference_node(expression.value)
+            if base_node is None:
+                return None
+            for successor in graph.G.successors(base_node):
+                successor_expr = graph.G.nodes[successor].get("expr_obj")
+                if (
+                    isinstance(successor_expr, ast.Attribute)
+                    and successor_expr.attr == expression.attr
+                ):
+                    return successor
+            return None
+        return None
 
     def evaluate_node(node_id: int) -> Any:
         if node_id in values:
+            cached_data = graph.G.nodes[node_id]
+            if str(cached_data.get("type")) in {"Input", "input"}:
+                if node_id in generator_binding_values:
+                    values[node_id] = generator_binding_values[node_id]
+                    return values[node_id]
+                cached_attributes = cached_data.get("attributes") or {}
+                cached_name = str(
+                    cached_attributes.get(
+                        "binding_name",
+                        cached_data.get("label", node_id),
+                    )
+                )
+                if cached_name in source_binding_values:
+                    values[node_id] = source_binding_values[cached_name]
+                    return values[node_id]
             return values[node_id]
         if node_id in inert_nodes:
             # A name or attribute lookup nobody reads.  Producing it would
@@ -6321,7 +7533,41 @@ def _coordinate_scheduled_capture_impl(
             )
         active_nodes.add(node_id)
         try:
-            region_index = region_for_node.get(node_id)
+            data = graph.G.nodes[node_id]
+            node_type = str(data.get("type"))
+            parents = tuple(data.get("parents") or ())
+            if node_type == "Indexed":
+                base_parent = next(
+                    (
+                        parent
+                        for parent, role in parents
+                        if str(role) == "base"
+                    ),
+                    None,
+                )
+                available_base = values.get(base_parent)
+                available_indices = tuple(
+                    values[parent]
+                    for parent, role in parents
+                    if str(role) == "index" and parent in values
+                )
+                if isinstance(
+                    available_base,
+                    (dict, list, tuple, set),
+                ) or any(
+                    isinstance(index, (str, bytes))
+                    for index in available_indices
+                ):
+                    # Runtime loop bindings can carry structural keys that
+                    # were not literals during planning. Container routing is
+                    # a type fact, not value specialization, and must be
+                    # decided before a numerical region claims the node.
+                    coordinator_override_nodes.add(node_id)
+            region_index = (
+                None
+                if node_id in coordinator_override_nodes
+                else region_for_node.get(node_id)
+            )
             if region_index is not None:
                 evaluate_region(region_index)
                 if node_id not in values:
@@ -6347,15 +7593,26 @@ def _coordinate_scheduled_capture_impl(
                     )
                 return values[node_id]
 
-            data = graph.G.nodes[node_id]
-            node_type = str(data.get("type"))
             expression = data.get("expr_obj")
-            parents = tuple(data.get("parents") or ())
             attributes = data.get("attributes") or {}
 
             if node_type in {"Input", "input"}:
                 if node_id in generator_binding_values:
                     result = generator_binding_values[node_id]
+                    values[node_id] = result
+                    return result
+                # Retained stores and attribute writes may still point at an
+                # Input-shaped identity for a local whose value is selected
+                # by source control.  Once that statement has executed, the
+                # active source frame is the authority for the spelling.
+                name = str(
+                    attributes.get(
+                        "binding_name",
+                        data.get("label", node_id),
+                    )
+                )
+                if name in source_binding_values:
+                    result = source_binding_values[name]
                     values[node_id] = result
                     return result
                 comprehension_owner = (
@@ -6367,7 +7624,28 @@ def _coordinate_scheduled_capture_impl(
                         result = generator_binding_values[node_id]
                         values[node_id] = result
                         return result
-                name = str(data.get("label", node_id))
+                loop_owner = loop_owner_by_binding.get(node_id)
+                if (
+                    loop_owner is not None
+                    and loop_owner not in active_nodes
+                ):
+                    # Normalized LoopExit/value dependencies can request an
+                    # inner loop's iterable before the flat evaluator has
+                    # visited the outer ``for`` statement.  A target is a
+                    # definition produced by its owner loop, never a public
+                    # function input.  Execute that owner first, then resolve
+                    # the binding from the exact iteration/source frame.
+                    evaluate_node(loop_owner)
+                    if node_id in generator_binding_values:
+                        result = generator_binding_values[node_id]
+                        values[node_id] = result
+                        return result
+                    if node_id in values:
+                        return values[node_id]
+                    if name in source_binding_values:
+                        result = source_binding_values[name]
+                        values[node_id] = result
+                        return result
                 raise KeyError(
                     f"missing ProcessGraph input {name!r} in "
                     f"{graph.G.graph.get('function_name', '?')} at node "
@@ -6394,11 +7672,17 @@ def _coordinate_scheduled_capture_impl(
                         ),
                         None,
                     )
-                    result = (
-                        evaluate_node(carried_initial)
-                        if carried_initial is not None
-                        else evaluate_node(by_role["value"])
-                    )
+                    if carried_initial is not None and carried_initial in values:
+                        result = values[carried_initial]
+                    elif (
+                        carried_initial is not None
+                        and carried_initial in graph.G
+                    ):
+                        result = evaluate_node(carried_initial)
+                    elif binding_name in source_binding_values:
+                        result = source_binding_values[binding_name]
+                    else:
+                        result = evaluate_node(by_role["value"])
                 else:
                     result = evaluate_node(by_role["value"])
             elif node_type in {"LoopStateTransition", "LoopStatePort"}:
@@ -6421,9 +7705,15 @@ def _coordinate_scheduled_capture_impl(
                     if str(role).startswith("arg")
                 )
             elif isinstance(expression, (ast.Tuple, ast.List, ast.Set)):
+                element_parents = [parent for parent, _role in parents]
                 items = [
-                    evaluate_node(parent)
-                    for parent, _role in parents
+                    evaluate_source_container_item(
+                        item,
+                        element_parents[index]
+                        if index < len(element_parents)
+                        else None,
+                    )
+                    for index, item in enumerate(expression.elts)
                 ]
                 if isinstance(expression, ast.Tuple):
                     result = tuple(items)
@@ -6432,23 +7722,7 @@ def _coordinate_scheduled_capture_impl(
                 else:
                     result = items
             elif isinstance(expression, ast.Dict):
-                keys = [
-                    evaluate_node(parent)
-                    for parent, role in parents
-                    if str(role) == "keys"
-                ]
-                items = [
-                    evaluate_node(parent)
-                    for parent, role in parents
-                    if str(role) == "values"
-                ]
-                result = {}
-                key_values = iter(keys)
-                for key_expression, item in zip(expression.keys, items):
-                    if key_expression is None:
-                        result.update(dict(item))
-                    else:
-                        result[next(key_values)] = item
+                result = evaluate_source_container_item(expression, node_id)
             elif (
                 isinstance(expression, ast.Attribute)
                 and node_type != "SetAttr"
@@ -6471,15 +7745,31 @@ def _coordinate_scheduled_capture_impl(
                         f"{(data.get('attributes') or {})!r}"
                     )
                 receiver = evaluate_node(parent)
-                try:
-                    result = getattr(receiver, expression.attr)
-                except AttributeError as exc:
-                    raise AttributeError(
-                        f"{graph.G.graph.get('function_name', '?')} attribute "
-                        f"{expression.attr!r} at node {node_id} has receiver "
-                        f"{type(receiver).__name__}; parent={parent}, "
-                        f"parents={parents!r}"
-                    ) from exc
+                if isinstance(receiver, _CompiledStructuralObject):
+                    # A field read on a compiler-owned structural object is
+                    # not a static Python fact to freeze into ``values``:
+                    # the field is genuine per-call state (see
+                    # ``_CompiledStructuralObject.state``), and a plain
+                    # ``getattr`` here would capture whatever this one
+                    # discovery trace happened to observe as if it were a
+                    # constant -- the exact one-value trap that makes
+                    # ``counter.value`` invisible to region capture. Keep
+                    # the field's own identity live instead of collapsing
+                    # it to a bare Python value.
+                    result = receiver.state.get(expression.attr)
+                else:
+                    try:
+                        result = getattr(receiver, expression.attr)
+                    except AttributeError as exc:
+                        raise AttributeError(
+                            f"{graph.G.graph.get('function_name', '?')} "
+                            f"attribute {expression.attr!r} at node "
+                            f"{node_id} has receiver "
+                            f"{type(receiver).__name__}; parent={parent}, "
+                            f"parents={parents!r}"
+                        ) from exc
+                if node_type == "GetAttr":
+                    shell.reference_operator_sequence.append(int(node_id))
             elif isinstance(expression, ast.Slice):
                 parts = {
                     str(role): evaluate_node(parent)
@@ -6507,6 +7797,30 @@ def _coordinate_scheduled_capture_impl(
                     str(evaluate_node(parent))
                     for parent, _role in parents
                 )
+            elif node_type == "IndexedStore":
+                by_role: dict[str, list[int]] = {}
+                for parent, role in parents:
+                    by_role.setdefault(str(role), []).append(parent)
+                base = evaluate_node(by_role["base"][0])
+                if isinstance(expression, ast.Subscript):
+                    index = evaluate_reduced_control_expression(
+                        expression.slice
+                    )
+                else:
+                    indices = [
+                        evaluate_node(parent)
+                        for parent in by_role.get("index", ())
+                    ]
+                    index = (
+                        indices[0]
+                        if len(indices) == 1
+                        else tuple(indices)
+                    )
+                value = evaluate_node(by_role["value"][0])
+                if isinstance(base, (dict, list, tuple, set)):
+                    index = coordinator_index(index)
+                base[index] = value
+                result = base
             elif node_type == "Indexed":
                 base = evaluate_node(
                     next(
@@ -6521,6 +7835,8 @@ def _coordinate_scheduled_capture_impl(
                     if str(role) == "index"
                 ]
                 index = indices[0] if len(indices) == 1 else tuple(indices)
+                if isinstance(base, (dict, list, tuple, set)):
+                    index = coordinator_index(index)
                 result = base[index]
             elif isinstance(expression, ast.BoolOp):
                 if isinstance(expression.op, ast.And):
@@ -6567,23 +7883,35 @@ def _coordinate_scheduled_capture_impl(
                     ),
                 )
             ):
-                materialized = [
-                    evaluate_node(parent)
-                    for parent, role in parents
-                    if str(role).startswith("arg")
-                ]
-                if isinstance(expression, ast.SetComp):
-                    result = set(materialized)
-                elif isinstance(expression, ast.DictComp):
-                    result = dict(materialized)
-                elif isinstance(expression, ast.GeneratorExp):
-                    # Keep a replayable finite sequence during discovery.
-                    # Consumers such as any/all/sum and starred calls preserve
-                    # their Python argument semantics without re-entering the
-                    # evaporated generator control node.
-                    result = tuple(materialized)
+                try:
+                    materialized = [
+                        evaluate_node(parent)
+                        for parent, role in parents
+                        if str(role).startswith("arg")
+                    ]
+                except KeyError:
+                    # An evaporated structural comprehension can retain a
+                    # cloned target-shaped Input after its loop binding was
+                    # removed. Reconstruct from source semantics, whose
+                    # comprehension frame publishes every destructured name.
+                    result = evaluate_reduced_control_expression(expression)
                 else:
-                    result = materialized
+                    if not materialized:
+                        result = evaluate_reduced_control_expression(
+                            expression
+                        )
+                    elif isinstance(expression, ast.SetComp):
+                        result = set(materialized)
+                    elif isinstance(expression, ast.DictComp):
+                        result = dict(materialized)
+                    elif isinstance(expression, ast.GeneratorExp):
+                        # Keep a replayable finite sequence during discovery.
+                        # Consumers such as any/all/sum and starred calls preserve
+                        # their Python argument semantics without re-entering the
+                        # evaporated generator control node.
+                        result = tuple(materialized)
+                    else:
+                        result = materialized
             elif isinstance(
                 expression,
                 (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
@@ -6641,9 +7969,15 @@ def _coordinate_scheduled_capture_impl(
                     for item in iterator:
                         targets = loop.target_bindings
                         items_by_name = dict(_destructure_loop_target(
-                            generator_expression.generators[index].target,
+                            expression.generators[index].target,
                             item,
                         ))
+                        # A later generator in the same comprehension may
+                        # consume a destructured name that never enters a
+                        # numerical target binding.  Publish the complete
+                        # Python target frame, just as retained ``for`` source
+                        # execution does.
+                        source_binding_values.update(items_by_name)
                         invalidated = set()
                         assignments = tuple(
                             (
@@ -6761,7 +8095,7 @@ def _coordinate_scheduled_capture_impl(
                         f"{type(expression.op).__name__}"
                     )
                 result = unary(operand)
-            elif isinstance(expression, ast.BinOp):
+            elif isinstance(expression, (ast.BinOp, ast.AugAssign)):
                 operands = [
                     evaluate_node(parent)
                     for parent, _role in parents
@@ -6795,7 +8129,42 @@ def _coordinate_scheduled_capture_impl(
                         f"parents={parents!r}"
                     )
                 result = binary(operands[0], operands[1])
+                if not isinstance(result, AbstractTensor):
+                    # A tensor-bearing structural op still enters the tape
+                    # (see _observe_process_graph_node); this branch runs for
+                    # plain values too, and a plain value never touches the
+                    # tape at all.  Record it the same way a reference
+                    # operator is recorded, in exact order, so an arithmetic
+                    # step feeding a field write is a real internal step
+                    # instead of looking like a phantom external input.
+                    shell.reference_operator_sequence.append(int(node_id))
             elif isinstance(expression, ast.Call):
+                if (
+                    isinstance(expression.func, ast.Attribute)
+                    and isinstance(expression.func.value, ast.Name)
+                    and expression.func.value.id in source_binding_values
+                ):
+                    receiver_parent = next(
+                        (
+                            int(parent)
+                            for parent, role in parents
+                            if str(role) in {"operand", "receiver"}
+                        ),
+                        None,
+                    )
+                    if receiver_parent is not None:
+                        # The receiver visible at this lexical callsite is
+                        # authoritative.  A normalized receiver edge can run
+                        # through a later LoopExit carrying the same spelling,
+                        # creating a false dependency cycle such as an outer
+                        # ``mapping.items()`` requiring its inner loop before
+                        # the outer target has been assigned.  Seed the exact
+                        # receiver identity before traversing call parents;
+                        # the ordinary callable/method routing below remains
+                        # responsible for compiling or invoking the method.
+                        values[receiver_parent] = source_binding_values[
+                            expression.func.value.id
+                        ]
                 for parent, _role in parents:
                     evaluate_node(parent)
                 attributes = data.get("attributes") or {}
@@ -6814,9 +8183,275 @@ def _coordinate_scheduled_capture_impl(
                     static_arguments,
                     graph,
                 )
+                # Exact source-name arguments observe the active lexical
+                # frame. A reduced edge may otherwise alias a saved value to
+                # a later write bearing the same spelling.
+                if not any(
+                    isinstance(argument, ast.Starred)
+                    for argument in expression.args
+                ):
+                    # Normalization can retain multiple SSA parents for one
+                    # source spelling after loop-carried/container rebinding.
+                    # Those are candidate identities, not additional Python
+                    # arguments.  Source syntax owns call arity; keep exactly
+                    # one planned slot per written positional argument before
+                    # applying lexical/live-value corrections below.
+                    source_args = list(args[: len(expression.args)])
+                    for index, argument in enumerate(expression.args):
+                        if (
+                            isinstance(argument, ast.Name)
+                            and argument.id in source_binding_values
+                            and index < len(source_args)
+                        ):
+                            source_args[index] = source_binding_values[
+                                argument.id
+                            ]
+                        elif (
+                            isinstance(argument, ast.Name)
+                            and argument.id not in supplied
+                            and index < len(source_args)
+                        ):
+                            live_argument = live_function_module_binding(
+                                argument.id
+                            )
+                            if live_argument is not live_binding_unavailable:
+                                source_args[index] = live_argument
+                        elif (
+                            index < len(source_args)
+                            and (
+                                isinstance(argument, (ast.IfExp, ast.BoolOp))
+                                or (
+                                    isinstance(argument, ast.Compare)
+                                    and len(argument.ops) == 1
+                                    and isinstance(
+                                        argument.ops[0],
+                                        (ast.Is, ast.IsNot),
+                                    )
+                                )
+                            )
+                        ):
+                            source_args[index] = (
+                                evaluate_reduced_control_expression(argument)
+                            )
+                    args = tuple(source_args)
+                for keyword in expression.keywords:
+                    if (
+                        keyword.arg is not None
+                        and isinstance(keyword.value, ast.Name)
+                        and keyword.value.id in source_binding_values
+                    ):
+                        kwargs[keyword.arg] = source_binding_values[
+                            keyword.value.id
+                        ]
+                    elif (
+                        keyword.arg is not None
+                        and isinstance(keyword.value, ast.Name)
+                        and keyword.value.id not in supplied
+                    ):
+                        live_argument = live_function_module_binding(
+                            keyword.value.id
+                        )
+                        if live_argument is not live_binding_unavailable:
+                            kwargs[keyword.arg] = live_argument
                 external_ref = attributes.get("external_callee_ref")
-                callee_ref = attributes.get("callee_ref")
+                callee_ref = attributes.get(
+                    "callee_ref", attributes.get("method_ref")
+                )
+                direct_self_recursion = (
+                    isinstance(expression.func, ast.Name)
+                    and expression.func.id
+                    == graph.G.graph.get("function_name")
+                )
+                if direct_self_recursion:
+                    callee_ref = graph.G.graph.get("function_ref", callee_ref)
                 class_ref = attributes.get("class_ref")
+                static_callable = None
+                runtime_bound_callable = None
+                static_reference = attributes.get(
+                    "static_python_reference"
+                )
+                if isinstance(expression.func, ast.Name):
+                    source_name = expression.func.id
+                    exact_callable = None
+                    if source_name in source_binding_values:
+                        candidate = source_binding_values[source_name]
+                        if callable(candidate):
+                            exact_callable = candidate
+                    elif source_name in supplied:
+                        candidate = supplied[source_name]
+                        if callable(candidate):
+                            exact_callable = candidate
+                    else:
+                        candidate = shell.static_python_bindings.get(
+                            source_name,
+                            getattr(builtins, source_name, None),
+                        )
+                        if callable(candidate):
+                            exact_callable = candidate
+                    if exact_callable is not None:
+                        # A bare source spelling has Python lexical authority.
+                        # Normalization may merge call edges whose constructors
+                        # have equal-looking scalar results (notably int(1)
+                        # and bool(1)); it may not change which callable the
+                        # source named.
+                        static_callable = exact_callable
+                        static_reference = source_name
+                        external_ref = None
+                        callable_name = getattr(
+                            exact_callable, "__name__", None
+                        )
+                        internal_ref = callee_ref
+                        if internal_ref is None:
+                            for reference_name in (
+                                source_name,
+                                callable_name,
+                            ):
+                                if reference_name is None:
+                                    continue
+                                reference = graph.function_table.reference(
+                                    reference_name
+                                )
+                                if reference is not None:
+                                    internal_ref = reference.address
+                                    if internal_ref in shell.function_shells:
+                                        break
+                        internal_shell = None
+                        if internal_ref is not None:
+                            internal_shell = shell.function_shells.get(
+                                int(internal_ref)
+                            )
+                        internal_name = (
+                            internal_shell.process_graph.G.graph.get(
+                                "function_name"
+                            )
+                            if internal_shell is not None
+                            else None
+                        )
+                        # Keep a source-ingested function linked to its
+                        # planner shell.  Only discard a spelling-derived
+                        # reference when it actually names a different
+                        # callable (the int(1)/bool(1) collision described
+                        # above).  Calling host Python with a compiled
+                        # callback argument would escape the compiler and is
+                        # invalid.
+                        callee_ref = (
+                            internal_ref
+                            if internal_shell is not None
+                            and str(internal_name) == str(callable_name)
+                            else None
+                        )
+                        class_ref = None
+                if static_reference is not None:
+                    try:
+                        candidate = _static_python_value(
+                            shell.static_python_bindings,
+                            static_reference,
+                        )
+                    except (AttributeError, KeyError):
+                        candidate = None
+                    if callable(candidate):
+                        static_callable = candidate
+                        if getattr(candidate, "__self__", None) is not None:
+                            # Exact bound-call authority outranks a bare-name
+                            # function-table collision and retains its receiver.
+                            callee_ref = None
+                if isinstance(expression.func, ast.Attribute):
+                    receiver_parent = next(
+                        (
+                            int(parent)
+                            for parent, role in parents
+                            if str(role) in {"operand", "receiver"}
+                        ),
+                        None,
+                    )
+                    if (
+                        receiver_parent is None
+                        and id(expression.func.value) in graph.G
+                    ):
+                        # Older compiled-plan checkpoints may have already
+                        # consumed the explicit operand edge while retaining
+                        # the original Attribute AST.  Its value node remains
+                        # the exact receiver identity and is safe to recover.
+                        receiver_parent = id(expression.func.value)
+                    source_receiver_name = (
+                        expression.func.value.id
+                        if isinstance(expression.func.value, ast.Name)
+                        else None
+                    )
+                    receiver_value = (
+                        source_binding_values[source_receiver_name]
+                        if source_receiver_name in source_binding_values
+                        else evaluate_node(receiver_parent)
+                        if receiver_parent is not None
+                        else None
+                    )
+                    if isinstance(
+                        receiver_value,
+                        (_CompiledStructuralObject, _CompiledStructuralClass),
+                    ):
+                        bound_method = getattr(
+                            receiver_value, expression.func.attr, None
+                        )
+                        if isinstance(bound_method, _CompiledStructuralMethod):
+                            # Runtime structural type identity is stronger than
+                            # a spelling-only method-table guess.
+                            callee_ref = bound_method.method_ref
+                    elif receiver_value is not None:
+                        candidate = getattr(
+                            receiver_value, expression.func.attr, None
+                        )
+                        if callable(candidate):
+                            candidate_name = getattr(
+                                getattr(candidate, "__func__", candidate),
+                                "__name__",
+                                None,
+                            )
+                            internal_ref = callee_ref
+                            if internal_ref is None and candidate_name:
+                                reference = graph.function_table.reference(
+                                    candidate_name
+                                )
+                                if reference is not None:
+                                    internal_ref = reference.address
+                            internal_shell = (
+                                shell.function_shells.get(int(internal_ref))
+                                if internal_ref is not None
+                                else None
+                            )
+                            internal_graph = (
+                                internal_shell.process_graph.G.graph
+                                if internal_shell is not None
+                                else {}
+                            )
+                            method_owner = internal_graph.get("method_owner")
+                            receiver_type = type(receiver_value)
+                            receiver_owner_names = {
+                                receiver_type.__name__,
+                                receiver_type.__qualname__,
+                                f"{receiver_type.__module__}."
+                                f"{receiver_type.__qualname__}",
+                            }
+                            if (
+                                internal_shell is not None
+                                and internal_graph.get("method_binding")
+                                == "instance"
+                                and str(internal_graph.get("function_name"))
+                                == str(candidate_name)
+                                and str(method_owner) in receiver_owner_names
+                            ):
+                                # The exact runtime bound method validates the
+                                # planner's class-method reference.  Keep the
+                                # call inside the source hierarchy so its
+                                # numerical regions enter the one discovery
+                                # tape.  Spelling alone remains insufficient:
+                                # unrelated same-named methods still take the
+                                # host-bound path below.
+                                callee_ref = internal_ref
+                                runtime_bound_callable = None
+                            else:
+                                runtime_bound_callable = candidate
+                                callee_ref = None
+                                external_ref = None
                 if class_ref is not None:
                     descriptor = (
                         graph.G.graph.get("class_table", {}).get(class_ref)
@@ -6825,12 +8460,94 @@ def _coordinate_scheduled_capture_impl(
                         raise RuntimeError(
                             f"unknown compiled class reference {class_ref!r}"
                         )
+                    host_factory = (
+                        static_callable
+                        if isinstance(static_callable, type)
+                        and getattr(static_callable, "__new__", object.__new__)
+                        is not object.__new__
+                        else None
+                    )
+                    if host_factory is not None:
+                        # A custom ``__new__`` is an allocation/factory
+                        # protocol, not an initializer.  Until allocation IR
+                        # exists, replacing it with a field-only structural
+                        # object is observably wrong (Path -> WindowsPath is
+                        # the canonical example). Preserve the exact available
+                        # factory and let subsequent bound calls retain their
+                        # real receiver.
+                        result = host_factory(*args, **kwargs)
+                        values[node_id] = result
+                        return result
                     result = _CompiledStructuralObject(
                         class_ref,
                         descriptor,
                         args,
                         kwargs,
                     )
+                    initializer_ref = (
+                        descriptor.get("methods") or {}
+                    ).get("__init__")
+                    initializer = (
+                        shell.function_shells.get(int(initializer_ref))
+                        if initializer_ref is not None
+                        else None
+                    )
+                    if initializer is not None:
+                        initializer.static_python_bindings = {
+                            **shell.static_python_bindings,
+                            **initializer.static_python_bindings,
+                        }
+                        receiver_parameter, positional_parameters, _ = (
+                            _method_parameter_layout(
+                                initializer.process_graph.G
+                            )
+                        )
+                        initializer_inputs = dict(
+                            zip(positional_parameters, args)
+                        ) | kwargs
+                        if receiver_parameter is not None:
+                            initializer_inputs[receiver_parameter] = result
+                        for name, default in (
+                            initializer.process_graph.G.graph.get(
+                                "parameter_defaults",
+                                {},
+                            ).items()
+                        ):
+                            initializer_inputs.setdefault(name, default)
+                        if capture:
+                            _coordinate_scheduled_capture(
+                                initializer,
+                                initializer_inputs,
+                                device=device,
+                                capture=True,
+                                discovery_session=discovery_session,
+                            )
+                        elif initializer.whole_program_compiled:
+                            initializer.execute_process_graph(
+                                initializer_inputs
+                            )
+                        else:
+                            initializer.coordinate_first_invocation(
+                                initializer_inputs,
+                                device=device,
+                            )
+                elif runtime_bound_callable is not None:
+                    try:
+                        result = runtime_bound_callable(*args, **kwargs)
+                    except Exception as error:
+                        if hasattr(error, "add_note"):
+                            error.add_note(
+                                "runtime-bound Python call failed; "
+                                f"shell={shell.profile_path!r}; "
+                                f"node={node_id}; "
+                                f"call={ast.dump(expression, include_attributes=False)!r}; "
+                                f"callable={_diagnostic_value_summary(runtime_bound_callable)!r}; "
+                                f"args={tuple(_diagnostic_value_summary(value) for value in args)!r}; "
+                                f"kwargs={{{', '.join(f'{name!r}: {_diagnostic_value_summary(value)!r}' for name, value in kwargs.items())}}}; "
+                                f"parents={parents!r}; "
+                                f"static_arguments={static_arguments!r}"
+                            )
+                        raise
                 elif external_ref is not None:
                     try:
                         external_label = (
@@ -6855,11 +8572,17 @@ def _coordinate_scheduled_capture_impl(
                     callee_ref is not None
                 ):
                     nested = (
-                        getattr(shell, "callsite_function_shells", {}).get(
-                            node_id
-                        )
+                        shell
+                        if direct_self_recursion
+                        else getattr(
+                            shell, "callsite_function_shells", {}
+                        ).get(node_id)
                         or shell.function_shells[int(callee_ref)]
                     )
+                    nested.static_python_bindings = {
+                        **shell.static_python_bindings,
+                        **nested.static_python_bindings,
+                    }
                     if shell._profiler.verbose:
                         shell._profiler.trace(
                             path=shell.profile_path,
@@ -6896,6 +8619,7 @@ def _coordinate_scheduled_capture_impl(
                         )
                     )
                     receiver_value = None
+                    call_args = args
                     if nested_graph_metadata.get("method_binding") == "class":
                         owner = nested_graph_metadata.get("method_owner")
                         descriptor = (
@@ -6910,8 +8634,32 @@ def _coordinate_scheduled_capture_impl(
                         receiver_value = _CompiledStructuralClass(
                             owner, descriptor
                         )
+                    elif nested_graph_metadata.get("method_binding") == "instance":
+                        receiver_parent = next(
+                            (
+                                int(parent)
+                                for parent, role in parents
+                                if str(role) in {"operand", "receiver"}
+                            ),
+                            None,
+                        )
+                        if (
+                            receiver_parent is None
+                            and isinstance(expression.func, ast.Attribute)
+                        ):
+                            receiver_parent = _resolve_reference_node(
+                                expression.func.value
+                            )
+                        if receiver_parent is not None:
+                            receiver_value = evaluate_node(receiver_parent)
+                        elif args:
+                            # A method discovered through a named Python
+                            # binding is an unbound function call: its first
+                            # explicit positional argument is the instance.
+                            receiver_value = args[0]
+                            call_args = args[1:]
                     nested_inputs = dict(
-                        zip(positional_parameters, args)
+                        zip(positional_parameters, call_args)
                     ) | kwargs
                     if receiver_parameter is not None and receiver_value is not None:
                         nested_inputs[receiver_parameter] = receiver_value
@@ -6935,17 +8683,40 @@ def _coordinate_scheduled_capture_impl(
                         if name in nested_inputs:
                             continue
                         resolution_errors = []
-                        for identity in reversed(
-                            caller_identities.get(name, ())
+                        if (
+                            name not in nested_inputs
+                            and discovery_session is not None
                         ):
-                            try:
-                                nested_inputs[name] = evaluate_node(identity)
-                            except (KeyError, RuntimeError) as error:
-                                resolution_errors.append(
-                                    (identity, str(error))
+                            for lexical_frame in reversed(
+                                discovery_session.get(
+                                    "lexical_frames", ()
                                 )
-                                continue
-                            break
+                            ):
+                                try:
+                                    resolved, lexical_value = (
+                                        lexical_frame["resolve"](name)
+                                    )
+                                except (KeyError, RuntimeError):
+                                    continue
+                                if resolved:
+                                    nested_inputs[name] = lexical_value
+                                    break
+                        if name not in nested_inputs and name in supplied:
+                            nested_inputs[name] = supplied[name]
+                        if name not in nested_inputs:
+                            for identity in reversed(
+                                caller_identities.get(name, ())
+                            ):
+                                try:
+                                    nested_inputs[name] = evaluate_node(
+                                        identity
+                                    )
+                                except (KeyError, RuntimeError) as error:
+                                    resolution_errors.append(
+                                        (identity, str(error))
+                                    )
+                                    continue
+                                break
                         if (
                             name not in nested_inputs
                             and caller_identities.get(name)
@@ -6983,8 +8754,20 @@ def _coordinate_scheduled_capture_impl(
                             device=device,
                         )
                     result = nested.last_result
-                elif attributes.get("static_python_reference"):
-                    reference = attributes["static_python_reference"]
+                    if discovery_session is not None:
+                        history = discovery_session.setdefault(
+                            "call_return_history", []
+                        )
+                        history.append((
+                            nested.profile_path,
+                            _diagnostic_value_summary(result),
+                        ))
+                        del history[:-64]
+                elif static_reference:
+                    # Exact lexical/builtin resolution can establish a static
+                    # source reference even when the normalized call node did
+                    # not originally carry metadata for one.
+                    reference = static_reference
                     structural_constructors = {
                         "tuple": tuple,
                         "list": list,
@@ -7007,13 +8790,109 @@ def _coordinate_scheduled_capture_impl(
                                 )
                             result = constructor(args)
                         else:
-                            result = constructor(*args, **kwargs)
+                            try:
+                                result = constructor(*args, **kwargs)
+                            except Exception as error:
+                                if hasattr(error, "add_note"):
+                                    error.add_note(
+                                        "static structural constructor failed; "
+                                        f"shell={shell.profile_path!r}; "
+                                        f"node={node_id}; "
+                                        f"call={ast.dump(expression, include_attributes=False)!r}; "
+                                        f"args={tuple(_diagnostic_value_summary(value) for value in args)!r}; "
+                                        f"kwargs={{{', '.join(f'{name!r}: {_diagnostic_value_summary(value)!r}' for name, value in kwargs.items())}}}"
+                                    )
+                                raise
                     else:
-                        callable_value = _static_python_value(
-                            shell.static_python_bindings,
-                            reference,
+                        callable_value = static_callable or _static_python_value(
+                            shell.static_python_bindings, reference
                         )
-                        result = callable_value(*args, **kwargs)
+                        if any(
+                            isinstance(value, _CompiledStructuralFunction)
+                            for value in (*args, *kwargs.values())
+                        ):
+                            available_shells = tuple(
+                                (
+                                    int(address),
+                                    child.process_graph.G.graph.get(
+                                        "function_name"
+                                    ),
+                                )
+                                for address, child in sorted(
+                                    shell.function_shells.items()
+                                )
+                            )
+                            raise RuntimeError(
+                                "source callable with compiled callback was "
+                                "not linked to a planner shell; "
+                                f"reference={reference!r}; "
+                                f"callable={getattr(callable_value, '__name__', callable_value)!r}; "
+                                f"callee_ref={attributes.get('callee_ref')!r}; "
+                                f"available_shells={available_shells!r}"
+                            )
+                        if (
+                            reference in {"max", "min"}
+                            and not kwargs
+                            and len(args) >= 2
+                            and any(
+                                isinstance(value, AbstractTensor)
+                                for value in args
+                            )
+                        ):
+                            # Python's scalar max/min returns one of its
+                            # operands by identity.  During tensor discovery
+                            # that would collapse the Call result onto the
+                            # selected input from this one sample, assigning
+                            # one primitive occurrence to two ProcessGraph
+                            # endpoints and (worse) specializing away the
+                            # runtime comparison.  Preserve the source scalar
+                            # semantics as an elementwise tensor operation;
+                            # scalar and singleton arenas are its degenerate
+                            # case and therefore retain a distinct SSA result.
+                            result = args[0]
+                            method_name = (
+                                "maximum" if reference == "max" else "minimum"
+                            )
+                            for operand in args[1:]:
+                                if not isinstance(result, AbstractTensor):
+                                    result = AbstractTensor.tensor(result)
+                                result = getattr(result, method_name)(operand)
+                        else:
+                            call_args = args
+                            if (
+                                reference == "next"
+                                and call_args
+                                and isinstance(call_args[0], (list, tuple))
+                            ):
+                                # A GeneratorExp/comprehension argument is
+                                # traced as an already-materialized list here
+                                # (this simulator has no lazy generator
+                                # value), but the real builtin `next()` --
+                                # reached as a static host call because it
+                                # has no compiled lowering -- requires an
+                                # actual iterator, not a list, and raises
+                                # TypeError otherwise. `next(genexpr, default)`
+                                # is an ordinary, common idiom (used by
+                                # MachineExecutionOrchestrator._relative_target,
+                                # among others); wrap the materialized
+                                # sequence in iter() so it behaves exactly
+                                # like the real generator would have.
+                                call_args = (iter(call_args[0]), *call_args[1:])
+                            try:
+                                result = callable_value(*call_args, **kwargs)
+                            except Exception as error:
+                                if hasattr(error, "add_note"):
+                                    error.add_note(
+                                        "static Python host call failed; "
+                                        f"shell={shell.profile_path!r}; "
+                                        f"node={node_id}; "
+                                        f"reference={reference!r}; "
+                                        f"call={ast.dump(expression, include_attributes=False)!r}; "
+                                        f"callable={_diagnostic_value_summary(callable_value)!r}; "
+                                        f"args={tuple(_diagnostic_value_summary(value) for value in call_args)!r}; "
+                                        f"kwargs={{{', '.join(f'{name!r}: {_diagnostic_value_summary(value)!r}' for name, value in kwargs.items())}}}"
+                                    )
+                                raise
                 elif any(
                     str(role) == "callee" for _parent, role in parents
                 ):
@@ -7023,6 +8902,71 @@ def _coordinate_scheduled_capture_impl(
                         if str(role) == "callee"
                     )
                     callee_value = evaluate_node(callee_parent)
+                    if isinstance(callee_value, _CompiledStructuralFunction):
+                        nested = (
+                            getattr(shell, "callsite_function_shells", {}).get(
+                                node_id
+                            )
+                            or shell.function_shells[
+                                int(callee_value.function_ref)
+                            ]
+                        )
+                        _receiver, positional_parameters, _all_parameters = (
+                            _method_parameter_layout(nested.process_graph.G)
+                        )
+                        nested_inputs = dict(
+                            zip(positional_parameters, args)
+                        ) | kwargs
+                        caller_identities = graph.G.graph.get(
+                            "identity_table", {}
+                        )
+                        for _input_id, input_data in (
+                            nested.process_graph.G.nodes(data=True)
+                        ):
+                            input_attributes = input_data.get(
+                                "attributes"
+                            ) or {}
+                            if (
+                                input_data.get("type") != "Input"
+                                or input_attributes.get("binding_kind")
+                                != "external"
+                            ):
+                                continue
+                            name = input_attributes.get("binding_name")
+                            if name in nested_inputs:
+                                continue
+                            for identity in reversed(
+                                caller_identities.get(name, ())
+                            ):
+                                try:
+                                    nested_inputs[name] = evaluate_node(identity)
+                                except (KeyError, RuntimeError):
+                                    continue
+                                break
+                        for name, value in (
+                            nested.process_graph.G.graph.get(
+                                "parameter_defaults", {}
+                            ).items()
+                        ):
+                            nested_inputs.setdefault(name, value)
+                        if capture:
+                            _coordinate_scheduled_capture(
+                                nested,
+                                nested_inputs,
+                                device=device,
+                                capture=True,
+                                discovery_session=discovery_session,
+                            )
+                        elif nested.whole_program_compiled:
+                            nested.execute_process_graph(nested_inputs)
+                        else:
+                            nested.coordinate_first_invocation(
+                                nested_inputs,
+                                device=device,
+                            )
+                        result = nested.last_result
+                        values[node_id] = result
+                        return result
                     if callable(callee_value) and not isinstance(
                         callee_value,
                         (
@@ -7174,6 +9118,15 @@ def _coordinate_scheduled_capture_impl(
                             None,
                         )
                         if receiver_parent is None:
+                            live_callable = (
+                                evaluate_reduced_control_expression(
+                                    expression.func
+                                )
+                            )
+                            if callable(live_callable):
+                                result = live_callable(*args, **kwargs)
+                                values[node_id] = result
+                                return result
                             raise RuntimeError(
                                 "attribute call has neither a callable nor "
                                 f"receiver edge at ProcessGraph node {node_id}: "
@@ -7456,6 +9409,17 @@ def _coordinate_scheduled_capture_impl(
                         values.pop(dependent, None)
                     for (_name, binding), value in target_assignments:
                         values[binding] = value
+                        generator_binding_values[binding] = value
+                    # A flat graph dependency can demand a nested loop before
+                    # the source-statement walker reaches that loop.  Its
+                    # destructured targets are still ordinary Python lexical
+                    # assignments, so publish every leaf into both runtime
+                    # identity tables and the source frame.  Keeping only the
+                    # planner-selected bindings makes a sibling target (for
+                    # example ``value_ids`` in ``for name, value_ids in ...``)
+                    # look like a missing function input when the inner loop
+                    # consumes it.
+                    source_binding_values.update(items_by_name)
                     for region_index in loop_runtime_region_indices.get(
                         node_id,
                         (),
@@ -7465,10 +9429,9 @@ def _coordinate_scheduled_capture_impl(
                     try:
                         for body_node in (
                             candidate
-                            for candidate in _dependency_order(graph)
+                            for candidate in loop.body_nodes
                             if (
-                                candidate in set(loop.body_nodes)
-                                and candidate not in nested_body_nodes_by_loop[
+                                candidate not in nested_body_nodes_by_loop[
                                     int(node_id)
                                 ]
                             )
@@ -7482,11 +9445,20 @@ def _coordinate_scheduled_capture_impl(
                         loop_signal = "break"
                     except _LoopContinueSignal:
                         loop_signal = "continue"
-                    for _name, initial, updated in loop.carried_bindings:
-                        values[initial] = evaluate_node(updated)
-                    iterations_completed += 1
                     if loop_signal == "break":
+                        iterations_completed += 1
                         break
+                    for carried_name, initial, updated in loop.carried_bindings:
+                        if (
+                            loop_signal == "continue"
+                            and carried_name in source_binding_values
+                        ):
+                            values[initial] = source_binding_values[
+                                carried_name
+                            ]
+                        elif loop_signal != "continue":
+                            values[initial] = evaluate_node(updated)
+                    iterations_completed += 1
                     if loop_signal == "continue":
                         continue
                     if shell._profiler.verbose:
@@ -7576,16 +9548,201 @@ def _coordinate_scheduled_capture_impl(
                     value,
                 )
                 result = value
+                shell.reference_operator_sequence.append(int(node_id))
+            elif node_type == "DelAttr":
+                by_role = {
+                    str(role): parent for parent, role in parents
+                }
+                receiver = evaluate_node(by_role["object"])
+                delattr(
+                    receiver,
+                    (data.get("attributes") or {})["attribute"],
+                )
+                result = None
+            elif node_type == "DelItem":
+                base = evaluate_node(
+                    next(
+                        parent
+                        for parent, role in parents
+                        if str(role) == "base"
+                    )
+                )
+                indices = [
+                    evaluate_node(parent)
+                    for parent, role in parents
+                    if str(role) == "index"
+                ]
+                index = indices[0] if len(indices) == 1 else tuple(indices)
+                del base[index]
+                result = None
             elif node_type == "StaticReference":
                 # This is a compiler-owned link to a function subgraph or
                 # structural symbol.  It is deliberately not a Python object
                 # and performs no runtime work.
                 attributes = data.get("attributes") or {}
-                result = attributes.get(
-                    "function_ref",
-                    attributes.get("static_python_reference"),
+                first_class_ref = attributes.get(
+                    "first_class_function_ref"
                 )
-            elif node_type in {"Return", "return", "Store", "store", "Output", "output"}:
+                static_reference = attributes.get("static_python_reference")
+                static_value = None
+                if static_reference is not None:
+                    try:
+                        static_value = _static_python_value(
+                            shell.static_python_bindings,
+                            static_reference,
+                        )
+                    except (AttributeError, KeyError):
+                        pass
+                if isinstance(static_value, type):
+                    # Classes used as first-class values (most importantly in
+                    # isinstance/issubclass tuples) retain Python type
+                    # identity. Constructor calls remain governed by the
+                    # class_ref branch above.
+                    result = static_value
+                else:
+                    result = (
+                        _CompiledStructuralFunction(first_class_ref)
+                        if first_class_ref is not None
+                        else attributes.get(
+                            "function_ref",
+                            static_reference,
+                        )
+                    )
+            elif isinstance(expression, ast.Lambda):
+                lambda_expression = expression
+                positional_parameters = tuple(
+                    (*lambda_expression.args.posonlyargs,
+                     *lambda_expression.args.args)
+                )
+                positional_defaults = {
+                    parameter.arg: evaluate_reduced_control_expression(default)
+                    for parameter, default in zip(
+                        positional_parameters[
+                            len(positional_parameters)
+                            - len(lambda_expression.args.defaults):
+                        ],
+                        lambda_expression.args.defaults,
+                    )
+                }
+                keyword_defaults = {
+                    parameter.arg: evaluate_reduced_control_expression(default)
+                    for parameter, default in zip(
+                        lambda_expression.args.kwonlyargs,
+                        lambda_expression.args.kw_defaults,
+                    )
+                    if default is not None
+                }
+
+                def structural_lambda(*call_args, **call_kwargs):
+                    remaining_kwargs = dict(call_kwargs)
+                    bound = {}
+                    if (
+                        len(call_args) > len(positional_parameters)
+                        and lambda_expression.args.vararg is None
+                    ):
+                        raise TypeError("lambda received too many arguments")
+                    for index, parameter in enumerate(positional_parameters):
+                        if index < len(call_args):
+                            if parameter.arg in remaining_kwargs:
+                                raise TypeError(
+                                    f"lambda got multiple values for "
+                                    f"{parameter.arg!r}"
+                                )
+                            bound[parameter.arg] = call_args[index]
+                        elif parameter.arg in remaining_kwargs:
+                            bound[parameter.arg] = remaining_kwargs.pop(
+                                parameter.arg
+                            )
+                        elif parameter.arg in positional_defaults:
+                            bound[parameter.arg] = positional_defaults[
+                                parameter.arg
+                            ]
+                        else:
+                            raise TypeError(
+                                f"lambda missing argument {parameter.arg!r}"
+                            )
+                    if lambda_expression.args.vararg is not None:
+                        bound[lambda_expression.args.vararg.arg] = tuple(
+                            call_args[len(positional_parameters):]
+                        )
+                    for parameter in lambda_expression.args.kwonlyargs:
+                        if parameter.arg in remaining_kwargs:
+                            bound[parameter.arg] = remaining_kwargs.pop(
+                                parameter.arg
+                            )
+                        elif parameter.arg in keyword_defaults:
+                            bound[parameter.arg] = keyword_defaults[
+                                parameter.arg
+                            ]
+                        else:
+                            raise TypeError(
+                                "lambda missing keyword-only argument "
+                                f"{parameter.arg!r}"
+                            )
+                    if lambda_expression.args.kwarg is not None:
+                        bound[lambda_expression.args.kwarg.arg] = (
+                            remaining_kwargs
+                        )
+                        remaining_kwargs = {}
+                    if remaining_kwargs:
+                        unexpected = next(iter(remaining_kwargs))
+                        raise TypeError(
+                            f"lambda got unexpected keyword {unexpected!r}"
+                        )
+                    missing = object()
+                    previous = {
+                        name: source_binding_values.get(name, missing)
+                        for name in bound
+                    }
+                    source_binding_values.update(bound)
+                    try:
+                        return evaluate_reduced_control_expression(
+                            lambda_expression.body
+                        )
+                    finally:
+                        for name, prior in previous.items():
+                            if prior is missing:
+                                source_binding_values.pop(name, None)
+                            else:
+                                source_binding_values[name] = prior
+
+                result = structural_lambda
+            elif isinstance(expression, ast.Return) or node_type in {
+                "Return",
+                "return",
+            }:
+                result = (
+                    evaluate_node(parents[0][0])
+                    if parents
+                    else None
+                )
+                values[node_id] = result
+                if capture:
+                    shell.forward_feed_ids = tuple(feed_maps)
+                    shell.forward_aggregate_feed_paths = tuple(
+                        aggregate_feed_maps
+                    )
+                    shell.forward_subgraphs = tuple(captured_subgraphs)
+                    shell.forward_compilers = tuple(captured_compilers)
+                    shell.forward_region_indices = tuple(
+                        captured_region_indices
+                    )
+                    shell.forward_output_values = tuple(
+                        captured_output_values
+                    )
+                    shell.forward_region_capture_node_ids = tuple(
+                        captured_region_node_ids
+                    )
+                    shell.forward_region_planned_capture_ids = tuple(
+                        captured_region_planned_ids
+                    )
+                    shell.forward_region_planned_input_ids = tuple(
+                        captured_region_planned_input_ids
+                    )
+                shell.captured_values = values
+                shell.last_result = result
+                raise _SourceReturnSignal(result)
+            elif node_type in {"Store", "store", "Output", "output"}:
                 result = (
                     evaluate_node(parents[0][0])
                     if parents
@@ -7599,12 +9756,549 @@ def _coordinate_scheduled_capture_impl(
             values[node_id] = result
             return result
         finally:
-            active_nodes.remove(node_id)
+            # Coordinator region arbitration can deliberately clear a
+            # region's active markers before replaying it structurally.
+            active_nodes.discard(node_id)
 
     generator_binding_values: dict[int, Any] = {}
+    source_binding_values: dict[str, Any] = {
+        str((data.get("attributes") or {}).get(
+            "binding_name", data.get("label", "")
+        )): values[int(node_id)]
+        for node_id, data in graph.G.nodes(data=True)
+        if str(data.get("type")) in {"Input", "input"}
+        and (data.get("attributes") or {}).get("binding_kind")
+        == "parameter"
+        and int(node_id) in values
+    }
+    source_binding_node_ids: dict[str, int] = {
+        str((data.get("attributes") or {}).get(
+            "binding_name", data.get("label", "")
+        )): int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if str(data.get("type")) in {"Input", "input"}
+        and (data.get("attributes") or {}).get("binding_kind")
+        == "parameter"
+        and int(node_id) in values
+    }
+
+    def has_live_source_root(expression: ast.AST) -> bool:
+        current = expression
+        while isinstance(current, (ast.Attribute, ast.Subscript)):
+            current = current.value
+        return (
+            isinstance(current, ast.Name)
+            and (
+                current.id in source_binding_values
+                or current.id in supplied
+                or live_function_module_binding(current.id)
+                is not live_binding_unavailable
+            )
+        )
+
+    def evaluate_reduced_control_expression(expression: ast.AST) -> Any:
+        if isinstance(
+            expression,
+            (ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp),
+        ):
+            def target_names(target: ast.AST) -> tuple[str, ...]:
+                if isinstance(target, ast.Name):
+                    return (target.id,)
+                if isinstance(target, (ast.Tuple, ast.List)):
+                    return tuple(
+                        name
+                        for item in target.elts
+                        for name in target_names(item)
+                    )
+                raise NotImplementedError(
+                    "reduced comprehension target is not supported: "
+                    f"{ast.unparse(target)}"
+                )
+
+            def bind_target(target: ast.AST, value: Any) -> None:
+                if isinstance(target, ast.Name):
+                    source_binding_values[target.id] = value
+                    return
+                if isinstance(target, (ast.Tuple, ast.List)):
+                    unpacked = tuple(value)
+                    if len(unpacked) != len(target.elts):
+                        raise ValueError(
+                            "comprehension target/value arity mismatch"
+                        )
+                    for item, item_value in zip(target.elts, unpacked):
+                        bind_target(item, item_value)
+                    return
+                raise NotImplementedError(
+                    "reduced comprehension target is not supported: "
+                    f"{ast.unparse(target)}"
+                )
+
+            missing = object()
+
+            def iterate(generators, index=0):
+                if index >= len(generators):
+                    if isinstance(expression, ast.DictComp):
+                        yield (
+                            evaluate_reduced_control_expression(
+                                expression.key
+                            ),
+                            evaluate_reduced_control_expression(
+                                expression.value
+                            ),
+                        )
+                    else:
+                        yield evaluate_reduced_control_expression(
+                            expression.elt
+                        )
+                    return
+                generator = generators[index]
+                if generator.is_async:
+                    raise NotImplementedError(
+                        "async reduced comprehensions are not supported"
+                    )
+                iterable = evaluate_reduced_control_expression(
+                    generator.iter
+                )
+                names = target_names(generator.target)
+                previous = {
+                    name: source_binding_values.get(name, missing)
+                    for name in names
+                }
+                try:
+                    for item in iterable:
+                        bind_target(generator.target, item)
+                        if all(
+                            bool(evaluate_reduced_control_expression(test))
+                            for test in generator.ifs
+                        ):
+                            yield from iterate(generators, index + 1)
+                finally:
+                    for name, value in previous.items():
+                        if value is missing:
+                            source_binding_values.pop(name, None)
+                        else:
+                            source_binding_values[name] = value
+
+            items = iterate(expression.generators)
+            if isinstance(expression, ast.GeneratorExp):
+                return items
+            if isinstance(expression, ast.ListComp):
+                return list(items)
+            if isinstance(expression, ast.SetComp):
+                return set(items)
+            return dict(items)
+        if isinstance(expression, ast.Name):
+            if expression.id in source_binding_values:
+                return source_binding_values[expression.id]
+            if expression.id in supplied:
+                return supplied[expression.id]
+            live_binding = live_function_module_binding(expression.id)
+            if live_binding is not live_binding_unavailable:
+                return live_binding
+            identities = graph.G.graph.get("identity_table", {}) or {}
+            for identity in reversed(identities.get(expression.id, ())):
+                identity = int(identity)
+                if identity in values or identity in graph.G:
+                    return evaluate_node(identity)
+            return evaluate_static_expression(expression)
+        if isinstance(expression, ast.IfExp):
+            branch = (
+                expression.body
+                if bool(evaluate_reduced_control_expression(expression.test))
+                else expression.orelse
+            )
+            return evaluate_reduced_control_expression(branch)
+        if isinstance(expression, ast.BoolOp):
+            if isinstance(expression.op, ast.And):
+                result = True
+                for operand in expression.values:
+                    result = evaluate_reduced_control_expression(operand)
+                    if not result:
+                        break
+                return result
+            result = False
+            for operand in expression.values:
+                result = evaluate_reduced_control_expression(operand)
+                if result:
+                    break
+            return result
+        if isinstance(expression, ast.UnaryOp):
+            operand = evaluate_reduced_control_expression(
+                expression.operand
+            )
+            unary = {
+                ast.Not: operator.not_,
+                ast.UAdd: operator.pos,
+                ast.USub: operator.neg,
+                ast.Invert: operator.invert,
+            }.get(type(expression.op))
+            if unary is None:
+                raise NotImplementedError(
+                    "reduced unary operator is not supported: "
+                    f"{ast.unparse(expression)}"
+                )
+            return unary(operand)
+        if isinstance(expression, ast.BinOp):
+            left = evaluate_reduced_control_expression(expression.left)
+            right = evaluate_reduced_control_expression(expression.right)
+            binary = {
+                ast.Add: operator.add,
+                ast.Sub: operator.sub,
+                ast.Mult: operator.mul,
+                ast.MatMult: operator.matmul,
+                ast.Div: operator.truediv,
+                ast.FloorDiv: operator.floordiv,
+                ast.Mod: operator.mod,
+                ast.Pow: operator.pow,
+                ast.LShift: operator.lshift,
+                ast.RShift: operator.rshift,
+                ast.BitOr: operator.or_,
+                ast.BitXor: operator.xor,
+                ast.BitAnd: operator.and_,
+            }.get(type(expression.op))
+            if binary is None:
+                raise NotImplementedError(
+                    "reduced binary operator is not supported: "
+                    f"{ast.unparse(expression)}"
+                )
+            return binary(left, right)
+        if (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Name)
+        ):
+            source_callable = shell.static_python_bindings.get(
+                expression.func.id
+            )
+            if discovery_session is not None:
+                history = discovery_session.setdefault(
+                    "structural_predicate_history", []
+                )
+                history.append((
+                    "source-call",
+                    expression.func.id,
+                    repr(source_callable),
+                    bool(
+                        isinstance(source_callable, type)
+                        and getattr(
+                            source_callable, "__new__", object.__new__
+                        ) is not object.__new__
+                    ),
+                ))
+                del history[:-32]
+            if (
+                isinstance(source_callable, type)
+                and getattr(source_callable, "__new__", object.__new__)
+                is not object.__new__
+            ):
+                positional = []
+                for argument in expression.args:
+                    if isinstance(argument, ast.Starred):
+                        positional.extend(
+                            evaluate_reduced_control_expression(
+                                argument.value
+                            )
+                        )
+                    else:
+                        positional.append(
+                            evaluate_reduced_control_expression(argument)
+                        )
+                keywords = {}
+                for keyword in expression.keywords:
+                    value = evaluate_reduced_control_expression(
+                        keyword.value
+                    )
+                    if keyword.arg is None:
+                        keywords.update(value)
+                    else:
+                        keywords[keyword.arg] = value
+                return source_callable(*positional, **keywords)
+        if (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Name)
+            and expression.func.id in {"isinstance", "issubclass"}
+            and len(expression.args) == 2
+            and not expression.keywords
+        ):
+            def evaluate_type_spec(type_expression: ast.AST) -> Any:
+                if isinstance(type_expression, ast.Tuple):
+                    return tuple(
+                        evaluate_type_spec(item)
+                        for item in type_expression.elts
+                    )
+                if isinstance(type_expression, ast.Name):
+                    if type_expression.id in shell.static_python_bindings:
+                        return shell.static_python_bindings[type_expression.id]
+                    builtin_type = getattr(
+                        builtins, type_expression.id, None
+                    )
+                    if isinstance(builtin_type, type):
+                        return builtin_type
+                if isinstance(type_expression, ast.Attribute):
+                    return getattr(
+                        evaluate_type_spec(type_expression.value),
+                        type_expression.attr,
+                    )
+                return evaluate_reduced_control_expression(type_expression)
+
+            predicate = (
+                isinstance
+                if expression.func.id == "isinstance"
+                else issubclass
+            )
+            subject = evaluate_reduced_control_expression(expression.args[0])
+            type_spec = evaluate_type_spec(expression.args[1])
+            result = predicate(subject, type_spec)
+            if discovery_session is not None:
+                history = discovery_session.setdefault(
+                    "structural_predicate_history", []
+                )
+                history.append((
+                    expression.func.id,
+                    _diagnostic_value_summary(subject),
+                    repr(type_spec),
+                    bool(result),
+                ))
+                del history[:-32]
+            return result
+        if (
+            isinstance(expression, ast.Compare)
+            and len(expression.ops) == 1
+            and len(expression.comparators) == 1
+            and isinstance(expression.ops[0], (ast.Is, ast.IsNot))
+        ):
+            def identity_operand(operand: ast.AST) -> Any:
+                # Identity tests are coordinator/source semantics all the way
+                # through an attribute path.  Do not let a retained Attribute
+                # node substitute an equal normalized value: SymPy's ``One``
+                # and ``true`` are especially sensitive to singleton identity.
+                if isinstance(operand, ast.Attribute):
+                    return getattr(
+                        identity_operand(operand.value), operand.attr
+                    )
+                return evaluate_reduced_control_expression(operand)
+
+            left = identity_operand(expression.left)
+            right = identity_operand(expression.comparators[0])
+            result = left is right
+            return (
+                not result
+                if isinstance(expression.ops[0], ast.IsNot)
+                else result
+            )
+        if isinstance(expression, ast.Compare):
+            operands = [
+                evaluate_reduced_control_expression(expression.left),
+                *(
+                    evaluate_reduced_control_expression(comparator)
+                    for comparator in expression.comparators
+                ),
+            ]
+            for index, comparison in enumerate(expression.ops):
+                comparator = {
+                    ast.Is: operator.is_,
+                    ast.IsNot: operator.is_not,
+                    ast.Eq: operator.eq,
+                    ast.NotEq: operator.ne,
+                    ast.Lt: operator.lt,
+                    ast.LtE: operator.le,
+                    ast.Gt: operator.gt,
+                    ast.GtE: operator.ge,
+                    ast.In: lambda left, right: left in right,
+                    ast.NotIn: lambda left, right: left not in right,
+                }.get(type(comparison))
+                if comparator is None:
+                    break
+                if not bool(comparator(operands[index], operands[index + 1])):
+                    return False
+            else:
+                return True
+        if isinstance(expression, ast.Subscript):
+            base = evaluate_reduced_control_expression(expression.value)
+            slice_expression = expression.slice
+            if isinstance(slice_expression, ast.Slice):
+                index = slice(
+                    evaluate_reduced_control_expression(
+                        slice_expression.lower
+                    ) if slice_expression.lower is not None else None,
+                    evaluate_reduced_control_expression(
+                        slice_expression.upper
+                    ) if slice_expression.upper is not None else None,
+                    evaluate_reduced_control_expression(
+                        slice_expression.step
+                    ) if slice_expression.step is not None else None,
+                )
+            elif isinstance(slice_expression, ast.Tuple):
+                index = tuple(
+                    evaluate_reduced_control_expression(item)
+                    for item in slice_expression.elts
+                )
+            else:
+                index = evaluate_reduced_control_expression(
+                    slice_expression
+                )
+            if isinstance(base, (dict, list, tuple, set)):
+                index = coordinator_index(index)
+            return base[index]
+        if (
+            isinstance(expression, ast.Attribute)
+            and has_live_source_root(expression)
+        ):
+            return getattr(
+                evaluate_reduced_control_expression(expression.value),
+                expression.attr,
+            )
+        if isinstance(expression, (ast.Tuple, ast.List, ast.Set)):
+            items = [
+                evaluate_reduced_control_expression(item)
+                for item in expression.elts
+            ]
+            if isinstance(expression, ast.Tuple):
+                return tuple(items)
+            if isinstance(expression, ast.Set):
+                return set(items)
+            return items
+        if isinstance(expression, ast.Dict):
+            result = {}
+            for key, value in zip(expression.keys, expression.values):
+                item = evaluate_reduced_control_expression(value)
+                if key is None:
+                    result.update(dict(item))
+                else:
+                    result[
+                        evaluate_reduced_control_expression(key)
+                    ] = item
+            return result
+        retained_node = expression_nodes.get(id(expression))
+        if retained_node is not None:
+            # Reduction can classify a value as graph-inert when its only
+            # consumer is a source assignment/control expression. Source
+            # execution is itself a real consumer: once it demands the AST
+            # expression, suppressing the node would replace the value with
+            # None and violate Python branch semantics.
+            inert_nodes.discard(retained_node)
+            return evaluate_node(retained_node)
+        if isinstance(expression, ast.Call):
+            # A structural method call can disappear from the numerical
+            # graph while its result is still consumed by source control.
+            # Resolve it against the live lexical bindings (not only the
+            # restricted static-binding table) and preserve Python's
+            # starred argument/keyword semantics.  State snapshots such as
+            # ``saved = state.copy_shallow()`` in the dt controller are the
+            # canonical case.
+            function = evaluate_reduced_control_expression(expression.func)
+            positional = []
+            for argument in expression.args:
+                if isinstance(argument, ast.Starred):
+                    positional.extend(
+                        evaluate_reduced_control_expression(argument.value)
+                    )
+                else:
+                    positional.append(
+                        evaluate_reduced_control_expression(argument)
+                    )
+            keywords = {}
+            for keyword in expression.keywords:
+                value = evaluate_reduced_control_expression(keyword.value)
+                if keyword.arg is None:
+                    keywords.update(value)
+                else:
+                    keywords[keyword.arg] = value
+            return function(*positional, **keywords)
+        if isinstance(expression, ast.Constant):
+            return expression.value
+        if isinstance(expression, ast.Attribute):
+            return getattr(
+                evaluate_reduced_control_expression(expression.value),
+                expression.attr,
+            )
+        return evaluate_static_expression(expression)
 
     def execute_generator_statements(statements):
+        source_value_unavailable = object()
+
+        def publish_nonlocal(name: str, value: Any) -> None:
+            if discovery_session is None:
+                return
+            for lexical_frame in reversed(
+                discovery_session.get("lexical_frames", ())
+            ):
+                if lexical_frame.get("shell") is shell:
+                    continue
+                if lexical_frame["assign"](name, value):
+                    return
+
+        def assign_source_target(target: ast.AST, value: Any) -> None:
+            if isinstance(target, ast.Name):
+                source_binding_values[target.id] = value
+                if discovery_session is not None:
+                    history = discovery_session.setdefault(
+                        "source_assignment_history", []
+                    )
+                    history.append((
+                        shell.profile_path,
+                        target.id,
+                        _diagnostic_value_summary(value),
+                    ))
+                    del history[:-64]
+                if target.id in nonlocal_names:
+                    publish_nonlocal(target.id, value)
+                return
+            if isinstance(target, (ast.Tuple, ast.List)):
+                unpacked = tuple(value)
+                starred = tuple(
+                    index
+                    for index, item in enumerate(target.elts)
+                    if isinstance(item, ast.Starred)
+                )
+                if len(starred) > 1:
+                    raise ValueError(
+                        "multiple starred assignment targets are invalid"
+                    )
+                if not starred:
+                    if len(unpacked) != len(target.elts):
+                        raise ValueError(
+                            "assignment target/value arity mismatch"
+                        )
+                    assigned = tuple(zip(target.elts, unpacked))
+                else:
+                    star_index = starred[0]
+                    trailing = len(target.elts) - star_index - 1
+                    minimum = len(target.elts) - 1
+                    if len(unpacked) < minimum:
+                        raise ValueError(
+                            "not enough values to unpack assignment"
+                        )
+                    assigned = (
+                        tuple(zip(target.elts[:star_index], unpacked[:star_index]))
+                        + ((
+                            target.elts[star_index].value,
+                            list(
+                                unpacked[
+                                    star_index:
+                                    len(unpacked) - trailing
+                                    if trailing
+                                    else len(unpacked)
+                                ]
+                            ),
+                        ),)
+                        + tuple(zip(
+                            target.elts[star_index + 1 :],
+                            unpacked[len(unpacked) - trailing :]
+                            if trailing
+                            else (),
+                        ))
+                    )
+                for item_target, item_value in assigned:
+                    assign_source_target(item_target, item_value)
+                return
+
         for statement in statements:
+            if isinstance(statement, ast.Break):
+                # Source control remains authoritative even when reduction
+                # removes the marker node because it has no numerical value.
+                raise _LoopBreakSignal()
+            if isinstance(statement, ast.Continue):
+                raise _LoopContinueSignal()
             if isinstance(statement, ast.Expr) and isinstance(
                 statement.value,
                 (ast.Yield, ast.YieldFrom),
@@ -7648,30 +10342,31 @@ def _coordinate_scheduled_capture_impl(
                     yield value
                 continue
             if isinstance(statement, ast.If):
-                test_node = expression_nodes.get(id(statement.test))
-                if test_node is None:
-                    statement_node = expression_nodes.get(id(statement))
-                    if statement_node is not None:
-                        test_node = next(
-                            (
-                                parent
-                                for parent, role in (
-                                    graph.G.nodes[statement_node].get(
-                                        "parents",
-                                        (),
-                                    )
-                                )
-                                if str(role) == "test"
-                            ),
-                            None,
-                        )
-                if test_node is None:
+                try:
+                    test = evaluate_reduced_control_expression(
+                        statement.test
+                    )
+                except (KeyError, TypeError) as error:
                     raise RuntimeError(
                         "generator branch test was not retained in "
                         f"{graph.G.graph.get('function_name', '?')}: "
                         f"{ast.dump(statement.test, include_attributes=False)}"
+                    ) from error
+                if discovery_session is not None:
+                    history = discovery_session.setdefault(
+                        "source_branch_history", []
                     )
-                test = evaluate_node(test_node)
+                    history.append((
+                        shell.profile_path,
+                        ast.dump(statement.test, include_attributes=False),
+                        _diagnostic_value_summary(test),
+                    ))
+                    del history[:-512]
+                shell._captured_source_branches.append((
+                    ast.dump(statement.test, include_attributes=False),
+                    _diagnostic_value_summary(test),
+                ))
+                del shell._captured_source_branches[:-64]
                 if shell._profiler.verbose:
                     shell._profiler.trace(
                         path=shell.profile_path,
@@ -7690,8 +10385,85 @@ def _coordinate_scheduled_capture_impl(
                 branch = statement.body if bool(test) else statement.orelse
                 yield from execute_generator_statements(branch)
                 continue
+            if isinstance(statement, ast.With):
+                # ``with`` is source-ordered Python control, including for
+                # context managers whose enter/exit effects do not produce a
+                # numerical graph value (locks are a common example).  Let
+                # ExitStack implement Python's ordered entry, reverse exit,
+                # and exception-suppression protocol while the coordinator
+                # remains responsible for evaluating expressions and binding
+                # optional ``as`` targets in the active lexical frame.
+                with ExitStack() as context_stack:
+                    for item in statement.items:
+                        context_manager = (
+                            evaluate_reduced_control_expression(
+                                item.context_expr
+                            )
+                        )
+                        entered_value = context_stack.enter_context(
+                            context_manager
+                        )
+                        if item.optional_vars is not None:
+                            assign_source_target(
+                                item.optional_vars, entered_value
+                            )
+                    yield from execute_generator_statements(statement.body)
+                continue
+            if isinstance(statement, ast.Try):
+                try:
+                    try:
+                        yield from execute_generator_statements(statement.body)
+                    except (
+                        _SourceReturnSignal,
+                        _LoopBreakSignal,
+                        _LoopContinueSignal,
+                    ):
+                        raise
+                    except BaseException as error:
+                        selected_handler = None
+                        for handler in statement.handlers:
+                            if handler.type is None:
+                                selected_handler = handler
+                                break
+                            exception_type = (
+                                evaluate_reduced_control_expression(
+                                    handler.type
+                                )
+                            )
+                            if isinstance(error, exception_type):
+                                selected_handler = handler
+                                break
+                        if selected_handler is None:
+                            raise
+                        exception_name = selected_handler.name
+                        if exception_name is not None:
+                            source_binding_values[exception_name] = error
+                        try:
+                            yield from execute_generator_statements(
+                                selected_handler.body
+                            )
+                        finally:
+                            # CPython clears an ``except ... as name`` target
+                            # when the handler suite exits.
+                            if exception_name is not None:
+                                source_binding_values.pop(exception_name, None)
+                    else:
+                        yield from execute_generator_statements(
+                            statement.orelse
+                        )
+                finally:
+                    yield from execute_generator_statements(
+                        statement.finalbody
+                    )
+                continue
             if isinstance(statement, ast.For):
-                loop_node = expression_nodes[id(statement)]
+                loop_node = expression_nodes.get(id(statement))
+                if loop_node is None:
+                    # A statically bounded loop may already have evaporated
+                    # into cloned straight-line graph nodes.  Those nodes are
+                    # evaluated by the ordinary dependency sweep; replaying
+                    # the removed source loop would duplicate the body.
+                    continue
                 plan = loop_plans_by_node[loop_node]
                 loop = plan.loop
                 target_initials = (
@@ -7731,10 +10503,26 @@ def _coordinate_scheduled_capture_impl(
                     ))
                 else:
                     iterator = iter(evaluate_node(loop.iterable_node))
+                loop_broken = False
+                # Source execution is now the authoritative owner of this
+                # retained loop.  Publish that fact before entering the body:
+                # a LoopExit demanded by a body expression must not recursively
+                # replay the generic flat-loop evaluator with an empty target
+                # frame while the source loop is already active.
+                values[loop_node] = None
+                iteration_count = 0
                 for item in iterator:
+                    iteration_count += 1
                     items_by_name = dict(_destructure_loop_target(
                         statement.target, item
                     ))
+                    # Numerical reduction is allowed to omit loop targets
+                    # that never enter a tensor region, but Python source
+                    # control may still read any destructured target.  Keep
+                    # the complete source binding environment in step with
+                    # the iterator rather than treating target_bindings as a
+                    # complete account of Python assignment semantics.
+                    source_binding_values.update(items_by_name)
                     assignments = tuple(
                         (
                             (name, binding),
@@ -7752,30 +10540,101 @@ def _coordinate_scheduled_capture_impl(
                         (),
                     ):
                         completed_regions.discard(region_index)
-                    yield from execute_generator_statements(statement.body)
-                    for _name, initial, updated in loop.carried_bindings:
-                        values[initial] = evaluate_node(updated)
+                    try:
+                        yield from execute_generator_statements(statement.body)
+                    except _LoopBreakSignal:
+                        loop_broken = True
+                        break
+                    except _LoopContinueSignal:
+                        loop_continued = True
+                    else:
+                        loop_continued = False
+                    for carried_name, initial, updated in loop.carried_bindings:
+                        if (
+                            loop_continued
+                            and carried_name in source_binding_values
+                        ):
+                            values[initial] = source_binding_values[
+                                carried_name
+                            ]
+                        elif not loop_continued:
+                            values[initial] = evaluate_node(updated)
                 # The generator interpreter is the planner-owned execution of
                 # this loop.  Publish completion so a downstream LoopExit
                 # cannot replay the same body through the generic flat loop
                 # evaluator (which would also lose nested branch semantics).
                 values[loop_node] = None
-                yield from execute_generator_statements(statement.orelse)
+                shell._captured_loop_iterations[int(loop_node)] = (
+                    int(iteration_count)
+                )
+                if not loop_broken:
+                    yield from execute_generator_statements(statement.orelse)
                 continue
             if isinstance(statement, ast.While):
-                loop_node = expression_nodes[id(statement)]
+                loop_node = expression_nodes.get(id(statement))
+                if loop_node is None:
+                    continue
+                source_loop_nodes = frozenset(
+                    int(member_node)
+                    for member in ast.walk(statement)
+                    if (
+                        member_node := expression_nodes.get(id(member))
+                    ) is not None
+                    and int(member_node) != int(loop_node)
+                )
                 iterations = 0
-                while bool(
-                    evaluate_node(expression_nodes[id(statement.test)])
-                ):
-                    for dependent in loop_invalidated_nodes[loop_node]:
+                loop_broken = False
+                plan = loop_plans_by_node[loop_node]
+                if plan.strategy is LoopStrategy.NATIVE_SOURCE:
+                    # Discovery traces the body of a retained native loop; it
+                    # must not execute the runtime trip count.  This is vital
+                    # for event/render loops whose configured bound is
+                    # intentionally infinite.  The semantic loop/control IR
+                    # owns repetition after capture.
+                    for dependent in (
+                        *loop_invalidated_nodes[loop_node],
+                        *source_loop_nodes,
+                    ):
+                        values.pop(dependent, None)
+                    for region_index in loop_runtime_region_indices.get(
+                        loop_node, ()
+                    ):
+                        completed_regions.discard(region_index)
+                    test = evaluate_reduced_control_expression(statement.test)
+                    if bool(test):
+                        try:
+                            yield from execute_generator_statements(
+                                statement.body
+                            )
+                        except (_LoopBreakSignal, _LoopContinueSignal):
+                            pass
+                    values[loop_node] = None
+                    # The runtime loop, not discovery, decides whether it
+                    # exhausts normally and therefore enters ``else``.
+                    continue
+                while True:
+                    for dependent in (
+                        *loop_invalidated_nodes[loop_node],
+                        *source_loop_nodes,
+                    ):
                         values.pop(dependent, None)
                     for region_index in loop_runtime_region_indices.get(
                         loop_node,
                         (),
                     ):
                         completed_regions.discard(region_index)
-                    yield from execute_generator_statements(statement.body)
+                    test = evaluate_reduced_control_expression(
+                        statement.test
+                    )
+                    if not bool(test):
+                        break
+                    try:
+                        yield from execute_generator_statements(statement.body)
+                    except _LoopBreakSignal:
+                        loop_broken = True
+                        break
+                    except _LoopContinueSignal:
+                        pass
                     iterations += 1
                     if iterations > 1_000_000:
                         raise RuntimeError(
@@ -7783,39 +10642,258 @@ def _coordinate_scheduled_capture_impl(
                             "safety limit"
                         )
                 values[loop_node] = None
-                yield from execute_generator_statements(statement.orelse)
+                if not loop_broken:
+                    yield from execute_generator_statements(statement.orelse)
                 continue
             if isinstance(statement, ast.Return):
-                if statement.value is not None:
-                    evaluate_node(expression_nodes[id(statement.value)])
-                return
+                source_return = object()
+                value = source_return
+                if isinstance(statement.value, ast.Name):
+                    if statement.value.id in source_binding_values:
+                        value = source_binding_values[statement.value.id]
+                    elif statement.value.id in supplied:
+                        value = supplied[statement.value.id]
+                elif (
+                    statement.value is not None
+                    and has_live_source_root(statement.value)
+                ):
+                    value = evaluate_reduced_control_expression(
+                        statement.value
+                    )
+                # The executing Return statement and its value expression are
+                # the exact source-order authority.  Normalized/checkpointed
+                # ``return_value_nodes`` can collapse multiple returns onto a
+                # function's syntactically last output identity; consulting
+                # it first made an executed early tensor return appear to be
+                # the later ``float(value.item())`` branch.  Prefer the live
+                # expression node and retain both metadata tables solely as
+                # compatibility fallbacks when AST identity was serialized.
+                value_node = (
+                    source_binding_node_ids.get(statement.value.id)
+                    if isinstance(statement.value, ast.Name)
+                    else expression_nodes.get(id(statement.value))
+                    if statement.value is not None
+                    else None
+                )
+                if value_node is None and statement.value is not None:
+                    value_node = graph.G.graph.get(
+                        "return_value_nodes", {}
+                    ).get(id(statement))
+                if value_node is None and statement.value is not None:
+                    value_node = checkpoint_return_value_nodes.get(
+                        id(statement)
+                    )
+                if value_node is not None and value_node not in graph.G:
+                    output_names = tuple(
+                        graph.G.graph.get("function_outputs", ())
+                    )
+                    identities = graph.G.graph.get("identity_table", {})
+                    candidates = tuple(
+                        int(identities[name][-1])
+                        for name in output_names
+                        if identities.get(name)
+                        and int(identities[name][-1]) in graph.G
+                    )
+                    value_node = (
+                        candidates[0]
+                        if len(candidates) == 1
+                        else graph.roots[0]
+                        if len(graph.roots) == 1
+                        else None
+                    )
+                if capture and value_node is not None:
+                    shell._captured_return_value_ids.add(int(value_node))
+                if value is source_return:
+                    value = (
+                        values[value_node]
+                        if value_node in values
+                        else evaluate_node(value_node)
+                        if value_node is not None
+                        else None
+                    )
+                if capture:
+                    shell.forward_feed_ids = tuple(feed_maps)
+                    shell.forward_aggregate_feed_paths = tuple(
+                        aggregate_feed_maps
+                    )
+                    shell.forward_subgraphs = tuple(captured_subgraphs)
+                    shell.forward_compilers = tuple(captured_compilers)
+                    shell.forward_region_indices = tuple(
+                        captured_region_indices
+                    )
+                    shell.forward_output_values = tuple(
+                        captured_output_values
+                    )
+                    shell.forward_region_capture_node_ids = tuple(
+                        captured_region_node_ids
+                    )
+                    shell.forward_region_planned_capture_ids = tuple(
+                        captured_region_planned_ids
+                    )
+                    shell.forward_region_planned_input_ids = tuple(
+                        captured_region_planned_input_ids
+                    )
+                shell.captured_values = values
+                shell.last_result = value
+                raise _SourceReturnSignal(value)
             if isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 value_expression = statement.value
+                assigned_value = None
                 if value_expression is not None:
-                    evaluate_node(expression_nodes[id(value_expression)])
+                    value_node = expression_nodes.get(id(value_expression))
+                    # A bare source name denotes the value visible at this
+                    # statement, not necessarily the last normalized SSA
+                    # identity bearing that spelling.  The distinction is
+                    # observable whenever a value is saved before a later
+                    # write, for example ``saved = counter; counter += 1``.
+                    # Consult the active lexical/source frame first; retained
+                    # compound expressions remain owned by the planned graph.
+                    if isinstance(
+                        value_expression,
+                        (ast.Name, ast.IfExp, ast.BoolOp),
+                    ):
+                        assigned_value = evaluate_reduced_control_expression(
+                            value_expression
+                        )
+                    elif value_node is not None:
+                        if is_shader_internal_node(value_node):
+                            evaluate_region(region_for_node[value_node])
+                            assigned_value = values.get(
+                                value_node,
+                                source_value_unavailable,
+                            )
+                        else:
+                            assigned_value = evaluate_node(value_node)
+                    else:
+                        assigned_value = evaluate_reduced_control_expression(
+                            value_expression
+                        )
                 targets = (
                     tuple(statement.targets)
                     if isinstance(statement, ast.Assign)
                     else (statement.target,)
                 )
                 for target in targets:
+                    if (
+                        assigned_value is not source_value_unavailable
+                        and isinstance(target, (ast.Name, ast.Tuple, ast.List))
+                    ):
+                        assign_source_target(target, assigned_value)
                     target_node = expression_nodes.get(id(target))
                     if (
                         target_node is not None
                         and target_node in graph.G
                         and graph.G.nodes[target_node].get("type")
-                        == "SetAttr"
+                        in {"SetAttr", "IndexedStore"}
                     ):
+                        if is_shader_internal_node(target_node):
+                            evaluate_region(region_for_node[target_node])
+                            continue
+                        # The source statement has already evaluated its RHS
+                        # at this exact program point.  A normalized store can
+                        # still refer to the final SSA identity with the same
+                        # spelling (for example ``result`` assigned in many
+                        # arms of a long if/elif chain).  Publish the live RHS
+                        # into the store's value port so structural mutation
+                        # observes Python's source-order value, not a later
+                        # predicate or branch identity.
+                        for parent, role in graph.G.nodes[target_node].get(
+                            "parents", ()
+                        ):
+                            if (
+                                str(role) == "value"
+                                and assigned_value
+                                is not source_value_unavailable
+                            ):
+                                values[int(parent)] = assigned_value
+                                inert_nodes.discard(int(parent))
                         evaluate_node(target_node)
+                continue
+            if isinstance(statement, ast.AugAssign):
+                statement_node = expression_nodes.get(id(statement))
+                if (
+                    statement_node is not None
+                    and is_shader_internal_node(statement_node)
+                ):
+                    evaluate_region(region_for_node[statement_node])
+                    if isinstance(statement.target, ast.Name):
+                        source_binding_values.pop(
+                            statement.target.id,
+                            None,
+                        )
+                    continue
+                assigned_value = None
+                scalar_source_update = False
+                if (
+                    isinstance(statement.target, ast.Name)
+                    and statement.target.id in source_binding_values
+                    and not isinstance(
+                        source_binding_values[statement.target.id],
+                        AbstractTensor,
+                    )
+                ):
+                    try:
+                        right_value = evaluate_reduced_control_expression(
+                            statement.value
+                        )
+                    except (KeyError, TypeError):
+                        right_value = None
+                    if not isinstance(right_value, AbstractTensor):
+                        binary = {
+                            ast.Add: operator.add,
+                            ast.Sub: operator.sub,
+                            ast.Mult: operator.mul,
+                            ast.Div: operator.truediv,
+                            ast.FloorDiv: operator.floordiv,
+                            ast.Mod: operator.mod,
+                            ast.Pow: operator.pow,
+                            ast.LShift: operator.lshift,
+                            ast.RShift: operator.rshift,
+                            ast.BitOr: operator.or_,
+                            ast.BitXor: operator.xor,
+                            ast.BitAnd: operator.and_,
+                            ast.MatMult: operator.matmul,
+                        }.get(type(statement.op))
+                        if binary is not None:
+                            assigned_value = binary(
+                                source_binding_values[statement.target.id],
+                                right_value,
+                            )
+                            scalar_source_update = True
+                if statement_node is not None:
+                    values.pop(statement_node, None)
+                    statement_region = region_for_node.get(statement_node)
+                    if statement_region is not None:
+                        completed_regions.discard(statement_region)
+                if not scalar_source_update:
+                    assigned_value = (
+                        evaluate_node(statement_node)
+                        if statement_node is not None
+                        else evaluate_reduced_control_expression(statement)
+                    )
+                if isinstance(statement.target, ast.Name):
+                    source_binding_values[
+                        statement.target.id
+                    ] = assigned_value
+                    if statement.target.id in nonlocal_names:
+                        publish_nonlocal(
+                            statement.target.id, assigned_value
+                        )
                 continue
             statement_node = expression_nodes.get(id(statement))
             if statement_node is not None and statement_node in graph.G:
-                evaluate_node(statement_node)
+                if is_shader_internal_node(statement_node):
+                    evaluate_region(region_for_node[statement_node])
+                else:
+                    evaluate_node(statement_node)
                 continue
             for member in ast.iter_child_nodes(statement):
                 member_node = expression_nodes.get(id(member))
                 if member_node is not None and member_node in graph.G:
-                    evaluate_node(member_node)
+                    if is_shader_internal_node(member_node):
+                        evaluate_region(region_for_node[member_node])
+                    else:
+                        evaluate_node(member_node)
 
     if graph.G.graph.get("generator_stream"):
         for input_id in tuple(values):
@@ -7870,6 +10948,37 @@ def _coordinate_scheduled_capture_impl(
         )
         return shell.last_result
 
+    if discovery_session is not None:
+        def resolve_lexical_name(name: str) -> tuple[bool, Any]:
+            if name in source_binding_values:
+                return True, source_binding_values[name]
+            if name in supplied:
+                return True, supplied[name]
+            for identity in reversed(
+                graph.G.graph.get("identity_table", {}).get(name, ())
+            ):
+                try:
+                    return True, evaluate_node(identity)
+                except (KeyError, RuntimeError):
+                    continue
+            return False, None
+
+        def assign_lexical_name(name: str, value: Any) -> bool:
+            if (
+                name not in source_binding_values
+                and name not in supplied
+                and name not in graph.G.graph.get("identity_table", {})
+            ):
+                return False
+            source_binding_values[name] = value
+            return True
+
+        discovery_session.setdefault("lexical_frames", []).append({
+            "shell": shell,
+            "resolve": resolve_lexical_name,
+            "assign": assign_lexical_name,
+        })
+
     with AbstractTensor.use_backend(
         _scheduled_capture_backend.get(),
         device,
@@ -7906,6 +11015,17 @@ def _coordinate_scheduled_capture_impl(
         if capture:
             for validation in _validation_control_blocks(shell):
                 evaluate_node(int(validation.predicate_value_id))
+
+        # Structural Python control is ordered by its retained source body,
+        # not by numerical dependency levels.  In particular, a later branch
+        # predicate must not run after an earlier branch returned.  Statement
+        # execution still demands each planned numerical region through
+        # evaluate_node; it does not replace or reinterpret numeric lowering.
+        if function_body:
+            for _yielded in execute_generator_statements(function_body):
+                raise RuntimeError(
+                    "non-generator ProcessGraph produced a yielded value"
+                )
 
         for node_id in _dependency_order(graph):
             if node_id in inert_nodes:
@@ -8017,12 +11137,50 @@ def _coordinate_scheduled_capture(
             capture=capture,
             discovery_session=discovery_session,
         )
+    except _SourceReturnSignal as signal:
+        shell.last_result = signal.value
+        return signal.value
     except Exception as error:
         if hasattr(error, "add_note"):
+            structural_state = tuple(
+                (
+                    str(name),
+                    {
+                        str(field): _diagnostic_value_summary(field_value)
+                        for field, field_value in list(value.state.items())[:24]
+                    },
+                )
+                for name, value in initial_values.items()
+                if isinstance(value, _CompiledStructuralObject)
+            )
+            active_session = discovery_session or getattr(
+                shell, "_discovery_session", None
+            )
+            call_returns = tuple(
+                (active_session or {}).get("call_return_history", ())
+            )
+            structural_predicates = tuple(
+                (active_session or {}).get(
+                    "structural_predicate_history", ()
+                )
+            )
+            source_assignments = tuple(
+                (active_session or {}).get(
+                    "source_assignment_history", ()
+                )
+            )
+            source_branches = tuple(
+                (active_session or {}).get("source_branch_history", ())
+            )
             error.add_note(
                 "while coordinating ProcessGraph shell "
                 f"{shell.profile_path!r} with inputs="
-                f"{tuple((str(name), _diagnostic_value_summary(value)) for name, value in initial_values.items())!r}"
+                f"{tuple((str(name), _diagnostic_value_summary(value)) for name, value in initial_values.items())!r}; "
+                f"structural_state={structural_state!r}; "
+                f"recent_call_returns={call_returns!r}; "
+                f"recent_structural_predicates={structural_predicates!r}; "
+                f"recent_source_assignments={source_assignments!r}; "
+                f"recent_source_branches={source_branches!r}"
             )
         shell._profiler.record_exception(
             error,
@@ -8031,6 +11189,15 @@ def _coordinate_scheduled_capture(
         )
         raise
     finally:
+        active_session = discovery_session or getattr(
+            shell, "_discovery_session", None
+        )
+        if active_session is not None:
+            frames = active_session.get("lexical_frames", [])
+            for index in range(len(frames) - 1, -1, -1):
+                if frames[index].get("shell") is shell:
+                    del frames[index]
+                    break
         shell._profiler.end_shell(shell.profile_path, token)
         if capture:
             shell._profiler._runtime_suppression -= 1
@@ -8129,6 +11296,9 @@ def _source_static_value(graph: Any, node_id: int, visiting=None) -> bool:
     data = graph.G.nodes[node_id]
     if data.get("type") in {"Constant", "Const", "const", "StaticReference"}:
         return True
+    if data.get("type") == "Input":
+        name = (data.get("attributes") or {}).get("binding_name")
+        return name in (graph.G.graph.get("planner_specializations") or {})
     expression = data.get("expr_obj")
     if isinstance(expression, (ast.Tuple, ast.List, ast.Set, ast.Dict)):
         return all(
@@ -8151,6 +11321,21 @@ def _source_static_literal(
     data = graph.G.nodes[node_id]
     if data.get("type") in {"Constant", "Const", "const"}:
         return _constant_value(data)
+    if data.get("type") == "StaticReference":
+        attributes = data.get("attributes") or {}
+        reference = attributes.get(
+            "first_class_function_ref",
+            attributes.get("function_ref"),
+        )
+        if reference is not None:
+            return FunctionReference(int(reference))
+        raise ValueError("static reference is not a graph-backed function")
+    if data.get("type") == "Input":
+        name = (data.get("attributes") or {}).get("binding_name")
+        specializations = graph.G.graph.get("planner_specializations") or {}
+        if name in specializations:
+            return specializations[name]
+        raise ValueError("input has no source-static planner binding")
     expression = data.get("expr_obj")
     parents = tuple(data.get("parents") or ())
     nested = visiting | {node_id}
@@ -8169,13 +11354,26 @@ def _source_static_literal(
         values = tuple(expression.values)
         if len(keys) != len(values):
             raise ValueError("invalid static dictionary")
-        resolved = [
-            _source_static_literal(graph, parent, nested)
-            for parent, _role in parents
-        ]
-        if len(resolved) != len(keys) * 2:
+        if any(key is None for key in keys):
+            # ``{**other}`` occupies a key slot with no key expression, so the
+            # mapping's contents are not decidable from this literal alone.
+            raise ValueError("dictionary unpacking is not source-static")
+        # Parents arrive grouped by the AST field they came from -- every
+        # ``keys`` parent, then every ``values`` parent -- not interleaved per
+        # entry, so pair them by role rather than by position.
+        key_parents = tuple(
+            parent for parent, role in parents if str(role) == "keys"
+        )
+        value_parents = tuple(
+            parent for parent, role in parents if str(role) == "values"
+        )
+        if len(key_parents) != len(keys) or len(value_parents) != len(values):
             raise ValueError("dictionary parents are not literal leaves")
-        return dict(zip(resolved[::2], resolved[1::2]))
+        return {
+            _source_static_literal(graph, key_parent, nested):
+                _source_static_literal(graph, value_parent, nested)
+            for key_parent, value_parent in zip(key_parents, value_parents)
+        }
     raise ValueError("value is not source-static")
 
 
@@ -8244,10 +11442,44 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
             )[parameter] = first
 
 
+def _resolve_bound_function_references(graph: Any) -> None:
+    """Turn a specialized callable parameter into an ordinary call edge.
+
+    A first-class source function is represented by its opaque function-table
+    address.  When that address crosses a function parameter (for example the
+    dt system's ``advance`` callback), the call remains parametric, but this
+    specialized card invocation can still link it to the selected callee.
+    No Python callable is retained or executed to establish the edge.
+    """
+
+    specializations = graph.G.graph.get("planner_specializations") or {}
+    for _node_id, data in graph.G.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if (
+            attributes.get("callee_ref") is not None
+            or attributes.get("method_ref") is not None
+        ):
+            continue
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Name)
+        ):
+            continue
+        bound = specializations.get(expression.func.id)
+        if not isinstance(bound, FunctionReference):
+            continue
+        attributes = dict(attributes)
+        attributes["callee_ref"] = int(bound.address)
+        attributes["callee_resolution"] = "bound-function-parameter"
+        data["attributes"] = attributes
+
+
 def propagate_bound_planner_specializations(
     graph: Any,
     entrypoint: str,
     bindings: Mapping[str, Any],
+    mutable_parameters: Iterable[str] = (),
 ) -> None:
     """Carry safe structural feed values through the linked call graph.
 
@@ -8304,10 +11536,18 @@ def propagate_bound_planner_specializations(
                     return getattr(owner, node.func.attr)()
         raise ValueError("expression is not a safe structural binding")
 
+    mutable = frozenset(map(str, mutable_parameters))
     entry = function_table.entry(reference.address).graph
     if entry is None:
         return
-    queue: list[tuple[Any, dict[str, Any]]] = [(entry, dict(bindings))]
+    queue: list[tuple[Any, dict[str, Any]]] = [(
+        entry,
+        {
+            str(name): value
+            for name, value in bindings.items()
+            if str(name) not in mutable
+        },
+    )]
     visited: set[tuple[int, tuple[str, ...]]] = set()
     while queue:
         current, environment = queue.pop(0)
@@ -8446,7 +11686,7 @@ def _callsite_specialized_shell_type(
     specialized.G.graph.setdefault(
         "planner_specializations", {}
     ).update(specializations)
-    planned = strategize_glsl_deployment(
+    planned = strategize_shell_deployment(
         specialized,
         max_nodes_per_dispatch=int(max_nodes_per_dispatch),
         _function_table_stack=(id(function_table),),
@@ -8502,7 +11742,7 @@ def _resolve_unambiguous_method_references(graph: Any) -> None:
 MAX_UNROLL_LIMIT = 4096
 
 
-def strategize_glsl_deployment(
+def strategize_shell_deployment(
     graph: Any,
     *,
     # Was 256, which was a GLSL dispatch-sizing constraint: a shader had to
@@ -8519,6 +11759,11 @@ def strategize_glsl_deployment(
     _function_table_stack: tuple[int, ...] = (),
 ) -> type:
     """Build a stateful shell around the graph's flat dispatch schedule.
+
+    This is the compilation choke point: every backend -- c, python, glsl,
+    fortran, webgl, webgpu -- funnels its ProcessGraph through this one
+    control-planning stage before any backend-specific emission happens.
+    The name is generic on purpose; nothing below is GLSL-specific.
 
     ``backend`` only tags the loop-composition capability profile below --
     it does not change GLSL emission, which stays gated behind
@@ -8573,6 +11818,7 @@ def strategize_glsl_deployment(
     }
     graph.G.graph["deployment_schedule_preference"] = schedule_preference
 
+    _resolve_bound_function_references(graph)
     _propagate_callsite_planner_specializations(graph)
     canonical_value_ids = bool(
         graph.G.graph.get("canonical_value_ids")
@@ -8652,6 +11898,20 @@ def strategize_glsl_deployment(
     )
     inert_nodes = _inert_routing_nodes(graph)
     closure_edges, closure_outputs = _closure_routing_dependencies(graph)
+    return_outputs = frozenset(
+        int(value_id)
+        for value_id in (
+            *(
+                parent
+                for _node_id, data in graph.G.nodes(data=True)
+                if isinstance(data.get("expr_obj"), ast.Return)
+                for parent, role in (data.get("parents") or ())
+                if str(role) in {"result", "value", "operand"}
+            ),
+            *(graph.G.graph.get("return_value_nodes", {}) or {}).values(),
+        )
+        if int(value_id) in graph.G
+    )
     recursion_control_nodes = frozenset(
         int(node_id)
         for record in (
@@ -8693,7 +11953,7 @@ def strategize_glsl_deployment(
         _dispatch_subgraph(
             graph,
             node_ids,
-            required_outputs=closure_outputs,
+            required_outputs=frozenset((*closure_outputs, *return_outputs)),
             inert_nodes=inert_nodes,
             schedule_preference=deployment_region_preferences.get(
                 region_index, "asap"
@@ -8894,6 +12154,15 @@ class ProcessGraphGLSLDeployment:
         self.compiled_shell_program = None
         self.compiled_region_indices = ()
         self.captured_region_programs = {}
+        # A reference operator (SetAttr/GetAttr) has an unambiguous identity
+        # from its own graph node id -- no tensor primitive to correlate,
+        # no ambiguity the tape machinery above exists to resolve.  Recorded
+        # here, in exact execution order, as each one runs: not a strategy,
+        # not a region to score for launch profitability, just what happened,
+        # in the order it happened -- the sequential memory operations this
+        # represents have real causality that reordering or fusing would
+        # break.
+        self.reference_operator_sequence = []
         self._capture_invocations = 0
         # Which source parameter each captured input tensor came from, by
         # object identity. Feeds are identified downstream by id(), and
@@ -8904,6 +12173,16 @@ class ProcessGraphGLSLDeployment:
         # The same names, keyed by the resident range instead of by object
         # identity, so a value that was rewrapped can still be recognised.
         self._capture_input_storage = {}
+        # Scalar configuration fields carried by structural input objects are
+        # compile-time control facts.  Their scoped field paths let hierarchy
+        # composition resolve predicates such as ``ctrl.dt_min is not None``
+        # without retaining or inspecting the object later.
+        self._capture_input_static_fields = {}
+        self._captured_return_value_ids = set()
+        self._capture_input_type_names = {}
+        self._capture_tensor_input_names = set()
+        self._captured_source_branches = []
+        self._captured_loop_iterations = {}
         self._execute_invocations = 0
         self._discovery_tape_creations = 0
         self._discovery_tape_lowerings = 0
@@ -8939,10 +12218,13 @@ class ProcessGraphGLSLDeployment:
         self.hierarchical_composed_closure_iterable_bindings = ()
         self.hierarchical_region_correlations = ()
         self.hierarchical_endpoint_details = {}
+        self.hierarchical_value_aliases = {}
         self.hierarchical_root_field_value_ids = {}
         self.hierarchical_effective_value_table = None
         self.hierarchical_compose_failure = None
         self.hierarchical_public_output_ids = set()
+        self.hierarchical_terminal_outputs = {}
+        self.hierarchical_specialized_values = {}
         self.hierarchy_identity_collapses = ()
         self.hierarchy_identity_rounds = 0
         self.hierarchy_remaining_callsite_ids = None
@@ -9316,7 +12598,10 @@ class ProcessGraphGLSLDeployment:
             missing = (
                 set(range(len(target.ephemeral_callables))) - captured
             )
-            for region_index in missing:
+            unexplained_missing = missing - set(
+                target.coordinator_region_indices
+            )
+            for region_index in unexplained_missing:
                 subgraph = target.dispatch_subgraphs[region_index]
                 tensor_outputs = [
                     output_id
@@ -9348,6 +12633,97 @@ class ProcessGraphGLSLDeployment:
                 target.compiled_region_indices,
                 target.compiled_tapes,
             ))
+            if target.reference_operator_sequence:
+                # Package exactly what happened, in the order it happened --
+                # no fusion, no launch-cost strategy, no tape correlation
+                # (a reference operator's own graph node id is already an
+                # unambiguous identity; nothing dynamic needs resolving).
+                # Reordering or batching these would break the causality of
+                # the sequential memory operations they represent.
+                seen_node_ids: set[int] = set()
+                ordered_node_ids = [
+                    node_id
+                    for node_id in target.reference_operator_sequence
+                    if node_id in target.process_graph.G
+                    and not (
+                        node_id in seen_node_ids
+                        or seen_node_ids.add(node_id)
+                    )
+                ]
+                def _reference_step_input_ids(node_id: int) -> list[int]:
+                    # A field's real identity is ``attribute_slot`` (see
+                    # ``bind_target``/``resolve_expression``) -- a
+                    # (class_identity, slot) pair grounded in the class's
+                    # own declared layout, not a node id.  It carries
+                    # through automatically via ``attrs`` below (a full copy
+                    # of this node's attributes), so nothing needs pulling in
+                    # here beyond the ordinary ``parents`` wiring.
+                    node_data = target.process_graph.G.nodes[node_id]
+                    return [
+                        int(parent)
+                        for parent, _role in (node_data.get("parents") or ())
+                    ]
+
+                reference_steps = [
+                    OpStep(
+                        step_id=index,
+                        op_name=str(
+                            target.process_graph.G.nodes[node_id].get("op")
+                            or target.process_graph.G.nodes[node_id].get(
+                                "type"
+                            )
+                        ),
+                        input_ids=_reference_step_input_ids(node_id),
+                        attrs=dict(
+                            target.process_graph.G.nodes[node_id].get(
+                                "attributes"
+                            )
+                            or {}
+                        ),
+                        result_id=int(node_id),
+                    )
+                    for index, node_id in enumerate(ordered_node_ids)
+                ]
+                reference_result_ids = {
+                    step.result_id for step in reference_steps
+                }
+                reference_feeds = {
+                    input_id
+                    for step in reference_steps
+                    for input_id in step.input_ids
+                    if input_id not in reference_result_ids
+                }
+                reference_feed_origins = {
+                    feed_id: {"binding_name": binding_name}
+                    for feed_id in reference_feeds
+                    if (
+                        binding_name := (
+                            target.process_graph.G.nodes.get(feed_id, {})
+                            .get("attributes", {})
+                            .get("binding_name")
+                        )
+                    )
+                    is not None
+                }
+                reference_program = FusedProgram(
+                    version=1,
+                    feeds=reference_feeds,
+                    steps=reference_steps,
+                    outputs={},
+                    extras={"capture_feed_origins": reference_feed_origins},
+                )
+                next_index = (
+                    max(target.compiled_region_indices, default=-1) + 1
+                )
+                target.captured_region_programs[next_index] = (
+                    CapturedFusedProgram(
+                        program=reference_program,
+                        feeds={},
+                    )
+                )
+                target.compiled_region_indices = (
+                    *target.compiled_region_indices, next_index,
+                )
             if target is self and precompile_only:
                 # SSA and other IR consumers stop at the Turing precompile
                 # boundary.  They need the complete numerical manifest,
@@ -10301,8 +13677,22 @@ class ProcessGraphGLSLDeployment:
             # their ProcessGraph IDs as external shell inputs.
             planned_region_id_map: dict[int, int] = {}
 
+            def compiled_alias_identity(graph_id: int) -> int:
+                current = int(graph_id)
+                seen = set()
+                while (
+                    current not in seen
+                    and current in self.compiled_process_graph_aliases
+                ):
+                    seen.add(current)
+                    current = int(
+                        self.compiled_process_graph_aliases[current]
+                    )
+                return current
+
             def add_planned_id(primitive_id: int, graph_id: int) -> None:
                 primitive_id = int(primitive_id)
+                graph_id = compiled_alias_identity(graph_id)
                 graph_id = endpoint_identity.get(
                     int(graph_id), int(graph_id)
                 )
@@ -10316,6 +13706,9 @@ class ProcessGraphGLSLDeployment:
                         f"{region_index}: primitive={primitive_id}, "
                         f"first={previous}, second={graph_id}, "
                         f"function={self.process_graph.G.graph.get('function_name', '?')!r}, "
+                        f"primitive_node={tape._nodes.get(primitive_id)!r}, "
+                        f"capture_rows={region_planned_capture_ids!r}, "
+                        f"input_rows={region_planned_input_ids!r}, "
                         f"first_node={dict(self.process_graph.G.nodes[previous]) if previous in self.process_graph.G else None!r}, "
                         f"second_node={dict(self.process_graph.G.nodes[graph_id]) if graph_id in self.process_graph.G else None!r}"
                     )
@@ -10328,6 +13721,31 @@ class ProcessGraphGLSLDeployment:
                 region_planned_input_ids
             ):
                 for primitive_id, graph_id in positional_inputs:
+                    previous = planned_region_id_map.get(int(primitive_id))
+                    previous_node = (
+                        self.process_graph.G.nodes[int(previous)]
+                        if previous is not None
+                        and int(previous) in self.process_graph.G
+                        else {}
+                    )
+                    if (
+                        int(primitive_id) == int(_result_capture_id)
+                        and previous is not None
+                        and int(previous) != int(graph_id)
+                        and previous_node.get("type")
+                        not in {"Store", "IndexedStore"}
+                    ):
+                        # Object-keyed capture represents an identity adapter
+                        # with the same transient ID at its input and result.
+                        # Keep that transient ID wired to the real input and
+                        # publish the planned result endpoint as an SSA alias.
+                        self.compiled_process_graph_aliases[
+                            int(previous)
+                        ] = int(graph_id)
+                        planned_region_id_map[int(primitive_id)] = int(
+                            graph_id
+                        )
+                        continue
                     add_planned_id(primitive_id, graph_id)
             live_result_ids = tuple(
                 value_id
@@ -11506,6 +14924,9 @@ class ProcessGraphGLSLDeployment:
         "AbstractTensor": AbstractTensor,
         "autograd": autograd,
         "np": np,
+        "OpStep": OpStep,
+        "FusedProgram": FusedProgram,
+        "CapturedFusedProgram": CapturedFusedProgram,
     }
     exec(
         compile(
@@ -11543,7 +14964,7 @@ class ProcessGraphGLSLDeployment:
                 dict(graph.G.graph.get("loop_settings") or {}),
             )
             function_shell_types[entry.reference.address] = (
-                strategize_glsl_deployment(
+                strategize_shell_deployment(
                     function_graph,
                     max_nodes_per_dispatch=max_nodes_per_dispatch,
                     _function_table_stack=nested_stack,
@@ -11556,7 +14977,7 @@ class ProcessGraphGLSLDeployment:
 __all__ = [
     "DeploymentErrorBuffer",
     "DeploymentProfiler",
-    "strategize_glsl_deployment",
+    "strategize_shell_deployment",
 ]
 class _CompiledStructuralObject:
     """Shell-owned state whose methods are compiled function subgraphs."""
@@ -11602,6 +15023,15 @@ class _CompiledStructuralMethod:
     def __init__(self, receiver, method_ref):
         self.receiver = receiver
         self.method_ref = int(method_ref)
+
+
+class _CompiledStructuralFunction:
+    """First-class edge to a source function already in the function table."""
+
+    __slots__ = ("function_ref",)
+
+    def __init__(self, function_ref):
+        self.function_ref = int(function_ref)
 
 
 class _CompiledStructuralClass:

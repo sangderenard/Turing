@@ -39,6 +39,48 @@ def kernel(x):
             assert data["type"] == original_type
 
 
+def test_annotated_assignments_use_one_ingestion_operator_in_functions_only():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse(
+            """
+class Example:
+    class_value: float = 1.0
+
+    def method(self, value):
+        local_value: float = value
+        return local_value
+"""
+        ))
+
+    # A class body's own ``AnnAssign`` is its field schema -- the class-table
+    # builder (topological_reducer.py's ``class_field_defaults``/``fields``)
+    # reads it directly off the untouched ``ClassDef`` AST, so it must
+    # survive ingestion unnormalized.  Only a method body's local-variable
+    # annotation is executable code, and that one is normalized to ``Assign``
+    # the same way it always was.
+    class_body_ann_assigns = [
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.AnnAssign)
+    ]
+    assert len(class_body_ann_assigns) == 1
+
+    assignments = [
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Assign)
+    ]
+    assert len(assignments) == 1
+
+    reduce_abstract_tensor_topology(graph)
+
+    assert all(data["type"] == "Store" for data in assignments)
+    assert graph.G.graph["map_ir"]["schema"]["classes"][0][
+        "members"
+    ][0]["annotation"] == "float"
+
+
 def test_expr_wrapper_is_removed_without_removing_its_interior():
     graph = ProcessGraph(materialize_memory=False)
     with contextlib.redirect_stdout(io.StringIO()):
@@ -708,6 +750,120 @@ class Accumulator:
     )
 
 
+def test_static_class_attribute_update_uses_reference_and_latest_ssa_value():
+    class Counter:
+        value = 0
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"Counter": Counter}
+    module = ast.parse(
+        """
+def increment():
+    Counter.value += 1
+    return Counter.value
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("increment").graph
+
+    reference_id, reference = next(
+        (node_id, data)
+        for node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "StaticReference"
+    )
+    set_attr_id, set_attr = next(
+        (node_id, data)
+        for node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "SetAttr"
+    )
+    updated_value = next(
+        parent
+        for parent, role in set_attr["parents"]
+        if role == "value"
+    )
+
+    assert reference["attributes"]["static_python_reference"] == "Counter"
+    assert (reference_id, "object") in set_attr["parents"]
+    assert set_attr["attributes"]["attribute"] == "value"
+    assert function_graph.G.graph["identity_table"]["result_0"] == (
+        updated_value,
+    )
+    assert set_attr_id != updated_value
+
+
+def test_scope_declarations_do_not_become_runtime_operators():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+shared = 0
+
+def outer(value):
+    captured = value
+
+    def update():
+        nonlocal captured
+        global shared
+        captured += 1
+        shared = captured
+        return captured
+
+    return update()
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("update").graph
+
+    for candidate in (graph, function_graph):
+        assert not any(
+            data.get("type") in {"Nonlocal", "Global"}
+            for _node_id, data in candidate.G.nodes(data=True)
+        )
+
+
+def test_delete_lowers_names_away_and_preserves_object_effects():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def discard(mapping, key, owner, temporary):
+    del temporary
+    del mapping[key]
+    del owner.cached
+    return mapping
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("discard").graph
+
+    for candidate in (graph, function_graph):
+        assert not any(
+            data.get("type") == "Delete"
+            for _node_id, data in candidate.G.nodes(data=True)
+        )
+
+    del_item = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "DelItem"
+    )
+    del_attr = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "DelAttr"
+    )
+    assert {role for _parent, role in del_item["parents"]} == {
+        "base",
+        "index",
+    }
+    assert {role for _parent, role in del_attr["parents"]} == {"object"}
+    assert del_attr["attributes"]["attribute"] == "cached"
+
+
 def test_try_value_survives_when_every_exception_handler_terminates():
     graph = ProcessGraph(materialize_memory=False)
     module = ast.parse(
@@ -730,3 +886,108 @@ def convert(value):
         and (data.get("attributes") or {}).get("binding_name") == "numeric"
         for _node_id, data in function_graph.G.nodes(data=True)
     )
+
+
+def test_generator_expression_target_does_not_leak_into_later_same_named_loop():
+    # A comprehension/generator-expression `for` target has owned its own
+    # scope since Python 3.0 -- it is never visible outside the
+    # comprehension, unlike a bare `for` statement's target. Before this was
+    # fixed, `environment["address"]` set while resolving
+    # `tuple(... for address in xs)` was never undone, so the *unrelated*
+    # `for address in ys:` statement two lines later picked up the
+    # comprehension's own (later-evaporated) node as its "value of address
+    # before this loop" -- surfacing much later, once that node was deleted,
+    # as an unrelated "missing ProcessGraph input" KeyError with no mention
+    # of a comprehension anywhere nearby.
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def repro(xs, ys):
+    tagged = tuple(int(address) for address in xs)
+    total = 0
+    for address in ys:
+        total = total + address
+    return total, tagged
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("repro").graph
+
+    for_loops = [
+        (node_id, data)
+        for node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    ]
+    assert len(for_loops) == 1
+    _node_id, loop_data = for_loops[0]
+    attributes = loop_data.get("attributes") or {}
+    # The real `for address in ys:` has nothing bound before it -- the
+    # comprehension's own `address` must not appear as its "initial" value.
+    assert "address" not in attributes.get("loop_target_initials", {})
+
+
+def test_generator_expression_materialization_pass_also_does_not_leak_target():
+    # Same as above but for tuple()/list() around the generator expression,
+    # which topological_reducer.py resolves the generator's `elt` a second
+    # time (to attach loop_iteration_outputs metadata) through a separate,
+    # originally-unscoped code path -- fixing only the first pass left this
+    # second one still leaking.
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def repro(xs, ys):
+    tagged = tuple(int(address) & 1 for address in xs)
+    total = 0
+    for address in ys:
+        total = total + address
+    return total, tagged
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("repro").graph
+
+    for_loops = [
+        (node_id, data)
+        for node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    ]
+    assert len(for_loops) == 1
+    _node_id, loop_data = for_loops[0]
+    attributes = loop_data.get("attributes") or {}
+    assert "address" not in attributes.get("loop_target_initials", {})
+
+
+def test_generator_target_leak_no_longer_crashes_the_real_aot_pipeline():
+    # End-to-end regression for the bug these two tests isolate: compiling
+    # the exact repro shape through the real compiler entrypoint (not just
+    # the reducer) used to fail with a bare `KeyError` from deep inside
+    # capture, referencing a node number with no readable connection to a
+    # comprehension five lines above the code that actually failed.
+    from src.common.tensors.accelerator_backends.aot_compile import (
+        compile_ast_aot,
+    )
+
+    source = """
+def repro(xs, ys, flag):
+    tagged = tuple(int(address) for address in xs)
+    total = 0
+    for address in ys:
+        total = total + address
+    if flag:
+        return total + len(tagged)
+    return total
+"""
+    for xs, ys, flag in [
+        ((), (), True),
+        ((1, 2), (), True),
+        ((), (3, 4), True),
+        ((1, 2), (3, 4), False),
+    ]:
+        compile_ast_aot(
+            source, "repro", {"xs": xs, "ys": ys, "flag": flag},
+            precompile_only=True,
+        )

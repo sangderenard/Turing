@@ -93,7 +93,7 @@ def zero_grad(self, *, clear_cache: bool = False):  # pragma: no cover - simple 
     if clear_cache:
         tape = getattr(self, "_tape", None)
         if tape is not None:
-            tid = id(self)
+            tid = _tensor_identity(self)
             if tape.graph.has_node(tid):
                 anns = tape.graph.nodes[tid].get("annotations")
                 if anns and "cache" in anns:
@@ -143,6 +143,17 @@ import math
 import statistics
 import re
 
+
+def _tensor_identity(value: Any) -> int:
+    """Stable, non-reused identity token -- see ``abstraction.tensor_identity``.
+
+    Imported lazily (module-cached after first call) to avoid the
+    abstraction/autograd circular import both modules already work around
+    elsewhere in this file.
+    """
+    from .abstraction import tensor_identity
+    return tensor_identity(value)
+
 _INTENTIONALLY_NONDIFFERENTIABLE = {
     "round", "trunc", "floor", "ceil", "floordiv",
     "isfinite", "isnan", "isinf", "logical_not", "invert",
@@ -171,9 +182,13 @@ class GradNode:
 class GradTape:
     """Minimal tape to record operations for reverse-mode autodiff.
 
-    Nodes are keyed by ``id(tensor)`` similar to the provenance tracking
-    used in the Turing scaffold. Each node knows its parents and the
-    positional slot they occupied during the forward pass. Traversal
+    Nodes are keyed by ``tensor_identity(tensor)`` -- a monotonic counter
+    value assigned once and cached on the tensor itself, not ``id(tensor)``.
+    Raw ``id()`` is a memory address CPython may hand to an unrelated later
+    object once the original is freed; a monotonic token can never be
+    reused, so two different tensors can never collide onto the same node
+    key even if their lifetimes don't overlap. Each node knows its parents
+    and the positional slot they occupied during the forward pass. Traversal
     yields nodes in reverse topological order suitable for backprop.
     """
 
@@ -236,7 +251,7 @@ class GradTape:
 
     def create_tensor_node(self, tensor: Any) -> None:
         """Register ``tensor`` as a root node in the graph."""
-        tid = id(tensor)
+        tid = _tensor_identity(tensor)
         self.graph.add_node(
             tid,
             kind="tensor",
@@ -280,7 +295,7 @@ class GradTape:
     # ------------------------------------------------------------------
     def mark_loss(self, tensor: Any) -> None:
         """Declare ``tensor`` as the loss node for training."""
-        tid = id(tensor)
+        tid = _tensor_identity(tensor)
         self._loss_tensor = tensor
         self._loss_id = tid
         self.graph.add_node(
@@ -295,7 +310,7 @@ class GradTape:
     # ------------------------------------------------------------------
     def mark_structural(self, tensor: Any, *, label: str | None = None) -> None:
         """Mark ``tensor`` as structural (non-trainable, excluded from params)."""
-        tid = id(tensor)
+        tid = _tensor_identity(tensor)
         self._structural.add(tid)
         self.graph.add_node(
             tid,
@@ -316,7 +331,7 @@ class GradTape:
     def is_structural(self, tensor: Any) -> bool:
         """Return ``True`` if ``tensor`` has been marked structural on this tape."""
         try:
-            tid = id(tensor)
+            tid = _tensor_identity(tensor)
             if tid in self._structural:
                 return True
             anns = self.graph.nodes.get(tid, {}).get("annotations", {})
@@ -441,7 +456,7 @@ class GradTape:
             inputs = list(inputs)
         else:
             inputs = [inputs]
-        parent_ids = [(id(t), pos) for pos, t in enumerate(inputs)]
+        parent_ids = [(_tensor_identity(t), pos) for pos, t in enumerate(inputs)]
 
         def _dtype(x: Any) -> Any:
             try:
@@ -527,7 +542,7 @@ class GradTape:
             "backward_status": backward_status,
         }
         node = GradNode(op=op, parents=parent_ids, ctx=ctx)
-        self._nodes[id(result)] = node
+        self._nodes[_tensor_identity(result)] = node
 
         # Build the global operation graph
         op_name = f"op_{self._op_index}"
@@ -546,14 +561,14 @@ class GradTape:
             ctx=ctx,
         )
         for t in inputs:
-            tid = id(t)
+            tid = _tensor_identity(t)
             self.graph.add_node(
                 tid,
                 kind="tensor",
                 **self._tensor_metadata(t),
             )
             self.graph.add_edge(tid, op_name)
-        rid = id(result)
+        rid = _tensor_identity(result)
         self.graph.add_node(
             rid,
             kind="tensor",
@@ -606,7 +621,7 @@ class GradTape:
         tape yet.
         """
 
-        tid = id(tensor)
+        tid = _tensor_identity(tensor)
 
         # Always ensure the tensor exists in the global graph and update its
         # annotations.
@@ -669,7 +684,7 @@ class GradTape:
     def node(self, tensor: Any) -> Optional[GradNode]:
         """Return the ``GradNode`` for ``tensor`` if present."""
 
-        return self._nodes.get(id(tensor))
+        return self._nodes.get(_tensor_identity(tensor))
 
     def traverse(self, result: Any) -> Generator[Tuple[int, GradNode], None, None]:
         """Yield ``(tensor_id, GradNode)`` in reverse topological order.
@@ -692,7 +707,7 @@ class GradTape:
                 dfs(pid)
             order.append((tid, node))
 
-        dfs(id(result))
+        dfs(_tensor_identity(result))
         for item in reversed(order):
             yield item
 
@@ -722,7 +737,7 @@ class GradTape:
         """Return a forward computation graph of recorded operations.
 
         The returned graph is a :class:`networkx.DiGraph` where nodes are
-        keyed by ``id(tensor)``.  Each node carries three attributes:
+        keyed by ``tensor_identity(tensor)`` (a monotonic token, not the raw address).  Each node carries three attributes:
 
         ``op``
             Name of the operator that produced the tensor or ``None`` for
@@ -800,7 +815,7 @@ class GradTape:
         """Return a backward computation graph starting at ``result``.
 
         The returned graph is a :class:`networkx.DiGraph` whose nodes are
-        keyed by ``id(tensor)``.  Each node describes the backward operator
+        keyed by ``tensor_identity(tensor)`` (a monotonic token, not the raw address).  Each node describes the backward operator
         associated with the tensor that produced it during the forward pass.
 
         ``op``
@@ -965,6 +980,25 @@ class Autograd:
             yield
         finally:
             self._no_grad_depth -= 1
+
+    @contextmanager
+    def forward_observation(self) -> Generator[None, None, None]:
+        """Preserve forward tensor result types without recording a tape.
+
+        Compiler discovery records one representative occurrence of a planned
+        region, then executes later loop occurrences only to obtain concrete
+        source-control values.  Those later executions must retain the same
+        tensor/scalar result types as the recorded occurrence without adding
+        duplicate tape nodes.
+        """
+
+        previous_capture_all = self.capture_all
+        self.capture_all = True
+        try:
+            with self.no_grad():
+                yield
+        finally:
+            self.capture_all = previous_capture_all
 
     @contextmanager
     def forward_capture(
@@ -1133,7 +1167,7 @@ class Autograd:
                 # Helper: whitelist check via per-tensor annotations or label allowlist
                 def _is_strict_whitelisted(t: Any) -> bool:
                     try:
-                        tid = id(t)
+                        tid = _tensor_identity(t)
                         anns = tape_v.graph.nodes.get(tid, {}).get("annotations", {})
                     except Exception:
                         anns = {}
@@ -1151,7 +1185,7 @@ class Autograd:
                 # Helper: structural check: if parameter is structural, skip
                 def _is_structural(t: Any) -> bool:
                     try:
-                        tid = id(t)
+                        tid = _tensor_identity(t)
                         if tid in getattr(tape_v, "_structural", set()):
                             return True
                         anns = tape_v.graph.nodes.get(tid, {}).get("annotations", {})
@@ -1193,7 +1227,7 @@ class Autograd:
                     return desc
                 for idx, p in enumerate(inputs):
                     try:
-                        pid = id(p)
+                        pid = _tensor_identity(p)
                     except Exception:
                         continue
                     path_exists = False
@@ -1215,7 +1249,7 @@ class Autograd:
                     for rid, node in tape_v._nodes.items():
                         ctx = node.ctx
                         ins = ctx.get("inputs", [])
-                        in_ids = [id(t) for t in ins]
+                        in_ids = [_tensor_identity(t) for t in ins]
                         if pid in in_ids:
                             consumers.append({
                                 "op": node.op,
@@ -1245,7 +1279,7 @@ class Autograd:
             out_grad = output.ones_like()
 
         tape = tape_for_output
-        grad_map: Dict[int, Any] = {id(output): out_grad}
+        grad_map: Dict[int, Any] = {_tensor_identity(output): out_grad}
 
         backward_context = nullcontext() if record_backward else self.no_grad()
         with backward_context:
@@ -1279,13 +1313,13 @@ class Autograd:
 
         results: List[Any] = []
         for idx, inp in enumerate(inputs):
-            g = grad_map.get(id(inp))
+            g = grad_map.get(_tensor_identity(inp))
             if g is None:
                 if allow_unused:
                     results.append(None)
                 else:
                     raise ValueError(
-                        f"No gradient found for input at index {idx} with id={id(inp)}"
+                        f"No gradient found for input at index {idx} with id={_tensor_identity(inp)}"
                     )
             else:
                 if hasattr(inp, "data") and isinstance(inp.data, list):

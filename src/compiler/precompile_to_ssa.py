@@ -103,9 +103,18 @@ class PrecompileSSALoweringResult:
 
 
 def _ssa_value(value_id: int, meta: Meta | None) -> SSAValue:
+    dtype = None if meta is None else meta.dtype
+    if dtype is not None:
+        dtype = str(dtype)
+    if dtype is not None and "." in dtype:
+        # Capturing through Torch records qualified spellings such as
+        # ``torch.bool``. SSA and every compiled ABI use canonical dtype
+        # names; allowing the frontend backend's module prefix to escape here
+        # makes the Fortran declaration and C sidecar disagree.
+        dtype = dtype.rsplit(".", 1)[-1]
     return SSAValue(
         int(value_id),
-        dtype=None if meta is None else meta.dtype,
+        dtype=dtype,
         shape=(
             ()
             if meta is None or meta.shape is None
@@ -276,6 +285,8 @@ def lower_fused_program_to_ssa(
             )
             continue
         attributes = dict(step.attrs)
+        if handler is Handler.Call:
+            attributes.setdefault("tensor_operation", step.op_name)
         if algorithm is not None:
             attributes.update({
                 "callee": algorithm,
@@ -573,15 +584,11 @@ class _ControlSSABuilder:
         value = self.external_values.get(value_id)
         if value is not None:
             if value in self.arguments:
-                self.shortfalls.append(
-                    SSALoweringShortfall(
-                        "control",
-                        "producer_identity",
-                        self.current.name,
-                        f"value {value_id} is both a control argument and "
-                        "a scheduled-region result",
-                    )
-                )
+                # A preallocated arena is commonly both the initial value
+                # entering control and the destination published by a later
+                # region.  SSA versions the write; it is not an identity
+                # conflict.  The source value ID stays in accounting so the
+                # public arena-address policy can rotate the two versions.
                 value = self.fresh_value(dtype=dtype)
                 value.accounting["source_value_id"] = value_id
                 self.external_values[value_id] = value
@@ -603,15 +610,20 @@ class _ControlSSABuilder:
     def indexed_load(
         self,
         source: SSAValue,
-        index: SSAValue,
+        index: SSAValue | tuple[SSAValue, ...] | list[SSAValue],
         result_id: int,
         *,
         attributes: dict[str, Any],
     ) -> SSAValue:
         address = self.fresh_value(dtype="ptr")
+        indices = (
+            tuple(index)
+            if isinstance(index, (tuple, list))
+            else (index,)
+        )
         self.emit(
             Handler.GetElementPtr,
-            [source, index],
+            [source, *indices],
             address,
             attributes=attributes,
         )
@@ -779,6 +791,25 @@ class _ControlSSABuilder:
         location: str,
     ) -> SSAValue:
         spelling = str(expression).strip()
+        iterable_extent = re.fullmatch(
+            r"__iterable_extent_(\d+)__", spelling
+        )
+        if iterable_extent is not None:
+            iterable_id = int(iterable_extent.group(1))
+            source = self.external_value(iterable_id)
+            extent = self.fresh_value(dtype="int")
+            self.emit(
+                Handler.Call,
+                [source],
+                extent,
+                attributes={
+                    "tensor_operation": "extent",
+                    "dim": 0,
+                    "binding": "iterable_extent",
+                    "source_value_id": iterable_id,
+                },
+            )
+            return extent
         value_match = re.fullmatch(r"value_(\d+)", spelling)
         if value_match is not None:
             return self.external_value(int(value_match.group(1)))
@@ -1186,6 +1217,30 @@ class _ControlSSABuilder:
                 attributes={
                     "binding": "iterable",
                     "induction": loop.induction,
+                },
+            )
+        for iterable_id, target_id, induction_name, projection in (
+            self.program.projected_iterable_bindings
+        ):
+            if induction_name != loop.induction:
+                continue
+            restored_values[int(target_id)] = self.external_values.get(
+                int(target_id)
+            )
+            if projection == "induction":
+                self.external_values[int(target_id)] = induction
+                continue
+            indices = [induction]
+            if projection is not None:
+                indices.append(self.constant_value(int(projection)))
+            self.indexed_load(
+                self.external_value(iterable_id),
+                indices,
+                target_id,
+                attributes={
+                    "binding": "projected_iterable",
+                    "induction": loop.induction,
+                    "projection": projection,
                 },
             )
         for iterable_id, target_id, induction_name, values in (

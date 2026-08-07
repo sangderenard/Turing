@@ -54,6 +54,8 @@ def test_parallel_tags_become_scale_one_worker_deploy_and_join_plan():
 
     assert plan["abi"] == "turing.wasm-thread-deployment.v1"
     assert plan["tile_alignment"] == 8
+    assert plan["extent_effect"] == "pointwise"
+    assert plan["collective_methods"] == []
     deploy = plan["root"]["children"][1]
     assert deploy == {
         "kind": "deploy",
@@ -108,6 +110,25 @@ def test_durable_parallel_table_groups_contiguous_unrolled_regions():
     assert children[1]["region_id"] == 7
     assert children[1]["scale"] == 1
     assert [lane["method"] for lane in children[1]["lanes"]] == [1, 2]
+
+
+def test_collective_extent_is_recorded_for_browser_safety():
+    control = ControlProgram(
+        ParallelDeployment((
+            StatementBlock(("__scheduled_region_0__",)),
+            StatementBlock(("__scheduled_region_1__",)),
+        )),
+        region_indices=(0, 1),
+    )
+
+    plan = build_browser_thread_plan(
+        control,
+        {0: 10, 1: 11},
+        region_extent_effects={0: "collective", 1: "pointwise"},
+    )
+
+    assert plan["extent_effect"] == "collective"
+    assert plan["collective_methods"] == [10]
 
 
 def _deployment():

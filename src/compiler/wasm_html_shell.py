@@ -280,6 +280,7 @@ function log(kind, message, detail) {
     pane.appendChild(line);
     pane.scrollTop = pane.scrollHeight;
   }
+  window.dispatchEvent(new CustomEvent("turing-telemetry", { detail: entry }));
   return entry;
 }
 
@@ -313,6 +314,85 @@ window.addEventListener("unhandledrejection", (event) => {
     ? event.reason.message : event.reason));
 });
 
+"""
+
+# A static, always-present textual rendering of the same data this shell
+# already collects (process graph, telemetry, network/shader manifests,
+# class navigation) -- not a second engine, just a second view a
+# non-visual client can read. It sits at the very back of the stacking
+# context so a sighted visitor keeps seeing the shader/inspection page
+# until they actually follow one of its links.
+_TRANSCRIPT_CSS = """
+#program-transcript {
+  position: fixed;
+  inset: 0;
+  z-index: -2147483648;
+  overflow: auto;
+  margin: 0;
+  padding: 1.5rem;
+  max-width: none;
+  background: Canvas;
+  color: CanvasText;
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+#program-transcript .transcript-inner { max-width: 60rem; margin: 0 auto; }
+#program-transcript h2 { font-size: 1.05rem; margin: 1.6rem 0 .5rem; }
+#program-transcript h2:first-child { margin-top: 0; }
+#program-transcript ul { padding-left: 1.2rem; }
+#program-transcript li { margin: .15rem 0; }
+#program-transcript a { color: var(--accent, #3b82f6); }
+body.transcript-active #shader-surface,
+body.transcript-active #shader-layout-document,
+body.transcript-active > .title,
+body.transcript-active > .sub,
+body.transcript-active > #fatal,
+body.transcript-active > .note,
+body.transcript-active > .panel {
+  display: none;
+}
+body.transcript-active #program-transcript {
+  z-index: 2147483646;
+}
+"""
+
+_TRANSCRIPT_JS = r"""(() => {
+  const root = document.getElementById("program-transcript");
+  if (!root) return;
+  function currentNode() {
+    return new URLSearchParams(location.search).get("node");
+  }
+  function focusNode(id) {
+    if (!id) return;
+    const el = root.querySelector('[data-node="' + CSS.escape(id) + '"]');
+    if (el) el.scrollIntoView({ block: "start" });
+  }
+  function activate(id) {
+    document.body.classList.add("transcript-active");
+    focusNode(id);
+  }
+  const initial = currentNode();
+  if (initial) activate(initial);
+  root.addEventListener("click", (event) => {
+    const link = event.target.closest("a[href]");
+    if (!link) return;
+    const url = new URL(link.getAttribute("href"), location.href);
+    if (url.pathname !== location.pathname) return;
+    event.preventDefault();
+    const node = url.searchParams.get("node");
+    history.pushState({ node }, "", url.search || location.pathname);
+    activate(node);
+  });
+  window.addEventListener("popstate", () => activate(currentNode()));
+  window.addEventListener("turing-telemetry", (event) => {
+    const list = root.querySelector('[data-node="log"] ul');
+    if (!list || !event.detail) return;
+    const record = event.detail;
+    const item = document.createElement("li");
+    item.textContent = "[" + record.kind + "] " + record.message +
+      (record.path ? " (" + record.path + ")" : "");
+    list.appendChild(item);
+  });
+})();
 """
 
 # Managed-time audio is installed before feed expressions are evaluated.  It
@@ -446,6 +526,7 @@ let GRAPH_VIEWS = __GRAPH_VIEWS__;
 const NETWORK = __NETWORK__;
 const CLASS_GRAPH = __CLASS_GRAPH__;
 const MAP_IR = __MAP_IR__;
+const CARD_GRAPH = MAP_IR.card_graph || {cards: [], connections: [], paths: {}};
 const SOURCE_DOWNLOADS = __SOURCE_DOWNLOADS__;
 const MATHEMATICS = __MATHEMATICS__;
 const RESOURCE_ROUTE = __RESOURCE_ROUTE__;
@@ -453,7 +534,18 @@ const STATIC_GALLERY = __STATIC_GALLERY__;
 const DEFAULT_SERVER_ADDRESS = __DEFAULT_SERVER_ADDRESS__;
 const entry = API.entry_points.find(e => e.name === API.entry) || API.entry_points[0];
 const params = entry.parameters;
-const inputs = params.filter(p => p.role === "input");
+const SHELL_IO = (API.metadata || {}).shell_io || null;
+const SYSTEM_PORTS = SHELL_IO && SHELL_IO.requirements
+  ? (SHELL_IO.requirements.system_ports || []) : [];
+const VIRTUAL_FILESYSTEM = SHELL_IO && SHELL_IO.requirements
+  ? (SHELL_IO.requirements.virtual_filesystem || null) : null;
+const SYSTEM_FIELDS = new Map();
+for (const port of SYSTEM_PORTS) {
+  for (const field of port.fields || []) {
+    SYSTEM_FIELDS.set(field.parameter, {port, field: field.name});
+  }
+}
+const inputs = params.filter(p => p.role === "input" && !SYSTEM_FIELDS.has(p.name));
 const outputs = params.filter(p => p.role === "output");
 const bytes = API.metadata.element_bytes || 8;
 const isF32 = (API.metadata.value_type || "f64") === "f32";
@@ -463,6 +555,349 @@ const isF32 = (API.metadata.value_type || "f64") === "f32";
 const STATE_FEEDBACK = (API.metadata || {}).state_feedback || {};
 const STATE_FEEDBACK_PAIRS = Object.entries(STATE_FEEDBACK);
 const HAS_STATE_FEEDBACK = STATE_FEEDBACK_PAIRS.length > 0;
+
+// A page's numeric feed UI was built around one uniform float type for the
+// whole program (the shader/fluid demos this shell first served). A
+// parameter's own `dtype` (compiled_program_api.Parameter -- already emitted
+// per parameter, just previously unread here) says what it actually is:
+// register/address/byte state is not floating point, and round-tripping it
+// through Float64Array would silently lose exactness. This resolves a
+// parameter's real element type to the matching JS typed-array constructor,
+// falling back to the page-wide float default for parameters that don't (or
+// can't) declare one, so existing pages are unaffected.
+function typedArrayForDtype(dtype) {
+  switch (String(dtype || "")) {
+    case "uint8": case "u8": case "bool": case "logical":
+      return Uint8Array;
+    case "int32": case "i32": case "int":
+      return Int32Array;
+    case "uint32": case "u32":
+      return Uint32Array;
+    case "int64": case "i64":
+      // Exact 64-bit integers (registers, addresses) need BigInt64Array, not
+      // a float array. Callers that read these values must expect BigInt
+      // elements, not plain numbers -- that boundary is deliberate, not an
+      // oversight, since a plain Number cannot hold every int64 exactly.
+      return BigInt64Array;
+    case "float32": case "f32": case "float":
+      return Float32Array;
+    case "float64": case "f64": case "double":
+      return Float64Array;
+    default:
+      return isF32 ? Float32Array : Float64Array;
+  }
+}
+
+// Named system ports carry non-numerical shell resources outside the ordinary
+// elementwise feed UI. Files are byte-exact. Web external references are
+// limited to other registered Turing bundles, or a named host-simulated
+// capability the default shell (not the program) resolves -- the general
+// support structure for letting a compiled executor live inside this page
+// by simulation: the program declares which named capabilities it needs
+// (bundle.json is the same document either way), the shell owns whatever
+// handler actually simulates each one, and a request the shell has no
+// handler for fails closed instead of the executor silently proceeding.
+const systemPorts = {
+  descriptors: new Map(SYSTEM_PORTS.map(port => [port.name, port])),
+  files: new Map(),
+  bundles: new Map(),
+  hostCapabilities: new Map(),
+  fileHandlers: new Map(),
+  listeners: new Map(),
+  virtualFiles: new Map(),
+  deviceBuffers: new Map(),
+  deviceHandlers: new Map(),
+  pendingPersistence: Promise.resolve(),
+  virtualFilesystem: VIRTUAL_FILESYSTEM,
+  normalizeVirtualPath(path) {
+    const raw = String(path || ".").replaceAll(String.fromCharCode(92), "/");
+    const cwd = (this.virtualFilesystem || {}).current_directory || "/";
+    const absolute = raw.startsWith("/") ? raw : cwd.replace(/\/$/, "") + "/" + raw;
+    const parts = [];
+    for (const part of absolute.split("/")) {
+      if (!part || part === ".") continue;
+      if (part === "..") parts.pop(); else parts.push(part);
+    }
+    return "/" + parts.join("/");
+  },
+  virtualMount(path) {
+    if (!this.virtualFilesystem) throw new Error("no virtual filesystem was declared");
+    const normalized = this.normalizeVirtualPath(path);
+    const mounts = (this.virtualFilesystem.mounts || []).filter(mount =>
+      normalized === mount.path || normalized.startsWith(mount.path.replace(/\/$/, "") + "/")
+    ).sort((a, b) => b.path.length - a.path.length);
+    if (!mounts.length) throw new Error("path is outside declared virtual mounts: " + normalized);
+    return mounts[0];
+  },
+  readVirtualFile(path) {
+    const normalized = this.normalizeVirtualPath(path);
+    this.virtualMount(normalized);
+    const value = this.virtualFiles.get(normalized);
+    if (!value) throw new Error("virtual file does not exist: " + normalized);
+    return value.slice();
+  },
+  writeVirtualFile(path, bytes) {
+    const normalized = this.normalizeVirtualPath(path);
+    const mount = this.virtualMount(normalized);
+    if (mount.access !== "read_write") throw new Error("virtual mount is read-only: " + mount.path);
+    const value = bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(bytes);
+    this.virtualFiles.set(normalized, value);
+    if (mount.kind === "indexed_db" || mount.kind === "opfs") {
+      this.pendingPersistence = this.pendingPersistence.then(() =>
+        this.persistVirtualFile(mount, normalized, value)
+      );
+    }
+    return value;
+  },
+  relativeMountPath(mount, normalized) {
+    const prefix = mount.path === "/" ? "/" : mount.path + "/";
+    return normalized === mount.path ? "" : normalized.slice(prefix.length);
+  },
+  openIndexedDB(mount) {
+    if (!globalThis.indexedDB) throw new Error("IndexedDB is unavailable for " + mount.path);
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open("turing-vfs:" + mount.source, 1);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains("files")) {
+          request.result.createObjectStore("files");
+        }
+      };
+      request.onerror = () => reject(request.error || new Error("IndexedDB open failed"));
+      request.onsuccess = () => resolve(request.result);
+    });
+  },
+  indexedDBRequest(request) {
+    return new Promise((resolve, reject) => {
+      request.onerror = () => reject(request.error || new Error("IndexedDB request failed"));
+      request.onsuccess = () => resolve(request.result);
+    });
+  },
+  async opfsRoot(mount, create) {
+    if (!navigator.storage || typeof navigator.storage.getDirectory !== "function") {
+      throw new Error("OPFS is unavailable for " + mount.path);
+    }
+    let directory = await navigator.storage.getDirectory();
+    for (const part of String(mount.source).split("/")) {
+      directory = await directory.getDirectoryHandle(part, {create});
+    }
+    return directory;
+  },
+  async hydrateIndexedDB(mount) {
+    const database = await this.openIndexedDB(mount);
+    try {
+      const store = database.transaction("files", "readonly").objectStore("files");
+      const keysRequest = store.getAllKeys();
+      const valuesRequest = store.getAll();
+      const [keys, values] = await Promise.all([
+        this.indexedDBRequest(keysRequest), this.indexedDBRequest(valuesRequest),
+      ]);
+      keys.forEach((key, index) => {
+        const path = mount.path.replace(/\/$/, "") + "/" + String(key);
+        this.virtualFiles.set(this.normalizeVirtualPath(path), new Uint8Array(values[index]));
+      });
+    } finally { database.close(); }
+  },
+  async hydrateOPFS(mount) {
+    const root = await this.opfsRoot(mount, mount.access === "read_write");
+    const visit = async (directory, prefix) => {
+      for await (const [name, handle] of directory.entries()) {
+        const relative = prefix ? prefix + "/" + name : name;
+        if (handle.kind === "directory") await visit(handle, relative);
+        else {
+          const file = await handle.getFile();
+          const path = mount.path.replace(/\/$/, "") + "/" + relative;
+          this.virtualFiles.set(
+            this.normalizeVirtualPath(path), new Uint8Array(await file.arrayBuffer())
+          );
+        }
+      }
+    };
+    await visit(root, "");
+  },
+  async initializeVirtualFilesystem() {
+    for (const mount of (this.virtualFilesystem || {}).mounts || []) {
+      if (mount.kind === "indexed_db") await this.hydrateIndexedDB(mount);
+      else if (mount.kind === "opfs") await this.hydrateOPFS(mount);
+    }
+    return this;
+  },
+  async persistVirtualFile(mount, normalized, value) {
+    const relative = this.relativeMountPath(mount, normalized);
+    if (!relative) throw new Error("a mount root cannot be written as a file");
+    if (mount.kind === "indexed_db") {
+      const database = await this.openIndexedDB(mount);
+      try {
+        const transaction = database.transaction("files", "readwrite");
+        transaction.objectStore("files").put(value.slice().buffer, relative);
+        await new Promise((resolve, reject) => {
+          transaction.oncomplete = resolve;
+          transaction.onerror = () => reject(transaction.error || new Error("IndexedDB write failed"));
+          transaction.onabort = () => reject(transaction.error || new Error("IndexedDB write aborted"));
+        });
+      } finally { database.close(); }
+      return;
+    }
+    if (mount.kind === "opfs") {
+      let directory = await this.opfsRoot(mount, true);
+      const parts = relative.split("/");
+      const filename = parts.pop();
+      for (const part of parts) {
+        directory = await directory.getDirectoryHandle(part, {create: true});
+      }
+      const handle = await directory.getFileHandle(filename, {create: true});
+      const writable = await handle.createWritable();
+      await writable.write(value);
+      await writable.close();
+    }
+  },
+  async readVirtualFileAsync(path) {
+    await this.ready;
+    return this.readVirtualFile(path);
+  },
+  async writeVirtualFileAsync(path, bytes) {
+    await this.ready;
+    const value = this.writeVirtualFile(path, bytes);
+    await this.flushVirtualFilesystem();
+    return value;
+  },
+  async flushVirtualFilesystem() { await this.pendingPersistence; },
+  deviceDescriptor(name) {
+    const descriptor = this.descriptor(name);
+    if (descriptor.kind !== "device") throw new Error(name + " is not a device port");
+    return descriptor;
+  },
+  registerDeviceHandler(name, handler) {
+    this.deviceDescriptor(name);
+    this.deviceHandlers.set(name, handler);
+  },
+  readDevice(name) {
+    this.deviceDescriptor(name);
+    const value = this.deviceBuffers.get(name) || new Uint8Array();
+    return value.slice();
+  },
+  async writeDevice(name, bytes, {append = true} = {}) {
+    const descriptor = this.deviceDescriptor(name);
+    if (descriptor.direction === "output") throw new Error(name + " is output-only");
+    const value = bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(bytes);
+    const previous = append ? (this.deviceBuffers.get(name) || new Uint8Array()) : new Uint8Array();
+    const combined = new Uint8Array(previous.length + value.length);
+    combined.set(previous); combined.set(value, previous.length);
+    this.deviceBuffers.set(name, combined);
+    const handler = this.deviceHandlers.get(name);
+    if (handler) await handler(value, {append});
+    for (const listener of this.listeners.get(name) || []) listener(combined.slice());
+    return combined.slice();
+  },
+  publishDevice(name, bytes, {append = true} = {}) {
+    const descriptor = this.deviceDescriptor(name);
+    if (descriptor.direction === "input") throw new Error(name + " is input-only");
+    const value = bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(bytes);
+    const previous = append ? (this.deviceBuffers.get(name) || new Uint8Array()) : new Uint8Array();
+    const combined = new Uint8Array(previous.length + value.length);
+    combined.set(previous); combined.set(value, previous.length);
+    this.deviceBuffers.set(name, combined);
+    for (const listener of this.listeners.get(name) || []) listener(combined.slice());
+    return combined.slice();
+  },
+  descriptor(name) {
+    const descriptor = this.descriptors.get(name);
+    if (!descriptor) throw new Error("unknown system port " + name);
+    return descriptor;
+  },
+  subscribe(name, listener) {
+    this.descriptor(name);
+    if (!this.listeners.has(name)) this.listeners.set(name, new Set());
+    this.listeners.get(name).add(listener);
+    return () => this.listeners.get(name).delete(listener);
+  },
+  registerFileHandler(name, handler) {
+    const descriptor = this.descriptor(name);
+    if (descriptor.kind !== "file") throw new Error(name + " is not a file port");
+    this.fileHandlers.set(name, handler);
+  },
+  async publishFile(name, file) {
+    const descriptor = this.descriptor(name);
+    if (descriptor.kind !== "file") throw new Error(name + " is not a file port");
+    const bytes = file instanceof Uint8Array
+      ? file : new Uint8Array(await file.arrayBuffer());
+    const value = Object.freeze({
+      name: file.name || name,
+      type: file.type || "application/octet-stream",
+      lastModified: Number(file.lastModified || 0),
+      bytes,
+    });
+    this.files.set(name, value);
+    const handler = this.fileHandlers.get(name);
+    if (handler) await handler(value);
+    for (const listener of this.listeners.get(name) || []) listener(value);
+    return value;
+  },
+  registerBundle(identity, descriptor) {
+    if (!identity || !descriptor) throw new Error("bundle registration needs identity and descriptor");
+    this.bundles.set(String(identity), descriptor);
+  },
+  resolveBundle(name) {
+    const port = this.descriptor(name);
+    if (port.kind !== "external_reference" || port.external_domain !== "bundle") {
+      throw new Error(name + " is not a web bundle-reference port");
+    }
+    const identity = String((port.attributes || {}).bundle || "");
+    const resolved = this.bundles.get(identity);
+    if (!resolved && !port.optional) throw new Error("required bundle is not registered: " + identity);
+    return resolved || null;
+  },
+  // The general host-system-capability channel. registerHostCapability is
+  // called by the default shell's own bootstrap code (never by a program's
+  // bespoke script) to install the simulation for one declared capability
+  // port; resolveHostCapability is what a compiled executor's own
+  // (possibly Wasm) coordinator calls per request. The completion shape is
+  // deliberately left up to the registered handler -- there is no fixed
+  // wire format asserted here yet, since no compiled coordinator ABI this
+  // is meant to serve has been finalized. What is fixed: an unregistered
+  // *required* capability fails closed rather than letting the executor
+  // guess, the same discipline resolveBundle already uses.
+  registerHostCapability(name, handler) {
+    const port = this.descriptor(name);
+    if (port.kind !== "external_reference" || port.external_domain !== "host_system") {
+      throw new Error(name + " is not a host-system capability port");
+    }
+    if (typeof handler !== "function") {
+      throw new Error("host capability handler for " + name + " must be a function");
+    }
+    this.hostCapabilities.set(name, handler);
+  },
+  async resolveHostCapability(name, request) {
+    const port = this.descriptor(name);
+    if (port.kind !== "external_reference" || port.external_domain !== "host_system") {
+      throw new Error(name + " is not a host-system capability port");
+    }
+    const handler = this.hostCapabilities.get(name);
+    if (!handler) {
+      if (port.optional) return null;
+      throw new Error("required host-system capability has no simulation registered: " + name);
+    }
+    return await handler(request);
+  },
+};
+systemPorts.ready = systemPorts.initializeVirtualFilesystem();
+for (const port of SYSTEM_PORTS) {
+  if (
+    port.kind === "external_reference"
+    && port.external_domain !== "bundle"
+    && port.external_domain !== "host_system"
+  ) {
+    throw new Error(
+      "HTML shells accept external references only to Turing bundles or "
+      + "declared host-system capability simulations"
+    );
+  }
+}
+for (const mount of (VIRTUAL_FILESYSTEM || {}).mounts || []) {
+  if (mount.kind === "host_directory") {
+    throw new Error("HTML shells cannot materialize host-directory mounts");
+  }
+}
+window.TuringSystemPorts = systemPorts;
 
 function refreshNonStateFeeds(activeFeeds, count, d, frameIndex) {
   return inputs.map((p, index) =>
@@ -613,6 +1048,40 @@ function resolveClassInstantiation(classIdentity, evaluator) {
   return Array.from(constructors);
 }
 
+class CardGraphReadHead {
+  constructor(graph = CARD_GRAPH) {
+    this.graph = graph;
+    this.cards = new Map((graph.cards || []).map(card => [card.id, card]));
+    this.outgoing = new Map();
+    for (const connection of graph.connections || []) {
+      if (!this.outgoing.has(connection.from)) this.outgoing.set(connection.from, []);
+      this.outgoing.get(connection.from).push(connection);
+    }
+  }
+
+  card(identity) {
+    const card = this.cards.get(identity);
+    if (!card) throw new Error("unknown punch card " + identity);
+    return card;
+  }
+
+  connectionsFrom(identity, kind = null) {
+    return (this.outgoing.get(identity) || []).filter(
+      connection => kind === null || connection.kind === kind
+    );
+  }
+
+  async traverse(path = "linear", visit, maximumCards = 100000) {
+    if (typeof visit !== "function") throw new TypeError("card traversal requires a visitor");
+    const identities = (this.graph.paths || {})[path];
+    if (!Array.isArray(identities)) throw new Error("unknown card path " + path);
+    if (identities.length > maximumCards) throw new Error("card traversal limit exceeded");
+    for (let index = 0; index < identities.length; index++) {
+      await visit(this.card(identities[index]), index, identities.length);
+    }
+  }
+}
+
 window.TuringClassNavigation = Object.freeze({
   map: MAP_IR,
   resolveClass,
@@ -620,9 +1089,17 @@ window.TuringClassNavigation = Object.freeze({
   instantiate: resolveClassInstantiation,
   evaluatePermission: evaluateClassPermission
 });
+window.TuringCardGraph = Object.freeze({
+  graph: CARD_GRAPH,
+  createReadHead: () => new CardGraphReadHead(CARD_GRAPH),
+});
 
 let moduleBytes = null;
 if (WASM_BASE64) {
+// Compiled modules contain no arena address and can be cached globally.
+// Instances cannot: imported memory binds them to one outer coordinator.
+const PUNCH_CARD_MODULE_CACHE = new Map();
+
   const raw = atob(WASM_BASE64);
   moduleBytes = new Uint8Array(raw.length);
   for (let i = 0; i < raw.length; i++) moduleBytes[i] = raw.charCodeAt(i);
@@ -786,7 +1263,7 @@ async function advanceFeedback(ticks = 1) {
   const reserved = runtime.api.metadata.reserved_bytes || 0;
   const required = reserved + (inputs.length + outputs.length) * count * elementBytes;
   if (required > memory.buffer.byteLength) memory.grow(Math.ceil((required - memory.buffer.byteLength) / 65536));
-  const View = runtime.api.metadata.value_type === "f32" ? Float32Array : Float64Array;
+  const View = typedArrayForDtype(runtime.api.metadata.value_type);
   const offsetsBytes = Array.from({length: inputs.length + outputs.length}, (_, i) => reserved + i * count * elementBytes);
   new View(memory.buffer, offsetsBytes[0], count).fill(feedbackState.travel);
   new View(memory.buffer, offsetsBytes[1], count).set(offsets.map(value => feedbackState.travel + value));
@@ -824,62 +1301,83 @@ let running = false;
 // calls one translated WASM coordinator. Card-to-card calls stay in WASM.
 // No live tensor is copied through JavaScript at a seam.
 function wasmTileWorkerSource() {
-  return `self.onmessage = async event => {
+  return `const contexts = new Map();
+  let configuredManifest = null;
+  let configuredInventory = null;
+  let configuredModules = null;
+
+  async function contextFor(count) {
+    if (contexts.has(count)) return contexts.get(count);
+    const manifest = configuredManifest;
+    const inventory = configuredInventory;
+    const elementBytes = Number(manifest.modules[0].element_bytes || 8);
+    const View = typedArrayForDtype(manifest.modules[0].value_type);
+    const fieldCount = (inventory.field_slots || []).length;
+    let cursor = Math.ceil(Number(manifest.shared_static_bytes || 0) / 4) * 4;
+    const inventoryOffset = cursor;
+    cursor += fieldCount * 4;
+    cursor = Math.ceil(cursor / elementBytes) * elementBytes;
+    const offsets = Array.from({length: fieldCount}, () => {
+      const offset = cursor; cursor += count * elementBytes; return offset;
+    });
+    const memory = new WebAssembly.Memory({initial: Math.max(1, Math.ceil(cursor / 65536))});
+    new Int32Array(memory.buffer, inventoryOffset, fieldCount).set(offsets);
+    const context = {memory, offsets, View, instances: new Map()};
+    contexts.set(count, context);
+    return context;
+  }
+
+  self.onmessage = async event => {
     try {
-      const {manifest, inventory, methodIds, count, fields} = event.data;
+      if (event.data.type === "configure") {
+        configuredManifest = event.data.manifest;
+        configuredInventory = event.data.inventory;
+        configuredModules = new Map(event.data.compiledModules);
+        contexts.clear();
+        self.postMessage({type: "configured"});
+        return;
+      }
+      const {taskId, methodIds, count, fields, resultSlots} = event.data;
+      const manifest = configuredManifest;
+      const inventory = configuredInventory;
+      if (!manifest || !inventory) throw new Error("tile worker is not configured");
       const specs = new Map(manifest.modules.map(spec => [spec.name, spec]));
       const cards = new Map((inventory.methods || []).map(card => [card.index, card]));
-      const elementBytes = Number(manifest.modules[0].element_bytes || 8);
-      const View = manifest.modules[0].value_type === "f32" ? Float32Array : Float64Array;
-      const fieldCount = (inventory.field_slots || []).length;
-      let cursor = Math.ceil(Number(manifest.shared_static_bytes || 0) / 4) * 4;
-      const inventoryOffset = cursor;
-      cursor += fieldCount * 4;
-      cursor = Math.ceil(cursor / elementBytes) * elementBytes;
-      const offsets = Array.from({length: fieldCount}, () => {
-        const offset = cursor; cursor += count * elementBytes; return offset;
-      });
-      const memory = new WebAssembly.Memory({initial: Math.max(1, Math.ceil(cursor / 65536))});
-      new Int32Array(memory.buffer, inventoryOffset, fieldCount).set(offsets);
+      const context = await contextFor(count);
+      const {memory, offsets, View, instances} = context;
       for (const [indexText, values] of Object.entries(fields)) {
         const index = Number(indexText);
         new View(memory.buffer, offsets[index], count).set(values);
       }
-      const outputSlots = new Set();
       for (const methodId of methodIds) {
         const card = cards.get(methodId);
         if (!card) throw new Error("unknown deployment method " + methodId);
         const spec = specs.get(card.module);
         if (!spec) throw new Error("missing deployment module " + card.module);
-        let bytes;
-        if (spec.url) {
-          const response = await fetch(spec.absolute_url || spec.url);
-          if (!response.ok) throw new Error("worker fetch failed: HTTP " + response.status);
-          bytes = await response.arrayBuffer();
-        } else if (spec.wasm_base64) {
-          const raw = atob(spec.wasm_base64);
-          const decoded = new Uint8Array(raw.length);
-          for (let i = 0; i < raw.length; i++) decoded[i] = raw.charCodeAt(i);
-          bytes = decoded;
-        } else throw new Error("deployment module has no bytes");
-        const memoryImport = spec.shared_memory_import || {module: "env", field: "memory"};
-        const imports = {};
-        imports[memoryImport.module] = {[memoryImport.field]: memory};
-        const {instance} = await WebAssembly.instantiate(bytes, imports);
+        let instance = instances.get(spec.name);
+        if (!instance) {
+          const compiled = configuredModules.get(spec.name);
+          if (!compiled) throw new Error("deployment module was not precompiled: " + spec.name);
+          const memoryImport = spec.shared_memory_import || {module: "env", field: "memory"};
+          const imports = {};
+          imports[memoryImport.module] = {[memoryImport.field]: memory};
+          instance = await WebAssembly.instantiate(compiled, imports);
+          instances.set(spec.name, instance);
+        }
         const args = [...card.input_slots, ...card.output_slots].map(slot => offsets[slot]);
         instance.exports[card.entry](count, ...args);
-        card.output_slots.forEach(slot => outputSlots.add(slot));
       }
       const outputs = {};
       const transfer = [];
-      for (const slot of outputSlots) {
+      for (const slot of resultSlots) {
         const values = new View(memory.buffer, offsets[slot], count).slice();
         outputs[slot] = values;
         transfer.push(values.buffer);
       }
-      self.postMessage({outputs}, transfer);
+      self.postMessage({taskId, outputs}, transfer);
     } catch (error) {
-      self.postMessage({error: String(error && (error.stack || error.message || error))});
+      self.postMessage({taskId: event.data.taskId,
+        error: String(error && (error.stack || error.message || error))});
     }
   };`;
 }
@@ -890,6 +1388,7 @@ class ClassGraphRunner {
       "segmented manifest does not declare the shared-memory ABI"
     );
     this.manifest = manifest;
+    this.cardGraph = CARD_GRAPH;
     this.modulesByName = new Map(manifest.modules.map(m => [m.name, m]));
     this.instances = new Map();
     this.runtime = null;
@@ -908,6 +1407,11 @@ class ClassGraphRunner {
     this.layoutCount = 0;
     this.inventoryOffset = 0;
     this.tileWorkerURL = null;
+    this.tileWorkers = [];
+    this.tileModulesPromise = null;
+    this.nextTileTaskId = 1;
+    this.threadingEnabled = new URLSearchParams(location.search).get("wasmThreads") !== "0";
+    this.collectiveNoticeShown = false;
     const staticBytes = Number(manifest.shared_static_bytes || 0);
     this.memory = new WebAssembly.Memory({
       initial: Math.max(1, Math.ceil(staticBytes / 65536))
@@ -920,6 +1424,12 @@ class ClassGraphRunner {
       child => this.callsInDeploymentNode(child)
     );
     throw new Error("worker lane contains unsupported " + node.kind + " node");
+  }
+
+  callsInDeploymentSchedule(node) {
+    if (node.kind === "call") return [Number(node.method)];
+    const children = node.kind === "deploy" ? node.lanes : node.children;
+    return children.flatMap(child => this.callsInDeploymentSchedule(child));
   }
 
   tileRanges(count, workerCount) {
@@ -942,31 +1452,17 @@ class ClassGraphRunner {
     return Math.max(1, Math.min(taskCount, 8, Math.max(1, hardware - 1)));
   }
 
-  async runTileTask(methodIds, start, end, View) {
+  threadingEligible() {
+    const contract = this.manifest.thread_deployment || {};
+    return contract.extent_effect !== "collective" &&
+      contract.extent_effect !== "global-state";
+  }
+
+  async ensureTileWorkers(count) {
     if (!this.tileWorkerURL) {
       this.tileWorkerURL = URL.createObjectURL(new Blob(
         [wasmTileWorkerSource()], {type: "text/javascript"}
       ));
-    }
-    const count = end - start;
-    const elementBytes = Number(this.manifest.modules[0].element_bytes || 8);
-    const cards = new Map((this.manifest.class_inventory.methods || []).map(
-      card => [Number(card.index), card]
-    ));
-    const touchedSlots = new Set();
-    for (const methodId of methodIds) {
-      const card = cards.get(Number(methodId));
-      [...card.input_slots, ...card.output_slots].forEach(
-        slot => touchedSlots.add(Number(slot))
-      );
-    }
-    const fields = {};
-    for (const slot of touchedSlots) {
-      fields[slot] = new View(
-        this.memory.buffer,
-        this.fieldOffsets[slot] + start * elementBytes,
-        count,
-      ).slice();
     }
     const manifest = {
       ...this.manifest,
@@ -975,23 +1471,68 @@ class ClassGraphRunner {
         absolute_url: spec.url ? new URL(spec.url, document.baseURI).href : null,
       })),
     };
-    return new Promise((resolve, reject) => {
+    if (!this.tileModulesPromise) {
+      this.tileModulesPromise = Promise.all(manifest.modules.map(async spec => {
+        let bytes;
+        if (spec.url) {
+          const response = await fetchResource(spec.absolute_url || spec.url);
+          if (!response.ok) throw new Error(
+            "tile module fetch failed: HTTP " + response.status + " for " + spec.name
+          );
+          bytes = await response.arrayBuffer();
+        } else if (spec.wasm_base64) {
+          const raw = atob(spec.wasm_base64);
+          const decoded = new Uint8Array(raw.length);
+          for (let index = 0; index < raw.length; index++) {
+            decoded[index] = raw.charCodeAt(index);
+          }
+          bytes = decoded;
+        } else throw new Error("deployment module has no bytes: " + spec.name);
+        return [spec.name, await WebAssembly.compile(bytes)];
+      }));
+    }
+    const compiledModules = await this.tileModulesPromise;
+    while (this.tileWorkers.length < count) {
       const worker = new Worker(this.tileWorkerURL);
+      const ready = new Promise((resolve, reject) => {
+        worker.onmessage = event => event.data.type === "configured" && resolve();
+        worker.onerror = event => reject(new Error(
+          event.message || "WebAssembly tile worker failed during configuration"
+        ));
+      });
+      worker.postMessage({
+        type: "configure", manifest, inventory: this.manifest.class_inventory,
+        compiledModules,
+      });
+      this.tileWorkers.push({worker, ready});
+    }
+    await Promise.all(this.tileWorkers.slice(0, count).map(item => item.ready));
+  }
+
+  async runTileTask(methodIds, start, end, View, workerIndex, inputSlots, resultSlots) {
+    const count = end - start;
+    const elementBytes = Number(this.manifest.modules[0].element_bytes || 8);
+    const fields = {};
+    for (const slot of inputSlots) {
+      fields[slot] = new View(
+        this.memory.buffer,
+        this.fieldOffsets[slot] + start * elementBytes,
+        count,
+      ).slice();
+    }
+    const taskId = this.nextTileTaskId++;
+    const worker = this.tileWorkers[workerIndex].worker;
+    return new Promise((resolve, reject) => {
       worker.onmessage = event => {
-        worker.terminate();
+        if (Number(event.data.taskId) !== taskId) return;
         if (event.data.error) reject(new Error(event.data.error));
         else resolve({start, end, outputs: event.data.outputs});
       };
       worker.onerror = event => {
-        worker.terminate();
         reject(new Error(event.message || "WebAssembly tile worker failed"));
       };
       worker.postMessage({
-        manifest,
-        inventory: this.manifest.class_inventory,
-        methodIds,
-        count,
-        fields,
+        type: "run", taskId, methodIds, count, fields, resultSlots,
       });
     });
   }
@@ -1001,11 +1542,11 @@ class ClassGraphRunner {
       const method = (this.manifest.class_inventory.methods || []).find(
         candidate => Number(candidate.index) === Number(node.method)
       );
+      if (!method) throw new Error("unknown deployment method " + node.method);
       const spec = this.modulesByName.get(method.module);
-      const instance = this.instances.get(method.module);
-      const args = [...method.input_slots, ...method.output_slots].map(
-        slot => this.fieldOffsets[slot]
-      );
+      if (!spec) throw new Error("missing deployment module " + method.module);
+      const instance = await this.instantiateCard(spec);
+      const args = this.rebindCardAliases(method);
       instance.exports[method.entry](count, ...args);
       return;
     }
@@ -1041,12 +1582,27 @@ class ClassGraphRunner {
       done: 0, total: tasks.length, workers: limit, tiles: ranges.length,
       lanes: laneCalls.length, join: node.join.mode
     });
+    const producedSlots = new Set();
+    for (const calls of laneCalls) for (const methodId of calls) {
+      for (const slot of methods.get(methodId).output_slots) producedSlots.add(Number(slot));
+    }
+    const inputSlots = new Set();
+    for (const calls of laneCalls) for (const methodId of calls) {
+      for (const slot of methods.get(methodId).input_slots) {
+        if (!producedSlots.has(Number(slot))) inputSlots.add(Number(slot));
+      }
+    }
+    const resultSlots = [...producedSlots];
+    await this.ensureTileWorkers(limit);
     const completed = [];
     try {
       for (let cursor = 0; cursor < tasks.length; cursor += limit) {
         const batch = tasks.slice(cursor, cursor + limit);
-        completed.push(...await Promise.all(batch.map(task =>
-          this.runTileTask(task.methodIds, task.start, task.end, View)
+        completed.push(...await Promise.all(batch.map((task, index) =>
+          this.runTileTask(
+            task.methodIds, task.start, task.end, View, index,
+            inputSlots, resultSlots
+          )
         )));
         setProgress(completed.length, tasks.length, "Join: awaiting WebAssembly tiles");
       }
@@ -1072,6 +1628,71 @@ class ClassGraphRunner {
     });
   }
 
+  async executeThreadDeployment(root, count, View) {
+    // Each tile owns a complete vertical slice of the scheduled graph. This
+    // keeps producer/consumer chains inside one worker and crosses one Join
+    // barrier for the whole tick instead of copying fields at every wave.
+    const methodIds = this.callsInDeploymentSchedule(root);
+    const methods = new Map((this.manifest.class_inventory.methods || []).map(
+      method => [Number(method.index), method]
+    ));
+    const producedSlots = new Set();
+    for (const methodId of methodIds) {
+      for (const slot of methods.get(methodId).output_slots) producedSlots.add(Number(slot));
+    }
+    const inputSlots = new Set();
+    for (const methodId of methodIds) {
+      for (const slot of methods.get(methodId).input_slots) {
+        if (!producedSlots.has(Number(slot))) inputSlots.add(Number(slot));
+      }
+    }
+    const resultSlots = new Set();
+    for (const binding of Object.values(this.manifest.logical_outputs || {})) {
+      const slot = this.fieldIndex.get("out::" + binding[0] + "::" + binding[1]);
+      if (slot !== undefined) resultSlots.add(Number(slot));
+    }
+    const desiredWorkers = this.workerCount(Math.max(1, Math.ceil(count / 8)));
+    const ranges = this.tileRanges(count, desiredWorkers);
+    const limit = this.workerCount(ranges.length);
+    await this.ensureTileWorkers(limit);
+    log("progress", "Deploy: dispatching vertically fused WebAssembly tiles", {
+      done: 0, total: ranges.length, workers: limit,
+      operations: methodIds.length, join: "barrier"
+    });
+    const completed = [];
+    try {
+      for (let cursor = 0; cursor < ranges.length; cursor += limit) {
+        const batch = ranges.slice(cursor, cursor + limit);
+        completed.push(...await Promise.all(batch.map(([start, end], index) =>
+          this.runTileTask(
+            methodIds, start, end, View, index, inputSlots, resultSlots
+          )
+        )));
+        setProgress(completed.length, ranges.length, "Join: awaiting fused WebAssembly tiles");
+      }
+    } catch (error) {
+      log("warn", "thread deployment failed; replaying serial Wasm schedule", {
+        error: String(error)
+      });
+      await Promise.all(this.manifest.modules.map(spec => this.instantiateCard(spec)));
+      return this.executeDeploymentNodeSerial(root, count);
+    }
+    const elementBytes = Number(this.manifest.modules[0].element_bytes || 8);
+    for (const result of completed) {
+      for (const [slotText, values] of Object.entries(result.outputs)) {
+        const slot = Number(slotText);
+        new View(
+          this.memory.buffer,
+          this.fieldOffsets[slot] + result.start * elementBytes,
+          result.end - result.start,
+        ).set(values);
+      }
+    }
+    log("ok", "Join: vertically fused WebAssembly tiles committed", {
+      tiles: completed.length, workers: limit, operations: methodIds.length
+    });
+  }
+
   async executeDeploymentNode(node, count, View) {
     if (node.kind === "deploy") return this.executeDeploy(node, count, View);
     if (node.kind === "sequence") {
@@ -1094,30 +1715,39 @@ class ClassGraphRunner {
   async instantiateCard(spec) {
     if (this.instances.has(spec.name)) return this.instances.get(spec.name);
     markDeploymentNode(spec.name, "downloading");
-    let moduleBinary;
-    if (spec.url) {
-      const response = await fetchResource(spec.url);
-      if (!response.ok) throw new Error(
-        "failed to load method card " + spec.name + ": HTTP " + response.status
-      );
-      moduleBinary = await response.arrayBuffer();
-    } else if (spec.wasm_base64) {
-      const raw = atob(spec.wasm_base64);
-      moduleBinary = new Uint8Array(raw.length);
-      for (let i = 0; i < raw.length; i++) moduleBinary[i] = raw.charCodeAt(i);
-    } else if (this.manifest.thread_deployment) {
-      const started = performance.now();
-      await this.executeDeploymentNode(
-        this.manifest.thread_deployment.root, count, View
-      );
-      this.lastExecutionMs = performance.now() - started;
-    } else {
-      throw new Error("method card " + spec.name + " has no URL or bytes");
+    const cacheKey = spec.cache_key || spec.url || (spec.name + "::" + (spec.wasm_base64 || ""));
+    let compiled = PUNCH_CARD_MODULE_CACHE.get(cacheKey);
+    if (!compiled) {
+      compiled = (async () => {
+        let moduleBinary;
+        if (spec.url) {
+          const response = await fetchResource(spec.url);
+          if (!response.ok) throw new Error(
+            "failed to load method card " + spec.name + ": HTTP " + response.status
+          );
+          moduleBinary = await response.arrayBuffer();
+        } else if (spec.wasm_base64) {
+          const raw = atob(spec.wasm_base64);
+          moduleBinary = new Uint8Array(raw.length);
+          for (let i = 0; i < raw.length; i++) moduleBinary[i] = raw.charCodeAt(i);
+        } else {
+          throw new Error("method card " + spec.name + " has no URL or bytes");
+        }
+        return WebAssembly.compile(moduleBinary);
+      })();
+      PUNCH_CARD_MODULE_CACHE.set(cacheKey, compiled);
     }
     const memoryImport = spec.shared_memory_import || {module: "env", field: "memory"};
     const imports = {};
     imports[memoryImport.module] = {[memoryImport.field]: this.memory};
-    const { instance } = await WebAssembly.instantiate(moduleBinary, imports);
+    let module;
+    try {
+      module = await compiled;
+    } catch (error) {
+      PUNCH_CARD_MODULE_CACHE.delete(cacheKey);
+      throw error;
+    }
+    const instance = await WebAssembly.instantiate(module, imports);
     this.instances.set(spec.name, instance);
     markDeploymentNode(spec.name, "ready");
     return instance;
@@ -1171,6 +1801,37 @@ class ClassGraphRunner {
     return this.fieldOffsets[index];
   }
 
+  rebindCardAliases(method) {
+    const slots = [...method.input_slots, ...method.output_slots].map(Number);
+    const table = new Int32Array(
+      this.memory.buffer, this.inventoryOffset,
+      (this.manifest.class_inventory.field_slots || []).length
+    );
+    // Always rewrite: a cached card may be entered through a different graph
+    // edge, and a previous traversal's address must never survive the seam.
+    for (const slot of slots) table[slot] = this.fieldOffsets[slot];
+    return slots.map(slot => table[slot]);
+  }
+
+  async executeReadHeadRange(count, activeMethods, latch) {
+    for (let index = 0; index < activeMethods.length && (!latch || running); index++) {
+      const method = activeMethods[index];
+      const spec = this.modulesByName.get(method.module);
+      if (!spec) throw new Error("inventory method module not found: " + method.module);
+      const instance = await this.instantiateCard(spec);
+      const args = this.rebindCardAliases(method);
+      markDeploymentNode(method.module, "running");
+      const started = performance.now();
+      instance.exports[method.entry](count, ...args);
+      const elapsed = performance.now() - started;
+      queueDeploymentProfile(method.module, elapsed, "lazy read head");
+      markDeploymentNode(method.module, "done", elapsed, "lazy read head");
+      if (latch && index + 1 < activeMethods.length && running) {
+        await waitForCardLatch(index + 1, activeMethods.length);
+      }
+    }
+  }
+
   redirectStorageOffset(identity, offset) {
     const index = this.fieldIndex.get(identity);
     if (index === undefined) throw new Error("unknown shared-memory identity " + identity);
@@ -1210,7 +1871,7 @@ class ClassGraphRunner {
     residentOutputs = false
   ) {
     this.layout(count);
-    const View = this.manifest.modules[0].value_type === "f32" ? Float32Array : Float64Array;
+    const View = typedArrayForDtype(this.manifest.modules[0].value_type);
     for (const [logicalName, source] of Object.entries(logicalInputs)) {
       const identity = "in::" + logicalName;
       if (source && source.turingStorageReference === true) {
@@ -1233,7 +1894,6 @@ class ClassGraphRunner {
         target.fill(Number(source));
       }
     }
-    const runtime = await this.ensureRuntime();
     const methodCount = Number(this.manifest.coordinator.method_count);
     const supportsRanges = this.manifest.coordinator.supports_ranges !== false;
     const rangeStart = supportsRanges ? start : 0;
@@ -1242,8 +1902,31 @@ class ClassGraphRunner {
     const activeMethods = (this.manifest.class_inventory.methods || []).filter(
       method => method.index >= rangeStart && method.index < rangeEnd
     );
-    const coordinate = runtime.exports[this.manifest.coordinator.entry || "run_range"];
-    if (latch && supportsRanges) {
+    if (this.threadingEnabled && this.manifest.thread_deployment &&
+        !this.threadingEligible() && !this.collectiveNoticeShown) {
+      this.collectiveNoticeShown = true;
+      log("info", "whole-extent Wasm coordinator retained", {
+        reason: "deployment contains collective/global-state operations",
+        collectiveMethods: this.manifest.thread_deployment.collective_methods || []
+      });
+    }
+    const cardPolicy = (this.cardGraph || {}).address_policy || {};
+    if (cardPolicy.execution === "read-head") {
+      const started = performance.now();
+      await this.executeReadHeadRange(count, activeMethods, latch);
+      this.lastExecutionMs = performance.now() - started;
+    } else if (this.threadingEnabled && this.manifest.thread_deployment &&
+        this.threadingEligible() && !latch &&
+        rangeStart === 0 && rangeEnd === methodCount) {
+      const started = performance.now();
+      await this.executeThreadDeployment(
+        this.manifest.thread_deployment.root, count, View
+      );
+      this.lastExecutionMs = performance.now() - started;
+    } else {
+      const runtime = await this.ensureRuntime();
+      const coordinate = runtime.exports[this.manifest.coordinator.entry || "run_range"];
+      if (latch && supportsRanges) {
       for (let index = 0; index < activeMethods.length && running; index++) {
         const method = activeMethods[index];
         markDeploymentNode(method.module, "running");
@@ -1254,15 +1937,16 @@ class ClassGraphRunner {
           await waitForCardLatch(index + 1, activeMethods.length);
         }
       }
-    } else {
-      const started = performance.now();
-      coordinate(count, this.inventoryOffset, rangeStart, rangeEnd);
-      const elapsed = performance.now() - started;
-      this.lastExecutionMs = elapsed;
-      activeMethods.forEach(method => queueDeploymentProfile(
-        method.module, elapsed / Math.max(1, activeMethods.length),
-        "coordinator amortized"
-      ));
+      } else {
+        const started = performance.now();
+        coordinate(count, this.inventoryOffset, rangeStart, rangeEnd);
+        const elapsed = performance.now() - started;
+        this.lastExecutionMs = elapsed;
+        activeMethods.forEach(method => queueDeploymentProfile(
+          method.module, elapsed / Math.max(1, activeMethods.length),
+          "coordinator amortized"
+        ));
+      }
     }
     return outputs.map(parameter => {
       const binding = this.manifest.logical_outputs[parameter.name];
@@ -1291,7 +1975,7 @@ class ContiguousRunner {
     const instance = await this.instance();
     const memory = instance.exports[this.spec.memory_export || "memory"];
     const elementBytes = Number(this.spec.element_bytes || 8);
-    const View = this.spec.value_type === "f32" ? Float32Array : Float64Array;
+    const View = typedArrayForDtype(this.spec.value_type);
     let cursor = Math.ceil(Number(this.spec.reserved_bytes || 0) / elementBytes) * elementBytes;
     const offsets = {};
     for (const name of [...this.spec.inputs, ...this.spec.outputs]) {
@@ -1345,6 +2029,29 @@ function activeClassGraphRunner() {
   }
   return classGraphRunners.get(key);
 }
+
+window.TuringWasmThreads = Object.freeze({
+  get enabled() {
+    const runner = activeClassGraphRunner();
+    return runner ? runner.threadingEnabled : null;
+  },
+  setEnabled(enabled) {
+    const runner = activeClassGraphRunner();
+    if (!runner) throw new Error("no active divided-program runner");
+    runner.threadingEnabled = Boolean(enabled);
+  },
+  profile() {
+    const runner = activeClassGraphRunner();
+    return runner ? {
+      enabled: runner.threadingEnabled,
+      eligible: runner.threadingEligible(),
+      extentEffect: (runner.manifest.thread_deployment || {}).extent_effect || null,
+      lastExecutionMs: runner.lastExecutionMs,
+      workers: runner.tileWorkers.length,
+      topology: runner.manifest.thread_topology || null,
+    } : null;
+  },
+});
 
 window.TuringSharedClassMemory = Object.freeze({
   redirect(identity, storage) {
@@ -1412,7 +2119,7 @@ window.TuringWasmRuntime = Object.freeze({
 
 function residentValues(value) {
   if (!value || value.turingStorageReference !== true) return value;
-  const View = value.valueType === "f32" ? Float32Array : Float64Array;
+  const View = typedArrayForDtype(value.valueType);
   return new View(value.memory.buffer, value.offset, value.count);
 }
 
@@ -1552,6 +2259,7 @@ async function runClassGraphMode() {
 }
 
 async function run() {
+  await systemPorts.ready;
   if (CLASS_GRAPH) { await runClassGraphMode(); return; }
   if (running) {            // the button is a toggle while a run is live
     running = false;
@@ -2597,7 +3305,53 @@ function wireFilePicker() {
   });
 }
 
+function wireSystemPorts() {
+  document.querySelectorAll("input[data-system-file-port]").forEach(input => {
+    input.addEventListener("change", async event => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      const port = event.target.dataset.systemFilePort;
+      try {
+        const value = await systemPorts.publishFile(port, file);
+        const status = document.querySelector('[data-system-port-status="' + CSS.escape(port) + '"]');
+        if (status) status.textContent = value.name + " · " + value.bytes.byteLength + " bytes";
+        setStatus("loaded " + value.name + " for " + port, "good");
+      } catch (error) {
+        setStatus(String(error), "bad");
+      }
+    });
+  });
+  const runtime = window.TuringMachineProgram || window.TuringMachineRuntime || null;
+  if (runtime && typeof runtime.bindSystemPorts === "function") {
+    runtime.bindSystemPorts(systemPorts);
+  } else if (runtime && typeof runtime.loadBinary === "function") {
+    const filePorts = SYSTEM_PORTS.filter(port => port.kind === "file" && port.direction === "input");
+    if (filePorts.length === 1) {
+      systemPorts.registerFileHandler(filePorts[0].name, value => runtime.loadBinary(value.bytes));
+    }
+  }
+  if (runtime) for (const port of SYSTEM_PORTS.filter(port => port.kind === "device")) {
+    const device = String((port.attributes || {}).device || port.name);
+    if (port.direction !== "output") {
+      systemPorts.registerDeviceHandler(port.name, (bytes, options) => {
+        if (typeof runtime.injectDeviceBytes === "function") {
+          return runtime.injectDeviceBytes(device, bytes, options);
+        }
+        if (device === "console.input" && typeof runtime.injectConsoleInput === "function") {
+          return runtime.injectConsoleInput(bytes);
+        }
+        throw new Error("machine runtime cannot accept device " + device);
+      });
+    }
+  }
+}
+
 wireFilePicker();
+wireSystemPorts();
+systemPorts.ready.catch(error => {
+  setStatus("virtual filesystem initialization failed: " + String(error), "bad");
+  log("error", "virtual filesystem initialization failed", {error: String(error)});
+});
 wireTabs();
 wireCallableTabs();
 wirePythonCallables();
@@ -2711,13 +3465,27 @@ body.shader-execution #shader-layout-document {
 _SHADER_EXECUTION_JS = r"""
 const SHADER = __SHADER_EXECUTION__;
 const canvas = document.getElementById("shader-surface");
-const gl = canvas.getContext("webgl2", {
+// Priority: WebGPU compute (real dispatch, no draw-buffer cap) -> WebGL 2
+// fragment-raster (the only path older browsers have) -> plain 2D canvas
+// (no GPU shading language at all, see the canvas2d branch below). A
+// canvas commits to one context type for the rest of its lifetime the
+// first time getContext() succeeds with a specific type, so this pick has
+// to happen before any getContext() call is made, not by trying one and
+// falling back afterward.
+const shaderCandidates = (SHADER.candidates && SHADER.candidates.length)
+  ? SHADER.candidates : [SHADER];
+const activeCandidate =
+  shaderCandidates.find(candidate => candidate.language === "wgsl" && "gpu" in navigator) ||
+  shaderCandidates.find(candidate => candidate.language === "webgl2-glsl-es") ||
+  shaderCandidates.find(candidate => candidate.language === "canvas2d") ||
+  shaderCandidates[0];
+const gl = activeCandidate.language === "webgl2-glsl-es" ? canvas.getContext("webgl2", {
   alpha: false,
   antialias: false,
   depth: false,
   stencil: false,
   preserveDrawingBuffer: false,
-});
+}) : null;
 const input = {
   pointer: [0, 0],
   buttons: 0,
@@ -2852,14 +3620,127 @@ const domLayout = {
     return this.loadHTML(await file.text(), {baseURL: document.baseURI});
   },
 };
+// The compiled machine runtime publishes complete TMSNAP01 generations here.
+// Presentation observes the newest flip; it never clocks or blocks execution.
+const machineSnapshots = {
+  generation: 0,
+  current: null,
+  listeners: new Set(),
+  transport: null,
+  publish(value) {
+    const bytes = value instanceof Uint8Array
+      ? value
+      : new Uint8Array(value && value.buffer ? value.buffer : value);
+    if (bytes.byteLength < 76) throw new Error("machine snapshot is shorter than its header");
+    const magic = String.fromCharCode(...bytes.subarray(0, 8));
+    if (magic !== "TMSNAP01") throw new Error("machine snapshot has an unknown ABI");
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const generation = Number(view.getBigUint64(16, true));
+    if (generation <= this.generation) return false;
+    this.generation = generation;
+    this.current = bytes;
+    this.listeners.forEach(listener => listener(bytes, generation));
+    return true;
+  },
+  latest() { return this.current; },
+  subscribe(listener) {
+    this.listeners.add(listener);
+    if (this.current) listener(this.current, this.generation);
+    return () => this.listeners.delete(listener);
+  },
+  connect(endpoint = "/snapshot", options = {}) {
+    this.disconnect();
+    const controller = new AbortController();
+    const transport = {
+      endpoint: String(endpoint),
+      inputEndpoint: String(options.inputEndpoint || "/input"),
+      controlEndpoint: String(options.controlEndpoint || "/control"),
+      subjectEndpoint: String(options.subjectEndpoint || "/subject"),
+      interval: Math.max(4, Number(options.interval || 16)),
+      controller,
+      running: true,
+      error: null,
+    };
+    this.transport = transport;
+    document.dispatchEvent(new CustomEvent("turing-machine-transport", {
+      detail: {connected: true, endpoint: transport.endpoint},
+    }));
+    const poll = async () => {
+      while (transport.running && !controller.signal.aborted) {
+        try {
+          const separator = transport.endpoint.includes("?") ? "&" : "?";
+          const response = await fetch(
+            transport.endpoint + separator + "after=" + this.generation,
+            {cache: "no-store", signal: controller.signal},
+          );
+          if (response.status === 200) this.publish(new Uint8Array(await response.arrayBuffer()));
+          else if (response.status !== 204) throw new Error(
+            "machine snapshot stream returned HTTP " + response.status
+          );
+          transport.error = null;
+        } catch (error) {
+          if (controller.signal.aborted) break;
+          transport.error = error;
+        }
+        await new Promise(resolve => setTimeout(resolve, transport.interval));
+      }
+    };
+    transport.done = poll();
+    return transport;
+  },
+  disconnect() {
+    const transport = this.transport;
+    if (!transport) return;
+    transport.running = false;
+    transport.controller.abort();
+    this.transport = null;
+    document.dispatchEvent(new CustomEvent("turing-machine-transport", {
+      detail: {connected: false},
+    }));
+  },
+  async sendTerminalInput(value) {
+    if (!this.transport) throw new Error("machine snapshot transport is not connected");
+    const bytes = value instanceof Uint8Array
+      ? value : new TextEncoder().encode(String(value));
+    const response = await fetch(this.transport.inputEndpoint, {
+      method: "POST", body: bytes, cache: "no-store",
+      headers: {"Content-Type": "application/octet-stream"},
+    });
+    if (!response.ok) throw new Error("terminal input returned HTTP " + response.status);
+  },
+  async sendControl(action, value = null) {
+    if (!this.transport) throw new Error("machine snapshot transport is not connected");
+    const response = await fetch(this.transport.controlEndpoint, {
+      method: "POST", cache: "no-store",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({action: String(action), value}),
+    });
+    if (!response.ok) throw new Error("machine control returned HTTP " + response.status);
+  },
+  async loadSubject(value) {
+    if (!this.transport) throw new Error("machine snapshot transport is not connected");
+    const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+    const response = await fetch(this.transport.subjectEndpoint, {
+      method: "POST", body: bytes, cache: "no-store",
+      headers: {"Content-Type": "application/octet-stream"},
+    });
+    if (!response.ok) throw new Error("machine subject load returned HTTP " + response.status);
+  },
+};
+window.TuringMachineSnapshots = machineSnapshots;
 const liaison = {
   role: SHADER.role,
   canvas,
   gl,
+  context: gl,
+  candidate: activeCandidate,
   input,
   io: SHADER.io || (window.TuringWasmRuntime && window.TuringWasmRuntime.io) || null,
   wasm: window.TuringWasmRuntime || null,
   dom: domLayout,
+  machineSnapshots,
+  systemPorts: window.TuringSystemPorts || null,
+  machineProgram: window.TuringMachineProgram || window.TuringMachineRuntime || null,
   ready: null,
 };
 
@@ -2910,7 +3791,20 @@ canvas.addEventListener("dragover", event => event.preventDefault());
 canvas.addEventListener("drop", event => {
   event.preventDefault();
   const file = event.dataTransfer && event.dataTransfer.files[0];
-  if (file) domLayout.loadFile(file).catch(fail);
+  if (!file) return;
+  if (/html?/i.test(file.type || file.name || "")) {
+    domLayout.loadFile(file).catch(fail);
+  } else if (liaison.systemPorts) {
+    const filePorts = Array.from(liaison.systemPorts.descriptors.values())
+      .filter(port => port.kind === "file" && port.direction === "input");
+    if (filePorts.length !== 1) {
+      fail(new Error("binary drop requires exactly one input file system port"));
+      return;
+    }
+    liaison.systemPorts.publishFile(filePorts[0].name, file).catch(fail);
+  } else {
+    fail(new Error("this build has no compiled file system port"));
+  }
 });
 canvas.focus({preventScroll: true});
 
@@ -2935,11 +3829,38 @@ void main() {
   gl_Position = vec4(TURING_TRIANGLE[gl_VertexID], 0.0, 1.0);
 }`;
 
+let ready;
+if (SHADER.display_ownership === "program-interior") {
+  ready = (async () => {
+    const interior = SHADER.interior || null;
+    if (!interior || !interior.controller_source || !interior.controller_entry) {
+      throw new Error("interior display ownership requires a controller source and entrypoint");
+    }
+    if (SHADER.context === "webgl2" && !gl) {
+      throw new Error("the interior program promised WebGL2 presentation but no context is available");
+    }
+    // The shell stops here: it owns allocation of the canvas/context and the
+    // input liaison, but it does not compile a display shader, create a frame
+    // loop, or interpret visual outputs. The authored interior controller
+    // receives the complete context and assumes presentation ownership.
+    const install = new Function(
+      "liaison", "interior",
+      interior.controller_source
+        + "\nreturn " + interior.controller_entry + "(liaison, interior);"
+    );
+    const claimed = await install(liaison, interior);
+    if (!claimed || claimed.ownsDisplay !== true) {
+      throw new Error("interior display controller did not confirm presentation ownership");
+    }
+    canvas.dataset.displayOwner = interior.owner || "program-interior";
+    return claimed;
+  })();
+} else if (activeCandidate.language === "webgl2-glsl-es") {
 if (!gl) {
   fail(new Error("WebGL 2 is required by this execution page"));
 } else {
-  const ready = (async () => {
-    const response = await fetch(new URL(SHADER.url, document.baseURI), {cache: "no-store"});
+  ready = (async () => {
+    const response = await fetch(new URL(activeCandidate.url, document.baseURI), {cache: "no-store"});
     if (!response.ok) throw new Error("shader load failed: HTTP " + response.status);
     const fragmentSource = await response.text();
     const program = gl.createProgram();
@@ -3250,6 +4171,237 @@ if (!gl) {
     }
     return {canvas, gl, program, input, fragmentSource};
   })();
+}
+} else if (activeCandidate.language === "wgsl") {
+  ready = (async () => {
+    if (!("gpu" in navigator)) {
+      throw new Error("WebGPU is not available in this browser");
+    }
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) throw new Error("no WebGPU adapter is available");
+    const device = await adapter.requestDevice();
+    const response = await fetch(new URL(activeCandidate.url, document.baseURI), {cache: "no-store"});
+    if (!response.ok) throw new Error("shader load failed: HTTP " + response.status);
+    const computeSource = await response.text();
+    const computeModule = device.createShaderModule({code: computeSource});
+
+    // Bindings are discovered from the emitted WGSL text itself, the same
+    // way the WebGL branch above discovers its sampler2D feed uniforms by
+    // scanning the fetched fragment source -- ssa_webgpu_backend.py's
+    // WGSLModule.io_layout is not threaded through the published
+    // descriptor JSON, so this mirrors the existing established pattern
+    // instead of widening that contract for a first version.
+    const bindingPattern = /@group\(0\)\s+@binding\((\d+)\)\s+var<storage,\s*(read|read_write)>\s+(\w+)\s*:\s*array<(f32|i32|u32)>;/g;
+    const bindings = [...computeSource.matchAll(bindingPattern)].map(match => ({
+      index: Number(match[1]), access: match[2], name: match[3], dtype: match[4],
+    }));
+    const feedBindings = bindings.filter(binding => binding.access === "read");
+    const outputBindings = bindings.filter(binding => binding.access === "read_write");
+    if (!outputBindings.length) throw new Error("compute shader declares no output binding");
+    const workgroupMatch = computeSource.match(/@workgroup_size\((\d+),\s*(\d+),\s*(\d+)\)/);
+    const workgroupSizeX = workgroupMatch ? Number(workgroupMatch[1]) : 32;
+
+    const context = canvas.getContext("webgpu");
+    if (!context) throw new Error("failed to acquire a webgpu canvas context");
+    const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({device, format: presentationFormat, alphaMode: "opaque"});
+
+    const computePipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: {module: computeModule, entryPoint: "main"},
+    });
+
+    // Fixed presentation stage, authored here rather than compiler-emitted
+    // -- analogous to FULLSCREEN_VERTEX_SHADER for the WebGL branch above.
+    // Reads the compute pass's first output buffer as a grayscale field;
+    // this is a first-light default, not a claim about what the program
+    // means visually.
+    const presentationModule = device.createShaderModule({code: `
+struct Dims { width: u32, height: u32 };
+@group(0) @binding(0) var<uniform> turing_dims: Dims;
+@group(0) @binding(1) var<storage, read> turing_present: array<f32>;
+
+struct VertexOut { @builtin(position) position: vec4<f32> };
+
+@vertex
+fn vs(@builtin(vertex_index) vertexIndex: u32) -> VertexOut {
+  var positions = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0),
+  );
+  var out: VertexOut;
+  out.position = vec4<f32>(positions[vertexIndex], 0.0, 1.0);
+  return out;
+}
+
+@fragment
+fn fs(vertexOut: VertexOut) -> @location(0) vec4<f32> {
+  let x = u32(vertexOut.position.x);
+  let y = u32(vertexOut.position.y);
+  if (x >= turing_dims.width || y >= turing_dims.height) {
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+  }
+  let index = y * turing_dims.width + x;
+  let value = turing_present[index];
+  return vec4<f32>(value, value, value, 1.0);
+}
+`});
+    const presentationPipeline = device.createRenderPipeline({
+      layout: "auto",
+      vertex: {module: presentationModule, entryPoint: "vs"},
+      fragment: {module: presentationModule, entryPoint: "fs", targets: [{format: presentationFormat}]},
+      primitive: {topology: "triangle-list"},
+    });
+    const dimsBuffer = device.createBuffer({
+      size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    let elementCount = 0;
+    let feedBuffers = [];
+    let outputBuffer = null;
+    let computeBindGroup = null;
+    let presentationBindGroup = null;
+
+    function ensureBuffers(width, height) {
+      const count = width * height;
+      if (count === elementCount && computeBindGroup) return;
+      feedBuffers.forEach(buffer => buffer.destroy());
+      if (outputBuffer) outputBuffer.destroy();
+      const byteLength = Math.max(4, count * 4);
+      feedBuffers = feedBindings.map(() => device.createBuffer({
+        size: byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      }));
+      outputBuffer = device.createBuffer({
+        size: byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      computeBindGroup = device.createBindGroup({
+        layout: computePipeline.getBindGroupLayout(0),
+        entries: [
+          ...feedBindings.map((binding, index) => ({binding: binding.index, resource: {buffer: feedBuffers[index]}})),
+          {binding: outputBindings[0].index, resource: {buffer: outputBuffer}},
+        ],
+      });
+      presentationBindGroup = device.createBindGroup({
+        layout: presentationPipeline.getBindGroupLayout(0),
+        entries: [
+          {binding: 0, resource: {buffer: dimsBuffer}},
+          {binding: 1, resource: {buffer: outputBuffer}},
+        ],
+      });
+      device.queue.writeBuffer(dimsBuffer, 0, new Uint32Array([width, height]));
+      elementCount = count;
+    }
+
+    function writeFeeds(time) {
+      feedBindings.forEach((binding, index) => {
+        const values = new Float32Array(Math.max(1, elementCount));
+        for (let i = 0; i < elementCount; i += 1) {
+          const channel = index % 4;
+          values[i] = channel === 0 ? i / Math.max(1, elementCount - 1)
+            : channel === 1 ? time
+            : channel === 2 ? input.pointer[0]
+            : input.pointer[1];
+        }
+        device.queue.writeBuffer(feedBuffers[index], 0, values);
+      });
+    }
+
+    async function frame(milliseconds) {
+      const ratio = Math.max(1, window.devicePixelRatio || 1);
+      const width = Math.max(1, Math.round(canvas.clientWidth * ratio));
+      const height = Math.max(1, Math.round(canvas.clientHeight * ratio));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      ensureBuffers(width, height);
+      writeFeeds(milliseconds / 1000);
+
+      const encoder = device.createCommandEncoder();
+      const computePass = encoder.beginComputePass();
+      computePass.setPipeline(computePipeline);
+      computePass.setBindGroup(0, computeBindGroup);
+      const workgroups = Math.max(1, Math.min(65535, Math.ceil(elementCount / workgroupSizeX)));
+      computePass.dispatchWorkgroups(workgroups);
+      computePass.end();
+
+      const renderPass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: context.getCurrentTexture().createView(),
+          clearValue: {r: 0, g: 0, b: 0, a: 1},
+          loadOp: "clear",
+          storeOp: "store",
+        }],
+      });
+      renderPass.setPipeline(presentationPipeline);
+      renderPass.setBindGroup(0, presentationBindGroup);
+      renderPass.draw(3);
+      renderPass.end();
+      device.queue.submit([encoder.finish()]);
+      requestAnimationFrame(value => frame(value).catch(fail));
+    }
+
+    domLayout.latest = await settledLayout(document);
+    requestAnimationFrame(value => frame(value).catch(fail));
+    if (SHADER.autostart !== false && liaison.wasm) {
+      const execution = SHADER.execution || {};
+      liaison.wasm.start({
+        continuous: execution.continuous !== false,
+        preferContiguous: execution.prefer_contiguous !== false,
+      }).catch(fail);
+    }
+    return {canvas, device, context, input};
+  })();
+} else {
+  // Plain 2D canvas, no shader compilation of any kind: paint the WASM
+  // numeric output's named channels straight to pixels. Always available,
+  // the last-resort tier when neither WebGPU nor WebGL 2 can run.
+  ready = (async () => {
+    const context2d = canvas.getContext("2d");
+    if (!context2d) throw new Error("2D canvas context is unavailable");
+    const configuration = SHADER.configuration || {};
+    const channelNames = Array.isArray(configuration.channels)
+      ? configuration.channels : ["red", "green", "blue"];
+    domLayout.latest = await settledLayout(document);
+
+    function paint() {
+      const ratio = Math.max(1, window.devicePixelRatio || 1);
+      const width = Math.max(1, Math.round(canvas.clientWidth * ratio));
+      const height = Math.max(1, Math.round(canvas.clientHeight * ratio));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      const frame = liaison.wasm && liaison.wasm.outputFrame ? liaison.wasm.outputFrame() : null;
+      if (frame && frame.outputs.length) {
+        const byName = new Map(frame.outputs.map(item => [item.name, item.values]));
+        const channels = channelNames.slice(0, 3).map(name => byName.get(name));
+        const count = frame.width * frame.height;
+        if (channels.length === 3 && channels.every(values => values && values.length >= count)) {
+          const pixels = new Uint8ClampedArray(count * 4);
+          for (let index = 0; index < count; index += 1) {
+            const base = index * 4;
+            pixels[base] = Math.max(0, Math.min(255, Math.round(channels[0][index])));
+            pixels[base + 1] = Math.max(0, Math.min(255, Math.round(channels[1][index])));
+            pixels[base + 2] = Math.max(0, Math.min(255, Math.round(channels[2][index])));
+            pixels[base + 3] = 255;
+          }
+          context2d.putImageData(new ImageData(pixels, frame.width, frame.height), 0, 0);
+        }
+      }
+      requestAnimationFrame(paint);
+    }
+    requestAnimationFrame(paint);
+    if (SHADER.autostart !== false && liaison.wasm) {
+      const execution = SHADER.execution || {};
+      liaison.wasm.start({
+        continuous: execution.continuous !== false,
+        preferContiguous: execution.prefer_contiguous !== false,
+      }).catch(fail);
+    }
+    return {canvas, context2d, input};
+  })();
+}
+if (ready) {
   liaison.ready = ready;
   window.TuringShaderLiaison = liaison;
   // Compatibility name for callers of the first shader-surface probe.
@@ -3288,6 +4440,7 @@ def _input_rows(
     parameters: Sequence[Mapping[str, Any]],
     feed_expressions: Mapping[str, str] | None = None,
     network_routes: Mapping[str, Mapping[str, Any]] | None = None,
+    shell_io: Mapping[str, Any] | None = None,
 ) -> str:
     """One row per feed, each able to be literal values or an expression.
 
@@ -3299,7 +4452,16 @@ def _input_rows(
 
     expressions = dict(feed_expressions or {})
     routes = dict(network_routes or {})
-    feeds = [p for p in parameters if p["role"] == "input"]
+    requirements = dict((shell_io or {}).get("requirements") or {})
+    system_parameters = {
+        str(field.get("parameter"))
+        for port in requirements.get("system_ports", ())
+        for field in port.get("fields", ())
+    }
+    feeds = [
+        p for p in parameters
+        if p["role"] == "input" and str(p["name"]) not in system_parameters
+    ]
     rows = []
     for parameter in feeds:
         name = str(parameter["name"])
@@ -3335,6 +4497,43 @@ def _input_rows(
             '<div class="meta">This program takes no array feeds; the domain '
             "width and height decide how many elements one run covers.</div>"
         )
+    return "\n".join(rows)
+
+
+def _system_port_rows(shell_io: Mapping[str, Any] | None) -> str:
+    requirements = dict((shell_io or {}).get("requirements") or {})
+    ports = list(requirements.get("system_ports", ()))
+    rows = []
+    for port in ports:
+        name = str(port.get("name", "system-port"))
+        kind = str(port.get("kind", ""))
+        if kind == "file":
+            attributes = dict(port.get("attributes") or {})
+            accept = str(attributes.get("accept", "application/octet-stream"))
+            required = "" if port.get("optional") else " required"
+            rows.append(
+                '<div class="row system-port" data-system-port="' + _escape(name) + '">'
+                '<div class="name">' + _escape(name) + '</div>'
+                '<div class="grow"><input type="file" data-system-file-port="'
+                + _escape(name) + '" accept="' + _escape(accept) + '"' + required + '>'
+                '<div class="meta" data-system-port-status="' + _escape(name)
+                + '">awaiting file · byte-exact shell port</div></div></div>'
+            )
+        elif kind == "external_reference":
+            domain = str(port.get("external_domain", ""))
+            attributes = dict(port.get("attributes") or {})
+            if domain == "host_system":
+                description = str(attributes.get("description", "shell-simulated"))
+            else:
+                bundle = str(attributes.get("bundle", "unbound bundle"))
+                export = str(attributes.get("export", "default"))
+                description = bundle + " :: " + export
+            rows.append(
+                '<div class="row system-port" data-system-port="' + _escape(name) + '">'
+                '<div class="name">' + _escape(name) + '</div><div class="meta grow">'
+                + _escape(domain + " · " + description)
+                + '</div></div>'
+            )
     return "\n".join(rows)
 
 
@@ -3648,6 +4847,184 @@ def _mathematics_panel(mathematics: Mapping[str, Any] | None) -> str:
   </div>"""
 
 
+def _transcript_section(node_id: str, title: str, body_html: str) -> str:
+    return (
+        f'<section data-node="{_escape(node_id)}">'
+        f"<h2>{_escape(title)}</h2>{body_html}</section>"
+    )
+
+
+def _transcript_list(items: Sequence[str]) -> str:
+    if not items:
+        return "<p>None.</p>"
+    return "<ul>" + "".join(f"<li>{item}</li>" for item in items) + "</ul>"
+
+
+def _render_transcript(
+    *,
+    mapping: Mapping[str, Any],
+    entry: Mapping[str, Any],
+    parameters: Sequence[Mapping[str, Any]],
+    graph_mapping: Mapping[str, Any],
+    telemetry_mapping: Mapping[str, Any],
+    network_mapping: Mapping[str, Any],
+    map_mapping: Mapping[str, Any],
+    shader_execution: Mapping[str, Any] | None,
+    backend_sources: Any,
+    origin_source: str,
+    build_parameters: Mapping[str, Any] | None,
+) -> str:
+    """A static, fully-linked textual transcript of what this page already knows.
+
+    Every fact here already exists as a Python value passed into
+    :func:`emit_html_shell` for the canvas/JS presentation; this renders the
+    same facts as literal HTML text and real ``?node=`` links instead of
+    JSON handed only to a script. Nothing is computed here that the compiler
+    did not already compute -- see ``docs/WASM_SHELL_HANDOFF.md``'s "one
+    ingested program" rule.
+    """
+
+    sections: list[str] = []
+
+    param_items = [
+        f'<code>{_escape(str(p.get("name", "")))}</code> '
+        f'<span>({_escape(str(p.get("dtype", "")))})</span>'
+        for p in parameters
+    ]
+    root_body = (
+        f'<p><b>{_escape(str(mapping.get("module", "")))}</b> &middot; '
+        f'{_escape(str(mapping.get("language", "")))} &middot; entry '
+        f'<code>{_escape(str(entry.get("name", "")))}</code></p>'
+        f"<p>Parameters:</p>{_transcript_list(param_items)}"
+        f'<p><a href="?node=graph-index">Process graph</a> &middot; '
+        f'<a href="?node=log">Build and run log</a> &middot; '
+        f'<a href="?node=network">Feedback network</a> &middot; '
+        f'<a href="?node=shader">Shader execution</a> &middot; '
+        f'<a href="?node=classes">Classes and callables</a> &middot; '
+        f'<a href="?node=sources">Sources</a></p>'
+    )
+    sections.append(_transcript_section("root", "Program", root_body))
+
+    table = list(graph_mapping.get("table") or ())
+    histogram = dict(graph_mapping.get("histogram") or {})
+    index_body = (
+        f'<p>{graph_mapping.get("nodes", 0)} nodes, '
+        f'{graph_mapping.get("edges", 0)} edges'
+        f'{" (truncated)" if graph_mapping.get("truncated") else ""}.</p>'
+        + _transcript_list(
+            [f"{_escape(kind)}: {count}" for kind, count in histogram.items()]
+        )
+        + _transcript_list(
+            [
+                f'<a href="?node=graph-{_escape(str(row.get("id")))}">'
+                f'node {_escape(str(row.get("id")))} '
+                f'({_escape(str(row.get("type")))})</a>'
+                for row in table
+            ]
+        )
+    )
+    sections.append(_transcript_section("graph-index", "Process graph", index_body))
+    for row in table:
+        node_id = str(row.get("id"))
+        parents = list(row.get("parents") or ())
+        node_body = (
+            f'<p>type <code>{_escape(str(row.get("type")))}</code></p>'
+            f'<p>{_escape(str(row.get("label") or ""))}</p>'
+            "<p>Parents:</p>"
+            + _transcript_list(
+                [
+                    f'<a href="?node=graph-{_escape(str(p))}">node {_escape(str(p))}</a>'
+                    for p in parents
+                ]
+            )
+            + f'<p><a href="?node=graph-index">Back to graph index</a></p>'
+        )
+        sections.append(
+            _transcript_section(f"graph-{node_id}", f"Node {node_id}", node_body)
+        )
+
+    log_items = [
+        f'[{_escape(str(record.get("kind")))}] {_escape(str(record.get("message")))}'
+        + (
+            f' ({_escape(str(record.get("path")))})'
+            if record.get("path")
+            else ""
+        )
+        for record in telemetry_mapping.get("records") or ()
+    ]
+    sections.append(
+        _transcript_section(
+            "log", "Build and run log", f'<ul>{"".join(f"<li>{i}</li>" for i in log_items)}</ul>'
+        )
+    )
+
+    routes = list(network_mapping.get("routes") or ())
+    network_body = (
+        f'<p>{_escape(str(network_mapping.get("name", "")))}</p>'
+        + _transcript_list(
+            [
+                f'feed <code>{_escape(str(route.get("feed", "")))}</code>'
+                for route in routes
+                if isinstance(route, Mapping)
+            ]
+        )
+    )
+    sections.append(_transcript_section("network", "Feedback network", network_body))
+
+    if shader_execution:
+        shader_body = (
+            f'<p>role <code>{_escape(str(shader_execution.get("role", "")))}</code> '
+            f'&middot; stage <code>{_escape(str(shader_execution.get("stage", "")))}</code></p>'
+            f'<p>Published at <code>{_escape(str(shader_execution.get("url", "")))}</code></p>'
+        )
+    else:
+        shader_body = "<p>No shader execution surface attached to this page.</p>"
+    sections.append(_transcript_section("shader", "Shader execution", shader_body))
+
+    class_nav = dict(map_mapping.get("class_navigation") or {})
+    callables = list(map_mapping.get("callable_systems") or ())
+    classes_body = _transcript_list(
+        [_escape(str(name)) for name in class_nav.get("classes", ())]
+    ) + _transcript_list(
+        [
+            f'<a href="?node=class-{_escape(str(c.get("identity", "")))}">'
+            f'{_escape(str(c.get("name", "")))}</a> '
+            f'<code>{_escape(str(c.get("signature", "")))}</code>'
+            for c in callables
+            if isinstance(c, Mapping)
+        ]
+    )
+    sections.append(_transcript_section("classes", "Classes and callables", classes_body))
+
+    if hasattr(backend_sources, "to_mapping"):
+        source_entries = list(backend_sources.to_mapping()["sources"])
+    else:
+        source_entries = list(backend_sources or [])
+    sources_body = _transcript_list(
+        [
+            f'{_escape(str(s.get("language", "")))} &middot; '
+            f'{_escape(str(s.get("filename", "")))}'
+            for s in source_entries
+            if isinstance(s, Mapping)
+        ]
+    ) + (
+        f"<p>Original source: {len(origin_source.splitlines())} lines.</p>"
+        if origin_source
+        else ""
+    )
+    if build_parameters:
+        sources_body += "<p>Compiled-in parameters:</p>" + _transcript_list(
+            [f"{_escape(str(k))} = {_escape(str(v))}" for k, v in build_parameters.items()]
+        )
+    sections.append(_transcript_section("sources", "Sources", sources_body))
+
+    return (
+        '<div id="program-transcript" role="document" '
+        'aria-label="Plain-text transcript of this compiled program">'
+        '<div class="transcript-inner">' + "".join(sections) + "</div></div>"
+    )
+
+
 def emit_html_shell(
     api: Any,
     *,
@@ -3671,6 +5048,7 @@ def emit_html_shell(
     static_gallery: Sequence[Mapping[str, Any]] | None = None,
     shader_execution: Mapping[str, Any] | None = None,
     audio_runtime: Mapping[str, Any] | None = None,
+    passthrough_shader: Mapping[str, Any] | None = None,
     default_server_address: str = "http://localhost:8787",
 ) -> HtmlShell:
     """Generate a launchable page for one compiled program.
@@ -3711,6 +5089,16 @@ def emit_html_shell(
         mapping["entry_points"][0],
     )
     parameters = entry["parameters"]
+    shell_io_mapping = dict((mapping.get("metadata") or {}).get("shell_io") or {})
+    for port in dict(shell_io_mapping.get("requirements") or {}).get("system_ports", ()):
+        if (
+            port.get("kind") == "external_reference"
+            and port.get("external_domain") not in {"bundle", "host_system"}
+        ):
+            raise ValueError(
+                "HTML shells accept external references only to Turing bundles or "
+                "declared host-system capability simulations"
+            )
     shell_name = name or f"{mapping['module']}_shell"
 
     shader_css = ""
@@ -3720,10 +5108,17 @@ def emit_html_shell(
     body_class = ""
     if shader_execution is not None:
         shader = dict(shader_execution)
-        if not shader.get("url"):
+        interior_display = shader.get("display_ownership") == "program-interior"
+        if not shader.get("url") and not interior_display:
             raise ValueError("shader execution requires a published shader URL")
         if shader.get("role") != "shader-surface":
             raise ValueError("shader execution requires the shader-surface role")
+        if interior_display:
+            interior = shader.get("interior")
+            if not isinstance(interior, Mapping):
+                raise ValueError("interior display ownership requires an interior contract")
+            if not interior.get("controller_source") or not interior.get("controller_entry"):
+                raise ValueError("interior display ownership requires a controller source and entrypoint")
         # Keep the complete inspection document available for tooling and
         # diagnostics, but graduate its presentation to the WebGL surface.
         # CSS owns the visibility switch exactly so removing this class is a
@@ -3732,7 +5127,7 @@ def emit_html_shell(
         shader_css = _SHADER_EXECUTION_CSS
         shader_canvas = (
             '<canvas id="shader-surface" tabindex="0" '
-            'aria-label="WebGL shader execution surface"></canvas>'
+            'aria-label="shader execution surface"></canvas>'
         )
         shader_script = "<script>" + _SHADER_EXECUTION_JS.replace(
             "__SHADER_EXECUTION__", json.dumps(shader, default=str)
@@ -3741,6 +5136,18 @@ def emit_html_shell(
         audio_script = "<script>" + _AUDIO_RUNTIME_JS.replace(
             "__AUDIO_RUNTIME__", json.dumps(dict(audio_runtime), default=str)
         ) + "</script>"
+
+    # Present on every page regardless of whether this page's own
+    # presentation uses it -- a standing, always-compiled whole-screen
+    # identity shader that anything on the page can reach for later. It is
+    # never instantiated here; nothing subscribes to it by default.
+    passthrough_script = ""
+    if passthrough_shader is not None:
+        passthrough_script = (
+            "<script>window.TuringPassthroughShader = "
+            + json.dumps(dict(passthrough_shader), default=str)
+            + ";</script>"
+        )
 
     encoded = (
         json.dumps(base64.b64encode(wasm_bytes).decode("ascii"))
@@ -3766,6 +5173,22 @@ def emit_html_shell(
     network_mapping.setdefault("routes", [])
     network_routes = {str(route["feed"]): route for route in network_mapping["routes"] if isinstance(route, Mapping) and route.get("feed")}
     map_mapping = _map_ir_mapping(map_ir)
+    from .card_graph import build_card_graph
+
+    map_mapping.setdefault("card_graph", build_card_graph(map_mapping, class_graph))
+    transcript_html = _render_transcript(
+        mapping=mapping,
+        entry=entry,
+        parameters=parameters,
+        graph_mapping=graph_mapping,
+        telemetry_mapping=telemetry_mapping,
+        network_mapping=network_mapping,
+        map_mapping=map_mapping,
+        shader_execution=shader_execution,
+        backend_sources=backend_sources,
+        origin_source=origin_source,
+        build_parameters=build_parameters,
+    )
     script = (
         _JS.replace("__API__", json.dumps(mapping))
         .replace("__WASM__", encoded)
@@ -3922,9 +5345,10 @@ def emit_html_shell(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_escape(shell_name)}</title>
-<style>{_CSS}{shader_css}</style>
+<style>{_CSS}{shader_css}{_TRANSCRIPT_CSS}</style>
 </head>
 <body{body_class}>
+  {transcript_html}
   {shader_canvas}
   <div class="title">{_escape(str(mapping["module"]))}</div>
   <div class="sub">{_escape(str(mapping["language"]))} &middot; entry
@@ -3993,7 +5417,8 @@ def emit_html_shell(
   <div class="panel">
     <div class="panel-title">Inputs</div>
     {picker}
-    {_input_rows(parameters, feed_expressions, network_routes)}
+    {_system_port_rows(shell_io_mapping)}
+    {_input_rows(parameters, feed_expressions, network_routes, shell_io_mapping)}
     <div id="stats" class="stat"></div>
     <div class="row">
       <button id="run"{disabled}>Run {_escape(str(entry["name"]))}</button>
@@ -4102,6 +5527,8 @@ def emit_html_shell(
 <script>{boot_script}</script>
 <script>{script}</script>
 {shader_script}
+{passthrough_script}
+<script>{_TRANSCRIPT_JS}</script>
 </body>
 </html>
 """
@@ -4126,6 +5553,7 @@ def shell_for_artifact(
     resource_route: str = "/",
     shader_execution: Mapping[str, Any] | None = None,
     audio_runtime: Mapping[str, Any] | None = None,
+    passthrough_shader: Mapping[str, Any] | None = None,
     default_server_address: str = "http://localhost:8787",
 ) -> HtmlShell:
     """Generate the page straight from a ``machine_targets.TargetArtifact``."""
@@ -4153,6 +5581,7 @@ def shell_for_artifact(
         resource_route=resource_route,
         shader_execution=shader_execution,
         audio_runtime=audio_runtime,
+        passthrough_shader=passthrough_shader,
         default_server_address=default_server_address,
     )
 

@@ -56,7 +56,14 @@ def _v1_valuewise(self, op: str, *, annotate: Dict[str, Any] | None = None):
     # Across a real-sized tensor that failed-exception cost, not the
     # comparison itself, was the actual bottleneck.
     out = [K(a) for a in flat]
-    out = self.ensure_tensor(out).reshape(*self.get_shape())
+    if not out and op in {
+        "invert", "logical_not", "isfinite", "isinf", "isnan",
+    }:
+        out = type(self).tensor(
+            [], dtype="bool", tape=getattr(self, "_tape", None)
+        ).reshape(*self.get_shape())
+    else:
+        out = self.ensure_tensor(out).reshape(*self.get_shape())
     out = finalize(out)
     tape = getattr(out, "_tape", None)
     if tape and annotate:
@@ -103,7 +110,15 @@ def _v2_valuewise(
             shape = self.get_shape() if na == 0 else other_t.get_shape()
         else:
             raise ValueError(f"{op}: incompatible lengths {na} vs {nb}")
-        out = self.ensure_tensor([]).reshape(*shape)
+        boolean_result = op in {
+            "equal", "not_equal", "less", "less_equal", "greater",
+            "greater_equal", "logical_and", "logical_or", "logical_xor",
+        }
+        out = type(self).tensor(
+            [],
+            dtype="bool" if boolean_result else getattr(self, "dtype", None),
+            tape=getattr(self, "_tape", None),
+        ).reshape(*shape)
         out = finalize(out)
         tape = getattr(out, "_tape", None)
         if tape and annotate:

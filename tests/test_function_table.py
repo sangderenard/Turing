@@ -32,6 +32,38 @@ def test_function_table_exposes_recursive_resolution_as_one_backedge():
     assert entry.graph is graph
 
 
+def test_reference_by_bare_name_silently_picks_the_last_declared_collision():
+    # Documents the real, load-bearing gap reference_by_source_node exists
+    # to route around: declare() rebinds the bare name every time, with no
+    # collision detection, so two unrelated functions sharing a name (a
+    # method on one class and a same-named method on another, say) leave
+    # the bare-name lookup pointing at whichever was declared last.
+    table = FunctionTable()
+    first = table.declare("tick", qualified_name="FreeRunningMachineRunner.tick")
+    second = table.declare("tick", qualified_name="BinaryMachineProgram.tick")
+
+    assert table.reference("tick") == second
+    assert table.reference("tick") != first
+
+
+def test_reference_by_source_node_disambiguates_the_same_collision():
+    table = FunctionTable()
+    first_node = 111
+    second_node = 222
+    first = table.declare(
+        "tick", qualified_name="FreeRunningMachineRunner.tick",
+        metadata={"source_node": first_node},
+    )
+    second = table.declare(
+        "tick", qualified_name="BinaryMachineProgram.tick",
+        metadata={"source_node": second_node},
+    )
+
+    assert table.reference_by_source_node(first_node) == first
+    assert table.reference_by_source_node(second_node) == second
+    assert table.reference_by_source_node(333) is None
+
+
 def test_ssa_module_owns_the_same_neutral_function_table_type():
     module = IRModule(functions={})
     assert isinstance(module.function_table, FunctionTable)

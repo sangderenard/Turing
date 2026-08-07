@@ -86,6 +86,21 @@ ABSTRACT_TENSOR = Dialect(
 
 DIALECTS: dict[str, Dialect] = {d.name: d for d in (NUMPY, TORCH, ABSTRACT_TENSOR)}
 
+# Span-memory initialisation constructors and their implicit fill scalar.
+# ``None`` requires an explicit ``fill_value`` (``full``/``fill``).
+_SPAN_INIT_DEFAULTS: dict[str, float | None] = {
+    "fill": None,
+    "zeros": 0.0,
+    "zeros_like": 0.0,
+    "empty": 0.0,
+    "empty_like": 0.0,
+    "ones": 1.0,
+    "ones_like": 1.0,
+    "full": None,
+    "full_like": None,
+}
+
+
 # Operator syntax: identical across every dialect, so these are not part of
 # the Dialect record.
 _ELEMENTWISE_TEMPLATES: dict[str, str] = {
@@ -150,6 +165,23 @@ def _call(dialect: Dialect, function: str, args: list[str]) -> str:
     return f"{dialect.module}.{function}({', '.join(args)})"
 
 
+# Axis reductions the numeric backends fold away. Kept aligned with the
+# WebAssembly backend's ``_REDUCE_FOLD`` so a program that lowers to one also
+# lowers to the other.
+_REDUCE_NUMPY: dict[str, str] = {
+    "sum": "sum", "mean": "mean", "prod": "prod",
+    "min": "min", "amin": "min", "max": "max", "amax": "max",
+}
+_REDUCE_TORCH: dict[str, str] = {
+    "sum": "sum", "mean": "mean", "prod": "prod",
+    "min": "amin", "amin": "amin", "max": "amax", "amax": "amax",
+}
+_REDUCE_ABSTRACT: dict[str, str] = {
+    "sum": "sum", "mean": "mean", "prod": "prod",
+    "min": "amin", "amin": "amin", "max": "amax", "amax": "amax",
+}
+
+
 def _step_expression(dialect: Dialect, step: OpStep, names: dict[int, str]) -> str:
     op = step.op_name
     if op == "tensor_from_list":
@@ -165,20 +197,49 @@ def _step_expression(dialect: Dialect, step: OpStep, names: dict[int, str]) -> s
         raise PythonLoweringShortfall(
             f"tensor_from_list has no {dialect.name} spelling registered"
         )
+    if op in _SPAN_INIT_DEFAULTS:
+        shape = tuple(step.attrs.get("shape", ()))
+        value = step.attrs.get(
+            "fill_value", step.attrs.get("value", _SPAN_INIT_DEFAULTS[op])
+        )
+        if value is None:
+            raise PythonLoweringShortfall(f"{op} requires an explicit fill_value")
+        value = float(value)
+        shape_src = repr(shape)
+        if value == 0.0:
+            # Zero-fill is the calloc case; the constructors already zero-page.
+            if dialect is NUMPY:
+                return f"np.zeros({shape_src})"
+            if dialect is TORCH:
+                return f"torch.zeros({shape_src})"
+            if dialect is ABSTRACT_TENSOR:
+                return f"AbstractTensor.zeros({shape_src})"
+        else:
+            if dialect is NUMPY:
+                return f"np.full({shape_src}, {value!r})"
+            if dialect is TORCH:
+                return f"torch.full({shape_src}, {value!r})"
+            if dialect is ABSTRACT_TENSOR:
+                return f"AbstractTensor.full({shape_src}, {value!r})"
+        raise PythonLoweringShortfall(
+            f"{op} has no {dialect.name} spelling registered"
+        )
     a = names[step.input_ids[0]]
-    if op == "sum":
+    reduce_numpy = _REDUCE_NUMPY.get(op)
+    if reduce_numpy is not None:
         axis = step.attrs.get("axis")
         keepdim = bool(step.attrs.get("keepdim", False))
         if dialect is NUMPY:
-            return f"np.sum({a}, axis={axis!r}, keepdims={keepdim!r})"
+            return f"np.{reduce_numpy}({a}, axis={axis!r}, keepdims={keepdim!r})"
         if dialect is TORCH:
+            fn = _REDUCE_TORCH[op]
             if axis is None:
-                return f"torch.sum({a})"
-            return f"torch.sum({a}, dim={axis!r}, keepdim={keepdim!r})"
+                return f"torch.{fn}({a})"
+            return f"torch.{fn}({a}, dim={axis!r}, keepdim={keepdim!r})"
         if dialect is ABSTRACT_TENSOR:
-            return f"{a}.sum(dim={axis!r}, keepdim={keepdim!r})"
+            return f"{a}.{_REDUCE_ABSTRACT[op]}(dim={axis!r}, keepdim={keepdim!r})"
         raise PythonLoweringShortfall(
-            f"sum has no {dialect.name} spelling registered"
+            f"{op} has no {dialect.name} spelling registered"
         )
     if op in ELEMENTWISE_UNARY:
         args = [a]

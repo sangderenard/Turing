@@ -138,6 +138,214 @@ def test_elementwise_ssa_emits_whole_array_fortran():
     assert "t2 = sum(t5)" in source
 
 
+def test_empty_array_constant_has_a_typed_fortran_constructor():
+    empty = SSAValue(0, "float64", (0, 3))
+    function = Function(
+        "empty_constant",
+        [],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("Const", [], empty, attributes={"values": ()}),
+                    Instr("Ret", [], SSAValue(1)),
+                ],
+            )
+        },
+    )
+
+    module = emit_module(
+        IRModule({function.name: function}),
+        outputs={function.name: [empty]},
+    )
+
+    assert module.complete, [shortfall.format() for shortfall in module.shortfalls]
+    assert "reshape([real(c_double) ::], [0, 3])" in module.source
+
+
+def test_imported_llvm_scalar_literals_emit_fortran_constants():
+    zero = SSAValue(0, "i32", ())
+    positive_infinity = SSAValue(1, "float64", ())
+    function = Function(
+        "llvm_constants",
+        [],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr(
+                        "Const", [], zero,
+                        attributes={"llvm_literal": "i32 0"},
+                    ),
+                    Instr(
+                        "Const", [], positive_infinity,
+                        attributes={
+                            "llvm_literal": "double 0x7FF0000000000000"
+                        },
+                    ),
+                ],
+            )
+        },
+    )
+
+    module = emit_module(
+        {function.name: function},
+        outputs={function.name: [zero, positive_infinity]},
+    )
+
+    assert module.complete, [item.format() for item in module.shortfalls]
+    assert "ieee_value(0.0_c_double, ieee_positive_inf)" in module.source
+
+
+def test_fortran_module_omits_helpers_replaced_by_native_tensor_ops():
+    argument = SSAValue(0, "float64", (4,))
+    result = SSAValue(1, "float64", (4,))
+    public = Function(
+        "public_numeric",
+        [argument],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [Instr("add", [argument], result, attributes={"right_scalar": 1})],
+            )
+        },
+        metadata={"named_outputs": (("result", 1),)},
+    )
+    dead_helper = Function(
+        "llvm_helper_replaced_by_native_expression",
+        [argument],
+        {"entry": BasicBlock("entry", [Instr("einsum", [argument], result)])},
+    )
+
+    module = emit_module(
+        {public.name: public, dead_helper.name: dead_helper},
+        outputs={public.name: [result]},
+    )
+
+    assert module.complete, [item.format() for item in module.shortfalls]
+    assert tuple(item.name for item in module.subroutines) == (public.name,)
+
+
+def test_fortran_module_derives_outputs_from_ssa_metadata():
+    argument = SSAValue(0, "float64", (4,))
+    result = SSAValue(1, "float64", (4,))
+    function = Function(
+        "metadata_outputs",
+        [argument],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [Instr("add", [argument], result, attributes={"right_scalar": 1})],
+            )
+        },
+        metadata={"named_outputs": (("result", 1),)},
+    )
+
+    module = emit_module({function.name: function})
+
+    assert module.complete, [item.format() for item in module.shortfalls]
+    assert "intent(out) :: t1(extent_4)" in module.source
+
+
+def test_scalar_reduction_is_identity_and_logical_arithmetic_is_numeric():
+    logical = SSAValue(0, "bool", ())
+    numeric = SSAValue(1, "bool", ())
+    reduced = SSAValue(2, "float64", (1,))
+    function = Function(
+        "scalar_numpy_semantics",
+        [],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("Const", [], logical, attributes={"value": True}),
+                    Instr(
+                        "add", [logical], numeric,
+                        attributes={"right_scalar": 0},
+                    ),
+                    Instr(
+                        "Call", [numeric], reduced,
+                        attributes={"tensor_operation": "sum"},
+                    ),
+                ],
+            )
+        },
+        metadata={"named_outputs": (("result", 2),)},
+    )
+
+    module = emit_module({function.name: function})
+
+    assert module.complete, [item.format() for item in module.shortfalls]
+    assert "sum(" not in module.source
+    assert ".true._c_bool +" not in module.source
+
+
+def test_index_set_accepts_a_scalar_value_without_reducing_it():
+    base = SSAValue(0, "float64", (5,))
+    value = SSAValue(1, "float64", ())
+    result = SSAValue(2, "float64", (5,))
+    function = Function(
+        "scalar_index_set",
+        [base, value],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [Instr(
+                    "Call", [base, value], result,
+                    attributes={"tensor_operation": "index_set", "slices": 0},
+                )],
+            )
+        },
+        metadata={"named_outputs": (("result", 2),)},
+    )
+
+    module = emit_module({function.name: function})
+
+    assert module.complete, [item.format() for item in module.shortfalls]
+    assert "sum(t1)" not in module.source
+    assert "t2(1) = t1" in module.source
+
+
+def test_ieee_classification_ops_emit_logical_fortran_expressions():
+    value = SSAValue(0, "float64", (4,))
+    isnan = SSAValue(1, "bool", (4,))
+    isfinite = SSAValue(2, "bool", (4,))
+    function = Function(
+        "classify",
+        [value],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr(
+                        "Call",
+                        [value],
+                        isnan,
+                        attributes={"tensor_operation": "isnan"},
+                    ),
+                    Instr(
+                        "Call",
+                        [value],
+                        isfinite,
+                        attributes={"tensor_operation": "isfinite"},
+                    ),
+                    Instr("Ret", [], SSAValue(3)),
+                ],
+            )
+        },
+    )
+
+    module = emit_module(
+        IRModule({function.name: function}),
+        outputs={function.name: [isnan, isfinite]},
+    )
+
+    assert module.complete, [shortfall.format() for shortfall in module.shortfalls]
+    assert "use, intrinsic :: ieee_arithmetic" in module.source
+    assert "ieee_is_nan(t0)" in module.source
+    assert "ieee_is_finite(t0)" in module.source
+
+
 def test_single_use_temporaries_are_fused_into_one_expression():
     """One SSA chain must become one array statement, not one per step.
 
@@ -182,6 +390,151 @@ def test_bind_c_arrays_are_explicit_shape_over_a_passed_extent():
     # and nothing may reach the heap.
     assert "(:)" not in source
     assert "allocatable" not in source
+
+
+def test_fill_initializes_a_large_predeclared_span_without_array_literals():
+    span = SSAValue(20, "float64", (70_000,))
+    function = Function("zero_span", [], {
+        "entry": BasicBlock("entry", [
+            Instr("Fill", [], span, attributes={"fill_value": 0.0}),
+            Instr("Ret", [], SSAValue(99)),
+        ]),
+    })
+
+    source = emit_function(function, outputs=[span]).source
+
+    assert "intent(out) :: t20(extent_70000)" in source
+    assert "t20 = 0.0_c_double" in source
+    assert "[" not in source
+    assert "allocatable" not in source
+
+
+def test_argument_output_alias_emits_one_inout_fortran_arena():
+    arena = SSAValue(20, "float64", (4,))
+    function = Function("advance", [arena], {
+        "entry": BasicBlock("entry", [
+            Instr("Ret", [], SSAValue(99)),
+        ]),
+    })
+
+    module = emit_module(
+        IRModule({"advance": function}),
+        outputs={"advance": [arena]},
+    )
+    source = module.source
+    entry = module.api.entry_point("advance")
+
+    assert "subroutine advance(extent_4, t20)" in source
+    assert "intent(inout) :: t20(extent_4)" in source
+    assert source.count(":: t20(extent_4)") == 1
+    assert [parameter.role for parameter in entry.parameters] == [
+        "extent",
+        "input",
+    ]
+
+
+def test_inout_region_load_and_phi_retain_resident_arena_rank():
+    arena = SSAValue(20, "float64", (4,))
+    region = Function("advance", [arena], {
+        "entry": BasicBlock("entry", [
+            Instr("Ret", [], SSAValue(99)),
+        ]),
+    })
+    aggregate = SSAValue(10, "aggregate")
+    address = SSAValue(11, "pointer")
+    rank_lost_load = SSAValue(12, "float64")
+    rank_lost_phi = SSAValue(13, "float64")
+    caller_arena = SSAValue(1, "float64", (4,))
+    caller = Function("cycle", [caller_arena], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "Call", [caller_arena], aggregate,
+                attributes={
+                    "callee": "advance",
+                    "result_convention": "ssa.aggregate",
+                },
+            ),
+            Instr(
+                "GetElementPtr", [aggregate], address,
+                attributes={"aggregate_index": 0},
+            ),
+            Instr("Load", [address], rank_lost_load),
+            Instr(
+                "Phi", [rank_lost_load], rank_lost_phi,
+                attributes={"incoming": (("entry", rank_lost_load),)},
+            ),
+            Instr("Ret", [], SSAValue(100)),
+        ]),
+    })
+
+    source = emit_module(
+        IRModule({"advance": region, "cycle": caller}),
+        outputs={"advance": [arena]},
+    ).source
+
+    assert "real(c_double) :: t12(extent_4)" in source
+    assert "real(c_double) :: t13(extent_4)" in source
+    assert "t12 = t1" in source
+    assert "call advance(extent_4, t12)" in source
+
+
+def test_generic_index_addresses_lower_to_fortran_loads_and_stores():
+    arena = SSAValue(20, "float64", (3, 4))
+    row = SSAValue(21, "int32")
+    column = SSAValue(22, "int32")
+    value = SSAValue(23, "float64")
+    address = SSAValue(24, "pointer")
+    stored = SSAValue(25, "void")
+    loaded = SSAValue(26, "float64")
+    function = Function("indexed_arena", [arena, row, column, value], {
+        "entry": BasicBlock("entry", [
+            Instr("GetElementPtr", [arena, row, column], address),
+            Instr("Store", [value, address], stored),
+            Instr("Load", [address], loaded),
+            Instr("Ret", [], SSAValue(99)),
+        ]),
+    })
+
+    source = emit_function(function, outputs=[loaded]).source
+
+    assert "intent(inout) :: t20(extent_3, extent_4)" in source
+    assert "t20(t21 + 1, t22 + 1) = t23" in source
+    assert "t26 = t20(t21 + 1, t22 + 1)" in source
+    assert "UNSUPPORTED" not in source
+
+
+def test_numeric_where_mask_and_scalar_branch_are_conformed_for_fortran():
+    mask = SSAValue(20, "float64", (4,))
+    when_true = SSAValue(21, "float64", (4,))
+    when_false = SSAValue(22, "float64", (1,))
+    result = SSAValue(23, "float64", (4,))
+    function = Function("numeric_where", [mask, when_true, when_false], {
+        "entry": BasicBlock("entry", [
+            Instr("where", [mask, when_true, when_false], result),
+            Instr("Ret", [], SSAValue(99)),
+        ]),
+    })
+
+    source = emit_function(function, outputs=[result]).source
+
+    assert "merge(t21, t22(1), (t20 /= 0.0_c_double))" in source
+
+
+def test_where_promotes_mixed_branch_kinds_to_the_result_dtype():
+    mask = SSAValue(30, "bool", (4,))
+    integers = SSAValue(31, "int64", (1,))
+    reals = SSAValue(32, "float64", (1,))
+    result = SSAValue(33, "float64", (4,))
+    function = Function("promoted_where", [mask, integers, reals], {
+        "entry": BasicBlock("entry", [
+            Instr("where", [mask, integers, reals], result),
+            Instr("Ret", [], SSAValue(99)),
+        ]),
+    })
+
+    source = emit_function(function, outputs=[result]).source
+
+    assert "merge(real(t31(1), c_double), t32(1), t30)" in source
 
 
 def test_api_describes_transitive_callee_extents_from_final_signature():

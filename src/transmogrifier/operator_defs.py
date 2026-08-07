@@ -107,6 +107,18 @@ array_sig = {
 # Operation name -> signature mapping
 # -------------------------------------------------
 operator_signatures = {
+    # Structural concurrency framing. Deploy and Join do not perform numeric
+    # work; a Join reduction names an existing operator in its metadata.
+    'Deploy': {
+        'min_inputs': 0, 'max_inputs': None,
+        'min_outputs': 0, 'max_outputs': None,
+        'concurrency': None, 'allows_inplace': False,
+    },
+    'Join': {
+        'min_inputs': 0, 'max_inputs': None,
+        'min_outputs': 0, 'max_outputs': None,
+        'concurrency': None, 'allows_inplace': False,
+    },
     'Add': sig_binary_elementwise,
     'Mul': sig_binary_elementwise,
     'Pow': sig_binary_elementwise,
@@ -346,6 +358,8 @@ def matrixelement_op(role_map):
 default_funcs['MatrixElement'] = matrixelement_op
 # --- role schemas -----------------------------------------------------------
 role_schemas = {
+            'Deploy': {'up': {'domain': 'many'}, 'down': {'lanes': 'many'}},
+            'Join': {'up': {'lanes': 'many'}, 'down': {'result': 'many'}},
             'IndexedBase': {'up':{'shape':1}, 'down':{}},
             'Indexed': {'up':{'base':1, 'index':'many'},'down':{}},
             'Idx': {'up':{'limits': 'many'}, 'down':{}},
@@ -695,6 +709,40 @@ def _abstract_tensor_index(*values):
     return operands[0][index]
 
 
+def _abstract_tensor_index_store(*values):
+    operands = _abstract_tensor_values(*values)
+    if len(operands) < 3:
+        raise ValueError(
+            "AbstractTensor indexed assignment requires tensor, index, and value"
+        )
+    tensor = operands[0]
+    value = operands[-1]
+    indices = tuple(operands[1:-1])
+    index = indices[0] if len(indices) == 1 else indices
+    if len(indices) == 1:
+        index_storage = getattr(index, "data", index)
+        index_dtype = getattr(index_storage, "dtype", getattr(index, "dtype", None))
+        if str(index_dtype).casefold().endswith("bool"):
+            from ..common.tensors.abstraction import AbstractTensor
+            return AbstractTensor.where(index, value, tensor)
+        if hasattr(index, "shape") and str(index_dtype).casefold().endswith(
+            ("float", "float32", "float64", "double")
+        ):
+            raise TypeError(
+                "indexed assignment received a floating tensor index from "
+                f"ProcessGraph: shape={tuple(index.shape)!r}, "
+                f"dtype={index_dtype!s}, tensor_shape={tuple(tensor.shape)!r}"
+            )
+    from ..common.tensors.abstraction import AbstractTensor
+    finalize = AbstractTensor._pre_autograd(
+        "index_set", [tensor, value], params={"idx": index}
+    )
+    with AbstractTensor.autograd.no_grad():
+        result = tensor.clone()
+        result[index] = value
+    return finalize(result)
+
+
 def _abstract_tensor_sum(*values, **kwargs):
     operands = _abstract_tensor_values(*values)
     if not operands:
@@ -706,8 +754,18 @@ def _abstract_tensor_maximum(*values):
     operands = _abstract_tensor_values(*values)
     if not operands:
         raise ValueError("AbstractTensor maximum requires an operand")
-    result = operands[0]
-    for operand in operands[1:]:
+    tensor_index = next(
+        (
+            index
+            for index, operand in enumerate(operands)
+            if callable(getattr(operand, "maximum", None))
+        ),
+        None,
+    )
+    if tensor_index is None:
+        return max(operands)
+    result = operands.pop(tensor_index)
+    for operand in operands:
         result = result.maximum(operand)
     return result
 
@@ -716,14 +774,26 @@ def _abstract_tensor_minimum(*values):
     operands = _abstract_tensor_values(*values)
     if not operands:
         raise ValueError("AbstractTensor minimum requires an operand")
-    result = operands[0]
-    for operand in operands[1:]:
+    tensor_index = next(
+        (
+            index
+            for index, operand in enumerate(operands)
+            if callable(getattr(operand, "minimum", None))
+        ),
+        None,
+    )
+    if tensor_index is None:
+        return min(operands)
+    result = operands.pop(tensor_index)
+    for operand in operands:
         result = result.minimum(operand)
     return result
 
 
-def _abstract_tensor_stack(*values, dim=0):
+def _abstract_tensor_stack(*values, dim=0, axis=None):
     from ..common.tensors.abstraction import AbstractTensor
+    if axis is not None:
+        dim = axis
     operands = _abstract_tensor_values(*values)
     if operands and isinstance(operands[-1], int):
         dim = operands.pop()
@@ -732,8 +802,10 @@ def _abstract_tensor_stack(*values, dim=0):
     return AbstractTensor.stack(operands, dim=dim)
 
 
-def _abstract_tensor_cat(*values, dim=0):
+def _abstract_tensor_cat(*values, dim=0, axis=None):
     from ..common.tensors.abstraction import AbstractTensor
+    if axis is not None:
+        dim = axis
     operands = _abstract_tensor_values(*values)
     if operands and isinstance(operands[-1], int):
         dim = operands.pop()
@@ -826,6 +898,7 @@ abstract_tensor_funcs = {
     "Max": _abstract_tensor_maximum,
     "Min": _abstract_tensor_minimum,
     "Indexed": _abstract_tensor_index,
+    "IndexedStore": _abstract_tensor_index_store,
     "IndexedBase": _abstract_tensor_identity,
     "Idx": _abstract_tensor_index,
     "MatrixElement": _abstract_tensor_index,
@@ -956,6 +1029,7 @@ abstract_tensor_funcs = {
     "concat": _abstract_tensor_cat,
     "concatenate": _abstract_tensor_cat,
     "where": _abstract_tensor_where,
+    "nan_to_num": _abstract_tensor_static("nan_to_num"),
     "dot": _abstract_tensor_static("dot"),
     "norm": _abstract_tensor_static("norm"),
     "cross": _abstract_tensor_static("cross"),

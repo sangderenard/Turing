@@ -8,7 +8,7 @@ from src.common.tensors.topological_reducer import (
     reduce_abstract_tensor_topology,
 )
 from src.compiler.glsl_deployment_strategy import (
-    strategize_glsl_deployment,
+    strategize_shell_deployment,
 )
 from src.compiler.shell_reference_tables import (
     build_class_navigation_table,
@@ -130,7 +130,7 @@ def affine(value):
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
-    shell_type = strategize_glsl_deployment(graph)
+    shell_type = strategize_shell_deployment(graph)
     first = shell_type()
     second = shell_type()
     try:
@@ -281,3 +281,57 @@ class Vault:
         table.resolve_dot(
             "Vault", "erase", evaluator({"vault:enter", "vault:read"})
         )
+
+
+def test_instance_field_shadows_same_named_non_data_method():
+    module = ast.parse(
+        '''
+class Adapter:
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def nodes(self):
+        return ()
+'''
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    table = build_class_navigation_table(graph)
+    allow = lambda _identity, _permissions: True
+
+    instance_member = table.resolve_dot("Adapter", "nodes", allow)
+    class_member = table.resolve_dot(
+        "Adapter", "nodes", allow, receiver_kind="class"
+    )
+
+    assert instance_member.kind == "attribute"
+    assert instance_member.storage == "instance"
+    assert class_member.kind == "method"
+    assert class_member.function_reference is not None
+
+
+def test_same_named_classes_use_discovered_module_qualified_identity():
+    first = ast.parse("class Edge:\n    left = 1\n").body[0]
+    second = ast.parse("class Edge:\n    right = 2\n").body[0]
+    first._python_source_identity = ("package.solver", "Edge")
+    second._python_source_identity = ("package.renderer", "Edge")
+    module = ast.Module(body=[first, second], type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    assert {
+        item["class_identity"]
+        for item in graph.G.graph["map_ir"]["objects"]
+    } == {"package.solver.Edge", "package.renderer.Edge"}
+    table = build_class_navigation_table(graph)
+    assert {record.identity for record in table.classes} == {
+        "package.solver.Edge",
+        "package.renderer.Edge",
+    }

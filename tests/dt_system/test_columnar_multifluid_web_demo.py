@@ -113,6 +113,15 @@ def test_python_page_contract_declares_compiled_state_feedback():
     }
     assert contract.autostart
     assert contract.render_fps == 30.0
+    assert set(contract.constant_map) == set(_feeds()) - set(contract.state_feedback)
+    assert set(contract.mutable_parameters) == set(contract.state_feedback)
+    assert contract.constant_map["dt"] == 0.025
+    assert "entity_x" not in contract.constant_map
+    assert len(contract.constant_map["column_x"]) == 256 * 176
+    assert len(contract.constant_map["column_y"]) == 256 * 176
+    assert len(contract.constant_map["rest_surface"]) == 256 * 176
+    assert contract.constant_map["column_x"][0] < contract.constant_map["column_x"][-1]
+    assert contract.constant_map["column_y"][0] < contract.constant_map["column_y"][-1]
 
 
 def test_native_fortran_contract_is_an_inspection_bundle_without_a_shader():
@@ -322,6 +331,10 @@ def test_compiler_generated_webgl_presents_non_black_wasm_output(tmp_path):
     assert result["glError"] == 0
     assert result["center"][3] == 255
     assert sum(result["center"][:3]) > 0
+    assert result["threadProfile"]["eligible"] is False
+    assert result["threadProfile"]["extentEffect"] == "collective"
+    assert result["globalStateSpreads"]["next_entity_x"] < 1.0e-12
+    assert result["globalStateSpreads"]["next_entity_y"] < 1.0e-12
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")

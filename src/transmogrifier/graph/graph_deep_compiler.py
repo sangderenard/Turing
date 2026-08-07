@@ -14,7 +14,7 @@ Example
 """
 from __future__ import annotations
 
-import enum, textwrap, inspect, hashlib, types
+import builtins, enum, textwrap, inspect, hashlib, types
 from typing import Any, Callable, Dict, List, Tuple
 
 import networkx as nx
@@ -303,7 +303,7 @@ class GraphDeepCompiler:
                 if k not in node:
                     raise KeyError(f"ProcessGraph node missing '{k}' field")
 
-            ntype = node["type"]
+            ntype = node.get("dtype") or node["type"]
             sig = self.signatures.get(ntype, {})
             role_parents = list(node["parents"])
 
@@ -338,8 +338,6 @@ class GraphDeepCompiler:
                 # as a runtime symbol in the compiled shell.
                 if isinstance(literal, enum.IntEnum):
                     literal = int(literal)
-                if isinstance(literal, str):
-                    literal = literal.encode("utf-8")
                 if not _is_emittable_literal(literal):
                     raise TypeError(
                         f"{ntype} node {nid} has unsupported literal type "
@@ -440,11 +438,148 @@ class GraphDeepCompiler:
                     f"{observe(nid, tuple(parent for parent, role in role_parents if role not in {'func', 'callee'}), f'{callee_expression}({arguments})')}"
                 )
                 continue
+            elif ntype == "DelAttr":
+                receiver = next(
+                    parent for parent, role in role_parents if role == "object"
+                )
+                attribute = (node.get("attributes") or {})["attribute"]
+                env["_delattr"] = delattr
+                lines.append(
+                    f"{indent}{lhs} = _delattr(v{receiver}, {attribute!r})"
+                )
+                continue
+            elif ntype == "DelItem":
+                base = next(
+                    parent for parent, role in role_parents if role == "base"
+                )
+                indices = [
+                    parent for parent, role in role_parents if role == "index"
+                ]
+                index_expression = (
+                    f"v{indices[0]}"
+                    if len(indices) == 1
+                    else "(" + ", ".join(f"v{index}" for index in indices) + ")"
+                )
+                env["_delitem"] = lambda container, index: container.__delitem__(index)
+                lines.append(
+                    f"{indent}{lhs} = _delitem(v{base}, {index_expression})"
+                )
+                continue
             else:
                 # operator
                 fn = self.op_table.get(ntype)
                 if fn is None:
-                    raise KeyError(f"No operator impl for '{ntype}'")
+
+                    def describe_node(node_id) -> str:
+                        if node_id not in G:
+                            return f"node={node_id} <not in graph>"
+                        data = G.nodes[node_id]
+                        return (
+                            f"node={node_id} type={data.get('type')!r} "
+                            f"op={data.get('op')!r} label={data.get('label')!r} "
+                            f"attributes={data.get('attributes')!r}"
+                        )
+
+                    def walk_relations(
+                        node_id, *, direction: str, depth: int, seen=None
+                    ) -> list[str]:
+                        """A few hops of parents (or children), each level indented.
+
+                        A single-hop neighborhood often shows an already-
+                        resolved intermediate node beside an opaque
+                        placeholder -- not enough to see *why* an operand
+                        went missing several relations back. Walking a few
+                        levels either direction turns "here is one broken
+                        edge" into a real, readable picture of the local
+                        subgraph around the failure.
+                        """
+
+                        if seen is None:
+                            seen = set()
+                        if depth <= 0 or node_id in seen or node_id not in G:
+                            return []
+                        seen.add(node_id)
+                        edges = (
+                            G.nodes[node_id].get("parents", ())
+                            if direction == "parents"
+                            else G.nodes[node_id].get("children", ())
+                        )
+                        lines = []
+                        indent = "  " * (3 - depth + 1)
+                        for related_id, role in edges:
+                            lines.append(
+                                f"{indent}({direction[:-1]} role={role!r}) "
+                                + describe_node(related_id)
+                            )
+                            lines.extend(
+                                walk_relations(
+                                    related_id,
+                                    direction=direction,
+                                    depth=depth - 1,
+                                    seen=seen,
+                                )
+                            )
+                        return lines
+
+                    node_attributes = node.get("attributes") or {}
+                    neighborhood = [describe_node(nid)]
+                    neighborhood.append("ancestors (parents, 3 hops):")
+                    neighborhood.extend(
+                        walk_relations(nid, direction="parents", depth=3)
+                        or ["  <none>"]
+                    )
+                    neighborhood.append("descendants (children, 3 hops):")
+                    neighborhood.extend(
+                        walk_relations(nid, direction="children", depth=3)
+                        or ["  <none>"]
+                    )
+                    if node_attributes.get("untranslated"):
+                        # _untranslated_operand (topological_reducer.py)
+                        # already records exactly what went missing and why
+                        # -- surface it here instead of leaving only the
+                        # bare, unexplained placeholder type name.
+                        neighborhood.append(
+                            "untranslated_operand: "
+                            f"consumer_node={node_attributes.get('consumer_node')} "
+                            f"consumer_operation="
+                            f"{node_attributes.get('consumer_operation')!r} "
+                            f"operand_role={node_attributes.get('operand_role')!r} "
+                            f"absent_node_id="
+                            f"{node_attributes.get('absent_node_id')} "
+                            f"source_span={node_attributes.get('source_span')!r} "
+                            f"translation_grade="
+                            f"{node_attributes.get('translation_grade')!r} "
+                            f"translated_operands="
+                            f"{node_attributes.get('translated_operands')} "
+                            f"expected_operands="
+                            f"{node_attributes.get('expected_operands')}"
+                        )
+                        consumer_id = node_attributes.get("consumer_node")
+                        if consumer_id is not None:
+                            neighborhood.append(
+                                "consumer neighborhood: "
+                                + describe_node(consumer_id)
+                            )
+                            neighborhood.append(
+                                "consumer's ancestors (parents, 3 hops):"
+                            )
+                            neighborhood.extend(
+                                walk_relations(
+                                    consumer_id, direction="parents", depth=3
+                                )
+                                or ["  <none>"]
+                            )
+                        absent_id = node_attributes.get("absent_node_id")
+                        if absent_id is not None:
+                            neighborhood.append(
+                                "absent operand's own record (if it exists "
+                                "anywhere in the graph under another id): "
+                                + describe_node(absent_id)
+                            )
+                    raise KeyError(
+                        f"No operator impl for '{ntype}'; node neighborhood:\n"
+                        + "\n".join(neighborhood)
+                    )
                 fn_name = f"op_{nid}"
                 env[fn_name] = fn
 
@@ -459,13 +594,68 @@ class GraphDeepCompiler:
                     for parent, role in role_parents
                     if not str(role).startswith("kw:")
                 ]
-                if keyword_parents:
+                static_call_arguments = dict(
+                    (node.get("attributes") or {}).get(
+                        "static_call_arguments", {}
+                    )
+                )
+                static_call_values = dict(
+                    (node.get("attributes") or {}).get(
+                        "static_call_values", {}
+                    )
+                )
+                keyword_parents = [
+                    (parent, name)
+                    for parent, name in keyword_parents
+                    if f"kw:{name}" not in static_call_arguments
+                ]
+                static_positional = []
+                static_keywords = []
+                for role, reference in sorted(
+                    static_call_arguments.items(),
+                    key=lambda item: (
+                        0 if str(item[0]).startswith("arg:") else 1,
+                        str(item[0]),
+                    ),
+                ):
+                    parts = str(reference).split(".")
+                    direct_static_value = role in static_call_values
+                    value = static_call_values.get(role)
+                    if value is None:
+                        value = getattr(builtins, parts[0], None)
+                    if value is None:
+                        value = dict(
+                            self.pg.G.graph.get(
+                                "static_python_values", {}
+                            ) or {}
+                        ).get(str(reference))
+                    if value is None:
+                        value = dict(
+                            getattr(self.pg, "python_bindings", {}) or {}
+                        ).get(parts[0])
+                    if value is None:
+                        raise KeyError(
+                            "numerical ProcessGraph static call argument "
+                            f"{reference!r} has no retained Python binding"
+                        )
+                    if not direct_static_value:
+                        for part in parts[1:]:
+                            value = getattr(value, part)
+                    name = f"static_{nid}_{len(env)}"
+                    env[name] = value
+                    if str(role).startswith("kw:"):
+                        static_keywords.append(f"{str(role)[3:]}={name}")
+                    else:
+                        static_positional.append(name)
+                if keyword_parents or static_call_arguments:
                     args = ", ".join((
                         *(f"v{parent}" for parent in positional_parents),
+                        *static_positional,
                         *(
                             f"{name}=v{parent}"
                             for parent, name in keyword_parents
                         ),
+                        *static_keywords,
                     ))
                 elif sig.get("min_inputs",None) is None and sig.get("max_inputs",None) is None and sig.get("min_outputs",None) is None and sig.get("max_outputs",None) is None:
                     args = f"[{', '.join(f'v{pid}' for pid,_ in node['parents'])}]"

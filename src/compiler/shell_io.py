@@ -24,6 +24,220 @@ class ShellIOCapability(str, Enum):
     POINTER = "pointer"
     DISPLAY = "display_double_buffer"
     FILES = "files"
+    DEVICES = "system_devices"
+    # Web pages resolve only other published Turing bundles. Host-system
+    # references are deliberately a separate native-only capability.
+    BUNDLE_REFERENCES = "bundle_references"
+    HOST_REFERENCES = "host_references"
+
+
+class SystemPortKind(str, Enum):
+    FILE = "file"
+    DEVICE = "device"
+    EXTERNAL_REFERENCE = "external_reference"
+
+
+class SystemPortDirection(str, Enum):
+    INPUT = "input"
+    OUTPUT = "output"
+    BIDIRECTIONAL = "bidirectional"
+    CALL = "call"
+
+
+class ExternalReferenceDomain(str, Enum):
+    BUNDLE = "bundle"
+    HOST_SYSTEM = "host_system"
+    GUEST_BINARY = "guest_binary"
+
+
+class VirtualMountKind(str, Enum):
+    """Storage supplied beneath a shell-owned virtual path."""
+
+    MEMORY = "memory"
+    BUNDLE = "bundle"
+    HOST_DIRECTORY = "host_directory"
+    INDEXED_DB = "indexed_db"
+    OPFS = "opfs"
+
+
+class VirtualMountAccess(str, Enum):
+    READ_ONLY = "read_only"
+    READ_WRITE = "read_write"
+
+
+@dataclass(frozen=True)
+class VirtualMount:
+    """One explicit mapping into the program's otherwise private namespace."""
+
+    path: str
+    kind: VirtualMountKind
+    access: VirtualMountAccess = VirtualMountAccess.READ_ONLY
+    source: str | None = None
+
+    @classmethod
+    def create(
+        cls, path: str, kind: VirtualMountKind | str, *,
+        access: VirtualMountAccess | str = VirtualMountAccess.READ_ONLY,
+        source: str | None = None,
+    ) -> "VirtualMount":
+        return cls(str(path), VirtualMountKind(kind), VirtualMountAccess(access), source)
+
+    def __post_init__(self) -> None:
+        if not self.path or not self.path.startswith("/"):
+            raise ValueError("virtual mount paths must be absolute")
+        if self.path != "/" and self.path.endswith("/"):
+            raise ValueError("virtual mount paths must not have a trailing slash")
+        if self.kind is not VirtualMountKind.MEMORY and not self.source:
+            raise ValueError(f"{self.kind.value} mounts require a source")
+        if self.kind in {VirtualMountKind.INDEXED_DB, VirtualMountKind.OPFS}:
+            source = str(self.source)
+            if source.startswith(("/", "\\")) or any(
+                part in {"", ".", ".."}
+                for part in source.replace("\\", "/").split("/")
+            ):
+                raise ValueError(
+                    f"{self.kind.value} mount sources must be relative namespace paths"
+                )
+
+    def to_mapping(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "path": self.path, "kind": self.kind.value, "access": self.access.value,
+        }
+        if self.source is not None:
+            result["source"] = self.source
+        return result
+
+
+@dataclass(frozen=True)
+class VirtualFileSystemContract:
+    """Logical filesystem presented to a program by its enclosing shell."""
+
+    current_directory: str = "/"
+    mounts: tuple[VirtualMount, ...] = (VirtualMount("/", VirtualMountKind.MEMORY, VirtualMountAccess.READ_WRITE),)
+
+    def __post_init__(self) -> None:
+        if not self.current_directory.startswith("/"):
+            raise ValueError("virtual current directory must be absolute")
+        paths = [mount.path.casefold() for mount in self.mounts]
+        if len(paths) != len(set(paths)):
+            raise ValueError("virtual filesystem contains duplicate mount paths")
+        if not any(path == "/" for path in paths):
+            raise ValueError("virtual filesystem requires a root mount")
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema": "turing-virtual-filesystem",
+            "version": 1,
+            "current_directory": self.current_directory,
+            "mounts": [mount.to_mapping() for mount in self.mounts],
+        }
+
+
+@dataclass(frozen=True)
+class SystemPortField:
+    """Map one semantic system-port field to a compiled API parameter."""
+
+    name: str
+    parameter: str
+
+    def to_mapping(self) -> dict[str, str]:
+        return {"name": self.name, "parameter": self.parameter}
+
+
+@dataclass(frozen=True)
+class SystemPort:
+    """A named shell boundary, independent of target-language spelling.
+
+    File input ports conventionally bind ``data`` and ``length`` fields.
+    External-reference ports name a resolution domain and may bind request or
+    result fields. Web shells accept only the ``bundle`` domain.
+    """
+
+    name: str
+    kind: SystemPortKind
+    direction: SystemPortDirection
+    entry_point: str | None = None
+    fields: tuple[SystemPortField, ...] = ()
+    optional: bool = False
+    external_domain: ExternalReferenceDomain | None = None
+    attributes: tuple[tuple[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("system port needs a non-empty name")
+        field_names = [field.name for field in self.fields]
+        if len(field_names) != len(set(field_names)):
+            raise ValueError(f"system port {self.name!r} has duplicate fields")
+        if self.fields and not self.entry_point:
+            raise ValueError(
+                f"system port {self.name!r} binds parameters without an entry point"
+            )
+        if self.kind in {SystemPortKind.FILE, SystemPortKind.DEVICE}:
+            if self.external_domain is not None:
+                raise ValueError(
+                    f"{self.kind.value} system ports do not have an external domain"
+                )
+            if (
+                self.kind is SystemPortKind.FILE
+                and self.direction in {
+                    SystemPortDirection.INPUT, SystemPortDirection.BIDIRECTIONAL,
+                }
+            ):
+                required = {"data", "length"}
+                missing = required - set(field_names)
+                if missing:
+                    raise ValueError(
+                        f"input file port {self.name!r} lacks fields {sorted(missing)!r}"
+                    )
+        elif self.external_domain is None:
+            raise ValueError("external-reference ports require an explicit domain")
+
+    @classmethod
+    def create(
+        cls,
+        name: str,
+        kind: SystemPortKind | str,
+        direction: SystemPortDirection | str,
+        *,
+        entry_point: str | None = None,
+        fields: Mapping[str, str] | None = None,
+        optional: bool = False,
+        external_domain: ExternalReferenceDomain | str | None = None,
+        attributes: Mapping[str, Any] | None = None,
+    ) -> "SystemPort":
+        return cls(
+            str(name), SystemPortKind(kind), SystemPortDirection(direction),
+            entry_point,
+            tuple(SystemPortField(str(key), str(value)) for key, value in (fields or {}).items()),
+            bool(optional),
+            None if external_domain is None else ExternalReferenceDomain(external_domain),
+            tuple(sorted((attributes or {}).items())),
+        )
+
+    @property
+    def capability(self) -> ShellIOCapability:
+        if self.kind is SystemPortKind.FILE:
+            return ShellIOCapability.FILES
+        if self.kind is SystemPortKind.DEVICE:
+            return ShellIOCapability.DEVICES
+        if self.external_domain is ExternalReferenceDomain.BUNDLE:
+            return ShellIOCapability.BUNDLE_REFERENCES
+        return ShellIOCapability.HOST_REFERENCES
+
+    def to_mapping(self) -> dict[str, Any]:
+        mapping = {
+            "name": self.name,
+            "kind": self.kind.value,
+            "direction": self.direction.value,
+            "optional": self.optional,
+            "fields": [field.to_mapping() for field in self.fields],
+            "attributes": dict(self.attributes),
+        }
+        if self.entry_point is not None:
+            mapping["entry_point"] = self.entry_point
+        if self.external_domain is not None:
+            mapping["external_domain"] = self.external_domain.value
+        return mapping
 
 
 @dataclass(frozen=True)
@@ -94,6 +308,8 @@ class ShellIOManifest:
     requests: tuple[ShellIORequest, ...] = ()
     bindings: tuple[ShellIOBinding, ...] = ()
     options: tuple[ShellOption, ...] = ()
+    system_ports: tuple[SystemPort, ...] = ()
+    virtual_filesystem: VirtualFileSystemContract | None = None
 
     def __post_init__(self) -> None:
         kinds = [request.capability for request in self.requests]
@@ -107,6 +323,21 @@ class ShellIOManifest:
         option_names = [option.name for option in self.options]
         if len(option_names) != len(set(option_names)):
             raise ValueError("shell IO manifest contains duplicate options")
+        port_names = [port.name for port in self.system_ports]
+        if len(port_names) != len(set(port_names)):
+            raise ValueError("shell IO manifest contains duplicate system ports")
+        requested = set(kinds)
+        if self.virtual_filesystem is not None and ShellIOCapability.FILES not in requested:
+            raise ValueError("virtual filesystem requires the files shell capability")
+        unsupported = [
+            port.name for port in self.system_ports
+            if port.capability not in requested and not port.optional
+        ]
+        if unsupported:
+            raise ValueError(
+                "required system ports lack matching shell capabilities: "
+                + ", ".join(unsupported)
+            )
 
     @property
     def required(self) -> frozenset[ShellIOCapability]:
@@ -121,7 +352,7 @@ class ShellIOManifest:
         )
 
     def to_mapping(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema": "turing-shell-io-requirements",
             "version": 1,
             "requests": [
@@ -134,7 +365,11 @@ class ShellIOManifest:
             ],
             "bindings": [binding.to_mapping() for binding in self.bindings],
             "options": [option.to_mapping() for option in self.options],
+            "system_ports": [port.to_mapping() for port in self.system_ports],
         }
+        if self.virtual_filesystem is not None:
+            result["virtual_filesystem"] = self.virtual_filesystem.to_mapping()
+        return result
 
     def specialize_options(self, values: Mapping[str, Any]) -> "ShellIOManifest":
         """Return the manifest with compile-time option defaults recorded."""
@@ -184,9 +419,22 @@ class FileBrokerABI:
     completion_record_bytes: int = 32
     operations: tuple[str, ...] = (
         "open", "create", "read", "write", "close", "stat",
+        "list", "mkdir", "remove", "rename", "getcwd", "chdir", "flush",
     )
     # Paths and payloads are offset/length spans in the artifact's memory.
     span_fields: tuple[str, ...] = ("memory_offset", "byte_length")
+    namespace: str = "utf8-posix-absolute"
+    effects: str = "ordered-journal"
+
+
+@dataclass(frozen=True)
+class ExternalReferenceABI:
+    """Asynchronous calls across a declared bundle/host/guest boundary."""
+
+    request_record_bytes: int = 32
+    completion_record_bytes: int = 32
+    operations: tuple[str, ...] = ("resolve", "call", "release")
+    domains: tuple[str, ...] = tuple(domain.value for domain in ExternalReferenceDomain)
 
 
 @dataclass(frozen=True)
@@ -196,8 +444,11 @@ class ShellIOABI:
     input_events: RingBufferABI = RingBufferABI()
     file_requests: RingBufferABI = RingBufferABI()
     file_completions: RingBufferABI = RingBufferABI()
+    external_requests: RingBufferABI = RingBufferABI()
+    external_completions: RingBufferABI = RingBufferABI()
     display: DisplayDoubleBufferABI = DisplayDoubleBufferABI()
     files: FileBrokerABI = FileBrokerABI()
+    external_references: ExternalReferenceABI = ExternalReferenceABI()
     schema_version: int = 1
     input_event_fields: tuple[str, ...] = (
         "kind", "code", "value", "x", "y", "buttons", "modifiers",
@@ -210,6 +461,14 @@ class ShellIOABI:
     file_completion_fields: tuple[str, ...] = (
         "operation", "request_id", "handle", "status", "bytes_transferred",
         "size_low", "size_high", "flags",
+    )
+    external_request_fields: tuple[str, ...] = (
+        "operation", "request_id", "reference_id", "arguments_offset",
+        "arguments_length", "result_offset", "result_capacity", "flags",
+    )
+    external_completion_fields: tuple[str, ...] = (
+        "operation", "request_id", "reference_id", "status",
+        "result_length", "effects_offset", "effects_length", "generation",
     )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -226,6 +485,8 @@ class ShellIOABI:
             "input_events": ring(self.input_events),
             "file_requests": ring(self.file_requests),
             "file_completions": ring(self.file_completions),
+            "external_requests": ring(self.external_requests),
+            "external_completions": ring(self.external_completions),
             "display": {
                 "pixel_format": self.display.pixel_format,
                 "descriptor_fields": list(self.display.descriptor_fields),
@@ -236,11 +497,22 @@ class ShellIOABI:
                 "completion_record_bytes": self.files.completion_record_bytes,
                 "operations": list(self.files.operations),
                 "span_fields": list(self.files.span_fields),
+                "namespace": self.files.namespace,
+                "effects": self.files.effects,
+            },
+            "external_references": {
+                "request_record_bytes": self.external_references.request_record_bytes,
+                "completion_record_bytes": self.external_references.completion_record_bytes,
+                "operations": list(self.external_references.operations),
+                "domains": list(self.external_references.domains),
+                "web_domain": ExternalReferenceDomain.BUNDLE.value,
             },
             "records": {
                 "input_event_i32": list(self.input_event_fields),
                 "file_request_i32": list(self.file_request_fields),
                 "file_completion_i32": list(self.file_completion_fields),
+                "external_request_i32": list(self.external_request_fields),
+                "external_completion_i32": list(self.external_completion_fields),
             },
         }
 
@@ -305,7 +577,36 @@ def resolve_shell_io_bindings(api: Any, manifest: ShellIOManifest) -> ShellIOMan
         manifest.requests,
         bindings=tuple(resolved),
         options=manifest.options,
+        system_ports=tuple(
+            _resolve_system_port(api, port) for port in manifest.system_ports
+        ),
+        virtual_filesystem=manifest.virtual_filesystem,
     )
+
+
+def _resolve_system_port(api: Any, port: SystemPort) -> SystemPort:
+    if not port.fields:
+        return port
+    entries = {str(entry.name): entry for entry in getattr(api, "entry_points", ())}
+    entry = entries.get(str(port.entry_point))
+    if entry is None:
+        raise ValueError(
+            f"system port {port.name!r} names unknown entry point {port.entry_point!r}"
+        )
+    resolved = []
+    for field in port.fields:
+        direct = [item for item in entry.parameters if item.name == field.parameter]
+        semantic = [
+            item for item in entry.parameters if item.source_name == field.parameter
+        ]
+        matches = direct or semantic
+        if len(matches) != 1:
+            raise ValueError(
+                f"system port {port.name!r} field {field.name!r} does not name "
+                f"a unique parameter of {port.entry_point!r}"
+            )
+        resolved.append(SystemPortField(field.name, matches[0].name))
+    return replace(port, fields=tuple(resolved))
 
 
 @dataclass(frozen=True)
@@ -317,6 +618,7 @@ class ShellProfile:
     exposes: str
     provides: frozenset[ShellIOCapability] = frozenset()
     cost: int = 1
+    mount_kinds: frozenset[VirtualMountKind] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -355,6 +657,19 @@ def plan_shell_stack(
         queue = deque(sorted(queue, key=lambda item: item[0]))
         cost, (kind, provided), wrappers = queue.popleft()
         if required <= provided:
+            requested_mounts = {
+                mount.kind for mount in (
+                    manifest.virtual_filesystem.mounts
+                    if manifest.virtual_filesystem is not None else ()
+                )
+            }
+            available_mounts = frozenset().union(*(
+                wrapper.mount_kinds for wrapper in wrappers
+            )) if wrappers else frozenset()
+            if not requested_mounts <= available_mounts:
+                # This state satisfies capabilities but not the requested
+                # namespace backing; keep searching for another wrapper.
+                continue
             return ShellStack(
                 str(artifact_kind),
                 wrappers,
@@ -381,22 +696,44 @@ WEB_JAVASCRIPT_SHELL = ShellProfile(
     name="web_javascript",
     accepts=frozenset({"wasm"}),
     exposes="web_page",
-    provides=frozenset(ShellIOCapability),
+    provides=frozenset({
+        ShellIOCapability.KEYBOARD,
+        ShellIOCapability.POINTER,
+        ShellIOCapability.DISPLAY,
+        ShellIOCapability.FILES,
+        ShellIOCapability.DEVICES,
+        ShellIOCapability.BUNDLE_REFERENCES,
+    }),
     cost=1,
+    mount_kinds=frozenset({
+        VirtualMountKind.MEMORY, VirtualMountKind.BUNDLE,
+        VirtualMountKind.INDEXED_DB, VirtualMountKind.OPFS,
+    }),
 )
 
 NATIVE_PROCESS_SHELL = ShellProfile(
     name="native_process",
     accepts=frozenset({"native_library", "llvm", "fortran"}),
     exposes="native_process",
-    provides=frozenset(ShellIOCapability),
+    provides=frozenset({
+        ShellIOCapability.KEYBOARD,
+        ShellIOCapability.POINTER,
+        ShellIOCapability.DISPLAY,
+        ShellIOCapability.FILES,
+        ShellIOCapability.HOST_REFERENCES,
+    }),
     cost=1,
+    mount_kinds=frozenset({
+        VirtualMountKind.MEMORY, VirtualMountKind.BUNDLE,
+        VirtualMountKind.HOST_DIRECTORY,
+    }),
 )
 
 
 __all__ = [
     "DisplayDoubleBufferABI",
     "FileBrokerABI",
+    "ExternalReferenceABI",
     "NATIVE_PROCESS_SHELL",
     "RingBufferABI",
     "ShellIOABI",
@@ -407,6 +744,15 @@ __all__ = [
     "ShellOption",
     "ShellProfile",
     "ShellStack",
+    "ExternalReferenceDomain",
+    "SystemPort",
+    "SystemPortDirection",
+    "SystemPortField",
+    "SystemPortKind",
+    "VirtualFileSystemContract",
+    "VirtualMount",
+    "VirtualMountAccess",
+    "VirtualMountKind",
     "WEB_JAVASCRIPT_SHELL",
     "attach_shell_io",
     "plan_shell_stack",

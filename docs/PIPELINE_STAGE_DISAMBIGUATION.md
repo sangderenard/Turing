@@ -1,5 +1,13 @@
 # Pipeline stage disambiguation
 
+> **Application-entry warning:** The numerical objects and emitters described
+> below are internal submechanisms reached only after Python/AST ingestion and
+> compiler planning.  Their deliberately narrow shapes do not define the
+> source language accepted by the Python recompiler.  Application code starts
+> from Python source through the AST/ProcessGraph frontend; it must not create a
+> `FusedProgram`, call `lower_fused_program_to_ssa`, or call a fused-program
+> backend emitter as a substitute compiler path.
+
 This repo has several representations that all sit "between the math and the
 machine code" and are easy to conflate. This doc names each one precisely,
 says what it actually is, what produces it, and what consumes it — grounded

@@ -571,8 +571,20 @@ def ingest_sympy_expression(
             return node_id
 
         function_name = getattr(getattr(value, "func", None), "__name__", "")
-        if value is sympy.true or value is sympy.false:
-            literal: Any = bool(value)
+        # Classify numeric atoms by their SymPy domain before singleton-like
+        # literals.  Python considers bool a subclass of int and symbolic
+        # runtimes can normalize singleton identity tests; the mathematical
+        # type is the durable distinction.  In particular ``One`` must remain
+        # integer 1 while BooleanTrue remains a Boolean atom.
+        if value.is_Number:
+            if value.is_Integer:
+                literal: Any = int(value)
+            elif isinstance(value, sympy.Float):
+                literal = float(value)
+            else:
+                literal = value
+        elif value is sympy.true or value is sympy.false:
+            literal = bool(value)
         elif function_name == "Bytes":
             literal = bytes(int(item) for item in value.args)
         elif function_name == "String":
@@ -581,13 +593,6 @@ def ingest_sympy_expression(
             literal = None
         elif function_name == "EllipsisValue" and not value.args:
             literal = Ellipsis
-        elif value.is_Number:
-            if value.is_Integer:
-                literal = int(value)
-            elif isinstance(value, sympy.Float):
-                literal = float(value)
-            else:
-                literal = value
         else:
             literal = no_literal
         if literal is not no_literal:

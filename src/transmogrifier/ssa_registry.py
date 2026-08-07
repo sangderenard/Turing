@@ -50,6 +50,7 @@ class Handler(Enum):
     Load          = "Load"
     Store         = "Store"
     Alloca        = "Alloca"
+    Fill          = "Fill"          # span-memory initialisation; zero-fill == calloc
     GetElementPtr = "GetElementPtr"
 
     # Casts & Conversions
@@ -68,6 +69,8 @@ class Handler(Enum):
     CondBr        = "CondBr"
     Ret           = "Ret"
     Call          = "Call"
+    Deploy        = "Deploy"
+    Join          = "Join"
 
     # Misc
     Select        = "Select"
@@ -96,6 +99,8 @@ sympy_ssa_name_map: Dict[str, Handler] = {
     'imaginaryunit':       Handler.Const,
     'true':                Handler.Const,
     'false':               Handler.Const,
+    'deploy':              Handler.Deploy,
+    'join':                Handler.Join,
 
     # Arithmetic
     'add':                 Handler.Add,
@@ -139,6 +144,17 @@ sympy_ssa_name_map: Dict[str, Handler] = {
     'load':                Handler.Load,
     'store':               Handler.Store,
     'alloca':              Handler.Alloca,
+    # Span-memory initialisation collapses the construction constructors onto a
+    # single Fill operation. Zero-fill (``zeros``/``empty``) is the calloc case.
+    'fill':                Handler.Fill,
+    'zeros':               Handler.Fill,
+    'zeros_like':          Handler.Fill,
+    'ones':                Handler.Fill,
+    'ones_like':           Handler.Fill,
+    'full':                Handler.Fill,
+    'full_like':           Handler.Fill,
+    'empty':               Handler.Fill,
+    'empty_like':          Handler.Fill,
     'getelementptr':       Handler.GetElementPtr,
     'idx':                 Handler.GetElementPtr,
     'indexed':             Handler.Load,
@@ -435,6 +451,19 @@ ast_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
         'index',
     ),
 
+    # Span-memory initialisation. Tensor construction constructors collapse onto
+    # a single Fill operation whose zero-fill spelling is the calloc case.
+    Handler.Fill: (
+        'call:zeros',
+        'call:zeros_like',
+        'call:ones',
+        'call:ones_like',
+        'call:full',
+        'call:full_like',
+        'call:empty',
+        'call:empty_like',
+    ),
+
     # Type expressions collapse to the existing conversion operators. Generic
     # Python constructors use Cast; explicitly typed IR spellings retain their
     # narrower conversion handler.
@@ -513,11 +542,185 @@ ast_ssa_name_map: Dict[str, Handler] = {
 }
 
 
+# -----------------------------------------------------------------------------
+# C (pycparser ``c_ast``) → the same SSA / BitOps language
+# -----------------------------------------------------------------------------
+#
+# Same equivalence-table contract as ``ast_ssa_equivalents`` above, for the node
+# type names ``C_ROLE_SCHEMAS`` (oop_language_translations.py) registers. Keys
+# are the lowercase spelling of the ``pycparser.c_ast`` class name, with the
+# same ``qualified:piece`` convention for compound nodes.
+#
+# One difference from Python is worth stating rather than leaving to be
+# rediscovered: Python spells its operators as *node classes* (``ast.Add``, so
+# ``binop:add``), while pycparser spells them as *strings* on the parent node
+# (``BinaryOp.op == '+'``, so ``binaryop:+``). Both are just surface spellings
+# converging on one Handler -- which is the entire point of this table, and why
+# C needs no new Handler of its own. Where a C spelling collides with a Python
+# one (``constant``, ``return``, ``if``, ``for``, ``while``, ``break``,
+# ``continue``) it deliberately resolves to the *same* Handler: those are a
+# shared vocabulary both languages genuinely share, not a collision to route
+# around.
+c_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
+    # Values and C literal spellings.
+    Handler.Load: (
+        'id',
+        'structref',
+        # Pointer dereference reads the pointee, the same reading Python's
+        # 'attribute:load' has: a Load.
+        'unaryop:*',
+    ),
+    Handler.Const: (
+        'constant',
+    ),
+    Handler.Alloca: (
+        'decl',
+        'initlist',
+        'struct',
+        'funcdef',
+    ),
+
+    # Arithmetic. C's compound assignments carry the same operator meaning as
+    # Python's AugAssign spellings already registered above.
+    Handler.Add: (
+        'binaryop:+',
+        'assignment:+=',
+    ),
+    Handler.Sub: (
+        'binaryop:-',
+        'assignment:-=',
+    ),
+    Handler.Mul: (
+        'binaryop:*',
+        'assignment:*=',
+    ),
+    Handler.Div: (
+        'binaryop:/',
+        'assignment:/=',
+    ),
+    Handler.Mod: (
+        'binaryop:%',
+        'assignment:%=',
+    ),
+    Handler.Neg: (
+        'unaryop:-',
+    ),
+
+    # Bitwise.
+    Handler.And: (
+        'binaryop:&',
+        'assignment:&=',
+    ),
+    Handler.Or: (
+        'binaryop:|',
+        'assignment:|=',
+    ),
+    Handler.Xor: (
+        'binaryop:^',
+        'assignment:^=',
+    ),
+    Handler.Not: (
+        'unaryop:~',
+    ),
+    Handler.Shl: (
+        'binaryop:<<',
+        'assignment:<<=',
+    ),
+    Handler.Shr: (
+        'binaryop:>>',
+        'assignment:>>=',
+    ),
+
+    # Logical.
+    Handler.LAnd: (
+        'binaryop:&&',
+    ),
+    Handler.LOr: (
+        'binaryop:||',
+    ),
+    Handler.LNot: (
+        'unaryop:!',
+    ),
+
+    # Comparison.
+    Handler.Eq: (
+        'binaryop:==',
+    ),
+    Handler.Ne: (
+        'binaryop:!=',
+    ),
+    Handler.Lt: (
+        'binaryop:<',
+    ),
+    Handler.Le: (
+        'binaryop:<=',
+    ),
+    Handler.Gt: (
+        'binaryop:>',
+    ),
+    Handler.Ge: (
+        'binaryop:>=',
+    ),
+
+    # Storage and addressing.
+    Handler.Store: (
+        'assignment',
+        'assignment:=',
+    ),
+    Handler.GetElementPtr: (
+        'arrayref',
+        # Address-of. C's only way to spell "a reference to this object",
+        # which the cpp shell's method desugaring emits for every receiver
+        # (``obj.m(x)`` -> ``Class_m(&obj, x)``).
+        'unaryop:&',
+    ),
+
+    # Conversions. C's unary plus is a no-op conversion, the same reading
+    # Python's 'uadd' already has above.
+    Handler.Cast: (
+        'cast',
+        'unaryop:+',
+    ),
+
+    # Control and calls.
+    Handler.CondBr: (
+        'if',
+        'switch',
+    ),
+    Handler.Br: (
+        'for',
+        'while',
+        'dowhile',
+        'break',
+        'continue',
+        'goto',
+    ),
+    Handler.Ret: (
+        'return',
+    ),
+    Handler.Call: (
+        'funccall',
+    ),
+    Handler.Select: (
+        'ternaryop',
+    ),
+}
+
+
+c_ssa_name_map: Dict[str, Handler] = {
+    spelling: handler
+    for handler, spellings in c_ssa_equivalents.items()
+    for spelling in spellings
+}
+
+
 # The registry is the language-neutral correlation table. Existing SymPy names
-# remain intact; AST spellings simply join them at the same Handler.
+# remain intact; AST spellings simply join them at the same Handler, and C
+# spellings join both.
 ssa_name_map: Dict[str, Handler] = {
     **sympy_ssa_name_map,
     **ast_ssa_name_map,
+    **c_ssa_name_map,
 }
 
 

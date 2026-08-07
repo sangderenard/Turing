@@ -32,6 +32,8 @@ SCHEMA = "turing-compiled-program-api-v1"
 # Python caller needs. Both are recorded because a caller in another language
 # needs the first and cannot use the second.
 _C_TYPES: dict[str, tuple[str, str]] = {
+    "uint8": ("uint8_t", "c_uint8"),
+    "u8": ("uint8_t", "c_uint8"),
     "float": ("float", "c_float"),
     "float32": ("float", "c_float"),
     "f32": ("float", "c_float"),
@@ -184,7 +186,11 @@ def describe_fortran_function(
         parameters.append(
             Parameter(
                 name=f"t{value.id}",
-                role="output" if value.id in output_ids else "input",
+                # An SSA value that is both an argument and a result is one
+                # preallocated Fortran intent(inout) arena.  Keep it an input
+                # in the shell contract so its initial contents are loaded;
+                # feedback/output aliases refer to the same resident slot.
+                role="input",
                 dtype=str(value.dtype or "float64"),
                 c_type=c_type,
                 ctypes_name=ctypes_name,

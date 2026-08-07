@@ -1,12 +1,20 @@
 import base64
 from pathlib import Path
+import socket
 import subprocess
+import sys
+import time
 
 import pytest
 
 from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.machine_targets import emit
 from src.compiler.wasm_html_shell import emit_html_shell, shell_for_artifact
+from src.compiler.compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter
+from src.compiler.shell_io import (
+    ShellIOManifest, ShellIORequest, SystemPort, VirtualFileSystemContract,
+    VirtualMount, attach_shell_io,
+)
 
 
 def _artifact(name="demo"):
@@ -59,6 +67,243 @@ def test_with_a_binary_the_page_is_self_contained():
     assert "self-contained" in shell.html
 
 
+def _file_port_api(*, domain=None):
+    parameters = (
+        Parameter("t4", "input", "u8", "uint8_t", "c_uint8", "reference", source_name="subject_bytes"),
+        Parameter("t5", "input", "i64", "int64_t", "c_int64", "value", source_name="subject_length"),
+    )
+    requests = [ShellIORequest.create("files")]
+    ports = [SystemPort.create(
+        "subject", "file", "input", entry_point="load_subject",
+        fields={"data": "subject_bytes", "length": "subject_length"},
+        attributes={"accept": ".exe,.dll"},
+    )]
+    if domain is not None:
+        requests.append(ShellIORequest.create(
+            "bundle_references" if domain == "bundle" else "host_references"
+        ))
+        ports.append(SystemPort.create(
+            "decoder", "external_reference", "call",
+            external_domain=domain,
+            attributes={"bundle": "decoder-bundle", "export": "decode"},
+        ))
+    return attach_shell_io(CompiledProgramAPI(
+        "machine", "wasm", "load_subject",
+        (EntryPoint("load_subject", "load_subject", "control", parameters),),
+    ), ShellIOManifest(tuple(requests), system_ports=tuple(ports)))
+
+
+def test_html_renders_file_system_port_instead_of_numeric_parameter_fields():
+    html = emit_html_shell(_file_port_api(domain="bundle")).html
+
+    assert 'data-system-file-port="subject"' in html
+    assert 'accept=".exe,.dll"' in html
+    assert 'id="in_t4"' not in html
+    assert 'id="in_t5"' not in html
+    assert "window.TuringSystemPorts = systemPorts" in html
+    assert "publishFile(name, file)" in html
+    assert "bundle · decoder-bundle :: decode" in html
+
+
+def test_html_accepts_host_system_external_reference_ports():
+    # Host-system capability ports are the general support structure for a
+    # compiled executor living inside this page by simulation: the shell
+    # (not the program) owns whatever handler actually resolves each named
+    # capability. Only "bundle" and "host_system" domains are accepted.
+    html = emit_html_shell(_file_port_api(domain="host_system")).html
+    assert "registerHostCapability(name, handler)" in html
+    assert "resolveHostCapability(name, request)" in html
+    assert "host_system · " in html
+
+
+def test_html_still_rejects_other_external_reference_domains():
+    with pytest.raises(ValueError, match="Turing bundles or"):
+        emit_html_shell(_file_port_api(domain="guest_binary"))
+
+
+@pytest.mark.skipif(
+    not Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe").exists(),
+    reason="Chrome is not installed",
+)
+def test_host_system_capability_registers_and_resolves_in_a_real_browser(tmp_path):
+    html = emit_html_shell(_file_port_api(domain="host_system")).html
+    injected = html.replace(
+        "</body>",
+        """
+<script>
+window.TuringSystemPorts.registerHostCapability("decoder", async (request) => {
+  return { echoed: request.value * 2 };
+});
+window.TuringSystemPorts.resolveHostCapability("decoder", { value: 21 }).then(result => {
+  document.body.setAttribute("data-test-result", "RESOLVED " + JSON.stringify(result));
+}).catch(error => {
+  document.body.setAttribute("data-test-result", "ERROR " + error.message);
+});
+</script>
+</body>""",
+    )
+    page = tmp_path / "host_capability.html"
+    page.write_text(injected, encoding="utf-8")
+    completed = subprocess.run(
+        [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            "--headless=new", "--disable-gpu", "--no-sandbox",
+            "--virtual-time-budget=5000", "--dump-dom", page.as_uri(),
+        ],
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert 'data-test-result="RESOLVED {&quot;echoed&quot;:42}"' in completed.stdout
+
+
+@pytest.mark.skipif(
+    not Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe").exists(),
+    reason="Chrome is not installed",
+)
+def test_required_host_system_capability_fails_closed_without_a_handler(tmp_path):
+    html = emit_html_shell(_file_port_api(domain="host_system")).html
+    injected = html.replace(
+        "</body>",
+        """
+<script>
+window.TuringSystemPorts.resolveHostCapability("decoder", { value: 1 }).then(result => {
+  document.body.setAttribute("data-test-result", "RESOLVED " + JSON.stringify(result));
+}).catch(error => {
+  document.body.setAttribute("data-test-result", "ERROR " + error.message);
+});
+</script>
+</body>""",
+    )
+    page = tmp_path / "host_capability_unregistered.html"
+    page.write_text(injected, encoding="utf-8")
+    completed = subprocess.run(
+        [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            "--headless=new", "--disable-gpu", "--no-sandbox",
+            "--virtual-time-budget=5000", "--dump-dom", page.as_uri(),
+        ],
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert 'data-test-result="ERROR required host-system capability has no simulation registered: decoder"' in completed.stdout
+
+
+def test_html_shell_hydrates_persistent_mounts_and_bridges_virtual_devices():
+    api = attach_shell_io(
+        CompiledProgramAPI(
+            "machine", "wasm", "run",
+            (EntryPoint("run", "run", "control", ()),),
+        ),
+        ShellIOManifest(
+            (
+                ShellIORequest.create("files"),
+                ShellIORequest.create("system_devices"),
+            ),
+            system_ports=(
+                SystemPort.create(
+                    "terminal_input", "device", "input",
+                    attributes={"device": "console.input"},
+                ),
+                SystemPort.create(
+                    "terminal_output", "device", "output",
+                    attributes={"device": "console.output"},
+                ),
+            ),
+            virtual_filesystem=VirtualFileSystemContract(mounts=(
+                VirtualMount.create("/", "memory", access="read_write"),
+                VirtualMount.create(
+                    "/database", "indexed_db", access="read_write",
+                    source="machine-runtime",
+                ),
+                VirtualMount.create(
+                    "/origin", "opfs", access="read_write",
+                    source="machine/runtime",
+                ),
+            )),
+        ),
+    )
+
+    html = emit_html_shell(api).html
+
+    assert 'indexedDB.open("turing-vfs:" + mount.source, 1)' in html
+    assert "navigator.storage.getDirectory()" in html
+    assert "systemPorts.ready = systemPorts.initializeVirtualFilesystem()" in html
+    assert "await systemPorts.ready" in html
+    assert "writeVirtualFileAsync(path, bytes)" in html
+    assert "registerDeviceHandler(name, handler)" in html
+    assert 'device === "console.input"' in html
+    assert "runtime.injectDeviceBytes(device, bytes, options)" in html
+
+
+@pytest.mark.skipif(
+    not Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe").exists(),
+    reason="Chrome is unavailable",
+)
+def test_persistent_virtual_mounts_execute_in_browser(tmp_path):
+    api = attach_shell_io(
+        CompiledProgramAPI(
+            "storage_probe", "wasm", "run",
+            (EntryPoint("run", "run", "control", ()),),
+        ),
+        ShellIOManifest(
+            (ShellIORequest.create("files"),),
+            virtual_filesystem=VirtualFileSystemContract(mounts=(
+                VirtualMount.create("/", "memory", access="read_write"),
+                VirtualMount.create(
+                    "/database", "indexed_db", access="read_write",
+                    source="browser-probe",
+                ),
+                VirtualMount.create(
+                    "/origin", "opfs", access="read_write",
+                    source="browser/probe",
+                ),
+            )),
+        ),
+    )
+    probe = r"""<script>
+(async () => {
+  try {
+    const ports = window.TuringSystemPorts;
+    await ports.ready;
+    await ports.writeVirtualFileAsync("/database/one.bin", new Uint8Array([1, 2, 3]));
+    await ports.writeVirtualFileAsync("/origin/two.bin", new Uint8Array([4, 5, 6]));
+    ports.virtualFiles.delete("/database/one.bin");
+    ports.virtualFiles.delete("/origin/two.bin");
+    await ports.hydrateIndexedDB(ports.virtualMount("/database/one.bin"));
+    await ports.hydrateOPFS(ports.virtualMount("/origin/two.bin"));
+    const left = Array.from(ports.readVirtualFile("/database/one.bin"));
+    const right = Array.from(ports.readVirtualFile("/origin/two.bin"));
+    document.body.textContent = JSON.stringify(left) === "[1,2,3]" &&
+      JSON.stringify(right) === "[4,5,6]" ? "PASS PERSISTENT VFS" : "FAIL VALUES";
+  } catch (error) { document.body.textContent = "FAIL " + String(error); }
+})();
+</script>"""
+    (tmp_path / "index.html").write_text(
+        emit_html_shell(api).html + probe, encoding="utf-8",
+    )
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    server = subprocess.Popen(
+        [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+        cwd=tmp_path, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(0.2)
+        completed = subprocess.run(
+            [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                "--headless=new", "--disable-gpu", "--no-sandbox",
+                "--virtual-time-budget=10000", "--dump-dom",
+                f"--user-data-dir={tmp_path / 'chrome-profile'}",
+                f"http://127.0.0.1:{port}/index.html",
+            ],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+    assert "PASS PERSISTENT VFS" in completed.stdout
+
+
 def test_published_webgl_shader_graduates_page_to_execution_surface():
     shell = shell_for_artifact(
         _artifact(),
@@ -77,7 +322,7 @@ def test_published_webgl_shader_graduates_page_to_execution_surface():
     assert 'width: 100%;' in html
     assert 'height: 100%;' in html
     assert 'canvas.getContext("webgl2"' in html
-    assert 'fetch(new URL(SHADER.url, document.baseURI)' in html
+    assert 'fetch(new URL(activeCandidate.url, document.baseURI)' in html
     assert "canvas.setPointerCapture(event.pointerId)" in html
     assert 'canvas.addEventListener("keydown"' in html
     assert "window.TuringShaderSurface" in html
@@ -324,10 +569,12 @@ def test_output_views_are_tabs_over_the_same_numbers():
 def test_the_diagnostics_bootstrap_is_a_separate_script():
     """A handler defined inside the program script cannot catch that
     script's own parse error -- nothing in it has run yet. Two script tags
-    is what makes a dead shell announce itself instead of looking inert."""
+    is what makes a dead shell announce itself instead of looking inert.
+    (A third, later tag drives the always-present text transcript and is
+    independent of this boot/program pair.)"""
 
     html = shell_for_artifact(_artifact()).html
-    assert html.count("<script>") == 2
+    assert html.count("<script>") == 3
     boot, program = html.split("<script>")[1], html.split("<script>")[2]
     assert 'addEventListener("error"' in boot
     assert "const API =" in program
@@ -442,7 +689,8 @@ def test_segmented_shell_keeps_one_public_api_and_runs_full_arrays():
     assert "residentValues" in html
     assert "queueDeploymentProfile" in html
     assert "requestAnimationFrame" in html
-    assert "WebAssembly.instantiate(moduleBinary, imports)" in html
+    assert "WebAssembly.compile(moduleBinary)" in html
+    assert "WebAssembly.instantiate(module, imports)" in html
     assert "No live tensor is copied through" in html
     assert "shared-memory slot" in html
     assert "Live deployment schedule:" in html
@@ -486,6 +734,11 @@ def test_parallel_wasm_plan_uses_aligned_bounded_worker_tiles_and_join():
     assert "Math.min(taskCount, 8" in html
     assert "tile_alignment" in html
     assert "new Worker(this.tileWorkerURL)" in html
+    assert "executeThreadDeployment" in html
+    assert "vertically fused WebAssembly tiles" in html
+    assert "window.TuringWasmThreads" in html
+    assert 'contract.extent_effect !== "collective"' in html
+    assert "whole-extent Wasm coordinator retained" in html
     assert "await Promise.all" in html
     assert "Join: all WebAssembly tiles committed" in html
     assert "replaying serial Wasm schedule" in html
@@ -533,13 +786,22 @@ const inventory = {{field_slots: [{{index:0}}, {{index:1}}], methods: [{{
 const url = URL.createObjectURL(new Blob([wasmTileWorkerSource()], {{type:"text/javascript"}}));
 const worker = new Worker(url);
 worker.onmessage = event => {{
+  if (event.data.type === "configured") {{
+    worker.postMessage({{type:"run", taskId:1, methodIds:[0], count:3,
+      fields:{{0:new Float64Array([1,2,3])}}, resultSlots:[1]}});
+    return;
+  }}
   const values = Array.from(event.data.outputs[1] || []);
   document.body.textContent = !event.data.error && JSON.stringify(values) === "[2,4,6]"
     ? "PASS JOIN [2,4,6]" : "FAIL " + JSON.stringify(event.data);
   worker.terminate();
 }};
-worker.postMessage({{manifest, inventory, methodIds:[0], count:3,
-  fields:[new Float64Array([1,2,3]), new Float64Array(3)]}});
+const raw = atob("{encoded}");
+const bytes = new Uint8Array(raw.length);
+for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+WebAssembly.compile(bytes).then(compiled => worker.postMessage({{
+  type:"configure", manifest, inventory, compiledModules:[["lane", compiled]]
+}}));
 </script></body>"""
     page_path = tmp_path / "worker.html"
     page_path.write_text(page, encoding="utf-8")
@@ -803,3 +1065,84 @@ def test_feedback_network_contract_is_executable():
     assert "candidate_offsets" in html
     assert "feedbackState.speed" in html
     assert "WebAssembly.instantiate(bytes" in html
+
+
+def test_transcript_is_present_and_linked_regardless_of_shader_or_graph():
+    """The plain-text transcript is not gated behind the shader body class or
+    a supplied process graph -- a bare inspection page still gets one, and a
+    reader following raw HTML (no JS, no canvas) can reach every node."""
+
+    html = emit_html_shell(_artifact().api).html
+    assert 'id="program-transcript"' in html
+    assert 'class="shader-execution"' not in html
+    assert '?node=graph-index' in html
+    assert '?node=log' in html
+    assert '?node=network' in html
+    assert '?node=shader' in html
+    assert "No shader execution surface attached" in html
+
+
+def test_transcript_graph_nodes_link_to_their_parents():
+    """The process graph's own parent edges are the navigable structure --
+    each node section links every parent by the same ?node= scheme."""
+
+    graph = {
+        "nodes": 2,
+        "edges": 1,
+        "truncated": False,
+        "histogram": {"add": 1, "sub": 1},
+        "table": [
+            {"id": 1, "type": "sub", "label": "left - right", "parents": []},
+            {"id": 2, "type": "add", "label": "abs(...) + 1", "parents": [1]},
+        ],
+    }
+    html = emit_html_shell(_artifact().api, process_graph=graph).html
+    assert 'data-node="graph-1"' in html
+    assert 'data-node="graph-2"' in html
+    assert '<a href="?node=graph-1">' in html
+    assert '<a href="?node=graph-1">node 1 (sub)</a>' in html
+
+
+def test_transcript_telemetry_renders_as_readable_log_text():
+    """Build-time telemetry records show up as plain list text in the
+    transcript, not only as JSON handed to the diagnostics script."""
+
+    telemetry = {
+        "records": [
+            {"kind": "log", "message": "compiled entry", "path": "backend_sources"},
+            {"kind": "error", "message": "boom", "path": ""},
+        ]
+    }
+    html = emit_html_shell(_artifact().api, telemetry=telemetry).html
+    assert "[log] compiled entry (backend_sources)" in html
+    assert "[error] boom" in html
+
+
+def test_transcript_survives_with_no_optional_data_at_all():
+    """Every input the transcript reads is optional; omitting all of them
+    must still produce a coherent, non-crashing transcript."""
+
+    html = emit_html_shell(_artifact().api).html
+    assert 'id="program-transcript"' in html
+    assert "No feedback network attached" in html
+
+
+def test_machine_snapshot_liaison_has_bounded_live_transport_and_input_port():
+    html = emit_html_shell(
+        _artifact().api,
+        shader_execution={
+            "url": "display.frag.glsl", "language": "webgl2-glsl-es",
+            "stage": "fragment", "role": "shader-surface",
+        },
+    ).html
+
+    assert 'connect(endpoint = "/snapshot", options = {})' in html
+    assert '"after=" + this.generation' in html
+    assert 'cache: "no-store"' in html
+    assert "this.disconnect();" in html
+    assert "async sendTerminalInput(value)" in html
+    assert "async sendControl(action, value = null)" in html
+    assert "async loadSubject(value)" in html
+    assert 'String(options.inputEndpoint || "/input")' in html
+    assert 'String(options.controlEndpoint || "/control")' in html
+    assert 'String(options.subjectEndpoint || "/subject")' in html

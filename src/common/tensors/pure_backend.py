@@ -224,6 +224,8 @@ class PurePythonTensorOperations(AbstractTensor):
         return any(_flatten(self.data)) if dim is None else any(_flatten(row[dim] for row in self.data))
     def max_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self.data
+        if dim is not None and dim < 0:
+            dim += len(_get_shape(data))
         def _max(lst):
             flat = _flatten(lst)
             return max(flat) if flat else 0.0
@@ -254,6 +256,8 @@ class PurePythonTensorOperations(AbstractTensor):
 
     def argmax_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self.data
+        if dim is not None and dim < 0:
+            dim += len(_get_shape(data))
         def _argmax(lst):
             flat = _flatten(lst)
             return flat.index(max(flat)) if flat else 0
@@ -499,10 +503,6 @@ class PurePythonTensorOperations(AbstractTensor):
         if isinstance(tensor, list) and len(tensor) == 1:
             return tensor[0]
         return tensor
-
-    def max_(self, tensor: Any) -> Any:
-        flat = _flatten(tensor)
-        return max(flat) if flat else None
 
     def long_cast_(self, tensor: Any) -> Any:
         if isinstance(tensor, list):
@@ -1103,6 +1103,8 @@ class PurePythonTensorOperations(AbstractTensor):
 
     def mean_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self.data
+        if dim is not None and dim < 0:
+            dim += len(_get_shape(data))
         def _mean(lst):
             flat = _flatten(lst)
             return sum(flat) / len(flat) if flat else 0.0
@@ -1134,6 +1136,8 @@ class PurePythonTensorOperations(AbstractTensor):
 
     def sum_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self.data
+        if dim is not None and dim < 0:
+            dim += len(_get_shape(data))
         def _sum(lst):
             flat = _flatten(lst)
             return sum(flat)
@@ -1163,6 +1167,8 @@ class PurePythonTensorOperations(AbstractTensor):
         return reduce_dim(data, dim)
     def min_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self.data
+        if dim is not None and dim < 0:
+            dim += len(_get_shape(data))
         def _min(lst):
             flat = _flatten(lst)
             return min(flat) if flat else 0.0
@@ -1427,6 +1433,8 @@ class PurePythonTensorOperations(AbstractTensor):
 
     def argmin_(self, tensor: Any, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self._AbstractTensor__unwrap(tensor)
+        if dim is not None and dim < 0:
+            dim += len(_get_shape(data))
         def _argmin(lst):
             flat = _flatten(lst)
             return flat.index(min(flat)) if flat else 0

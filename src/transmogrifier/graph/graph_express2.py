@@ -4,8 +4,11 @@ import numpy as np
 import ast
 import importlib
 import inspect
+import math
 import os
+import pickle
 import textwrap
+import types
 from typing import Any
 from sympy import Sum, IndexedBase, Idx, symbols, Function
 from ...compiler.bitops import BitTensorMemoryGraph
@@ -14,6 +17,11 @@ from ..solver_types import Operation, NodeSet, Node, READWRITE, DomainNode, Edge
 from ..operator_defs import default_funcs, operator_signatures, role_schemas
 from ..ilpscheduler import ILPScheduler
 from ..function_table import ExternalFunctionTable, FunctionTable
+from .node_special_cases import (
+    interpret_special_case,
+    dissolve_spans,
+    tensor_operation_name,
+)
 import colorsys
 import random
 import time
@@ -140,6 +148,61 @@ def _source_ast_definition(value):
     )
 
 
+def _attach_external_methods(retained_class, definition):
+    """Materialise methods bound onto a class outside its own body.
+
+    ``AbstractTensor.reshape = _reshape_methods.reshape`` in the defining
+    module makes ``reshape`` a real method whose ``def`` lives in another
+    file, so ingesting the class's own source text alone never sees it and
+    the whole aliased family is missing from every downstream method table.
+    Pull each such function's own definition in under the attribute name it
+    was bound to, so it becomes an ordinary method of the retained class.
+    Only a plain name or dotted reference is treated as a bound method; a
+    literal or call result is an ordinary class attribute, not an alias.
+    """
+
+    if not isinstance(definition, ast.ClassDef):
+        return definition
+    module = inspect.getmodule(retained_class)
+    if module is None:
+        return definition
+    try:
+        module_tree = ast.parse(inspect.getsource(module))
+    except (OSError, TypeError, SyntaxError):
+        return definition
+    present = {
+        member.name
+        for member in definition.body
+        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for statement in module_tree.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        if not isinstance(statement.value, (ast.Name, ast.Attribute)):
+            continue
+        for target in statement.targets:
+            if (
+                not isinstance(target, ast.Attribute)
+                or not isinstance(target.value, ast.Name)
+                or target.value.id != retained_class.__name__
+                or target.attr in present
+            ):
+                continue
+            method = _source_ast_definition(
+                getattr(retained_class, target.attr, None)
+            )
+            if not isinstance(
+                method, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                continue
+            # The bound attribute name is the method's name here; the source
+            # function may have been defined under a different one.
+            method.name = target.attr
+            definition.body.append(method)
+            present.add(target.attr)
+    return definition
+
+
 def _filter_discovered_definition(definition, module):
     """Discard unreferenced class surface before recursive discovery."""
 
@@ -199,6 +262,32 @@ def _filter_discovered_definition(definition, module):
     return ast.copy_location(filtered, definition)
 
 
+def instance_attribute_slot(attributes, attribute_name):
+    """The deterministic instance-storage slot for one class field, or ``None``.
+
+    ``attributes`` is a ``class_schema["attributes"]``-shaped sequence (see
+    ``_class_schema_from_ast``): each item has ``name``/``storage``, in
+    source declaration order.  Every ``storage == "instance"`` attribute
+    gets the next integer, in that order -- the single authoritative
+    computation both ``build_class_navigation_table``
+    (``shell_reference_tables.py``) and ingestion-time attribute-operator
+    construction (``topological_reducer.py``'s ``bind_target``/
+    ``resolve_expression``) must share, so a field's real position in its
+    class's layout is computed exactly once, not reimplemented twice with
+    room to drift.  Returns ``None`` for a class-level or method member --
+    those are not instance storage and have no slot.
+    """
+
+    slot = 0
+    for attribute in attributes:
+        if str(attribute["storage"]) != "instance":
+            continue
+        if str(attribute["name"]) == attribute_name:
+            return slot
+        slot += 1
+    return None
+
+
 def _class_schema_from_ast(definition):
     """Record only class syntax already being ingested by ``ProcessGraph``.
 
@@ -222,11 +311,11 @@ def _class_schema_from_ast(definition):
             "permissions": (),
         })
 
-    methods = [
-        member
-        for member in definition.body
-        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
+    methods_by_name = {}
+    for member in definition.body:
+        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            methods_by_name[member.name] = member
+    methods = list(methods_by_name.values())
     for member in definition.body:
         if isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
             add_attribute(member.target.id, member.annotation, "class")
@@ -250,8 +339,15 @@ def _class_schema_from_ast(definition):
                     and target.value.id == "self"
                 ):
                     add_attribute(target.attr, annotation, "instance")
+    source_identity = getattr(definition, "_python_source_identity", None)
+    class_identity = (
+        ".".join(part for part in source_identity if part)
+        if source_identity is not None
+        else definition.name
+    )
     return {
         "class_name": definition.name,
+        "class_identity": class_identity,
         "class_node_id": id(definition),
         "permissions": (),
         "attributes": tuple(attributes),
@@ -450,24 +546,28 @@ def _map_ir_from_ast(tree):
 
 
 class _RuntimeAnnAssignNormalizer(ast.NodeTransformer):
-    """Separate local annotation schema from executable assignment logic."""
+    """Translate annotation syntax to the ordinary assignment operator.
 
-    def __init__(self):
-        self.function_depth = 0
+    Only inside executable bodies. A class body's own ``AnnAssign`` is its
+    field schema -- name, type, default -- which the class-table builder
+    reads directly off the untouched ``ClassDef`` AST later. Recursing into
+    it here would silently erase every locally-defined dataclass's field
+    list (``fields``/``field_defaults``) before anything ever reads it, so
+    ``visit_ClassDef`` normalizes each method body without touching the
+    class's own direct-child statements.
+    """
 
-    def visit_FunctionDef(self, node):
-        self.function_depth += 1
-        try:
-            return self.generic_visit(node)
-        finally:
-            self.function_depth -= 1
-
-    visit_AsyncFunctionDef = visit_FunctionDef
+    def visit_ClassDef(self, node):
+        node.body = [
+            self.visit(member)
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            else member
+            for member in node.body
+        ]
+        return node
 
     def visit_AnnAssign(self, node):
         node = self.generic_visit(node)
-        if not self.function_depth:
-            return node
         if node.value is None:
             return ast.copy_location(ast.Pass(), node)
         return ast.copy_location(
@@ -593,6 +693,68 @@ def _import_ast_bindings(tree, bindings, package=None):
     return resolved
 
 
+def _heat_escape(level: int) -> str:
+    """An ANSI truecolor escape that gets warmer and brighter every level
+    the upward search climbs -- cool blue at the first pass, through
+    yellow, to hot white the deeper it has to go looking for a definition
+    this ``while True:`` loop was never given a constant bound to stop at."""
+
+    t = max(0.0, min(level / 8.0, 1.0))
+    if t < 0.5:
+        u = t / 0.5
+        r, g, b = int(70 + u * 185), int(120 + u * 135), int(220 - u * 170)
+    else:
+        u = (t - 0.5) / 0.5
+        r, g, b = 255, int(255 - u * 55) if u < 1 else 255, int(50 + u * 205)
+    return f"\x1b[1m\x1b[38;2;{r};{g};{b}m"
+
+
+_HEAT_RESET = "\x1b[0m"
+
+
+def _depth_escape(depth: int) -> str:
+    """The downward counterpart to ``_heat_escape``: green through cyan to
+    violet, deepening (not brightening) the further this descends into a
+    just-discovered definition's own nested functions/classes. Cool/violet
+    for descent, warm/bright for the upward search -- the two are never
+    mistakable for each other even color-blind, because they also use
+    different marker glyphs (``v`` vs ``!``)."""
+
+    t = max(0.0, min(depth / 6.0, 1.0))
+    if t < 0.5:
+        u = t / 0.5
+        r, g, b = int(60 + u * 20), int(190 - u * 10), int(110 + u * 110)
+    else:
+        u = (t - 0.5) / 0.5
+        r, g, b = int(80 + u * 120), int(180 - u * 130), int(220 + u * 15)
+    return f"\x1b[1m\x1b[38;2;{r};{g};{b}m"
+
+
+def _safe_repr(value, *, max_length=180):
+    if value is None:
+        return "None"
+    try:
+        text = repr(value)
+    except Exception as exc:
+        return f"<repr-error {exc!r}>"
+    if len(text) > max_length:
+        return text[: max_length - 3] + "..."
+    return text
+
+
+def _walk_definitions_with_depth(node, depth=1):
+    """Yield ``(member, depth)`` for every nested FunctionDef/AsyncFunctionDef
+    /ClassDef inside ``node``, depth-first, unlike ``ast.walk`` which gives
+    no depth at all. Depth 1 is a direct child definition of ``node``."""
+
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            yield child, depth
+            yield from _walk_definitions_with_depth(child, depth + 1)
+        else:
+            yield from _walk_definitions_with_depth(child, depth)
+
+
 def _expand_unresolved_ast_parents(
     tree,
     bindings,
@@ -600,12 +762,30 @@ def _expand_unresolved_ast_parents(
     package=None,
     include=None,
     profile_verbose=False,
+    progress=None,
 ):
     """Discover missing source definitions and return AST parent links.
 
     The returned definitions are ordinary AST objects.  They are subsequently
     ingested by ``ProcessGraph.build_graph``; no callable is installed in a
     function table or deferred to runtime.
+
+    ``progress``, if given, is called once per node discovered by the
+    upward search with one already-colored, already-``!``-decorated line.
+    The color and exclamation count both scale with ``pass_index`` -- this
+    loop is a genuine ``while True:``, not bounded by any constant depth,
+    and each additional pass means the search climbed one level further
+    looking for a source definition that was not where the previous pass
+    expected it.
+
+    Also returns ``root_bindings`` -- ``bindings`` plus every name this
+    call actually resolved via real imports (``_import_ast_bindings``,
+    ``importlib.import_module`` against ``package``).  The caller must
+    store it back onto ``self.python_bindings`` for later stages (name
+    resolution during reduction, ``static_bindings`` in
+    ``topological_reducer.py``) to see it -- this function's own use of
+    it (discovering additional source definitions) is real but internal,
+    and previously never escaped this call at all.
     """
 
     if isinstance(tree, ast.Module):
@@ -613,6 +793,12 @@ def _expand_unresolved_ast_parents(
     else:
         module = ast.Module(body=[tree], type_ignores=[])
         ast.fix_missing_locations(module)
+
+    def emit(message):
+        if profile_verbose:
+            print(message, flush=True)
+        if progress is not None:
+            progress(message)
 
     root_bindings = _import_ast_bindings(module, bindings, package=package)
     # Resolution context belongs to the definition containing a call.  Never
@@ -701,9 +887,18 @@ def _expand_unresolved_ast_parents(
                     node.func.value,
                     call_bindings,
                 )
+            emit(
+                f"[ast-parent] call line={getattr(node, 'lineno', '?')} col={getattr(node, 'col_offset', '?')} "
+                f"resolving {call_name or '<unknown>'} -> {identity[1]} "
+                f"source={_safe_repr(getattr(node.func, 'id', None) or getattr(node.func, 'attr', None) or getattr(node.func, 'name', None))}"
+            )
             source_definition = _source_ast_definition(source_target)
             if source_definition is None:
                 unavailable_identities.add(identity)
+                emit(
+                    f"[ast-parent] unresolved source for {identity[1]} "
+                    f"reason=source_unavailable"
+                )
                 continue
             process_graph_boundary = getattr(
                 source_target,
@@ -725,20 +920,45 @@ def _expand_unresolved_ast_parents(
                 source_definition,
                 module,
             )
+            # The AST node's short ``name`` is insufficient once an unbounded
+            # closure contains same-named definitions from different modules.
+            # Preserve the exact live Python identity used to discover it;
+            # later map/function tables can qualify without retaining the
+            # callable itself.
+            source_definition._python_source_identity = identity
 
             module.body.append(source_definition)
-            new_definitions = [
-                member
-                for member in ast.walk(source_definition)
-                if isinstance(
-                    member,
-                    (
-                        ast.FunctionDef,
-                        ast.AsyncFunctionDef,
-                        ast.ClassDef,
-                    ),
+            emit(
+                f"[ast-parent] discovered definition {getattr(source_definition, 'name', identity)!r} "
+                f"from {identity[1]} pass={pass_index} "
+                f"kind={type(source_definition).__name__} line={getattr(source_definition, 'lineno', '?')}"
+            )
+            if progress is not None:
+                bang = "!" * min(pass_index, 12)
+                progress(
+                    f"{_heat_escape(pass_index)}[upward search L{pass_index}]{bang} "
+                    f"found {getattr(source_definition, 'name', identity)!r} "
+                    f"(unbounded -- no constant depth limit){bang}{_HEAT_RESET}"
                 )
-            ]
+            # ``source_definition`` itself is included first, matching what
+            # ``ast.walk(source_definition)`` used to yield before this loop
+            # tracked depth -- it is the node the upward search just found,
+            # already logged above, not a downward descent in its own right.
+            new_definitions = [source_definition]
+            for member, member_depth in _walk_definitions_with_depth(source_definition):
+                new_definitions.append(member)
+                emit(
+                    f"[ast-parent] nested {type(member).__name__} {getattr(member, 'name', '?')!r} "
+                    f"depth={member_depth} inside {getattr(source_definition, 'name', identity)!r} "
+                    f"line={getattr(member, 'lineno', '?')}"
+                )
+                if progress is not None:
+                    arrows = "v" * min(member_depth, 12)
+                    progress(
+                        f"{_depth_escape(member_depth)}[downward descent D{member_depth}]{arrows} "
+                        f"found {getattr(member, 'name', '?')!r} nested inside "
+                        f"{getattr(source_definition, 'name', identity)!r}{arrows}{_HEAT_RESET}"
+                    )
             definitions.extend(new_definitions)
             for new_definition in new_definitions:
                 definitions_by_name.setdefault(
@@ -819,6 +1039,9 @@ def _expand_unresolved_ast_parents(
             if len(candidates) == 1:
                 definition = candidates[0]
         if definition is not None and definition is not call:
+            emit(
+                f"[ast-parent] linked parent {getattr(definition, 'name', '?')!r} -> call line={getattr(call, 'lineno', '?')}"
+            )
             parent_links.append((definition, call))
             continue
         if isinstance(call.func, ast.Name):
@@ -842,6 +1065,9 @@ def _expand_unresolved_ast_parents(
             reason = "source_unavailable"
         else:
             reason = "missing_source_parent"
+        emit(
+            f"[ast-parent] unresolved call {unresolved_name!r} line={getattr(call, 'lineno', '?')} reason={reason}"
+        )
         unresolved_calls.append(
             {
                 "name": unresolved_name,
@@ -860,7 +1086,7 @@ def _expand_unresolved_ast_parents(
             f"elapsed={time.perf_counter() - started:.3f}s",
             flush=True,
         )
-    return module, tuple(parent_links), tuple(unresolved_calls)
+    return module, tuple(parent_links), tuple(unresolved_calls), root_bindings
 
 
 def _resolve(val):
@@ -1029,6 +1255,9 @@ class ProcessGraph:
         )
         self.levels = {}
         self.node_map = {}
+        self._graph_profile_verbose = False
+        self._graph_build_counter = 0
+        self._graph_progress = None
         # integer level for recombinatorics aggressiveness: 0=no, higher unlock more transforms
         self.recombinatorics_level = recombinatorics_level
         self.expand_complex = expand_complex
@@ -1046,6 +1275,134 @@ class ProcessGraph:
             if external_function_table is None
             else external_function_table
         )
+
+    def __getstate__(self):
+        """Serialize compiler state without live synchronization observers."""
+
+        state = dict(self.__dict__)
+        serialized_bindings = {}
+        for name, value in (state.get("python_bindings") or {}).items():
+            if isinstance(value, types.ModuleType):
+                serialized_bindings[name] = ("module", value.__name__)
+                continue
+            module = getattr(value, "__module__", None)
+            qualname = getattr(value, "__qualname__", None)
+            if module and qualname and "<locals>" not in str(qualname):
+                serialized_bindings[name] = (
+                    "qualified",
+                    str(module),
+                    str(qualname),
+                )
+                continue
+            try:
+                serialized_bindings[name] = (
+                    "pickle",
+                    pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL),
+                )
+            except Exception:
+                # Live interpreter state (ContextVar, locks, active contexts)
+                # and local closures are not compiler state and are resolved
+                # again from imported source bindings when needed.  CPython's
+                # pickle reports local functions as AttributeError rather
+                # than PicklingError, so every ordinary serialization failure
+                # means this binding is not checkpointable.
+                continue
+        state["python_bindings"] = serialized_bindings
+        for name in (
+            "_graph_lock",
+            "_graph_condition",
+            "_graph_accessor",
+            "_graph_subscribers",
+            "_evolution_metagraph",
+            "_evolution_graph",
+            "_graph_progress",
+        ):
+            state.pop(name, None)
+        return state
+
+    def __setstate__(self, state):
+        """Restore a checkpoint as an independent live ProcessGraph."""
+
+        self.__dict__.update(state)
+        restored_bindings = {}
+        for name, descriptor in (
+            self.__dict__.get("python_bindings") or {}
+        ).items():
+            try:
+                if descriptor[0] == "module":
+                    value = importlib.import_module(descriptor[1])
+                elif descriptor[0] == "qualified":
+                    value = importlib.import_module(descriptor[1])
+                    for part in descriptor[2].split("."):
+                        value = getattr(value, part)
+                elif descriptor[0] == "pickle":
+                    value = pickle.loads(descriptor[1])
+                else:
+                    continue
+            except (ImportError, AttributeError, TypeError, ValueError):
+                continue
+            restored_bindings[name] = value
+        self.python_bindings = restored_bindings
+        self._graph_lock = threading.RLock()
+        self._graph_condition = threading.Condition(self._graph_lock)
+        self._graph_subscribers = []
+        self._graph_accessor = ProcessGraphAccessor(self)
+        self._evolution_metagraph = None
+        self._evolution_graph = None
+        self._graph_progress = None
+
+    def _safe_repr(self, value, *, max_length=180):
+        return _safe_repr(value, max_length=max_length)
+
+    def _node_debug_summary(self, node):
+        if isinstance(node, ast.AST):
+            parts = []
+            if hasattr(node, "lineno") and getattr(node, "lineno", None) is not None:
+                parts.append(f"line={node.lineno}")
+            if hasattr(node, "col_offset") and getattr(node, "col_offset", None) is not None:
+                parts.append(f"col={node.col_offset}")
+            if isinstance(node, ast.Constant):
+                parts.append(f"value={self._safe_repr(node.value)}")
+            elif isinstance(node, ast.Name):
+                parts.append(f"id={node.id}")
+            elif isinstance(node, ast.Attribute):
+                parts.append(f"attr={node.attr}")
+            elif isinstance(node, ast.Call):
+                func_kind = type(node.func).__name__
+                parts.append(f"func={func_kind}")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                parts.append(f"body={len(node.body)}")
+            if hasattr(node, "name") and getattr(node, "name", None) not in {None, ""}:
+                parts.append(f"name={node.name}")
+            if hasattr(node, "value") and not isinstance(node.value, ast.AST):
+                parts.append(f"value={self._safe_repr(node.value)}")
+            if hasattr(node, "arg") and getattr(node, "arg", None) not in {None, ""}:
+                parts.append(f"arg={node.arg}")
+            if hasattr(node, "id") and getattr(node, "id", None) not in {None, ""}:
+                parts.append(f"id={node.id}")
+            return " | ".join(parts) if parts else type(node).__name__
+
+        parts = []
+        for attr in ("name", "id", "arg", "value", "label"):
+            candidate = getattr(node, attr, None)
+            if candidate is None:
+                continue
+            if isinstance(candidate, (str, int, float, bool)) or candidate is None:
+                parts.append(f"{attr}={self._safe_repr(candidate)}")
+            elif not isinstance(candidate, (list, tuple, dict, set)):
+                parts.append(f"{attr}={self._safe_repr(candidate)}")
+        if not parts:
+            parts.append(self._safe_repr(node))
+        return " | ".join(parts)
+
+    def _emit_graph_build_log(self, message: str, *, progress=None) -> None:
+        """Emit verbose compiler progress for each ingested AST item."""
+
+        if self._graph_profile_verbose:
+            print(message, flush=True)
+        sink = progress if progress is not None else self._graph_progress
+        if sink is not None:
+            sink(message)
 
     def graph_accessor(self) -> ProcessGraphAccessor:
         """Return the stable accessor used by live compilation observers."""
@@ -1221,30 +1578,58 @@ class ProcessGraph:
                 self.G.nodes[tgt_id]['parents'].append((src_id, consumer_role))
             self.observe_evolution_edge(src_id, tgt_id, consumer_role)
 
-    def _recurse_spec(self, nid, args, spec, direction, store_id=None, schema_repeats=None, role_indices=None):
+    def _recurse_spec(self, nid, args, spec, direction, store_id=None, schema_repeats=None, role_indices=None, progress=None):
         # For each role in spec, use the role_indices and a counter (schema_repeats) to determine which arg to use.
-        
+
         if os.environ.get("TURING_GRAPH_BUILD_VERBOSE", "").strip().lower() in {
             "1", "true", "yes", "on",
         }:
             print(spec.items())
-        
+
         for role, param in spec.items():
             if param == 1:
-                idx = role_indices[role][ schema_repeats.get(role, 0) ]
+                idx = role_indices[role][schema_repeats.get(role, 0)]
                 schema_repeats[role] = schema_repeats.get(role, 0) + 1
                 if direction == 'down':
-                    self.build_graph(args[idx], producer_id=nid, producer_role=role, consumer_role=f"arg{idx}", store_id=store_id)
+                    self.build_graph(
+                        args[idx],
+                        producer_id=nid,
+                        producer_role=role,
+                        consumer_role=f"arg{idx}",
+                        store_id=store_id,
+                        progress=progress,
+                    )
                 else:
-                    self.build_graph(args[idx], consumer_id=nid, producer_role="output", consumer_role=role, store_id=store_id)
+                    self.build_graph(
+                        args[idx],
+                        consumer_id=nid,
+                        producer_role="output",
+                        consumer_role=role,
+                        store_id=store_id,
+                        progress=progress,
+                    )
             elif param == 'many':
                 indices = role_indices[role]
                 # Use all remaining indices for this role.
                 for idx in indices[schema_repeats.get(role, 0):]:
                     if direction == 'down':
-                        self.build_graph(args[idx], producer_id=nid, producer_role=role, consumer_role=f"arg{idx}", store_id=store_id)
+                        self.build_graph(
+                            args[idx],
+                            producer_id=nid,
+                            producer_role=role,
+                            consumer_role=f"arg{idx}",
+                            store_id=store_id,
+                            progress=progress,
+                        )
                     else:
-                        self.build_graph(args[idx], consumer_id=nid, producer_role="output", consumer_role=role, store_id=store_id)
+                        self.build_graph(
+                            args[idx],
+                            consumer_id=nid,
+                            producer_role="output",
+                            consumer_role=role,
+                            store_id=store_id,
+                            progress=progress,
+                        )
                 schema_repeats[role] = len(indices)
             elif isinstance(param, tuple):
                 num = param[1] if len(param) == 2 else param[0]
@@ -1253,16 +1638,47 @@ class ProcessGraph:
                     idx = indices[schema_repeats.get(role, 0)]
                     schema_repeats[role] = schema_repeats.get(role, 0) + 1
                     if direction == 'down':
-                        self.build_graph(args[idx], producer_id=nid, producer_role=role, consumer_role=f"arg{idx}", store_id=store_id)
+                        self.build_graph(
+                            args[idx],
+                            producer_id=nid,
+                            producer_role=role,
+                            consumer_role=f"arg{idx}",
+                            store_id=store_id,
+                            progress=progress,
+                        )
                     else:
-                        self.build_graph(args[idx], consumer_id=nid, producer_role="output", consumer_role=role, store_id=store_id)
+                        self.build_graph(
+                            args[idx],
+                            consumer_id=nid,
+                            producer_role="output",
+                            consumer_role=role,
+                            store_id=store_id,
+                            progress=progress,
+                        )
         # ...existing code...
 
-    def build_graph(self, node, producer_id=None, consumer_id=None, producer_role=None, consumer_role=None, store_id=None):
+    def build_graph(self, node, producer_id=None, consumer_id=None, producer_role=None, consumer_role=None, store_id=None, progress=None):
         if not self.domain_shape:
             self.domain_shape = (1,)
 
+        self._graph_build_counter += 1
         nid, already_defined = self.ensure_node(node, store_id)
+        node_type = type(node).__name__
+        location = ""
+        if isinstance(node, ast.AST):
+            location = (
+                f" line={getattr(node, 'lineno', '?')} col={getattr(node, 'col_offset', '?')}"
+            )
+        if hasattr(node, "name") and getattr(node, "name", None) not in {None, ""}:
+            location += f" name={node.name}"
+        detail = self._node_debug_summary(node)
+        self._emit_graph_build_log(
+            f"[graph-build #{self._graph_build_counter}] {node_type}{location} "
+            f"nid={nid} already_defined={already_defined} "
+            f"producer={producer_role or '-'} consumer={consumer_role or '-'} "
+            f"details={detail}",
+            progress=progress,
+        )
         if already_defined:
             # just hook up to parents or consumers and exit
             if producer_id is not None:
@@ -1271,7 +1687,58 @@ class ProcessGraph:
                 self.connect(nid, consumer_id, producer_role, consumer_role, store_id)
             return nid
 
-        node_type = type(node).__name__
+        # Both the AST and SymPy front ends converge here (dispatch is on
+        # ``type(node).__name__``).  A span dissolved at the ingestion seam
+        # arrives carrying its resolved decision on ``_special_case``;
+        # anything else is classified now by the same switch.
+        special = getattr(node, "_special_case", None)
+        if special is None:
+            special = interpret_special_case(node)
+        if special is not None:
+            data = self.G.nodes[nid]
+            data["type"] = special.type
+            data["op"] = special.type
+            data["attributes"] = special.attributes
+            data["extra_args"] = special.attributes
+            data["constant"] = special.constant
+            if special.type == "GetAttr" and isinstance(node, ast.Attribute):
+                # The GetAttr shortcut classifies this node without walking
+                # the normal schema-descent below -- but the receiver
+                # (``node.value``) is still this node's real operand.  A
+                # bare-Name receiver was tolerated without this (resolved on
+                # demand elsewhere, by lexical lookup), but a compound
+                # receiver -- another attribute access, a call, ... -- has
+                # no such fallback: skipping this recursion left it with no
+                # graph node at all, so nothing downstream could ever wire
+                # its own receiver to it.
+                self.build_graph(
+                    node.value,
+                    consumer_id=nid,
+                    producer_role="output",
+                    consumer_role="value",
+                    store_id=store_id,
+                    progress=progress,
+                )
+            if producer_id is not None:
+                self.connect(producer_id, nid, producer_role, consumer_role, store_id)
+            if consumer_id is not None:
+                self.connect(nid, consumer_id, producer_role, consumer_role, store_id)
+            if producer_id is None and consumer_id is None:
+                self.roots.append(nid)
+            return nid
+
+        # A call whose callee names an authoritative tensor operation is
+        # flagged here, without collapsing it, so a downstream off-tensor
+        # target can find and unroll reductions before serialization.
+        tensor_op = tensor_operation_name(node)
+        if tensor_op is not None:
+            data = self.G.nodes[nid]
+            attributes = data.get("attributes")
+            if attributes is None:
+                attributes = {}
+                data["attributes"] = attributes
+            attributes["tensor"] = tensor_op
+
         schema = self.role_schemas.get(node_type, None)
         # Graph ingestion can visit thousands of nodes.  Dumping every Python
         # object here is neither shell profiling nor progress reporting: the
@@ -1336,11 +1803,11 @@ class ProcessGraph:
             if graph_build_verbose:
                 print(f"[build_graph] Node {nid} ({node_type}) has schema: {schema}")
             # Pass along repeat_counter and role_indices to _recurse_spec.
-            self._recurse_spec(nid, args, schema.get('up', {}), direction='up', store_id=store_id, schema_repeats=repeat_counter, role_indices=role_indices)
-            self._recurse_spec(nid, args, schema.get('down', {}), direction='down', store_id=store_id, schema_repeats=repeat_counter, role_indices=role_indices)
+            self._recurse_spec(nid, args, schema.get('up', {}), direction='up', store_id=store_id, schema_repeats=repeat_counter, role_indices=role_indices, progress=progress)
+            self._recurse_spec(nid, args, schema.get('down', {}), direction='down', store_id=store_id, schema_repeats=repeat_counter, role_indices=role_indices, progress=progress)
         else:
             for idx, arg in enumerate(args):
-                self.build_graph(arg, consumer_id=nid, producer_role="output", consumer_role=f'arg{idx}', store_id=store_id)
+                self.build_graph(arg, consumer_id=nid, producer_role="output", consumer_role=f'arg{idx}', store_id=store_id, progress=progress)
 
         # now that we've fully resolved, connect this node in the context given
         if producer_id is not None:
@@ -1414,10 +1881,33 @@ class ProcessGraph:
         resolve_unresolved_parents=False,
         parent_bindings=None,
         parent_include=None,
+        retain=(),
         profile_verbose=False,
+        progress=None,
         **kwargs,
     ):
-        """Import Python source as a structural AST ProcessGraph."""
+        """Import Python source as a structural AST ProcessGraph.
+
+        NOT the compiler entrypoint. This is one frontend step -- it builds
+        the raw structural graph and nothing past it: no global/free-name
+        binding, no control/region splitting (if/for/raise/comprehensions
+        stay unresolved AST-node placeholders), no scheduling. Calling this
+        directly and then handing the result to
+        transmogrifier.ssa_builder.process_graph_to_ssa_instrs will "succeed"
+        (no exception) while silently emitting garbage ops for anything
+        beyond straight-line scalar expressions -- verified by trying it on
+        a real function from amd64_machine_semantics.py, which produced
+        Instr(op='<ast.Name object at 0x...>', args=[]) for most nodes.
+
+        For real compilation of a Python function -- including control flow
+        -- use
+        src.common.tensors.accelerator_backends.aot_compile.compile_ast_aot,
+        which calls this method internally as one step of a real pipeline
+        (global/free-name binding via ``python_bindings``, control/region
+        splitting through control_source.ControlProgram, scheduling). Pass
+        ``precompile_only=True`` to plan without requiring an installed
+        runtime.
+        """
         import os
 
         supplied_ast = isinstance(node_or_path, ast.AST)
@@ -1437,25 +1927,90 @@ class ProcessGraph:
                 "build_from_ast expects an AST node, a filename, or a source string"
             )
 
+        retained = () if retain is None else (
+            (retain,) if inspect.isclass(retain) else tuple(retain)
+        )
+        retained_identities = []
+        existing_classes = {
+            definition.name
+            for definition in getattr(tree, "body", ())
+            if isinstance(definition, ast.ClassDef)
+        }
+        for retained_class in retained:
+            if not inspect.isclass(retained_class):
+                raise TypeError(
+                    "retain expects a class object or an iterable of class objects"
+                )
+            identity = retained_class.__name__
+            retained_identities.append(identity)
+            if identity in existing_classes:
+                continue
+            definition = _source_ast_definition(retained_class)
+            if not isinstance(definition, ast.ClassDef):
+                raise ValueError(
+                    f"cannot ingest retained class {retained_class!r}: "
+                    "source is unavailable"
+                )
+            definition = _attach_external_methods(retained_class, definition)
+            tree.body.append(definition)
+            existing_classes.add(identity)
+
+        # Dissolve recognised spans at the seam -- before parent-expansion, IR
+        # mapping, state-machine planning, and the normalizer each walk the
+        # tree -- so a repr-expanded feed array is collapsed exactly once and
+        # never seen expanded again by any downstream pass.
+        tree = dissolve_spans(tree)
+
         parent_links = ()
         unresolved_calls = ()
+        self._graph_profile_verbose = bool(profile_verbose) or bool(
+            os.environ.get("TURING_GRAPH_BUILD_VERBOSE", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._graph_progress = progress
+        self._graph_build_counter = 0
         if resolve_unresolved_parents:
             bindings = dict(getattr(self, "python_bindings", {}) or {})
             bindings.update(parent_bindings or {})
-            tree, parent_links, unresolved_calls = (
+            tree, parent_links, unresolved_calls, root_bindings = (
                 _expand_unresolved_ast_parents(
                 tree,
                 bindings,
                     package=getattr(self, "python_package", None),
                     include=parent_include,
                     profile_verbose=profile_verbose,
+                    progress=progress,
                 )
             )
+            # The real imports this just resolved (importlib, against
+            # ``python_package``) previously never left this call --
+            # ``static_bindings`` (topological_reducer.py), the actual
+            # lookup an ordinary Name resolves against, only ever saw
+            # whatever ``python_bindings`` the caller supplied up front,
+            # never anything discovered here.  A name imported by the
+            # source itself (``from .machine_path_forest import
+            # MachinePathHeadStatus``) was real and resolved, just
+            # discarded before reduction could ever see it.
+            self.python_bindings = root_bindings
 
         # Preserve class declarations as schema metadata beside the exact AST
         # nodes ProcessGraph is about to ingest; do not create a second AST
         # ingestion path or infer process topology from them.
         self.G.graph["map_ir"] = _map_ir_from_ast(tree)
+        if retained_identities:
+            self.G.graph["map_ir"]["selected_class_identities"] = tuple(
+                dict.fromkeys(retained_identities)
+            )
+        # A name being a locally-defined class is a fact about the source,
+        # known the moment ``map_ir`` sees its ``ClassDef`` -- not something
+        # later passes should rediscover (or, absent that, fall through to
+        # treating the name as an unresolved external). Publish it here,
+        # once, so every later stage that creates or resolves a call to
+        # this name reads the same authoritative answer.
+        self.G.graph["class_definitions"] = frozenset(
+            str(item["class_name"])
+            for item in self.G.graph["map_ir"].get("objects", ())
+        )
         from ...compiler.state_machine_ast import plan_marked_state_machines
         state_machine_plans, state_machine_shortfalls = (
             plan_marked_state_machines(tree)
@@ -1480,7 +2035,7 @@ class ProcessGraph:
                 flush=True,
             )
             build_started = time.perf_counter()
-        root = self.build_graph(tree, *args, **kwargs)
+        root = self.build_graph(tree, *args, progress=progress, **kwargs)
         if profile_verbose:
             print(
                 "[ast-build-profile] complete build_graph "
@@ -1576,23 +2131,49 @@ class ProcessGraph:
                 # Gather all incoming edges
                 incoming_edges = self.G.in_edges(nid, data=True)
                 index_symbols = []
+                numeric_indices = []
                 for src, tgt, data in incoming_edges:
                     if src in self.G.nodes:
                         src_node = self.G.nodes[src]
                         src_type = src_node['type']
                         if src_type in ('Symbol', 'Input', 'Var'):
                             dynamic = True
-                        
-                        index_symbols.append((src_node['label'], src_type))
+                        label = src_node['label']
+                        index_symbols.append((label, src_type))
+                        candidate = src_node.get('constant')
+                        if candidate is None:
+                            candidate = (src_node.get('attributes') or {}).get(
+                                'value'
+                            )
+                        if candidate is None and isinstance(
+                            src_node.get('expr_obj'), ast.Constant
+                        ):
+                            candidate = src_node['expr_obj'].value
+                        if candidate is None:
+                            candidate = label
+                        try:
+                            numeric = float(candidate)
+                        except (TypeError, ValueError, OverflowError):
+                            dynamic = True
+                        else:
+                            if not math.isfinite(numeric) or not numeric.is_integer():
+                                dynamic = True
+                            numeric_indices.append(numeric)
                 self.G.nodes[nid]['index_symbols'] = index_symbols
-                if not dynamic:
+                if not index_symbols:
+                    self.G.nodes[nid]['domain_shape'] = ()
+                elif not dynamic and len(numeric_indices) == len(index_symbols):
                     # If all indices are static, we can set a fixed domain shape
-                    # we just need the extents per dimension
-                    extents = [0] * len(index_symbols[0])  # default to 1 for
-                    for idx, (label, _) in enumerate(index_symbols):
-                        extents[idx] = (0, 0)
-                        extents[idx] = min(float(label), extents[idx][0]), max(float(label), extents[idx][1])
-                    domain_shape = tuple(extent[1] - extent[0] + 1 for extent in extents)
+                    # from zero through each integral coordinate.  Every
+                    # incoming index is one axis, not one row in a two-column
+                    # ``(label, type)`` table.
+                    extents = [
+                        (min(value, 0.0), max(value, 0.0))
+                        for value in numeric_indices
+                    ]
+                    domain_shape = tuple(
+                        int(extent[1] - extent[0] + 1) for extent in extents
+                    )
                     self.G.nodes[nid]['domain_shape'] = domain_shape
                 else:
                     # If dynamic, we cannot set a fixed shape, but we can track the symbols
@@ -1772,8 +2353,10 @@ class ProcessGraph:
                             "kwargs": dict(node.kwargs),
                             "arg_ids": tuple(node.args),
                             "out_obj_id": node.out_obj_id,
+                            "metadata": dict(node.metadata),
                         },
                         attributes=dict(node.kwargs),
+                        metadata=dict(node.metadata),
                         constant=None,
                         tensor=tensor,
                         bit_quanta=(

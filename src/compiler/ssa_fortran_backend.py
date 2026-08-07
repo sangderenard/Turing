@@ -28,7 +28,9 @@ common case here.
 
 from __future__ import annotations
 
+import math
 import shutil
+import struct
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -132,6 +134,9 @@ _UNARY: dict[str, str] = {
     "atanh": "atanh({0})",
     "trunc": "aint({0})",
     "copy": "{0}",
+    "isnan": "ieee_is_nan({0})",
+    "isfinite": "ieee_is_finite({0})",
+    "isinf": "(.not. ieee_is_finite({0}) .and. .not. ieee_is_nan({0}))",
     # Every other backend in the torture matrix reports a comparison as a
     # plain 0.0/1.0 double, not a native boolean -- callers compare outputs
     # with assert_allclose, not a boolean buffer.  Match that at the
@@ -171,7 +176,9 @@ _LOGICAL_UNARY = frozenset({"LNot", "Not", "logical_not", "bool_to_float64"})
 # Of those, the ones that also *produce* LOGICAL. bool_to_float64 is the
 # conversion itself: it consumes a mask and yields a number, so treating its
 # result as logical would convert what was just converted.
-_LOGICAL_RESULT_UNARY = frozenset({"LNot", "Not", "logical_not"})
+_LOGICAL_RESULT_UNARY = frozenset(
+    {"LNot", "Not", "logical_not", "isnan", "isfinite", "isinf"}
+)
 
 # Comparisons yield LOGICAL; everything else here yields a number.
 _COMPARISON = frozenset(
@@ -187,7 +194,10 @@ _COMPARISON = frozenset(
 # Operations that rearrange values without computing new ones, so the type of
 # the result is the type of what went in.
 _SHAPE_ONLY = frozenset(
-    {"slice", "reshape", "view", "permute", "stack", "concat", "scatter"}
+    {
+        "slice", "reshape", "view", "broadcast_to", "permute", "pad", "stack",
+        "concat", "gather", "scatter", "index_set", "repeat",
+    }
 )
 
 _REAL_OPERAND = frozenset(
@@ -230,7 +240,10 @@ def supported_tensor_operations() -> frozenset[str]:
         | frozenset(_UNARY)
         | frozenset(_REDUCTION)
         | _SHAPE_ONLY
-        | frozenset({"tensor_from_list", "where"})
+        | frozenset({
+            "tensor_from_list", "where", "fill", "zeros", "zeros_like",
+            "empty", "empty_like", "ones", "ones_like", "full", "full_like",
+        })
     )
     return frozenset(registered & CANONICAL_ABSTRACT_TENSOR_OPERATORS)
 
@@ -342,6 +355,15 @@ def _broadcast(
     if not expanding:
         return None
 
+    # A one-element array is semantically a scalar broadcast. SUM is the
+    # legal Fortran scalarisation for an arbitrary array expression; unlike
+    # appending ``(1)`` it also works when the producer was inlined.
+    if shape and _element_count(shape) == 1:
+        result = f"sum({expression})"
+        for position, target in enumerate(result_shape):
+            result = f"spread({result}, dim={position + 1}, ncopies={int(target)})"
+        return result
+
     # Only the operand's *own* extent-one dimensions need indexing away.
     # The dimensions alignment prepended do not exist on it, and SPREAD
     # introduces them; reshaping to the aligned rank first and then indexing
@@ -364,7 +386,12 @@ def _broadcast(
     return result
 
 
-def _array_literal(values: Sequence[Any], shape: tuple[int, ...]) -> str:
+def _array_literal(
+    values: Sequence[Any],
+    shape: tuple[int, ...],
+    *,
+    dtype: str = DEFAULT_DTYPE,
+) -> str:
     """A Fortran array constructor for an SSA array constant.
 
     Fortran expresses this natively: ``[a, b, c]`` is an array constructor,
@@ -377,7 +404,14 @@ def _array_literal(values: Sequence[Any], shape: tuple[int, ...]) -> str:
 
     elements = tuple(values)
     if not elements:
-        raise FortranEmissionError("cannot express an empty array constant")
+        kind = _DTYPE_KIND.get(dtype or DEFAULT_DTYPE)
+        if kind is None:
+            raise FortranEmissionError(f"no Fortran kind for dtype {dtype!r}")
+        constructor = f"[{kind} ::]"
+        if len(shape) <= 1:
+            return constructor
+        extents = ", ".join(str(int(size)) for size in shape)
+        return f"reshape({constructor}, [{extents}])"
     if len(set(elements)) == 1:
         return _literal(elements[0])
     constructor = "[" + ", ".join(_literal(element) for element in elements) + "]"
@@ -393,6 +427,11 @@ def _literal(value: Any) -> str:
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
+        if math.isnan(value):
+            return "ieee_value(0.0_c_double, ieee_quiet_nan)"
+        if math.isinf(value):
+            direction = "ieee_positive_inf" if value > 0 else "ieee_negative_inf"
+            return f"ieee_value(0.0_c_double, {direction})"
         text = repr(float(value))
         if "e" in text or "E" in text:
             mantissa, _, exponent = text.partition("e")
@@ -403,6 +442,33 @@ def _literal(value: Any) -> str:
             text += ".0"
         return f"{text}_c_double"
     raise FortranEmissionError(f"cannot express literal {value!r} in Fortran")
+
+
+def _llvm_literal(value: str) -> Any:
+    """Decode the scalar spelling retained by the LLVM-to-SSA importer."""
+
+    dtype, separator, token = str(value).strip().partition(" ")
+    if not separator:
+        raise FortranEmissionError(f"malformed LLVM literal {value!r}")
+    token = token.strip()
+    if dtype.startswith("i"):
+        if token in {"true", "false"}:
+            return token == "true"
+        return int(token, 0)
+    if dtype in {"half", "float", "double"}:
+        if token.casefold().startswith("0x"):
+            bits = token[2:]
+            if len(bits) == 8:
+                return struct.unpack(">f", bytes.fromhex(bits))[0]
+            if len(bits) == 16:
+                return struct.unpack(">d", bytes.fromhex(bits))[0]
+            raise FortranEmissionError(
+                f"unsupported LLVM floating bit pattern {token!r}"
+            )
+        return float(token)
+    raise FortranEmissionError(
+        f"unsupported LLVM literal type {dtype!r} in {value!r}"
+    )
 
 
 class _FunctionEmitter:
@@ -416,12 +482,21 @@ class _FunctionEmitter:
         outputs: Sequence[SSAValue] = (),
         callee_extents: Mapping[str, Sequence[str]] | None = None,
         callee_arity: Mapping[str, int] | None = None,
+        callee_inout_pairs: Mapping[
+            str, Sequence[tuple[int, int]]
+        ] | None = None,
     ):
         self.function = function
         self.dtype = dtype
         self.outputs = tuple(outputs)
         self.callee_extents = dict(callee_extents or {})
         self.callee_arity = dict(callee_arity or {})
+        self.callee_inout_pairs = {
+            str(name): tuple(pairs)
+            for name, pairs in (callee_inout_pairs or {}).items()
+        }
+        self._value_types: dict[int, SSAValue] = {}
+        self._infer_control_value_types()
         self.shortfalls: list[FortranShortfall] = []
         self._branch_targets: set[str] = set()
         # Single-use temporaries are substituted into their consumer so one SSA
@@ -437,10 +512,119 @@ class _FunctionEmitter:
         # Values emitted as part of a multi-instruction group (a region call,
         # an indexed store) rather than one at a time.
         self._consumed: set[int] = set()
-        self._address_producers: dict[int, tuple[SSAValue, SSAValue]] = {}
+        self._address_producers: dict[int, tuple[SSAValue, tuple[SSAValue, ...]]] = {}
+        self._mutated_arrays: set[int] = set()
         self._producers: dict[int, Instr] = {}
         # Collection value id -> the induction that indexes it.
         self._collections: dict[int, SSAValue] = {}
+
+    def _prefer_value_type(self, value: SSAValue) -> bool:
+        """Retain the richest known type for one SSA identity."""
+
+        current = self._value_types.get(int(value.id))
+        if current is None or (
+            not tuple(current.shape) and tuple(value.shape)
+        ):
+            self._value_types[int(value.id)] = value
+            return True
+        return False
+
+    def _typed(self, value: SSAValue) -> SSAValue:
+        return self._value_types.get(int(value.id), value)
+
+    def _infer_control_value_types(self) -> None:
+        """Propagate resident arena rank through aggregate calls and Phis."""
+
+        for value in (*self.function.args, *self.outputs):
+            self._prefer_value_type(value)
+        for block in self.function.blocks.values():
+            for instr in block.instrs:
+                for value in instr.args:
+                    self._prefer_value_type(value)
+                if instr.res is not None:
+                    self._prefer_value_type(instr.res)
+
+        # A region result paired with an input denotes that input's arena.
+        for block in self.function.blocks.values():
+            calls: dict[int, tuple[str, Sequence[SSAValue]]] = {}
+            addresses: dict[int, tuple[str, Sequence[SSAValue], int]] = {}
+            for instr in block.instrs:
+                if (
+                    instr.op in ("Call", "call")
+                    and instr.res is not None
+                    and instr.attributes.get("result_convention")
+                    == "ssa.aggregate"
+                ):
+                    calls[instr.res.id] = (
+                        str(instr.attributes.get("callee") or ""),
+                        instr.args,
+                    )
+                elif (
+                    instr.op == "GetElementPtr"
+                    and instr.res is not None
+                    and instr.args
+                    and instr.args[0].id in calls
+                ):
+                    position = instr.attributes.get("aggregate_index")
+                    if position is not None:
+                        callee, arguments = calls[instr.args[0].id]
+                        addresses[instr.res.id] = (
+                            callee,
+                            arguments,
+                            int(position),
+                        )
+                elif (
+                    instr.op in ("Load", "load")
+                    and instr.res is not None
+                    and instr.args
+                    and instr.args[0].id in addresses
+                ):
+                    callee, arguments, output_index = addresses[
+                        instr.args[0].id
+                    ]
+                    for input_index, paired_output in self.callee_inout_pairs.get(
+                        callee, ()
+                    ):
+                        if (
+                            int(paired_output) == output_index
+                            and int(input_index) < len(arguments)
+                        ):
+                            source = self._typed(arguments[int(input_index)])
+                            self._value_types[instr.res.id] = SSAValue(
+                                instr.res.id,
+                                source.dtype,
+                                tuple(source.shape),
+                                source.device,
+                                dict(source.accounting),
+                            )
+
+        # Loop-carried values can form Phi chains, so settle to a fixed point.
+        changed = True
+        while changed:
+            changed = False
+            for block in self.function.blocks.values():
+                for instr in block.instrs:
+                    if instr.op not in ("Phi", "phi") or instr.res is None:
+                        continue
+                    candidates = [self._typed(value) for value in instr.args]
+                    candidates.extend(
+                        self._typed(value)
+                        for _, value in (instr.attributes.get("incoming") or ())
+                    )
+                    shaped = next(
+                        (value for value in candidates if tuple(value.shape)),
+                        None,
+                    )
+                    if shaped is None or tuple(self._typed(instr.res).shape):
+                        continue
+                    self._value_types[instr.res.id] = SSAValue(
+                        instr.res.id,
+                        shaped.dtype,
+                        tuple(shaped.shape),
+                        shaped.device,
+                        dict(shaped.accounting),
+                    )
+                    changed = True
 
     # -- expression construction ------------------------------------------
     def _operand(self, value: SSAValue) -> str:
@@ -496,7 +680,10 @@ class _FunctionEmitter:
         operation = (
             consumer.attributes.get("tensor_operation") or consumer.op
         )
-        if operation in ("slice", "scatter", "cumsum"):
+        if operation in (
+            "slice", "gather", "scatter", "index_set", "pad", "cumsum",
+            "repeat",
+        ):
             return True
         if consumer.res is None:
             return False
@@ -538,20 +725,48 @@ class _FunctionEmitter:
         shape = instr.res.shape
         rank = len(shape)
 
-        if operation in _REDUCTION and "dim" in attributes and len(args) == 1:
+        reduction_axis = attributes.get("dim", attributes.get("axis"))
+        if operation == "extent" and len(args) == 1:
+            source_rank = len(instr.args[0].shape)
+            dim = int(attributes.get("dim", 0))
+            if source_rank == 0 or not (-source_rank <= dim < source_rank):
+                return None
+            return f"size({args[0]}, {(dim % source_rank) + 1})"
+        if (
+            operation in _REDUCTION
+            and reduction_axis is not None
+            and len(args) == 1
+        ):
             # Fortran reduces along one dimension natively. Arrays are
             # declared in SSA dimension order, so the axis needs no
             # translation; sum(a, dim=k) drops that dimension, and keepdim
             # asks for it back as an extent of one.
             source_rank = len(instr.args[0].shape)
-            axis = (int(attributes["dim"]) % source_rank) + 1
+            if isinstance(reduction_axis, (tuple, list)):
+                if len(reduction_axis) != 1:
+                    return None
+                reduction_axis = reduction_axis[0]
+            axis = (int(reduction_axis) % source_rank) + 1
             reduced = _REDUCTION[operation].format(
                 f"{args[0]}, dim={axis}"
             )
             if len(shape) == source_rank:
+                if source_rank == 1:
+                    return f"[{reduced}]"
                 extents = ", ".join(str(int(size)) for size in shape)
                 return f"reshape({reduced}, [{extents}])"
             return reduced
+
+        if (
+            operation in _REDUCTION
+            and len(args) == 1
+            and len(instr.args[0].shape) == 0
+        ):
+            # Reducing a scalar is the identity.  NumPy permits it (and may
+            # retain a singleton result shape); Fortran's reduction
+            # intrinsics require an array argument, while scalar assignment
+            # already broadcasts into a singleton destination.
+            return args[0]
 
         if operation in ("reshape", "view") and len(args) == 1:
             # A reshape is defined by row-major element order, but Fortran
@@ -568,6 +783,13 @@ class _FunctionEmitter:
             source = args[0]
             source_shape = tuple(instr.args[0].shape)
             source_rank = len(source_shape)
+            if rank == 0:
+                if source_rank == 0:
+                    return source
+                indices = ", ".join("1" for _ in source_shape)
+                return f"{source}({indices})"
+            if source_rank == 0:
+                source = f"[{source}]"
             if source_rank > 1:
                 reversed_extents = ", ".join(
                     str(int(size)) for size in reversed(source_shape)
@@ -585,9 +807,66 @@ class _FunctionEmitter:
             order = ", ".join(str(value) for value in range(rank, 0, -1))
             return f"reshape({source}, [{extents}], order=[{order}])"
 
-        if operation in ("zeros", "full"):
-            # A scalar broadcasts across a whole array on assignment.
-            fill = attributes.get("fill_value", 0)
+        if operation == "broadcast_to" and len(args) == 1:
+            source_shape = tuple(instr.args[0].shape)
+            target_shape = tuple(shape)
+            if source_shape == target_shape:
+                return args[0]
+            return _broadcast(args[0], source_shape, target_shape)
+
+        if operation == "repeat" and len(args) == 1:
+            source_shape = tuple(map(int, instr.args[0].shape))
+            target_shape = tuple(map(int, shape))
+            if len(source_shape) != len(target_shape):
+                return None
+            raw_repeats = attributes.get("repeats", 1)
+            dim = attributes.get("dim")
+            if dim is not None and not isinstance(raw_repeats, (tuple, list)):
+                repeat_counts = [1] * rank
+                repeat_counts[int(dim) % rank] = int(raw_repeats)
+            else:
+                repeat_counts = list(map(int, (
+                    raw_repeats
+                    if isinstance(raw_repeats, (tuple, list))
+                    else (raw_repeats,)
+                )))
+                if len(repeat_counts) != rank:
+                    return None
+            if any(count <= 0 for count in repeat_counts):
+                return None
+            if any(
+                target != source * count
+                for source, target, count in zip(
+                    source_shape, target_shape, repeat_counts
+                )
+            ):
+                return None
+            subscripts = []
+            for source_extent, target_extent, count in zip(
+                source_shape, target_shape, repeat_counts
+            ):
+                if count == 1:
+                    subscripts.append(":")
+                    continue
+                index = self._loop_variable()
+                subscripts.append(
+                    f"[(mod({index} - 1, {source_extent}) + 1, "
+                    f"{index} = 1, {target_extent})]"
+                )
+            return f"{args[0]}({', '.join(subscripts)})"
+
+        if operation in {
+            "Fill", "fill", "zeros", "zeros_like", "empty", "empty_like",
+            "ones", "ones_like", "full", "full_like",
+        }:
+            # Handler.Fill is the compiler's backend-neutral span operation.
+            # The result storage is already declared (or supplied by the
+            # caller when it is public), so initialization is one scalar
+            # whole-array assignment, never an element constructor.
+            default = 1 if operation in {"ones", "ones_like"} else 0
+            fill = attributes.get("fill_value", attributes.get("value", default))
+            if fill is None:
+                return None
             if instr.res.dtype in ("float64", "float32", "double"):
                 fill = float(fill)
             return _literal(fill)
@@ -674,6 +953,8 @@ class _FunctionEmitter:
             operation = (
                 producer.attributes.get("tensor_operation") or producer.op
             )
+            if producer.op in ("Const", "const"):
+                return self._instruction_is_logical(producer)
             if operation in _SHAPE_ONLY and producer.args:
                 return self._is_logical(producer.args[0])
             if (
@@ -858,6 +1139,52 @@ class _FunctionEmitter:
             )
         return converted
 
+    def _coerce_to_result(
+        self,
+        instr: Instr,
+        value: SSAValue,
+        expression: str,
+    ) -> str:
+        """Convert one expression to the instruction result's scalar kind.
+
+        Fortran's ``merge`` requires its true and false sources to have the
+        same type and kind.  The tensor IR follows numpy promotion rules, so
+        a ``where`` may quite correctly select between an integer and a real,
+        or between a logical and a number.  Apply that promotion to each
+        branch before spelling the intrinsic.
+        """
+
+        result_dtype = str(getattr(instr.res, "dtype", None) or self.dtype)
+        target_logical = result_dtype in ("bool", "logical")
+        source_logical = self._is_logical(value)
+        if target_logical:
+            if source_logical:
+                return expression
+            source_dtype = str(getattr(value, "dtype", None) or self.dtype)
+            zero = (
+                "0_c_int64_t" if source_dtype.endswith("int64")
+                else "0_c_int32_t" if source_dtype.endswith(("int32", "int"))
+                else "0.0_c_double"
+            )
+            return f"({expression} /= {zero})"
+        if source_logical:
+            numeric = _UNARY["bool_to_float64"].format(expression)
+            return (
+                numeric
+                if result_dtype not in _INTEGER_DTYPES
+                else f"int({numeric}, c_int64_t)"
+            )
+        source_dtype = str(getattr(value, "dtype", None) or self.dtype)
+        source_real = source_dtype not in _INTEGER_DTYPES
+        target_real = result_dtype not in _INTEGER_DTYPES
+        if source_real == target_real:
+            return expression
+        return (
+            f"real({expression}, c_double)"
+            if target_real
+            else f"int({expression}, c_int64_t)"
+        )
+
     def _conform(self, instr: Instr, args: list[str]) -> list[str] | None:
         """Make an elementwise op's operands conform to its result shape.
 
@@ -888,14 +1215,40 @@ class _FunctionEmitter:
                 continue
             count = _element_count(shape)
             if count == result_count:
-                # Same elements, different rank: restate the shape. Both
-                # sides are already in this emitter's dimension order, so
-                # this is a pure re-description, not a reordering.
+                # Same elements, different rank: preserve the recorded
+                # row-major walk while restating the shape. A plain Fortran
+                # RESHAPE consumes and fills in column-major order; that
+                # silently transposes/chops non-square reshape -> permute ->
+                # flatten programs. Reverse the source traversal first, then
+                # make the destination's last dimension vary fastest, exactly
+                # as the explicit reshape structural lowering does above.
                 if not result_shape:
                     conformed.append(f"{expression}({', '.join(['1'] * len(shape))})")
                     continue
+                source = expression
+                if len(shape) > 1:
+                    source_extents = ", ".join(
+                        str(int(size)) for size in reversed(shape)
+                    )
+                    source_order = ", ".join(
+                        str(value) for value in range(len(shape), 0, -1)
+                    )
+                    source = (
+                        f"reshape({source}, [{source_extents}], "
+                        f"order=[{source_order}])"
+                    )
                 extents = ", ".join(str(int(size)) for size in result_shape)
-                conformed.append(f"reshape({expression}, [{extents}])")
+                if len(result_shape) > 1:
+                    result_order = ", ".join(
+                        str(value)
+                        for value in range(len(result_shape), 0, -1)
+                    )
+                    conformed.append(
+                        f"reshape({source}, [{extents}], "
+                        f"order=[{result_order}])"
+                    )
+                else:
+                    conformed.append(f"reshape({source}, [{extents}])")
                 continue
             if count == 1:
                 # A one-element array acting as a scalar: index it, so
@@ -964,7 +1317,7 @@ class _FunctionEmitter:
 
         ordered_outputs = [outputs[key] for key in sorted(outputs)]
         for value in ordered_outputs:
-            self._locals[value.id] = value
+            self._locals[value.id] = self._typed(value)
         for value in consumed:
             self._consumed.add(value.id)
 
@@ -979,12 +1332,34 @@ class _FunctionEmitter:
         else:
             call_values = [*instr.args, *ordered_outputs]
             extents = sorted(dimension_extents(call_values).values())
+        input_arguments = [self._operand(value) for value in instr.args]
+        output_arguments = [_name(value) for value in ordered_outputs]
+        prelude = []
+        aliased_output_indices = set()
+        for input_index, output_index in self.callee_inout_pairs.get(
+            str(callee), ()
+        ):
+            if (
+                input_index >= len(input_arguments)
+                or output_index >= len(output_arguments)
+            ):
+                return None
+            output_argument = output_arguments[output_index]
+            prelude.append(
+                f"    {output_argument} = {input_arguments[input_index]}"
+            )
+            input_arguments[input_index] = output_argument
+            aliased_output_indices.add(int(output_index))
         arguments = [
             *extents,
-            *(self._operand(value) for value in instr.args),
-            *(_name(value) for value in ordered_outputs),
+            *input_arguments,
+            *(
+                argument
+                for index, argument in enumerate(output_arguments)
+                if index not in aliased_output_indices
+            ),
         ]
-        return [f"    call {callee}({', '.join(arguments)})"]
+        return [*prelude, f"    call {callee}({', '.join(arguments)})"]
 
     def _indexed_store(self, instr: Instr) -> list[str] | None:
         """``collection[i] = value``, without materialising an address.
@@ -995,17 +1370,20 @@ class _FunctionEmitter:
         the pair collapses into one assignment.
         """
 
-        if instr.op != "Store" or len(instr.args) != 2:
+        if instr.op not in ("Store", "store") or len(instr.args) != 2:
             return None
         source, address = instr.args
         producer = self._address_producers.get(address.id)
         if producer is None:
             return None
-        collection, position = producer
+        collection, positions = producer
         self._consumed.add(address.id)
         # SSA induction values are 0-based; Fortran subscripts start at 1.
+        subscripts = ", ".join(
+            f"{self._operand(position)} + 1" for position in positions
+        )
         return [
-            f"    {self._operand(collection)}({self._operand(position)} + 1)"
+            f"    {self._operand(collection)}({subscripts})"
             f" = {self._operand(source)}"
         ]
 
@@ -1014,21 +1392,32 @@ class _FunctionEmitter:
 
         for block in self.function.blocks.values():
             for instr in block.instrs:
-                if instr.op != "GetElementPtr" or instr.res is None:
+                if instr.op not in ("GetElementPtr", "getelementptr") or instr.res is None:
                     continue
-                if instr.attributes.get("binding") != "collection_publication":
+                # Aggregate result extraction is handled by _region_call and
+                # carries its index as metadata. Ordinary tensor addressing
+                # carries the collection followed by one index per rank.
+                if len(instr.args) < 2:
                     continue
-                if len(instr.args) != 2:
-                    continue
-                self._address_producers[instr.res.id] = (
-                    instr.args[0],
-                    instr.args[1],
-                )
-                # A collection is written once per iteration, so it holds one
-                # element per trip: it is a member of the enclosing object,
-                # not a local, and nothing else in the program declares its
-                # extent.
-                self._collections[instr.args[0].id] = instr.args[1]
+                collection = instr.args[0]
+                positions = tuple(instr.args[1:])
+                self._address_producers[instr.res.id] = (collection, positions)
+                if instr.attributes.get("binding") == "collection_publication":
+                    # A collection is written once per iteration, so it holds
+                    # one element per trip and its extent comes from the loop.
+                    self._collections[collection.id] = positions[0]
+
+        stored_addresses = {
+            instr.args[1].id
+            for block in self.function.blocks.values()
+            for instr in block.instrs
+            if instr.op in ("Store", "store") and len(instr.args) == 2
+        }
+        self._mutated_arrays = {
+            collection.id
+            for address_id, (collection, _positions) in self._address_producers.items()
+            if address_id in stored_addresses
+        }
 
     def _collection_extent(self, induction: SSAValue) -> str | None:
         """The trip count governing a collection, as a Fortran expression.
@@ -1074,9 +1463,124 @@ class _FunctionEmitter:
         batched = self._batched_matmul(instr, operation)
         if batched is not None:
             return batched
-        if operation not in ("cumsum", "scatter", "stack", "concat"):
+        if operation not in (
+            "cumsum", "gather", "scatter", "index_set", "pad", "stack", "concat"
+        ):
             return None
         target = _name(instr.res)
+
+        if operation == "pad":
+            if len(instr.args) != 1:
+                return None
+            source = self._operand(instr.args[0])
+            source_shape = tuple(int(value) for value in instr.args[0].shape)
+            rank = len(source_shape)
+            pad = instr.attributes.get("pad", 0)
+            if isinstance(pad, int):
+                widths = [(int(pad), int(pad))] * rank
+            elif (
+                isinstance(pad, (tuple, list))
+                and len(pad) == rank
+                and all(
+                    isinstance(pair, (tuple, list)) and len(pair) == 2
+                    for pair in pad
+                )
+            ):
+                widths = [tuple(map(int, pair)) for pair in pad]
+            elif isinstance(pad, (tuple, list)) and len(pad) % 2 == 0:
+                widths = [(0, 0)] * (rank - len(pad) // 2)
+                widths.extend(
+                    (int(pad[-2 * (axis + 1)]), int(pad[-2 * (axis + 1) + 1]))
+                    for axis in range(len(pad) // 2)
+                )
+            else:
+                return None
+            mode = str(instr.attributes.get("mode", "constant"))
+            if mode == "constant":
+                value = _literal(instr.attributes.get("value", 0.0))
+                sections = [
+                    f"{left + 1}:{left + extent}"
+                    for extent, (left, _right) in zip(source_shape, widths)
+                ]
+                return [
+                    f"    {target} = {value}",
+                    f"    {target}({', '.join(sections)}) = {source}",
+                ]
+            if mode != "edge":
+                return None
+            indices = [self._loop_variable() for _ in range(rank)]
+            statements = []
+            indent = "    "
+            for index, extent, (left, right) in zip(
+                indices, source_shape, widths
+            ):
+                statements.append(
+                    f"{indent}do {index} = 1, {left + extent + right}"
+                )
+                indent += "  "
+            source_indices = [
+                f"min(max({index} - {left}, 1), {extent})"
+                for index, extent, (left, _right) in zip(
+                    indices, source_shape, widths
+                )
+            ]
+            statements.append(
+                f"{indent}{target}({', '.join(indices)}) = "
+                f"{source}({', '.join(source_indices)})"
+            )
+            for _index in reversed(indices):
+                indent = indent[:-2]
+                statements.append(f"{indent}end do")
+            return statements
+
+        if operation == "gather":
+            if len(instr.args) != 2 or len(instr.res.shape) != 1:
+                return None
+            source, indices = (self._operand(arg) for arg in instr.args)
+            return [f"    {target} = {source}({indices} + 1)"]
+
+        if operation == "index_set":
+            if len(instr.args) != 2:
+                return None
+            base = self._operand(instr.args[0])
+            value = self._operand(instr.args[1])
+            rank = len(instr.res.shape)
+            index = instr.attributes.get("slices")
+            items = list(index) if isinstance(index, tuple) else [index]
+            items.extend([slice(None)] * (rank - len(items)))
+            if len(items) != rank:
+                return None
+            subscripts = []
+            for axis, item in enumerate(items):
+                extent = int(instr.res.shape[axis])
+                if isinstance(item, int):
+                    normalized = item + extent if item < 0 else item
+                    subscripts.append(str(normalized + 1))
+                elif isinstance(item, slice):
+                    start, stop, step = item.indices(extent)
+                    if step > 0:
+                        subscripts.append(
+                            f"{start + 1}:{stop}"
+                            + ("" if step == 1 else f":{step}")
+                        )
+                    else:
+                        # Python's stop is exclusive; for a descending
+                        # Fortran triplet its inclusive endpoint is stop+2 in
+                        # one-based coordinates.
+                        subscripts.append(
+                            f"{start + 1}:{stop + 2}:{step}"
+                        )
+                else:
+                    return None
+            if (
+                tuple(instr.args[1].shape)
+                and _element_count(tuple(instr.args[1].shape)) == 1
+            ):
+                value = f"sum({value})"
+            return [
+                f"    {target} = {base}",
+                f"    {target}({', '.join(subscripts)}) = {value}",
+            ]
 
         if operation == "concat":
             # Concatenation writes each source into its own run of the joined
@@ -1166,13 +1670,17 @@ class _FunctionEmitter:
         constant = instr.attributes.get("constant", None)
 
         if op in ("Const", "const"):
+            if constant is None and "llvm_literal" in instr.attributes:
+                return _literal(_llvm_literal(instr.attributes["llvm_literal"]))
             if constant is None and "values" in instr.attributes:
                 # An array constant carries its elements under "values", not
                 # the scalar "constant" key.  Reading only "constant" here
                 # yielded None and reported "cannot express literal None",
                 # which named the missing key rather than the real content.
                 return _array_literal(
-                    instr.attributes["values"], instr.res.shape
+                    instr.attributes["values"],
+                    instr.res.shape,
+                    dtype=instr.res.dtype or self.dtype,
                 )
             if constant is None and instr.attributes.get("value") is not None:
                 # Control-flow scalars (loop bounds, strides) are recorded
@@ -1182,6 +1690,15 @@ class _FunctionEmitter:
                 # discard the real elements.
                 return _literal(instr.attributes["value"])
             return _literal(constant)
+
+        if op in ("Load", "load") and len(instr.args) == 1:
+            producer = self._address_producers.get(instr.args[0].id)
+            if producer is not None:
+                collection, positions = producer
+                subscripts = ", ".join(
+                    f"{self._operand(position)} + 1" for position in positions
+                )
+                return f"{self._operand(collection)}({subscripts})"
 
         structural = self._structural(instr, args, op)
         if structural is not None:
@@ -1225,11 +1742,25 @@ class _FunctionEmitter:
             # wrap what was already wrapped.
             return template.format(*args)
         if op in _UNARY and len(args) == 1:
-            if op not in _LOGICAL_UNARY:
+            if op not in _LOGICAL_UNARY and op not in _LOGICAL_RESULT_UNARY:
                 args = self._numeric(instr, args)
             return _UNARY[op].format(*args)
         if op in ("Select", "where") and len(args) == 3:
-            return f"merge({args[1]}, {args[2]}, {args[0]})"
+            conformed = self._conform(instr, args)
+            if conformed is None:
+                return None
+            args = conformed
+            mask = args[0]
+            if not self._is_logical(instr.args[0]):
+                mask_dtype = str(getattr(instr.args[0], "dtype", "")).casefold()
+                zero = "0_c_int64_t" if mask_dtype.endswith("int64") else (
+                    "0_c_int32_t" if mask_dtype.endswith(("int32", "int"))
+                    else "0.0_c_double"
+                )
+                mask = f"({mask} /= {zero})"
+            true_value = self._coerce_to_result(instr, instr.args[1], args[1])
+            false_value = self._coerce_to_result(instr, instr.args[2], args[2])
+            return f"merge({true_value}, {false_value}, {mask})"
         return None
 
     # -- statement emission ------------------------------------------------
@@ -1296,7 +1827,7 @@ class _FunctionEmitter:
 
             statements = self._statements(instr)
             if statements is not None:
-                self._locals[instr.res.id] = instr.res
+                self._locals[instr.res.id] = self._typed(instr.res)
                 body.extend(statements)
                 continue
 
@@ -1304,7 +1835,10 @@ class _FunctionEmitter:
             if expression is None:
                 self.shortfalls.append(
                     FortranShortfall(
-                        instr.op,
+                        str(
+                            instr.attributes.get("tensor_operation")
+                            or instr.op
+                        ),
                         block.name,
                         "no Fortran intrinsic or expression is registered",
                     )
@@ -1314,7 +1848,7 @@ class _FunctionEmitter:
             if self._may_inline(instr, block):
                 self._inlined[instr.res.id] = expression
                 continue
-            self._locals[instr.res.id] = instr.res
+            self._locals[instr.res.id] = self._typed(instr.res)
             if (
                 self._instruction_is_logical(instr)
                 and str(instr.res.dtype or self.dtype)
@@ -1389,7 +1923,7 @@ class _FunctionEmitter:
                     )
                     if len(blocks) == len(instr.args):
                         incoming = tuple(zip(blocks, instr.args))
-                self._locals[instr.res.id] = instr.res
+                self._locals[instr.res.id] = self._typed(instr.res)
                 entries = self._phi_targets.setdefault(block.name, [])
                 for predecessor, value in incoming:
                     entries.append((str(predecessor), instr.res, value))
@@ -1422,8 +1956,8 @@ class _FunctionEmitter:
         # or -- worse -- silently declares mismatched-size arrays under one
         # extent, which compiles cleanly and corrupts memory at runtime.
         all_values = (
-            *self.function.args,
-            *self.outputs,
+            *(self._typed(value) for value in self.function.args),
+            *(self._typed(value) for value in self.outputs),
             *self._locals.values(),
         )
         arrays_present = any(_is_array(value) for value in all_values)
@@ -1450,9 +1984,15 @@ class _FunctionEmitter:
         }
         extent_names = sorted(set(dim_extents.values()) | called_extent_names)
         self.extent_names = tuple(extent_names)
+        argument_ids = {argument.id for argument in self.function.args}
+        output_ids = {value.id for value in self.outputs}
         arguments = list(extent_names)
         arguments.extend(_name(a) for a in self.function.args)
-        arguments.extend(_name(value) for value in self.outputs)
+        arguments.extend(
+            _name(value)
+            for value in self.outputs
+            if value.id not in argument_ids
+        )
 
         declarations: list[str] = [
             f"    integer(c_int), intent(in), value :: {extent}"
@@ -1460,6 +2000,16 @@ class _FunctionEmitter:
         ]
         for argument in self.function.args:
             kind = _DTYPE_KIND.get(argument.dtype or self.dtype, "real(c_double)")
+            if argument.id in output_ids:
+                if _is_array(argument):
+                    declarations.append(
+                        f"    {kind}, intent(inout) :: {_name(argument)}({dims(argument)})"
+                    )
+                else:
+                    declarations.append(
+                        f"    {kind}, intent(inout) :: {_name(argument)}"
+                    )
+                continue
             if argument.id in self._collections:
                 # A collection accumulates one element per iteration and is
                 # read back by the caller, so it is neither a scalar nor
@@ -1471,6 +2021,11 @@ class _FunctionEmitter:
                         f"    {kind}, intent(inout) :: {_name(argument)}({extent})"
                     )
                     continue
+            if argument.id in self._mutated_arrays and _is_array(argument):
+                declarations.append(
+                    f"    {kind}, intent(inout) :: {_name(argument)}({dims(argument)})"
+                )
+                continue
             if _is_array(argument):
                 declarations.append(
                     f"    {kind}, intent(in) :: {_name(argument)}({dims(argument)})"
@@ -1480,6 +2035,8 @@ class _FunctionEmitter:
                     f"    {kind}, intent(in), value :: {_name(argument)}"
                 )
         for value in self.outputs:
+            if value.id in argument_ids:
+                continue
             kind = _DTYPE_KIND.get(value.dtype or self.dtype, "real(c_double)")
             if _is_array(value):
                 declarations.append(
@@ -1514,6 +2071,7 @@ class _FunctionEmitter:
         lines = [
             f"  subroutine {name}({', '.join(arguments)}) bind(C, name=\"{name}\")",
             "    use, intrinsic :: iso_c_binding",
+            "    use, intrinsic :: ieee_arithmetic",
             "    implicit none",
             *declarations,
             "",
@@ -1535,6 +2093,9 @@ def emit_function(
     outputs: Sequence[SSAValue] = (),
     callee_extents: Mapping[str, Sequence[str]] | None = None,
     callee_arity: Mapping[str, int] | None = None,
+    callee_inout_pairs: Mapping[
+        str, Sequence[tuple[int, int]]
+    ] | None = None,
 ) -> FortranSubroutine:
     """Translate one SSA function into a bind(C) Fortran subroutine.
 
@@ -1553,6 +2114,7 @@ def emit_function(
         outputs=outputs,
         callee_extents=callee_extents,
         callee_arity=callee_arity,
+        callee_inout_pairs=callee_inout_pairs,
     ).emit()
 
 
@@ -1603,6 +2165,66 @@ def emit_module(
         module.functions if isinstance(module, IRModule) else dict(module)
     )
     named_outputs = dict(outputs or {})
+    for function_name, function in functions.items():
+        if function_name in named_outputs:
+            continue
+        declared = tuple(function.metadata.get("named_outputs") or ())
+        if not declared:
+            continue
+        values = {
+            int(value.id): value
+            for value in function.args
+        }
+        values.update({
+            int(instruction.res.id): instruction.res
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        })
+        resolved = tuple(
+            values[int(value_id)]
+            for _name, value_id in declared
+            if int(value_id) in values
+        )
+        if resolved:
+            named_outputs[function_name] = resolved
+    roots = {
+        str(name)
+        for name in named_outputs
+        if str(name) in functions
+    }
+    roots.update(
+        str(name)
+        for name, function in functions.items()
+        if function.metadata.get("named_outputs")
+        or function.metadata.get("control_ir")
+    )
+    if roots:
+        reachable = set()
+        pending = list(sorted(roots))
+        while pending:
+            function_name = pending.pop()
+            if function_name in reachable or function_name not in functions:
+                continue
+            reachable.add(function_name)
+            function = functions[function_name]
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.op not in {"Call", "call"}:
+                        continue
+                    # A canonical tensor operation is emitted as a native
+                    # Fortran expression.  Its C/LLVM helper name is retained
+                    # for those targets, but is not a Fortran call edge.
+                    if instruction.attributes.get("tensor_operation"):
+                        continue
+                    callee = instruction.attributes.get("callee")
+                    if callee in functions and callee not in reachable:
+                        pending.append(str(callee))
+        functions = {
+            name: function
+            for name, function in functions.items()
+            if name in reachable
+        }
     # Two passes: a subroutine that calls another must pass exactly the
     # extents that one declares, and those are only known once it has been
     # emitted. The first pass is discarded apart from its signatures.
@@ -1618,6 +2240,17 @@ def emit_module(
         function_name: len(function.args)
         for function_name, function in functions.items()
     }
+    callee_inout_pairs = {
+        function_name: tuple(
+            (input_index, output_index)
+            for input_index, argument in enumerate(function.args)
+            for output_index, output in enumerate(
+                named_outputs.get(function_name, ())
+            )
+            if int(argument.id) == int(output.id)
+        )
+        for function_name, function in functions.items()
+    }
     subroutines = tuple(
         emit_function(
             function,
@@ -1625,6 +2258,7 @@ def emit_module(
             outputs=named_outputs.get(function_name, ()),
             callee_extents=callee_extents,
             callee_arity=callee_arity,
+            callee_inout_pairs=callee_inout_pairs,
         )
         for function_name, function in functions.items()
     )
@@ -1635,6 +2269,7 @@ def emit_module(
     lines = [
         f"module {name}",
         "  use, intrinsic :: iso_c_binding",
+        "  use, intrinsic :: ieee_arithmetic",
         "  implicit none",
         "contains",
         "",
@@ -1744,7 +2379,8 @@ def compile_module(
     module: FortranModule,
     *,
     directory: str | Path | None = None,
-    extra_flags: Sequence[str] = ("-O3", "-march=native", "-funroll-loops"),
+    extra_flags: Sequence[str] | None = None,
+    standalone: bool = True,
 ) -> Path:
     """Compile a generated module to a shared library.
 
@@ -1760,20 +2396,37 @@ def compile_module(
         )
     import os
     import sys
+    from .fortran_toolchain import (
+        aggressive_fortran_flags,
+        standalone_fortran_link_flags,
+        standalone_runtime_shim_sources,
+    )
 
     workdir = Path(directory or tempfile.mkdtemp(prefix="turing_fortran_"))
     workdir.mkdir(parents=True, exist_ok=True)
     source = module.write(workdir)
     suffix = ".dll" if sys.platform == "win32" else ".so"
     library = workdir / f"{module.name}{suffix}"
+    compile_flags = tuple(extra_flags or aggressive_fortran_flags(compiler))
+    try:
+        link_flags = (
+            standalone_fortran_link_flags(compiler) if standalone else ()
+        )
+    except ValueError as error:
+        raise FortranEmissionError(str(error)) from error
+    shim_sources = standalone_runtime_shim_sources(
+        compiler, workdir, standalone
+    )
     command = [
         compiler,
         "-shared",
         *(() if sys.platform == "win32" else ("-fPIC",)),
-        *extra_flags,
+        *compile_flags,
         str(source),
+        *shim_sources,
         "-o",
         str(library),
+        *link_flags,
     ]
 
     # gfortran spawns f951, which loads libgmp/libmpfr from the toolchain's own

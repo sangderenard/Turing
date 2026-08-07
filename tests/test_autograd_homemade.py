@@ -2,6 +2,7 @@
 import pytest
 import numpy as np
 from src.common.tensors import AbstractTensor
+from src.common.tensors.abstraction import tensor_identity
 
 @pytest.mark.parametrize("a, b", [([2.0, 3.0], [4.0, 5.0]), ([[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]])])
 def test_autograd_add_and_mul(a, b):
@@ -49,7 +50,7 @@ def test_autograd_records_only_for_grad_inputs():
 
     node = autograd.tape.node(z)
     assert node is not None
-    assert {pid for pid, _ in node.parents} == {id(a), id(b)}
+    assert {pid for pid, _ in node.parents} == {tensor_identity(a), tensor_identity(b)}
 
 
 def test_autograd_single_tensor_input():

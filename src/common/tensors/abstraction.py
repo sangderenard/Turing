@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque, NamedTuple, Iterable, TYPE_CHECKING
 import math
 import inspect
+import itertools
 from functools import wraps
 import time
 from collections import deque
@@ -218,11 +219,36 @@ def _register_all_conversions():
     PyTorchTensorOperations = BACKEND_REGISTRY.get("torch")
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
+_IDENTITY_COUNTER = itertools.count()
+
+
+def tensor_identity(value: Any) -> int:
+    """Return a stable identity token for ``value``.
+
+    ``id(value)`` is a memory address: once an object is freed, CPython is
+    free to hand that same address to a later, unrelated object. Any code
+    that uses ``id()`` as a durable cross-reference key (tape node keys,
+    ProcessGraph primitive-capture correlation, ...) can then silently
+    conflate two different values that happened not to be alive at the same
+    time. For an :class:`AbstractTensor`, a monotonic counter value is
+    assigned once, lazily, and cached on the instance itself -- so the token
+    lives exactly as long as the object and is never reused. Non-tensor
+    values fall back to ``id()`` since there is nowhere to cache a token.
+    """
+    if isinstance(value, AbstractTensor):
+        token = value.__dict__.get("_identity_token")
+        if token is None:
+            token = next(_IDENTITY_COUNTER)
+            value.__dict__["_identity_token"] = token
+        return token
+    return id(value)
+
+
 class AbstractTensor:
     _preferred_backend: str | None = None
     _preferred_device: Any = None
     inf: float = float('inf')
-    ninf: float = float('-inf')  
+    ninf: float = float('-inf')
     nan: float = float('nan')
 
     @staticmethod
@@ -542,25 +568,87 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement log_softmax_()")
 
     # --- Basic layout ---
-    def mean(self, dim=None, keepdim: bool = False):
+    def _normalize_reduction_call(
+        self,
+        operation: str,
+        dim,
+        keepdim: bool,
+        *,
+        axis=None,
+        dtype=None,
+        out=None,
+        keepdims=None,
+    ):
+        """Normalize NumPy and tensor-dialect reduction spellings.
+
+        NumPy reduction dispatch calls an object's method with ``axis``,
+        ``dtype``, ``out``, and ``keepdims`` keywords.  The tensor dialect
+        historically exposed the equivalent ``dim`` and ``keepdim`` names.
+        Keeping the normalization here lets captured programs accept either
+        surface without teaching every backend about both ABIs.
+        """
+        if axis is not None:
+            if dim is not None and dim != axis:
+                raise TypeError(
+                    f"{operation}() received conflicting dim={dim!r} and axis={axis!r}"
+                )
+            dim = axis
+        if keepdims is not None:
+            if keepdim is not False and bool(keepdim) != bool(keepdims):
+                raise TypeError(
+                    f"{operation}() received conflicting keepdim and keepdims values"
+                )
+            keepdim = bool(keepdims)
+        if out is not None:
+            raise TypeError(
+                f"{operation}() does not support an out arena; alias the returned tensor instead"
+            )
+        source = self if dtype is None else self.to_dtype(dtype)
+        return source, dim, keepdim
+
+    def mean(
+        self,
+        dim=None,
+        keepdim: bool = False,
+        *,
+        axis=None,
+        dtype=None,
+        out=None,
+        keepdims=None,
+    ):
         """Return the mean of the tensor along the specified dimension(s)."""
-        finalize = AbstractTensor._pre_autograd(
-            "mean", [self], params={"axis": dim, "keepdim": keepdim}
+        source, dim, keepdim = self._normalize_reduction_call(
+            "mean", dim, keepdim, axis=axis, dtype=dtype, out=out, keepdims=keepdims
         )
-        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.mean_(dim=dim, keepdim=keepdim)
+        finalize = AbstractTensor._pre_autograd(
+            "mean", [source], params={"axis": dim, "keepdim": keepdim}
+        )
+        result = type(source)(track_time=source.track_time, tape=getattr(source, "_tape", None))
+        result.data = source.mean_(dim=dim, keepdim=keepdim)
         result = finalize(result)
         if getattr(result.data, "shape", ()) == ():
             return AbstractScalar.__new__(AbstractScalar, result)
         return result
 
-    def sum(self, dim=None, keepdim: bool = False):
+    def sum(
+        self,
+        dim=None,
+        keepdim: bool = False,
+        *,
+        axis=None,
+        dtype=None,
+        out=None,
+        keepdims=None,
+    ):
         """Return the sum of the tensor along the specified dimension(s)."""
-        finalize = AbstractTensor._pre_autograd(
-            "sum", [self], params={"axis": dim, "keepdim": keepdim}
+        source, dim, keepdim = self._normalize_reduction_call(
+            "sum", dim, keepdim, axis=axis, dtype=dtype, out=out, keepdims=keepdims
         )
-        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.sum_(dim=dim, keepdim=keepdim)
+        finalize = AbstractTensor._pre_autograd(
+            "sum", [source], params={"axis": dim, "keepdim": keepdim}
+        )
+        result = type(source)(track_time=source.track_time, tape=getattr(source, "_tape", None))
+        result.data = source.sum_(dim=dim, keepdim=keepdim)
         result = finalize(result)
         if getattr(result.data, "shape", ()) == ():
             return AbstractScalar.__new__(AbstractScalar, result)
@@ -575,13 +663,25 @@ class AbstractTensor:
         result.data = self.cumsum_(dim)
         return finalize(result)
 
-    def min(self, dim=None, keepdim: bool = False):
+    def min(
+        self,
+        dim=None,
+        keepdim: bool = False,
+        *,
+        axis=None,
+        dtype=None,
+        out=None,
+        keepdims=None,
+    ):
         """Return the minimum of the tensor along the specified dimension(s)."""
-        finalize = AbstractTensor._pre_autograd(
-            "min", [self], params={"axis": dim, "keepdim": keepdim}
+        source, dim, keepdim = self._normalize_reduction_call(
+            "min", dim, keepdim, axis=axis, dtype=dtype, out=out, keepdims=keepdims
         )
-        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.min_(dim=dim, keepdim=keepdim)
+        finalize = AbstractTensor._pre_autograd(
+            "min", [source], params={"axis": dim, "keepdim": keepdim}
+        )
+        result = type(source)(track_time=source.track_time, tape=getattr(source, "_tape", None))
+        result.data = source.min_(dim=dim, keepdim=keepdim)
         result = finalize(result)
         if getattr(result.data, "shape", ()) == ():
             return AbstractScalar.__new__(AbstractScalar, result)
@@ -1128,10 +1228,20 @@ class AbstractTensor:
         result.data = self.log_softmax_(dim)
         return result
 
-    def pad(self, pad: Tuple[int, ...] = (0, 0), value: float = 0) -> "AbstractTensor":
+    def pad(
+        self,
+        pad: Tuple[int, ...] = (0, 0),
+        value: float = 0,
+        mode: str = "constant",
+    ) -> "AbstractTensor":
+        finalize = AbstractTensor._pre_autograd(
+            "pad",
+            [self],
+            params={"pad": pad, "value": value, "mode": mode},
+        )
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.pad_(pad, value)
-        return result
+        result.data = self.pad_(pad, value, mode=mode)
+        return finalize(result)
 
     # --- 2D spatial helpers -------------------------------------------------
     def pad2d(self, pad: Tuple[int, int, int, int], value: float = 0.0) -> "AbstractTensor":
@@ -1763,17 +1873,11 @@ class AbstractTensor:
     def to_dtype(self, dtype: str = "float") -> "AbstractTensor":
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.to_dtype_(dtype)
-        source_kind = getattr(
-            getattr(getattr(self, "data", None), "dtype", None),
-            "kind",
-            None,
-        )
-        target_kind = getattr(
-            getattr(getattr(result, "data", None), "dtype", None),
-            "kind",
-            None,
-        )
-        if target_kind == source_kind:
+        source_dtype = getattr(getattr(self, "data", None), "dtype", None)
+        target_dtype = getattr(getattr(result, "data", None), "dtype", None)
+        source_kind = getattr(source_dtype, "kind", None)
+        target_kind = getattr(target_dtype, "kind", None)
+        if source_dtype == target_dtype:
             operation = "reshape"
             params = {"shape": tuple(result.shape)}
         elif target_kind == "b":
@@ -1879,6 +1983,11 @@ class AbstractTensor:
         - Interpolation uses NumPy's traditional "linear" scheme with
           rank = p/100 * (N-1).
         """
+        # Several public call sites intentionally use the class-style form
+        # ``AbstractTensor.percentile(sequence, n)``.  Normalize that first
+        # operand just as the rest of the high-level tensor API does, while
+        # leaving ordinary instance calls unchanged.
+        self = AbstractTensor.get_tensor(self)
         # Parse percentile and behaviour flags
         try:
             p = float(n)
@@ -2505,8 +2614,19 @@ class AbstractTensor:
         # ---- prefer backend-specific get_item_ if available ----
         # Try to locate the ops/backend object (name may vary in your codebase)
 
+        index_tensors = (
+            tuple(item for item in idx if isinstance(item, AbstractTensor))
+            if isinstance(idx, tuple)
+            else (idx,) if isinstance(idx, AbstractTensor)
+            else ()
+        )
         finalize = AbstractTensor._pre_autograd(
-            "slice", [self], params={"slices": index}
+            "slice",
+            [self],
+            params={
+                "slices": index,
+                "index_tensors": index_tensors,
+            },
         )
 
         if hasattr(self, "get_item_"):
@@ -2519,6 +2639,23 @@ class AbstractTensor:
         if isinstance(result, self.tensor_type):
             wrapped = type(self)(track_time=getattr(self, "track_time", False), tape=getattr(self, "_tape", None))
             wrapped.data = result
+            return finalize(wrapped)
+        if getattr(AbstractTensor.autograd, "capture_all", False):
+            # Backends commonly return a native scalar for an integer index
+            # (NumPy's ``np.float64`` is the usual example).  Compiler forward
+            # observation preserves the backend and scalar rank in a fresh
+            # wrapper so the recorded occurrence and later no-grad loop
+            # occurrences agree on result type and shape.  Ordinary Python
+            # execution retains the backend's native scalar behavior.
+            wrapped = type(self)(
+                track_time=getattr(self, "track_time", False),
+                tape=getattr(self, "_tape", None),
+            )
+            wrapped.data = self.tensor_from_list_(
+                result,
+                dtype=getattr(result, "dtype", None),
+                device=self.get_device(),
+            )
             return finalize(wrapped)
         return result
 
@@ -3200,8 +3337,8 @@ def _wrap_with_autograd(name: str, func: Callable) -> Callable:
         # canonical node with normalized parameters. Do not overwrite that
         # node with the parameterless compatibility wrapper record.
         tape = getattr(result, "_tape", None)
-        existing = getattr(tape, "_nodes", {}).get(id(result))
-        previous = previous_nodes.get(id(tape), {}).get(id(result))
+        existing = getattr(tape, "_nodes", {}).get(tensor_identity(result))
+        previous = previous_nodes.get(id(tape), {}).get(tensor_identity(result))
         if (
             existing is not None
             and existing is not previous

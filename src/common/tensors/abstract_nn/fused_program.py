@@ -78,8 +78,13 @@ def build_fused_program(
             if not pred_ops:
                 if isinstance(nid, int):
                     feeds.add(nid)
+            raw_shape = data.get("shape")
             m = Meta(
-                shape=tuple(data.get("shape", [])) or None,
+                # Rank-zero is a complete scalar shape, not absent tensor
+                # accommodation metadata. Collapsing ``()`` to ``None`` made
+                # the shared compiler reject otherwise valid captured scalar
+                # spans and forced late targets to guess their ABI.
+                shape=None if raw_shape is None else tuple(raw_shape),
                 dtype=data.get("dtype"),
                 device=data.get("device"),
             )

@@ -770,30 +770,43 @@ def evaporate_unrolled_loops(
             )))
 
         for _name, _initial, updated in carried_bindings:
-            final_value = last_mapping.get(int(updated))
-            if final_value is not None:
-                _replace_parent_value(
-                    graph,
-                    next(
-                        (
-                            int(node_id)
-                            for node_id, data in graph.G.nodes(data=True)
-                            if data.get("type") == "LoopExit"
-                            and (
-                                data.get("attributes") or {}
-                            ).get("binding_name") == _name
-                            and any(
-                                int(parent) == int(loop.node_id)
-                                and str(role) == "control"
-                                for parent, role in (
-                                    data.get("parents") or ()
-                                )
+            # ``last_mapping`` only gets assigned inside the per-iteration
+            # loop above (line ~765). A loop whose traced iterable is empty
+            # never enters that loop, so ``last_mapping`` stays the {}
+            # this block was seeded with and every carried binding's
+            # "updated" value looks unavailable. That is not a genuine
+            # unavailability: zero iterations means the carried value never
+            # changed, so its correct final value is simply its pre-loop
+            # ``_initial`` binding. Falling through to "skip the redirect"
+            # instead left every downstream consumer (for example a value
+            # only used inside a sibling ``if`` branch's separately
+            # extracted region) pointed at a node this same function then
+            # deletes as part of the evaporated loop body, surfacing much
+            # later as "missing ProcessGraph input" with no loop plan left
+            # to explain it.
+            final_value = last_mapping.get(int(updated), int(_initial))
+            _replace_parent_value(
+                graph,
+                next(
+                    (
+                        int(node_id)
+                        for node_id, data in graph.G.nodes(data=True)
+                        if data.get("type") == "LoopExit"
+                        and (
+                            data.get("attributes") or {}
+                        ).get("binding_name") == _name
+                        and any(
+                            int(parent) == int(loop.node_id)
+                            and str(role) == "control"
+                            for parent, role in (
+                                data.get("parents") or ()
                             )
-                        ),
-                        int(updated),
+                        )
                     ),
-                    (int(final_value),),
-                )
+                    int(updated),
+                ),
+                (int(final_value),),
+            )
         for collection_id, values in publications.items():
             if values:
                 _replace_parent_value(
@@ -982,6 +995,10 @@ def evaporate_unrolled_loops(
                 if effect.loop_result_id is not None:
                     live.add(int(effect.loop_result_id))
                 live.update(map(int, effect.argument_value_ids))
+        # Loop plans are snapshots taken before evaporation rewrites the
+        # graph.  A sibling/nested rewrite can legitimately remove IDs still
+        # named by a retained plan; only live graph nodes may seed ancestry.
+        live.intersection_update(int(node_id) for node_id in graph.G)
         for root in tuple(live):
             live.update(int(node_id) for node_id in nx.ancestors(graph.G, root))
         graph.G.remove_nodes_from(
@@ -1157,9 +1174,32 @@ def materialize_retained_loop_ports(
         if attributes.get("loop_ports_materialized"):
             materialized_plans.append(plan)
             continue
+        recursion_region_id = attributes.get("recursion_region_id")
+        region_nodes = (
+            tuple(
+                int(node_id)
+                for node_id, data in graph.G.nodes(data=True)
+                if (
+                    recursion_region_id is not None
+                    and (data.get("attributes") or {}).get(
+                        "recursion_region_id"
+                    ) == recursion_region_id
+                )
+            )
+            if recursion_region_id is not None
+            else ()
+        )
+        carried_update_cone = {
+            int(ancestor)
+            for _name, _initial, updated in loop.carried_bindings
+            if int(updated) in graph.G
+            for ancestor in nx.ancestors(graph.G, int(updated))
+        }
         owned_nodes = frozenset((
             int(loop.node_id),
             *map(int, loop.body_nodes),
+            *region_nodes,
+            *carried_update_cone,
             *(int(effect.effect_node_id) for effect in loop.state_effects),
         ))
 
@@ -1482,7 +1522,18 @@ def _static_iterable_expression(
         if isinstance(node, ast.Name) and node.id in specializations:
             return specializations[node.id]
         if isinstance(node, ast.Attribute) and not node.attr.startswith("_"):
-            return getattr(resolve(node.value), node.attr)
+            base = resolve(node.value)
+            try:
+                return getattr(base, node.attr)
+            except AttributeError as error:
+                # A statically-resolved base can be a real None (the base
+                # expression's own constant-propagated value at this point
+                # in the traced code, not a compiler artifact) -- that is
+                # exactly "not a compiler-known iterable literal" here, not
+                # a crash. Re-raising as ValueError keeps this function's
+                # own contract: every non-resolvable expression fails the
+                # same way, regardless of which branch decided it couldn't.
+                raise ValueError(str(error)) from error
         if isinstance(node, (ast.Tuple, ast.List)):
             values = [resolve(item) for item in node.elts]
             return tuple(values) if isinstance(node, ast.Tuple) else values
@@ -1618,11 +1669,10 @@ class LoopComposer:
             for candidate, node_data in graph.G.nodes(data=True)
             if node_data.get("expr_obj") is not None
         }
-        def graph_node_for_ast(member: ast.AST) -> int | None:
-            direct = expression_nodes.get(id(member))
-            if direct is not None:
-                return int(direct)
-            signature = (
+        signature_nodes: dict[tuple[Any, ...], int] | None = None
+
+        def ast_signature(member: ast.AST) -> tuple[Any, ...]:
+            return (
                 type(member),
                 getattr(member, "lineno", None),
                 getattr(member, "col_offset", None),
@@ -1630,22 +1680,24 @@ class LoopComposer:
                 getattr(member, "end_col_offset", None),
                 ast.dump(member, include_attributes=False),
             )
-            matches = []
-            for candidate, node_data in graph.G.nodes(data=True):
-                candidate_expression = node_data.get("expr_obj")
-                if not isinstance(candidate_expression, ast.AST):
-                    continue
-                candidate_signature = (
-                    type(candidate_expression),
-                    getattr(candidate_expression, "lineno", None),
-                    getattr(candidate_expression, "col_offset", None),
-                    getattr(candidate_expression, "end_lineno", None),
-                    getattr(candidate_expression, "end_col_offset", None),
-                    ast.dump(candidate_expression, include_attributes=False),
-                )
-                if candidate_signature == signature:
-                    matches.append(int(candidate))
-            return min(matches) if matches else None
+
+        def graph_node_for_ast(member: ast.AST) -> int | None:
+            nonlocal signature_nodes
+            direct = expression_nodes.get(id(member))
+            if direct is not None:
+                return int(direct)
+            if signature_nodes is None:
+                signature_nodes = {}
+                for candidate, node_data in graph.G.nodes(data=True):
+                    candidate_expression = node_data.get("expr_obj")
+                    if not isinstance(candidate_expression, ast.AST):
+                        continue
+                    signature = ast_signature(candidate_expression)
+                    signature_nodes[signature] = min(
+                        int(candidate),
+                        signature_nodes.get(signature, int(candidate)),
+                    )
+            return signature_nodes.get(ast_signature(member))
 
         loop_controls: list[tuple[str, int, int | None, bool]] = []
 
@@ -2368,9 +2420,17 @@ def analyze_shader_loop_reductions(
             (graph.G.graph.get("recursion_table") or {}).items()
         )
     )
+    # ``ast.Try`` is deliberately absent here.  A Try node is ordinary,
+    # already-evaluable dataflow -- ``topological_reducer.py``'s ``ast.Try``
+    # reduction resolves a name whose branches disagree straight to the
+    # Try node's own id (mirroring how an ``ast.If``'s differing branches
+    # become a ``Phi``), and ``evaluate_node``'s own ``ast.Try`` handling
+    # already knows how to run body/handlers and return whichever arm's
+    # value applies.  What remains forbidden is control divergence with no
+    # such resolution: ``raise`` has no continuation value to merge, and
+    # ``with``/``async with``/``await`` have no reduction at all yet.
     forbidden = (
         ast.Raise,
-        ast.Try,
         ast.With,
         ast.AsyncWith,
         ast.Await,
@@ -2560,6 +2620,59 @@ def analyze_shader_loop_reductions(
         # this graph, so every backend receives an identity-derived induction
         # symbol while the source name remains diagnostic metadata only.
         induction_name = f"iteration_{int(loop.node_id)}"
+        projected_iterable_bindings = ()
+        if (
+            loop.stop is None
+            and loop.stop_node is None
+            and loop.iterable_node is not None
+            and len(loop.target_bindings) > 1
+            and loop.iterable_constant is None
+        ):
+            iterable_id = int(loop.iterable_node)
+            iterable_data = graph.G.nodes[iterable_id]
+            reference = (iterable_data.get("attributes") or {}).get(
+                "static_python_reference"
+            )
+            if reference == "enumerate":
+                source_id = next(
+                    (
+                        int(parent)
+                        for parent, role in iterable_data.get("parents", ())
+                        if str(role) in {"arg", "args", "arg:0", "arg0"}
+                    ),
+                    None,
+                )
+                if source_id is not None and len(loop.target_bindings) == 2:
+                    projected_iterable_bindings = (
+                        (
+                            source_id,
+                            int(loop.target_bindings[0][1]),
+                            induction_name,
+                            "induction",
+                        ),
+                        (
+                            source_id,
+                            int(loop.target_bindings[1][1]),
+                            induction_name,
+                            None,
+                        ),
+                    )
+            else:
+                projected_iterable_bindings = tuple(
+                    (
+                        iterable_id,
+                        int(target_id),
+                        induction_name,
+                        int(position),
+                    )
+                    for position, (_name, target_id)
+                    in enumerate(loop.target_bindings)
+                )
+        iterable_extent_id = (
+            int(projected_iterable_bindings[0][0])
+            if projected_iterable_bindings
+            else loop.iterable_node
+        )
         dynamic_bounds = tuple(
             (
                 name,
@@ -2661,6 +2774,7 @@ def analyze_shader_loop_reductions(
                 and (
                     len(loop.target_bindings) == 1
                     or loop.iterable_constant is not None
+                    or bool(projected_iterable_bindings)
                 )
             )
         ):
@@ -2673,6 +2787,16 @@ def analyze_shader_loop_reductions(
                 blockers.append(type(expression).__name__)
         blockers = list(dict.fromkeys(blockers))
 
+        # ``identity_table`` groups every value ever correlated with a source
+        # name.  That class is scope-free: for one carried name it holds the
+        # caller result, a local copy, an IndexedStore, the loop's LoopResult
+        # port and a nested callee's parameter alongside the real body update.
+        # Offering all of them as backedge candidates emits several pairs per
+        # binding, and only the one produced inside the loop can ever satisfy
+        # the header Phi.  Restrict the candidates to the loop body's induced
+        # subgraph, which is the graph-level statement of "this version was
+        # written by this cycle"; the lexical update stays authoritative.
+        body_scope = frozenset(map(int, loop.body_nodes))
         carried_aliases = tuple(dict.fromkeys(
             (
                 int(alias),
@@ -2681,6 +2805,7 @@ def analyze_shader_loop_reductions(
             for name, initial, updated in loop.carried_bindings
             for alias in (*tuple(identity_table.get(name, ())), updated)
             if int(alias) != int(initial)
+            and (int(alias) == int(updated) or int(alias) in body_scope)
         ))
         body_items: list[tuple[int, object]] = [
             (
@@ -2769,7 +2894,7 @@ def analyze_shader_loop_reductions(
                         is IterableAccess.CLOSURE_AGGREGATE
                         and plan.semantic.domain.source_value_ids
                     )
-                    else f"__iterable_extent_{loop.iterable_node}__"
+                    else f"__iterable_extent_{iterable_extent_id}__"
                     if loop.stop_node is None and loop.iterable_node is not None
                     and bool(loop.target_bindings)
                     and loop.iterable_constant is None
@@ -2936,6 +3061,9 @@ def analyze_shader_loop_reductions(
                         and len(loop.target_bindings) == 1
                     )
                     else (),
+                    projected_iterable_bindings=(
+                        projected_iterable_bindings
+                    ),
                     recursion_regions=tuple(
                         region
                         for region in recursion_regions

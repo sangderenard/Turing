@@ -147,7 +147,7 @@ def _run_one(
             execute_ns = perf_counter_ns() - execute_started
         elif backend in {"c_aot", "glsl_aot"}:
             # AOT precompiler route: ProcessGraph.build_from_ast ->
-            # reduce_abstract_tensor_topology -> strategize_glsl_deployment
+            # reduce_abstract_tensor_topology -> strategize_shell_deployment
             # -> compile_process_graph/capture_fused_programs, not the
             # tape-walking JIT backends above. See aot_compile.py and
             # docs/PIPELINE_STAGE_DISAMBIGUATION.md.

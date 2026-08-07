@@ -538,21 +538,46 @@ class NumPyTensorOperations(AbstractTensor):
         tensors = [self._AbstractTensor__unwrap(t) for t in tensors]
         return np.stack(tensors, axis=dim)
 
-    def pad_(self, pad, value=0.0):
-        if len(pad) % 2 != 0:
-            raise ValueError("Padding length must be even.")
-        num_dims_to_pad = len(pad) // 2
+    def pad_(self, pad, value=0.0, mode="constant"):
         tensor = self.data
-        if num_dims_to_pad > tensor.ndim:
-            raise ValueError("Padding tuple length implies padding more dimensions than tensor has.")
-        np_pad_width = []
-        for _ in range(tensor.ndim - num_dims_to_pad):
-            np_pad_width.append((0, 0))
-        for i in range(num_dims_to_pad):
-            left = pad[-2 * (i + 1)]
-            right = pad[-2 * (i + 1) + 1]
-            np_pad_width.append((left, right))
-        return np.pad(tensor, pad_width=np_pad_width, constant_values=value)
+        scalar_width = isinstance(pad, (int, np.integer))
+        if scalar_width:
+            np_pad_width = [(int(pad), int(pad))] * tensor.ndim
+            numpy_widths = True
+        else:
+            numpy_widths = bool(pad) and all(
+            isinstance(pair, (tuple, list)) and len(pair) == 2
+            for pair in pad
+            )
+        if scalar_width:
+            pass
+        elif numpy_widths:
+            if len(pad) != tensor.ndim:
+                raise ValueError(
+                    "NumPy-style padding must provide one pair per dimension."
+                )
+            np_pad_width = [tuple(map(int, pair)) for pair in pad]
+        else:
+            if len(pad) % 2 != 0:
+                raise ValueError("Padding length must be even.")
+            num_dims_to_pad = len(pad) // 2
+            if num_dims_to_pad > tensor.ndim:
+                raise ValueError("Padding tuple length implies padding more dimensions than tensor has.")
+            np_pad_width = []
+            for _ in range(tensor.ndim - num_dims_to_pad):
+                np_pad_width.append((0, 0))
+            for i in range(num_dims_to_pad):
+                left = pad[-2 * (i + 1)]
+                right = pad[-2 * (i + 1) + 1]
+                np_pad_width.append((left, right))
+        if mode == "constant":
+            return np.pad(
+                tensor,
+                pad_width=np_pad_width,
+                mode=mode,
+                constant_values=value,
+            )
+        return np.pad(tensor, pad_width=np_pad_width, mode=mode)
 
     def pad2d_(self, pad, value=0.0):
         pl, pr, pt, pb = pad

@@ -117,7 +117,32 @@ def test_comparisons_come_back_in_the_value_type():
 def test_an_unrepresentable_dtype_is_refused():
     program = _sub_abs_plus_one()
     with pytest.raises(WasmEmissionError):
-        emit_wasm_module(program, name="t", dtype="int64")
+        # A dtype WebAssembly genuinely has no value type for. This used to
+        # assert "int64", which was accurate while the module could only
+        # compute in f32/f64; integer working types are real now, so an
+        # integral program is compiled rather than refused and the refusal
+        # has to be demonstrated with something actually unrepresentable.
+        emit_wasm_module(program, name="t", dtype="complex128")
+
+
+def test_an_integral_program_computes_in_integer_instructions():
+    """An all-integer program is not silently computed in floating point.
+
+    ``//`` and ``%`` are not float operations, bit patterns are not float
+    values, and a 64-bit integer does not survive f64's 2**53 exact range --
+    so a program whose dtype is integral has to reach integer opcodes.
+    """
+
+    module = emit_wasm_module(_sub_abs_plus_one(), name="t", dtype="int64")
+
+    assert module.value_type == "i64"
+    assert "i64.sub" in module.source
+    # Signedness is explicit for integers, unlike the float comparisons.
+    assert "f64." not in module.source
+    # And it assembles, not only prints: the WAT text and the binary are two
+    # independent emitters, so an integer type existing in one but not the
+    # other would emit readable text that cannot run.
+    assert module.binary
 
 
 def test_float32_programs_use_four_byte_strides():

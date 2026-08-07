@@ -255,6 +255,8 @@ def emit_ssa_webgl_fragment_module(
         shortfalls=conversion_shortfalls + emitted.shortfalls,
         api=emitted.api,
         vertex_source=emitted.vertex_source,
+        io_layout=emitted.io_layout,
+        component_abi=emitted.component_abi,
     )
     from .evolution_metagraph import (
         EvolutionComponentRef,

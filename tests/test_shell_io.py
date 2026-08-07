@@ -9,6 +9,10 @@ from src.compiler.shell_io import (
     ShellIOManifest,
     ShellIORequest,
     ShellOption,
+    ExternalReferenceDomain,
+    SystemPort,
+    VirtualFileSystemContract,
+    VirtualMount,
     attach_shell_io,
     plan_shell_stack,
 )
@@ -63,6 +67,11 @@ def test_shared_abi_has_event_file_and_optional_double_buffer_mailboxes():
     assert mapping["records"]["input_event_i32"][:3] == [
         "kind", "code", "value",
     ]
+    assert mapping["external_references"]["web_domain"] == "bundle"
+    assert mapping["external_references"]["operations"] == [
+        "resolve", "call", "release",
+    ]
+    assert mapping["records"]["external_request_i32"][2] == "reference_id"
 
 
 def test_shell_io_travels_in_the_existing_compiled_api_descriptor():
@@ -120,3 +129,135 @@ def test_attaching_io_resolves_source_name_to_fortran_abi_parameter():
     assert attached["metadata"]["shell_io"]["requirements"]["bindings"] == [{
         "resource": "display.back", "entry_point": "frame", "parameter": "t77",
     }]
+
+
+def test_file_parameter_port_resolves_data_and_length_through_compiled_api():
+    parameters = (
+        Parameter("t4", "input", "u8", "uint8_t", "c_uint8", "reference", source_name="binary_bytes"),
+        Parameter("t5", "input", "i64", "int64_t", "c_int64", "value", source_name="binary_length"),
+    )
+    api = CompiledProgramAPI(
+        "machine", "wasm", "load_subject",
+        (EntryPoint("load_subject", "load_subject", "control", parameters),),
+    )
+    manifest = ShellIOManifest(
+        (ShellIORequest.create("files"),),
+        system_ports=(SystemPort.create(
+            "subject", "file", "input", entry_point="load_subject",
+            fields={"data": "binary_bytes", "length": "binary_length"},
+            attributes={"accept": ".exe,.dll,application/octet-stream"},
+        ),),
+    )
+
+    attached = attach_shell_io(api, manifest).to_mapping()
+    port = attached["metadata"]["shell_io"]["requirements"]["system_ports"][0]
+
+    assert port["kind"] == "file"
+    assert port["fields"] == [
+        {"name": "data", "parameter": "t4"},
+        {"name": "length", "parameter": "t5"},
+    ]
+
+
+def test_web_bundle_references_are_distinct_from_native_host_references():
+    web_manifest = ShellIOManifest(
+        (ShellIORequest.create("bundle_references"),),
+        system_ports=(SystemPort.create(
+            "decoder", "external_reference", "call",
+            external_domain=ExternalReferenceDomain.BUNDLE,
+            attributes={"bundle": "machine-decoder", "export": "decode"},
+        ),),
+    )
+    assert plan_shell_stack("wasm", web_manifest, (WEB_JAVASCRIPT_SHELL,)).outer_kind == "web_page"
+
+    host_manifest = ShellIOManifest(
+        (ShellIORequest.create("host_references"),),
+        system_ports=(SystemPort.create(
+            "kernel32", "external_reference", "call",
+            external_domain=ExternalReferenceDomain.HOST_SYSTEM,
+            attributes={"library": "kernel32", "symbol": "ReadFile"},
+        ),),
+    )
+    with pytest.raises(ValueError, match="no shell stack"):
+        plan_shell_stack("wasm", host_manifest, (WEB_JAVASCRIPT_SHELL,))
+    assert plan_shell_stack("fortran", host_manifest, (NATIVE_PROCESS_SHELL,)).outer_kind == "native_process"
+
+
+def test_virtual_filesystem_mounts_are_shell_specific_and_serialized():
+    web = ShellIOManifest(
+        (ShellIORequest.create("files"),),
+        virtual_filesystem=VirtualFileSystemContract(mounts=(
+            VirtualMount.create("/", "memory", access="read_write"),
+            VirtualMount.create("/programs", "bundle", source="program-bundle"),
+        )),
+    )
+    stack = plan_shell_stack("wasm", web, (WEB_JAVASCRIPT_SHELL,))
+    assert stack.outer_kind == "web_page"
+    mapping = web.to_mapping()["virtual_filesystem"]
+    assert mapping["current_directory"] == "/"
+    assert mapping["mounts"][1]["kind"] == "bundle"
+
+    native_only = ShellIOManifest(
+        (ShellIORequest.create("files"),),
+        virtual_filesystem=VirtualFileSystemContract(mounts=(
+            VirtualMount.create("/", "memory", access="read_write"),
+            VirtualMount.create("/host", "host_directory", source="C:\\sandbox"),
+        )),
+    )
+    with pytest.raises(ValueError, match="no shell stack"):
+        plan_shell_stack("wasm", native_only, (WEB_JAVASCRIPT_SHELL,))
+    assert plan_shell_stack(
+        "fortran", native_only, (NATIVE_PROCESS_SHELL,),
+    ).outer_kind == "native_process"
+
+
+def test_web_shell_accepts_declared_indexeddb_and_opfs_mounts_only():
+    manifest = ShellIOManifest(
+        (ShellIORequest.create("files"),),
+        virtual_filesystem=VirtualFileSystemContract(mounts=(
+            VirtualMount.create("/", "memory", access="read_write"),
+            VirtualMount.create(
+                "/database", "indexed_db", access="read_write",
+                source="machine-runtime",
+            ),
+            VirtualMount.create(
+                "/origin", "opfs", access="read_write",
+                source="machine/runtime",
+            ),
+        )),
+    )
+
+    assert plan_shell_stack(
+        "wasm", manifest, (WEB_JAVASCRIPT_SHELL,),
+    ).outer_kind == "web_page"
+    assert [mount["kind"] for mount in manifest.to_mapping()["virtual_filesystem"]["mounts"]] == [
+        "memory", "indexed_db", "opfs",
+    ]
+    with pytest.raises(ValueError, match="relative namespace paths"):
+        VirtualMount.create("/escape", "opfs", source="../host")
+
+
+def test_system_device_ports_are_an_explicit_shell_capability():
+    manifest = ShellIOManifest(
+        (ShellIORequest.create("system_devices"),),
+        system_ports=(SystemPort.create(
+            "terminal_input", "device", "input",
+            attributes={"device": "console.input", "encoding": "utf-8"},
+        ),),
+    )
+
+    port = manifest.to_mapping()["system_ports"][0]
+    assert port["kind"] == "device"
+    assert port["attributes"]["device"] == "console.input"
+    assert plan_shell_stack(
+        "wasm", manifest, (WEB_JAVASCRIPT_SHELL,),
+    ).outer_kind == "web_page"
+    with pytest.raises(ValueError, match="no shell stack"):
+        plan_shell_stack("fortran", manifest, (NATIVE_PROCESS_SHELL,))
+
+
+def test_file_broker_declares_namespace_and_journal_operations():
+    files = ShellIOABI().to_mapping()["files"]
+    assert files["namespace"] == "utf8-posix-absolute"
+    assert files["effects"] == "ordered-journal"
+    assert {"list", "rename", "chdir", "flush"} <= set(files["operations"])

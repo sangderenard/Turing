@@ -5,19 +5,20 @@ from __future__ import annotations
 import ast
 import builtins
 import copy
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass, fields, is_dataclass
 import importlib
 import logging
 import types
-from typing import Any
+from typing import Any, Callable
 
 import networkx as nx
 
+from ...compiler.shell_reference_tables import build_class_navigation_table
 from ...transmogrifier.function_table import (
     ExternalFunctionTable,
     FunctionTable,
 )
-from ...transmogrifier.ssa_registry import ast_ssa_name_map
+from ...transmogrifier.ssa_registry import ast_ssa_name_map, c_ssa_name_map
 
 
 logger = logging.getLogger(__name__)
@@ -31,11 +32,286 @@ class _StaticPythonReference:
     path: str
 
 
+# The export table: which graph node types are runnable definitions
+# (functions/methods), and how to read each one's own name off it. Python's
+# three cases are the built-in defaults; a foreign language's ingestion
+# (oop_language_translations.py's install_c_role_schemas, for C's
+# pycparser.c_ast.FuncDef, say) extends this the same way role_schemas
+# itself is extended -- registering its own node-type name and a callable
+# to read that type's own name field, rather than this reducer growing an
+# isinstance branch per language. This is the frontend-side half of
+# FunctionTable already being "shared function references for ProcessGraph
+# and SSA compilation" (function_table.py's own docstring) -- the table was
+# already meant to be language-neutral; only *populating* it was Python-AST-
+# specific until this registry existed.
+_RUNNABLE_DEFINITION_NAME_EXTRACTORS: dict[str, Callable[[Any], str]] = {
+    "FunctionDef": lambda node: str(node.name),
+    "AsyncFunctionDef": lambda node: str(node.name),
+    "Lambda": lambda node: (
+        f"<lambda:{getattr(node, 'lineno', 0)}:"
+        f"{getattr(node, 'col_offset', 0)}>"
+    ),
+}
+
+
+def register_runnable_definition_type(
+    type_name: str, name_extractor: Callable[[Any], str],
+) -> None:
+    """Register a foreign language's function/method-definition node type.
+
+    ``type_name`` is ``type(node).__name__`` for that language's own
+    function-definition node class (``"FuncDef"`` for ``pycparser``, say).
+    ``name_extractor`` reads that node's own name (``pycparser.c_ast.FuncDef``
+    keeps it at ``node.decl.name``, not ``node.name``, so this cannot be one
+    generic ``.name`` access across languages). Idempotent: re-registering
+    the same type name overwrites, it does not duplicate or error.
+    """
+
+    _RUNNABLE_DEFINITION_NAME_EXTRACTORS[str(type_name)] = name_extractor
+
+
+def is_runnable_definition(node: Any) -> bool:
+    """Is ``node`` a registered function/method-definition node, in any
+    registered language -- the export-table membership test."""
+
+    return type(node).__name__ in _RUNNABLE_DEFINITION_NAME_EXTRACTORS
+
+
+def runnable_definition_name(node: Any) -> str:
+    """The name of a registered function/method-definition node."""
+
+    return _RUNNABLE_DEFINITION_NAME_EXTRACTORS[type(node).__name__](node)
+
+
+# Same export-table pattern, for the two other node shapes call/return
+# ownership walking needs to recognize: a call, and a return-shaped node.
+# "Return" is deliberately one shared key for every registered language
+# rather than a per-language key -- pycparser's own Return node is *also*
+# literally named "Return" (not a naming collision to route around, an
+# actual shared vocabulary word both languages use for the same construct).
+#
+# The returned value itself is read from the graph's own dependency
+# structure (a node's "value"/"expr" parent-edge role -- role_schemas'
+# Return: {"up": {"value": 1}} for Python, {"up": {"expr": 1}} for C), never
+# from the raw source node's own attributes. This is deliberate, not
+# incidental: everywhere else this session resolved a value this way
+# (ShellMemoryReference.base_node_id, _resolve_reference_node in
+# glsl_deployment_strategy.py) it went through the graph's own parents/role
+# edges, not getattr on expr_obj -- the graph is the abstract, language-
+# neutral representation; the raw node is not, and reaching back into it
+# here would just reintroduce a second, Python-shaped assumption
+# (node.value vs node.expr) into code meant to be language-neutral.
+_CALL_SHAPED_TYPE_NAMES: set[str] = {"Call"}
+_RETURN_VALUE_ROLES: set[str] = {"value", "expr"}
+
+
+def register_call_shaped_type(type_name: str) -> None:
+    """Register a foreign language's call-expression node type name."""
+
+    _CALL_SHAPED_TYPE_NAMES.add(str(type_name))
+
+
+def register_return_value_role(role: str) -> None:
+    """Register a foreign language's own parent-edge role name for "this is
+    the value a return-shaped node returns" (role_schemas' own "up" key for
+    that language's Return-equivalent node)."""
+
+    _RETURN_VALUE_ROLES.add(str(role))
+
+
+def source_child_nodes(node: Any) -> tuple[Any, ...]:
+    """Every direct child of a source node, in any registered language.
+
+    The one traversal primitive a language must supply. Python spells it
+    ``ast.iter_child_nodes``; pycparser spells it ``node.children()``
+    (yielding ``(role_name, child)`` pairs). Neither understands the other:
+    ``ast.NodeVisitor.generic_visit`` requires ``node._fields``, which
+    pycparser nodes do not have, which is why walking a C body with an
+    ``ast`` visitor raises ``AttributeError: 'Decl' object has no attribute
+    '_fields'`` rather than simply finding nothing.
+
+    Dispatch is on the protocol the node actually implements, not on a
+    registered type name, because that is what genuinely varies -- and it
+    means a third frontend whose nodes are ``ast``-shaped or
+    ``children()``-shaped needs no registration here at all.
+    """
+
+    if isinstance(node, ast.AST):
+        return tuple(ast.iter_child_nodes(node))
+    children = getattr(node, "children", None)
+    if callable(children):
+        return tuple(child for _role, child in children())
+    return ()
+
+
+def source_body_statements(definition: Any) -> tuple[Any, ...]:
+    """The ordered statements making up a function definition's body.
+
+    Python keeps them directly on ``FunctionDef.body``; C wraps them in a
+    ``Compound`` whose ``block_items`` holds the list (and which may be
+    ``None`` for an empty body).
+    """
+
+    body = getattr(definition, "body", None)
+    if body is None:
+        return ()
+    if isinstance(body, list):
+        return tuple(body)
+    block_items = getattr(body, "block_items", None)
+    if block_items is not None:
+        return tuple(block_items)
+    # A lambda-style single-expression body is itself the only statement.
+    return (body,)
+
+
+def source_walk(node: Any) -> tuple[Any, ...]:
+    """``ast.walk`` for any registered language, via ``source_child_nodes``.
+
+    Callers filter the result with ``isinstance`` against the constructs
+    they care about. That stays correct for a foreign language rather than
+    merely not crashing: C genuinely has no ``ast.ExceptHandler`` and no
+    Python-style ``for``, so a scan for those legitimately finds nothing,
+    which is the right answer and not a silent gap.
+    """
+
+    collected: list[Any] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        collected.append(current)
+        stack.extend(source_child_nodes(current))
+    return tuple(collected)
+
+
+def function_parameter_names(definition: Any) -> tuple[str, ...]:
+    """A function definition's declared parameter names, in order.
+
+    Genuinely per-language grammar rather than shared vocabulary, so this
+    is one of the few places a language really must be taught its own
+    shape: Python hangs them off ``FunctionDef.args`` as ``arg`` nodes
+    across three lists (positional-only, ordinary, keyword-only), while C
+    reaches ``FuncDef -> decl -> type -> args.params`` to a list of
+    ``Decl`` nodes whose ``.name`` is a plain string.
+    """
+
+    arguments = getattr(definition, "args", None)
+    if arguments is not None and hasattr(arguments, "posonlyargs"):
+        return tuple(
+            argument.arg
+            for argument in (
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+            )
+        )
+    declaration = getattr(definition, "decl", None)
+    if declaration is not None:
+        parameter_list = getattr(getattr(declaration, "type", None), "args", None)
+        return tuple(
+            str(parameter.name)
+            for parameter in (getattr(parameter_list, "params", None) or ())
+            if getattr(parameter, "name", None) is not None
+        )
+    return ()
+
+
+def _record_owned_calls_and_returns(
+    graph: Any,
+    owner_reference: Any,
+    function_node_id: int,
+    call_owners: dict[int, Any],
+    function_return_values: dict[int, list[int]],
+) -> None:
+    """Walk ``graph.G`` (not the raw source tree) to find every call/return
+    belonging to the function at ``function_node_id``, stopping at any
+    nested function/method-definition boundary -- the graph-based,
+    language-neutral replacement for a source-tree ``ast.NodeVisitor`` walk,
+    which cannot walk a foreign language's own node types at all (a
+    ``pycparser`` node has no ``_fields`` attribute Python's
+    ``ast.NodeVisitor.generic_visit`` requires). Bounded, not
+    ``nx.ancestors``' full transitive closure: a nested definition's own
+    calls/returns belong to *it*, not this enclosing function, the same
+    rule the original visitor's ``visit_FunctionDef`` returning ``None``
+    (not recursing) enforced.
+    """
+
+    visited: set[int] = set()
+    stack = list(graph.G.predecessors(function_node_id))
+    while stack:
+        node_id = stack.pop()
+        if node_id in visited or node_id not in graph.G:
+            continue
+        visited.add(node_id)
+        data = graph.G.nodes[node_id]
+        expression = data.get("expr_obj")
+        if node_id != function_node_id and is_runnable_definition(expression):
+            # A nested definition owns its own calls/returns; do not
+            # descend into it from here.
+            continue
+        node_type = str(data.get("type"))
+        if node_type in _CALL_SHAPED_TYPE_NAMES:
+            call_owners[node_id] = owner_reference
+        if node_type == "Return":
+            # The returned value's own node id, read off the Return node's
+            # graph-native parent edges (role "value" for Python, "expr" for
+            # C) -- never off the raw source node's attributes. Already a
+            # graph node id (an "up" edge's producer), not a raw object,
+            # so it needs no id()/wrapping before use.
+            value_node_id = next(
+                (
+                    parent_id
+                    for parent_id, role in (data.get("parents") or ())
+                    if str(role) in _RETURN_VALUE_ROLES
+                ),
+                None,
+            )
+            if value_node_id is not None:
+                function_return_values.setdefault(
+                    function_node_id, [],
+                ).append(value_node_id)
+        stack.extend(graph.G.predecessors(node_id))
+
+
+# Source-language node type name -> the canonical SSA vocabulary spelling it
+# universalizes to. The point of routing through the registry rather than
+# hardcoding strings here is that a second language's own spelling for the
+# same construct lands on the *same* canonical type: C's ``FuncCall`` and
+# Python's ``Call`` both become "Call", so downstream passes see one
+# vocabulary instead of one per frontend. Extend by registering the foreign
+# spelling in ssa_registry.py (c_ssa_equivalents, say) and naming its node
+# type here -- not by adding a branch downstream.
 _AST_PROCESS_GRAPH_ALIASES = {
     "Name": ast_ssa_name_map["name"].value,
     "Assign": ast_ssa_name_map["assign"].value,
     "Call": ast_ssa_name_map["call"].value,
+    # C (pycparser c_ast), joining the same canonical spellings above.
+    # StructRef is C's field read (``self->value``), the same reading
+    # Python's ``attribute:load`` has -- both are Load.
+    "ID": c_ssa_name_map["id"].value,
+    "Assignment": c_ssa_name_map["assignment"].value,
+    "FuncCall": c_ssa_name_map["funccall"].value,
+    "StructRef": c_ssa_name_map["structref"].value,
 }
+
+# C node types that exist only to spell out a *type*, carrying no runtime
+# value of their own. Python's grammar has no equivalent (it is untyped at
+# the syntax level), which is why this set has no Python counterpart --
+# these are stripped for the same reason ast.Nonlocal/ast.Global are:
+# compile-time syntax, not operations. ``Decl`` is deliberately NOT here --
+# it carries both the declared name and its initializer, so it is a real
+# binding event, not type machinery.
+_C_COMPILE_TIME_SYNTAX = frozenset({
+    "TypeDecl",
+    "FuncDecl",
+    "PtrDecl",
+    "ArrayDecl",
+    "IdentifierType",
+    "ParamList",
+    "Typedef",
+    "Struct",
+    "Union",
+    "Enum",
+})
 
 _BITOPS_TO_EXECUTABLE = {
     "Xor": "bitxor",
@@ -61,12 +337,263 @@ def _qualified_handler(prefix: str, operator: ast.AST) -> str:
     return _BITOPS_TO_EXECUTABLE.get(handler.value, handler.value)
 
 
+def _c_qualified_handler(prefix: str, operator: str) -> str:
+    """``_qualified_handler`` for C, whose operators are strings not classes.
+
+    Python spells an operator as a child *node class* (``ast.Add``, hence
+    ``binop:add``); pycparser spells it as a plain string attribute on the
+    parent (``BinaryOp.op == '+'``, hence ``binaryop:+``). Two surface
+    spellings, one canonical Handler -- which is the whole point of the
+    registry, and why this returns the identical vocabulary
+    ``_qualified_handler`` does rather than a parallel C-flavored one.
+    """
+
+    spelling = f"{prefix}:{str(operator).lower()}"
+    handler = c_ssa_name_map.get(spelling)
+    if handler is None:
+        raise KeyError(f"no existing C operator alias for {spelling!r}")
+    return _BITOPS_TO_EXECUTABLE.get(handler.value, handler.value)
+
+
+def _c_constant_value(expression: Any) -> Any:
+    """A ``pycparser`` Constant's real Python value.
+
+    pycparser keeps every literal as the *source text* plus a type name
+    (``Constant(type='int', value='10')`` -- the value is the string "10",
+    not the integer 10). Downstream compiler stages treat ``data["constant"]``
+    as a real value, so the conversion has to happen here, at the one place
+    C literals are canonicalized, rather than being re-derived (or silently
+    left as a string) at each consumer.
+    """
+
+    raw = str(getattr(expression, "value", ""))
+    kind = str(getattr(expression, "type", ""))
+    if "char" in kind:
+        return raw.strip("'")
+    if "string" in kind:
+        return raw.strip('"')
+    if "float" in kind or "double" in kind:
+        return float(raw.rstrip("fFlL"))
+    if "int" in kind:
+        # C integer literals carry base prefixes and width/sign suffixes that
+        # Python's int() will not accept directly (0x1FUL, 10u, 07).
+        text = raw.rstrip("uUlL")
+        return int(text, 0) if text else 0
+    return raw
+
+
+# The type given to a node standing in for something ingestion could not
+# translate. Mangled data is mangled data: it needs a real, named, *non*
+# operation rather than either a silent hole or a hard stop.
+#
+# This type name MUST NEVER be added to any operator table -- not
+# ``operator_defs.operator_signatures``' executable entries, not
+# ``graph_deep_compiler``'s ``op_table``, not ``ssa_webgpu_backend``'s
+# ``_BINARY``/``_UNARY``, not ``fused_ir``'s ``ELEMENTWISE_*``. Its safety is
+# structural, not a matter of anyone remembering to check: because no table
+# maps it, every backend that meets it already reports it through that
+# backend's own existing "no instruction for this" path. Nothing can quietly
+# treat it as zero, which is the one line this repository does not cross --
+# never silently produce a plausible wrong number.
+#
+# It is deliberately *one* generic type carrying free-text provenance, not a
+# taxonomy of failure kinds. A closed enum of defect categories would need a
+# central owner to admit every new construct a contributor or agent adds --
+# exactly the bottleneck ``role_schemas``,
+# ``_RUNNABLE_DEFINITION_NAME_EXTRACTORS`` and the ssa_registry spelling
+# tables exist to remove. ``operator_signatures`` falls back to 'Default'
+# for an unrecognized type, so a graph carrying these still finalizes and
+# stays walkable; the translation simply reports how far it got.
+UNTRANSLATED_NODE_TYPE = "Untranslated"
+
+
+# How completely the affected construct survived translation. This is an
+# ordered *scale*, not a taxonomy -- which is why it is a closed set where
+# ``reason`` is deliberately free text. A scale has rungs that mean
+# something relative to each other and can be compared and sorted; a
+# taxonomy of failure kinds would need a central owner to admit every new
+# construct a contributor or agent introduces, which is the bottleneck this
+# module keeps removing. Add a rung only if it is genuinely between or
+# beyond these, never to describe a new *kind* of failure.
+#
+# Nothing here is binary. A translation is not "worked" or "failed": it
+# reached some depth and stopped, and how far it reached is the useful
+# fact. ``complete`` on the backend artifacts is the cheapest summary of
+# this scale, not a replacement for it.
+TRANSLATION_ABSENT = "absent"      # nothing of the construct translated
+TRANSLATION_PARTIAL = "partial"    # some constituents translated, some not
+TRANSLATION_DEGRADED = "degraded"  # fully translated, reduced fidelity
+TRANSLATION_UNKNOWN = "unknown"    # not determinable at this pass
+
+TRANSLATION_GRADES = (
+    TRANSLATION_ABSENT,
+    TRANSLATION_PARTIAL,
+    TRANSLATION_DEGRADED,
+    TRANSLATION_UNKNOWN,
+)
+
+
+@dataclass(frozen=True)
+class GraphTranslationShortfall:
+    """One construct graph ingestion could not fully translate.
+
+    Same contract the backend shortfall records already use
+    (``WasmShortfall``, ``WGSLShortfall``): structured fields for the parts
+    worth querying across many programs, and one free-text ``reason`` so
+    reporting something new never requires extending a type. Recorded on
+    ``graph.G.graph["translation_shortfalls"]``, alongside the existing
+    ``state_machine_control_shortfalls``.
+
+    ``grade`` carries how far the translation got, and ``observed``/
+    ``expected`` the countable evidence behind that grade (operands
+    resolved out of operands required, say). A reader deciding whether a
+    specimen is solid enough to reason about needs the degree, not just the
+    fact -- and a caller aggregating across many programs needs the counts,
+    not a prose summary of them.
+    """
+
+    pass_name: str
+    node_id: int
+    operation: str
+    role: str
+    source_span: str
+    reason: str
+    grade: str = TRANSLATION_UNKNOWN
+    observed: int = 0
+    expected: int = 0
+
+    @property
+    def coverage(self) -> float | None:
+        """Fraction of the construct that translated, when countable."""
+
+        if self.expected <= 0:
+            return None
+        return self.observed / self.expected
+
+    def format(self) -> str:
+        where = f" at {self.source_span}" if self.source_span else ""
+        role = f" ({self.role})" if self.role else ""
+        ratio = (
+            f" [{self.observed}/{self.expected}]" if self.expected else ""
+        )
+        return (
+            f"{self.pass_name}: {self.operation}{role}{where} "
+            f"<{self.grade}{ratio}>: {self.reason}"
+        )
+
+
+# Cap on a folded sequence, so `[0] * 10**9` is refused rather than
+# materialized. A refused fold is not a failure: it falls through to the
+# ordinary path and reports itself there like anything else.
+_MAX_FOLDED_SEQUENCE_ELEMENTS = 1 << 20
+
+
+def _static_sequence_literal(expression: Any) -> Any:
+    """Fold literal sequence replication (``[0] * 256``) to its value.
+
+    Returns the folded list, or ``None`` when this is not that construct.
+
+    ``[0] * 256`` is **Python list replication, not arithmetic** -- but the
+    AST spells it ``BinOp(op=Mult)``, so canonicalization would otherwise
+    rewrite it into a ``Mul`` dataflow operation that was never arithmetic.
+    Its operands are not in the graph either (a literal list inside a
+    comprehension is never descended into), so the ``Mul`` ends up with two
+    absent operands.
+
+    This is compile-time table allocation -- the shape a decoder's lookup
+    tables are declared in -- and its value is knowable now, so it becomes
+    constant data. Only the both-operands-literal case folds; anything
+    depending on a runtime value is left alone.
+    """
+
+    if not isinstance(expression, ast.BinOp) or not isinstance(
+        expression.op, ast.Mult
+    ):
+        return None
+    for sequence_node, count_node in (
+        (expression.left, expression.right),
+        (expression.right, expression.left),
+    ):
+        if not isinstance(sequence_node, (ast.List, ast.Tuple)):
+            continue
+        try:
+            sequence = ast.literal_eval(sequence_node)
+            count = ast.literal_eval(count_node)
+        except (ValueError, TypeError, SyntaxError, MemoryError):
+            return None
+        if isinstance(count, bool) or not isinstance(count, int):
+            return None
+        if count < 0:
+            return None
+        if len(sequence) * count > _MAX_FOLDED_SEQUENCE_ELEMENTS:
+            return None
+        return list(sequence) * count
+    return None
+
+
+def _source_span(expression: Any) -> str:
+    line = getattr(expression, "lineno", None)
+    if line is None:
+        return ""
+    column = getattr(expression, "col_offset", None)
+    return f"line {line}" + (f":{column}" if column is not None else "")
+
+
+def record_translation_shortfall(
+    graph: Any,
+    *,
+    pass_name: str,
+    node_id: int,
+    operation: str,
+    reason: str,
+    role: str = "",
+    source_span: str = "",
+    grade: str = TRANSLATION_UNKNOWN,
+    observed: int = 0,
+    expected: int = 0,
+) -> None:
+    """Accumulate one graph-level shortfall instead of raising.
+
+    Ingestion reports the way the backends already do -- a partial
+    translation is a real, inspectable result, not a failure. Raising here
+    would surface exactly one defect per run of a multi-minute build, when
+    the same run could have named every one of them.
+    """
+
+    existing = graph.G.graph.get("translation_shortfalls") or ()
+    graph.G.graph["translation_shortfalls"] = (
+        *existing,
+        GraphTranslationShortfall(
+            pass_name=str(pass_name),
+            node_id=int(node_id),
+            operation=str(operation),
+            role=str(role),
+            source_span=str(source_span),
+            reason=str(reason),
+            grade=str(grade),
+            observed=int(observed),
+            expected=int(expected),
+        ),
+    )
+
+
 def _replace_inputs(
     graph: Any,
     node_id: int,
     inputs: tuple[tuple[int, str], ...],
 ) -> None:
-    """Replace one wrapper's incoming topology with executable operands."""
+    """Replace one wrapper's incoming topology with executable operands.
+
+    An operand that is not in the graph is replaced by an explicit
+    ``UNTRANSLATED_NODE_TYPE`` node rather than passed to ``add_edge``.
+    NetworkX *creates* an absent endpoint rather than raising, which turned
+    a missing operand into a node with no ``type``, no ``expr_obj`` and no
+    ``label`` -- invisible here and fatal thousands of nodes later, as a
+    bare ``KeyError('type')`` naming nothing. The placeholder keeps the
+    consuming operation's arity intact (an operation silently short an
+    operand is a *wrong* program, not a smaller one) while making it
+    honestly inexecutable.
+    """
 
     for predecessor in tuple(graph.G.predecessors(node_id)):
         graph.G.remove_edge(predecessor, node_id)
@@ -77,12 +604,99 @@ def _replace_inputs(
             )
             if child_id != node_id
         ]
-    graph.G.nodes[node_id]["parents"] = list(inputs)
+    consumer = graph.G.nodes[node_id] if node_id in graph.G else {}
+    expected = len(inputs)
+    present = sum(1 for operand, _role in inputs if operand in graph.G)
+    # The grade describes the *construct*, not the individual operand: an
+    # operation with one of two operands resolved is partially translated,
+    # even though each absent operand is individually absent.
+    grade = TRANSLATION_ABSENT if present == 0 else TRANSLATION_PARTIAL
+    resolved: list[tuple[int, str]] = []
     for predecessor, role in inputs:
+        if predecessor not in graph.G:
+            predecessor = _untranslated_operand(
+                graph,
+                consumer_id=node_id,
+                consumer=consumer,
+                role=role,
+                absent_id=predecessor,
+                grade=grade,
+                observed=present,
+                expected=expected,
+            )
+        resolved.append((predecessor, role))
+    graph.G.nodes[node_id]["parents"] = list(resolved)
+    for predecessor, role in resolved:
         graph.G.add_edge(predecessor, node_id, role=role)
         children = graph.G.nodes[predecessor].setdefault("children", [])
         if node_id not in {child_id for child_id, _role in children}:
             children.append((node_id, role))
+
+
+def _untranslated_operand(
+    graph: Any,
+    *,
+    consumer_id: int,
+    consumer: Any,
+    role: str,
+    absent_id: int,
+    grade: str = TRANSLATION_UNKNOWN,
+    observed: int = 0,
+    expected: int = 0,
+) -> int:
+    """Materialize one explicit stand-in for an operand that never arrived."""
+
+    expression = consumer.get("expr_obj") if hasattr(consumer, "get") else None
+    operation = str(consumer.get("type") or type(expression).__name__)
+    span = _source_span(expression)
+    label = f"untranslated[{operation}.{role}]"
+    placeholder_id = id(label)
+    while placeholder_id in graph.G:
+        # ``id`` of a fresh string is unique among live objects, but this
+        # label is not retained, so a later identical label could reuse the
+        # address. Step off any collision rather than silently aliasing two
+        # unrelated stand-ins onto one node.
+        placeholder_id += 1
+    graph.G.add_node(
+        placeholder_id,
+        label=label,
+        type=UNTRANSLATED_NODE_TYPE,
+        op=UNTRANSLATED_NODE_TYPE.lower(),
+        expr_obj=None,
+        extra_args={},
+        domain_node=None,
+        store_id=None,
+        parents=[],
+        children=[],
+        attributes={
+            "untranslated": True,
+            "consumer_node": int(consumer_id),
+            "consumer_operation": operation,
+            "operand_role": str(role),
+            "absent_node_id": int(absent_id),
+            "source_span": span,
+            "translation_grade": str(grade),
+            "translated_operands": int(observed),
+            "expected_operands": int(expected),
+        },
+    )
+    record_translation_shortfall(
+        graph,
+        pass_name="process-graph-operands",
+        node_id=consumer_id,
+        operation=operation,
+        role=role,
+        source_span=span,
+        grade=grade,
+        observed=observed,
+        expected=expected,
+        reason=(
+            "operand was never ingested as a graph node; a non-operation "
+            "stands in its place so the translation reports rather than "
+            "computes"
+        ),
+    )
+    return placeholder_id
 
 
 def _remove_node(graph: Any, node_id: int) -> None:
@@ -152,6 +766,7 @@ def _normalize_lexical_values(
     statement: ast.FunctionDef | ast.AsyncFunctionDef,
     static_bindings: dict[str, Any],
     function_table: FunctionTable,
+    lexical_function_bindings: dict[str, Any] | None = None,
 ) -> None:
     """Resolve unique lexical occurrences into a monotonic value DAG.
 
@@ -164,19 +779,126 @@ def _normalize_lexical_values(
     graph = function_graph
     environment: dict[str, int] = {}
     static_environment: dict[str, _StaticPythonReference] = {}
+    deleted_names: set[str] = set()
     identity_bindings: dict[str, list[int]] = {}
     loop_target_bindings_by_ast: dict[int, int] = {}
     static_reference_nodes: dict[tuple[int, str], int] = {}
+    first_class_function_nodes: dict[int, int] = {}
     static_constant_nodes: dict[str, int] = {}
-    parameter_names = {
-        argument.arg
-        for argument in (
-            *statement.args.posonlyargs,
-            *statement.args.args,
-            *statement.args.kwonlyargs,
-        )
+    static_attribute_values: dict[tuple[int, str], int] = {}
+    parameter_names = set(function_parameter_names(statement))
+    # A parameter annotated with a locally-defined class name gives a
+    # receiver a real, known class identity at ingestion -- enough to
+    # resolve ``receiver.attr`` through the class's own navigation table
+    # (below) instead of inventing a name for it.  Only a bare ``Name``
+    # annotation naming a class this source itself defines counts; anything
+    # else (no annotation, an external/generic type) leaves the receiver's
+    # class unknown here, and attribute access on it is not slot-resolvable.
+    #
+    # ``build_class_navigation_table`` needs only ``map_ir`` (ingestion-time,
+    # AST-derived) and ``function_table`` for method references; both are
+    # already populated on ``graph`` before reduction runs -- but this
+    # function is called once per *function* being reduced, and
+    # ``build_class_navigation_table`` is a real, previously whole-
+    # compilation-scoped call (``aot_compile.py``, after all reduction
+    # finishes).  Memoized on the graph itself so it still runs exactly
+    # once per graph, not once per method of a retained class with many
+    # methods -- calling it repeatedly, interleaved with other functions'
+    # own active reduction, is not a cost concern here so much as an
+    # unreviewed-reentrancy risk against shared reduction state.
+    navigation_table = graph.G.graph.get("_class_navigation_table")
+    if navigation_table is None:
+        navigation_table = build_class_navigation_table(graph)
+        graph.G.graph["_class_navigation_table"] = navigation_table
+    parameter_class_names: dict[str, str] = {}
+    known_class_identities = {
+        record.identity for record in navigation_table.classes
     }
-    for body_statement in statement.body:
+    for argument in (
+        *statement.args.posonlyargs,
+        *statement.args.args,
+        *statement.args.kwonlyargs,
+    ):
+        annotation = argument.annotation
+        if (
+            isinstance(annotation, ast.Name)
+            and annotation.id in known_class_identities
+        ):
+            parameter_class_names[argument.arg] = annotation.id
+
+    def _resolve_instance_attribute_slot(
+        class_identity: str, attribute_name: str
+    ) -> int | None:
+        """A field's real position in ``class_identity``'s layout, or ``None``.
+
+        Permission evaluation here is deliberately permissive: this call
+        resolves *structural* identity for SSA construction (which slot),
+        the same question ``resolve_dot`` answers for real elsewhere in the
+        compiler -- it does not enforce access policy.  A denied/ambiguous
+        resolution is a fact about the source (an unknown or non-attribute
+        member), not a security decision, so it is treated as "not slot-
+        resolvable" rather than raised.
+        """
+
+        try:
+            member = navigation_table.resolve_dot(
+                class_identity,
+                attribute_name,
+                lambda _identity, _permissions: True,
+                receiver_kind="instance",
+            )
+        except (KeyError, PermissionError):
+            return None
+        return member.slot if member.kind == "attribute" else None
+    exception_local_names = {
+        target.id
+        for handler in (
+            node
+            for node in source_walk(statement)
+            if isinstance(node, ast.ExceptHandler)
+        )
+        for body_node in handler.body
+        for assignment in source_walk(body_node)
+        if isinstance(assignment, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+        for target in (
+            (*assignment.targets,)
+            if isinstance(assignment, ast.Assign)
+            else (assignment.target,)
+        )
+        if isinstance(target, ast.Name)
+    }
+    scalar_loop_target_ast_ids: set[int] = set()
+
+    def target_name_nodes(target: ast.AST) -> tuple[ast.Name, ...]:
+        if isinstance(target, ast.Name):
+            return (target,)
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return tuple(
+                name
+                for element in target.elts
+                for name in target_name_nodes(element)
+            )
+        return ()
+
+    for loop in source_walk(statement):
+        if not (
+            isinstance(loop, ast.For)
+            and isinstance(loop.iter, ast.Call)
+            and isinstance(loop.iter.func, ast.Name)
+        ):
+            continue
+        if loop.iter.func.id == "range":
+            scalar_loop_target_ast_ids.update(
+                id(name) for name in target_name_nodes(loop.target)
+            )
+        elif loop.iter.func.id == "enumerate":
+            if isinstance(loop.target, (ast.Tuple, ast.List)) and loop.target.elts:
+                scalar_loop_target_ast_ids.update(
+                    id(name)
+                    for name in target_name_nodes(loop.target.elts[0])
+                )
+    scalar_loop_binding_ids: set[int] = set()
+    for body_statement in source_body_statements(statement):
         if not isinstance(body_statement, ast.Return):
             continue
         returned = body_statement.value
@@ -285,9 +1007,33 @@ def _normalize_lexical_values(
         class_descriptor = graph.G.graph.get("class_table", {}).get(
             target_name
         )
+        if class_descriptor is not None and is_dataclass(target):
+            # Imported dataclasses enter the function table as structural
+            # class references, but their defining ClassDef belongs to a
+            # different source unit.  Recover the constructor schema here so
+            # omitted literal defaults (for example SuperstepPlan.eps) remain
+            # compiler facts instead of disappearing into Python reflection
+            # at execution time.
+            dataclass_fields = tuple(fields(target))
+            class_descriptor["fields"] = tuple(
+                field.name for field in dataclass_fields
+            )
+            defaults = dict(class_descriptor.get("field_defaults") or {})
+            for field in dataclass_fields:
+                if field.default is not MISSING and is_static_literal(
+                    field.default
+                ):
+                    defaults[field.name] = copy.deepcopy(field.default)
+            class_descriptor["field_defaults"] = defaults
         function_reference = (
             function_table.reference(target_name) if target_name else None
         )
+        if getattr(target, "__self__", None) is not None:
+            # A bound runtime/builtin method is identified by both callable
+            # and receiver.  Linking it to an unrelated source method by the
+            # final spelling alone (for example ContextVar.get versus a
+            # user class's get) discards the receiver and is never valid.
+            function_reference = None
         attributes = {
             "static_python_reference": reference.path,
             "reference_kind": (
@@ -312,6 +1058,25 @@ def _normalize_lexical_values(
         static_reference_nodes[key] = node_id
         return node_id
 
+    def first_class_function_node(name: str, reference: Any) -> int:
+        """Represent a source function used as data by its table address."""
+
+        address = int(reference.address)
+        existing = first_class_function_nodes.get(address)
+        if existing is not None:
+            return existing
+        node_id = new_node(
+            "StaticReference",
+            name,
+            attributes={
+                "function_ref": address,
+                "first_class_function_ref": address,
+                "reference_kind": "function_subgraph",
+            },
+        )
+        first_class_function_nodes[address] = node_id
+        return node_id
+
     def bind_loop_target(target: ast.AST) -> None:
         if isinstance(target, ast.Name):
             target_identity = id(target)
@@ -327,6 +1092,8 @@ def _normalize_lexical_values(
                 )
                 loop_target_bindings_by_ast[target_identity] = value
                 identity_bindings.setdefault(target.id, []).append(value)
+            if target_identity in scalar_loop_target_ast_ids:
+                scalar_loop_binding_ids.add(value)
             environment[target.id] = value
             _remove_node(graph, id(target))
             return
@@ -361,6 +1128,30 @@ def _normalize_lexical_values(
             expression,
             (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
         ):
+            # Comprehensions and generator expressions have owned their own
+            # scope since Python 3.0: a `for x in ...` target inside one is
+            # never visible outside it, even when an outer variable of the
+            # same name already exists or gets bound later. (The one
+            # exception, a `:=` walrus target, deliberately leaks to the
+            # enclosing scope per PEP 572 -- that goes through bind_target,
+            # not bind_loop_target, and is untouched here.) Without this,
+            # a comprehension's `for` target silently overwrote (or was
+            # later mistaken for) an unrelated same-named binding elsewhere
+            # in the function -- for example `tuple(f(x) for x in seq)`
+            # followed later by an ordinary `for x in other:` picking up
+            # the comprehension's already-evaporated node as its own
+            # "before this loop" value, and crashing much later with
+            # "missing ProcessGraph input" once that node was removed.
+            comprehension_target_names = {
+                name
+                for generator in expression.generators
+                for name in loop_target_names(generator.target)
+            }
+            shadowed_bindings = {
+                name: environment[name]
+                for name in comprehension_target_names
+                if name in environment
+            }
             for generator in expression.generators:
                 resolve_expression(generator)
             if isinstance(expression, ast.DictComp):
@@ -391,6 +1182,11 @@ def _normalize_lexical_values(
                             "materializer_node_id": node_id,
                         })
                         attributes["loop_iteration_outputs"] = tuple(outputs)
+            for name in comprehension_target_names:
+                if name in shadowed_bindings:
+                    environment[name] = shadowed_bindings[name]
+                else:
+                    environment.pop(name, None)
             return node_id if node_id in graph.G else None
         if isinstance(expression, ast.comprehension):
             resolve_expression(expression.iter)
@@ -415,8 +1211,23 @@ def _normalize_lexical_values(
                     return static_reference
                 producer_id = environment.get(expression.id)
                 static_value = static_bindings.get(expression.id)
+                function_reference = (
+                    (lexical_function_bindings or {}).get(expression.id)
+                    or function_table.reference(expression.id)
+                )
                 if (
                     producer_id is None
+                    and expression.id not in parameter_names
+                    and function_reference is not None
+                ):
+                    _remove_node(graph, node_id)
+                    return first_class_function_node(
+                        expression.id,
+                        function_reference,
+                    )
+                if (
+                    producer_id is None
+                    and expression.id not in parameter_names
                     and static_value is not None
                     and isinstance(
                         static_value,
@@ -436,6 +1247,7 @@ def _normalize_lexical_values(
                     )
                 if (
                     producer_id is None
+                    and expression.id not in parameter_names
                     and expression.id in static_bindings
                     and is_static_literal(static_value)
                 ):
@@ -451,6 +1263,8 @@ def _normalize_lexical_values(
                         binding_kind=(
                             "parameter"
                             if expression.id in parameter_names
+                            else "exception"
+                            if expression.id in exception_local_names
                             else "external"
                         ),
                     )
@@ -461,6 +1275,7 @@ def _normalize_lexical_values(
             if (
                 isinstance(expression.value, ast.Name)
                 and expression.value.id not in environment
+                and expression.value.id not in parameter_names
                 and expression.value.id in static_bindings
             ):
                 _remove_node(graph, id(expression.value))
@@ -471,6 +1286,11 @@ def _normalize_lexical_values(
             else:
                 receiver = resolve_expression(expression.value)
             if isinstance(receiver, _StaticPythonReference):
+                attribute_key = (id(receiver.value), expression.attr)
+                assigned_value = static_attribute_values.get(attribute_key)
+                if assigned_value is not None:
+                    _redirect_value(graph, id(expression), assigned_value)
+                    return assigned_value
                 try:
                     value = getattr(receiver.value, expression.attr)
                 except AttributeError:
@@ -489,10 +1309,96 @@ def _normalize_lexical_values(
                         value,
                         f"{receiver.path}.{expression.attr}",
                     )
+            elif isinstance(receiver, int) and id(expression) in graph.G:
+                _replace_inputs(
+                    graph,
+                    id(expression),
+                    ((receiver, "value"),),
+                )
+                if isinstance(expression.value, ast.Name):
+                    # Mirror ``SetAttr``'s ``attribute_slot`` (see
+                    # ``bind_target``) on the read side: the field's real
+                    # position in its class's declared instance storage, not
+                    # a name invented at this call site.
+                    class_identity = parameter_class_names.get(
+                        expression.value.id
+                    )
+                    if class_identity is not None:
+                        slot = _resolve_instance_attribute_slot(
+                            class_identity, expression.attr
+                        )
+                        if slot is not None:
+                            graph.G.nodes[id(expression)].setdefault(
+                                "attributes", {}
+                            )["attribute_slot"] = (class_identity, slot)
+                # An ordinary attribute access on a resolved receiver is a
+                # real reference-operator node -- ``_replace_inputs`` above
+                # already gave it the receiver as a dependency, and
+                # ``attribute_slot`` its class-grounded identity where
+                # known.  Without returning that identity here, every
+                # caller of ``resolve_expression`` -- including ``ast.Call``
+                # resolving its own ``func`` for a method call -- silently
+                # receives ``None`` instead: the operator resolved
+                # correctly but never reported back that it did, severing
+                # the receiver as a dependency for anything built from this
+                # expression (a method call, a chained attribute, ...).
+                return id(expression)
 
         if isinstance(expression, ast.Call):
-            callee = resolve_expression(expression.func)
             node_id = id(expression)
+            if (
+                isinstance(expression.func, ast.Name)
+                and expression.func.id
+                in (graph.G.graph.get("class_definitions") or ())
+                and node_id in graph.G
+            ):
+                # A source-local class construction, already known from
+                # ``map_ir`` at ingestion -- no python_bindings/static
+                # reference resolution needed or wanted for this: the
+                # class isn't external, it's right here in the source.
+                graph.G.nodes[node_id].setdefault(
+                    "attributes", {},
+                )["class_ref"] = expression.func.id
+            if (
+                isinstance(expression.func, ast.Attribute)
+                and node_id in graph.G
+            ):
+                # A method call's receiver is wired here, through the same
+                # SSA lookup (resolve_expression) every other expression
+                # already goes through -- not a raw AST-node id, which is
+                # only valid by coincidence (it assumes ingestion happened
+                # to walk this exact receiver independently, which is not
+                # guaranteed for one reached only through this call
+                # expression). The receiver is an ordinary expression --
+                # commonly a Name already bound by bind_target, whose real,
+                # resolved value resolve_expression looks up directly.
+                receiver_value = resolve_expression(expression.func.value)
+                receiver_inputs = (
+                    ((receiver_value, "operand"),)
+                    if isinstance(receiver_value, int)
+                    else ()
+                )
+                argument_inputs = tuple(
+                    (resolved, f"arg{index}")
+                    for index, argument in enumerate(expression.args)
+                    if isinstance(
+                        (resolved := resolve_expression(argument)), int
+                    )
+                )
+                keyword_inputs = tuple(
+                    (resolved, f"kw:{keyword.arg}" if keyword.arg else "kwargs")
+                    for keyword in expression.keywords
+                    if isinstance(
+                        (resolved := resolve_expression(keyword.value)), int
+                    )
+                )
+                if receiver_inputs:
+                    _replace_inputs(
+                        graph,
+                        node_id,
+                        (*receiver_inputs, *argument_inputs, *keyword_inputs),
+                    )
+            callee = resolve_expression(expression.func)
             if isinstance(callee, int) and callee in graph.G:
                 callee_reference = (
                     graph.G.nodes[callee].get("attributes") or {}
@@ -543,23 +1449,161 @@ def _normalize_lexical_values(
                     # compiler metadata, but never feed it to the operation as
                     # tensor data.
                     attributes["operator_reference_node"] = reference_node_id
-                static_arguments = {}
+            # Every call's arguments need ``resolve_expression`` -- the same
+            # reduction/redirection every other expression gets -- regardless
+            # of what kind of callee this call has.  This used to run only
+            # inside the ``_StaticPythonReference`` branch above, so an
+            # ordinary method call (``pending.pop(0)``, a call through a
+            # resolved-but-not-static receiver) never had its arguments
+            # resolved at all during reduction: a literal like ``0`` was
+            # left exactly as ingestion produced it, unreachable by anything
+            # that expects reduction to have run -- the same "not translated"
+            # shape as any other missing operand.
+            if node_id in graph.G:
+                attributes = graph.G.nodes[node_id].setdefault(
+                    "attributes", {}
+                )
+                static_arguments = dict(
+                    attributes.get("static_call_arguments") or {}
+                )
                 for index, argument in enumerate(expression.args):
                     resolved = resolve_expression(argument)
                     if isinstance(resolved, _StaticPythonReference):
                         static_arguments[f"arg:{index}"] = resolved.path
+                        attributes.setdefault(
+                            "static_call_values", {}
+                        )[f"arg:{index}"] = resolved.value
+                        graph.G.graph.setdefault(
+                            "static_python_values", {}
+                        )[resolved.path] = resolved.value
+                    elif (
+                        isinstance(resolved, int)
+                        and resolved in graph.G
+                        and (graph.G.nodes[resolved].get("attributes") or {}).get(
+                            "first_class_function_ref"
+                        ) is not None
+                    ):
+                        role = f"arg:{index}"
+                        if not graph.G.has_edge(resolved, node_id):
+                            graph.G.add_edge(resolved, node_id, role=role)
+                        children = graph.G.nodes[resolved].setdefault(
+                            "children", []
+                        )
+                        if (node_id, role) not in children:
+                            children.append((node_id, role))
+                        parents = graph.G.nodes[node_id].setdefault(
+                            "parents", []
+                        )
+                        if (resolved, role) not in parents:
+                            parents.append((resolved, role))
                 for keyword in expression.keywords:
                     if keyword.arg is None:
                         continue
                     resolved = resolve_expression(keyword.value)
                     if isinstance(resolved, _StaticPythonReference):
                         static_arguments[f"kw:{keyword.arg}"] = resolved.path
+                        attributes.setdefault(
+                            "static_call_values", {}
+                        )[f"kw:{keyword.arg}"] = resolved.value
+                        graph.G.graph.setdefault(
+                            "static_python_values", {}
+                        )[resolved.path] = resolved.value
+                    elif (
+                        isinstance(resolved, int)
+                        and resolved in graph.G
+                        and (graph.G.nodes[resolved].get("attributes") or {}).get(
+                            "first_class_function_ref"
+                        ) is not None
+                    ):
+                        role = f"kw:{keyword.arg}"
+                        if not graph.G.has_edge(resolved, node_id):
+                            graph.G.add_edge(resolved, node_id, role=role)
+                        children = graph.G.nodes[resolved].setdefault(
+                            "children", []
+                        )
+                        if (node_id, role) not in children:
+                            children.append((node_id, role))
+                        parents = graph.G.nodes[node_id].setdefault(
+                            "parents", []
+                        )
+                        if (resolved, role) not in parents:
+                            parents.append((resolved, role))
                 if static_arguments:
                     attributes["static_call_arguments"] = static_arguments
 
+            # A source-defined function may itself be a positional/keyword
+            # value (callbacks, policies, hooks).  Its original Name node was
+            # intentionally removed, so reconnect the compiler-owned static
+            # reference to the call with the argument's real role.
+            if node_id in graph.G:
+                attributes = graph.G.nodes[node_id].setdefault(
+                    "attributes", {}
+                )
+                static_arguments = dict(
+                    attributes.get("static_call_arguments") or {}
+                )
+                for role, argument in (
+                    *tuple(
+                        (f"arg:{index}", argument)
+                        for index, argument in enumerate(expression.args)
+                    ),
+                    *tuple(
+                        (f"kw:{keyword.arg}", keyword.value)
+                        for keyword in expression.keywords
+                        if keyword.arg is not None
+                    ),
+                ):
+                    if (
+                        isinstance(argument, ast.Name)
+                        and isinstance(
+                            getattr(builtins, argument.id, None), type
+                        )
+                    ):
+                        static_arguments[role] = argument.id
+                        attributes.setdefault(
+                            "static_call_values", {}
+                        )[role] = getattr(builtins, argument.id)
+                        graph.G.graph.setdefault(
+                            "static_python_values", {}
+                        )[argument.id] = getattr(builtins, argument.id)
+                if static_arguments:
+                    attributes["static_call_arguments"] = static_arguments
+                for role, argument in (
+                    *tuple(
+                        (f"arg:{index}", argument)
+                        for index, argument in enumerate(expression.args)
+                    ),
+                    *tuple(
+                        (f"kw:{keyword.arg}", keyword.value)
+                        for keyword in expression.keywords
+                        if keyword.arg is not None
+                    ),
+                ):
+                    resolved = resolve_expression(argument)
+                    if not (
+                        isinstance(resolved, int)
+                        and resolved in graph.G
+                        and (graph.G.nodes[resolved].get("attributes") or {}).get(
+                            "first_class_function_ref"
+                        ) is not None
+                    ):
+                        continue
+                    if not graph.G.has_edge(resolved, node_id):
+                        graph.G.add_edge(resolved, node_id, role=role)
+                    children = graph.G.nodes[resolved].setdefault(
+                        "children", []
+                    )
+                    if (node_id, role) not in children:
+                        children.append((node_id, role))
+                    parents = graph.G.nodes[node_id].setdefault(
+                        "parents", []
+                    )
+                    if (resolved, role) not in parents:
+                        parents.append((resolved, role))
+
         # A named callee already represented by a function-table reference is
         # not a runtime value.  Its arguments still are.
-        children = tuple(ast.iter_child_nodes(expression))
+        children = tuple(source_child_nodes(expression))
         if isinstance(expression, ast.Call):
             call_data = (
                 graph.G.nodes[id(expression)]
@@ -657,7 +1701,33 @@ def _normalize_lexical_values(
             and isinstance(expression.args[0], ast.GeneratorExp)
             and node_id in graph.G
         ):
+            # This re-resolves generator_expression.elt, which the
+            # (ListComp, SetComp, DictComp, GeneratorExp) branch above
+            # already resolved once, inside its own scoped push/pop of the
+            # generator's `for` target names. resolve_expression() is not
+            # memoized for Name lookups -- it re-reads `environment` on
+            # every call -- so this second, unscoped pass through the same
+            # `elt` subtree re-looks-up the target name(s) (e.g. `address`
+            # in `tuple(f(address) for address in xs)`) after that first
+            # pass already popped them, silently creating a fresh
+            # "external input" binding for what should be, and already
+            # was, a properly loop-scoped local. That stray rebinding then
+            # leaked into whatever unrelated code came later in the
+            # function and happened to reuse the same name. Same
+            # push/pop discipline as above, applied to this second walk.
             generator_expression = expression.args[0]
+            comprehension_target_names = {
+                name
+                for generator in generator_expression.generators
+                for name in loop_target_names(generator.target)
+            }
+            shadowed_bindings = {
+                name: environment[name]
+                for name in comprehension_target_names
+                if name in environment
+            }
+            for generator in generator_expression.generators:
+                bind_loop_target(generator.target)
             value_id = resolve_expression(generator_expression.elt)
             for generator in generator_expression.generators:
                 generator_id = id(generator)
@@ -680,6 +1750,11 @@ def _normalize_lexical_values(
                     "materializer_node_id": node_id,
                 })
                 attributes["loop_iteration_outputs"] = tuple(outputs)
+            for name in comprehension_target_names:
+                if name in shadowed_bindings:
+                    environment[name] = shadowed_bindings[name]
+                else:
+                    environment.pop(name, None)
         return node_id if node_id in graph.G else None
 
     def bind_target(
@@ -689,6 +1764,7 @@ def _normalize_lexical_values(
         if value is None:
             return
         if isinstance(target, ast.Name):
+            deleted_names.discard(target.id)
             if isinstance(value, _StaticPythonReference):
                 environment.pop(target.id, None)
                 static_environment[target.id] = value
@@ -703,9 +1779,16 @@ def _normalize_lexical_values(
             if isinstance(value, _StaticPythonReference):
                 raise TypeError(
                     "a static Python reference cannot be stored as a runtime "
-                    "object attribute"
+                    f"object attribute in {statement.name}: "
+                    f"target={ast.dump(target, include_attributes=False)}, "
+                    f"value={value.path}"
                 )
             receiver = resolve_expression(target.value)
+            static_receiver = (
+                receiver if isinstance(receiver, _StaticPythonReference) else None
+            )
+            if static_receiver is not None:
+                receiver = static_reference_node(static_receiver)
             if not isinstance(receiver, int) or not isinstance(value, int):
                 raise TypeError(
                     "attribute assignment requires resolved object and value "
@@ -715,9 +1798,24 @@ def _normalize_lexical_values(
                 )
             node_id = id(target)
             if node_id not in graph.G:
-                raise RuntimeError(
-                    "attribute assignment target disappeared before SetAttr "
-                    "lowering"
+                # Resolving a compile-time receiver's literal attribute read
+                # redirects and removes the source Attribute wrapper.  The
+                # subsequent write is still a distinct runtime effect.
+                node_id = new_node(
+                    "SetAttr",
+                    f"setattr[{target.attr}]",
+                    attributes={"attribute": target.attr},
+                )
+            # In ``object.field += value`` the Attribute node is the read
+            # feeding the AugAssign result.  Reusing that same node as the
+            # write would create ``Attribute -> AugAssign -> SetAttr`` while
+            # SetAttr is still the Attribute node: an artificial dataflow
+            # cycle.  Keep the read and write as distinct program events.
+            if node_id == value or nx.has_path(graph.G, node_id, value):
+                node_id = new_node(
+                    "SetAttr",
+                    f"setattr[{target.attr}]",
+                    attributes={"attribute": target.attr},
                 )
             node_data = graph.G.nodes[node_id]
             node_data["type"] = "SetAttr"
@@ -731,6 +1829,90 @@ def _normalize_lexical_values(
                     (value, "value"),
                 ),
             )
+            if static_receiver is not None:
+                static_attribute_values[
+                    (id(static_receiver.value), target.attr)
+                ] = value
+            # A plain-named receiver (``counter.value = ...``) gets its own
+            # identity binding the same way a bare ``ast.Name`` target does
+            # above -- the field write is already a real, correctly wired
+            # SetAttr node; it was just never named, so it never reached
+            # ``identity_table`` for anything downstream to select by name.
+            if isinstance(target.value, ast.Name):
+                field_identity = f"{target.value.id}.{target.attr}"
+                identity_bindings.setdefault(
+                    field_identity, []
+                ).append(node_id)
+                # ``callee_ref``/``method_ref``/``class_ref`` each let a
+                # dependency walk recurse into the thing a node depends on --
+                # a real node reference grounded in the class's own layout,
+                # not a label invented at this call site.  ``attribute_slot``
+                # is the field's actual, deterministic position in its
+                # class's declared instance storage, resolved through
+                # ``ClassNavigationTable.resolve_dot`` (see
+                # ``navigation_table``/``_resolve_instance_attribute_slot``
+                # above), known only when the receiver's static class
+                # identity is known -- an annotated parameter naming a
+                # locally-defined class.  Nothing is invented when it is not
+                # known; the write remains correctly wired via
+                # ``object``/``value`` either way.
+                class_identity = parameter_class_names.get(target.value.id)
+                if class_identity is not None:
+                    slot = _resolve_instance_attribute_slot(
+                        class_identity, target.attr
+                    )
+                    if slot is not None:
+                        node_data.setdefault("attributes", {})[
+                            "attribute_slot"
+                        ] = (class_identity, slot)
+            return
+        if isinstance(target, ast.Subscript):
+            if isinstance(value, _StaticPythonReference):
+                raise TypeError(
+                    "a static Python reference cannot be assigned through "
+                    "a runtime tensor index"
+                )
+            base = resolve_expression(target.value)
+            index_expressions = (
+                tuple(target.slice.elts)
+                if isinstance(target.slice, ast.Tuple)
+                else (target.slice,)
+            )
+            indices = tuple(
+                resolve_expression(index) for index in index_expressions
+            )
+            if not isinstance(base, int) or not isinstance(value, int) or not all(
+                isinstance(index, int) for index in indices
+            ):
+                raise TypeError(
+                    "indexed assignment requires resolved tensor, index, "
+                    f"and value nodes in {statement.name}"
+                )
+            node_id = id(target)
+            if (
+                node_id not in graph.G
+                or node_id == base
+                or node_id == value
+                or nx.has_path(graph.G, node_id, value)
+            ):
+                node_id = new_node("IndexedStore", "indexed_store")
+            node_data = graph.G.nodes[node_id]
+            node_data["type"] = "IndexedStore"
+            node_data["op"] = "IndexedStore"
+            node_data.setdefault("attributes", {})[
+                "source_type"
+            ] = "SubscriptStore"
+            _replace_inputs(
+                graph,
+                node_id,
+                (
+                    (base, "base"),
+                    *((index, "index") for index in indices),
+                    (value, "value"),
+                ),
+            )
+            if isinstance(target.value, ast.Name):
+                bind_target(target.value, node_id)
             return
         if isinstance(target, (ast.Tuple, ast.List)):
             if isinstance(value, _StaticPythonReference):
@@ -754,7 +1936,94 @@ def _normalize_lexical_values(
                 )
                 bind_target(element, projected_id)
 
+    def delete_target(target: ast.AST) -> int | None:
+        """Lower one Python deletion target to its explicit state effect."""
+
+        if isinstance(target, ast.Name):
+            environment.pop(target.id, None)
+            static_environment.pop(target.id, None)
+            deleted_names.add(target.id)
+            _remove_node(graph, id(target))
+            return None
+        if isinstance(target, ast.Attribute):
+            receiver = resolve_expression(target.value)
+            if isinstance(receiver, _StaticPythonReference):
+                receiver = static_reference_node(receiver)
+            if not isinstance(receiver, int):
+                raise TypeError(
+                    "attribute deletion requires a resolved object node in "
+                    f"{statement.name}: "
+                    f"target={ast.dump(target, include_attributes=False)}, "
+                    f"receiver={receiver!r}"
+                )
+            node_id = id(target)
+            if node_id not in graph.G:
+                node_id = new_node(
+                    "DelAttr",
+                    f"delattr[{target.attr}]",
+                    attributes={"attribute": target.attr},
+                )
+            node_data = graph.G.nodes[node_id]
+            node_data["type"] = "DelAttr"
+            node_data["op"] = "delattr"
+            node_data.setdefault("attributes", {})["attribute"] = target.attr
+            _replace_inputs(graph, node_id, ((receiver, "object"),))
+            return node_id
+        if isinstance(target, ast.Subscript):
+            base = resolve_expression(target.value)
+            indices = (
+                tuple(target.slice.elts)
+                if isinstance(target.slice, ast.Tuple)
+                else (target.slice,)
+            )
+            resolved_indices = tuple(resolve_expression(index) for index in indices)
+            if not isinstance(base, int) or not all(
+                isinstance(index, int) for index in resolved_indices
+            ):
+                raise TypeError(
+                    "indexed deletion requires resolved container and index "
+                    f"nodes in {statement.name}: "
+                    f"target={ast.dump(target, include_attributes=False)}"
+                )
+            node_id = id(target)
+            if node_id not in graph.G:
+                node_id = new_node("DelItem", "delitem")
+            node_data = graph.G.nodes[node_id]
+            node_data["type"] = "DelItem"
+            node_data["op"] = "delitem"
+            node_data.setdefault("attributes", {})["source_type"] = "Subscript"
+            _replace_inputs(
+                graph,
+                node_id,
+                (
+                    (base, "base"),
+                    *((index, "index") for index in resolved_indices),
+                ),
+            )
+            return node_id
+        if isinstance(target, (ast.Tuple, ast.List)):
+            effects = [delete_target(element) for element in target.elts]
+            return next((effect for effect in reversed(effects) if effect is not None), None)
+        raise TypeError(
+            "unsupported Python deletion target: "
+            f"{ast.dump(target, include_attributes=False)}"
+        )
+
     def reduce_statement(body_statement: ast.stmt) -> int | None:
+        if isinstance(body_statement, (ast.Nonlocal, ast.Global)):
+            # Scope declarations affect name binding while parsing; they are
+            # not runtime operations and must never reach an execution
+            # backend as operator nodes.  The reducer's lexical environments
+            # and explicit Input/SetAttr effects carry the resulting values.
+            _remove_node(graph, id(body_statement))
+            return None
+        if isinstance(body_statement, ast.Delete):
+            effects = [delete_target(target) for target in body_statement.targets]
+            _remove_node(graph, id(body_statement))
+            return next(
+                (effect for effect in reversed(effects) if effect is not None),
+                None,
+            )
         if isinstance(body_statement, (ast.Assign, ast.AnnAssign)):
             value = resolve_expression(body_statement.value)
             targets = (
@@ -767,6 +2036,7 @@ def _normalize_lexical_values(
             _remove_node(graph, id(body_statement))
             return value
         if isinstance(body_statement, ast.AugAssign):
+            arena_mask = None
             if isinstance(body_statement.target, ast.Name):
                 current = environment.get(body_statement.target.id)
                 if current is None:
@@ -775,9 +2045,59 @@ def _normalize_lexical_values(
                         binding_kind=(
                             "parameter"
                             if body_statement.target.id in parameter_names
+                            else "exception"
+                            if body_statement.target.id in exception_local_names
                             else "external"
                         ),
                     )
+            elif (
+                isinstance(body_statement.target, ast.Subscript)
+                and not all(
+                    isinstance(item, ast.Slice)
+                    or (
+                        isinstance(item, ast.Constant)
+                        and (
+                            isinstance(item.value, int)
+                            or item.value is Ellipsis
+                        )
+                    )
+                    or (
+                        isinstance(item, ast.Name)
+                        and environment.get(item.id)
+                        in scalar_loop_binding_ids
+                    )
+                    for item in (
+                        tuple(body_statement.target.slice.elts)
+                        if isinstance(body_statement.target.slice, ast.Tuple)
+                        else (body_statement.target.slice,)
+                    )
+                )
+            ):
+                # Keep aligned boolean-mask updates arena-shaped.  Evaluating
+                # ``field[mask] += rhs[mask]`` literally creates two compact,
+                # data-dependent vectors and then requires a scatter.  The
+                # equivalent functional form
+                # ``field = where(mask, field + rhs, field)`` retains the
+                # preallocated grid shape through every compiler stage.
+                current = resolve_expression(body_statement.target.value)
+                arena_mask = resolve_expression(
+                    body_statement.target.slice
+                )
+                target_slice = ast.dump(
+                    body_statement.target.slice,
+                    include_attributes=False,
+                )
+                for candidate in source_walk(body_statement.value):
+                    if not isinstance(candidate, ast.Subscript):
+                        continue
+                    if ast.dump(
+                        candidate.slice,
+                        include_attributes=False,
+                    ) != target_slice:
+                        continue
+                    aligned = resolve_expression(candidate.value)
+                    if isinstance(aligned, int):
+                        _redirect_value(graph, id(candidate), aligned)
             else:
                 current = resolve_expression(body_statement.target)
             if current is not None:
@@ -790,6 +2110,22 @@ def _normalize_lexical_values(
             node_id = id(body_statement)
             if current is None or node_id not in graph.G:
                 return None
+            if isinstance(arena_mask, int):
+                where_id = new_node(
+                    "where",
+                    "where",
+                    attributes={
+                        "source_type": "MaskedAugAssign",
+                        "arena_shaped": True,
+                    },
+                    parents=(
+                        (arena_mask, "condition"),
+                        (node_id, "true"),
+                        (current, "false"),
+                    ),
+                )
+                bind_target(body_statement.target.value, where_id)
+                return where_id
             bind_target(body_statement.target, node_id)
             return node_id
         if isinstance(body_statement, ast.Return):
@@ -813,11 +2149,23 @@ def _normalize_lexical_values(
                         str(output_names[index]), []
                     ).append(value)
             if len(expressions) == 1:
-                return resolved[0] if resolved else None
+                value = resolved[0] if resolved else None
+                if value is not None:
+                    graph.G.graph.setdefault(
+                        "return_value_nodes",
+                        {},
+                    )[id(body_statement)] = value
+                return value
             # Preserve the structural tuple/list node for callers that consume
             # it as one Python-shaped value while the output identities above
             # expose each semantic result directly to compiled call binding.
-            return resolve_expression(returned)
+            value = resolve_expression(returned)
+            if value is not None:
+                graph.G.graph.setdefault(
+                    "return_value_nodes",
+                    {},
+                )[id(body_statement)] = value
+            return value
         if isinstance(body_statement, (ast.With, ast.AsyncWith)):
             static_contexts = []
             for item in body_statement.items:
@@ -868,13 +2216,15 @@ def _normalize_lexical_values(
             body_environment = dict(before)
             environment.clear()
             environment.update(body_environment)
+            body_result = None
             for nested in body_statement.body:
-                reduce_statement(nested)
+                body_result = reduce_statement(nested)
             body_environment = dict(environment)
             environment.clear()
             environment.update(before)
+            else_result = None
             for nested in body_statement.orelse:
-                reduce_statement(nested)
+                else_result = reduce_statement(nested)
             else_environment = dict(environment)
             environment.clear()
             environment.update(before)
@@ -902,6 +2252,46 @@ def _normalize_lexical_values(
                             (else_value, "orelse"),
                         ),
                     )
+            def terminal_branch(statements: list[ast.stmt]) -> bool:
+                if not statements:
+                    return False
+                terminal = statements[-1]
+                return isinstance(terminal, (ast.Return, ast.Raise)) or (
+                    isinstance(terminal, ast.If)
+                    and id(terminal) in graph.G
+                    and bool(
+                        (graph.G.nodes[id(terminal)].get("attributes") or {}).get(
+                            "terminal_return_merge"
+                        )
+                    )
+                )
+
+            if (
+                isinstance(test_value, int)
+                and isinstance(body_result, int)
+                and isinstance(else_result, int)
+                and terminal_branch(body_statement.body)
+                and terminal_branch(body_statement.orelse)
+                and id(body_statement) in graph.G
+            ):
+                _replace_inputs(
+                    graph,
+                    id(body_statement),
+                    (
+                        (test_value, "test"),
+                        (body_result, "body"),
+                        (else_result, "orelse"),
+                    ),
+                )
+                graph.G.nodes[id(body_statement)].setdefault(
+                    "attributes", {}
+                ).update({
+                    "terminal_return_merge": True,
+                    "terminal_return_values": (
+                        int(body_result),
+                        int(else_result),
+                    ),
+                })
             return id(body_statement)
         if isinstance(body_statement, ast.Try):
             before = dict(environment)
@@ -956,6 +2346,20 @@ def _normalize_lexical_values(
                     }
                     if len(values) == 1:
                         environment[name] = values.pop()
+                    elif id(body_statement) in graph.G:
+                        # The branches genuinely disagree (a body assignment
+                        # vs. a handler's fallback) -- exactly the case
+                        # ``ast.If`` resolves with a ``Phi``.  A Try node has
+                        # no single test expression to point a Phi at, but it
+                        # doesn't need one: this Try's own graph node already
+                        # evaluates to "whichever arm actually ran" (see
+                        # ``evaluate_node``'s ``ast.Try`` handling, which
+                        # re-runs body/handlers and keeps the last value) --
+                        # so binding the name straight to the Try node's own
+                        # id gives every later reference the same on-demand
+                        # resolution a Phi would, without inventing a second
+                        # node or a synthetic "did-raise" boolean.
+                        environment[name] = id(body_statement)
             for nested in body_statement.orelse:
                 reduce_statement(nested)
             for nested in body_statement.finalbody:
@@ -970,7 +2374,7 @@ def _normalize_lexical_values(
             state_effect_calls = tuple(
                 expression_statement.value
                 for nested_statement in body_statement.body
-                for expression_statement in ast.walk(nested_statement)
+                for expression_statement in source_walk(nested_statement)
                 if (
                     isinstance(expression_statement, ast.Expr)
                     and isinstance(expression_statement.value, ast.Call)
@@ -998,12 +2402,19 @@ def _normalize_lexical_values(
                 body_member_ids = {
                     id(member)
                     for nested in body_statement.body
-                    for member in ast.walk(nested)
+                    for member in source_walk(nested)
                 }
+                direct_loop_target_names = (
+                    set(loop_target_names(body_statement.target))
+                    if isinstance(body_statement, ast.For)
+                    else set()
+                )
                 current_loop_bindings = {
                     name: value_id
                     for name, value_id in environment.items()
                     if (
+                        name in direct_loop_target_names
+                        and
                         (
                             graph.G.nodes[value_id].get("attributes") or {}
                         ).get("binding_kind") == "loop"
@@ -1097,14 +2508,26 @@ def _normalize_lexical_values(
                         if str(role).startswith("arg")
                     )
                     environment[name] = initial
+                    argument_expression = (
+                        call.args[0] if len(call.args) == 1 else None
+                    )
                     state_effects.append({
                         "state_name": name,
                         "operator": call.func.attr,
                         "effect_mode": (
                             "indexed_publication"
                             if (
-                                call.func.attr == "append"
-                                and len(argument_ids) == 1
+                                len(argument_ids) == 1
+                                and (
+                                    call.func.attr == "append"
+                                    or (
+                                        call.func.attr == "extend"
+                                        and isinstance(
+                                            argument_expression,
+                                            (ast.GeneratorExp, ast.ListComp),
+                                        )
+                                    )
+                                )
                             )
                             else "opaque"
                         ),
@@ -1119,7 +2542,7 @@ def _normalize_lexical_values(
             return id(body_statement)
         if isinstance(body_statement, ast.Expr):
             return resolve_expression(body_statement.value)
-        for child in ast.iter_child_nodes(body_statement):
+        for child in source_child_nodes(body_statement):
             if isinstance(child, ast.expr):
                 resolve_expression(child)
         return id(body_statement) if id(body_statement) in graph.G else None
@@ -1132,11 +2555,62 @@ def _normalize_lexical_values(
     if returned_values:
         graph.roots = list(dict.fromkeys(returned_values))
 
+    # A source-linked unbound method can arrive with its receiver absent from
+    # the owned subgraph even though the Attribute load itself is owned.
+    # Restore the ordinary edge before lexical Name cleanup; an Attribute
+    # without its receiver is not a valid structural operation. The receiver
+    # can be a parameter (``self`` bound directly at the call boundary) or an
+    # ordinary local (``machine = load_pe(...)``) -- both are recorded under
+    # the same name in ``environment`` by ``bind_target``, so there is no
+    # reason to restore only the parameter case and leave a local's receiver
+    # permanently unresolved. A chained access (``machine.runner.tick``) puts
+    # an Attribute (``machine.runner``), not a Name, in the receiver position
+    # of the outer Attribute (``.tick``); that inner Attribute is itself just
+    # another node this same loop repairs on its own matching iteration, so
+    # linking straight to its node id (when it is still a live node) is
+    # enough -- the two repairs do not need to happen in any particular
+    # order, since neither removes a node, only reattaches an edge.
+    for node_id, data in list(graph.G.nodes(data=True)):
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Attribute)
+            and not data.get("parents")
+            and isinstance(expression.value, (ast.Name, ast.Attribute))
+        ):
+            continue
+        if isinstance(expression.value, ast.Name):
+            receiver = environment.get(expression.value.id)
+            if receiver is None:
+                receiver = input_value(
+                    expression.value.id,
+                    binding_kind=(
+                        "parameter"
+                        if expression.value.id in parameter_names
+                        else "local"
+                    ),
+                )
+        else:
+            inner_id = id(expression.value)
+            if inner_id not in graph.G:
+                continue
+            receiver = inner_id
+        _replace_inputs(graph, node_id, ((receiver, "value"),))
+
     # Any surviving lexical occurrence is either unused syntax or an unresolved
-    # source label.  It is not executable work in the reduced value graph.
+    # source label.  It is not executable work in the reduced value graph --
+    # but only when nothing still structurally depends on it. A Name node
+    # that still has a real successor (an Attribute load whose receiver is
+    # this exact node, say) is not unused syntax; removing it anyway does
+    # not erase that dependency, it just strips the successor's own record
+    # of it, leaving that successor orphaned for whatever later pass expects
+    # to find its receiver -- the exact "receiver Name absent" case the
+    # repair above this loop exists to patch after the fact. Checking
+    # liveness first means there is nothing left to repair.
     for node_id, data in list(graph.G.nodes(data=True)):
         expression = data.get("expr_obj")
         if isinstance(expression, ast.Name):
+            if graph.G.out_degree(node_id) > 0:
+                continue
             _remove_node(graph, node_id)
             continue
         if (
@@ -1200,6 +2674,18 @@ def _normalize_lexical_values(
     ordered_graph = nx.DiGraph()
     ordered_graph.graph.update(relabeled.graph)
     ordered_graph.graph["canonical_value_ids"] = True
+    map_ir = dict(ordered_graph.graph.get("map_ir") or {})
+    map_ir["schema_node_ids"] = tuple(
+        mapping[node_id]
+        for node_id in map_ir.get("schema_node_ids", ())
+        if node_id in mapping
+    )
+    map_ir["schema_roots"] = tuple(
+        mapping[node_id]
+        for node_id in map_ir.get("schema_roots", ())
+        if node_id in mapping
+    )
+    ordered_graph.graph["map_ir"] = map_ir
     for value_id in range(len(mapping)):
         ordered_graph.add_node(value_id, **relabeled.nodes[value_id])
     ordered_graph.add_edges_from(relabeled.edges(data=True))
@@ -1247,6 +2733,12 @@ def _normalize_lexical_values(
                 ].items()
                 if initial in mapping
             }
+        if "terminal_return_values" in attributes:
+            attributes["terminal_return_values"] = tuple(
+                mapping[value_id]
+                for value_id in attributes["terminal_return_values"]
+                if value_id in mapping
+            )
         if "loop_state_effects" in attributes:
             attributes["loop_state_effects"] = tuple(
                 {
@@ -1309,6 +2801,23 @@ def _normalize_lexical_values(
             if child_id in mapping
         ]
 
+    terminal_merges = [
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("terminal_return_merge")
+    ]
+    for merge_id in terminal_merges:
+        branch_values = set(
+            (graph.G.nodes[merge_id].get("attributes") or {}).get(
+                "terminal_return_values", ()
+            )
+        )
+        if branch_values and branch_values.issubset(graph.roots):
+            graph.roots = [
+                root for root in graph.roots if root not in branch_values
+            ]
+            graph.roots.append(merge_id)
+
 
 def reduce_abstract_tensor_topology(graph: Any) -> Any:
     """Apply existing ProcessGraph names to the three structural AST nodes."""
@@ -1331,63 +2840,97 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     call_owners: dict[int, Any] = {}
     method_owners: dict[int, str] = {}
     class_definitions: dict[str, ast.ClassDef] = {}
+    lexical_parent_by_function: dict[int, int] = {}
+    function_definitions = {
+        int(node_id): node_data.get("expr_obj")
+        for node_id, node_data in graph.G.nodes(data=True)
+        if is_runnable_definition(node_data.get("expr_obj"))
+    }
+
+    class _DirectNestedFunctionVisitor(ast.NodeVisitor):
+        def __init__(self, owner_id: int):
+            self.owner_id = int(owner_id)
+
+        def visit_FunctionDef(self, node):
+            lexical_parent_by_function[id(node)] = self.owner_id
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Lambda(self, node):
+            lexical_parent_by_function[id(node)] = self.owner_id
+
+        def visit_ClassDef(self, node):
+            return None
+
+    for owner_id, definition in function_definitions.items():
+        if not isinstance(
+            definition, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        visitor = _DirectNestedFunctionVisitor(owner_id)
+        for body_member in definition.body:
+            visitor.visit(body_member)
     for _node_id, node_data in graph.G.nodes(data=True):
         class_definition = node_data.get("expr_obj")
+        if isinstance(
+            class_definition,
+            (ast.FunctionDef, ast.AsyncFunctionDef),
+        ):
+            source_identity = getattr(
+                class_definition,
+                "_python_source_identity",
+                None,
+            )
+            qualified = (
+                str(source_identity[1])
+                if (
+                    isinstance(source_identity, tuple)
+                    and len(source_identity) == 2
+                )
+                else ""
+            )
+            parts = tuple(
+                part for part in qualified.split(".") if part != "<locals>"
+            )
+            if "<locals>" not in qualified and len(parts) >= 2:
+                method_owners[id(class_definition)] = parts[-2]
         if not isinstance(class_definition, ast.ClassDef):
             continue
         class_definitions[class_definition.name] = class_definition
         for member in class_definition.body:
             if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 method_owners[id(member)] = class_definition.name
-    class _OwnedCallVisitor(ast.NodeVisitor):
-        def __init__(self, owner, function_node_id):
-            self.owner = owner
-            self.function_node_id = function_node_id
-
-        def visit_Call(self, node):
-            call_owners[id(node)] = self.owner
-            self.generic_visit(node)
-
-        def visit_Return(self, node):
-            if node.value is not None:
-                function_return_values.setdefault(
-                    self.function_node_id,
-                    [],
-                ).append(id(node.value))
-            self.generic_visit(node)
-
-        def visit_FunctionDef(self, node):
-            # Nested definitions receive their own table entry and ownership
-            # walk; do not assign their calls to the enclosing function.
-            return None
-
-        visit_AsyncFunctionDef = visit_FunctionDef
-
-        def visit_Lambda(self, node):
-            # A lambda owns a separate anonymous function subgraph.
-            return None
-
     for node_id, data in graph.G.nodes(data=True):
         statement = data.get("expr_obj")
-        if not isinstance(
-            statement,
-            (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
-        ):
+        if not is_runnable_definition(statement):
             continue
-        function_name = (
-            statement.name
-            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
-            else (
-                f"<lambda:{getattr(statement, 'lineno', 0)}:"
-                f"{getattr(statement, 'col_offset', 0)}>"
-            )
-        )
+        function_name = runnable_definition_name(statement)
         owner_name = method_owners.get(node_id)
-        qualified_name = (
-            f"{owner_name}.{function_name}"
-            if owner_name is not None
-            else function_name
-        )
+
+        def lexical_qualified_name(definition_id: int) -> str:
+            definition = function_definitions[definition_id]
+            identity = getattr(definition, "_python_source_identity", None)
+            if isinstance(identity, tuple) and len(identity) == 2:
+                module_name, python_qualified = map(str, identity)
+                return ".".join(
+                    part
+                    for part in (module_name, python_qualified)
+                    if part
+                )
+            parent_id = lexical_parent_by_function.get(definition_id)
+            if parent_id is not None:
+                return (
+                    f"{lexical_qualified_name(parent_id)}.<locals>."
+                    f"{getattr(definition, 'name', function_name)}"
+                )
+            method_owner = method_owners.get(definition_id)
+            return (
+                f"{method_owner}.{getattr(definition, 'name', function_name)}"
+                if method_owner is not None
+                else str(getattr(definition, "name", function_name))
+            )
+
+        qualified_name = lexical_qualified_name(node_id)
         reference = function_table.declare(
             function_name,
             qualified_name=qualified_name,
@@ -1417,13 +2960,16 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             "function_ref"
         ] = reference.address
         function_nodes[node_id] = reference
-        visitor = _OwnedCallVisitor(reference, node_id)
         if isinstance(statement, ast.Lambda):
+            # A lambda's body is one expression, not a list of statements,
+            # and is itself the implicit return value -- no explicit
+            # Return-shaped node exists to walk to. Python-only construct;
+            # nothing here needs generalizing for another language.
             function_return_values[node_id] = [id(statement.body)]
-            visitor.visit(statement.body)
         else:
-            for body_statement in statement.body:
-                visitor.visit(body_statement)
+            _record_owned_calls_and_returns(
+                graph, reference, node_id, call_owners, function_return_values,
+            )
 
     def class_field_defaults(definition: ast.ClassDef) -> dict[str, Any]:
         """Retain literal class-field defaults as structural compiler facts."""
@@ -1482,7 +3028,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                             member,
                             (ast.FunctionDef, ast.AsyncFunctionDef),
                         )
-                        for target in ast.walk(member)
+                        for target in source_walk(member)
                         if isinstance(target, ast.Attribute)
                         and isinstance(target.ctx, ast.Store)
                         and isinstance(target.value, ast.Name)
@@ -1498,6 +3044,29 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             "field_defaults": class_field_defaults(definition),
         }
         for class_name, definition in class_definitions.items()
+    }
+    for function_node_id, owner_name in method_owners.items():
+        reference = function_nodes.get(function_node_id)
+        if reference is None:
+            continue
+        descriptor = graph.G.graph["class_table"].setdefault(
+            owner_name,
+            {"methods": {}, "fields": (), "field_defaults": {}},
+        )
+        function_definition = graph.G.nodes[function_node_id].get(
+            "expr_obj"
+        )
+        if isinstance(
+            function_definition,
+            (ast.FunctionDef, ast.AsyncFunctionDef),
+        ):
+            descriptor["methods"][function_definition.name] = int(
+                reference.address
+            )
+    method_owner_by_reference = {
+        int(reference.address): method_owners.get(function_node_id)
+        for function_node_id, reference in function_nodes.items()
+        if method_owners.get(function_node_id) is not None
     }
 
     contextual_requirements = list(
@@ -1579,7 +3148,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             owner,
             (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
         )
-        for member in ast.walk(owner)
+        for member in source_walk(owner)
         if member is not owner
     }
     for _node_id, node_data in graph.G.nodes(data=True):
@@ -1635,6 +3204,49 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     for builtin_name, value in vars(builtins).items():
         static_bindings.setdefault(builtin_name, value)
     graph.python_bindings = static_bindings
+    function_parameters_by_address = {}
+    for function_node_id, reference in function_nodes.items():
+        definition = graph.G.nodes[function_node_id].get("expr_obj")
+        if not isinstance(
+            definition,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
+        ):
+            continue
+        function_parameters_by_address[reference.address] = {
+            argument.arg
+            for argument in (
+                *definition.args.posonlyargs,
+                *definition.args.args,
+                *definition.args.kwonlyargs,
+                *(
+                    (definition.args.vararg,)
+                    if definition.args.vararg is not None
+                    else ()
+                ),
+                *(
+                    (definition.args.kwarg,)
+                    if definition.args.kwarg is not None
+                    else ()
+                ),
+            )
+        }
+    lexical_functions_by_owner: dict[int, dict[str, Any]] = {}
+    for child_id, parent_id in lexical_parent_by_function.items():
+        child_reference = function_nodes.get(child_id)
+        parent_reference = function_nodes.get(parent_id)
+        child_definition = function_definitions.get(child_id)
+        if (
+            child_reference is None
+            or parent_reference is None
+            or not isinstance(
+                child_definition,
+                (ast.FunctionDef, ast.AsyncFunctionDef),
+            )
+        ):
+            continue
+        lexical_functions_by_owner.setdefault(
+            int(parent_reference.address), {}
+        )[child_definition.name] = child_reference
 
     for _node_id, data in graph.G.nodes(data=True):
         source_type = data.get("type")
@@ -1647,12 +3259,139 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
 
     for node_id, data in list(graph.G.nodes(data=True)):
         expression = data.get("expr_obj")
+        # --- C (pycparser c_ast) canonicalization -------------------------
+        # Dispatched on the type *name*, never isinstance, so this module
+        # never imports pycparser (it is a frontend-optional dependency; a
+        # pure-Python compile must not require it to be installed).
+        #
+        # This is the same universalization the Python branches below
+        # perform, and it belongs here for the same reason: once a syntactic
+        # element is canonicalized into the shared operator vocabulary
+        # (Add/Load/Store/Call/Constant), no downstream pass needs to know
+        # which language it came from. Skipping it is precisely what let raw
+        # C node types survive all the way to the lexical-value pass.
+        c_type_name = type(expression).__name__
+        if expression is not None and c_type_name in _C_COMPILE_TIME_SYNTAX:
+            # Pure type machinery, with no runtime value of its own: the
+            # C counterpart of Python's Nonlocal/Global handling below.
+            _remove_node(graph, node_id)
+            continue
+        if c_type_name == "Decl" and not isinstance(expression, ast.AST):
+            # `int total = expr;` -- a declaration is not itself an
+            # operation. Its initializer is the value the declared name
+            # denotes, so the Decl collapses onto that value exactly the way
+            # Python's own Name-store nodes collapse onto their producer.
+            # A declaration with no initializer (`int total;`) names no
+            # value at all yet and carries no runtime effect of its own.
+            initializer = getattr(expression, "init", None)
+            if initializer is not None and id(initializer) in graph.G:
+                _redirect_value(graph, node_id, id(initializer))
+            else:
+                _remove_node(graph, node_id)
+            continue
+        if c_type_name == "Constant" and not isinstance(expression, ast.AST):
+            value = _c_constant_value(expression)
+            data["type"] = "Constant"
+            data["op"] = "const"
+            data["constant"] = value
+            data.setdefault("attributes", {})["value"] = value
+            continue
+        if c_type_name == "BinaryOp":
+            operation = _c_qualified_handler("binaryop", expression.op)
+            data["type"] = operation
+            data["op"] = operation
+            data.setdefault("attributes", {})["source_type"] = "BinaryOp"
+            # Absent operands are handled uniformly by _replace_inputs, which
+            # substitutes an explicit non-operation and records a shortfall.
+            # Filtering them out here instead would drop the operand
+            # silently, leaving an operation short an argument -- a wrong
+            # program rather than an honestly incomplete one.
+            _replace_inputs(
+                graph,
+                node_id,
+                (
+                    (id(expression.left), "lhs"),
+                    (id(expression.right), "rhs"),
+                ),
+            )
+            continue
+        if c_type_name == "UnaryOp" and not isinstance(expression, ast.AST):
+            if str(expression.op) in {"+", "&", "*"}:
+                # Unary plus is a no-op conversion, the same reading Python's
+                # ast.UAdd gets below.
+                #
+                # Address-of and dereference are identity *in this value
+                # graph specifically*: a node here denotes a value, and the
+                # graph has no separate address space for `&x` to point
+                # into that `x` does not already name. The cpp shell emits
+                # `&obj` for every method receiver, and `obj`'s own node is
+                # already exactly the receiver the callee needs. These stay
+                # registered as GetElementPtr/Load in ssa_registry (their
+                # true meanings, which a real memory model would need) --
+                # collapsing them is a property of this representation, not
+                # a claim that C's & and * are no-ops. Revisit when pointer
+                # arithmetic or aliasing enters the shell's scope; today it
+                # is excluded by CPP_LIKE_SHELL_FOR_C_INTENT.md.
+                _redirect_value(graph, node_id, id(expression.expr))
+                continue
+            operation = _c_qualified_handler("unaryop", expression.op)
+            data["type"] = operation
+            data["op"] = operation
+            data.setdefault("attributes", {})["source_type"] = "UnaryOp"
+            _replace_inputs(
+                graph,
+                node_id,
+                ((id(expression.expr), "operand"),),
+            )
+            continue
+        if isinstance(expression, (ast.Nonlocal, ast.Global)):
+            # Root whole-graph deployment regions are formed from this graph,
+            # not only from the normalized per-function copies below.  Scope
+            # declarations are compile-time syntax in both representations.
+            _remove_node(graph, node_id)
+            continue
+        if isinstance(expression, ast.Delete):
+            # The target nodes carry the executable deletion effects.  The
+            # statement wrapper is ordering syntax, not an operator.
+            _remove_node(graph, node_id)
+            continue
+        if (
+            isinstance(expression, ast.Name)
+            and isinstance(expression.ctx, ast.Del)
+        ):
+            # Deleting a lexical binding has no object-level runtime effect.
+            _remove_node(graph, node_id)
+            continue
+        if (
+            isinstance(expression, ast.Attribute)
+            and isinstance(expression.ctx, ast.Del)
+        ):
+            data["type"] = "DelAttr"
+            data["op"] = "delattr"
+            data.setdefault("attributes", {})["attribute"] = expression.attr
+            _replace_inputs(
+                graph,
+                node_id,
+                ((id(expression.value), "object"),),
+            )
+            continue
         if isinstance(expression, ast.Constant):
             data["type"] = "Constant"
             data["op"] = "const"
             data["constant"] = expression.value
             data.setdefault("attributes", {})["value"] = expression.value
         elif isinstance(expression, ast.BinOp):
+            folded = _static_sequence_literal(expression)
+            if folded is not None:
+                # Sequence replication is table allocation, not arithmetic.
+                data["type"] = "Constant"
+                data["op"] = "const"
+                data["constant"] = folded
+                attributes = data.setdefault("attributes", {})
+                attributes["value"] = folded
+                attributes["source_type"] = "BinOp"
+                attributes["constant_folded"] = "sequence-replication"
+                continue
             operation = _qualified_handler("binop", expression.op)
             data["type"] = operation
             data["op"] = operation
@@ -1735,8 +3474,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 if isinstance(expression.slice, ast.Tuple)
                 else (expression.slice,)
             )
-            data["type"] = "Indexed"
-            data["op"] = "Indexed"
+            deleting = isinstance(expression.ctx, ast.Del)
+            data["type"] = "DelItem" if deleting else "Indexed"
+            data["op"] = "delitem" if deleting else "Indexed"
             data.setdefault("attributes", {})["source_type"] = "Subscript"
             _replace_inputs(
                 graph,
@@ -1776,28 +3516,50 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             data["type"] = operation
             data["op"] = operation
             data.setdefault("attributes", {})["source_type"] = "Call"
-            _replace_inputs(
-                graph,
-                node_id,
-                (
-                    (id(expression.func.value), "operand"),
-                    *(
-                        (id(argument), f"arg{index}")
-                        for index, argument in enumerate(expression.args)
-                    ),
-                    *(
-                        (
-                            id(keyword.value),
-                            (
-                                f"kw:{keyword.arg}"
-                                if keyword.arg is not None
-                                else "kwargs"
-                            ),
-                        )
-                        for keyword in expression.keywords
-                    ),
-                ),
+            receiver_name = (
+                expression.func.value.id
+                if isinstance(expression.func.value, ast.Name)
+                else None
             )
+            call_owner = call_owners.get(node_id)
+            lexical_class = (
+                method_owner_by_reference.get(int(call_owner.address))
+                if call_owner is not None
+                else None
+            )
+            if receiver_name in {"self", "cls"} and lexical_class is not None:
+                method_reference = (
+                    graph.G.graph.get("class_table", {})
+                    .get(lexical_class, {})
+                    .get("methods", {})
+                    .get(expression.func.attr)
+                )
+                if method_reference is not None:
+                    data.setdefault("attributes", {})["method_ref"] = int(
+                        method_reference
+                    )
+            # Wiring the receiver/arguments as this node's own ``parents``
+            # used to happen right here, keyed by ``id(expression.func.
+            # value)`` -- the raw Python id() of the AST node, not a real
+            # graph reference.  That is only ever valid by coincidence: it
+            # assumes ingestion already walked this exact receiver
+            # independently, which is not guaranteed (a receiver reached
+            # only through this call expression, inside a nested try/loop,
+            # was never separately ingested).  ``orchestrator`` here is an
+            # ordinary local variable; it already has a real, resolved SSA
+            # value the moment its own assignment is processed
+            # (``bind_target`` -> ``environment``) -- fabricating a new
+            # node for it, or guessing at a raw id, both bypass that
+            # existing value instead of looking it up.  The actual lookup
+            # operator for "what did this expression resolve to" is
+            # ``resolve_expression`` itself, which only becomes available
+            # once lexical normalization runs (this pass runs earlier, over
+            # whatever ingestion already produced). Wiring is done instead
+            # in ``resolve_expression``'s own ``ast.Call`` handling
+            # (``_normalize_lexical_values``, run later during reduction),
+            # where ``resolve_expression`` can be called directly on the
+            # receiver and arguments -- the same SSA lookup every other
+            # expression in the program already goes through.
         elif isinstance(expression, ast.Call):
             call_inputs: list[tuple[int, str]] = [
                 (
@@ -1819,8 +3581,30 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             )
             if isinstance(expression.func, ast.Name):
                 callee_name = expression.func.id
-                reference = function_table.reference(callee_name)
-                if reference is None and callee_name in import_bindings:
+                owner = call_owners.get(node_id)
+                callee_is_parameter = (
+                    owner is not None
+                    and callee_name in function_parameters_by_address.get(
+                        owner.address,
+                        (),
+                    )
+                )
+                if callee_is_parameter:
+                    attributes = data.setdefault("attributes", {})
+                    attributes.pop("callee_ref", None)
+                    attributes.pop("external_callee_ref", None)
+                    call_inputs.insert(
+                        0,
+                        (id(expression.func), "callee"),
+                    )
+                    reference = None
+                else:
+                    reference = function_table.reference(callee_name)
+                if (
+                    not callee_is_parameter
+                    and reference is None
+                    and callee_name in import_bindings
+                ):
                     (
                         qualified_name,
                         imported_name,
@@ -1840,11 +3624,14 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     data.setdefault("attributes", {})[
                         "external_callee_ref"
                     ] = external_reference.address
-                elif reference is not None:
+                elif (
+                    not callee_is_parameter
+                    and reference is not None
+                ):
                     data.setdefault("attributes", {})[
                         "callee_ref"
                     ] = reference.address
-                else:
+                elif not callee_is_parameter:
                     call_inputs.insert(
                         0,
                         (id(expression.func), "callee"),
@@ -2058,6 +3845,32 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             for value in function_return_values.get(node_id, ())
             if value in graph.G
         ]
+        terminal_merges = [
+            int(member)
+            for member in graph.G
+            if (
+                (graph.G.nodes[member].get("attributes") or {}).get(
+                    "terminal_return_merge"
+                )
+                and set(
+                    (graph.G.nodes[member].get("attributes") or {}).get(
+                        "terminal_return_values", ()
+                    )
+                ).issubset(return_values)
+            )
+        ]
+        if terminal_merges:
+            merged_values = {
+                int(value)
+                for member in terminal_merges
+                for value in (
+                    graph.G.nodes[member].get("attributes") or {}
+                ).get("terminal_return_values", ())
+            }
+            return_values = [
+                value for value in return_values if value not in merged_values
+            ]
+            return_values.extend(terminal_merges)
         statement = graph.G.nodes[node_id].get("expr_obj")
         definition_static_bindings = dict(
             getattr(statement, "_python_bindings", static_bindings)
@@ -2070,51 +3883,65 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         # Function ownership is already exact in the saved Python AST.  Use
         # that ownership directly: graph ancestry from only the return value
         # silently discarded assignments, calls, loops, and side effects.
+        #
+        # This deliberately still walks the raw ``ast`` tree, not
+        # ``graph.G`` -- unlike ``_record_owned_calls_and_returns`` above,
+        # which runs right after ingestion while the graph still mirrors the
+        # source tree 1:1. By the time this loop runs, earlier reduction
+        # passes have already restructured ``graph.G`` (edges no longer
+        # necessarily match the original AST parent/child shape), so a
+        # graph-native walk here would silently miss nodes a raw-tree walk
+        # still finds (confirmed empirically: a graph-based version of this
+        # walk lost the Return node itself for a plain `return (...)`
+        # function body). Generalizing *this* walk to a foreign language
+        # needs its own graph-native traversal designed against the
+        # post-reduction graph shape, not a drop-in swap -- tracked
+        # separately, not attempted here.
         owned_members: set[int] = set()
 
-        class _OwnedMemberVisitor(ast.NodeVisitor):
-            def generic_visit(self, member):
-                if id(member) in graph.G and not isinstance(
-                    member,
-                    (
-                        ast.arguments,
-                        ast.arg,
-                        ast.expr_context,
-                        ast.operator,
-                        ast.unaryop,
-                        ast.boolop,
-                        ast.cmpop,
-                        ast.keyword,
-                        ast.alias,
-                        ast.Import,
-                        ast.ImportFrom,
-                    ),
-                ):
+        def record_owned_member(member: Any) -> None:
+            if isinstance(member, ast.ClassDef):
+                # A class's body belongs to its own methods' entries.
+                return
+            if is_runnable_definition(member):
+                # A nested definition's body belongs to another
+                # function-table entry, not to this enclosing shell. A
+                # lambda is still itself a value the enclosing scope
+                # references, so it is owned without being descended into.
+                if isinstance(member, ast.Lambda) and id(member) in graph.G:
                     owned_members.add(id(member))
-                super().generic_visit(member)
+                return
+            if id(member) in graph.G and not isinstance(
+                member,
+                (
+                    ast.arguments,
+                    ast.arg,
+                    ast.expr_context,
+                    ast.operator,
+                    ast.unaryop,
+                    ast.boolop,
+                    ast.cmpop,
+                    ast.keyword,
+                    ast.alias,
+                    ast.Import,
+                    ast.ImportFrom,
+                ),
+            ):
+                owned_members.add(id(member))
+            for child in source_child_nodes(member):
+                record_owned_member(child)
 
-            def visit_FunctionDef(self, member):
-                # Its definition and body belong to another function-table
-                # entry, not to the enclosing shell.
-                return None
-
-            visit_AsyncFunctionDef = visit_FunctionDef
-
-            def visit_ClassDef(self, member):
-                return None
-
-            def visit_Lambda(self, member):
-                # Nested lambdas have their own function-table entries.
-                if id(member) in graph.G:
-                    owned_members.add(id(member))
-                return None
-
-        ownership = _OwnedMemberVisitor()
         if isinstance(statement, ast.Lambda):
-            ownership.generic_visit(statement.body)
+            # A lambda's body is one expression, and is the body itself
+            # rather than a list of statements -- descend into it directly
+            # instead of treating it as a nested-definition boundary.
+            for child in source_child_nodes(statement.body):
+                record_owned_member(child)
+            if id(statement.body) in graph.G:
+                owned_members.add(id(statement.body))
         else:
-            for body_member in statement.body:
-                ownership.visit(body_member)
+            for body_member in source_body_statements(statement):
+                record_owned_member(body_member)
         included = owned_members
         included = {
             member
@@ -2330,6 +4157,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             normalization_statement,
             definition_static_bindings,
             function_table,
+            lexical_functions_by_owner.get(int(reference.address), {}),
         )
         generator_yields = tuple(
             node_id

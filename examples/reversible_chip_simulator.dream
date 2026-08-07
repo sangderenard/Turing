@@ -1,0 +1,537 @@
+/*@turing.segment.v1
+id = chip-setup
+language = python
+encoding = utf-8
+outputs = machine_program, machine_controls
+entry = main
+@end*/
+from src.compiler.binary_machine_program import BinaryMachineProgram
+from src.compiler.machine_state_buffer import MachineRunDirection
+
+machine_program = None
+
+def load_subject(binary_bytes, **runtime_options):
+    global machine_program
+    machine_program = BinaryMachineProgram.load_pe(
+        binary_bytes,
+        maximum_file_size=runtime_options.pop("maximum_file_size", 256 * 1024 * 1024),
+        **runtime_options,
+    )
+    machine_program.set_direction(MachineRunDirection.FORWARD)
+    return machine_program
+
+def tick_machine(elapsed_seconds):
+    if machine_program is None:
+        return 0
+    return machine_program.tick(elapsed_seconds)
+
+def set_machine_speed(transitions_per_second):
+    if machine_program is not None:
+        machine_program.set_speed(transitions_per_second)
+
+machine_controls = {
+    "load_binary": load_subject,
+    "tick": tick_machine,
+    "set_speed": set_machine_speed,
+}
+result = machine_controls
+/*@turing.end*/
+
+/*@turing.parallel.v1
+id = chip-frame
+members = head-step, register-light-compute
+join = frame-barrier
+@end*/
+
+/*@turing.segment.v1
+id = head-step
+language = python
+encoding = utf-8
+inputs = machine_program, shell_tick_seconds
+outputs = published_generation
+parallel-group = chip-frame
+entry = step
+@end*/
+elapsed = float(globals().get("shell_tick_seconds", 0.0))
+published_generation = tick_machine(elapsed)
+result = published_generation
+/*@turing.end*/
+
+/*@turing.shader.v1
+id = register-light-compute
+language = glsl
+encoding = utf-8
+stage = compute
+inputs = machine_state_snapshot
+outputs = register_cells
+abi = turing.shader-component.v1
+local-size = 64
+parallel-group = chip-frame
+@end*/
+#version 430
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer MachineStateSnapshot {
+    uint state_words[];
+};
+layout(std430, binding = 1) writeonly buffer RegisterCells {
+    vec4 register_cells[];
+};
+const uint HEADER_CORE_COUNT = 10u;
+const uint HEADER_REGISTER_COUNT = 11u;
+const uint HEADER_REGISTER_STRIDE = 12u;
+const uint HEADER_REGISTER_OFFSET = 13u;
+const uint HEADER_GENERATION_LOW = 4u;
+
+void main() {
+    uint logical_index = gl_GlobalInvocationID.x;
+    uint core_count = state_words[HEADER_CORE_COUNT];
+    uint register_count = state_words[HEADER_REGISTER_COUNT];
+    if (logical_index >= core_count * register_count) return;
+    uint core_index = logical_index / register_count;
+    uint register_index = logical_index % register_count;
+    uint stride_words = state_words[HEADER_REGISTER_STRIDE] / 4u;
+    uint base_words = state_words[HEADER_REGISTER_OFFSET] / 4u;
+    uint physical_index = base_words + core_index * stride_words + register_index * 2u;
+    uvec2 words = uvec2(state_words[physical_index], state_words[physical_index + 1u]);
+    float occupied = float((words.x | words.y) != 0u);
+    float low_energy = log2(1.0 + float(words.x)) / 32.0;
+    float high_energy = log2(1.0 + float(words.y)) / 32.0;
+    uint safe_register_count = max(register_count, 1u);
+    float scan = float((register_index + state_words[HEADER_GENERATION_LOW]) % safe_register_count) / float(safe_register_count);
+    register_cells[logical_index] = vec4(
+        0.08 + low_energy,
+        0.14 + high_energy,
+        0.22 + 0.72 * scan,
+        0.30 + 0.70 * occupied
+    );
+}
+/*@turing.end*/
+
+/*@turing.shader.v1
+id = chip-present-fragment
+language = glsl
+encoding = utf-8
+stage = fragment
+inputs = register_cells, cache_cells
+outputs = display_color
+abi = turing.shader-component.v1
+entry = main
+display-owner = program-interior
+context = webgl2
+@end*/
+#version 300 es
+precision highp float;
+in vec2 uv;
+out vec4 display_color;
+uniform highp usampler2D register_words;
+uniform highp usampler2D memory_pages;
+uniform sampler2D subject_output;
+uniform vec2 machine_shape;
+uniform float memory_page_count;
+uniform float memory_page_size;
+uniform float subject_available;
+uniform float gpu_active;
+
+void main() {
+    vec3 chip = vec3(0.015, 0.02, 0.03);
+    if (uv.y >= 0.64 && machine_shape.x > 0.0 && machine_shape.y > 0.0) {
+        vec2 machine_uv = vec2(uv.x, (uv.y - 0.64) / 0.36);
+        ivec2 cell = ivec2(clamp(floor(machine_uv * machine_shape), vec2(0.0), machine_shape - 1.0));
+        uvec2 words = texelFetch(register_words, cell, 0).rg;
+        float low_energy = log2(1.0 + float(words.x)) / 32.0;
+        float high_energy = log2(1.0 + float(words.y)) / 32.0;
+        float occupied = float((words.x | words.y) != 0u);
+        vec2 grid = fract(machine_uv * machine_shape);
+        float border = step(0.04, grid.x) * step(0.04, grid.y);
+        chip = border * vec3(0.08 + low_energy, 0.14 + high_energy, 0.25 + 0.7 * occupied);
+    } else if (uv.y >= 0.50 && memory_page_count > 0.5) {
+        float page_slot = min(floor(uv.x * memory_page_count), memory_page_count - 1.0);
+        uvec4 page = texelFetch(memory_pages, ivec2(int(page_slot), 0), 0);
+        float occupancy = float(page.z) / max(memory_page_size, 1.0);
+        float executable = float((page.w & 2u) != 0u);
+        float managed = float((page.w & 8u) != 0u);
+        float stripe = step(0.08, fract(uv.x * memory_page_count));
+        chip = stripe * mix(
+            vec3(0.035, 0.06, 0.075),
+            vec3(0.12 + 0.55 * executable, 0.18 + 0.62 * managed, 0.16),
+            clamp(0.15 + occupancy, 0.0, 1.0)
+        );
+    } else if (uv.y < 0.50 && subject_available > 0.5) {
+        chip = texture(subject_output, vec2(uv.x, uv.y * 2.0)).rgb;
+    }
+    vec3 gpu_lamp = mix(vec3(0.08, 0.10, 0.12), vec3(0.15, 1.0, 0.42), gpu_active);
+    float lamp = 1.0 - smoothstep(0.025, 0.04, distance(uv, vec2(0.94, 0.06)));
+    display_color = vec4(mix(chip, gpu_lamp, lamp), 1.0);
+}
+/*@turing.end*/
+
+/*@turing.segment.v1
+id = gpu-indicator-ui
+language = javascript
+encoding = utf-8
+inputs = gpu_active
+outputs = indicator_state
+entry = installTuringDisplay
+role = display-controller
+@end*/
+function updateGPUIndicator(active, block) {
+  const indicator = document.querySelector("[data-turing-gpu-active]");
+  if (!indicator) return;
+  indicator.dataset.active = active ? "true" : "false";
+  indicator.textContent = active
+    ? "GPU ACTIVE · " + block.identity
+    : "GPU IDLE";
+}
+
+function installTuringDisplay(liaison, interior) {
+  const gl = liaison.context;
+  if (!gl) throw new Error("the interior display requires a WebGL2 context");
+
+  function compile(type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader) || "interior shader compile failed");
+    }
+    return shader;
+  }
+
+  const vertexSource = `#version 300 es
+  precision highp float;
+  const vec2 positions[3] = vec2[3](
+    vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0)
+  );
+  out vec2 uv;
+  void main() {
+    vec2 position = positions[gl_VertexID];
+    uv = position * 0.5 + 0.5;
+    gl_Position = vec4(position, 0.0, 1.0);
+  }`;
+  const program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, vertexSource));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, interior.fragment_source));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(program) || "interior display link failed");
+  }
+  gl.useProgram(program);
+  gl.bindVertexArray(gl.createVertexArray());
+
+  function texture(unit, uniform) {
+    const resource = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, resource);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.uniform1i(gl.getUniformLocation(program, uniform), unit);
+    return resource;
+  }
+  const registerTexture = texture(0, "register_words");
+  const subjectTexture = texture(1, "subject_output");
+  const memoryTexture = texture(2, "memory_pages");
+  const shapeLocation = gl.getUniformLocation(program, "machine_shape");
+  const subjectLocation = gl.getUniformLocation(program, "subject_available");
+  const memoryCountLocation = gl.getUniformLocation(program, "memory_page_count");
+  const memorySizeLocation = gl.getUniformLocation(program, "memory_page_size");
+  const activeLocation = gl.getUniformLocation(program, "gpu_active");
+  const terminalCanvas = document.createElement("canvas");
+  terminalCanvas.width = 1024;
+  terminalCanvas.height = 512;
+  const terminalContext = terminalCanvas.getContext("2d");
+  const utf8 = new TextDecoder("utf-8", {fatal: false});
+  const registerNames = [
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    "rip", "rflags", "fs_base", "gs_base",
+    ...Array.from({length: 16}, (_, index) => [
+      `xmm${index}_lo`, `xmm${index}_hi`,
+    ]).flat(),
+    "steps", "call_depth",
+  ];
+  const displayHost = liaison.canvas.parentElement || liaison.canvas;
+  if (displayHost !== liaison.canvas) displayHost.style.position = "relative";
+  const registerHud = document.createElement("div");
+  registerHud.dataset.turingRegisterHud = "true";
+  registerHud.setAttribute("aria-label", "Contiguous virtual register contents");
+  Object.assign(registerHud.style, {
+    position: "absolute", left: "8px", right: "8px", top: "8px",
+    display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))",
+    gap: "2px 10px", padding: "7px 9px", maxHeight: "44%", overflow: "auto",
+    color: "#d7ffe4", background: "rgba(3,8,12,0.28)",
+    backdropFilter: "blur(3px)", WebkitBackdropFilter: "blur(3px)",
+    border: "1px solid rgba(85,255,145,0.35)", borderRadius: "4px",
+    font: "10px/1.25 ui-monospace,SFMono-Regular,Consolas,monospace",
+    textShadow: "0 1px 2px rgba(0,0,0,0.9)",
+    pointerEvents: "none", zIndex: "2147483647",
+  });
+  if (displayHost !== liaison.canvas) displayHost.appendChild(registerHud);
+  const controls = document.createElement("div");
+  controls.dataset.turingMachineControls = "true";
+  controls.setAttribute("aria-label", "Reversible machine controls");
+  Object.assign(controls.style, {
+    position: "absolute", left: "12px", right: "12px", bottom: "62px",
+    display: "flex", flexWrap: "wrap", alignItems: "center", gap: "6px",
+    padding: "7px", color: "#d7ffe4", background: "rgba(3,8,12,0.4)",
+    backdropFilter: "blur(3px)", WebkitBackdropFilter: "blur(3px)",
+    border: "1px solid rgba(85,255,145,0.45)", borderRadius: "4px",
+    font: "11px ui-monospace,SFMono-Regular,Consolas,monospace",
+    textShadow: "0 1px 2px rgba(0,0,0,0.9)",
+    zIndex: "2147483647",
+  });
+  const controlStatus = document.createElement("span");
+  controlStatus.textContent = "CONNECTING";
+  controlStatus.style.marginLeft = "auto";
+  const blockStatus = document.createElement("span");
+  blockStatus.textContent = "WASM BLOCK · LOADING";
+  blockStatus.style.color = "#8fb6ff";
+  const updateBlockStatus = () => {
+    const status = document.documentElement.dataset.recompiledMachineBlock;
+    const projection = document.documentElement.dataset.recompiledMachineProjection;
+    blockStatus.textContent = status === "ready" && projection === "ready"
+      ? "WASM STATE · LIVE"
+      : status === "ready" ? "WASM BLOCK · AUTHENTICATED"
+      : status === "error" ? "WASM BLOCK · ERROR" : "WASM BLOCK · LOADING";
+    blockStatus.style.color = status === "ready" ? "#9affb6"
+      : status === "error" ? "#ff8f9b" : "#8fb6ff";
+  };
+  document.addEventListener("turing-recompiled-machine-block", updateBlockStatus);
+  queueMicrotask(updateBlockStatus);
+  const actions = [
+    ["⏮ STEP", "step_backward"], ["◀ REVERSE", "backward"],
+    ["Ⅱ PAUSE", "pause"], ["FORWARD ▶", "forward"], ["STEP ⏭", "step_forward"],
+  ];
+  for (const [label, action] of actions) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.dataset.machineAction = action;
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        await liaison.machineSnapshots.sendControl(action);
+        controlStatus.textContent = action.toUpperCase();
+      } catch (error) {
+        controlStatus.textContent = error instanceof Error ? error.message : String(error);
+      } finally { button.disabled = false; }
+    });
+    controls.appendChild(button);
+  }
+  const speedLabel = document.createElement("label");
+  speedLabel.textContent = " FLIPS/CYCLE ";
+  const speed = document.createElement("input");
+  speed.type = "range"; speed.min = "0"; speed.max = "7"; speed.step = "1"; speed.value = "5";
+  const speedValue = document.createElement("output");
+  const speeds = [1, 4, 16, 256, 4096, 65536, 1000000, 10000000];
+  const updateSpeed = async () => {
+    const value = speeds[Number(speed.value)];
+    speedValue.value = value.toLocaleString();
+    await liaison.machineSnapshots.sendControl("speed", value);
+  };
+  speed.addEventListener("change", () => updateSpeed().catch(error => {
+    controlStatus.textContent = error instanceof Error ? error.message : String(error);
+  }));
+  speedValue.value = speeds[Number(speed.value)].toLocaleString();
+  speedLabel.append(speed, speedValue);
+  controls.append(speedLabel, blockStatus, controlStatus);
+  if (displayHost !== liaison.canvas) displayHost.appendChild(controls);
+  const terminalForm = document.createElement("form");
+  terminalForm.dataset.turingTerminalInput = "true";
+  terminalForm.setAttribute("aria-label", "Guest terminal input");
+  Object.assign(terminalForm.style, {
+    position: "absolute", left: "12px", right: "12px", bottom: "12px",
+    display: "flex", gap: "6px", padding: "7px",
+    background: "rgba(3,8,12,0.4)", backdropFilter: "blur(3px)",
+    WebkitBackdropFilter: "blur(3px)",
+    border: "1px solid rgba(85,255,145,0.45)",
+    borderRadius: "4px", zIndex: "2147483647", height: "44px",
+    boxSizing: "border-box", alignItems: "center",
+  });
+  const terminalInput = document.createElement("input");
+  terminalInput.type = "text";
+  terminalInput.placeholder = "guest command (Enter sends CRLF)";
+  terminalInput.autocomplete = "off";
+  Object.assign(terminalInput.style, {
+    minWidth: "0", minHeight: "30px", flex: "1", height: "30px", padding: "6px 8px", color: "#d7ffe4",
+    background: "#05080a", border: "1px solid #287344",
+    font: "13px ui-monospace,SFMono-Regular,Consolas,monospace",
+  });
+  const terminalSend = document.createElement("button");
+  terminalSend.type = "submit";
+  terminalSend.textContent = "SEND";
+  terminalSend.style.height = "30px";
+  terminalForm.append(terminalInput, terminalSend);
+  terminalForm.addEventListener("submit", async event => {
+    event.preventDefault();
+    const line = terminalInput.value;
+    if (!line.length) return;
+    terminalSend.disabled = true;
+    try {
+      await liaison.machineSnapshots.sendTerminalInput(line + "\r\n");
+      terminalInput.value = "";
+      terminalInput.placeholder = "sent; awaiting guest output";
+    } catch (error) {
+      terminalInput.placeholder = error instanceof Error ? error.message : String(error);
+    } finally {
+      terminalSend.disabled = false;
+      terminalInput.focus();
+    }
+  });
+  liaison.canvas.addEventListener("pointerdown", event => {
+    if (event.offsetY >= liaison.canvas.clientHeight * 0.5) {
+      queueMicrotask(() => terminalInput.focus({preventScroll: true}));
+    }
+  });
+  liaison.canvas.addEventListener("keydown", event => {
+    if (event.ctrlKey || event.altKey || event.metaKey) return;
+    if (event.key === "Enter") {
+      event.preventDefault();
+      terminalForm.requestSubmit();
+    } else if (event.key === "Backspace") {
+      event.preventDefault();
+      terminalInput.value = terminalInput.value.slice(0, -1);
+    } else if (event.key.length === 1) {
+      event.preventDefault();
+      terminalInput.value += event.key;
+    }
+  });
+  if (displayHost !== liaison.canvas) displayHost.appendChild(terminalForm);
+  if (liaison.systemPorts?.descriptors.has("subject-binary")) {
+    liaison.systemPorts.registerFileHandler("subject-binary", async value => {
+      controlStatus.textContent = `LOADING ${value.name}`;
+      await liaison.machineSnapshots.loadSubject(value.bytes);
+      controlStatus.textContent = `LOADED ${value.name} · PAUSED`;
+    });
+  }
+  let gpuActive = 0;
+  let subjectAvailable = 0;
+  let memoryPageCount = 0;
+
+  function uploadTerminal(payload) {
+    if (!terminalContext) throw new Error("terminal raster context is unavailable");
+    const text = utf8.decode(payload).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    terminalContext.fillStyle = "#05080a";
+    terminalContext.fillRect(0, 0, terminalCanvas.width, terminalCanvas.height);
+    terminalContext.font = "20px ui-monospace, SFMono-Regular, Consolas, monospace";
+    terminalContext.textBaseline = "top";
+    terminalContext.fillStyle = "#9affb6";
+    const columns = 96;
+    const rows = [];
+    for (const sourceLine of text.split("\n")) {
+      if (!sourceLine.length) {
+        rows.push("");
+      } else {
+        for (let begin = 0; begin < sourceLine.length; begin += columns) {
+          rows.push(sourceLine.slice(begin, begin + columns));
+        }
+      }
+    }
+    const visible = rows.slice(-24);
+    visible.forEach((line, row) => terminalContext.fillText(line, 18, 14 + row * 20));
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, subjectTexture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, terminalCanvas,
+    );
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    subjectAvailable = 1;
+  }
+
+  function uploadSnapshot(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const coreCount = view.getUint32(40, true);
+    const registerCount = view.getUint32(44, true);
+    const registerStride = view.getUint32(48, true);
+    const registerOffset = view.getUint32(52, true);
+    const direction = view.getInt32(24, true);
+    const transitions = view.getBigUint64(32, true);
+    const packed = new Uint32Array(coreCount * registerCount * 2);
+    for (let core = 0; core < coreCount; core++) {
+      const source = registerOffset + core * registerStride;
+      packed.set(new Uint32Array(
+        bytes.buffer, bytes.byteOffset + source, registerCount * 2
+      ), core * registerCount * 2);
+    }
+    registerHud.replaceChildren();
+    controlStatus.textContent = `${direction < 0 ? "REVERSE" : direction > 0 ? "FORWARD" : "PAUSED"} · ${transitions.toLocaleString()} FLIPS`;
+    for (let core = 0; core < coreCount; core++) {
+      for (let register = 0; register < registerCount; register++) {
+        const word = (core * registerCount + register) * 2;
+        const value = (BigInt(packed[word + 1]) << 32n) | BigInt(packed[word]);
+        const cell = document.createElement("span");
+        const name = registerNames[register] || `register_${register}`;
+        cell.textContent = `c${core}.${name}  0x${value.toString(16).padStart(16, "0")}`;
+        cell.dataset.core = String(core);
+        cell.dataset.register = name;
+        cell.dataset.value = `0x${value.toString(16).padStart(16, "0")}`;
+        registerHud.appendChild(cell);
+      }
+    }
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, registerTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32UI, registerCount, coreCount, 0, gl.RG_INTEGER, gl.UNSIGNED_INT, packed);
+    if (shapeLocation !== null) gl.uniform2f(shapeLocation, registerCount, coreCount);
+
+    subjectAvailable = 0;
+    memoryPageCount = 0;
+    const descriptorOffset = view.getUint32(60, true);
+    const outputCount = view.getUint32(64, true);
+    for (let index = 0; index < outputCount; index++) {
+      const descriptor = descriptorOffset + index * 64;
+      const kind = view.getUint32(descriptor, true);
+      const format = view.getUint32(descriptor + 4, true);
+      const width = view.getUint32(descriptor + 8, true);
+      const height = view.getUint32(descriptor + 12, true);
+      const offset = Number(view.getBigUint64(descriptor + 24, true));
+      const length = Number(view.getBigUint64(descriptor + 32, true));
+      if (kind === 5 && format === 5 && length >= width * 16) {
+        const pages = new Uint32Array(
+          bytes.buffer, bytes.byteOffset + offset, width * 4,
+        );
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, memoryTexture);
+        gl.texImage2D(
+          gl.TEXTURE_2D, 0, gl.RGBA32UI, width, 1, 0,
+          gl.RGBA_INTEGER, gl.UNSIGNED_INT, pages,
+        );
+        memoryPageCount = width;
+      } else if (kind === 2 && format === 2 && subjectAvailable === 0) {
+        uploadTerminal(new Uint8Array(
+          bytes.buffer, bytes.byteOffset + offset, length,
+        ));
+      } else if (kind === 3 && format === 3 && width * height * 4 <= length && subjectAvailable === 0) {
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, subjectTexture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+          new Uint8Array(bytes.buffer, bytes.byteOffset + offset, width * height * 4));
+        subjectAvailable = 1;
+      }
+    }
+    gpuActive = 1;
+  }
+  const unsubscribe = liaison.machineSnapshots.subscribe(uploadSnapshot);
+
+  function frame() {
+    const ratio = Math.max(1, window.devicePixelRatio || 1);
+    const width = Math.max(1, Math.round(liaison.canvas.clientWidth * ratio));
+    const height = Math.max(1, Math.round(liaison.canvas.clientHeight * ratio));
+    if (liaison.canvas.width !== width || liaison.canvas.height !== height) {
+      liaison.canvas.width = width;
+      liaison.canvas.height = height;
+      gl.viewport(0, 0, width, height);
+    }
+    liaison.canvas.dataset.gpuActive = gpuActive ? "true" : "false";
+    if (subjectLocation !== null) gl.uniform1f(subjectLocation, subjectAvailable);
+    if (memoryCountLocation !== null) gl.uniform1f(memoryCountLocation, memoryPageCount);
+    if (memorySizeLocation !== null) gl.uniform1f(memorySizeLocation, 4096);
+    if (activeLocation !== null) gl.uniform1f(activeLocation, gpuActive);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gpuActive = 0;
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  return {program, ownsDisplay: true, unsubscribe, terminalForm};
+}
+/*@turing.end*/
