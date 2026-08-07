@@ -169,6 +169,24 @@ def interpret_special_case(node: Any) -> Optional[SpecialCase]:
     if kind == "BinOp":
         return _broadcast_literal(node)
 
+    # ── AST attribute access: ``obj.field`` ──────────────────────────────
+    # A read (``Load`` context) is normalized to the canonical ``GetAttr``
+    # operator here, at ingestion, instead of being left as a generic
+    # ``Attribute`` node for later passes to individually recognise (or
+    # fail to).  This does not collapse the node -- its receiver
+    # (``node.value``) still descends normally as this node's operand -- it
+    # only stamps the canonical operator name, the same way a tensor-op
+    # ``Call`` is flagged without collapsing just above.  Only ``Load`` is
+    # claimed: a ``Store``-context ``Attribute`` is an assignment target,
+    # already correctly built into a ``SetAttr`` node (with its own
+    # ``object``/``value`` wiring) by ``bind_target`` -- reinterpreting it
+    # here too would fight that already-correct, already-tested
+    # construction over the same AST node identity.
+    if kind == "Attribute" and isinstance(
+        getattr(node, "ctx", None), ast.Load
+    ):
+        return SpecialCase("GetAttr", {"attribute": node.attr}, None)
+
     # ── (future cases go here) ───────────────────────────────────────────
     # e.g. SymPy ImmutableDenseMatrix of constants -> tensor_from_list,
     #      Call to zeros/ones/full/empty -> fill, etc.  Each is one branch.
@@ -244,3 +262,32 @@ def is_reduction_operation(name: str) -> bool:
     """Whether a canonical op name reduces an axis (needs unroll off-tensor)."""
 
     return canonical_operator_name(name) in REDUCTION_AND_LINALG_OPERATORS
+
+
+def graph_has_tensor_operation(graph: Any, node_ids: Any = None) -> bool:
+    """Whether any node in ``node_ids`` (default: the whole graph) is
+    tensor-bearing -- the ``attributes["tensor"]`` stamp ``build_graph``
+    already writes from :func:`tensor_operation_name`, an ingestion-time,
+    AST-derived fact, not a runtime observation.
+
+    This is the qualification test for kernel reduction: a subgraph with no
+    tensor operation anywhere has nothing for the flatten-and-optimize
+    reduction path to parallelize across, so it does not qualify -- its
+    already-correct ``ProcessGraph`` structure can be lowered directly
+    instead, one node at a time, with no algebraic fusion and no runtime
+    tape. A subgraph with at least one tensor operation still qualifies for
+    the ordinary tensor-kernel reduction path, unchanged.
+    """
+
+    nodes = graph.G.nodes(data=True)
+    if node_ids is not None:
+        wanted = frozenset(int(node_id) for node_id in node_ids)
+        nodes = (
+            (node_id, data)
+            for node_id, data in nodes
+            if int(node_id) in wanted
+        )
+    return any(
+        (data.get("attributes") or {}).get("tensor") is not None
+        for _node_id, data in nodes
+    )

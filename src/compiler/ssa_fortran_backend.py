@@ -2399,6 +2399,7 @@ def compile_module(
     from .fortran_toolchain import (
         aggressive_fortran_flags,
         standalone_fortran_link_flags,
+        standalone_runtime_shim_sources,
     )
 
     workdir = Path(directory or tempfile.mkdtemp(prefix="turing_fortran_"))
@@ -2413,12 +2414,16 @@ def compile_module(
         )
     except ValueError as error:
         raise FortranEmissionError(str(error)) from error
+    shim_sources = standalone_runtime_shim_sources(
+        compiler, workdir, standalone
+    )
     command = [
         compiler,
         "-shared",
         *(() if sys.platform == "win32" else ("-fPIC",)),
         *compile_flags,
         str(source),
+        *shim_sources,
         "-o",
         str(library),
         *link_flags,

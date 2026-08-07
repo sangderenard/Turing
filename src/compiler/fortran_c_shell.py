@@ -25,6 +25,7 @@ from .fortran_toolchain import (
     aggressive_c_flags,
     aggressive_fortran_flags,
     standalone_fortran_link_flags,
+    standalone_runtime_shim_sources,
 )
 from .ssa_fortran_backend import FortranEmissionError, fortran_compiler
 
@@ -838,7 +839,9 @@ def compile_fortran_module_c_shell(
         [compiler, *fortran_flags, "-c", str(fortran_path), "-o", str(fortran_object)],
         [gcc, *c_flags, "-std=c11", "-c", str(c_path), "-o", str(c_object)],
         [
-            compiler, str(c_object), str(fortran_object), "-o", str(executable),
+            compiler, str(c_object), str(fortran_object),
+            *standalone_runtime_shim_sources(compiler, output, standalone),
+            "-o", str(executable),
             *link_flags,
             *(
                 ["-mwindows", "-lgdi32", "-luser32"]

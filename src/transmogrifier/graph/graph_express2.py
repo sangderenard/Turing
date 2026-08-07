@@ -148,6 +148,61 @@ def _source_ast_definition(value):
     )
 
 
+def _attach_external_methods(retained_class, definition):
+    """Materialise methods bound onto a class outside its own body.
+
+    ``AbstractTensor.reshape = _reshape_methods.reshape`` in the defining
+    module makes ``reshape`` a real method whose ``def`` lives in another
+    file, so ingesting the class's own source text alone never sees it and
+    the whole aliased family is missing from every downstream method table.
+    Pull each such function's own definition in under the attribute name it
+    was bound to, so it becomes an ordinary method of the retained class.
+    Only a plain name or dotted reference is treated as a bound method; a
+    literal or call result is an ordinary class attribute, not an alias.
+    """
+
+    if not isinstance(definition, ast.ClassDef):
+        return definition
+    module = inspect.getmodule(retained_class)
+    if module is None:
+        return definition
+    try:
+        module_tree = ast.parse(inspect.getsource(module))
+    except (OSError, TypeError, SyntaxError):
+        return definition
+    present = {
+        member.name
+        for member in definition.body
+        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for statement in module_tree.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        if not isinstance(statement.value, (ast.Name, ast.Attribute)):
+            continue
+        for target in statement.targets:
+            if (
+                not isinstance(target, ast.Attribute)
+                or not isinstance(target.value, ast.Name)
+                or target.value.id != retained_class.__name__
+                or target.attr in present
+            ):
+                continue
+            method = _source_ast_definition(
+                getattr(retained_class, target.attr, None)
+            )
+            if not isinstance(
+                method, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                continue
+            # The bound attribute name is the method's name here; the source
+            # function may have been defined under a different one.
+            method.name = target.attr
+            definition.body.append(method)
+            present.add(target.attr)
+    return definition
+
+
 def _filter_discovered_definition(definition, module):
     """Discard unreferenced class surface before recursive discovery."""
 
@@ -1825,6 +1880,7 @@ class ProcessGraph:
                     f"cannot ingest retained class {retained_class!r}: "
                     "source is unavailable"
                 )
+            definition = _attach_external_methods(retained_class, definition)
             tree.body.append(definition)
             existing_classes.add(identity)
 

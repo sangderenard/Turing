@@ -2047,6 +2047,33 @@ def build_program_bundle(
             # internal numerical member required by this particular Wasm
             # emitter; it is not the source compiler, an application API, or
             # evidence that the Python recompiler is numerics-only.
+            if synthesized:
+                # A final fused reduction is only admissible when the whole
+                # program is one function or method.  Class-shaped state is
+                # not: fusing inlines every call into one flat, linear
+                # FusedProgram (see fused_program_wasm_backend.py), which
+                # erases the per-object structure the state ABI is named
+                # after -- ``counter.value`` has nowhere to live in a flat
+                # run(count, feed0, ..., out0, ...) kernel.  Refuse here
+                # rather than publish a page whose state is unnavigable,
+                # exactly as the whole-program control bake above refuses an
+                # incomplete lowering instead of baking the discovery trace.
+                navigable_regions = (
+                    aot.shell_control_program is not None
+                    and aot.shell_control_program.region_indices
+                    and aot.region_programs
+                )
+                if not navigable_regions:
+                    raise RuntimeError(
+                        "WebAssembly emission refused a final fused reduction "
+                        f"for class-shaped state {sorted(synthesized)!r}: "
+                        "flattening would erase the object structure "
+                        f"{sorted(contract.state_feedback)!r} is named after, "
+                        "and no navigable control regions were planned to "
+                        "emit instead (region_programs="
+                        f"{len(aot.region_programs or {})}, region_indices="
+                        f"{getattr(aot.shell_control_program, 'region_indices', ())!r})"
+                    )
             program = project_public_numerical_program(aot)
             channel.log("emitting wasm module", path="wasm", entrypoint=contract.entrypoint)
             module = emit_wasm_module(

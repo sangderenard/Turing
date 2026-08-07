@@ -1251,6 +1251,20 @@ def _normalize_lexical_values(
                     id(expression),
                     ((receiver, "value"),),
                 )
+                if isinstance(expression.value, ast.Name):
+                    # Mirror ``SetAttr``'s ``field_ref`` (see ``bind_target``)
+                    # on the read side, sharing the same memoized ``Input``
+                    # node per field name so a load and a later store of the
+                    # same field reference one identity, not two.
+                    field_identity = (
+                        f"{expression.value.id}.{expression.attr}"
+                    )
+                    field_node = input_value(
+                        field_identity, binding_kind="field"
+                    )
+                    graph.G.nodes[id(expression)].setdefault(
+                        "attributes", {}
+                    )["field_ref"] = field_node
 
         if isinstance(expression, ast.Call):
             node_id = id(expression)
@@ -1692,8 +1706,22 @@ def _normalize_lexical_values(
             # SetAttr node; it was just never named, so it never reached
             # ``identity_table`` for anything downstream to select by name.
             if isinstance(target.value, ast.Name):
+                field_identity = f"{target.value.id}.{target.attr}"
+                # ``callee_ref``/``method_ref``/``class_ref`` each let a
+                # dependency walk recurse into the thing a node depends on --
+                # a real node reference, not a label.  A field write only
+                # ever carried ``attribute`` (a bare string) alongside its
+                # ``object``/``value`` operands, so nothing could recurse
+                # into "which field slot this is" the way it already can
+                # for a call.  ``field_ref`` closes that gap: the field's
+                # own ``Input`` node (memoized by name, shared with every
+                # other read/write of the same field so they all reference
+                # one identity, the same way ``input_value`` already shares
+                # one node per parameter name).
+                field_node = input_value(field_identity, binding_kind="field")
+                node_data.setdefault("attributes", {})["field_ref"] = field_node
                 identity_bindings.setdefault(
-                    f"{target.value.id}.{target.attr}", []
+                    field_identity, []
                 ).append(node_id)
             return
         if isinstance(target, ast.Subscript):

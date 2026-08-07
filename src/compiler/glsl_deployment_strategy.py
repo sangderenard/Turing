@@ -6196,7 +6196,7 @@ def _coordinate_scheduled_capture_impl(
                 values[node_id] = shell.static_python_bindings[name]
                 continue
             if (
-                binding_kind == "external"
+                binding_kind in {"external", "field"}
                 and name not in supplied
                 and has_deferred_local_definition(name, node_id)
             ):
@@ -6204,7 +6204,11 @@ def _coordinate_scheduled_capture_impl(
                 # occurrence before its assignment producer (notably a
                 # local assigned inside ``try``).  It is a Python local, not
                 # an invocation requirement; its use will resolve from the
-                # source frame after the defining statement executes.
+                # source frame after the defining statement executes.  A
+                # ``field`` input is the same situation: ``field_ref``
+                # ties it to the same identity as its own later ``SetAttr``
+                # (see ``bind_target``), so a field this function itself
+                # assigns is not something its caller must supply either.
                 continue
             if name not in supplied:
                 raise KeyError(
@@ -7588,6 +7592,33 @@ def _coordinate_scheduled_capture_impl(
                         result = source_binding_values[name]
                         values[node_id] = result
                         return result
+                if attributes.get("binding_kind") == "field":
+                    # ``field_ref`` (see ``bind_target``) ties a field's
+                    # ``Input`` to the same name as its own later ``SetAttr``
+                    # in ``identity_table``.  A field this function itself
+                    # assigns (``self.value = 0`` here) is defined by that
+                    # write, not something the caller must have supplied --
+                    # the same reasoning the invocation-time coordinator
+                    # already applies for a deferred local.
+                    later_identity = next(
+                        (
+                            identity
+                            for identity in graph.G.graph.get(
+                                "identity_table", {}
+                            ).get(name, ())
+                            if int(identity) != int(node_id)
+                            and int(identity) in graph.G
+                            and str(
+                                graph.G.nodes[int(identity)].get("type")
+                            )
+                            not in {"Input", "input"}
+                        ),
+                        None,
+                    )
+                    if later_identity is not None:
+                        result = evaluate_node(int(later_identity))
+                        values[node_id] = result
+                        return result
                 raise KeyError(
                     f"missing ProcessGraph input {name!r} in "
                     f"{graph.G.graph.get('function_name', '?')} at node "
@@ -7687,15 +7718,29 @@ def _coordinate_scheduled_capture_impl(
                         f"{(data.get('attributes') or {})!r}"
                     )
                 receiver = evaluate_node(parent)
-                try:
-                    result = getattr(receiver, expression.attr)
-                except AttributeError as exc:
-                    raise AttributeError(
-                        f"{graph.G.graph.get('function_name', '?')} attribute "
-                        f"{expression.attr!r} at node {node_id} has receiver "
-                        f"{type(receiver).__name__}; parent={parent}, "
-                        f"parents={parents!r}"
-                    ) from exc
+                if isinstance(receiver, _CompiledStructuralObject):
+                    # A field read on a compiler-owned structural object is
+                    # not a static Python fact to freeze into ``values``:
+                    # the field is genuine per-call state (see
+                    # ``_CompiledStructuralObject.state``), and a plain
+                    # ``getattr`` here would capture whatever this one
+                    # discovery trace happened to observe as if it were a
+                    # constant -- the exact one-value trap that makes
+                    # ``counter.value`` invisible to region capture. Keep
+                    # the field's own identity live instead of collapsing
+                    # it to a bare Python value.
+                    result = receiver.state.get(expression.attr)
+                else:
+                    try:
+                        result = getattr(receiver, expression.attr)
+                    except AttributeError as exc:
+                        raise AttributeError(
+                            f"{graph.G.graph.get('function_name', '?')} "
+                            f"attribute {expression.attr!r} at node "
+                            f"{node_id} has receiver "
+                            f"{type(receiver).__name__}; parent={parent}, "
+                            f"parents={parents!r}"
+                        ) from exc
             elif isinstance(expression, ast.Slice):
                 parts = {
                     str(role): evaluate_node(parent)
@@ -11270,13 +11315,26 @@ def _source_static_literal(
         values = tuple(expression.values)
         if len(keys) != len(values):
             raise ValueError("invalid static dictionary")
-        resolved = [
-            _source_static_literal(graph, parent, nested)
-            for parent, _role in parents
-        ]
-        if len(resolved) != len(keys) * 2:
+        if any(key is None for key in keys):
+            # ``{**other}`` occupies a key slot with no key expression, so the
+            # mapping's contents are not decidable from this literal alone.
+            raise ValueError("dictionary unpacking is not source-static")
+        # Parents arrive grouped by the AST field they came from -- every
+        # ``keys`` parent, then every ``values`` parent -- not interleaved per
+        # entry, so pair them by role rather than by position.
+        key_parents = tuple(
+            parent for parent, role in parents if str(role) == "keys"
+        )
+        value_parents = tuple(
+            parent for parent, role in parents if str(role) == "values"
+        )
+        if len(key_parents) != len(keys) or len(value_parents) != len(values):
             raise ValueError("dictionary parents are not literal leaves")
-        return dict(zip(resolved[::2], resolved[1::2]))
+        return {
+            _source_static_literal(graph, key_parent, nested):
+                _source_static_literal(graph, value_parent, nested)
+            for key_parent, value_parent in zip(key_parents, value_parents)
+        }
     raise ValueError("value is not source-static")
 
 
