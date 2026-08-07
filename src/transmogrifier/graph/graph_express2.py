@@ -262,6 +262,32 @@ def _filter_discovered_definition(definition, module):
     return ast.copy_location(filtered, definition)
 
 
+def instance_attribute_slot(attributes, attribute_name):
+    """The deterministic instance-storage slot for one class field, or ``None``.
+
+    ``attributes`` is a ``class_schema["attributes"]``-shaped sequence (see
+    ``_class_schema_from_ast``): each item has ``name``/``storage``, in
+    source declaration order.  Every ``storage == "instance"`` attribute
+    gets the next integer, in that order -- the single authoritative
+    computation both ``build_class_navigation_table``
+    (``shell_reference_tables.py``) and ingestion-time attribute-operator
+    construction (``topological_reducer.py``'s ``bind_target``/
+    ``resolve_expression``) must share, so a field's real position in its
+    class's layout is computed exactly once, not reimplemented twice with
+    room to drift.  Returns ``None`` for a class-level or method member --
+    those are not instance storage and have no slot.
+    """
+
+    slot = 0
+    for attribute in attributes:
+        if str(attribute["storage"]) != "instance":
+            continue
+        if str(attribute["name"]) == attribute_name:
+            return slot
+        slot += 1
+    return None
+
+
 def _class_schema_from_ast(definition):
     """Record only class syntax already being ingested by ``ProcessGraph``.
 

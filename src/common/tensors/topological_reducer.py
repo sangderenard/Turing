@@ -17,6 +17,7 @@ from ...transmogrifier.function_table import (
     ExternalFunctionTable,
     FunctionTable,
 )
+from ...transmogrifier.graph.graph_express2 import instance_attribute_slot
 from ...transmogrifier.ssa_registry import ast_ssa_name_map, c_ssa_name_map
 
 
@@ -786,6 +787,32 @@ def _normalize_lexical_values(
     static_constant_nodes: dict[str, int] = {}
     static_attribute_values: dict[tuple[int, str], int] = {}
     parameter_names = set(function_parameter_names(statement))
+    # A parameter annotated with a locally-defined class name gives a
+    # receiver a real, known class identity at ingestion -- enough to
+    # resolve ``receiver.attr`` to that class's actual declared field slot
+    # (see ``instance_attribute_slot``/``ClassNavigationTable``) instead of
+    # inventing a name for it.  Only a bare ``Name`` annotation naming a
+    # class this source itself defines counts; anything else (no
+    # annotation, an external/generic type) leaves the receiver's class
+    # unknown here, and attribute access on it is not slot-resolvable.
+    parameter_class_names: dict[str, str] = {}
+    class_schemas_by_name: dict[str, tuple] = {
+        str(item.get("class_name")): tuple(item.get("attributes") or ())
+        for item in (
+            graph.G.graph.get("map_ir") or {}
+        ).get("objects", ())
+    }
+    for argument in (
+        *statement.args.posonlyargs,
+        *statement.args.args,
+        *statement.args.kwonlyargs,
+    ):
+        annotation = argument.annotation
+        if (
+            isinstance(annotation, ast.Name)
+            and annotation.id in class_schemas_by_name
+        ):
+            parameter_class_names[argument.arg] = annotation.id
     exception_local_names = {
         target.id
         for handler in (
@@ -1252,19 +1279,22 @@ def _normalize_lexical_values(
                     ((receiver, "value"),),
                 )
                 if isinstance(expression.value, ast.Name):
-                    # Mirror ``SetAttr``'s ``field_ref`` (see ``bind_target``)
-                    # on the read side, sharing the same memoized ``Input``
-                    # node per field name so a load and a later store of the
-                    # same field reference one identity, not two.
-                    field_identity = (
-                        f"{expression.value.id}.{expression.attr}"
+                    # Mirror ``SetAttr``'s ``attribute_slot`` (see
+                    # ``bind_target``) on the read side: the field's real
+                    # position in its class's declared instance storage, not
+                    # a name invented at this call site.
+                    class_identity = parameter_class_names.get(
+                        expression.value.id
                     )
-                    field_node = input_value(
-                        field_identity, binding_kind="field"
-                    )
-                    graph.G.nodes[id(expression)].setdefault(
-                        "attributes", {}
-                    )["field_ref"] = field_node
+                    if class_identity is not None:
+                        slot = instance_attribute_slot(
+                            class_schemas_by_name[class_identity],
+                            expression.attr,
+                        )
+                        if slot is not None:
+                            graph.G.nodes[id(expression)].setdefault(
+                                "attributes", {}
+                            )["attribute_slot"] = (class_identity, slot)
 
         if isinstance(expression, ast.Call):
             node_id = id(expression)
@@ -1707,22 +1737,29 @@ def _normalize_lexical_values(
             # ``identity_table`` for anything downstream to select by name.
             if isinstance(target.value, ast.Name):
                 field_identity = f"{target.value.id}.{target.attr}"
-                # ``callee_ref``/``method_ref``/``class_ref`` each let a
-                # dependency walk recurse into the thing a node depends on --
-                # a real node reference, not a label.  A field write only
-                # ever carried ``attribute`` (a bare string) alongside its
-                # ``object``/``value`` operands, so nothing could recurse
-                # into "which field slot this is" the way it already can
-                # for a call.  ``field_ref`` closes that gap: the field's
-                # own ``Input`` node (memoized by name, shared with every
-                # other read/write of the same field so they all reference
-                # one identity, the same way ``input_value`` already shares
-                # one node per parameter name).
-                field_node = input_value(field_identity, binding_kind="field")
-                node_data.setdefault("attributes", {})["field_ref"] = field_node
                 identity_bindings.setdefault(
                     field_identity, []
                 ).append(node_id)
+                # ``callee_ref``/``method_ref``/``class_ref`` each let a
+                # dependency walk recurse into the thing a node depends on --
+                # a real node reference grounded in the class's own layout,
+                # not a label invented at this call site.  ``attribute_slot``
+                # is the field's actual, deterministic position in its
+                # class's declared instance storage (see
+                # ``instance_attribute_slot``/``ClassNavigationTable``),
+                # known only when the receiver's static class identity is
+                # known -- an annotated parameter naming a locally-defined
+                # class.  Nothing is invented when it is not known; the write
+                # remains correctly wired via ``object``/``value`` either way.
+                class_identity = parameter_class_names.get(target.value.id)
+                if class_identity is not None:
+                    slot = instance_attribute_slot(
+                        class_schemas_by_name[class_identity], target.attr
+                    )
+                    if slot is not None:
+                        node_data.setdefault("attributes", {})[
+                            "attribute_slot"
+                        ] = (class_identity, slot)
             return
         if isinstance(target, ast.Subscript):
             if isinstance(value, _StaticPythonReference):
@@ -2541,17 +2578,6 @@ def _normalize_lexical_values(
     for value_id, data in graph.G.nodes(data=True):
         data["value_id"] = value_id
         attributes = data.get("attributes") or {}
-        if "field_ref" in attributes:
-            # A SetAttr/GetAttr's field_ref (see bind_target,
-            # resolve_expression) is a bare node-id reference stored inside
-            # attributes, not a parents/edge relationship -- relabel_nodes
-            # above rewrote the graph's edges but has no way to know this
-            # particular attribute value is also a node id needing the same
-            # translation. Drop it rather than leave it stale if its target
-            # did not survive reduction.
-            attributes["field_ref"] = mapping.get(attributes["field_ref"])
-            if attributes["field_ref"] is None:
-                del attributes["field_ref"]
         if "loop_carried_bindings" in attributes:
             attributes["loop_carried_bindings"] = {
                 name: (mapping[initial], mapping[updated])

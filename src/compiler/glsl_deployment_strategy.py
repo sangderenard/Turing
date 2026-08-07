@@ -6219,7 +6219,7 @@ def _coordinate_scheduled_capture_impl(
                 values[node_id] = shell.static_python_bindings[name]
                 continue
             if (
-                binding_kind in {"external", "field"}
+                binding_kind == "external"
                 and name not in supplied
                 and has_deferred_local_definition(name, node_id)
             ):
@@ -6227,11 +6227,7 @@ def _coordinate_scheduled_capture_impl(
                 # occurrence before its assignment producer (notably a
                 # local assigned inside ``try``).  It is a Python local, not
                 # an invocation requirement; its use will resolve from the
-                # source frame after the defining statement executes.  A
-                # ``field`` input is the same situation: ``field_ref``
-                # ties it to the same identity as its own later ``SetAttr``
-                # (see ``bind_target``), so a field this function itself
-                # assigns is not something its caller must supply either.
+                # source frame after the defining statement executes.
                 continue
             if name not in supplied:
                 raise KeyError(
@@ -7614,33 +7610,6 @@ def _coordinate_scheduled_capture_impl(
                         return values[node_id]
                     if name in source_binding_values:
                         result = source_binding_values[name]
-                        values[node_id] = result
-                        return result
-                if attributes.get("binding_kind") == "field":
-                    # ``field_ref`` (see ``bind_target``) ties a field's
-                    # ``Input`` to the same name as its own later ``SetAttr``
-                    # in ``identity_table``.  A field this function itself
-                    # assigns (``self.value = 0`` here) is defined by that
-                    # write, not something the caller must have supplied --
-                    # the same reasoning the invocation-time coordinator
-                    # already applies for a deferred local.
-                    later_identity = next(
-                        (
-                            identity
-                            for identity in graph.G.graph.get(
-                                "identity_table", {}
-                            ).get(name, ())
-                            if int(identity) != int(node_id)
-                            and int(identity) in graph.G
-                            and str(
-                                graph.G.nodes[int(identity)].get("type")
-                            )
-                            not in {"Input", "input"}
-                        ),
-                        None,
-                    )
-                    if later_identity is not None:
-                        result = evaluate_node(int(later_identity))
                         values[node_id] = result
                         return result
                 raise KeyError(
@@ -12648,24 +12617,18 @@ class ProcessGraphGLSLDeployment:
                     )
                 ]
                 def _reference_step_input_ids(node_id: int) -> list[int]:
+                    # A field's real identity is ``attribute_slot`` (see
+                    # ``bind_target``/``resolve_expression``) -- a
+                    # (class_identity, slot) pair grounded in the class's
+                    # own declared layout, not a node id.  It carries
+                    # through automatically via ``attrs`` below (a full copy
+                    # of this node's attributes), so nothing needs pulling in
+                    # here beyond the ordinary ``parents`` wiring.
                     node_data = target.process_graph.G.nodes[node_id]
-                    ids = [
+                    return [
                         int(parent)
                         for parent, _role in (node_data.get("parents") or ())
                     ]
-                    # ``parents`` wires the receiver object (``counter``),
-                    # never the field's own ``Input`` node -- ``field_ref``
-                    # (see ``bind_target``/``resolve_expression``) is the
-                    # only edge that actually points at it, stamped as an
-                    # attribute rather than a parent, so it has to be pulled
-                    # in explicitly here or the field's real identity never
-                    # becomes a dependency of this step at all.
-                    field_ref = (node_data.get("attributes") or {}).get(
-                        "field_ref"
-                    )
-                    if field_ref is not None:
-                        ids.append(int(field_ref))
-                    return ids
 
                 reference_steps = [
                     OpStep(

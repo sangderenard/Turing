@@ -21,6 +21,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ..transmogrifier.graph.graph_express2 import instance_attribute_slot
+
 
 @dataclass(frozen=True)
 class ShellFunctionReference:
@@ -284,13 +286,16 @@ def build_class_navigation_table(graph: Any) -> ClassNavigationTable:
             object_map.get("class_identity", object_map["class_name"])
         )
         members = []
-        next_instance_slot = 0
-        for attribute in object_map.get("attributes", ()):
+        attribute_list = tuple(object_map.get("attributes", ()))
+        for attribute in attribute_list:
             storage = str(attribute["storage"])
-            slot = None
-            if storage == "instance":
-                slot = next_instance_slot
-                next_instance_slot += 1
+            slot = (
+                instance_attribute_slot(
+                    attribute_list, str(attribute["name"])
+                )
+                if storage == "instance"
+                else None
+            )
             members.append(ClassNavigationMember(
                 name=str(attribute["name"]),
                 identity=str(attribute["identity"]),
