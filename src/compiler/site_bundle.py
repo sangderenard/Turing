@@ -1487,6 +1487,159 @@ def load_program_bundle(directory: Path) -> ProgramBundle:
     )
 
 
+DREAM_SENTINEL = "/*@turing."
+
+
+def is_dream_source(source: str) -> bool:
+    """Does this source carry Dream sentinel headers?"""
+
+    return DREAM_SENTINEL in str(source)[:4096]
+
+
+@dataclass(frozen=True)
+class FusedDreamProgram:
+    """One Dream document reduced to an ordinary compilable program."""
+
+    source: str
+    entrypoint: str | None
+    presentation_shader: str | None
+    title: str | None
+    slug: str | None
+    block_order: tuple[str, ...]
+    non_program_blocks: tuple[tuple[str, str], ...]
+
+
+def fuse_dream_document(source: str) -> FusedDreamProgram:
+    """Reduce a Dream document to one program the normal compiler accepts.
+
+    A Dream document is a sequence of blocks, and the executable ones in a
+    given language are not separate programs -- they are one program written
+    in pieces. ``head-step`` calls ``tick_machine``, which ``chip-setup``
+    defines; compiled in isolation that name is simply unbound. Fusing the
+    blocks in document order is what makes the reference resolve, and it is
+    the ordinary reading of a document: statements run top to bottom,
+    definitions accumulate, and what a later block refers to is whatever an
+    earlier block established.
+
+    Everything downstream of this is the normal compiler route -- the same
+    contract discovery, module-scope execution, AOT compile, deployment,
+    backend collection, shell emission and manifest that a plain Python
+    source gets. No second publisher, and no separate Dream page path.
+
+    Shader and script blocks are not program text and are not concatenated.
+    A fragment shader promising display ownership becomes the presentation
+    shader the normal route already accepts; the rest are returned so the
+    caller can record them rather than silently dropping them.
+    """
+
+    from .dream_document import parse_dream_document
+
+    document = parse_dream_document(source)
+    program_parts: list[str] = []
+    order: list[str] = []
+    others: list[tuple[str, str]] = []
+    presentation: str | None = None
+    entry: str | None = None
+
+    program_blocks: list[Any] = []
+    for block in document.blocks:
+        if block.language == "python" and block.kind != "shader":
+            program_blocks.append(block)
+            order.append(block.identity)
+            continue
+        if block.kind == "shader" and block.stage == "fragment":
+            presentation = block.payload
+        others.append((block.identity, block.language))
+
+    # Which block is the entry? A block may *declare* one that its body does
+    # not define -- `head-step` says `entry = step` and contains no `step`,
+    # because its body is the step: three statements ending in `result =`.
+    # That is the ordinary shape of a document, not a mistake, so the
+    # declaration names the entry to be *synthesised* from that block rather
+    # than a function expected to already exist.
+    entry_index = len(program_blocks) - 1
+    for index, block in enumerate(program_blocks):
+        declared = block.decorations.get("entry")
+        if declared:
+            entry = str(declared)
+            entry_index = index
+    if entry is None:
+        entry = "main"
+
+    for index, block in enumerate(program_blocks):
+        header = f"# --- dream block: {block.identity} ---"
+        if index != entry_index:
+            # Everything before the entry is setup: it runs at module scope,
+            # top to bottom, and its definitions are what the entry refers to.
+            program_parts.append(f"{header}\n{block.payload}")
+            continue
+        program_parts.append(
+            f"{header}\n{_synthesise_entry(block.payload, entry)}"
+        )
+
+    return FusedDreamProgram(
+        source="\n\n".join(program_parts) + "\n",
+        entrypoint=entry,
+        presentation_shader=presentation,
+        title=None,
+        slug=None,
+        block_order=tuple(order),
+        non_program_blocks=tuple(others),
+    )
+
+
+def _synthesise_entry(payload: str, entry: str) -> str:
+    """Wrap one block's statements as the named entry function.
+
+    Definitions and imports stay at module scope -- moving an ``import`` or a
+    ``def`` inside the entry would rebind it on every call and break any
+    ``global`` statement that refers to it. Only the operations become the
+    body, which is exactly the split the document already implies: a block
+    that declares an entry *is* that entry's body.
+
+    If the block leaves its value in ``result`` -- the convention every
+    Python block in this repository's documents already follows -- the
+    synthesised function returns it, so the entry has an output rather than
+    being a bare effect.
+    """
+
+    import textwrap
+
+    module = ast.parse(payload)
+    hoisted: list[str] = []
+    body: list[str] = []
+    lines = payload.splitlines()
+    for statement in module.body:
+        segment = ast.get_source_segment(payload, statement)
+        if segment is None:
+            start = (statement.lineno or 1) - 1
+            end = getattr(statement, "end_lineno", statement.lineno) or start + 1
+            segment = "\n".join(lines[start:end])
+        if isinstance(
+            statement,
+            (ast.Import, ast.ImportFrom, ast.FunctionDef,
+             ast.AsyncFunctionDef, ast.ClassDef),
+        ):
+            hoisted.append(segment)
+        else:
+            body.append(segment)
+
+    assigns_result = any(
+        isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "result"
+            for target in statement.targets
+        )
+        for statement in module.body
+    )
+    if not body:
+        body = ["pass"]
+    inner = textwrap.indent("\n".join(body), "    ")
+    tail = "\n    return result" if assigns_result else ""
+    definition = f"def {entry}():\n{inner}{tail}\n"
+    return ("\n".join(hoisted) + "\n\n" if hoisted else "") + definition
+
+
 def _execute_module_scope(
     source: str,
     source_filename: str,
@@ -1598,6 +1751,29 @@ def build_program_bundle(
     if progress_sink is not None:
         channel.subscribe(progress_sink)
     channel.log(f"parsing source ({len(source)} bytes)", path="contract")
+    dream_source: str | None = None
+    if is_dream_source(source):
+        # Source-kind dispatch: a Dream document is fused into one ordinary
+        # program and then takes the *normal* compiler route below --
+        # contract discovery, module scope, AOT, deployment, backends,
+        # shell, manifest. There is deliberately no separate Dream page
+        # path and no second publisher.
+        dream_source = source
+        fused = fuse_dream_document(source)
+        channel.log(
+            "fused dream document: "
+            f"{len(fused.block_order)} program block(s) "
+            f"{list(fused.block_order)}, "
+            f"{len(fused.non_program_blocks)} non-program block(s)",
+            path="contract",
+        )
+        source = fused.source
+        if entrypoint is None and fused.entrypoint:
+            entrypoint = fused.entrypoint
+        if presentation_shader is None and fused.presentation_shader:
+            presentation_shader = fused.presentation_shader
+        if source_filename.endswith(".dream"):
+            source_filename = source_filename[: -len(".dream")] + ".py"
     contract = discover_source_contract(
         source,
         entrypoint=entrypoint,
