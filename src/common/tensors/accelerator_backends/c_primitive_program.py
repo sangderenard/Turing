@@ -715,7 +715,9 @@ def _canonical_captured_cast(source: Any, result: Any) -> tuple[str, dict[str, A
     return ("fptosi" if source_kind == "f" else "sext"), {}
 
 
-def _captured_meta(value: Any) -> Meta:
+def _captured_meta(
+    value: Any, *, shape_source_ids: tuple[int | None, ...] | None = None,
+) -> Meta:
     device = getattr(value, "device", None)
     if device is None:
         try:
@@ -732,6 +734,7 @@ def _captured_meta(value: Any) -> Meta:
         shape=tuple(value.shape),
         dtype=str(dtype),
         device=None if device is None else str(device),
+        shape_source_ids=shape_source_ids,
     )
 
 
@@ -751,7 +754,9 @@ def _compile_single_native_node(node, operation: str) -> CapturedFusedProgram:
         metadata[value_id] = _captured_meta(value)
 
     result_id = tensor_identity(result)
-    metadata[result_id] = _captured_meta(result)
+    metadata[result_id] = _captured_meta(
+        result, shape_source_ids=node.ctx.get("shape_source_ids"),
+    )
     attrs = dict(node.ctx.get("params") or {})
     kernel_kind = _CAPTURED_NATIVE_KERNELS.get(operation, operation)
     lowered_operation = operation

@@ -96,7 +96,10 @@ from ..common.tensors.fused_ir import (
     OpStep,
     ordered_feed_ids,
 )
-from ..common.tensors.operator_catalog import ACCESSOR_OPERATORS
+from ..common.tensors.operator_catalog import (
+    ACCESSOR_OPERATORS,
+    CREATION_OPERATORS,
+)
 from ..transmogrifier.graph.graph_deep_compiler import GraphDeepCompiler
 from ..transmogrifier.operator_defs import (
     abstract_tensor_funcs,
@@ -241,6 +244,37 @@ def _observe_process_graph_node(
             int(node_id), []
         ).append(int(capture_id))
         primitive.ctx["process_graph_node_id"] = int(node_id)
+        tensor_op = (graph_node.get("attributes") or {}).get("tensor")
+        if tensor_op in CREATION_OPERATORS and graph is not None:
+            # The first positional argument is the size. Its role varies by
+            # which ingestion path resolved this call -- "args" (generic
+            # schema descent, taken here since a static class reference like
+            # ``AbstractTensor.zeros`` doesn't go through the ordinary
+            # receiver-argument rewiring), "arg0", or "arg:0" (other call
+            # shapes) -- so match any arg-prefixed role instead of guessing
+            # one spelling, and take the first by parent id for determinism.
+            size_parent_id = min(
+                (
+                    int(parent)
+                    for parent, role in (graph_node.get("parents") or ())
+                    if str(role).lower().startswith("arg")
+                ),
+                default=None,
+            )
+            if (
+                size_parent_id is not None
+                and size_parent_id in graph.G
+                and not _source_static_value(graph, size_parent_id)
+            ):
+                # The size argument is itself computed (not a literal), so
+                # this result's shape is only what this one discovery trace
+                # happened to observe, not a compile-time fact.  Record the
+                # real origin (see Meta.shape_source_ids) instead of letting
+                # it silently freeze into a fixed number downstream.
+                dimensions = len(tuple(getattr(result, "shape", ()) or ()))
+                primitive.ctx["shape_source_ids"] = tuple(
+                    size_parent_id for _ in range(dimensions)
+                )
         collection_owners = context.get("collection_owner_ids", frozenset())
 
         def collection_source(value_id: int) -> int | None:

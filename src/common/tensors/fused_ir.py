@@ -34,6 +34,20 @@ class Meta:
     ``source[offset + i * stride]``. This is IR-level and backend-agnostic:
     any backend's per-index addressing consults it instead of assuming every
     operand is its own contiguous, stride-1 buffer.
+
+    ``shape`` is the concrete extent observed during the one discovery trace
+    that recorded this value -- correct for that trace, not necessarily for
+    every real run.  ``shape_source_ids`` gives each dimension the same
+    "usually absent, sometimes a real reference" treatment ``source_id``
+    already gives storage: ``None`` at a position means that dimension is a
+    genuine compile-time constant (the overwhelming common case, and the
+    only case any backend consumes today); a ProcessGraph node id at a
+    position instead means that dimension's real extent is whatever that
+    node computes at actual runtime, and ``shape[i]`` is only the value one
+    discovery trace happened to observe there.  A dimension whose origin
+    cannot be traced at all falls back to ``None`` here the same way any
+    other unresolvable value in this compiler becomes a plain ``Input`` --
+    this field records a known origin, it does not invent one.
     """
 
     shape: Iterable[int] | None = None
@@ -42,6 +56,7 @@ class Meta:
     source_id: int | None = None
     offset: int = 0
     stride: int = 1
+    shape_source_ids: tuple[int | None, ...] | None = None
 
 
 @dataclass
