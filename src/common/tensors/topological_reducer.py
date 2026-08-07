@@ -13,11 +13,11 @@ from typing import Any, Callable
 
 import networkx as nx
 
+from ...compiler.shell_reference_tables import build_class_navigation_table
 from ...transmogrifier.function_table import (
     ExternalFunctionTable,
     FunctionTable,
 )
-from ...transmogrifier.graph.graph_express2 import instance_attribute_slot
 from ...transmogrifier.ssa_registry import ast_ssa_name_map, c_ssa_name_map
 
 
@@ -789,18 +789,30 @@ def _normalize_lexical_values(
     parameter_names = set(function_parameter_names(statement))
     # A parameter annotated with a locally-defined class name gives a
     # receiver a real, known class identity at ingestion -- enough to
-    # resolve ``receiver.attr`` to that class's actual declared field slot
-    # (see ``instance_attribute_slot``/``ClassNavigationTable``) instead of
-    # inventing a name for it.  Only a bare ``Name`` annotation naming a
-    # class this source itself defines counts; anything else (no
-    # annotation, an external/generic type) leaves the receiver's class
-    # unknown here, and attribute access on it is not slot-resolvable.
+    # resolve ``receiver.attr`` through the class's own navigation table
+    # (below) instead of inventing a name for it.  Only a bare ``Name``
+    # annotation naming a class this source itself defines counts; anything
+    # else (no annotation, an external/generic type) leaves the receiver's
+    # class unknown here, and attribute access on it is not slot-resolvable.
+    #
+    # ``build_class_navigation_table`` needs only ``map_ir`` (ingestion-time,
+    # AST-derived) and ``function_table`` for method references; both are
+    # already populated on ``graph`` before reduction runs -- but this
+    # function is called once per *function* being reduced, and
+    # ``build_class_navigation_table`` is a real, previously whole-
+    # compilation-scoped call (``aot_compile.py``, after all reduction
+    # finishes).  Memoized on the graph itself so it still runs exactly
+    # once per graph, not once per method of a retained class with many
+    # methods -- calling it repeatedly, interleaved with other functions'
+    # own active reduction, is not a cost concern here so much as an
+    # unreviewed-reentrancy risk against shared reduction state.
+    navigation_table = graph.G.graph.get("_class_navigation_table")
+    if navigation_table is None:
+        navigation_table = build_class_navigation_table(graph)
+        graph.G.graph["_class_navigation_table"] = navigation_table
     parameter_class_names: dict[str, str] = {}
-    class_schemas_by_name: dict[str, tuple] = {
-        str(item.get("class_name")): tuple(item.get("attributes") or ())
-        for item in (
-            graph.G.graph.get("map_ir") or {}
-        ).get("objects", ())
+    known_class_identities = {
+        record.identity for record in navigation_table.classes
     }
     for argument in (
         *statement.args.posonlyargs,
@@ -810,9 +822,34 @@ def _normalize_lexical_values(
         annotation = argument.annotation
         if (
             isinstance(annotation, ast.Name)
-            and annotation.id in class_schemas_by_name
+            and annotation.id in known_class_identities
         ):
             parameter_class_names[argument.arg] = annotation.id
+
+    def _resolve_instance_attribute_slot(
+        class_identity: str, attribute_name: str
+    ) -> int | None:
+        """A field's real position in ``class_identity``'s layout, or ``None``.
+
+        Permission evaluation here is deliberately permissive: this call
+        resolves *structural* identity for SSA construction (which slot),
+        the same question ``resolve_dot`` answers for real elsewhere in the
+        compiler -- it does not enforce access policy.  A denied/ambiguous
+        resolution is a fact about the source (an unknown or non-attribute
+        member), not a security decision, so it is treated as "not slot-
+        resolvable" rather than raised.
+        """
+
+        try:
+            member = navigation_table.resolve_dot(
+                class_identity,
+                attribute_name,
+                lambda _identity, _permissions: True,
+                receiver_kind="instance",
+            )
+        except (KeyError, PermissionError):
+            return None
+        return member.slot if member.kind == "attribute" else None
     exception_local_names = {
         target.id
         for handler in (
@@ -1287,14 +1324,25 @@ def _normalize_lexical_values(
                         expression.value.id
                     )
                     if class_identity is not None:
-                        slot = instance_attribute_slot(
-                            class_schemas_by_name[class_identity],
-                            expression.attr,
+                        slot = _resolve_instance_attribute_slot(
+                            class_identity, expression.attr
                         )
                         if slot is not None:
                             graph.G.nodes[id(expression)].setdefault(
                                 "attributes", {}
                             )["attribute_slot"] = (class_identity, slot)
+                # An ordinary attribute access on a resolved receiver is a
+                # real reference-operator node -- ``_replace_inputs`` above
+                # already gave it the receiver as a dependency, and
+                # ``attribute_slot`` its class-grounded identity where
+                # known.  Without returning that identity here, every
+                # caller of ``resolve_expression`` -- including ``ast.Call``
+                # resolving its own ``func`` for a method call -- silently
+                # receives ``None`` instead: the operator resolved
+                # correctly but never reported back that it did, severing
+                # the receiver as a dependency for anything built from this
+                # expression (a method call, a chained attribute, ...).
+                return id(expression)
 
         if isinstance(expression, ast.Call):
             node_id = id(expression)
@@ -1362,7 +1410,23 @@ def _normalize_lexical_values(
                     # compiler metadata, but never feed it to the operation as
                     # tensor data.
                     attributes["operator_reference_node"] = reference_node_id
-                static_arguments = {}
+            # Every call's arguments need ``resolve_expression`` -- the same
+            # reduction/redirection every other expression gets -- regardless
+            # of what kind of callee this call has.  This used to run only
+            # inside the ``_StaticPythonReference`` branch above, so an
+            # ordinary method call (``pending.pop(0)``, a call through a
+            # resolved-but-not-static receiver) never had its arguments
+            # resolved at all during reduction: a literal like ``0`` was
+            # left exactly as ingestion produced it, unreachable by anything
+            # that expects reduction to have run -- the same "not translated"
+            # shape as any other missing operand.
+            if node_id in graph.G:
+                attributes = graph.G.nodes[node_id].setdefault(
+                    "attributes", {}
+                )
+                static_arguments = dict(
+                    attributes.get("static_call_arguments") or {}
+                )
                 for index, argument in enumerate(expression.args):
                     resolved = resolve_expression(argument)
                     if isinstance(resolved, _StaticPythonReference):
@@ -1745,16 +1809,18 @@ def _normalize_lexical_values(
                 # a real node reference grounded in the class's own layout,
                 # not a label invented at this call site.  ``attribute_slot``
                 # is the field's actual, deterministic position in its
-                # class's declared instance storage (see
-                # ``instance_attribute_slot``/``ClassNavigationTable``),
-                # known only when the receiver's static class identity is
-                # known -- an annotated parameter naming a locally-defined
-                # class.  Nothing is invented when it is not known; the write
-                # remains correctly wired via ``object``/``value`` either way.
+                # class's declared instance storage, resolved through
+                # ``ClassNavigationTable.resolve_dot`` (see
+                # ``navigation_table``/``_resolve_instance_attribute_slot``
+                # above), known only when the receiver's static class
+                # identity is known -- an annotated parameter naming a
+                # locally-defined class.  Nothing is invented when it is not
+                # known; the write remains correctly wired via
+                # ``object``/``value`` either way.
                 class_identity = parameter_class_names.get(target.value.id)
                 if class_identity is not None:
-                    slot = instance_attribute_slot(
-                        class_schemas_by_name[class_identity], target.attr
+                    slot = _resolve_instance_attribute_slot(
+                        class_identity, target.attr
                     )
                     if slot is not None:
                         node_data.setdefault("attributes", {})[

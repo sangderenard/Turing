@@ -1069,6 +1069,16 @@ def _probe_value(specification: Any, size: int):
         return np.zeros(size, dtype=np.float64)
     if isinstance(specification, (bool, int, float)):
         return np.full(size, specification, dtype=np.float64)
+    # A live class instance is a real, already-constructed input, not a
+    # numeric probe shape -- the caller built it, and how is the class's
+    # own concern, not something to reconstruct or approximate here. Pass
+    # it through unchanged: discovery then traces whatever the entrypoint
+    # actually does with it (attribute reads, method calls) as ordinary
+    # operations on a real Input, the same as any other parameter.
+    if hasattr(specification, "__dict__") or hasattr(
+        specification, "__slots__"
+    ):
+        return specification
     raise TypeError(f"unsupported probe value {specification!r}")
 
 
@@ -1163,6 +1173,73 @@ def _feed_value(contract: "SourceContract", name: str, synthesized: frozenset[st
     return _probe_value(contract.feeds.get(name), contract.probe_size)
 
 
+def _dereference_object_octets(
+    value: Any, *, _seen: frozenset[int] = frozenset()
+) -> bytes:
+    """Deterministic octets for any value, dereferencing a class instance
+    through its own object table instead of requiring JSON compatibility.
+
+    A live class instance (a ``MachinePathForest``, a ``ReversibleMachine
+    Executor``, ...) is not, in general, JSON-serializable -- but its state
+    is always readable through its own object table (``vars(value)`` /
+    ``__dict__``, or ``__slots__`` where no ``__dict__`` exists), the same
+    structural fact ``ClassNavigationTable`` already reads at the compiler
+    level. This is the same dereference operation at the level of one live
+    Python value: walk it to its declared fields, recursively, and print
+    their octets directly, in a stable field order, rather than its JSON
+    representation, which may not exist.
+    """
+
+    if isinstance(value, bytes):
+        return b"bytes:" + value
+    if isinstance(value, bool):
+        return b"bool:" + (b"1" if value else b"0")
+    if isinstance(value, (int, float)):
+        return f"num:{value!r}".encode("utf-8")
+    if value is None:
+        return b"none"
+    if isinstance(value, str):
+        return b"str:" + value.encode("utf-8")
+    if isinstance(value, (list, tuple)):
+        return b"[" + b",".join(
+            _dereference_object_octets(item, _seen=_seen) for item in value
+        ) + b"]"
+    if isinstance(value, dict):
+        return b"{" + b",".join(
+            _dereference_object_octets(key, _seen=_seen)
+            + b":"
+            + _dereference_object_octets(item, _seen=_seen)
+            for key, item in sorted(
+                value.items(), key=lambda pair: repr(pair[0])
+            )
+        ) + b"}"
+    # A live class instance: dereference through its own object table.  A
+    # cycle (an object reachable from itself) prints its own id rather than
+    # recursing forever -- octets describing the shape once, not an
+    # infinite unrolling of it.
+    object_id = id(value)
+    if object_id in _seen:
+        return f"cycle:{object_id}".encode("utf-8")
+    if hasattr(value, "__dict__"):
+        table = vars(value)
+    else:
+        table = {
+            slot: getattr(value, slot)
+            for slot in getattr(value, "__slots__", ())
+            if hasattr(value, slot)
+        }
+    fields = b",".join(
+        name.encode("utf-8")
+        + b"="
+        + _dereference_object_octets(field_value, _seen=_seen | {object_id})
+        for name, field_value in sorted(table.items())
+    )
+    header = f"{type(value).__module__}.{type(value).__name__}(".encode(
+        "utf-8"
+    )
+    return header + fields + b")"
+
+
 def _content_version(
     source: str,
     contract: SourceContract,
@@ -1211,9 +1288,7 @@ def _content_version(
         "include_backends": include_backends,
         "backend_targets": sorted(str(item).lower() for item in backend_targets or ()),
     }
-    digest = hashlib.sha256(
-        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    digest = hashlib.sha256(_dereference_object_octets(identity)).hexdigest()
     return f"v{BUNDLE_LAYOUT_VERSION}-{digest[:16]}", source_digest, digest[:16]
 
 
