@@ -754,10 +754,37 @@ def _compile_single_native_node(node, operation: str) -> CapturedFusedProgram:
         metadata[value_id] = _captured_meta(value)
 
     result_id = tensor_identity(result)
+    shape_source_ids = node.ctx.get("shape_source_ids")
     metadata[result_id] = _captured_meta(
-        result, shape_source_ids=node.ctx.get("shape_source_ids"),
+        result, shape_source_ids=shape_source_ids,
     )
     attrs = dict(node.ctx.get("params") or {})
+    if shape_source_ids and any(
+        source_id is not None for source_id in shape_source_ids
+    ):
+        # ``size`` was captured into ``attrs`` as a frozen literal by
+        # ``_wrap_creation_fn`` -- the tape only tracks tensor-to-tensor
+        # flow, so a plain size tuple was never going to survive there.
+        # But its real dependency edge already exists, correctly, in the
+        # ProcessGraph (that is exactly what shape_source_ids names).
+        # Promote it to a genuine operand here instead of leaving the
+        # frozen literal as the only record: use the ProcessGraph node id
+        # directly as this feed's id (it is already resolved -- there is
+        # no transient tape identity to remap through, unlike a real
+        # tensor operand) so the existing feed/dependency machinery finds
+        # it the same way it finds every other operand, with nothing
+        # special-cased for this being a scalar rather than a tensor.
+        size_origin_id = int(shape_source_ids[0])
+        size_value = attrs.get("size")
+        if size_value is not None and size_origin_id not in feeds:
+            input_ids.append(size_origin_id)
+            feeds[size_origin_id] = size_value
+            metadata[size_origin_id] = Meta(
+                shape=(len(tuple(size_value)),),
+                dtype="int64",
+                device=None,
+            )
+            attrs["dynamic_shape_input_id"] = size_origin_id
     kernel_kind = _CAPTURED_NATIVE_KERNELS.get(operation, operation)
     lowered_operation = operation
 
