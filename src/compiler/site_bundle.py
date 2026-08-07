@@ -1507,6 +1507,10 @@ class FusedDreamProgram:
     slug: str | None
     block_order: tuple[str, ...]
     non_program_blocks: tuple[tuple[str, str], ...]
+    # The entry block's declared ports, which are the compiled program's
+    # own interface: what a caller must supply, and what it gets back.
+    entry_inputs: tuple[str, ...] = ()
+    entry_outputs: tuple[str, ...] = ()
 
 
 def fuse_dream_document(source: str) -> FusedDreamProgram:
@@ -1558,6 +1562,8 @@ def fuse_dream_document(source: str) -> FusedDreamProgram:
     # declaration names the entry to be *synthesised* from that block rather
     # than a function expected to already exist.
     entry_index = len(program_blocks) - 1
+    entry_inputs: tuple[str, ...] = ()
+    entry_outputs: tuple[str, ...] = ()
     for index, block in enumerate(program_blocks):
         declared = block.decorations.get("entry")
         if declared:
@@ -1574,8 +1580,13 @@ def fuse_dream_document(source: str) -> FusedDreamProgram:
             program_parts.append(f"{header}\n{block.payload}")
             continue
         program_parts.append(
-            f"{header}\n{_synthesise_entry(block.payload, entry)}"
+            f"{header}\n"
+            + _synthesise_entry(
+                block.payload, entry, block.inputs, block.outputs,
+            )
         )
+        entry_inputs = tuple(block.inputs)
+        entry_outputs = tuple(block.outputs)
 
     return FusedDreamProgram(
         source="\n\n".join(program_parts) + "\n",
@@ -1585,11 +1596,28 @@ def fuse_dream_document(source: str) -> FusedDreamProgram:
         slug=None,
         block_order=tuple(order),
         non_program_blocks=tuple(others),
+        entry_inputs=entry_inputs,
+        entry_outputs=entry_outputs,
     )
 
 
-def _synthesise_entry(payload: str, entry: str) -> str:
+def _synthesise_entry(
+    payload: str,
+    entry: str,
+    inputs: tuple[str, ...] = (),
+    outputs: tuple[str, ...] = (),
+) -> str:
     """Wrap one block's statements as the named entry function.
+
+    **The block's declared ports are its signature.** A Dream block states
+    its own interface -- ``inputs = machine_program, shell_tick_seconds``,
+    ``outputs = published_generation`` -- and those declarations are the
+    document telling the compiler what flows in and out. ``machine_program``
+    is an *output of chip-setup and an input to head-step*, which is to say
+    a value passed between blocks, not shared mutable module state. Fusing
+    the blocks as plain text loses that distinction and silently demotes a
+    declared port to a global, at which point the compiler is right to
+    refuse: it is being asked to read a name nothing supplies.
 
     Definitions and imports stay at module scope -- moving an ``import`` or a
     ``def`` inside the entry would rebind it on every call and break any
@@ -1597,10 +1625,10 @@ def _synthesise_entry(payload: str, entry: str) -> str:
     body, which is exactly the split the document already implies: a block
     that declares an entry *is* that entry's body.
 
-    If the block leaves its value in ``result`` -- the convention every
-    Python block in this repository's documents already follows -- the
-    synthesised function returns it, so the entry has an output rather than
-    being a bare effect.
+    Returns the declared outputs when there are any, falling back to the
+    ``result`` convention every Python block in this repository's documents
+    already follows, so the entry has an output rather than being a bare
+    effect.
     """
 
     import textwrap
@@ -1635,8 +1663,24 @@ def _synthesise_entry(payload: str, entry: str) -> str:
     if not body:
         body = ["pass"]
     inner = textwrap.indent("\n".join(body), "    ")
-    tail = "\n    return result" if assigns_result else ""
-    definition = f"def {entry}():\n{inner}{tail}\n"
+    bound = {
+        target.id
+        for statement in module.body
+        if isinstance(statement, ast.Assign)
+        for target in statement.targets
+        if isinstance(target, ast.Name)
+    }
+    returned = [name for name in outputs if name in bound]
+    if returned:
+        tail = "\n    return " + (
+            returned[0] if len(returned) == 1 else ", ".join(returned)
+        )
+    elif assigns_result:
+        tail = "\n    return result"
+    else:
+        tail = ""
+    signature = ", ".join(inputs)
+    definition = f"def {entry}({signature}):\n{inner}{tail}\n"
     return ("\n".join(hoisted) + "\n\n" if hoisted else "") + definition
 
 
