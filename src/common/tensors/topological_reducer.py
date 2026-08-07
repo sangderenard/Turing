@@ -481,6 +481,55 @@ class GraphTranslationShortfall:
         )
 
 
+# Cap on a folded sequence, so `[0] * 10**9` is refused rather than
+# materialized. A refused fold is not a failure: it falls through to the
+# ordinary path and reports itself there like anything else.
+_MAX_FOLDED_SEQUENCE_ELEMENTS = 1 << 20
+
+
+def _static_sequence_literal(expression: Any) -> Any:
+    """Fold literal sequence replication (``[0] * 256``) to its value.
+
+    Returns the folded list, or ``None`` when this is not that construct.
+
+    ``[0] * 256`` is **Python list replication, not arithmetic** -- but the
+    AST spells it ``BinOp(op=Mult)``, so canonicalization would otherwise
+    rewrite it into a ``Mul`` dataflow operation that was never arithmetic.
+    Its operands are not in the graph either (a literal list inside a
+    comprehension is never descended into), so the ``Mul`` ends up with two
+    absent operands.
+
+    This is compile-time table allocation -- the shape a decoder's lookup
+    tables are declared in -- and its value is knowable now, so it becomes
+    constant data. Only the both-operands-literal case folds; anything
+    depending on a runtime value is left alone.
+    """
+
+    if not isinstance(expression, ast.BinOp) or not isinstance(
+        expression.op, ast.Mult
+    ):
+        return None
+    for sequence_node, count_node in (
+        (expression.left, expression.right),
+        (expression.right, expression.left),
+    ):
+        if not isinstance(sequence_node, (ast.List, ast.Tuple)):
+            continue
+        try:
+            sequence = ast.literal_eval(sequence_node)
+            count = ast.literal_eval(count_node)
+        except (ValueError, TypeError, SyntaxError, MemoryError):
+            return None
+        if isinstance(count, bool) or not isinstance(count, int):
+            return None
+        if count < 0:
+            return None
+        if len(sequence) * count > _MAX_FOLDED_SEQUENCE_ELEMENTS:
+            return None
+        return list(sequence) * count
+    return None
+
+
 def _source_span(expression: Any) -> str:
     line = getattr(expression, "lineno", None)
     if line is None:
@@ -3114,6 +3163,17 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             data["constant"] = expression.value
             data.setdefault("attributes", {})["value"] = expression.value
         elif isinstance(expression, ast.BinOp):
+            folded = _static_sequence_literal(expression)
+            if folded is not None:
+                # Sequence replication is table allocation, not arithmetic.
+                data["type"] = "Constant"
+                data["op"] = "const"
+                data["constant"] = folded
+                attributes = data.setdefault("attributes", {})
+                attributes["value"] = folded
+                attributes["source_type"] = "BinOp"
+                attributes["constant_folded"] = "sequence-replication"
+                continue
             operation = _qualified_handler("binop", expression.op)
             data["type"] = operation
             data["op"] = operation

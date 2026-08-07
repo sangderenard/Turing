@@ -1487,6 +1487,53 @@ def load_program_bundle(directory: Path) -> ProgramBundle:
     )
 
 
+def _execute_module_scope(
+    source: str,
+    source_filename: str,
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Run the program's module-level statements and return its globals.
+
+    A compiled entrypoint routinely refers to names its own module bound
+    above it -- a configured object, a lookup table, a constant built once
+    at import. Those are *definitions*, established before anything runs,
+    not runtime inputs. Without executing module scope they reach the
+    compiler as unbound externals, and the build fails asking to be fed a
+    value the program already computed for itself (``missing ProcessGraph
+    input 'HEAD' ... binding_kind='external'``).
+
+    This is the compile-time setup phase: statements run top to bottom,
+    definitions are accepted, and the resulting namespace becomes the
+    entrypoint's static bindings. It is what ``import`` does, on a module
+    this function is compiling anyway.
+
+    A module that fails to execute is not fatal here. Its namespace is
+    simply whatever bound before the failure, and compilation proceeds to
+    report what it cannot resolve -- a partial result that names the gap,
+    rather than a stop that hides every other finding behind the first one.
+    """
+
+    namespace: dict[str, Any] = {
+        "__name__": "__turing_program__",
+        "__file__": str(source_filename),
+        "__builtins__": __builtins__,
+    }
+    try:
+        exec(compile(source, str(source_filename), "exec"), namespace)
+    except Exception as error:  # noqa: BLE001 - reported, never swallowed
+        if progress is not None:
+            progress(
+                f"module scope stopped early ({type(error).__name__}: "
+                f"{error}); continuing with the names bound so far"
+            )
+    else:
+        if progress is not None:
+            progress(f"module scope bound {len(namespace)} names")
+    namespace.pop("__builtins__", None)
+    return namespace
+
+
 def build_program_bundle(
     source: str,
     destination: str | Path,
@@ -1565,6 +1612,11 @@ def build_program_bundle(
     channel.log(
         f"discovered contract for {contract.entrypoint!r}",
         path="contract", slug=contract.slug,
+    )
+    program_bindings = _execute_module_scope(
+        source,
+        source_filename,
+        progress=lambda message: channel.log(message, path="module-scope"),
     )
     contract_shader_configuration = {
         **dict(contract.shader_configuration),
@@ -1662,7 +1714,7 @@ def build_program_bundle(
                     remove_loops=contract.remove_loops,
                     unroll_limit=contract.unroll_limit,
                     precompile_only=True,
-                    python_bindings=globals(),
+                    python_bindings={**globals(), **program_bindings},
                     bake_mode=contract.bake_mode,
                     schedule_preference=contract.schedule_preference,
                     constant_map=contract.constant_map,
@@ -1765,7 +1817,7 @@ def build_program_bundle(
                     remove_loops=contract.remove_loops,
                     unroll_limit=contract.unroll_limit,
                     precompile_only=True,
-                    python_bindings=globals(),
+                    python_bindings={**globals(), **program_bindings},
                     bake_mode=contract.bake_mode,
                     schedule_preference=contract.schedule_preference,
                     progress=lambda message: channel.log(message, path="presentation"),
@@ -1831,7 +1883,7 @@ def build_program_bundle(
             remove_loops=True,
             unroll_limit=contract.unroll_limit,
             precompile_only=True,
-            python_bindings=globals(),
+            python_bindings={**globals(), **program_bindings},
         )
         passthrough_program = project_public_numerical_program(passthrough_aot)
         passthrough_module = emit_webgl_fragment_module(
