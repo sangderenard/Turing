@@ -440,6 +440,7 @@ def compile_ast_aot(
     profiling: bool = False,
     precompile_only: bool = False,
     python_bindings: Mapping[str, Any] | None = None,
+    python_package: str | None = None,
     bake_mode: str = "whole_program",
     schedule_preference: str = "alap",
     constant_map: Mapping[str, Any] | None = None,
@@ -658,6 +659,16 @@ def compile_ast_aot(
     # them here lets the reducer retain computed constants and imported
     # references without executing or reinterpreting their source expressions.
         graph.python_bindings = dict(expanded_python_bindings)
+        # Real import resolution (_import_ast_bindings -> importlib.
+        # import_module) inside build_from_ast needs this to resolve a
+        # relative import (``from .machine_path_forest import ...``) at
+        # all -- without it, importlib silently fails (a relative import
+        # requires ``package``) and a name the source itself imports is
+        # never discovered, indistinguishable from one that truly is
+        # external and must be supplied.  site_bundle.py's own, separate,
+        # first ProcessGraph build already sets this; this second,
+        # independent graph build never did.
+        graph.python_package = python_package
         _report("aot: building process graph (second, independent build)")
         with contextlib.redirect_stdout(io.StringIO()):
             graph.build_from_ast(

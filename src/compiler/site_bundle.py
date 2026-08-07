@@ -2063,6 +2063,7 @@ def build_program_bundle(
                     unroll_limit=contract.unroll_limit,
                     precompile_only=True,
                     python_bindings=globals(),
+                    python_package=python_package,
                     bake_mode=contract.bake_mode,
                     schedule_preference=contract.schedule_preference,
                     constant_map=contract.constant_map,

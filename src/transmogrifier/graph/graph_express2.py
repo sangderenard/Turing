@@ -759,6 +759,15 @@ def _expand_unresolved_ast_parents(
     and each additional pass means the search climbed one level further
     looking for a source definition that was not where the previous pass
     expected it.
+
+    Also returns ``root_bindings`` -- ``bindings`` plus every name this
+    call actually resolved via real imports (``_import_ast_bindings``,
+    ``importlib.import_module`` against ``package``).  The caller must
+    store it back onto ``self.python_bindings`` for later stages (name
+    resolution during reduction, ``static_bindings`` in
+    ``topological_reducer.py``) to see it -- this function's own use of
+    it (discovering additional source definitions) is real but internal,
+    and previously never escaped this call at all.
     """
 
     if isinstance(tree, ast.Module):
@@ -1059,7 +1068,7 @@ def _expand_unresolved_ast_parents(
             f"elapsed={time.perf_counter() - started:.3f}s",
             flush=True,
         )
-    return module, tuple(parent_links), tuple(unresolved_calls)
+    return module, tuple(parent_links), tuple(unresolved_calls), root_bindings
 
 
 def _resolve(val):
@@ -1927,7 +1936,7 @@ class ProcessGraph:
         if resolve_unresolved_parents:
             bindings = dict(getattr(self, "python_bindings", {}) or {})
             bindings.update(parent_bindings or {})
-            tree, parent_links, unresolved_calls = (
+            tree, parent_links, unresolved_calls, root_bindings = (
                 _expand_unresolved_ast_parents(
                 tree,
                 bindings,
@@ -1937,6 +1946,16 @@ class ProcessGraph:
                     progress=progress,
                 )
             )
+            # The real imports this just resolved (importlib, against
+            # ``python_package``) previously never left this call --
+            # ``static_bindings`` (topological_reducer.py), the actual
+            # lookup an ordinary Name resolves against, only ever saw
+            # whatever ``python_bindings`` the caller supplied up front,
+            # never anything discovered here.  A name imported by the
+            # source itself (``from .machine_path_forest import
+            # MachinePathHeadStatus``) was real and resolved, just
+            # discarded before reduction could ever see it.
+            self.python_bindings = root_bindings
 
         # Preserve class declarations as schema metadata beside the exact AST
         # nodes ProcessGraph is about to ingest; do not create a second AST
