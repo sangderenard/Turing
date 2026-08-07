@@ -1359,6 +1359,45 @@ def _normalize_lexical_values(
                 graph.G.nodes[node_id].setdefault(
                     "attributes", {},
                 )["class_ref"] = expression.func.id
+            if (
+                isinstance(expression.func, ast.Attribute)
+                and node_id in graph.G
+            ):
+                # A method call's receiver is wired here, through the same
+                # SSA lookup (resolve_expression) every other expression
+                # already goes through -- not a raw AST-node id, which is
+                # only valid by coincidence (it assumes ingestion happened
+                # to walk this exact receiver independently, which is not
+                # guaranteed for one reached only through this call
+                # expression). The receiver is an ordinary expression --
+                # commonly a Name already bound by bind_target, whose real,
+                # resolved value resolve_expression looks up directly.
+                receiver_value = resolve_expression(expression.func.value)
+                receiver_inputs = (
+                    ((receiver_value, "operand"),)
+                    if isinstance(receiver_value, int)
+                    else ()
+                )
+                argument_inputs = tuple(
+                    (resolved, f"arg{index}")
+                    for index, argument in enumerate(expression.args)
+                    if isinstance(
+                        (resolved := resolve_expression(argument)), int
+                    )
+                )
+                keyword_inputs = tuple(
+                    (resolved, f"kw:{keyword.arg}" if keyword.arg else "kwargs")
+                    for keyword in expression.keywords
+                    if isinstance(
+                        (resolved := resolve_expression(keyword.value)), int
+                    )
+                )
+                if receiver_inputs:
+                    _replace_inputs(
+                        graph,
+                        node_id,
+                        (*receiver_inputs, *argument_inputs, *keyword_inputs),
+                    )
             callee = resolve_expression(expression.func)
             if isinstance(callee, int) and callee in graph.G:
                 callee_reference = (
@@ -3473,28 +3512,28 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     data.setdefault("attributes", {})["method_ref"] = int(
                         method_reference
                     )
-            _replace_inputs(
-                graph,
-                node_id,
-                (
-                    (id(expression.func.value), "operand"),
-                    *(
-                        (id(argument), f"arg{index}")
-                        for index, argument in enumerate(expression.args)
-                    ),
-                    *(
-                        (
-                            id(keyword.value),
-                            (
-                                f"kw:{keyword.arg}"
-                                if keyword.arg is not None
-                                else "kwargs"
-                            ),
-                        )
-                        for keyword in expression.keywords
-                    ),
-                ),
-            )
+            # Wiring the receiver/arguments as this node's own ``parents``
+            # used to happen right here, keyed by ``id(expression.func.
+            # value)`` -- the raw Python id() of the AST node, not a real
+            # graph reference.  That is only ever valid by coincidence: it
+            # assumes ingestion already walked this exact receiver
+            # independently, which is not guaranteed (a receiver reached
+            # only through this call expression, inside a nested try/loop,
+            # was never separately ingested).  ``orchestrator`` here is an
+            # ordinary local variable; it already has a real, resolved SSA
+            # value the moment its own assignment is processed
+            # (``bind_target`` -> ``environment``) -- fabricating a new
+            # node for it, or guessing at a raw id, both bypass that
+            # existing value instead of looking it up.  The actual lookup
+            # operator for "what did this expression resolve to" is
+            # ``resolve_expression`` itself, which only becomes available
+            # once lexical normalization runs (this pass runs earlier, over
+            # whatever ingestion already produced). Wiring is done instead
+            # in ``resolve_expression``'s own ``ast.Call`` handling
+            # (``_normalize_lexical_values``, run later during reduction),
+            # where ``resolve_expression`` can be called directly on the
+            # receiver and arguments -- the same SSA lookup every other
+            # expression in the program already goes through.
         elif isinstance(expression, ast.Call):
             call_inputs: list[tuple[int, str]] = [
                 (
