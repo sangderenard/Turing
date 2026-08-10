@@ -259,6 +259,40 @@ def emit_nested_map_store(
                  slot_local=slot_local, addr_local=addr_local, guard_local=guard_local)
 
 
+def emit_nested_map_get(
+    builder: CodeBuilder,
+    *,
+    table_base_local: int,
+    gx_local: int,
+    gy_local: int,
+    result_local: int,
+    child_local: int,
+    child_val_local: int,
+    cap_local: int,
+    slot_local: int,
+    addr_local: int,
+    guard_local: int | None = None,
+) -> None:
+    """Emit ``result = table[gx][gy]`` (0 on any miss). The read counterpart of
+    ``emit_nested_map_store``. A missing outer key yields a 0 child handle, so
+    the inner lookup is guarded -- probing an unallocated map (capacity 0) would
+    divide by zero. All the ``*_local`` args are caller-declared locals.
+    """
+
+    builder.i64_const(0).local_set(result_local)  # default: miss
+    emit_map_get(builder, map_base_local=table_base_local, key_local=gx_local,
+                 cap_local=cap_local, slot_local=slot_local, addr_local=addr_local,
+                 result_local=child_val_local, guard_local=guard_local)
+    builder.local_get(child_val_local).raw(_I32_WRAP_I64).local_set(child_local)
+    builder.local_get(child_local).raw(_I32_EQZ)
+    builder.if_()          # child == 0: leave result at 0
+    builder.else_()        # child present: result = child[gy]
+    emit_map_get(builder, map_base_local=child_local, key_local=gy_local,
+                 cap_local=cap_local, slot_local=slot_local, addr_local=addr_local,
+                 result_local=result_local, guard_local=guard_local)
+    builder.end()
+
+
 def emit_bump_alloc(
     builder: CodeBuilder,
     size: int,

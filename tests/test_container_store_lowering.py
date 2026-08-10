@@ -137,3 +137,65 @@ def test_string_keyed_single_dict_store_lowers_to_a_map():
     # The string constant is consumed as an immediate key, not a tensor param.
     assert module.parameters == ("$count", "$data", "$value", "$out0")
     assert "container store lowered" in module.source
+
+
+def _nested_read_program():
+    # value = table[gx][gy]: two Indexed gathers rooted at a container feed.
+    return FusedProgram(
+        version=1, feeds={20, 21, 22},
+        steps=[OpStep(0, "Indexed", [20, 21], {"source_type": "Subscript"}, 30),
+               OpStep(1, "Indexed", [30, 22], {"source_type": "Subscript"}, 31)],
+        outputs={"value": 31}, meta={},
+        extras={"capture_feed_origins": {
+            20: {"binding_name": "table"}, 21: {"binding_name": "gx"},
+            22: {"binding_name": "gy"}}},
+    )
+
+
+def test_nested_container_read_lowers():
+    module = emit_wasm_module(_nested_read_program(), name="rd", dtype="float64")
+    assert module.complete, module.shortfall_report()
+    assert module.parameters == ("$count", "$table", "$gx", "$gy", "$out0")
+    assert "container read lowered" in module.source
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_container_store_then_read_round_trips(tmp_path):
+    # Store table[k0][k1]=v with the store kernel, then read it back with the
+    # read kernel over the same linear memory: the two heap-map kernels agree on
+    # layout and hashing.
+    store = emit_wasm_module(_region_115_program(), name="st", dtype="float64")
+    read = emit_wasm_module(_nested_read_program(), name="rd", dtype="float64")
+    (tmp_path / "st.wasm").write_bytes(store.binary)
+    (tmp_path / "rd.wasm").write_bytes(read.binary)
+    script = tmp_path / "run.mjs"
+    script.write_text(
+        """
+        import {readFileSync} from "node:fs";
+        const st = await WebAssembly.instantiate(readFileSync(process.argv[2]), {});
+        const sMem = st.instance.exports.memory;
+        const s32 = new Int32Array(sMem.buffer), s64 = new BigInt64Array(sMem.buffer);
+        const CURSOR=0, TABLE=512, TOP_CAP=8, K0=64, K1=128, VAL=192, OUT=256, HEAP=4096;
+        s32[CURSOR/4]=HEAP; s32[TABLE/4]=TOP_CAP;
+        const k0=0x401000n, k1=0x20n, v=98765n;
+        s64[K0/8]=k0; s64[K1/8]=k1; s64[VAL/8]=v;
+        st.instance.exports.run(1, TABLE, K0, K1, VAL, OUT);
+        // Move the store's linear memory into the read instance and look it up.
+        const rd = await WebAssembly.instantiate(readFileSync(process.argv[3]), {});
+        const rMem = rd.instance.exports.memory;
+        if (rMem.buffer.byteLength < sMem.buffer.byteLength)
+          rMem.grow((sMem.buffer.byteLength - rMem.buffer.byteLength + 65535) >> 16);
+        new Uint8Array(rMem.buffer).set(new Uint8Array(sMem.buffer));
+        const r64 = new BigInt64Array(rMem.buffer);
+        const RK0=64, RK1=128, ROUT=256;
+        r64[RK0/8]=k0; r64[RK1/8]=k1;
+        rd.instance.exports.run(1, TABLE, RK0, RK1, ROUT);
+        console.log(new BigInt64Array(rMem.buffer)[ROUT/8].toString());
+        """,
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        ["node", str(script), str(tmp_path/"st.wasm"), str(tmp_path/"rd.wasm")],
+        capture_output=True, text=True, check=True,
+    )
+    assert completed.stdout.strip() == "98765", completed.stdout + completed.stderr

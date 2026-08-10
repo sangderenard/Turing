@@ -1214,6 +1214,196 @@ def _emit_container_store_module(
     )
 
 
+def _container_key_spec(program, by_result, feeds, ref):
+    """Normalise a subscript operand to ('imm', i64) | ('feed', id), plus whether
+    it was a string key. Shared by the container store and read detectors."""
+    producer = by_result.get(ref)
+    text = _string_constant(producer)
+    if text is not None:
+        return ("imm", _fnv1a_64(text)), True
+    if ref in feeds:
+        return ("feed", ref), False
+    if producer is not None and producer.op_name == "tensor_from_list":
+        scalar = _constant_scalar_index(producer.attrs.get("values"))
+        if scalar is not None:
+            return ("imm", int(scalar)), False
+    return None, False
+
+
+def _pure_container_read(program: FusedProgram, live: Sequence[OpStep]):
+    """A region that is one *shapeless* subscript read from a dict/list.
+
+    Returns ``(container_id, key_specs, result_id)`` or ``None``. The read
+    counterpart of ``_pure_container_store``: a chain of ``Indexed`` gathers
+    ``table[gx]`` (single) or ``table[gx][gy]`` (nested, two gathers) rooted at a
+    shapeless container feed, ending at the sole region output, surrounded only
+    by ``tensor_from_list`` key constants. Two levels are always a container; a
+    single level only when the key is a string (a numeric single gather is a
+    genuine buffer read, left on the strided path).
+    """
+
+    gathers = [s for s in live if s.op_name in ("Indexed", "gather")]
+    if not gathers:
+        return None
+    for other in live:
+        if other not in gathers and other.op_name != "tensor_from_list":
+            return None
+    outputs = list(program.outputs.values())
+    if len(outputs) != 1:
+        return None
+    by_result = {s.result_id: s for s in live}
+    feeds = set(program.feeds)
+
+    # Walk the gather chain backwards from the output to its container root.
+    chain: list[OpStep] = []
+    current = by_result.get(outputs[0])
+    while current is not None and current.op_name in ("Indexed", "gather"):
+        if len(current.input_ids) != 2:
+            return None
+        chain.append(current)
+        current = by_result.get(current.input_ids[0])
+    chain.reverse()
+    if not (1 <= len(chain) <= 2) or len(chain) != len(gathers):
+        return None
+    # Each link's source must be the previous link's result (a real chain).
+    for parent, child in zip(chain, chain[1:]):
+        if child.input_ids[0] != parent.result_id:
+            return None
+    container_id = chain[0].input_ids[0]
+    if container_id not in feeds:
+        return None
+    if not _is_shapeless(program, container_id) or not _is_shapeless(program, outputs[0]):
+        return None
+    key_specs = []
+    has_string = False
+    for gather in chain:
+        spec, is_string = _container_key_spec(program, by_result, feeds, gather.input_ids[1])
+        if spec is None:
+            return None
+        key_specs.append(spec)
+        has_string = has_string or is_string
+    if len(key_specs) == 2 or (len(key_specs) == 1 and has_string):
+        return container_id, key_specs, outputs[0]
+    return None
+
+
+def _emit_container_load_module(
+    program: FusedProgram,
+    *,
+    name: str,
+    function_name: str,
+    value_type: str,
+    element_bytes: int,
+    parameter_feed_ids: Sequence[int],
+    output_ids: Sequence[int],
+    labels: Sequence[str],
+    imports: Sequence[object],
+    static_data_offset: int,
+    descriptor,
+) -> "WasmModule":
+    """Emit a kernel for a pure shapeless container read: look the key(s) up in
+    the heap map and write the value (0 on a miss) to the region output. Mirror
+    of ``_emit_container_store_module``."""
+
+    from .wasm_binary import CodeBuilder, build_module
+    from .wasm_container import emit_map_get, emit_nested_map_get
+
+    container_id, key_specs, result_id = descriptor
+    parameter_count = 1 + len(parameter_feed_ids) + len(output_ids)
+    builder = CodeBuilder(value_type=value_type, parameter_count=parameter_count)
+
+    def feed_param(vid: int) -> int:
+        source = resolve_view_source(program.meta, vid)
+        return 1 + list(parameter_feed_ids).index(source)
+
+    def load_spec_i64(spec, dest: int) -> None:
+        kind, ref = spec
+        if kind == "imm":
+            builder.i64_const(int(ref)).local_set(dest)
+            return
+        offset, _stride = view_offset_stride(program.meta, ref)
+        builder.local_get(feed_param(ref))
+        byte_offset = offset * element_bytes
+        if byte_offset:
+            builder.i32_const(byte_offset).raw(0x6A)
+        if value_type == "f64":
+            builder.load()
+            builder.raw(_I64_REINTERPRET_F64)
+        else:
+            builder.i64_load()
+        builder.local_set(dest)
+
+    key0 = builder.declare_local("i64")
+    key1 = builder.declare_local("i64") if len(key_specs) == 2 else None
+    result = builder.declare_local("i64")
+    child = builder.declare_local("i32")
+    child_val = builder.declare_local("i64")
+    cap = builder.declare_local("i32")
+    slot = builder.declare_local("i32")
+    addr = builder.declare_local("i32")
+    guard = builder.declare_local("i32")
+
+    load_spec_i64(key_specs[0], key0)
+    if key1 is not None:
+        load_spec_i64(key_specs[1], key1)
+
+    table_base = feed_param(container_id)
+    if len(key_specs) == 2:
+        emit_nested_map_get(
+            builder, table_base_local=table_base, gx_local=key0, gy_local=key1,
+            result_local=result, child_local=child, child_val_local=child_val,
+            cap_local=cap, slot_local=slot, addr_local=addr, guard_local=guard,
+        )
+    else:
+        emit_map_get(
+            builder, map_base_local=table_base, key_local=key0, cap_local=cap,
+            slot_local=slot, addr_local=addr, result_local=result, guard_local=guard,
+        )
+
+    # Write the looked-up value to the region output field (index 0, scalar).
+    out_param = 1 + len(parameter_feed_ids) + list(output_ids).index(result_id)
+    builder.local_get(out_param)
+    builder.local_get(result)
+    if value_type == "f64":
+        builder.raw(0xBF)  # f64.reinterpret_i64 -- inverse of the store's reinterpret
+        builder.store()
+    else:
+        builder.i64_store()
+
+    binary = build_module(
+        function_name=function_name,
+        parameter_types=["i32"] * parameter_count,
+        body=builder, imports=imports,
+    )
+    memory_import = next(
+        (e for e in imports if getattr(e, "kind", None) == "memory"), None
+    )
+    api = _describe(
+        name, function_name, list(parameter_feed_ids), list(output_ids),
+        value_type, element_bytes, 0, static_data_offset=static_data_offset,
+        shared_memory_import=(
+            {"module": memory_import.module, "field": memory_import.field}
+            if memory_import is not None else None
+        ),
+        input_names=list(labels), output_names=list(program.outputs.keys()),
+    )
+    parameters = (
+        ["$count"] + [f"${label}" for label in labels]
+        + [f"$out{i}" for i in range(len(output_ids))]
+    )
+    source = (
+        f"(module ;; {name} -- container read lowered in the binary\n"
+        f"  ;; heap open-addressing map lookup ({len(key_specs)} level(s)).\n"
+        f"  ;; The WAT is a placeholder; the emitted binary is authoritative.\n"
+        f"  (func (export \"{function_name}\")"
+        + "".join(f" (param {p} i32)" for p in parameters) + ")\n)\n"
+    )
+    return WasmModule(
+        name=name, source=source, shortfalls=(), parameters=tuple(parameters),
+        value_type=value_type, api=api, binary=binary,
+    )
+
+
 def emit_wasm_module(
     program: FusedProgram,
     *,
@@ -1257,8 +1447,12 @@ def emit_wasm_module(
     # its string-key constants are not numeric tensors, so it must be detected
     # before static-data planning: it lowers to the heap open-addressing map ABI.
     if value_type in ("f64", "i64"):
-        container = _pure_container_store(program, live)
-        if container is not None:
+        container_store = _pure_container_store(program, live)
+        container_read = (
+            None if container_store is not None
+            else _pure_container_read(program, live)
+        )
+        if container_store is not None or container_read is not None:
             container_feed_ids = program_feed_order(program)
             container_output_ids = list(program.outputs.values())
             container_param_feeds: list[int] = []
@@ -1268,14 +1462,18 @@ def emit_wasm_module(
                 if source_id not in seen_container_sources:
                     seen_container_sources.add(source_id)
                     container_param_feeds.append(source_id)
-            return _emit_container_store_module(
+            emit = (
+                _emit_container_store_module if container_store is not None
+                else _emit_container_load_module
+            )
+            return emit(
                 program, name=name, function_name=function_name,
                 value_type=value_type, element_bytes=element_bytes,
                 parameter_feed_ids=container_param_feeds,
                 output_ids=container_output_ids,
                 labels=feed_names(program, container_param_feeds),
                 imports=imports, static_data_offset=static_data_offset,
-                descriptor=container,
+                descriptor=container_store or container_read,
             )
 
     static_data = plan_static_data(
