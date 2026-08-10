@@ -2635,6 +2635,33 @@ def build_program_bundle(
                 else:
                     channel.log("threaded partition unavailable, staying single-region", path="regions")
         if real_control is not None:
+            # Pre-flight consistency scan: a captured region whose op reads a
+            # value produced by no region and declared no feed is malformed
+            # (a producer eliminated during capture/partitioning). Surface the
+            # whole set once, upfront, instead of dying opaquely at the first --
+            # so a bad capture is diagnosed at a glance, not one rebuild at a time.
+            import collections as _collections
+            dangling_ops = _collections.Counter()
+            dangling_examples = []
+            for _idx, _prog in effective_region_programs.items():
+                _produced = set(_prog.feeds) | {s.result_id for s in _prog.steps}
+                for _step in _prog.steps:
+                    _missing = [v for v in _step.input_ids if v not in _produced]
+                    if _missing:
+                        dangling_ops[_step.op_name] += 1
+                        if len(dangling_examples) < 10:
+                            dangling_examples.append((_idx, _step.op_name, _missing))
+                        break
+            if dangling_ops:
+                channel.log(
+                    "region consistency: malformed regions with dangling operands "
+                    "(producer eliminated during capture/partitioning)",
+                    path="regions",
+                    malformed=int(sum(dangling_ops.values())),
+                    total=len(effective_region_programs),
+                    by_op=dict(dangling_ops),
+                    examples=dangling_examples,
+                )
             channel.log(
                 "emitting control region modules", path="regions",
                 regions=len(real_control.region_indices),
