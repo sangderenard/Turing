@@ -80,6 +80,53 @@ def fused_program_extent_effect(program: FusedProgram) -> str:
     return "pointwise"
 
 
+def _diagnose_region(program, region, module_name) -> str:
+    """A self-explaining diagnosis appended to a region emission failure.
+
+    An 'operand was never produced' shortfall is opaque on its own. This walks
+    the region and classifies every DANGLING operand -- a value an op reads that
+    is neither a region feed nor produced by an earlier step -- reporting what
+    the IR still knows about it: a capture origin means an undeclared feed; being
+    in ``state_in`` means unwired state; surviving metadata means its producer
+    was pruned; nothing at all means the producer was eliminated during
+    capture/partitioning while a consumer kept the reference. Naming the
+    distinction in the error turns a blind rebuild-and-guess loop into a direct
+    fix -- for this program and every future one.
+    """
+
+    produced = set(program.feeds) | {s.result_id for s in program.steps}
+    meta = program.meta or {}
+    origins = (program.extras or {}).get("capture_feed_origins", {})
+    state_in = program.state_in or set()
+    dangling: dict[int, list] = {}
+    for step in program.steps:
+        for operand in step.input_ids:
+            if operand in produced:
+                continue
+            dangling.setdefault(operand, []).append((step.step_id, step.op_name))
+    if not dangling:
+        return ""  # the shortfall is something else; no dangling operands
+    lines = [f"\n\nregion {region} ({module_name}) dangling operands "
+             f"(read but never produced and not a feed):"]
+    for operand in sorted(dangling):
+        entry = meta.get(operand)
+        origin = origins.get(operand) or origins.get(str(operand))
+        readers = ", ".join(f"{op}#{sid}" for sid, op in dangling[operand])
+        if origin is not None:
+            what = f"UNDECLARED FEED (capture origin {origin})"
+        elif operand in state_in:
+            what = "STATE value not wired as a feed"
+        elif entry is not None and getattr(entry, "shape", None) is not None:
+            what = (f"lost producer (meta shape={tuple(entry.shape)} "
+                    f"dtype={getattr(entry, 'dtype', None)})")
+        else:
+            what = "producer eliminated during capture/partitioning (no metadata)"
+        lines.append(f"  value {operand}: {what}; read by {readers}")
+    lines.append(f"  region feeds={sorted(program.feeds)} "
+                 f"outputs={dict(program.outputs)}")
+    return "\n".join(lines)
+
+
 def partition_threaded_wasm_program(
     program: FusedProgram,
     *,
@@ -424,7 +471,10 @@ def emit_control_region_modules(
             # never reaches the cache: a shortfall must be retried on the next
             # pass, not persisted as if it were a finished region.
             if not module.complete:
-                raise RuntimeError(module.shortfall_report())
+                raise RuntimeError(
+                    module.shortfall_report()
+                    + _diagnose_region(program, region, module_name)
+                )
             return module
 
         if reduction_cache is not None:
