@@ -995,48 +995,100 @@ def _is_shapeless(program: FusedProgram, value_id: int) -> bool:
     return not shape
 
 
-def _pure_container_store(program: FusedProgram, live: Sequence[OpStep]):
-    """A region that is exactly one *shapeless* subscript store over feeds.
+# FNV-1a 64-bit: a stable compile-time string hash so the same dict key interns
+# to the same i64 map key in every region, without a shared intern table.
+_FNV64_OFFSET = 0xCBF29CE484222325
+_FNV64_PRIME = 0x100000001B3
 
-    Returns ``(data_id, value_id, selectors, result_id)`` or ``None``. Shapeless
-    means the target is a dict/list container (the decoder's opcode maps and
-    token-multigraph tables are keyed by unbounded RVAs/addresses, with no
-    tensor shape), so it lowers to the heap open-addressing map ABI rather than a
-    strided scatter into a fixed buffer. Restricted to a single store whose
-    subscripts and value are region feeds (or constant subscripts); a region
-    that also computes its key/value in-line is left to the general path as an
-    honest miss (a later wall), not silently mis-lowered.
+
+def _fnv1a_64(text: str) -> int:
+    h = _FNV64_OFFSET
+    for byte in text.encode("utf-8"):
+        h = ((h ^ byte) * _FNV64_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return h - 2 ** 64 if h >= 2 ** 63 else h  # fold to signed i64
+
+
+def _string_constant(step: OpStep | None) -> str | None:
+    """The Python string a ``tensor_from_list`` step materialises, else None."""
+    if step is None or step.op_name != "tensor_from_list":
+        return None
+    values = step.attrs.get("values")
+    return values if isinstance(values, str) else None
+
+
+def _pure_container_store(program: FusedProgram, live: Sequence[OpStep]):
+    """A region that is one *shapeless* subscript store into a dict/list.
+
+    Returns ``(data_id, value_spec, key_specs, result_id)`` or ``None``. Each
+    spec is ``("imm", i64)`` (a constant int subscript, or a string key/value
+    hashed to i64) or ``("feed", value_id)`` (read from a field at run time).
+    Shapeless means the target is a container (the decoder's opcode maps and
+    token tables, keyed by unbounded RVAs/addresses or by string names), lowered
+    to the heap open-addressing map ABI rather than a strided buffer scatter.
+
+    The store may be surrounded by ``tensor_from_list`` constant steps (its
+    string/number key or value materialised inline). Two subscripts are always a
+    nested container; a single subscript is a container only when its key is a
+    string (a numeric single subscript is ambiguous with a 1-D buffer scatter,
+    so it stays on the strided path).
     """
 
-    if len(live) != 1:
+    stores = [s for s in live if s.op_name in ("index_set", "IndexedStore")]
+    if len(stores) != 1:
         return None
-    step = live[0]
-    if step.op_name not in ("index_set", "IndexedStore"):
-        return None
+    step = stores[0]
+    by_result = {s.result_id: s for s in live}
+    # Every non-store live step must be a constant materialisation feeding it.
+    for other in live:
+        if other is not step and other.op_name != "tensor_from_list":
+            return None
     descriptor = _slice_selectors(step)
     if descriptor is None:
         return None
     data_id, value_id, selectors = descriptor
-    # Only the two-subscript case is unambiguous: a shapeless value cannot be a
-    # dense 2-D tensor (that needs a row stride), so table[gx][gy] with no shape
-    # is a nested dict/list container. A single shapeless subscript is left on
-    # the strided path -- it may be a genuine 1-D buffer scatter, which region
-    # meta does not distinguish from a single dict store.
-    if len(selectors) != 2:
-        return None
-    # A shaped store is a real tensor scatter (strided path); only shapeless
-    # references are containers.
     if not _is_shapeless(program, step.result_id) or not _is_shapeless(program, data_id):
         return None
     if list(program.outputs.values()) != [step.result_id]:
         return None
     feeds = set(program.feeds)
-    if data_id not in feeds or value_id not in feeds:
+    if data_id not in feeds:
         return None
-    for kind, selector in selectors:
-        if kind == "runtime" and selector not in feeds:
+
+    def operand_spec(kind: str, ref):
+        """Normalise a subscript/value operand to ('imm', i64) | ('feed', id)."""
+        if kind == "const":
+            return ("imm", int(ref)), False
+        producer = by_result.get(ref)
+        text = _string_constant(producer)
+        if text is not None:
+            return ("imm", _fnv1a_64(text)), True
+        if ref in feeds:
+            return ("feed", ref), False
+        if producer is not None and producer.op_name == "tensor_from_list":
+            scalar = _constant_scalar_index(producer.attrs.get("values"))
+            if scalar is not None:
+                return ("imm", int(scalar)), False
+        return None, False
+
+    key_specs = []
+    has_string_key = False
+    for kind, ref in selectors:
+        spec, is_string = operand_spec(kind, ref)
+        if spec is None:
             return None
-    return data_id, value_id, selectors, step.result_id
+        key_specs.append(spec)
+        has_string_key = has_string_key or is_string
+    value_spec, _ = operand_spec("runtime", value_id)
+    if value_spec is None:
+        return None
+
+    if len(key_specs) == 2:
+        pass  # nested container
+    elif len(key_specs) == 1 and has_string_key:
+        pass  # single string-keyed dict store (unambiguous)
+    else:
+        return None
+    return data_id, value_spec, key_specs, step.result_id
 
 
 def _emit_container_store_module(
@@ -1064,7 +1116,7 @@ def _emit_container_store_module(
 
     from .wasm_binary import CodeBuilder, build_module
 
-    data_id, value_id, selectors, _result_id = descriptor
+    data_id, value_spec, key_specs, _result_id = descriptor
     parameter_count = 1 + len(parameter_feed_ids) + len(output_ids)
     builder = CodeBuilder(value_type=value_type, parameter_count=parameter_count)
 
@@ -1072,12 +1124,17 @@ def _emit_container_store_module(
         source = resolve_view_source(program.meta, vid)
         return 1 + list(parameter_feed_ids).index(source)
 
-    def load_operand_i64(vid: int, dest: int) -> None:
-        # dest = the raw 8 bytes of the operand field as i64. ``f64.load`` then
-        # reinterpret reads the bytes unchanged; an i64 working type loads them
-        # directly. Read once at index 0 (these operands are scalars).
-        offset, _stride = view_offset_stride(program.meta, vid)
-        builder.local_get(feed_param(vid))
+    def load_spec_i64(spec, dest: int) -> None:
+        # dest = the operand as i64. An immediate (constant int or hashed string)
+        # is a literal; a feed reads its field's raw 8 bytes (``f64.load`` then
+        # reinterpret is byte-preserving, so an integer RVA or a float both keep
+        # their identity). Fields are scalars, read once at index 0.
+        kind, ref = spec
+        if kind == "imm":
+            builder.i64_const(int(ref)).local_set(dest)
+            return
+        offset, _stride = view_offset_stride(program.meta, ref)
+        builder.local_get(feed_param(ref))
         byte_offset = offset * element_bytes
         if byte_offset:
             builder.i32_const(byte_offset).raw(0x6A)  # i32.add
@@ -1089,7 +1146,7 @@ def _emit_container_store_module(
         builder.local_set(dest)
 
     key0 = builder.declare_local("i64")
-    key1 = builder.declare_local("i64") if len(selectors) == 2 else None
+    key1 = builder.declare_local("i64") if len(key_specs) == 2 else None
     val = builder.declare_local("i64")
     child = builder.declare_local("i32")
     child_val = builder.declare_local("i64")
@@ -1098,20 +1155,13 @@ def _emit_container_store_module(
     addr = builder.declare_local("i32")
     guard = builder.declare_local("i32")
 
-    def set_key(dest: int, selector) -> None:
-        kind, value = selector
-        if kind == "const":
-            builder.i64_const(int(value)).local_set(dest)
-        else:
-            load_operand_i64(value, dest)
-
-    set_key(key0, selectors[0])
+    load_spec_i64(key_specs[0], key0)
     if key1 is not None:
-        set_key(key1, selectors[1])
-    load_operand_i64(value_id, val)
+        load_spec_i64(key_specs[1], key1)
+    load_spec_i64(value_spec, val)
 
     table_base = feed_param(data_id)  # the field slot's value is the map base
-    if len(selectors) == 2:
+    if len(key_specs) == 2:
         emit_nested_map_store(
             builder, table_base_local=table_base, gx_local=key0, gy_local=key1,
             value_local=val, capacity=DEFAULT_MAP_CAPACITY,
@@ -1148,8 +1198,8 @@ def _emit_container_store_module(
         + [f"$out{i}" for i in range(len(output_ids))]
     )
     keys = ", ".join(
-        f"const {value}" if kind == "const" else f"feed {value}"
-        for kind, value in selectors
+        f"imm {value}" if kind == "imm" else f"feed {value}"
+        for kind, value in key_specs
     )
     source = (
         f"(module ;; {name} -- container store lowered in the binary\n"
@@ -1201,6 +1251,33 @@ def emit_wasm_module(
     value_type, element_bytes, load, store = _value_type(program, dtype)
     shortfalls: list[WasmShortfall] = []
     live = required_steps(program)
+
+    # A pure shapeless container store (dict/list target keyed by unbounded
+    # RVAs/addresses or string names) does not fit the per-cell array walk and
+    # its string-key constants are not numeric tensors, so it must be detected
+    # before static-data planning: it lowers to the heap open-addressing map ABI.
+    if value_type in ("f64", "i64"):
+        container = _pure_container_store(program, live)
+        if container is not None:
+            container_feed_ids = program_feed_order(program)
+            container_output_ids = list(program.outputs.values())
+            container_param_feeds: list[int] = []
+            seen_container_sources: set[int] = set()
+            for feed_id in container_feed_ids:
+                source_id = resolve_view_source(program.meta, feed_id)
+                if source_id not in seen_container_sources:
+                    seen_container_sources.add(source_id)
+                    container_param_feeds.append(source_id)
+            return _emit_container_store_module(
+                program, name=name, function_name=function_name,
+                value_type=value_type, element_bytes=element_bytes,
+                parameter_feed_ids=container_param_feeds,
+                output_ids=container_output_ids,
+                labels=feed_names(program, container_param_feeds),
+                imports=imports, static_data_offset=static_data_offset,
+                descriptor=container,
+            )
+
     static_data = plan_static_data(
         live, value_type, data_offset=static_data_offset,
     )
@@ -1225,20 +1302,6 @@ def emit_wasm_module(
         parameters.append("$" + labels[index])
     for index, _ in enumerate(output_ids):
         parameters.append(f"$out{index}")
-
-    # A pure shapeless container store (dict/list target, unbounded keys) does
-    # not fit the per-cell array walk: it lowers to the heap open-addressing map
-    # ABI instead. Only for f64/i64 working types (the reinterpret path).
-    if not shortfalls and value_type in ("f64", "i64"):
-        container = _pure_container_store(program, live)
-        if container is not None:
-            return _emit_container_store_module(
-                program, name=name, function_name=function_name,
-                value_type=value_type, element_bytes=element_bytes,
-                parameter_feed_ids=parameter_feed_ids, output_ids=output_ids,
-                labels=labels, imports=imports,
-                static_data_offset=static_data_offset, descriptor=container,
-            )
 
     # A value whose real dtype isn't the module's f32/f64 working type is
     # still loaded/stored at its own byte width and WASM instruction; only

@@ -117,3 +117,23 @@ def test_container_store_kernel_runs_the_nested_map_insert(tmp_path):
     # The inner map was autovivified from the heap and holds the stored value.
     assert out["childHandle"] == HEAP, out
     assert out["value"] == 12345, out
+
+
+def test_string_keyed_single_dict_store_lowers_to_a_map():
+    # d['metadata'] = value -- region 116. The string key materialises as a
+    # tensor_from_list constant; a string key is unambiguously a dict, so the
+    # single-subscript store takes the container path (string hashed to an i64).
+    program = FusedProgram(
+        version=1, feeds={100, 102},
+        steps=[OpStep(0, "tensor_from_list", [], {"values": "metadata"}, 101),
+               OpStep(1, "IndexedStore", [100, 101, 102],
+                      {"source_type": "SubscriptStore"}, 103)],
+        outputs={"value_112": 103}, meta={},
+        extras={"capture_feed_origins": {
+            100: {"binding_name": "data"}, 102: {"binding_name": "value"}}},
+    )
+    module = emit_wasm_module(program, name="r116", dtype="float64")
+    assert module.complete, module.shortfall_report()
+    # The string constant is consumed as an immediate key, not a tensor param.
+    assert module.parameters == ("$count", "$data", "$value", "$out0")
+    assert "container store lowered" in module.source
