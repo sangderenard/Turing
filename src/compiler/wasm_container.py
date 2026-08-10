@@ -40,6 +40,191 @@ from .wasm_binary import CodeBuilder
 _I32_ADD = 0x6A
 _I32_MUL = 0x6C
 _I32_EQZ = 0x45
+_I32_REM_U = 0x6F
+_I32_WRAP_I64 = 0xA7
+# i64 opcodes for hashed keys/values (keys are arbitrary i64 -- e.g. RVAs).
+_I64_EQZ = 0x50
+_I64_EQ = 0x51
+_I64_REM_U = 0x82
+_I64_EXTEND_I32_U = 0xAD
+
+# Open-addressing map block layout: [capacity:i32] then, from byte 8 (i64
+# alignment), ``capacity`` slots of [state:i64, key:i64, value:i64] (24 bytes).
+# state 0 = empty (fresh bump-heap memory is already zero), 1 = occupied.
+_MAP_HEADER_BYTES = 8
+_MAP_SLOT_BYTES = 24
+_SLOT_STATE_OFF = 0
+_SLOT_KEY_OFF = 8
+_SLOT_VALUE_OFF = 16
+
+
+def emit_map_new(
+    builder: CodeBuilder,
+    capacity: int,
+    *,
+    heap_cursor_addr: int,
+    result_local: int,
+) -> None:
+    """Allocate an empty open-addressing map of ``capacity`` slots; leave its
+    heap offset in ``result_local`` (i32). Slots are left zero (empty) by the
+    bump heap; only the capacity header is written.
+    """
+
+    emit_bump_alloc(
+        builder, _MAP_HEADER_BYTES + int(capacity) * _MAP_SLOT_BYTES,
+        heap_cursor_addr=heap_cursor_addr, result_local=result_local,
+    )
+    builder.local_get(result_local).i32_const(int(capacity)).i32_store_width(32)
+
+
+def _emit_probe_addr(builder: CodeBuilder, map_base_local: int, slot_local: int,
+                     addr_local: int) -> None:
+    """addr = map_base + header + slot * slot_bytes."""
+    builder.local_get(map_base_local).i32_const(_MAP_HEADER_BYTES).raw(_I32_ADD)
+    builder.local_get(slot_local).i32_const(_MAP_SLOT_BYTES).raw(_I32_MUL).raw(_I32_ADD)
+    builder.local_set(addr_local)
+
+
+def _emit_initial_slot(builder: CodeBuilder, key_local: int, cap_local: int,
+                       slot_local: int) -> None:
+    """slot = (u64)key % capacity, narrowed to i32."""
+    builder.local_get(key_local)
+    builder.local_get(cap_local).raw(_I64_EXTEND_I32_U)
+    builder.raw(_I64_REM_U).raw(_I32_WRAP_I64)
+    builder.local_set(slot_local)
+
+
+def _emit_advance_slot(builder: CodeBuilder, slot_local: int, cap_local: int) -> None:
+    """slot = (slot + 1) % capacity  (linear probe, wrapping)."""
+    builder.local_get(slot_local).i32_const(1).raw(_I32_ADD)
+    builder.local_get(cap_local).raw(_I32_REM_U)
+    builder.local_set(slot_local)
+
+
+def emit_map_set(
+    builder: CodeBuilder,
+    *,
+    map_base_local: int,
+    key_local: int,
+    value_local: int,
+    cap_local: int,
+    slot_local: int,
+    addr_local: int,
+) -> None:
+    """Emit ``map[key] = value`` by linear-probe open addressing. Overwrites an
+    existing key or occupies the first empty slot. All the ``*_local`` args are
+    caller-declared locals (key/value i64, the rest i32).
+    """
+
+    builder.local_get(map_base_local).i32_load().local_set(cap_local)
+    _emit_initial_slot(builder, key_local, cap_local, slot_local)
+    builder.block()          # depth 2 target: done
+    builder.loop()           # depth 1: probe
+    _emit_probe_addr(builder, map_base_local, slot_local, addr_local)
+    # empty slot -> occupy (state=1, key, value), then leave the probe.
+    builder.local_get(addr_local).i64_load(offset=_SLOT_STATE_OFF).raw(_I64_EQZ)
+    builder.if_()
+    builder.local_get(addr_local).i64_const(1).i64_store(offset=_SLOT_STATE_OFF)
+    builder.local_get(addr_local).local_get(key_local).i64_store(offset=_SLOT_KEY_OFF)
+    builder.local_get(addr_local).local_get(value_local).i64_store(offset=_SLOT_VALUE_OFF)
+    builder.br(2)
+    builder.end()
+    # existing key -> overwrite value.
+    builder.local_get(addr_local).i64_load(offset=_SLOT_KEY_OFF)
+    builder.local_get(key_local).raw(_I64_EQ)
+    builder.if_()
+    builder.local_get(addr_local).local_get(value_local).i64_store(offset=_SLOT_VALUE_OFF)
+    builder.br(2)
+    builder.end()
+    _emit_advance_slot(builder, slot_local, cap_local)
+    builder.br(0)            # continue probing
+    builder.end()            # loop
+    builder.end()            # block
+
+
+def emit_map_get(
+    builder: CodeBuilder,
+    *,
+    map_base_local: int,
+    key_local: int,
+    cap_local: int,
+    slot_local: int,
+    addr_local: int,
+    result_local: int,
+) -> None:
+    """Emit ``result = map.get(key, 0)`` by the same linear probe. A miss
+    yields 0, which is an unused sentinel for handle values (heap offsets are
+    always > 0). ``result_local`` is an i64 local.
+    """
+
+    builder.local_get(map_base_local).i32_load().local_set(cap_local)
+    _emit_initial_slot(builder, key_local, cap_local, slot_local)
+    builder.block()          # done
+    builder.loop()           # probe
+    _emit_probe_addr(builder, map_base_local, slot_local, addr_local)
+    # empty slot -> miss (result 0).
+    builder.local_get(addr_local).i64_load(offset=_SLOT_STATE_OFF).raw(_I64_EQZ)
+    builder.if_()
+    builder.i64_const(0).local_set(result_local)
+    builder.br(2)
+    builder.end()
+    # key match -> return its value.
+    builder.local_get(addr_local).i64_load(offset=_SLOT_KEY_OFF)
+    builder.local_get(key_local).raw(_I64_EQ)
+    builder.if_()
+    builder.local_get(addr_local).i64_load(offset=_SLOT_VALUE_OFF).local_set(result_local)
+    builder.br(2)
+    builder.end()
+    _emit_advance_slot(builder, slot_local, cap_local)
+    builder.br(0)
+    builder.end()            # loop
+    builder.end()            # block
+
+
+def emit_nested_map_store(
+    builder: CodeBuilder,
+    *,
+    table_base_local: int,
+    gx_local: int,
+    gy_local: int,
+    value_local: int,
+    capacity: int,
+    heap_cursor_addr: int,
+    child_local: int,
+    child_val_local: int,
+    cap_local: int,
+    slot_local: int,
+    addr_local: int,
+) -> None:
+    """Emit ``table[gx][gy] = value`` where both levels are open-addressing maps
+    keyed by arbitrary i64 (the decoder's keys are RVAs/addresses, not bounded).
+    The inner map is autovivified from the heap on first touch of ``gx``.
+
+    ``gx_local``/``gy_local``/``value_local`` are i64 locals; ``child_local`` is
+    an i32 (the child map's heap base); ``child_val_local`` is an i64 scratch
+    (the handle as stored/read). The probe scratch (cap/slot/addr) is shared by
+    the three map operations, which run sequentially.
+    """
+
+    # child = (i32) table.get(gx)
+    emit_map_get(builder, map_base_local=table_base_local, key_local=gx_local,
+                 cap_local=cap_local, slot_local=slot_local, addr_local=addr_local,
+                 result_local=child_val_local)
+    builder.local_get(child_val_local).raw(_I32_WRAP_I64).local_set(child_local)
+    # if child == 0: autovivify an inner map and link table[gx] = child.
+    builder.local_get(child_local).raw(_I32_EQZ)
+    builder.if_()
+    emit_map_new(builder, capacity, heap_cursor_addr=heap_cursor_addr,
+                 result_local=child_local)
+    builder.local_get(child_local).raw(_I64_EXTEND_I32_U).local_set(child_val_local)
+    emit_map_set(builder, map_base_local=table_base_local, key_local=gx_local,
+                 value_local=child_val_local, cap_local=cap_local,
+                 slot_local=slot_local, addr_local=addr_local)
+    builder.end()
+    # child[gy] = value
+    emit_map_set(builder, map_base_local=child_local, key_local=gy_local,
+                 value_local=value_local, cap_local=cap_local,
+                 slot_local=slot_local, addr_local=addr_local)
 
 
 def emit_bump_alloc(
