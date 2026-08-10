@@ -12573,32 +12573,19 @@ class ProcessGraphGLSLDeployment:
             _note(
                 f"aot: lowering {len(subgraphs)} region(s) for shell {fn_name}"
             )
-            # Deduplicate identical regions at the IR by their value-id-
-            # invariant kernel signature, so the prepared plan holds ONE program
-            # object per distinct kernel and every backend (WASM, C/native/PE,
-            # ...) inherits the reduction -- a repeated operation lowered once,
-            # not thousands of times. Best-effort: a program that cannot be
-            # signed is simply kept as its own.
-            from .topology_catalogue import kernel_signature
-
-            region_programs = {}
-            unique_by_kernel: dict = {}
-            for region_index, subgraph in subgraphs:
-                program = _structural_region_program_from_subgraph(subgraph)
-                try:
-                    signature = kernel_signature(
-                        getattr(program, "program", program)
-                    )
-                    program = unique_by_kernel.setdefault(signature, program)
-                except Exception:
-                    pass
-                region_programs[region_index] = program
+            # NOTE: regions are NOT deduplicated by sharing program objects
+            # here. Structurally-identical regions are distinct *invocations*
+            # with their own value-ids and field bindings; sharing one object
+            # collides their value-ids and destroys the coordinator's per-region
+            # wiring (producer[value_id] would overwrite). The correct IR-level
+            # reduction is the kernel/invocation split -- one shared kernel
+            # structure plus a per-region binding table -- not object sharing.
+            # Byte-identical *kernel files* are still deduped later in the bake.
+            region_programs = {
+                region_index: _structural_region_program_from_subgraph(subgraph)
+                for region_index, subgraph in subgraphs
+            }
             target.captured_region_programs = region_programs
-            if subgraphs:
-                _note(
-                    f"aot: {len(subgraphs)} region(s) reduced to "
-                    f"{len(unique_by_kernel)} unique kernel(s) for shell {fn_name}"
-                )
             target.compile_time_region_indices = set()
             target.planned_operator_implementations = (
                 _build_planned_operator_implementations(
