@@ -113,9 +113,13 @@ def slice_selectors(step: OpStep):
 
 def container_key_spec(program, by_result, feeds, ref):
     """Normalise a subscript operand to ('imm', i64) | ('feed', id), plus whether
-    it was a string key. A string constant interns to its FNV-1a hash so a
-    runtime-derived name and a constant name resolve to the same map slot."""
+    it was a string key. A string constant interns to its content token so a
+    runtime-derived name and a constant name resolve to the same map slot --
+    whether the token was assigned here (a raw ``str`` constant) or upstream by
+    the string-interning fold (a ``string_token`` op)."""
     producer = by_result.get(ref)
+    if producer is not None and producer.op_name == "string_token":
+        return ("imm", int(producer.attrs["token"])), True
     text = string_constant(producer)
     if text is not None:
         return ("imm", fnv1a_64(text)), True
@@ -150,7 +154,7 @@ def pure_container_store(program: FusedProgram, live: Sequence[OpStep]):
     step = stores[0]
     by_result = {s.result_id: s for s in live}
     for other in live:
-        if other is not step and other.op_name != "tensor_from_list":
+        if other is not step and other.op_name not in ("tensor_from_list", "string_token"):
             return None
     descriptor = slice_selectors(step)
     if descriptor is None:
@@ -199,7 +203,7 @@ def pure_container_read(program: FusedProgram, live: Sequence[OpStep]):
     if not gathers:
         return None
     for other in live:
-        if other not in gathers and other.op_name != "tensor_from_list":
+        if other not in gathers and other.op_name not in ("tensor_from_list", "string_token"):
             return None
     outputs = list(program.outputs.values())
     if len(outputs) != 1:

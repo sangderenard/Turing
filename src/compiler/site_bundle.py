@@ -2601,11 +2601,18 @@ def build_program_bundle(
         # Backend-neutral IR fold: collapse byte-string idioms (e.g. the
         # null-terminated name extraction) to single general ops before any
         # backend emits, so the reduction is shared, not WASM-bespoke.
+        # Backend-neutral IR folds, shared by every backend: collapse byte-string
+        # idioms to single ops, then intern every string word to its universal
+        # content token (recording the token -> word table for reverse lookup).
         from .ir_byte_idioms import fold_byte_string_idioms
+        from .ir_string_interning import intern_string_constants
+        from .string_table import StringTable
+        _string_table = StringTable()
         effective_region_programs = {
-            index: fold_byte_string_idioms(program)
+            index: intern_string_constants(fold_byte_string_idioms(program), _string_table)
             for index, program in aot.region_programs.items()
         }
+        _string_table.save()
         thread_topology = None
         if (
             program is not None

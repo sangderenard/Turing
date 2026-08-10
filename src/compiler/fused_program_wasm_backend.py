@@ -1913,6 +1913,16 @@ def _step_instructions(
             "      i32.add",
             f"      {value_type}.load",
         ]
+    if op == "string_token":
+        # A word's universal token (an i64 identity) held in the working type;
+        # f64 carries it as reinterpreted bits so it round-trips exactly.
+        token = int(step.attrs["token"])
+        lines = [f"      i64.const {token}"]
+        if value_type == "f64":
+            lines.append("      f64.reinterpret_i64")
+        elif value_type != "i64":
+            lines.append(f"      {value_type}.reinterpret_i64")
+        return lines
     integral = _is_integer_type(value_type)
     if op in _NO_WASM_INSTRUCTION and not (
         integral
@@ -2157,6 +2167,20 @@ def _step_instructions(
     operands = [f"      local.get {left}", *right_source]
     if step.attrs.get("reverse", False):
         operands = [*right_source, f"      local.get {left}"]
+
+    if step.attrs.get("string_compare") and op in ("equal", "not_equal"):
+        # Compare the 64-bit token identities, not the float they are held as
+        # (two distinct token bit patterns can be NaN, which mis-compares in f64).
+        cmp = "eq" if op == "equal" else "ne"
+        if value_type == "f64":
+            body = [operands[0], "      i64.reinterpret_f64",
+                    operands[1], "      i64.reinterpret_f64", f"      i64.{cmp}",
+                    "      f64.convert_i32_s"]
+        elif value_type == "i64":
+            body = [*operands, f"      i64.{cmp}", "      i64.extend_i32_u"]
+        else:
+            body = [*operands, f"      i64.{cmp}"]
+        return body
 
     if integral:
         instruction = _INTEGER_BINARY_INSTRUCTION.get(op)
@@ -2417,6 +2441,29 @@ def _assemble(
             builder.raw(0x6C)  # i32.mul
             builder.raw(0x6A)  # i32.add
             builder.load()
+            builder.local_set(local)
+            return
+        if step.op_name == "string_token":
+            # A word's universal i64 token, held in the working type (f64 carries
+            # it as reinterpreted bits so it round-trips exactly).
+            builder.i64_const(int(step.attrs["token"]))
+            if value_type == "f64":
+                builder.raw(0xBF)  # f64.reinterpret_i64
+            builder.local_set(local)
+            return
+        if step.attrs.get("string_compare") and step.op_name in ("equal", "not_equal"):
+            # Compare the 64-bit token identities, not the float they are held as.
+            builder.local_get(locals_for[step.input_ids[0]])
+            if value_type == "f64":
+                builder.raw(0xBD)  # i64.reinterpret_f64
+            builder.local_get(locals_for[step.input_ids[1]])
+            if value_type == "f64":
+                builder.raw(0xBD)
+            builder.raw(0x51 if step.op_name == "equal" else 0x52)  # i64.eq / i64.ne
+            if value_type == "f64":
+                builder.raw(OP_F64_CONVERT_I32_S)
+            elif value_type == "i64":
+                builder.op("extend_i32_u")
             builder.local_set(local)
             return
         if step.op_name in ("index_set", "IndexedStore"):
