@@ -1,0 +1,119 @@
+"""A shapeless nested-container IndexedStore lowers to the heap map ABI.
+
+Region 115 of the decoder build is exactly this: ``table[gx][gy] = value`` where
+the target is a dict/list container (unbounded RVA keys, no tensor shape). The
+emitter routes such a pure store to a dedicated kernel that reads the scalar
+operands once and mutates a heap open-addressing map -- no per-cell array walk.
+A shaped store still takes the strided tensor scatter (asserted elsewhere).
+
+The coordinator (a later step) seeds the container field with a map header and
+the bump cursor; here the harness seeds them to verify the kernel itself.
+"""
+from __future__ import annotations
+
+import shutil
+import subprocess
+
+import pytest
+
+from src.common.tensors.fused_ir import FusedProgram, OpStep, Meta
+from src.compiler.fused_program_wasm_backend import emit_wasm_module
+from src.compiler.wasm_container import DEFAULT_MAP_CAPACITY, HEAP_CURSOR_ADDR
+
+
+def _region_115_program():
+    return FusedProgram(
+        version=1, feeds={10, 11, 12, 13},
+        steps=[OpStep(0, "IndexedStore", [10, 11, 12, 13],
+                      {"source_type": "SubscriptStore"}, 14)],
+        outputs={"value_136": 14}, meta={},
+        extras={"capture_feed_origins": {
+            10: {"binding_name": "data"}, 11: {"binding_name": "i"},
+            12: {"binding_name": "j"}, 13: {"binding_name": "value"}}},
+    )
+
+
+def test_shapeless_2index_store_emits_a_complete_container_kernel():
+    module = emit_wasm_module(_region_115_program(), name="r115", dtype="float64")
+    assert module.complete, module.shortfall_report()
+    assert module.parameters == ("$count", "$data", "$i", "$j", "$value", "$out0")
+    assert module.binary and module.binary[:4] == b"\x00asm"
+
+
+def test_single_subscript_shapeless_store_stays_on_the_strided_path():
+    # A single shapeless subscript is ambiguous (a 1-D buffer scatter looks the
+    # same in region meta as a single dict store), so it is NOT routed to the
+    # container map -- it keeps the strided lowering. The container path is only
+    # taken for the unambiguous two-subscript nested case.
+    program = FusedProgram(
+        version=1, feeds={0, 1, 2},
+        steps=[OpStep(0, "IndexedStore", [0, 1, 2],
+                      {"source_type": "SubscriptStore"}, 3)],
+        outputs={"d": 3}, meta={},
+        extras={"capture_feed_origins": {
+            0: {"binding_name": "data"}, 1: {"binding_name": "key"},
+            2: {"binding_name": "value"}}},
+    )
+    module = emit_wasm_module(program, name="r1", dtype="float64")
+    assert module.complete, module.shortfall_report()
+    # It is the strided scatter, not the container map: no placeholder WAT, and
+    # it emits a real per-cell store loop.
+    assert "container store lowered" not in module.source
+    assert "f64.store" in module.source
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_container_store_kernel_runs_the_nested_map_insert(tmp_path):
+    module = emit_wasm_module(_region_115_program(), name="r115", dtype="float64")
+    wasm = tmp_path / "r115.wasm"
+    wasm.write_bytes(module.binary)
+    # Memory plan (bytes): cursor cell at HEAP_CURSOR_ADDR; a top-level map at
+    # TABLE seeded with a small capacity header; scalar operand cells; the heap
+    # (for the autovivified inner map of DEFAULT_MAP_CAPACITY) starts at HEAP.
+    TABLE, TOP_CAP = 512, 8
+    KEY0, KEY1, VALUE, OUT = 64, 128, 192, 256
+    HEAP = 4096
+    script = tmp_path / "run.mjs"
+    script.write_text(
+        f"""
+        import {{readFileSync}} from "node:fs";
+        const mod = await WebAssembly.instantiate(readFileSync(process.argv[2]), {{}});
+        const {{run, memory}} = mod.instance.exports;
+        const i32 = new Int32Array(memory.buffer);
+        const i64 = new BigInt64Array(memory.buffer);
+        i32[{HEAP_CURSOR_ADDR} / 4] = {HEAP};   // bump cursor
+        i32[{TABLE} / 4] = {TOP_CAP};           // top-level map capacity header
+        const k0 = 0x401000n, k1 = 0x20n, v = 12345n;
+        i64[{KEY0} / 8] = k0; i64[{KEY1} / 8] = k1; i64[{VALUE} / 8] = v;
+        run(1, {TABLE}, {KEY0}, {KEY1}, {VALUE}, {OUT});
+        // Mirror the kernel's linear-probe lookup to read the value back.
+        function mapGet(base, key, cap) {{
+          let slot = Number(BigInt.asUintN(64, key) % BigInt(cap));
+          for (let n = 0; n < cap; n++) {{
+            const addr = base + 8 + slot * 24;
+            const state = i64[addr / 8];
+            if (state === 0n) return null;
+            if (i64[addr / 8 + 1] === BigInt.asIntN(64, key)) return i64[addr / 8 + 2];
+            slot = (slot + 1) % cap;
+          }}
+          return null;
+        }}
+        const child = mapGet({TABLE}, k0, {TOP_CAP});
+        const value = child === null ? null
+          : mapGet(Number(child), k1, {DEFAULT_MAP_CAPACITY});
+        console.log(JSON.stringify({{
+          childHandle: child === null ? null : Number(child),
+          value: value === null ? null : Number(value),
+          heap: HEAP,
+        }}));
+        """.replace("HEAP", str(HEAP)),
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        ["node", str(script), str(wasm)], capture_output=True, text=True, check=True,
+    )
+    import json
+    out = json.loads(completed.stdout)
+    # The inner map was autovivified from the heap and holds the stored value.
+    assert out["childHandle"] == HEAP, out
+    assert out["value"] == 12345, out

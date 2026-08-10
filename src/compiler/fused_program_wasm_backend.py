@@ -67,6 +67,17 @@ from .wasm_binary import (
     OP_I64_TRUNC_F64_S,
     OP_I64_XOR,
 )
+from .wasm_container import (
+    DEFAULT_MAP_CAPACITY,
+    HEAP_CURSOR_ADDR,
+    emit_map_set,
+    emit_nested_map_store,
+)
+
+# f64 bits reinterpreted as i64 read the raw 8 bytes unchanged, so a map key or
+# value keeps its exact identity whether it logically holds an integer (an RVA)
+# or a float. The container ABI hashes/stores these opaque 64-bit patterns.
+_I64_REINTERPRET_F64 = 0xBD
 
 # Bitwise/shift ops are integer-only, but a program can carry them on a float
 # working type (an integer-valued f64: the reversible decoder represents its
@@ -975,6 +986,184 @@ def _emit_reduction_body_wat(
         body.append("      )")
 
 
+def _is_shapeless(program: FusedProgram, value_id: int) -> bool:
+    """A value with no tensor shape (``()`` or absent) -- a scalar reference into
+    a dict/list container, not a shaped tensor buffer."""
+
+    meta = (program.meta or {}).get(int(value_id))
+    shape = tuple(meta.shape) if meta is not None and getattr(meta, "shape", None) else None
+    return not shape
+
+
+def _pure_container_store(program: FusedProgram, live: Sequence[OpStep]):
+    """A region that is exactly one *shapeless* subscript store over feeds.
+
+    Returns ``(data_id, value_id, selectors, result_id)`` or ``None``. Shapeless
+    means the target is a dict/list container (the decoder's opcode maps and
+    token-multigraph tables are keyed by unbounded RVAs/addresses, with no
+    tensor shape), so it lowers to the heap open-addressing map ABI rather than a
+    strided scatter into a fixed buffer. Restricted to a single store whose
+    subscripts and value are region feeds (or constant subscripts); a region
+    that also computes its key/value in-line is left to the general path as an
+    honest miss (a later wall), not silently mis-lowered.
+    """
+
+    if len(live) != 1:
+        return None
+    step = live[0]
+    if step.op_name not in ("index_set", "IndexedStore"):
+        return None
+    descriptor = _slice_selectors(step)
+    if descriptor is None:
+        return None
+    data_id, value_id, selectors = descriptor
+    # Only the two-subscript case is unambiguous: a shapeless value cannot be a
+    # dense 2-D tensor (that needs a row stride), so table[gx][gy] with no shape
+    # is a nested dict/list container. A single shapeless subscript is left on
+    # the strided path -- it may be a genuine 1-D buffer scatter, which region
+    # meta does not distinguish from a single dict store.
+    if len(selectors) != 2:
+        return None
+    # A shaped store is a real tensor scatter (strided path); only shapeless
+    # references are containers.
+    if not _is_shapeless(program, step.result_id) or not _is_shapeless(program, data_id):
+        return None
+    if list(program.outputs.values()) != [step.result_id]:
+        return None
+    feeds = set(program.feeds)
+    if data_id not in feeds or value_id not in feeds:
+        return None
+    for kind, selector in selectors:
+        if kind == "runtime" and selector not in feeds:
+            return None
+    return data_id, value_id, selectors, step.result_id
+
+
+def _emit_container_store_module(
+    program: FusedProgram,
+    *,
+    name: str,
+    function_name: str,
+    value_type: str,
+    element_bytes: int,
+    parameter_feed_ids: Sequence[int],
+    output_ids: Sequence[int],
+    labels: Sequence[str],
+    imports: Sequence[object],
+    static_data_offset: int,
+    descriptor,
+) -> "WasmModule":
+    """Emit a dedicated kernel for a pure shapeless container store.
+
+    Unlike the elementwise ``run(count, ...)`` regions, this does no per-cell
+    array walk: the container base arrives as the ``data`` parameter (the
+    coordinator's field slot holds it), the scalar key/value operands are read
+    once from their fields, and the store mutates the heap map in place. The
+    output aliases the container, so nothing is written back to ``out``.
+    """
+
+    from .wasm_binary import CodeBuilder, build_module
+
+    data_id, value_id, selectors, _result_id = descriptor
+    parameter_count = 1 + len(parameter_feed_ids) + len(output_ids)
+    builder = CodeBuilder(value_type=value_type, parameter_count=parameter_count)
+
+    def feed_param(vid: int) -> int:
+        source = resolve_view_source(program.meta, vid)
+        return 1 + list(parameter_feed_ids).index(source)
+
+    def load_operand_i64(vid: int, dest: int) -> None:
+        # dest = the raw 8 bytes of the operand field as i64. ``f64.load`` then
+        # reinterpret reads the bytes unchanged; an i64 working type loads them
+        # directly. Read once at index 0 (these operands are scalars).
+        offset, _stride = view_offset_stride(program.meta, vid)
+        builder.local_get(feed_param(vid))
+        byte_offset = offset * element_bytes
+        if byte_offset:
+            builder.i32_const(byte_offset).raw(0x6A)  # i32.add
+        if value_type == "f64":
+            builder.load()  # f64.load
+            builder.raw(_I64_REINTERPRET_F64)
+        else:  # i64 working type
+            builder.i64_load()
+        builder.local_set(dest)
+
+    key0 = builder.declare_local("i64")
+    key1 = builder.declare_local("i64") if len(selectors) == 2 else None
+    val = builder.declare_local("i64")
+    child = builder.declare_local("i32")
+    child_val = builder.declare_local("i64")
+    cap = builder.declare_local("i32")
+    slot = builder.declare_local("i32")
+    addr = builder.declare_local("i32")
+    guard = builder.declare_local("i32")
+
+    def set_key(dest: int, selector) -> None:
+        kind, value = selector
+        if kind == "const":
+            builder.i64_const(int(value)).local_set(dest)
+        else:
+            load_operand_i64(value, dest)
+
+    set_key(key0, selectors[0])
+    if key1 is not None:
+        set_key(key1, selectors[1])
+    load_operand_i64(value_id, val)
+
+    table_base = feed_param(data_id)  # the field slot's value is the map base
+    if len(selectors) == 2:
+        emit_nested_map_store(
+            builder, table_base_local=table_base, gx_local=key0, gy_local=key1,
+            value_local=val, capacity=DEFAULT_MAP_CAPACITY,
+            heap_cursor_addr=HEAP_CURSOR_ADDR, child_local=child,
+            child_val_local=child_val, cap_local=cap, slot_local=slot,
+            addr_local=addr, guard_local=guard,
+        )
+    else:
+        emit_map_set(
+            builder, map_base_local=table_base, key_local=key0, value_local=val,
+            cap_local=cap, slot_local=slot, addr_local=addr, guard_local=guard,
+        )
+
+    binary = build_module(
+        function_name=function_name,
+        parameter_types=["i32"] * parameter_count,
+        body=builder,
+        imports=imports,
+    )
+    memory_import = next(
+        (e for e in imports if getattr(e, "kind", None) == "memory"), None
+    )
+    api = _describe(
+        name, function_name, list(parameter_feed_ids), list(output_ids),
+        value_type, element_bytes, 0, static_data_offset=static_data_offset,
+        shared_memory_import=(
+            {"module": memory_import.module, "field": memory_import.field}
+            if memory_import is not None else None
+        ),
+        input_names=list(labels), output_names=list(program.outputs.keys()),
+    )
+    parameters = (
+        ["$count"] + [f"${label}" for label in labels]
+        + [f"$out{i}" for i in range(len(output_ids))]
+    )
+    keys = ", ".join(
+        f"const {value}" if kind == "const" else f"feed {value}"
+        for kind, value in selectors
+    )
+    source = (
+        f"(module ;; {name} -- container store lowered in the binary\n"
+        f"  ;; heap open-addressing map: table[{keys}] = value.\n"
+        f"  ;; The WAT is a placeholder; the emitted binary is authoritative.\n"
+        f"  (func (export \"{function_name}\")"
+        + "".join(f" (param {p} i32)" for p in parameters) + ")\n)\n"
+    )
+    return WasmModule(
+        name=name, source=source, shortfalls=(), parameters=tuple(parameters),
+        value_type=value_type, api=api, binary=binary,
+    )
+
+
 def emit_wasm_module(
     program: FusedProgram,
     *,
@@ -1036,6 +1225,20 @@ def emit_wasm_module(
         parameters.append("$" + labels[index])
     for index, _ in enumerate(output_ids):
         parameters.append(f"$out{index}")
+
+    # A pure shapeless container store (dict/list target, unbounded keys) does
+    # not fit the per-cell array walk: it lowers to the heap open-addressing map
+    # ABI instead. Only for f64/i64 working types (the reinterpret path).
+    if not shortfalls and value_type in ("f64", "i64"):
+        container = _pure_container_store(program, live)
+        if container is not None:
+            return _emit_container_store_module(
+                program, name=name, function_name=function_name,
+                value_type=value_type, element_bytes=element_bytes,
+                parameter_feed_ids=parameter_feed_ids, output_ids=output_ids,
+                labels=labels, imports=imports,
+                static_data_offset=static_data_offset, descriptor=container,
+            )
 
     # A value whose real dtype isn't the module's f32/f64 working type is
     # still loaded/stored at its own byte width and WASM instruction; only

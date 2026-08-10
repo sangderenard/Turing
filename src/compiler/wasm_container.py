@@ -35,6 +35,14 @@ from __future__ import annotations
 
 from .wasm_binary import CodeBuilder
 
+# Shared coordinator<->kernel ABI. The coordinator reserves a 4-byte bump-cursor
+# cell at this fixed offset (initialised to the first free heap byte) and every
+# container kernel allocates against it. DEFAULT_MAP_CAPACITY is the fixed slot
+# count each map is born with (no rehash yet -- a full map traps via the probe
+# guard rather than looping).
+HEAP_CURSOR_ADDR = 0
+DEFAULT_MAP_CAPACITY = 1024
+
 # i32 arithmetic/compare opcodes (the numerical kernel value type may be i64 or
 # f64; addresses are always i32, so these are emitted raw).
 _I32_ADD = 0x6A
@@ -42,6 +50,8 @@ _I32_MUL = 0x6C
 _I32_EQZ = 0x45
 _I32_REM_U = 0x6F
 _I32_WRAP_I64 = 0xA7
+_I32_GE_U = 0x4F
+_UNREACHABLE = 0x00
 # i64 opcodes for hashed keys/values (keys are arbitrary i64 -- e.g. RVAs).
 _I64_EQZ = 0x50
 _I64_EQ = 0x51
@@ -94,8 +104,21 @@ def _emit_initial_slot(builder: CodeBuilder, key_local: int, cap_local: int,
     builder.local_set(slot_local)
 
 
-def _emit_advance_slot(builder: CodeBuilder, slot_local: int, cap_local: int) -> None:
-    """slot = (slot + 1) % capacity  (linear probe, wrapping)."""
+def _emit_advance_slot(builder: CodeBuilder, slot_local: int, cap_local: int,
+                       guard_local: int | None = None) -> None:
+    """slot = (slot + 1) % capacity  (linear probe, wrapping).
+
+    With ``guard_local`` (an i32 counter reset to 0 by the caller), trap via
+    ``unreachable`` once the probe has visited ``capacity`` slots -- a full map
+    with the key absent would otherwise loop forever. A trap is an honest,
+    visible failure; capacity is a fixed-size limitation until rehashing lands.
+    """
+    if guard_local is not None:
+        builder.local_get(guard_local).i32_const(1).raw(_I32_ADD).local_set(guard_local)
+        builder.local_get(guard_local).local_get(cap_local).raw(_I32_GE_U)
+        builder.if_()
+        builder.raw(_UNREACHABLE)
+        builder.end()
     builder.local_get(slot_local).i32_const(1).raw(_I32_ADD)
     builder.local_get(cap_local).raw(_I32_REM_U)
     builder.local_set(slot_local)
@@ -110,13 +133,17 @@ def emit_map_set(
     cap_local: int,
     slot_local: int,
     addr_local: int,
+    guard_local: int | None = None,
 ) -> None:
     """Emit ``map[key] = value`` by linear-probe open addressing. Overwrites an
     existing key or occupies the first empty slot. All the ``*_local`` args are
-    caller-declared locals (key/value i64, the rest i32).
+    caller-declared locals (key/value i64, the rest i32). ``guard_local`` (i32)
+    traps on a full map instead of looping forever.
     """
 
     builder.local_get(map_base_local).i32_load().local_set(cap_local)
+    if guard_local is not None:
+        builder.i32_const(0).local_set(guard_local)
     _emit_initial_slot(builder, key_local, cap_local, slot_local)
     builder.block()          # depth 2 target: done
     builder.loop()           # depth 1: probe
@@ -136,7 +163,7 @@ def emit_map_set(
     builder.local_get(addr_local).local_get(value_local).i64_store(offset=_SLOT_VALUE_OFF)
     builder.br(2)
     builder.end()
-    _emit_advance_slot(builder, slot_local, cap_local)
+    _emit_advance_slot(builder, slot_local, cap_local, guard_local)
     builder.br(0)            # continue probing
     builder.end()            # loop
     builder.end()            # block
@@ -151,13 +178,17 @@ def emit_map_get(
     slot_local: int,
     addr_local: int,
     result_local: int,
+    guard_local: int | None = None,
 ) -> None:
     """Emit ``result = map.get(key, 0)`` by the same linear probe. A miss
     yields 0, which is an unused sentinel for handle values (heap offsets are
-    always > 0). ``result_local`` is an i64 local.
+    always > 0). ``result_local`` is an i64 local. ``guard_local`` (i32) traps
+    on a full map with the key absent instead of looping forever.
     """
 
     builder.local_get(map_base_local).i32_load().local_set(cap_local)
+    if guard_local is not None:
+        builder.i32_const(0).local_set(guard_local)
     _emit_initial_slot(builder, key_local, cap_local, slot_local)
     builder.block()          # done
     builder.loop()           # probe
@@ -175,7 +206,7 @@ def emit_map_get(
     builder.local_get(addr_local).i64_load(offset=_SLOT_VALUE_OFF).local_set(result_local)
     builder.br(2)
     builder.end()
-    _emit_advance_slot(builder, slot_local, cap_local)
+    _emit_advance_slot(builder, slot_local, cap_local, guard_local)
     builder.br(0)
     builder.end()            # loop
     builder.end()            # block
@@ -195,6 +226,7 @@ def emit_nested_map_store(
     cap_local: int,
     slot_local: int,
     addr_local: int,
+    guard_local: int | None = None,
 ) -> None:
     """Emit ``table[gx][gy] = value`` where both levels are open-addressing maps
     keyed by arbitrary i64 (the decoder's keys are RVAs/addresses, not bounded).
@@ -209,7 +241,7 @@ def emit_nested_map_store(
     # child = (i32) table.get(gx)
     emit_map_get(builder, map_base_local=table_base_local, key_local=gx_local,
                  cap_local=cap_local, slot_local=slot_local, addr_local=addr_local,
-                 result_local=child_val_local)
+                 result_local=child_val_local, guard_local=guard_local)
     builder.local_get(child_val_local).raw(_I32_WRAP_I64).local_set(child_local)
     # if child == 0: autovivify an inner map and link table[gx] = child.
     builder.local_get(child_local).raw(_I32_EQZ)
@@ -219,12 +251,12 @@ def emit_nested_map_store(
     builder.local_get(child_local).raw(_I64_EXTEND_I32_U).local_set(child_val_local)
     emit_map_set(builder, map_base_local=table_base_local, key_local=gx_local,
                  value_local=child_val_local, cap_local=cap_local,
-                 slot_local=slot_local, addr_local=addr_local)
+                 slot_local=slot_local, addr_local=addr_local, guard_local=guard_local)
     builder.end()
     # child[gy] = value
     emit_map_set(builder, map_base_local=child_local, key_local=gy_local,
                  value_local=value_local, cap_local=cap_local,
-                 slot_local=slot_local, addr_local=addr_local)
+                 slot_local=slot_local, addr_local=addr_local, guard_local=guard_local)
 
 
 def emit_bump_alloc(
