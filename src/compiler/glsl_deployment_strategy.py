@@ -12573,24 +12573,32 @@ class ProcessGraphGLSLDeployment:
             _note(
                 f"aot: lowering {len(subgraphs)} region(s) for shell {fn_name}"
             )
+            # Deduplicate identical regions at the IR by their value-id-
+            # invariant kernel signature, so the prepared plan holds ONE program
+            # object per distinct kernel and every backend (WASM, C/native/PE,
+            # ...) inherits the reduction -- a repeated operation lowered once,
+            # not thousands of times. Best-effort: a program that cannot be
+            # signed is simply kept as its own.
+            from .topology_catalogue import kernel_signature
+
             region_programs = {}
+            unique_by_kernel: dict = {}
             for region_index, subgraph in subgraphs:
-                if reduction_cache is not None:
-                    program, cached = reduction_cache.get_or_compute(
-                        _subgraph_reduction_digest(subgraph),
-                        lambda subgraph=subgraph:
-                            _structural_region_program_from_subgraph(subgraph),
+                program = _structural_region_program_from_subgraph(subgraph)
+                try:
+                    signature = kernel_signature(
+                        getattr(program, "program", program)
                     )
-                else:
-                    program = _structural_region_program_from_subgraph(subgraph)
-                    cached = False
+                    program = unique_by_kernel.setdefault(signature, program)
+                except Exception:
+                    pass
                 region_programs[region_index] = program
-                _note(
-                    f"aot: region {fn_name}[{region_index}] "
-                    + ("reused from catalogue" if cached else "lowered")
-                    + f" ({region_index + 1}/{len(subgraphs)})"
-                )
             target.captured_region_programs = region_programs
+            if subgraphs:
+                _note(
+                    f"aot: {len(subgraphs)} region(s) reduced to "
+                    f"{len(unique_by_kernel)} unique kernel(s) for shell {fn_name}"
+                )
             target.compile_time_region_indices = set()
             target.planned_operator_implementations = (
                 _build_planned_operator_implementations(
