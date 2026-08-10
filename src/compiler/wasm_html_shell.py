@@ -1789,11 +1789,28 @@ class ClassGraphRunner {
   layout(count) {
     if (this.layoutCount === count) return;
     const elementBytes = Number(this.manifest.modules[0].element_bytes || 8);
-    const fields = this.manifest.class_inventory.field_slots || [];
-    this.inventoryOffset = Math.ceil(Number(this.manifest.shared_static_bytes || 0) / 4) * 4;
+    const inv = this.manifest.class_inventory || {};
+    const fields = inv.field_slots || [];
+    const containerFields = new Set((inv.container_fields || []).map(Number));
+    const heap = this.manifest.heap || {};
+    const reserved = Number(heap.reserved_bytes || 0);
+    const mapBlockBytes = Number(heap.map_block_bytes || 0);
+    const mapCapacity = Number(heap.map_capacity || 0);
+    // The heap-control bytes at [0, reserved) hold the bump cursor; the field
+    // table and everything else start past them.
+    this.inventoryOffset = Math.max(
+      reserved, Math.ceil(Number(this.manifest.shared_static_bytes || 0) / 4) * 4
+    );
     let cursor = this.inventoryOffset + fields.length * 4;
     cursor = Math.ceil(cursor / elementBytes) * elementBytes;
-    this.fieldOffsets = fields.map(() => {
+    // A container field gets a heap map block (header + slots), not a per-count
+    // array; its slot holds the map base and the kernels autovivify inner maps.
+    this.fieldOffsets = fields.map((field, index) => {
+      if (containerFields.has(index)) {
+        const base = cursor;
+        cursor = Math.ceil((base + mapBlockBytes) / elementBytes) * elementBytes;
+        return base;
+      }
       const offset = cursor; cursor += count * elementBytes; return offset;
     });
     if (cursor > this.memory.buffer.byteLength) {
@@ -1802,6 +1819,18 @@ class ClassGraphRunner {
     new Int32Array(this.memory.buffer, this.inventoryOffset, fields.length).set(
       this.fieldOffsets
     );
+    // Seed each container map: zero the block (empty slots) and write its
+    // capacity header, then point the bump cursor past every allocation so the
+    // container kernels allocate inner maps from fresh, zeroed heap.
+    for (let i = 0; i < fields.length; i++) {
+      if (!containerFields.has(i)) continue;
+      const base = this.fieldOffsets[i];
+      new Uint8Array(this.memory.buffer, base, mapBlockBytes).fill(0);
+      new Int32Array(this.memory.buffer, base, 1)[0] = mapCapacity;
+    }
+    if (reserved >= 4) {
+      new Int32Array(this.memory.buffer, Number(heap.cursor_addr || 0), 1)[0] = cursor;
+    }
     this.layoutCount = count;
   }
 

@@ -345,8 +345,18 @@ def emit_control_region_modules(
     from .fused_program_wasm_backend import (
         emit_wasm_module,
         program_feed_order,
+        required_steps,
+        _pure_container_store,
+        _pure_container_read,
     )
     from .wasm_binary import WasmImport
+    from .wasm_container import (
+        HEAP_CURSOR_ADDR,
+        HEAP_RESERVED_BYTES,
+        DEFAULT_MAP_CAPACITY,
+        MAP_HEADER_BYTES,
+        map_block_bytes,
+    )
 
     ordered_regions = tuple(dict.fromkeys(map(int, control.region_indices)))
     missing = set(ordered_regions) - set(map(int, region_programs))
@@ -384,7 +394,10 @@ def emit_control_region_modules(
         value_id: f"out::{module_name}::{output_name}"
         for value_id, (module_name, output_name) in producer.items()
     }
-    static_offset = 0
+    # Reserve the heap-control bytes at the start of linear memory so the fixed
+    # HEAP_CURSOR_ADDR the container kernels bake never collides with static
+    # data. Region static data (and everything else) starts past it.
+    static_offset = HEAP_RESERVED_BYTES
     for region in ordered_regions:
         program = programs[region]
         module_name = module_names[region]
@@ -504,6 +517,24 @@ def emit_control_region_modules(
             if out_key and data_key and out_key != data_key:
                 storage_redirects[str(out_key)] = str(data_key)
 
+    # A container field (a dict/list keyed by RVAs or string names) needs a heap
+    # map seeded by the coordinator, not a plain count-sized array. Detect them
+    # with the same predicates the backend uses to lower container stores/reads,
+    # and record the resident field key so the coordinator allocates a map there.
+    container_field_keys: set[str] = set()
+    for region in ordered_regions:
+        program = programs[region]
+        live = required_steps(program)
+        descriptor = (
+            _pure_container_store(program, live)
+            or _pure_container_read(program, live)
+        )
+        if descriptor is None:
+            continue
+        key = value_bindings.get(descriptor[0])
+        if key:
+            container_field_keys.add(str(key))
+
     return modules, {
         "modules": entries,
         "edges": edges,
@@ -515,6 +546,14 @@ def emit_control_region_modules(
             str(value_id): key for value_id, key in value_bindings.items()
         },
         "storage_redirects": storage_redirects,
+        "container_fields": sorted(container_field_keys),
+        "heap": {
+            "cursor_addr": HEAP_CURSOR_ADDR,
+            "reserved_bytes": HEAP_RESERVED_BYTES,
+            "map_capacity": DEFAULT_MAP_CAPACITY,
+            "map_block_bytes": map_block_bytes(DEFAULT_MAP_CAPACITY),
+            "map_header_bytes": MAP_HEADER_BYTES,
+        },
         "region_count": len(ordered_regions),
         "unique_kernels": len(kernel_files),
     }

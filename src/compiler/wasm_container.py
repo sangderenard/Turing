@@ -42,6 +42,11 @@ from .wasm_binary import CodeBuilder
 # guard rather than looping).
 HEAP_CURSOR_ADDR = 0
 DEFAULT_MAP_CAPACITY = 1024
+# The coordinator reserves this many bytes at the very start of linear memory
+# for heap control (the 4-byte cursor cell at HEAP_CURSOR_ADDR, padded); every
+# other allocation -- static data, the field-slot table, field arrays, the heap
+# -- starts past it.
+HEAP_RESERVED_BYTES = 8
 
 # i32 arithmetic/compare opcodes (the numerical kernel value type may be i64 or
 # f64; addresses are always i32, so these are emitted raw).
@@ -61,11 +66,18 @@ _I64_EXTEND_I32_U = 0xAD
 # Open-addressing map block layout: [capacity:i32] then, from byte 8 (i64
 # alignment), ``capacity`` slots of [state:i64, key:i64, value:i64] (24 bytes).
 # state 0 = empty (fresh bump-heap memory is already zero), 1 = occupied.
-_MAP_HEADER_BYTES = 8
-_MAP_SLOT_BYTES = 24
+MAP_HEADER_BYTES = 8
+MAP_SLOT_BYTES = 24
+_MAP_HEADER_BYTES = MAP_HEADER_BYTES
+_MAP_SLOT_BYTES = MAP_SLOT_BYTES
 _SLOT_STATE_OFF = 0
 _SLOT_KEY_OFF = 8
 _SLOT_VALUE_OFF = 16
+
+
+def map_block_bytes(capacity: int = DEFAULT_MAP_CAPACITY) -> int:
+    """Total bytes of a map block: header plus ``capacity`` 24-byte slots."""
+    return MAP_HEADER_BYTES + int(capacity) * MAP_SLOT_BYTES
 
 
 def emit_map_new(

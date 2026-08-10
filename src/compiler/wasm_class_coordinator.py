@@ -275,6 +275,7 @@ class ClassInventory:
     fields: tuple[ClassFieldSlot, ...]
     methods: tuple[ClassMethodCard, ...]
     storage_redirects: tuple[StorageRedirect, ...] = ()
+    container_fields: tuple[int, ...] = ()
 
     def to_mapping(self) -> dict:
         return {
@@ -283,6 +284,7 @@ class ClassInventory:
                 {"index": field.index, "key": field.key}
                 for field in self.fields
             ],
+            "container_fields": list(self.container_fields),
             "storage_redirects": [
                 {"identity": item.identity, "storage": item.storage}
                 for item in self.storage_redirects
@@ -390,6 +392,11 @@ def build_class_inventory(manifest: Mapping[str, object]) -> ClassInventory:
             output_slots=outputs,
             kernel=str(module.get("kernel", module["name"])),
         ))
+    container_fields = tuple(sorted({
+        canonical_index[canonical(str(key))]
+        for key in manifest.get("container_fields", ())
+        if canonical(str(key)) in canonical_index
+    }))
     return ClassInventory(
         fields=tuple(
             ClassFieldSlot(index, key) for index, key in enumerate(canonical_keys)
@@ -400,6 +407,7 @@ def build_class_inventory(manifest: Mapping[str, object]) -> ClassInventory:
             for identity in keys
             if canonical(identity) != identity
         ),
+        container_fields=container_fields,
     )
 
 
