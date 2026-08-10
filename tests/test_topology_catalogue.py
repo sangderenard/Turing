@@ -50,6 +50,23 @@ def test_catalogue_entry_carries_the_algebraic_domain():
     assert catalogue.entries[signature]["domain"] == "GF(2) boolean ring"
 
 
+def test_math_torture_seeds_a_named_library_of_number_systems():
+    from src.compiler.topology_catalogue import seed_catalogue_with_math_torture
+
+    catalogue = seed_catalogue_with_math_torture(
+        root=__import__("tempfile").mkdtemp()
+    )
+    domains = {e["domain"] for e in catalogue.entries.values()}
+    # The seed witnesses every number system the classifier knows.
+    assert "GF(2) boolean ring" in domains
+    assert any(d.startswith("ring Z/2^n") for d in domains)
+    assert "min/max semilattice" in domains
+    # And it records involutions (op ∘ op = id).
+    assert any(
+        "involution" in e["symmetries"] for e in catalogue.entries.values()
+    )
+
+
 def _program(steps, feeds, outputs):
     return FusedProgram(
         version=1, feeds=set(feeds), steps=list(steps), outputs=dict(outputs)

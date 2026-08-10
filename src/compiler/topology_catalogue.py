@@ -86,16 +86,18 @@ def _digest(canonical: tuple) -> str:
 
 
 def topology_signature(program: Any) -> str:
-    """A stable hex digest of a region program's topology (data abstracted)."""
+    """A stable digest of a region's topology: the symmetry-invariant canonical
+    formula (data abstracted), so commutative variants share one signature and
+    therefore one catalogue group."""
 
-    return _digest(_canonical_form(program, keep_data=False))
+    return _digest(canonical_formula(program, keep_data=False))
 
 
 def kernel_signature(program: Any) -> str:
-    """A stable hex digest that also fixes the constants -- one byte-distinct
-    compiled kernel (still value-id-invariant)."""
+    """Like ``topology_signature`` but with the constants fixed -- one
+    byte-distinct compiled kernel, still value-id- and symmetry-invariant."""
 
-    return _digest(_canonical_form(program, keep_data=True))
+    return _digest(canonical_formula(program, keep_data=True))
 
 
 def _attr_formula(attrs: Mapping[str, Any], keep_data: bool) -> str:
@@ -153,6 +155,69 @@ _COMMUTATIVE = frozenset({
 _FORMULA_STEP_CAP = 48
 
 
+def _symmetry_colors(program: Any) -> dict:
+    """Weisfeiler-Lehman color refinement -> a symmetry-invariant color per value.
+
+    Iterative (an explicit fixed-point loop, no recursion). Each value's color is
+    refined from its own operator/attrs, the colors of its inputs (as an
+    unordered multiset for commutative operators, an ordered tuple otherwise),
+    and the colors of its consumers -- so two values that are structurally
+    interchangeable (e.g. the two operands of an ``add``) end up the same color,
+    while values used differently stay distinct. Naming inputs by color order
+    then makes ``add(a,b)`` and ``add(b,a)`` render identically.
+    """
+
+    steps = list(getattr(program, "steps", ()))
+    steps_by_result = {int(s.result_id): s for s in steps}
+    values: set[int] = set()
+    for step in steps:
+        values.add(int(step.result_id))
+        values.update(int(i) for i in step.input_ids)
+    for v in getattr(program, "outputs", {}).values():
+        values.add(int(v))
+
+    consumers: dict[int, list] = {v: [] for v in values}
+    for step in steps:
+        commutative = step.op_name in _COMMUTATIVE
+        for position, input_id in enumerate(step.input_ids):
+            consumers[int(input_id)].append(
+                (step.op_name, "c" if commutative else position, int(step.result_id))
+            )
+
+    color = {
+        v: (
+            "leaf" if v not in steps_by_result
+            else f"{steps_by_result[v].op_name}|{_attr_signature(dict(steps_by_result[v].attrs))}"
+        )
+        for v in values
+    }
+
+    # A small fixed number of rounds (WL-k): color refinement stabilizes in a
+    # few passes on the shallow DAGs here, and an unbounded fixed point would
+    # cost O(V^2) per region for no extra discrimination in practice.
+    for _ in range(min(_WL_ROUNDS, len(values) + 1)):
+        updated = {}
+        for v in values:
+            step = steps_by_result.get(v)
+            if step is None:
+                in_sig: Any = ()
+            else:
+                child = [color[int(i)] for i in step.input_ids]
+                in_sig = tuple(sorted(child)) if step.op_name in _COMMUTATIVE else tuple(child)
+            out_sig = tuple(sorted(
+                (op, position, color[result]) for op, position, result in consumers[v]
+            ))
+            updated[v] = _digest((color[v], in_sig, out_sig))
+        if len(set(updated.values())) == len(set(color.values())):
+            color = updated
+            break
+        color = updated
+    return color
+
+
+_WL_ROUNDS = 4
+
+
 def canonical_formula(program: Any, *, keep_data: bool = False) -> str:
     """A canonical, analyzable structural formula for a region program.
 
@@ -176,7 +241,9 @@ def canonical_formula(program: Any, *, keep_data: bool = False) -> str:
     if len(steps) > _FORMULA_STEP_CAP:
         histogram = Counter(step.op_name for step in steps)
         slug = "-".join(f"{op}{n}" for op, n in sorted(histogram.items())) or "empty"
-        digest = (kernel_signature if keep_data else topology_signature)(program)
+        # Raw canonical form (not the formula) to avoid recursing into the
+        # signature, which now rides on this function.
+        digest = _digest(_canonical_form(program, keep_data=keep_data))
         return f"{slug}#{len(steps)}~{digest[:8]}"
 
     steps_by_result = {int(s.result_id): s for s in steps}
@@ -190,12 +257,24 @@ def canonical_formula(program: Any, *, keep_data: bool = False) -> str:
 
     reference: dict[int, str] = {}     # value_id -> its rendered reference
     definitions: list[str] = []        # "&k=expr" for shared computed values
-    feed_index: dict[int, int] = {}
+
+    # Name inputs by symmetry-invariant color, not traversal order, so
+    # commutative variants render identically. Interchangeable (same-color)
+    # inputs make the formula invariant to their relative order regardless of
+    # the id tie-break.
+    colors = _symmetry_colors(program)
+    producers = set(steps_by_result)
+    feed_values = {int(i) for s in steps for i in s.input_ids} - producers
+    feed_values |= {v for v in output_ids if v not in producers}
+    feed_name = {
+        value_id: f"in{index}"
+        for index, value_id in enumerate(
+            sorted(feed_values, key=lambda f: (colors.get(f, ""), f))
+        )
+    }
 
     def feed_reference(value_id: int) -> str:
-        if value_id not in feed_index:
-            feed_index[value_id] = len(feed_index)
-        return f"in{feed_index[value_id]}"
+        return feed_name.get(value_id, "in?")
 
     # Explicit-stack post-order: children resolve before their parent, so every
     # value's inputs already have a reference when its inline form is built.
@@ -411,6 +490,52 @@ class TopologyCatalogue:
         return self.manifest_path
 
 
+def math_torture_programs():
+    """Region programs that exercise the math operator space and the algebraic
+    structures, for seeding the catalogue with a canonical named library rather
+    than only whatever one build happens to contain.
+
+    Covers every elementwise unary/binary operator on its own, plus curated
+    compositions that name the number systems: a multiply-add (ring), an
+    and/xor chain (GF(2)), a min/max chain (lattice), and involutions.
+    """
+
+    from ..common.tensors.fused_ir import (
+        FusedProgram, OpStep, ELEMENTWISE_BINARY, ELEMENTWISE_UNARY,
+    )
+
+    programs = []
+
+    def add(steps, output):
+        programs.append(FusedProgram(
+            version=1, feeds={1, 2, 3}, steps=list(steps), outputs={"r": output},
+        ))
+
+    for op in sorted(ELEMENTWISE_BINARY):
+        add([OpStep(0, op, [1, 2], {}, 4)], 4)
+    for op in sorted(ELEMENTWISE_UNARY):
+        add([OpStep(0, op, [1], {}, 4)], 4)
+
+    # Algebraic-structure witnesses -- each names a number system in the profile.
+    add([OpStep(0, "mul", [1, 2], {}, 4), OpStep(1, "add", [4, 3], {}, 5)], 5)      # ring: a*b+c
+    add([OpStep(0, "bitand", [1, 2], {}, 4), OpStep(1, "bitxor", [4, 3], {}, 5)], 5)  # GF(2)
+    add([OpStep(0, "minimum", [1, 2], {}, 4), OpStep(1, "maximum", [4, 3], {}, 5)], 5)  # lattice
+    add([OpStep(0, "neg", [1], {}, 4), OpStep(1, "neg", [4], {}, 5)], 5)            # involution
+    add([OpStep(0, "invert", [1], {}, 4), OpStep(1, "invert", [4], {}, 5)], 5)      # involution
+    # Subscript get/set (the reference-operator pair).
+    add([OpStep(0, "index_set", [1, 2], {"slices": 0}, 4)], 4)
+    return programs
+
+
+def seed_catalogue_with_math_torture(root=None) -> "TopologyCatalogue":
+    """Populate (and persist) a catalogue from the math torture programs."""
+
+    catalogue = TopologyCatalogue(root=root)
+    catalogue.record_all(math_torture_programs())
+    catalogue.save()
+    return catalogue
+
+
 __all__ = [
     "topology_signature",
     "kernel_signature",
@@ -419,5 +544,7 @@ __all__ = [
     "kernel_name",
     "invocation_name",
     "algebraic_profile",
+    "math_torture_programs",
+    "seed_catalogue_with_math_torture",
     "TopologyCatalogue",
 ]
