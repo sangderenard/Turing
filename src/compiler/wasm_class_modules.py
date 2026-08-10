@@ -47,6 +47,7 @@ chunk is a numbered prerequisite of it.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -298,6 +299,26 @@ class ClassModuleSpec:
         return f"{self.name}__{self.index}"
 
 
+def _region_reduction_digest(program, module_name, dtype, static_offset) -> str:
+    """Content key for one lowered region.
+
+    ``emit_wasm_module`` is a pure function of the region program plus these
+    emission parameters, so hashing exactly those makes the cached kernel valid
+    to reuse whenever they are unchanged. ``static_offset`` is included on
+    purpose: two builds that place a region's static data at different offsets
+    are genuinely different kernels and must not share a cache entry.
+    """
+
+    from joblib.externals import cloudpickle
+
+    digest = hashlib.sha256()
+    digest.update(cloudpickle.dumps(program))
+    digest.update(
+        f"|{module_name}|{dtype}|{int(static_offset)}".encode("utf-8")
+    )
+    return digest.hexdigest()
+
+
 def emit_control_region_modules(
     control,
     region_programs: Mapping[int, FusedProgram],
@@ -305,6 +326,8 @@ def emit_control_region_modules(
     owner_name: str,
     module_dir: str,
     dtype: str = "float64",
+    reduction_cache=None,
+    progress=None,
 ) -> tuple[dict[int, object], dict]:
     """Emit planner regions without flattening their controlling program.
 
@@ -312,6 +335,11 @@ def emit_control_region_modules(
     Values crossing region boundaries are assigned shared-memory identities;
     the companion control coordinator invokes these exact kernels according
     to the planner-owned loop/state-machine structure.
+
+    ``reduction_cache`` (a ``ReductionArtifactStore``), when given, persists each
+    lowered region under its content key so an interrupted or repeated bake
+    reloads regions it already lowered instead of re-emitting them. ``progress``,
+    if given, is called ``progress(region, was_cached)`` as each region resolves.
     """
 
     from .fused_program_wasm_backend import (
@@ -343,6 +371,13 @@ def emit_control_region_modules(
 
     modules = {}
     entries = []
+    # Byte-identical kernels (same topology + constants + dtype) share one file:
+    # the module binary is independent of the region's value-ids and name, so a
+    # program that repeats an operation over different data collapses to a
+    # handful of distinct kernels. Per-region method-card wiring is unaffected --
+    # only the emitted ``.wasm`` file dedups. ``kernel_files`` maps a binary
+    # hash to its shared kernel name.
+    kernel_files: dict[str, str] = {}
     edges = []
     logical_inputs: dict[str, list[tuple[str, str]]] = {}
     value_bindings: dict[int, str] = {
@@ -353,21 +388,44 @@ def emit_control_region_modules(
     for region in ordered_regions:
         program = programs[region]
         module_name = module_names[region]
-        module = emit_wasm_module(
-            program,
-            name=module_name,
-            dtype=dtype,
-            imports=(WasmImport(
-                module="env",
-                field="memory",
-                kind="memory",
-                memory_pages=1,
-            ),),
-            static_data_offset=static_offset,
-        )
-        if not module.complete:
-            raise RuntimeError(module.shortfall_report())
+
+        def _lower_region(program=program, module_name=module_name,
+                          static_offset=static_offset):
+            module = emit_wasm_module(
+                program,
+                name=module_name,
+                dtype=dtype,
+                imports=(WasmImport(
+                    module="env",
+                    field="memory",
+                    kind="memory",
+                    memory_pages=1,
+                ),),
+                static_data_offset=static_offset,
+            )
+            # Raise *inside* the compute closure so an incomplete lowering
+            # never reaches the cache: a shortfall must be retried on the next
+            # pass, not persisted as if it were a finished region.
+            if not module.complete:
+                raise RuntimeError(module.shortfall_report())
+            return module
+
+        if reduction_cache is not None:
+            module, was_cached = reduction_cache.get_or_compute(
+                _region_reduction_digest(
+                    program, module_name, dtype, static_offset
+                ),
+                _lower_region,
+            )
+        else:
+            module, was_cached = _lower_region(), False
+        if progress is not None:
+            progress(int(region), was_cached)
         modules[region] = module
+        kernel_hash = hashlib.sha256(module.binary).hexdigest()
+        kernel_name = kernel_files.setdefault(
+            kernel_hash, f"{owner_name}_k{kernel_hash[:12]}"
+        )
         api_entry = module.api.entry_points[0]
         inputs = [
             parameter.name for parameter in api_entry.parameters
@@ -405,7 +463,10 @@ def emit_control_region_modules(
             value_bindings.setdefault(value_id, f"in::{logical_name}")
         entries.append({
             "name": module_name,
-            "url": f"{module_dir}/{module_name}.wasm",
+            # The kernel file is shared by byte-identical regions; the method
+            # card keeps its own per-region ``name`` for field-slot wiring.
+            "kernel": kernel_name,
+            "url": f"{module_dir}/{kernel_name}.wasm",
             "entry": module.api.entry,
             "inputs": inputs,
             "outputs": outputs,
@@ -427,6 +488,22 @@ def emit_control_region_modules(
             static_offset,
             int(module.api.metadata.get("reserved_bytes", 0)),
         )
+    # A field write (``index_set``) mutates its object in place: the updated
+    # buffer IS the source buffer. Redirect the region's output storage onto the
+    # ``data`` input's storage so the coordinator hands both the same resident
+    # slot -- the scatter store then writes the live field, not a fresh copy.
+    # (``build_class_inventory`` merges redirected keys into one field slot.)
+    storage_redirects: dict[str, str] = {}
+    for region in ordered_regions:
+        for step in getattr(programs[region], "steps", ()):
+            # Both subscript-store conventions put the target buffer first.
+            if step.op_name not in ("index_set", "IndexedStore"):
+                continue
+            out_key = value_bindings.get(step.result_id)
+            data_key = value_bindings.get(step.input_ids[0])
+            if out_key and data_key and out_key != data_key:
+                storage_redirects[str(out_key)] = str(data_key)
+
     return modules, {
         "modules": entries,
         "edges": edges,
@@ -437,6 +514,9 @@ def emit_control_region_modules(
         "value_bindings": {
             str(value_id): key for value_id, key in value_bindings.items()
         },
+        "storage_redirects": storage_redirects,
+        "region_count": len(ordered_regions),
+        "unique_kernels": len(kernel_files),
     }
 
 

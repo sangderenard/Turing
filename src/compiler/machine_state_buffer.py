@@ -14,6 +14,7 @@ WebAssembly atomics when those hosts own the runner.
 
 from __future__ import annotations
 
+import copyreg
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
@@ -29,6 +30,31 @@ from .machine_execution import (
     MachineExecutionStatus,
     MachineVirtualMulticore,
 )
+
+
+def register_binary_format_pickler(cls: type, attribute: str = "format") -> None:
+    """Make a binary-format-descriptor type picklable by reconstructing it
+    from the one string/bytes attribute that fully describes it, instead of
+    hand-writing a one-off reducer each time a new such type turns up.
+
+    ``struct.Struct`` is the first case: it has no ``__reduce__`` of its
+    own, so pickling one directly raises "cannot pickle '_struct.Struct'
+    object" (confirmed directly -- this is the type's actual default
+    behavior, not a version quirk). Its ``.format`` string is a complete,
+    exact description of it, so reconstructing from that is correct, not
+    approximate. Registered globally (``copyreg`` keys off the type, not
+    the module), so any checkpoint/pickle anywhere in the process that
+    transitively holds one of these stops failing, instead of every holder
+    needing to know to strip it first.
+    """
+
+    def _reduce(value: Any) -> tuple:
+        return (cls, (getattr(value, attribute),))
+
+    copyreg.pickle(cls, _reduce)
+
+
+register_binary_format_pickler(struct.Struct)
 
 
 SNAPSHOT_MAGIC = b"TMSNAP01"

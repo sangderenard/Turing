@@ -146,6 +146,7 @@ def compile_source_autogenesis(
             aot.compiled_shell_program,
             aot.shell_control_program,
             region_programs=dict(aot.region_programs),
+            hierarchy_plan=getattr(aot, "hierarchy_plan", None),
             numerical_name=entrypoint,
             control_name=f"{entrypoint}_control",
         )

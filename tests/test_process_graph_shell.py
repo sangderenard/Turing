@@ -453,6 +453,95 @@ def entry(value):
     )
 
 
+def test_aot_checkpoint_resumes_prepared_plan_after_later_phase_is_removed(
+    tmp_path,
+):
+    source = """
+def entry(value):
+    return value + 1
+"""
+    first_progress = []
+    second_progress = []
+
+    compile_ast_aot(
+        source,
+        "entry",
+        {},
+        backend="fortran",
+        precompile_only=True,
+        mutable_parameters=("value",),
+        checkpoint=tmp_path,
+        progress=first_progress.append,
+    )
+    checkpoint_directory = next(
+        (tmp_path / "aot-checkpoints").iterdir()
+    )
+    (checkpoint_directory / "captured_program.json").unlink()
+    (checkpoint_directory / "captured_program.pkl").unlink()
+
+    compile_ast_aot(
+        source,
+        "entry",
+        {},
+        backend="fortran",
+        precompile_only=True,
+        mutable_parameters=("value",),
+        checkpoint=tmp_path,
+        progress=second_progress.append,
+    )
+
+    assert "aot: saving prepared-plan checkpoint" in first_progress
+    assert "aot: resumed prepared-plan checkpoint" in second_progress
+    assert "aot: graph-only precompile already prepared" in second_progress
+    assert not any(
+        message.startswith("aot: preparing graph-only precompile")
+        for message in second_progress
+    )
+
+
+def test_aot_hierarchy_failure_reports_full_traceback(monkeypatch, tmp_path):
+    from src.common.tensors.accelerator_backends import aot_compile
+
+    def fail_hierarchy(_shell):
+        raise KeyError((2, 306))
+
+    monkeypatch.setattr(
+        aot_compile,
+        "_build_hierarchical_glsl_artifact",
+        fail_hierarchy,
+    )
+    progress = []
+    aot_compile.compile_ast_aot(
+        """
+def increment(value):
+    return value + 1
+
+def entry(value):
+    return increment(value)
+""",
+        "entry",
+        {"value": 1},
+        backend="fortran",
+        precompile_only=True,
+        checkpoint=tmp_path,
+        progress=progress.append,
+    )
+
+    diagnostic = next(
+        message
+        for message in progress
+        if message.startswith("aot: hierarchy recomposition traceback")
+    )
+    assert "Traceback (most recent call last):" in diagnostic
+    assert "KeyError: (2, 306)" in diagnostic
+    assert "fail_hierarchy" in diagnostic
+    checkpoint_directory = next(
+        (tmp_path / "aot-checkpoints").iterdir()
+    )
+    assert (checkpoint_directory / "compiled_plan.json").is_file()
+    assert not (checkpoint_directory / "captured_program.json").exists()
+
+
 def test_aot_checkpoint_reports_why_a_plan_cannot_resume(tmp_path):
     source = """
 def entry(value):

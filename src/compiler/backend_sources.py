@@ -273,6 +273,7 @@ def collect_backend_sources(
             program,
             aot.shell_control_program,
             region_programs=aot.region_programs,
+            hierarchy_plan=getattr(aot, "hierarchy_plan", None),
             numerical_name=numerical_name,
             control_name=control_name,
             identity_table=getattr(aot, "identity_table", {}),

@@ -314,7 +314,21 @@ _C_COMPILE_TIME_SYNTAX = frozenset({
 })
 
 _BITOPS_TO_EXECUTABLE = {
+    # Bitwise operators resolve to their lowercase canonical executable names,
+    # the ones every numeric table registers (``fused_ir.ELEMENTWISE_BINARY``,
+    # ``canonical_elementwise_op``, the WASM/C/GLSL backends). Left as the bare
+    # Handler names (``And``/``Or``/``Not``/``Shl``/``Shr``) they are recognized
+    # only by the SymPy-spelling path in ``abstract_tensor_funcs`` and silently
+    # drop out of any consumer keyed on the canonical set -- e.g. the structural
+    # region builder ``dispatch_region_to_fused_program``. ``Xor`` was already
+    # mapped; the rest were the asymmetry that made ``^`` reachable but ``&``,
+    # ``|``, ``~``, ``<<``, ``>>`` not.
+    "And": "bitand",
+    "Or": "bitor",
     "Xor": "bitxor",
+    "Not": "invert",
+    "Shl": "shl",
+    "Shr": "shr",
     "Neg": "neg",
     "Eq": "equal",
     "Ne": "not_equal",

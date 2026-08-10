@@ -123,6 +123,32 @@ def test_numerical_tensor_ops_call_real_imported_llvm_algorithms():
     assert function.blocks["entry"].instrs[1].attributes["right_scalar"] == 1.0
 
 
+def test_random_source_lowers_to_repository_ssa_feature_call():
+    program = FusedProgram(
+        version=1,
+        feeds=set(),
+        steps=[
+            OpStep(
+                0,
+                "random_source",
+                [],
+                {"shape": (4,), "seed": 7, "seed0": 11, "seed1": 13},
+                0,
+            ),
+        ],
+        outputs={"result": 0},
+        meta={0: Meta((4,), "float64", "cpu")},
+    )
+
+    function, shortfalls = lower_fused_program_to_ssa(program)
+    call = function.blocks["entry"].instrs[0]
+
+    assert shortfalls == ()
+    assert call.op == "Call"
+    assert call.attributes["callee"] == "xoroshiro128ss_fill_double"
+    assert call.attributes["seed"] == 7
+
+
 def test_native_fortran_ops_keep_mean_and_span_fill_in_ssa():
     program = _program(
         OpStep(0, "mean", [0], {}, 1),
@@ -261,6 +287,42 @@ def test_combined_lowering_retains_sequence_order_and_cycle_report():
     assert len(result.cycles) == 1
     assert result.cycles[0].represented_by_phi
     assert result.shortfalls == ()
+
+
+def test_combined_lowering_uses_graph_region_without_fused_kernel():
+    from src.compiler.hierarchical_plan import PlanClosure, PlanLine
+
+    program = _program(OpStep(0, "mul", [0], {"right_scalar": 2}, 1))
+    control = ControlProgram(
+        StatementBlock(("__scheduled_region_4__",)),
+        region_indices=(4,),
+    )
+    hierarchy = PlanClosure(
+        "root",
+        (10,),
+        (
+            PlanClosure(
+                "region_4",
+                (10,),
+                (PlanLine.create("Store", inputs=(10,), outputs=(11,)),),
+            ),
+        ),
+    )
+
+    result = lower_precompile_and_control_to_ssa(
+        program,
+        control,
+        hierarchy_plan=hierarchy,
+    )
+
+    assert "planned_region_4" in result.module.functions
+    assert result.module.functions["planned_region_4"].blocks[
+        "entry"
+    ].instrs[0].op == "Store"
+    assert not any(
+        shortfall.domain == "planned-region"
+        for shortfall in result.shortfalls
+    )
 
 
 def test_control_region_call_wires_feeds_and_explicit_output_producers():

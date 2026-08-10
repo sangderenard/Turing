@@ -357,6 +357,7 @@ ast_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
         '__invert__',
     ),
     Handler.Shl: (
+        'shl',
         'lshift',
         'binop:lshift',
         'augassign:lshift',
@@ -366,6 +367,7 @@ ast_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
         '__ilshift__',
     ),
     Handler.Shr: (
+        'shr',
         'rshift',
         'binop:rshift',
         'augassign:rshift',

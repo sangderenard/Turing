@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import build_homepage
 import build_site_page
@@ -21,6 +22,21 @@ def test_gallery_generators_default_to_parent_publish_root(monkeypatch):
 
     monkeypatch.setattr(sys, "argv", ["build_wasm_compiler_page.py"])
     assert build_wasm_compiler_page._arguments().destination == DEFAULT_PUBLISH_ROOT
+
+
+def test_infer_python_package(tmp_path: Path):
+    source = tmp_path / "src" / "compiler" / "example.py"
+    source.parent.mkdir(parents=True)
+    (tmp_path / "src" / "__init__.py").touch()
+    (source.parent / "__init__.py").touch()
+    source.touch()
+
+    assert build_site_page._infer_python_package(source) == "src.compiler"
+
+    standalone = tmp_path / "standalone" / "example.py"
+    standalone.parent.mkdir()
+    standalone.touch()
+    assert build_site_page._infer_python_package(standalone) is None
 
 
 def test_homepage_generator_refuses_turing_as_destination():

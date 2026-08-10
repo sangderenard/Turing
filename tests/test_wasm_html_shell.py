@@ -103,6 +103,9 @@ def test_html_renders_file_system_port_instead_of_numeric_parameter_fields():
     assert "window.TuringSystemPorts = systemPorts" in html
     assert "publishFile(name, file)" in html
     assert "bundle · decoder-bundle :: decode" in html
+    assert "logicalInputs[logicalName] = file.bytes" in html
+    assert "required file input is not loaded:" in html
+    assert "loadedFileLengths" in html
 
 
 def test_html_accepts_host_system_external_reference_ports():

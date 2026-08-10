@@ -1,6 +1,7 @@
 from src.compiler.bitops_process_graph import expand_bitops_process_graph
 from src.compiler.ssa_builder import process_graph_to_ssa_instrs
 from src.compiler.ssa_primitive_lowering import lower_ssa_to_fused_program
+from src.compiler.precompile_to_ssa import lower_fused_program_to_ssa
 from src.common.tensors.accelerator_backends.c_backend import CTensor
 from src.common.tensors.accelerator_backends.c_primitive_program import (
     execute_fused_program,
@@ -61,6 +62,60 @@ def kernel(x, y):
     assert "float s2 = s0 + s1;" in shader
     assert "float s3 = sin(s2);" in shader
     assert "float s4 = tanh(s3);" in shader
+
+
+def test_random_spellings_normalize_to_one_fused_operator():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.build_from_ast(
+        """
+def kernel():
+    a = random.random()
+    b = np.random.randn(4)
+    c = torch.randint(0, 8, size=(4,))
+    return c
+"""
+    )
+
+    random_nodes = [
+        data
+        for _, data in graph.G.nodes(data=True)
+        if data.get("op") == "random_source"
+    ]
+
+    assert len(random_nodes) == 3
+    assert {node["attributes"]["distribution"] for node in random_nodes} == {
+        "uniform",
+        "normal",
+        "integer",
+    }
+    assert {node["attributes"]["request"] for node in random_nodes} == {
+        "random.random",
+        "np.random.randn",
+        "torch.randint",
+    }
+
+    numerical_graph = ProcessGraph(materialize_memory=False)
+    numerical_graph.build_from_ast(
+        """
+def kernel():
+    return np.random.randn(4)
+"""
+    )
+    fused = lower_ssa_to_fused_program(
+        process_graph_to_ssa_instrs(numerical_graph, schedule="asap")
+    ).require_complete()
+    assert [step.op_name for step in fused.steps] == ["random_source"]
+
+    function, shortfalls = lower_fused_program_to_ssa(fused)
+    assert shortfalls == ()
+    calls = [
+        instruction
+        for instruction in function.blocks["entry"].instrs
+        if instruction.op == "Call"
+    ]
+    assert {call.attributes["callee"] for call in calls} == {
+        "xoroshiro128ss_fill_double"
+    }
 
 
 def test_bitops_nand_graph_lowers_without_bypassing_provenance():

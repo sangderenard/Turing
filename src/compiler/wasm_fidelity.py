@@ -21,7 +21,26 @@ from typing import Any, Mapping, Sequence
 
 WASM_FIDELITY_SCHEMA = "turing-wasm-fidelity-v1"
 
-_NUMPY_DTYPES = {"f32": "float32", "f64": "float64"}
+_NUMPY_DTYPES = {
+    "f32": "float32",
+    "f64": "float64",
+    # Integer working types. The oracle, the feed layout, and the JS memory
+    # view all key off this so a bitwise/integer program is verified against an
+    # integer NumPy reference and integer linear memory, not silently coerced
+    # to float (which would make ``np.bitwise_and`` raise, and would round a
+    # shift result). The compiler's own integer results default to int64, so
+    # i64 is the primary integer working type here; i32 is supported for
+    # narrower programs.
+    "i32": "int32",
+    "i64": "int64",
+}
+
+# Working types whose linear-memory values are integers, not IEEE floats. i64
+# additionally needs BigInt on the JS side (a 64-bit integer has no exact
+# IEEE-double JSON encoding), handled in the run script and re-parsed from
+# decimal strings on the Python side.
+_INTEGER_VALUE_TYPES = {"i32", "i64"}
+_BIGINT_VALUE_TYPES = {"i64"}
 
 # The reference-case generator and the NumPy oracle both already exist for the
 # Fortran path; reuse them rather than minting parallel copies.
@@ -77,14 +96,25 @@ const memory = instance.exports.memory;
 if (plan.required_bytes > memory.buffer.byteLength) {
   memory.grow(Math.ceil((plan.required_bytes - memory.buffer.byteLength) / 65536));
 }
-const View = plan.value_type === "f32" ? Float32Array : Float64Array;
+const isI64 = plan.value_type === "i64";
+const View =
+  plan.value_type === "f32" ? Float32Array :
+  plan.value_type === "i32" ? Int32Array :
+  plan.value_type === "i64" ? BigInt64Array :
+  Float64Array;
 for (const feed of plan.feeds) {
-  new View(memory.buffer, feed.offset, feed.data.length).set(feed.data);
+  // A 64-bit integer view stores BigInt elements; the plan carries them as
+  // plain JSON numbers (small, exact) and they are lifted to BigInt here.
+  const data = isI64 ? feed.data.map(BigInt) : feed.data;
+  new View(memory.buffer, feed.offset, feed.data.length).set(data);
 }
 instance.exports.run(plan.count, ...plan.run_offsets);
-const outputs = plan.outputs.map(
-  o => Array.from(new View(memory.buffer, o.offset, o.length))
-);
+const outputs = plan.outputs.map(o => {
+  const window = Array.from(new View(memory.buffer, o.offset, o.length));
+  // BigInt has no JSON encoding, so a 64-bit result is emitted as decimal
+  // strings and re-parsed to integers on the Python side.
+  return isI64 ? window.map(String) : window;
+});
 console.log(JSON.stringify(outputs));
 """
 
@@ -183,6 +213,9 @@ def verify_wasm_module(
         # baked-table region, element-aligned, in the module's own ABI order.
         cursor = ((int(metadata.get("reserved_bytes", 0)) + element_bytes - 1)
                   // element_bytes) * element_bytes
+        # An integer working type lays integer elements into memory (read back
+        # through an Int32Array in the run script); a float type lays floats.
+        cast = int if value_type in _INTEGER_VALUE_TYPES else float
         feed_layout: list[dict[str, Any]] = []
         feed_offsets: dict[int, int] = {}
         for feed_id in abi_feed_ids:
@@ -190,7 +223,7 @@ def verify_wasm_module(
             feed_offsets[feed_id] = cursor
             feed_layout.append({
                 "offset": cursor,
-                "data": [float(v) for v in flat.tolist()],
+                "data": [cast(v) for v in flat.tolist()],
             })
             cursor += int(flat.size) * element_bytes
         output_layout: list[dict[str, Any]] = []

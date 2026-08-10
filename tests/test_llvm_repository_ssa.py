@@ -8,6 +8,12 @@ from src.common.tensors.accelerator_backends.llvm_repository_ssa import (
     import_llvm_to_repository_ssa,
 )
 from src.compiler.precompile_to_ssa import find_ssa_cycles
+from src.compiler.ssa_features import (
+    RANDOM_SSA_MODULE,
+    XOROSHIRO128SS_FILL,
+    link_required_ssa_features,
+)
+from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
 from src.transmogrifier.ssa_registry import Handler
 
 
@@ -57,3 +63,45 @@ def test_llvm_switch_is_legalized_to_existing_compare_and_branch_ops():
         and instruction.attributes.get("llvm_opcode") == "switch"
         for instruction in instructions
     )
+
+
+def test_random_feature_imports_as_real_bitwise_repository_ssa():
+    imported = import_llvm_to_repository_ssa(RANDOM_SSA_MODULE)
+
+    assert imported.complete, imported.shortfall_report()
+    function = imported.module.functions[XOROSHIRO128SS_FILL]
+    operations = {
+        instruction.op
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    }
+    assert {
+        Handler.Xor.value,
+        Handler.Or.value,
+        Handler.Shl.value,
+        Handler.Shr.value,
+    } <= operations
+
+
+def test_random_feature_is_linked_only_when_called():
+    output = SSAValue(0, dtype="float64", shape=(4,))
+    caller = Function(
+        "program",
+        [],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr(
+                        Handler.Call.value,
+                        [],
+                        output,
+                        attributes={"callee": XOROSHIRO128SS_FILL},
+                    )
+                ],
+            )
+        },
+    )
+
+    assert XOROSHIRO128SS_FILL in link_required_ssa_features({"program": caller})
+    assert XOROSHIRO128SS_FILL not in link_required_ssa_features({})

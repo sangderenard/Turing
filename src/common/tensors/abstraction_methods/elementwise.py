@@ -21,7 +21,19 @@ def _scalar_kernel(op: str):
         "logical_and":   lambda a, b, **k: bool(bool(a) and bool(b)),
         "logical_or":    lambda a, b, **k: bool(bool(a) or  bool(b)),
         "logical_xor":   lambda a, b, **k: bool(bool(a) ^    bool(b)),
-        "invert":        lambda a,     **k: bool(not bool(a)),
+        # Bitwise integer ops. These are what Python's ``&``/``|``/``^``/
+        # ``<<``/``>>``/``~`` mean by language definition -- distinct from the
+        # ``logical_*`` connectives above, which coerce to bool first. Operands
+        # arrive as plain Python scalars from ``tolist()``, so Python's own
+        # arbitrary-precision integer operators are the reference semantics
+        # every backend must agree with.
+        "bitand":        lambda a, b, **k: int(a) & int(b),
+        "bitor":         lambda a, b, **k: int(a) | int(b),
+        "bitxor":        lambda a, b, **k: int(a) ^ int(b),
+        "shl":           lambda a, b, **k: int(a) << int(b),
+        "shr":           lambda a, b, **k: int(a) >> int(b),
+        "invert":        lambda a,     **k: ~int(a),
+        "logical_not":   lambda a,     **k: bool(not bool(a)),
         "where":         lambda c, a, b, **k: (a if bool(c) else b),
         "sign":          lambda a,     **k: (a if (a != a) else (1 if a > 0 else (-1 if a < 0 else 0)))
     }
@@ -57,7 +69,10 @@ def _v1_valuewise(self, op: str, *, annotate: Dict[str, Any] | None = None):
     # comparison itself, was the actual bottleneck.
     out = [K(a) for a in flat]
     if not out and op in {
-        "invert", "logical_not", "isfinite", "isinf", "isnan",
+        # Predicate/logical unaries produce a boolean empty result; ``invert``
+        # is bitwise (``~int``) and produces an integer, so it keeps the
+        # input's own dtype rather than being forced to bool.
+        "logical_not", "isfinite", "isinf", "isnan",
     }:
         out = type(self).tensor(
             [], dtype="bool", tape=getattr(self, "_tape", None)
@@ -268,10 +283,70 @@ def __le__(self, other):         return self._v2_valuewise("less_equal", other, 
 def __gt__(self, other):         return self._v2_valuewise("greater", other, annotate={"op":"greater"})
 def __ge__(self, other):         return self._v2_valuewise("greater_equal", other, annotate={"op":"greater_equal"})
 
-def __and__(self, other):        return self._v2_valuewise("logical_and", other, annotate={"op":"logical_and"})
-def __or__(self, other):         return self._v2_valuewise("logical_or",  other, annotate={"op":"logical_or"})
-def __xor__(self, other):        return self._v2_valuewise("logical_xor", other, annotate={"op":"logical_xor"})
-def __invert__(self):            return self._v1_valuewise("invert", annotate={"op":"invert"})
+# ``&``/``|``/``^``/``~`` carry two meanings in a tensor system, and which one
+# applies is decided by dtype -- exactly as NumPy/PyTorch decide it:
+#
+#   * On boolean operands they are the *logical* connectives. This is the
+#     mask algebra existing tensor code relies on (``mask_a & mask_b``), and
+#     it must keep both its logical semantics and its boolean result dtype.
+#   * On integer operands they are *bitwise* -- real bit manipulation, which
+#     is what a byte/bitfield decoder (PE parsing, Huffman packing) needs.
+#
+# For ``&``/``|``/``^`` the two readings coincide on booleans (``1 & 1 == 1``),
+# so the only thing dtype-dispatch protects there is the result dtype (bool in,
+# bool out). ``~`` genuinely differs -- logical ``~True`` is ``False`` while
+# bitwise ``~1`` is ``-2`` -- so its dispatch is load-bearing, not cosmetic.
+# ``<<``/``>>`` have no logical reading at all and are always bitwise.
+def _both_bool(self, other) -> bool:
+    from ..abstraction import AbstractTensor
+    if not _is_bool_like(self):
+        return False
+    if isinstance(other, bool):
+        return True
+    if isinstance(other, AbstractTensor):
+        return _is_bool_like(other)
+    # A raw Python int/float operand is not boolean -> integer (bitwise) result.
+    return False
+
+
+def _is_bool_like(tensor) -> bool:
+    # ``get_dtype()`` is normalized to a torch-style dtype (``torch.bool``)
+    # even on the NumPy backend, while ``bool_dtype`` is that backend's own
+    # sentinel (``numpy.bool``) -- so an identity/equality check misses. A
+    # string match is what the rest of the abstraction already uses to
+    # classify dtype families (see ``_apply_operator``'s ``kind``).
+    try:
+        dt = tensor.get_dtype()
+    except Exception:
+        return False
+    if dt is None:
+        return False
+    try:
+        if dt == tensor.bool_dtype:
+            return True
+    except Exception:
+        pass
+    return "bool" in str(dt).lower()
+
+
+def __and__(self, other):
+    if _both_bool(self, other):
+        return self._v2_valuewise("logical_and", other, annotate={"op":"logical_and"})
+    return self._v2_valuewise("bitand", other, annotate={"op":"bitand"})
+def __or__(self, other):
+    if _both_bool(self, other):
+        return self._v2_valuewise("logical_or", other, annotate={"op":"logical_or"})
+    return self._v2_valuewise("bitor", other, annotate={"op":"bitor"})
+def __xor__(self, other):
+    if _both_bool(self, other):
+        return self._v2_valuewise("logical_xor", other, annotate={"op":"logical_xor"})
+    return self._v2_valuewise("bitxor", other, annotate={"op":"bitxor"})
+def __lshift__(self, other):     return self._v2_valuewise("shl", other, annotate={"op":"shl"})
+def __rshift__(self, other):     return self._v2_valuewise("shr", other, annotate={"op":"shr"})
+def __invert__(self):
+    if _is_bool_like(self):
+        return self._v1_valuewise("logical_not", annotate={"op":"logical_not"})
+    return self._v1_valuewise("invert", annotate={"op":"invert"})
 
 @staticmethod
 def where(cond, a, b, *, allow_scalar: bool = True):

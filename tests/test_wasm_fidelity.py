@@ -129,6 +129,69 @@ def test_elementwise_operator_matches_numpy(tmp_path, name):
     assert all(case["passed"] for case in proof["cases"])
 
 
+# Bitwise ops require an integer working type. The compiler's own integer
+# results default to int64 (a valuewise ``int(a) & int(b)`` is an unbounded
+# Python int, materialised as int64), so int64 is the working type these
+# programs actually compile to -- and the WebAssembly is emitted, executed in
+# linear memory (i64.load/i64.store arrays), and read back through a
+# BigInt64Array, then compared against the integer NumPy reference. ``y``
+# doubles as the shift amount for shl/shr, so it stays small and non-negative
+# (a negative shift count is undefined); ``x`` still carries negative
+# two's-complement values so ``~`` and the arithmetic ``shr`` are exercised.
+_XI = np.asarray([0b1010, 0b1100, 5, 255, -8, 123], dtype=np.int64)
+_YI = np.asarray([0b0110, 3, 2, 1, 2, 7], dtype=np.int64)
+
+_BITWISE_CASES = {
+    "bitand": "def op(x, y):\n    return x & y\n",
+    "bitor": "def op(x, y):\n    return x | y\n",
+    "bitxor": "def op(x, y):\n    return x ^ y\n",
+    "shl": "def op(x, y):\n    return x << y\n",
+    "shr": "def op(x, y):\n    return x >> y\n",
+    "invert": "def op(x, y):\n    return ~x + y - y\n",
+}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+@pytest.mark.parametrize("name", sorted(_BITWISE_CASES))
+def test_bitwise_operator_matches_numpy_in_linear_memory(tmp_path, name):
+    proof = verify_wasm_source(
+        _BITWISE_CASES[name],
+        "op",
+        {"x": _XI, "y": _YI},
+        tmp_path,
+        dtype="int64",
+    )
+    assert proof["passed"] is True
+    assert all(case["passed"] for case in proof["cases"])
+
+
+# A view op (reshape/view/clone) is the same linear elements under a new shape.
+# The WebAssembly backend lowers it to an identity of its operand, so the
+# result is bit-identical to the un-reshaped bitwise result -- and the shape
+# argument constants fall out as dead. The fidelity oracle compares flattened
+# values, so the shape change itself is transparent to the check; what this
+# proves is that the view lowers and runs rather than being refused.
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_reshape_view_lowers_and_matches_numpy(tmp_path):
+    proof = verify_wasm_source(
+        "def op(x, y):\n    return (x & y).reshape(2, 3)\n",
+        "op",
+        {"x": _XI, "y": _YI},
+        tmp_path,
+        dtype="int64",
+    )
+    assert proof["passed"] is True
+    assert all(case["passed"] for case in proof["cases"])
+
+
+# (An int32 working-type end-to-end test is intentionally omitted: the
+# compiler materialises every integer result as int64 -- a valuewise
+# ``int(a) op int(b)`` is an unbounded Python int -- so an int32 *working
+# type* would emit an i64 memory store of an i32 value. int32 remains a
+# supported emission path for programs whose result Meta is genuinely int32;
+# the front end simply does not produce one from these source expressions.)
+
+
 # Reductions need a derived grid (a direct N*K feed cannot be sized by the
 # count-based ABI), so each builds one from a row feed minus a kaxis feed.
 _REDUCE_CASES = {

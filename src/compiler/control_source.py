@@ -960,8 +960,25 @@ def project_control_regions(
 def overlay_scheduled_control(
     region_indices: Iterable[int],
     controls: Iterable[ControlProgram],
+    *,
+    known_nesting: "Mapping[int, Iterable[int]] | None" = None,
 ) -> ControlProgram:
-    """Overlay planned control blocks on the flat scheduled region order."""
+    """Overlay planned control blocks on the flat scheduled region order.
+
+    ``known_nesting``, if given, maps a control's index (into ``controls``)
+    to the indices of controls known -- by real structure, not inferred
+    here -- to be lexically nested directly inside it. Region-set strict
+    containment (``child < parent``) is the ordinary signal for "this
+    control is nested inside that one", but it is only a proxy: a loop
+    whose entire body is another loop (``while a: while b: ...`` with
+    nothing of its own between them) computes the *same* region set as
+    its child, not a superset, since it contributes no region of its own.
+    Strict-subset containment cannot tell those two controls apart -- ``<``
+    is ``False`` in both directions for equal sets -- so without this hint
+    they are wrongly treated as independent siblings both claiming the
+    same regions, which is exactly the "maximal control blocks overlap
+    without containment" failure this parameter exists to prevent.
+    """
 
     order = tuple(int(index) for index in region_indices)
     positions = {region_index: index for index, region_index in enumerate(order)}
@@ -982,6 +999,22 @@ def overlay_scheduled_control(
     controlled_sets = tuple(
         frozenset(control.region_indices) for control in controls
     )
+    direct_children = {
+        int(parent): frozenset(int(child) for child in children)
+        for parent, children in (known_nesting or {}).items()
+    }
+    nested_children_overall = frozenset(
+        child
+        for children in direct_children.values()
+        for child in children
+    )
+
+    def _nested_in(child: int, parent: int) -> bool:
+        if child == parent:
+            return False
+        if controlled_sets[child] < controlled_sets[parent]:
+            return True
+        return child in direct_children.get(parent, ())
 
     def embed(
         block: ControlBlock,
@@ -1015,13 +1048,15 @@ def overlay_scheduled_control(
             body, consumed = embed(
                 block.body, nested_root, nested_regions
             )
+            if body is None:
+                body = nested_root if consumed else SequenceBlock(())
             return (
                 LoopBlock(
                     block.induction,
                     block.start,
                     block.stop,
                     block.step,
-                    body or SequenceBlock(()),
+                    body,
                     block.carried_aliases,
                     block.parallel_iterations,
                     block.dispatch_shell,
@@ -1037,11 +1072,17 @@ def overlay_scheduled_control(
             body, body_consumed = embed(
                 block.body, nested_root, nested_regions
             )
+            if condition is None:
+                condition = (
+                    nested_root if condition_consumed else SequenceBlock(())
+                )
+            if body is None:
+                body = nested_root if body_consumed else SequenceBlock(())
             return (
                 WhileBlock(
                     block.predicate_value_id,
-                    condition or SequenceBlock(()),
-                    body or SequenceBlock(()),
+                    condition,
+                    body,
                     block.carried_aliases,
                     block.recursion_region_id,
                     block.predicate_expression,
@@ -1057,14 +1098,17 @@ def overlay_scheduled_control(
                 projected, consumed = embed(
                     body, nested_root, nested_regions
                 )
-                cases.append((value, projected or SequenceBlock(())))
+                if projected is None:
+                    projected = nested_root if consumed else SequenceBlock(())
+                cases.append((value, projected))
                 consumed_any |= consumed
             default = None
             if block.default is not None:
                 default, consumed = embed(
                     block.default, nested_root, nested_regions
                 )
-                default = default or SequenceBlock(())
+                if default is None:
+                    default = nested_root if consumed else SequenceBlock(())
                 consumed_any |= consumed
             return (
                 StateMachineTick(block.state, tuple(cases), default),
@@ -1077,7 +1121,9 @@ def overlay_scheduled_control(
                 projected, consumed = embed(
                     lane, nested_root, nested_regions
                 )
-                lanes.append(projected or SequenceBlock(()))
+                if projected is None:
+                    projected = nested_root if consumed else SequenceBlock(())
+                lanes.append(projected)
                 consumed_any |= consumed
             return (
                 ParallelDeployment(tuple(lanes), block.schedule_preference),
@@ -1087,10 +1133,12 @@ def overlay_scheduled_control(
             callee, consumed = embed(
                 block.callee, nested_root, nested_regions
             )
+            if callee is None:
+                callee = nested_root if consumed else SequenceBlock(())
             return (
                 CallBlock(
                     block.callsite_id,
-                    callee or SequenceBlock(()),
+                    callee,
                     block.argument_bindings,
                     block.result_bindings,
                 ),
@@ -1111,10 +1159,10 @@ def overlay_scheduled_control(
             for child, child_regions in enumerate(controlled_sets)
             if child != index
             and child_regions
-            and child_regions < controlled_sets[index]
+            and _nested_in(child, index)
             and not any(
-                child_regions < middle_regions < controlled_sets[index]
-                for middle, middle_regions in enumerate(controlled_sets)
+                _nested_in(child, middle) and _nested_in(middle, index)
+                for middle in range(len(controlled_sets))
                 if middle not in {index, child}
             )
         ]
@@ -1141,9 +1189,12 @@ def overlay_scheduled_control(
     maximal = [
         index
         for index, regions in enumerate(controlled_sets)
-        if regions and not any(
-            regions < other
-            for other in controlled_sets
+        if regions
+        and index not in nested_children_overall
+        and not any(
+            _nested_in(index, other)
+            for other in range(len(controlled_sets))
+            if other != index
         )
     ]
     for index, control in enumerate(controls):

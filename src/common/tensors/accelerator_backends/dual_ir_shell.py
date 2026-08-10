@@ -62,6 +62,7 @@ class DualIRShell:
     class_navigation: Optional[Any] = None
     dependency_regions: Optional[Any] = None
     reference_tables: Optional[Any] = None
+    hierarchy_plan: Optional[Any] = None
 
     def rollup_profile(self) -> Optional[CLaunchProfile]:
         """This shell's own profile combined with every descendant's,
@@ -122,6 +123,7 @@ def compose_dual_ir_shell(
         reference_tables=getattr(
             getattr(aot, "deployment", None), "reference_tables", None,
         ),
+        hierarchy_plan=getattr(aot, "hierarchy_plan", None),
     )
 
 

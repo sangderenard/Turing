@@ -984,6 +984,7 @@ def compile_ast_fortran_c_shell(
             numerical_seed,
             compilation.shell_control_program,
             region_programs=dict(compilation.region_programs),
+            hierarchy_plan=getattr(compilation, "hierarchy_plan", None),
             numerical_name=f"{artifact_name}_discovery",
             control_name=artifact_name,
             identity_table=identity_table,

@@ -3640,6 +3640,8 @@ from .abstraction_methods.elementwise import (
     __or__ as elementwise_or,
     __xor__ as elementwise_xor,
     __invert__ as elementwise_invert,
+    __lshift__ as elementwise_lshift,
+    __rshift__ as elementwise_rshift,
     where as elementwise_where,
     sign as elementwise_sign,
     maximum as elementwise_maximum,
@@ -3659,6 +3661,8 @@ AbstractTensor.__and__   = elementwise_and
 AbstractTensor.__or__    = elementwise_or
 AbstractTensor.__xor__   = elementwise_xor
 AbstractTensor.__invert__= elementwise_invert
+AbstractTensor.__lshift__= elementwise_lshift
+AbstractTensor.__rshift__= elementwise_rshift
 AbstractTensor.where     = staticmethod(elementwise_where)
 AbstractTensor.sign      = elementwise_sign
 AbstractTensor.maximum   = elementwise_maximum

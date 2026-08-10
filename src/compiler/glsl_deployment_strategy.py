@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import ast
 import builtins
+import concurrent.futures
 import copy
 import gc
+import hashlib
 import operator
 import sys
 import time
@@ -23,7 +25,7 @@ import traceback
 from collections import deque
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, Mapping
 from types import ModuleType
 
@@ -32,9 +34,12 @@ import numpy as np
 
 from .deployment_fifo import DeploymentFIFO
 from .control_source import (
+    CallBlock,
     ControlProgram,
     LoopBlock,
+    ParallelDeployment,
     SequenceBlock,
+    StateMachineTick,
     StreamPublishBlock,
     ValidationBlock,
     WhileBlock,
@@ -61,6 +66,8 @@ from .loop_composer import (
 )
 from .process_graph_callable import EphemeralProcessGraphCallable
 from .process_graph_fusion import (
+    DispatchRegion,
+    dispatch_region_to_fused_program,
     extract_clean_process_subgraph,
     reduce_scheduled_shader_regions,
 )
@@ -94,6 +101,7 @@ from ..common.tensors.fused_ir import (
     FusedProgram,
     Meta,
     OpStep,
+    canonical_elementwise_op,
     ordered_feed_ids,
 )
 from ..common.tensors.operator_catalog import (
@@ -108,23 +116,40 @@ from ..transmogrifier.operator_defs import (
 
 
 def _dependency_order(graph: Any) -> tuple[int, ...]:
-    """Return DAG order, or stable condensation order for retained loops."""
+    """Return DAG order, or stable condensation order for retained loops.
 
+    The result is cached on the graph, keyed by a cheap (node count, edge
+    count) fingerprint. During deployment planning the same shell graph is
+    dependency-ordered repeatedly (once per ``_build_shell_hierarchy_plan``,
+    which runs on shell construction and on every ``refresh_hierarchy_plan``),
+    yet it is only read there -- so re-running the topological sort each time
+    was pure repeated work. The fingerprint invalidates the cache the moment
+    the graph gains or loses a node/edge, so a genuinely mutated graph is
+    re-ordered.
+    """
+
+    G = graph.G
+    fingerprint = (G.number_of_nodes(), G.number_of_edges())
+    cached = G.graph.get("_dependency_order_cache")
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
     try:
-        return tuple(nx.lexicographical_topological_sort(
-            graph.G, key=lambda value_id: int(value_id)
+        order = tuple(nx.lexicographical_topological_sort(
+            G, key=lambda value_id: int(value_id)
         ))
     except nx.NetworkXUnfeasible:
-        recursive = graph.G.graph.get("recursion_table")
-        if not recursive or set(graph.levels) != set(graph.G):
+        recursive = G.graph.get("recursion_table")
+        if not recursive or set(graph.levels) != set(G):
             raise
-        return tuple(sorted(
-            graph.G,
+        order = tuple(sorted(
+            G,
             key=lambda node_id: (
                 int(graph.levels[node_id]),
                 int(node_id),
             ),
         ))
+    G.graph["_dependency_order_cache"] = (fingerprint, order)
+    return order
 
 
 _scheduled_capture_backend: ContextVar[str] = ContextVar(
@@ -1423,7 +1448,18 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                         )
                     ),
                     outputs=(value,),
-                    attributes={"region": region_index},
+                    attributes={
+                        **dict(
+                            graph.G.nodes[value].get("attributes") or {}
+                        ),
+                        "region": region_index,
+                    },
+                    input_roles=tuple(
+                        str(role)
+                        for _parent, role in (
+                            graph.G.nodes[value].get("parents") or ()
+                        )
+                    ),
                 )
                 for value in region_nodes
             ),
@@ -1540,6 +1576,232 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         ))),
         items=tuple(items),
     )
+
+
+def _loop_induction_name(loop_node_id: int) -> str:
+    return f"iteration_{loop_node_id}"
+
+
+def _find_nested_loop_node_ids_in_block(
+    block: Any,
+) -> "frozenset[int]":
+    """Collect the node_ids of all LoopBlock/WhileBlock induction names in a
+    block tree by parsing the ``iteration_{node_id}`` induction convention."""
+
+    found: set[int] = set()
+
+    def walk(b: Any) -> None:
+        if isinstance(b, LoopBlock):
+            name = str(b.induction)
+            if name.startswith("iteration_"):
+                try:
+                    found.add(int(name[len("iteration_"):]))
+                except ValueError:
+                    pass
+            walk(b.body)
+        elif isinstance(b, WhileBlock):
+            walk(b.condition)
+            walk(b.body)
+        elif isinstance(b, SequenceBlock):
+            for child in b.blocks:
+                walk(child)
+        elif isinstance(b, StateMachineTick):
+            for _value, body in b.cases:
+                walk(body)
+            if b.default is not None:
+                walk(b.default)
+        elif isinstance(b, ParallelDeployment):
+            for lane in b.lanes:
+                walk(lane)
+        elif isinstance(b, CallBlock):
+            walk(b.callee)
+
+    walk(block)
+    return frozenset(found)
+
+
+def _loop_reduction_nesting_hints(
+    reductions: "Sequence[LoopShaderReduction]",
+    loop_plans: "Iterable[LoopPlan]",
+    graph: Any | None = None,
+) -> dict[int, frozenset[int]]:
+    """Direct-child hints for ``overlay_scheduled_control``'s
+    ``known_nesting``, keyed by index into ``reductions``.
+
+    Region-set containment is only a proxy for "this loop is lexically
+    nested inside that one" -- it fails when the outer loop's entire body
+    is the inner loop (``while a: while b: ...`` with nothing of the
+    outer's own between them), since then both compute the identical
+    region set rather than the outer being a superset. The real signal is
+    the same one ``analyze_shader_loop_reductions`` already used to
+    compute each reduction's own ``region_indices`` in the first place:
+    ``LoopDescriptor.body_nodes``, the set of graph nodes lexically inside
+    a loop's body. A loop is a direct concern of this hint only if its own
+    node id is a member of another loop's ``body_nodes`` -- real AST
+    nesting, not inferred from schedule position or edge traversal.
+
+    Fallback: when ``loop_plans`` does not provide ``body_nodes`` for a
+    candidate outer loop (e.g. the plan was evaporated or belongs to a
+    different shell), equal-region-set pairs are disambiguated by
+    inspecting the ``control_program.root`` block tree.  The outer loop's
+    un-projected ``LoopBlock`` body must contain the inner loop's
+    ``LoopBlock`` as a direct or indirect child; this is always true for
+    genuinely nested reductions because the planner embeds the inner loop's
+    ``LoopBlock`` inside the outer one before any region projection occurs.
+    """
+
+    loop_plans = tuple(loop_plans or ())
+    body_nodes_by_loop_id = {
+        int(plan.loop.node_id): frozenset(map(int, plan.loop.body_nodes))
+        for plan in loop_plans
+    }
+    loop_ids = [int(reduction.loop_node_id) for reduction in reductions]
+    hints: dict[int, frozenset[int]] = {}
+    for parent_index, parent_loop_id in enumerate(loop_ids):
+        body = body_nodes_by_loop_id.get(parent_loop_id)
+        if not body:
+            continue
+        children = frozenset(
+            child_index
+            for child_index, child_loop_id in enumerate(loop_ids)
+            if child_index != parent_index and child_loop_id in body
+        )
+        if children:
+            hints[parent_index] = children
+
+    # Fallback for equal-region-set pairs missed by the body_nodes pass.
+    # Two reductions whose projected region sets are equal but whose loop
+    # plans did not provide a nesting signal are resolved structurally: the
+    # outer reduction's un-projected control_program.root should embed the
+    # inner reduction's LoopBlock (identifiable by its ``iteration_{id}``
+    # induction name) somewhere in its tree.
+    already_covered_as_child = frozenset(
+        child for children in hints.values() for child in children
+    )
+    for parent_index, parent_reduction in enumerate(reductions):
+        if parent_reduction.control_program is None:
+            continue
+        parent_region_set = frozenset(parent_reduction.region_indices)
+        if not parent_region_set:
+            continue
+        parent_nested_ids = _find_nested_loop_node_ids_in_block(
+            parent_reduction.control_program.root
+        )
+        if not parent_nested_ids:
+            continue
+        fallback_children = frozenset(
+            child_index
+            for child_index, child_reduction in enumerate(reductions)
+            if child_index != parent_index
+            and child_index not in already_covered_as_child
+            and frozenset(child_reduction.region_indices) == parent_region_set
+            and int(child_reduction.loop_node_id) in parent_nested_ids
+        )
+        if fallback_children:
+            merged = hints.get(parent_index, frozenset()) | fallback_children
+            hints[parent_index] = merged
+
+    # Comprehension clauses are represented as sibling ``generators`` parents
+    # of one aggregate materializer, not as one clause's body containing the
+    # next clause's node. Their ordered parent list is nevertheless the exact
+    # Python lexical nesting order: ``for outer ... for inner ...``. Preserve
+    # that order explicitly when multiple clauses reduce to the same region.
+    if graph is not None:
+        reduction_index_by_loop_id = {
+            int(reduction.loop_node_id): index
+            for index, reduction in enumerate(reductions)
+        }
+        for _node_id, data in graph.G.nodes(data=True):
+            generator_indices = tuple(
+                reduction_index_by_loop_id[int(parent_id)]
+                for parent_id, role in data.get("parents", ())
+                if str(role) == "generators"
+                and int(parent_id) in reduction_index_by_loop_id
+            )
+            for parent_index, child_index in zip(
+                generator_indices, generator_indices[1:]
+            ):
+                parent_regions = frozenset(
+                    reductions[parent_index].region_indices
+                )
+                child_regions = frozenset(
+                    reductions[child_index].region_indices
+                )
+                if parent_regions and child_regions == parent_regions:
+                    hints[parent_index] = (
+                        hints.get(parent_index, frozenset()) | {child_index}
+                    )
+
+    return hints
+
+
+def _planned_operator_node_ids(hierarchy: PlanClosure) -> tuple[int, ...]:
+    """Return this closure's operators in planner-owned segment order."""
+
+    return tuple(
+        int(output_id)
+        for item in hierarchy.items
+        if isinstance(item, PlanClosure)
+        and item.name.startswith("region_")
+        for line in item.items
+        if isinstance(line, PlanLine)
+        for output_id in line.outputs
+    )
+
+
+@dataclass(frozen=True)
+class PlannedOperatorImplementation:
+    node_id: int
+    kind: str
+    fused_step_ids: tuple[int, ...] = ()
+
+
+def _build_planned_operator_implementations(
+    hierarchy: PlanClosure,
+    captured_regions: Mapping[int, CapturedFusedProgram],
+    observed_plain_node_ids: Iterable[int],
+) -> dict[int, tuple[PlannedOperatorImplementation, ...]]:
+    """Attach lowering evidence to planner-owned operators by node ID."""
+
+    observed_plain = set(map(int, observed_plain_node_ids))
+    implementations = {}
+    for item in hierarchy.items:
+        if not (
+            isinstance(item, PlanClosure)
+            and item.name.startswith("region_")
+        ):
+            continue
+        region_index = int(item.name.split("_", 1)[1])
+        captured = captured_regions.get(region_index)
+        fused_steps: dict[int, list[int]] = {}
+        if captured is not None:
+            for program in captured.execution_programs:
+                for step in program.steps:
+                    fused_steps.setdefault(
+                        int(step.result_id), []
+                    ).append(int(step.step_id))
+        region_implementations = []
+        for line in item.items:
+            if not isinstance(line, PlanLine):
+                continue
+            for node_id in line.outputs:
+                node_id = int(node_id)
+                step_ids = tuple(fused_steps.get(node_id, ()))
+                region_implementations.append(
+                    PlannedOperatorImplementation(
+                        node_id,
+                        "plain"
+                        if node_id in observed_plain
+                        else "fused"
+                        if step_ids
+                        else "structural",
+                        step_ids,
+                    )
+                )
+        implementations[region_index] = tuple(
+            region_implementations
+        )
+    return implementations
 
 
 def _refresh_hierarchy_control_captures(
@@ -1672,6 +1934,7 @@ def _refresh_hierarchy_control_captures(
         tuple(refreshed_items),
         closure.closure_id,
     )
+
 
 
 def _build_hierarchical_glsl_artifact(shell: Any):
@@ -4455,8 +4718,33 @@ def _inert_routing_nodes(graph: Any) -> frozenset[int]:
 
 
 def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
-    """Return whether a node routes syntax but performs no computation."""
+    """Whether a node routes syntax but performs no computation (cached).
 
+    This ~200-line classifier dominated ``compile_process_graph`` because it is
+    a pure function of the (planning-stable) graph yet is evaluated for every
+    node more than once -- once building each shell's executable-node set, again
+    validating dispatch coverage. Memoize it per graph, keyed by the same cheap
+    (node count, edge count) fingerprint ``_dependency_order`` uses, so a graph
+    that gains or loses structure is reclassified while a mere re-query is a
+    dict hit.
+    """
+
+    G = graph.G
+    fingerprint = (G.number_of_nodes(), G.number_of_edges())
+    cache = G.graph.get("_dispatch_metadata_cache")
+    if cache is None or cache.get("__fingerprint__") != fingerprint:
+        cache = {"__fingerprint__": fingerprint}
+        G.graph["_dispatch_metadata_cache"] = cache
+    key = int(node_id)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    result = _is_dispatch_metadata_node_impl(graph, node_id)
+    cache[key] = result
+    return result
+
+
+def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
     data = graph.G.nodes[node_id]
     node_type = str(data.get("type"))
     expression = data.get("expr_obj")
@@ -4544,10 +4832,13 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
     coordinator_accessor = (
         str(data.get("op") or node_type) in ACCESSOR_OPERATORS
     )
-    coordinator_bit_shift = (
-        isinstance(expression, ast.BinOp)
-        and isinstance(expression.op, (ast.LShift, ast.RShift))
-    )
+    # ``<<``/``>>`` are ordinary numeric tensor operators (bitfield extraction
+    # in a byte decoder, for example), not inherently coordinator-side. A
+    # genuine *scalar* shift -- address/index arithmetic -- is already caught
+    # by ``static_scalar_expression`` below (every operand a scalar), exactly
+    # as a scalar ``&`` is; there is deliberately no ``coordinator_bitand``.
+    # Special-casing every shift as coordinator metadata additionally swallowed
+    # tensor-parallel shifts, which then never reached a numeric region.
     coordinator_boolean_not = (
         isinstance(expression, ast.UnaryOp)
         and isinstance(expression.op, ast.Not)
@@ -4698,7 +4989,6 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
         or compares_none
         or static_scalar_expression
         or coordinator_accessor
-        or coordinator_bit_shift
         or coordinator_boolean_not
         or chained_comparison
         or loop_target_initializer
@@ -4706,6 +4996,49 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
             data.get("type") == "Load"
             and (data.get("attributes") or {}).get("source_type") == "Name"
         )
+    )
+
+
+def _subgraph_reduction_digest(subgraph: Any) -> str:
+    """Content key for one region's structural lowering.
+
+    ``_structural_region_program_from_subgraph`` is a pure function of the
+    dispatch subgraph, so hashing the subgraph identifies the region program it
+    will produce -- letting the incremental backup reuse an already-lowered
+    region whenever its subgraph is unchanged.
+    """
+
+    from joblib.externals import cloudpickle
+
+    return hashlib.sha256(cloudpickle.dumps(subgraph)).hexdigest()
+
+
+def _structural_region_program_from_subgraph(
+    subgraph: Any,
+) -> CapturedFusedProgram:
+    """Build one region's numeric program from its dispatch subgraph structure.
+
+    This is the value-free counterpart to a captured region program: the same
+    ``dispatch_region_to_fused_program`` the JIT/tape path uses, driven by the
+    subgraph the planner already isolated rather than by an observed tape. It
+    is how the graph-only precompile (an unfed mutable parameter left symbolic,
+    the exact case an autograd tape cannot observe) still produces real region
+    programs -- transcribing the ops faithfully, no hand-synthesis. Layout/cast
+    ops flow through under their own names for the backend to lower.
+    """
+
+    graph_data = subgraph.G.graph
+    region = DispatchRegion(
+        tuple(int(n) for n in graph_data.get("deployment_nodes", ())),
+        tuple(int(n) for n in graph_data.get("deployment_inputs", ())),
+        tuple(
+            (f"value_{int(v)}", int(v))
+            for v in graph_data.get("deployment_outputs", ())
+        ),
+        0.0,
+    )
+    return CapturedFusedProgram(
+        dispatch_region_to_fused_program(subgraph, region), {}
     )
 
 
@@ -4861,17 +5194,20 @@ def _dispatch_subgraph(
     subgraph.G.graph["compartment_schedule_preference"] = (
         schedule_preference
     )
+    # One topological sort, then bucket by level -- not one full sort per
+    # level. The order within a level is identical (it is the single sort's
+    # order, filtered), so the schedule is unchanged; only the redundant
+    # O(levels x sort) work is removed.
+    _compartment_order = nx.lexicographical_topological_sort(
+        subgraph.G, key=lambda value_id: int(value_id)
+    )
+    _nodes_by_level: dict[int, list[int]] = {}
+    for node_id in _compartment_order:
+        _nodes_by_level.setdefault(
+            int(subgraph.levels.get(node_id, 0)), []
+        ).append(node_id)
     subgraph.G.graph["compartment_schedule"] = tuple(
-        (
-            level,
-            tuple(
-                node_id
-                for node_id in nx.lexicographical_topological_sort(
-                    subgraph.G, key=lambda value_id: int(value_id)
-                )
-                if int(subgraph.levels.get(node_id, 0)) == level
-            ),
-        )
+        (level, tuple(_nodes_by_level.get(level, ())))
         for level in sorted(set(subgraph.levels.values()))
     )
     subgraph.G.graph["deployment_inputs"] = tuple(
@@ -5036,41 +5372,55 @@ def _control_partition_keys(
             for member in ast.walk(expression)
         )
     )
+    # Invert every owner->members relation into member->owners once, in owner
+    # order, so each node's key is a set of dict lookups rather than a rescan of
+    # every plan/callsite/comprehension/frontier. The old per-node membership
+    # scans were O(nodes x owners) and dominated the planning pass; this is
+    # O(sum of membership sizes + nodes) with byte-identical output.
+    def _invert(owners, member_sets):
+        by_node: dict[int, list[Any]] = {}
+        for owner in owners:
+            for member in member_sets(owner):
+                by_node.setdefault(int(member), []).append(owner)
+        return by_node
+
+    loops_by_node = _invert(
+        plans, lambda plan: plan.loop.body_nodes,
+    )
+    loops_by_node = {
+        node_id: tuple(plan.loop.node_id for plan in owners)
+        for node_id, owners in loops_by_node.items()
+    }
+    comp_body_by_node = _invert(
+        comprehension_owners, lambda owner: comprehension_body_members[owner],
+    )
+    callsites_by_node = _invert(
+        callsites, lambda callsite: call_descendants[callsite],
+    )
+    comp_desc_by_node = _invert(
+        comprehension_owners, lambda owner: comprehension_descendants[owner],
+    )
+    frontiers_by_node: dict[int, list[tuple[int, int]]] = {}
+    for loop_id, control_id, end_line, body in loop_control_frontiers:
+        for member in body:
+            member = int(member)
+            if member not in graph.G:
+                continue
+            if int(getattr(
+                graph.G.nodes[member].get("expr_obj"), "lineno", -1,
+            )) > end_line:
+                frontiers_by_node.setdefault(member, []).append(
+                    (loop_id, control_id)
+                )
+
     return {
         node_id: (
-            tuple(
-                plan.loop.node_id
-                for plan in plans
-                if node_id in plan.loop.body_nodes
-            ),
+            tuple(loops_by_node.get(int(node_id), ())),
             tuple(sorted(branches.get(node_id, ()))),
-            tuple(
-                owner
-                for owner in comprehension_owners
-                if node_id in comprehension_body_members[owner]
-            ),
-            tuple(
-                callsite
-                for callsite in callsites
-                if node_id in call_descendants[callsite]
-            ),
-            tuple(
-                owner
-                for owner in comprehension_owners
-                if node_id in comprehension_descendants[owner]
-            ),
-            tuple(
-                (loop_id, control_id)
-                for loop_id, control_id, end_line, body in loop_control_frontiers
-                if node_id in body
-                and int(
-                    getattr(
-                        graph.G.nodes[node_id].get("expr_obj"),
-                        "lineno",
-                        -1,
-                    )
-                ) > end_line
-            ),
+            tuple(comp_body_by_node.get(int(node_id), ())),
+            tuple(callsites_by_node.get(int(node_id), ())),
+            tuple(comp_desc_by_node.get(int(node_id), ())),
+            tuple(frontiers_by_node.get(int(node_id), ())),
         )
         for node_id in node_ids
     }
@@ -11742,289 +12092,31 @@ def _resolve_unambiguous_method_references(graph: Any) -> None:
 MAX_UNROLL_LIMIT = 4096
 
 
-def strategize_shell_deployment(
-    graph: Any,
-    *,
-    # Was 256, which was a GLSL dispatch-sizing constraint: a shader had to
-    # be split into chunks a driver would accept. That is no longer what the
-    # number means now that emission goes SPIR-V -> GLSL, and for a target
-    # that wants one flat program it was actively harmful -- a program past
-    # the bound was split into regions, so a caller asking for a flat
-    # unrolled loop silently got a retained one instead.
-    max_nodes_per_dispatch: int = 65536,
-    backend: str | None = None,
-    remove_loops: bool | None = None,
-    unroll_limit: int | None = None,
-    schedule_preference: str | None = None,
-    _function_table_stack: tuple[int, ...] = (),
-) -> type:
-    """Build a stateful shell around the graph's flat dispatch schedule.
-
-    This is the compilation choke point: every backend -- c, python, glsl,
-    fortran, webgl, webgpu -- funnels its ProcessGraph through this one
-    control-planning stage before any backend-specific emission happens.
-    The name is generic on purpose; nothing below is GLSL-specific.
-
-    ``backend`` only tags the loop-composition capability profile below --
-    it does not change GLSL emission, which stays gated behind
-    ``capture_fused_programs(precompile_only=...)`` regardless of this
-    argument. Callers that only want the FusedProgram/ControlProgram/SSA
-    stages (any backend) should pass ``precompile_only=True`` there and
-    never reach GLSL-specific emission at all.
-
-    ``remove_loops`` disables native loop retention, so
-    ``evaporate_unrolled_loops`` unrolls every discovered loop into a flat
-    instruction sequence instead of a real ``LoopBlock``.
-
-    ``unroll_limit`` is the largest trip count that may be unrolled. It was
-    fixed at 8, which is not a property of any backend -- a target that
-    wants a flat program wants *its* loops flat, whatever their length. A
-    loop above the limit is silently retained instead, which for a caller
-    that needed a flat program means a shorter program that still compiles
-    and quietly computes fewer iterations. Raise it to whatever the target
-    can actually take.
-    """
-
-    # Inherit whatever the compilation asked for, then record it so the
-    # function shells planned from subgraphs of this one see the same thing.
-    # Without this a nested function -- which is where a loop usually lives,
-    # since the entrypoint is a thin wrapper -- silently planned with the
-    # defaults, and a caller asking for a flat program got a retained loop.
-    inherited = dict(graph.G.graph.get("loop_settings") or {})
-    backend = inherited.get("backend", "glsl") if backend is None else backend
-    remove_loops = (
-        inherited.get("remove_loops", False) if remove_loops is None
-        else remove_loops
-    )
-    unroll_limit = (
-        inherited.get("unroll_limit", 8) if unroll_limit is None
-        else unroll_limit
-    )
-    schedule_preference = (
-        inherited.get("schedule_preference", "alap")
-        if schedule_preference is None else schedule_preference
-    )
-    schedule_preference = str(schedule_preference).lower()
-    if schedule_preference not in {"asap", "alap"}:
-        raise ValueError(
-            "deployment schedule preference must be 'asap' or 'alap'"
-        )
-    unroll_limit = max(1, min(int(unroll_limit), MAX_UNROLL_LIMIT))
-    graph.G.graph["loop_settings"] = {
-        "backend": backend,
-        "remove_loops": bool(remove_loops),
-        "unroll_limit": int(unroll_limit),
-        "schedule_preference": schedule_preference,
-    }
-    graph.G.graph["deployment_schedule_preference"] = schedule_preference
-
-    _resolve_bound_function_references(graph)
-    _propagate_callsite_planner_specializations(graph)
-    canonical_value_ids = bool(
-        graph.G.graph.get("canonical_value_ids")
-    )
-    loop_composer = LoopComposer(
-        LoopBackendCapabilities(
-            backend=backend,
-            native_for=not remove_loops,
-            native_while=not remove_loops,
-            dynamic_bounds=not remove_loops,
-            kpn=False,
-            unroll_limit=int(unroll_limit),
-        )
-    )
-    discovered_loop_plans = (
-        loop_composer.discover(graph)
-        if canonical_value_ids
-        else ()
-    )
-    evaporated_loop_plans = (
-        evaporate_unrolled_loops(graph, discovered_loop_plans)
-        if discovered_loop_plans
-        else ()
-    )
-    evaporated_loop_ids = {
-        int(plan.loop.node_id) for plan in evaporated_loop_plans
-    }
-    retained_loop_plans = tuple(
-        plan
-        for plan in discovered_loop_plans
-        if int(plan.loop.node_id) not in evaporated_loop_ids
-        and int(plan.loop.node_id) in graph.G
-    )
-    semantic_loop_plans = (
-        loop_composer.materialize_semantic_ir(
-            graph,
-            retained_loop_plans,
-        )
-        if retained_loop_plans
-        else ()
-    )
-    loop_plans = (
-        materialize_retained_loop_ports(graph, semantic_loop_plans)
-        if semantic_loop_plans
-        else ()
-    )
-    function_entry = None
-    function_reference = graph.G.graph.get("function_ref")
-    function_table = getattr(graph, "function_table", None)
-    if function_reference is not None and function_table is not None:
-        function_entry = function_table.entry(function_reference)
-    process_graph_boundary = (
-        None
-        if function_entry is None
-        else function_entry.metadata.get("process_graph_boundary")
-    )
-    python_callable = (
-        None if function_entry is None else function_entry.python_callable
-    )
-    _resolve_unambiguous_method_references(graph)
-    reference_tables = build_shell_reference_tables(graph)
-    ordered_executable_nodes = _dependency_order(graph)
-    executable_nodes = tuple(
-        node_id
-        for node_id in ordered_executable_nodes
-        if not _is_dispatch_metadata_node(graph, node_id)
-    )
-    # Control membership is a semantic partition: numerical work may be
-    # reduced freely inside one planner-owned loop body or conditional branch,
-    # but never fused across that control boundary.  All other dispatch
-    # boundaries are produced by the fixed-point shader-region identities
-    # rather than inherited from schedule levels or operator spelling.
-    partition_keys = _control_partition_keys(
-        graph,
-        loop_plans,
-        executable_nodes,
-    )
-    inert_nodes = _inert_routing_nodes(graph)
-    closure_edges, closure_outputs = _closure_routing_dependencies(graph)
-    return_outputs = frozenset(
-        int(value_id)
-        for value_id in (
-            *(
-                parent
-                for _node_id, data in graph.G.nodes(data=True)
-                if isinstance(data.get("expr_obj"), ast.Return)
-                for parent, role in (data.get("parents") or ())
-                if str(role) in {"result", "value", "operand"}
-            ),
-            *(graph.G.graph.get("return_value_nodes", {}) or {}).values(),
-        )
-        if int(value_id) in graph.G
-    )
-    recursion_control_nodes = frozenset(
-        int(node_id)
-        for record in (
-            graph.G.graph.get("recursion_table") or {}
-        ).values()
-        if record.get("control_ir", True)
-        for node_id in record.get("control_members", ())
-    )
-    dispatch_plan = reduce_scheduled_shader_regions(
-        graph,
-        executable_nodes,
-        max_nodes_per_region=max_nodes_per_dispatch,
-        partition_keys=partition_keys,
-        extra_dependency_edges=closure_edges,
-        control_node_ids=recursion_control_nodes,
-    )
-    executable_dispatch_nodes = tuple(
-        dispatch.node_ids
-        for dispatch in dispatch_plan.dispatches
-    )
-    control_deployment_regions = bind_control_deployments_to_regions(
-        graph.G.graph.get("control_deployment_regions", ()),
-        executable_dispatch_nodes,
-    )
-    deployment_region_preferences: dict[int, str] = {}
-    for deployment in control_deployment_regions:
-        for lane in deployment.lanes:
-            for region_index in lane.region_indices:
-                previous = deployment_region_preferences.setdefault(
-                    int(region_index), deployment.schedule_preference
-                )
-                if previous != deployment.schedule_preference:
-                    raise ValueError(
-                        "scheduled region has conflicting deployment "
-                        f"preferences: region={region_index}, "
-                        f"preferences={(previous, deployment.schedule_preference)!r}"
-                    )
-    dispatch_subgraphs = tuple(
-        _dispatch_subgraph(
-            graph,
-            node_ids,
-            required_outputs=frozenset((*closure_outputs, *return_outputs)),
-            inert_nodes=inert_nodes,
-            schedule_preference=deployment_region_preferences.get(
-                region_index, "asap"
-            ),
-        )
-        for region_index, node_ids in enumerate(executable_dispatch_nodes)
-        if node_ids
-    )
-    for subgraph, dispatch in zip(
-        dispatch_subgraphs,
-        dispatch_plan.dispatches,
-    ):
-        subgraph.G.graph["rewrite_history"] = dispatch.rewrite_history
-    loop_region_indices = {
-        plan.loop.node_id: tuple(
-            region_index
-            for region_index, subgraph in enumerate(dispatch_subgraphs)
-            if set(
-                subgraph.G.graph.get("deployment_nodes", ())
-            ).intersection(plan.loop.body_nodes)
-        )
-        for plan in loop_plans
-    }
-    loop_shader_reductions = analyze_shader_loop_reductions(
-        graph,
-        loop_plans,
-        executable_dispatch_nodes,
-    )
-    deep_compilers = tuple(
-        GraphDeepCompiler(
-            subgraph,
-            dict(abstract_tensor_funcs),
-            abstract_tensor_sigs,
-            node_observer=_observe_process_graph_node,
-        )
-        for subgraph in dispatch_subgraphs
-    )
-    ephemeral_callables = tuple(
-        EphemeralProcessGraphCallable(
-            subgraph,
-            compiler=compiler,
-            eager=False,
-        )
-        for subgraph, compiler in zip(
-            dispatch_subgraphs,
-            deep_compilers,
-        )
-    )
-
-    class_ast = ast.parse(
-        """
 class ProcessGraphGLSLDeployment:
-    process_graph = __process_graph__
-    external_function_table = __external_function_table__
-    static_python_bindings = __static_python_bindings__
-    dispatch_plan = __dispatch_plan__
-    loop_plans = __loop_plans__
-    loop_region_indices = __loop_region_indices__
-    loop_shader_reductions = __loop_shader_reductions__
-    control_deployment_regions = __control_deployment_regions__
-    process_graph_boundary = __process_graph_boundary__
-    python_callable = staticmethod(__python_callable__)
-    dispatch_subgraphs = __dispatch_subgraphs__
-    deep_compilers = __deep_compilers__
-    ephemeral_callables = __ephemeral_callables__
-    reference_table_template = __reference_tables__
+    # Per-compile values. A fresh subclass is created for each compiled
+    # ProcessGraph (see strategize_shell_deployment) with these overridden
+    # via ordinary class-attribute assignment -- no source-text templating.
+    process_graph = None
+    external_function_table = None
+    static_python_bindings = None
+    dispatch_plan = None
+    loop_plans = None
+    loop_region_indices = None
+    loop_shader_reductions = None
+    control_deployment_regions = None
+    process_graph_boundary = None
+    python_callable = None
+    dispatch_subgraphs = None
+    deep_compilers = None
+    ephemeral_callables = None
+    reference_table_template = None
     function_shell_types = {}
-    source_node_count = __source_node_count__
-    primitive_count = __primitive_count__
-    loop_count = __loop_count__
-    dispatch_count = __dispatch_count__
+    source_node_count = None
+    primitive_count = None
+    loop_count = None
+    dispatch_count = None
+    deployment_batches = None
+    max_nodes_per_dispatch = None
 
     def __init__(
         self,
@@ -12055,7 +12147,7 @@ class ProcessGraphGLSLDeployment:
             else "composed_control"
         )
         self.batch_size = dict(
-            __deployment_batches__
+            self.deployment_batches
             if batch_size is None
             else batch_size
         )
@@ -12102,7 +12194,7 @@ class ProcessGraphGLSLDeployment:
                     node_id,
                     reference,
                     shell_type,
-                    __max_nodes_per_dispatch__,
+                    self.max_nodes_per_dispatch,
                 )
                 planned = shell_type(**tuning)
                 planned.function_shells = self.function_shells
@@ -12154,6 +12246,7 @@ class ProcessGraphGLSLDeployment:
         self.compiled_shell_program = None
         self.compiled_region_indices = ()
         self.captured_region_programs = {}
+        self.planned_operator_implementations = {}
         # A reference operator (SetAttr/GetAttr) has an unambiguous identity
         # from its own graph node id -- no tensor primitive to correlate,
         # no ambiguity the tape machinery above exists to resolve.  Recorded
@@ -12392,6 +12485,131 @@ class ProcessGraphGLSLDeployment:
             self.hierarchy_value_table,
         ) = assign_hierarchy_ids(_build_shell_hierarchy_plan(self))
         return self.hierarchy_plan
+
+    def prepare_graph_precompile(
+        self, *, device=None, reduction_cache=None, progress=None
+    ):
+        # Prepare graph/control IR without observing runtime parameter values.
+        #
+        # ``reduction_cache`` (a ``ReductionArtifactStore``), when given,
+        # persists each region program under its own content key as it is
+        # lowered -- an incremental backup of this portion, so an interrupted
+        # prepare reloads the regions it already built instead of redoing all
+        # of them, and each region becomes an independently addressable
+        # catalogue entry. ``progress``, if given, is called with a message
+        # string per shell and per region so this otherwise-silent phase is
+        # visible.
+
+        def _note(message):
+            if progress is not None:
+                progress(message)
+
+        self.refresh_hierarchy_plan()
+        if not self.whole_program_compiled:
+            self.compile_process_graph(device=device)
+        for target in _walk_planned_shells(self):
+            target.refresh_hierarchy_plan()
+            complete_regions = tuple(range(len(target.dispatch_subgraphs)))
+            retained_value_ids = {
+                int(value_id)
+                for item in target.hierarchy_plan.items
+                if isinstance(item, PlanClosure)
+                and item.name.startswith("region_")
+                for line in item.items
+                if isinstance(line, PlanLine)
+                for value_id in (*line.inputs, *line.outputs)
+            }
+            considered_reductions = tuple(
+                reduction
+                for reduction in target.loop_shader_reductions
+                if reduction.control_program is not None
+            )
+            controls = tuple(
+                project_control_regions(
+                    reduction.control_program,
+                    complete_regions,
+                    retained_value_ids=retained_value_ids,
+                )
+                for reduction in considered_reductions
+            )
+            shell_control = overlay_scheduled_control(
+                complete_regions,
+                controls,
+                known_nesting=_loop_reduction_nesting_hints(
+                    considered_reductions,
+                    target.loop_plans,
+                    target.process_graph,
+                ),
+            )
+            target.shell_control_program = replace(
+                shell_control,
+                deployment_regions=tuple(dict.fromkeys((
+                    *shell_control.deployment_regions,
+                    *target.control_deployment_regions,
+                ))),
+            )
+            target.compiled_shell_program = CapturedFusedProgram(
+                FusedProgram(
+                    version=1,
+                    feeds=set(),
+                    steps=[],
+                    outputs={},
+                    meta={},
+                    extras={"kernel_kind": "graph-precompile"},
+                ),
+                {},
+            )
+            target.compiled_tapes = ()
+            target.compiled_region_indices = ()
+            # An unfed mutable parameter is left a symbolic SSA input; its
+            # region programs come from the planner-isolated dispatch subgraphs
+            # via the same structural builder the tape path uses, not from a
+            # bespoke plan transcription. Layout/cast ops ride through under
+            # their own names for each backend to lower.
+            subgraphs = tuple(enumerate(target.dispatch_subgraphs))
+            fn_name = str(
+                target.process_graph.G.graph.get("function_name") or "?"
+            )
+            _note(
+                f"aot: lowering {len(subgraphs)} region(s) for shell {fn_name}"
+            )
+            region_programs = {}
+            for region_index, subgraph in subgraphs:
+                if reduction_cache is not None:
+                    program, cached = reduction_cache.get_or_compute(
+                        _subgraph_reduction_digest(subgraph),
+                        lambda subgraph=subgraph:
+                            _structural_region_program_from_subgraph(subgraph),
+                    )
+                else:
+                    program = _structural_region_program_from_subgraph(subgraph)
+                    cached = False
+                region_programs[region_index] = program
+                _note(
+                    f"aot: region {fn_name}[{region_index}] "
+                    + ("reused from catalogue" if cached else "lowered")
+                    + f" ({region_index + 1}/{len(subgraphs)})"
+                )
+            target.captured_region_programs = region_programs
+            target.compile_time_region_indices = set()
+            target.planned_operator_implementations = (
+                _build_planned_operator_implementations(
+                    target.hierarchy_plan,
+                    {},
+                    (),
+                )
+            )
+        (
+            self.hierarchy_plan,
+            self.hierarchy_value_table,
+        ) = assign_hierarchy_ids(
+            _refresh_hierarchy_control_captures(
+                self.hierarchy_plan,
+                self,
+            ),
+            self.hierarchy_value_table,
+        )
+        return self
 
     def capture_fused_programs(
         self,
@@ -12633,23 +12851,37 @@ class ProcessGraphGLSLDeployment:
                 target.compiled_region_indices,
                 target.compiled_tapes,
             ))
-            if target.reference_operator_sequence:
-                # Package exactly what happened, in the order it happened --
-                # no fusion, no launch-cost strategy, no tape correlation
-                # (a reference operator's own graph node id is already an
-                # unambiguous identity; nothing dynamic needs resolving).
-                # Reordering or batching these would break the causality of
-                # the sequential memory operations they represent.
-                seen_node_ids: set[int] = set()
+            target.planned_operator_implementations = (
+                _build_planned_operator_implementations(
+                    target.hierarchy_plan,
+                    target.captured_region_programs,
+                    target.reference_operator_sequence,
+                )
+            )
+            if target.reference_operator_sequence and not precompile_only:
+                # Observation classifies the lowering selected at runtime;
+                # it does not define segment membership or order.  Those are
+                # already fixed by the ProcessGraph hierarchy plan.
+                observed_node_ids = set(
+                    map(int, target.reference_operator_sequence)
+                )
                 ordered_node_ids = [
                     node_id
-                    for node_id in target.reference_operator_sequence
-                    if node_id in target.process_graph.G
-                    and not (
-                        node_id in seen_node_ids
-                        or seen_node_ids.add(node_id)
+                    for node_id in _planned_operator_node_ids(
+                        target.hierarchy_plan
                     )
+                    if node_id in observed_node_ids
+                    if node_id in target.process_graph.G
                 ]
+                missing_planned_nodes = observed_node_ids - set(
+                    ordered_node_ids
+                )
+                if missing_planned_nodes:
+                    raise RuntimeError(
+                        "observed plain operators are absent from the "
+                        "ProcessGraph segment plan: "
+                        f"{tuple(sorted(missing_planned_nodes))!r}"
+                    )
                 def _reference_step_input_ids(node_id: int) -> list[int]:
                     # A field's real identity is ``attribute_slot`` (see
                     # ``bind_target``/``resolve_expression``) -- a
@@ -14050,6 +14282,15 @@ class ProcessGraphGLSLDeployment:
                     "loops": len(self.loop_shader_reductions),
                 },
             )
+            considered_reductions = tuple(
+                reduction
+                for reduction in self.loop_shader_reductions
+                if reduction.control_program is not None
+                and (
+                    not emit_glsl
+                    or reduction.collapsible
+                )
+            )
             shell_control = overlay_scheduled_control(
                 complete_regions,
                 tuple(
@@ -14058,12 +14299,12 @@ class ProcessGraphGLSLDeployment:
                         complete_regions,
                         retained_value_ids=retained_value_ids,
                     )
-                    for reduction in self.loop_shader_reductions
-                    if reduction.control_program is not None
-                    and (
-                        not emit_glsl
-                        or reduction.collapsible
-                    )
+                    for reduction in considered_reductions
+                ),
+                known_nesting=_loop_reduction_nesting_hints(
+                    considered_reductions,
+                    self.loop_plans,
+                    self.process_graph,
                 ),
             )
             shell_control = replace(
@@ -14807,8 +15048,269 @@ class ProcessGraphGLSLDeployment:
     def __exit__(self, exc_type, exc, traceback):
         self.release()
         return False
-"""
+
+
+def strategize_shell_deployment(
+    graph: Any,
+    *,
+    # Was 256, which was a GLSL dispatch-sizing constraint: a shader had to
+    # be split into chunks a driver would accept. That is no longer what the
+    # number means now that emission goes SPIR-V -> GLSL, and for a target
+    # that wants one flat program it was actively harmful -- a program past
+    # the bound was split into regions, so a caller asking for a flat
+    # unrolled loop silently got a retained one instead.
+    max_nodes_per_dispatch: int = 65536,
+    backend: str | None = None,
+    remove_loops: bool | None = None,
+    unroll_limit: int | None = None,
+    schedule_preference: str | None = None,
+    _function_table_stack: tuple[int, ...] = (),
+) -> type:
+    """Build a stateful shell around the graph's flat dispatch schedule.
+
+    This is the compilation choke point: every backend -- c, python, glsl,
+    fortran, webgl, webgpu -- funnels its ProcessGraph through this one
+    control-planning stage before any backend-specific emission happens.
+    The name is generic on purpose; nothing below is GLSL-specific.
+
+    ``backend`` only tags the loop-composition capability profile below --
+    it does not change GLSL emission, which stays gated behind
+    ``capture_fused_programs(precompile_only=...)`` regardless of this
+    argument. Callers that only want the FusedProgram/ControlProgram/SSA
+    stages (any backend) should pass ``precompile_only=True`` there and
+    never reach GLSL-specific emission at all.
+
+    ``remove_loops`` disables native loop retention, so
+    ``evaporate_unrolled_loops`` unrolls every discovered loop into a flat
+    instruction sequence instead of a real ``LoopBlock``.
+
+    ``unroll_limit`` is the largest trip count that may be unrolled. It was
+    fixed at 8, which is not a property of any backend -- a target that
+    wants a flat program wants *its* loops flat, whatever their length. A
+    loop above the limit is silently retained instead, which for a caller
+    that needed a flat program means a shorter program that still compiles
+    and quietly computes fewer iterations. Raise it to whatever the target
+    can actually take.
+    """
+
+    # Inherit whatever the compilation asked for, then record it so the
+    # function shells planned from subgraphs of this one see the same thing.
+    # Without this a nested function -- which is where a loop usually lives,
+    # since the entrypoint is a thin wrapper -- silently planned with the
+    # defaults, and a caller asking for a flat program got a retained loop.
+    inherited = dict(graph.G.graph.get("loop_settings") or {})
+    backend = inherited.get("backend", "glsl") if backend is None else backend
+    remove_loops = (
+        inherited.get("remove_loops", False) if remove_loops is None
+        else remove_loops
     )
+    unroll_limit = (
+        inherited.get("unroll_limit", 8) if unroll_limit is None
+        else unroll_limit
+    )
+    schedule_preference = (
+        inherited.get("schedule_preference", "alap")
+        if schedule_preference is None else schedule_preference
+    )
+    schedule_preference = str(schedule_preference).lower()
+    if schedule_preference not in {"asap", "alap"}:
+        raise ValueError(
+            "deployment schedule preference must be 'asap' or 'alap'"
+        )
+    unroll_limit = max(1, min(int(unroll_limit), MAX_UNROLL_LIMIT))
+    graph.G.graph["loop_settings"] = {
+        "backend": backend,
+        "remove_loops": bool(remove_loops),
+        "unroll_limit": int(unroll_limit),
+        "schedule_preference": schedule_preference,
+    }
+    graph.G.graph["deployment_schedule_preference"] = schedule_preference
+
+    _resolve_bound_function_references(graph)
+    _propagate_callsite_planner_specializations(graph)
+    canonical_value_ids = bool(
+        graph.G.graph.get("canonical_value_ids")
+    )
+    loop_composer = LoopComposer(
+        LoopBackendCapabilities(
+            backend=backend,
+            native_for=not remove_loops,
+            native_while=not remove_loops,
+            dynamic_bounds=not remove_loops,
+            kpn=False,
+            unroll_limit=int(unroll_limit),
+        )
+    )
+    discovered_loop_plans = (
+        loop_composer.discover(graph)
+        if canonical_value_ids
+        else ()
+    )
+    evaporated_loop_plans = (
+        evaporate_unrolled_loops(graph, discovered_loop_plans)
+        if discovered_loop_plans
+        else ()
+    )
+    evaporated_loop_ids = {
+        int(plan.loop.node_id) for plan in evaporated_loop_plans
+    }
+    retained_loop_plans = tuple(
+        plan
+        for plan in discovered_loop_plans
+        if int(plan.loop.node_id) not in evaporated_loop_ids
+        and int(plan.loop.node_id) in graph.G
+    )
+    semantic_loop_plans = (
+        loop_composer.materialize_semantic_ir(
+            graph,
+            retained_loop_plans,
+        )
+        if retained_loop_plans
+        else ()
+    )
+    loop_plans = (
+        materialize_retained_loop_ports(graph, semantic_loop_plans)
+        if semantic_loop_plans
+        else ()
+    )
+    function_entry = None
+    function_reference = graph.G.graph.get("function_ref")
+    function_table = getattr(graph, "function_table", None)
+    if function_reference is not None and function_table is not None:
+        function_entry = function_table.entry(function_reference)
+    process_graph_boundary = (
+        None
+        if function_entry is None
+        else function_entry.metadata.get("process_graph_boundary")
+    )
+    python_callable = (
+        None if function_entry is None else function_entry.python_callable
+    )
+    _resolve_unambiguous_method_references(graph)
+    reference_tables = build_shell_reference_tables(graph)
+    ordered_executable_nodes = _dependency_order(graph)
+    executable_nodes = tuple(
+        node_id
+        for node_id in ordered_executable_nodes
+        if not _is_dispatch_metadata_node(graph, node_id)
+    )
+    # Control membership is a semantic partition: numerical work may be
+    # reduced freely inside one planner-owned loop body or conditional branch,
+    # but never fused across that control boundary.  All other dispatch
+    # boundaries are produced by the fixed-point shader-region identities
+    # rather than inherited from schedule levels or operator spelling.
+    partition_keys = _control_partition_keys(
+        graph,
+        loop_plans,
+        executable_nodes,
+    )
+    inert_nodes = _inert_routing_nodes(graph)
+    closure_edges, closure_outputs = _closure_routing_dependencies(graph)
+    return_outputs = frozenset(
+        int(value_id)
+        for value_id in (
+            *(
+                parent
+                for _node_id, data in graph.G.nodes(data=True)
+                if isinstance(data.get("expr_obj"), ast.Return)
+                for parent, role in (data.get("parents") or ())
+                if str(role) in {"result", "value", "operand"}
+            ),
+            *(graph.G.graph.get("return_value_nodes", {}) or {}).values(),
+        )
+        if int(value_id) in graph.G
+    )
+    recursion_control_nodes = frozenset(
+        int(node_id)
+        for record in (
+            graph.G.graph.get("recursion_table") or {}
+        ).values()
+        if record.get("control_ir", True)
+        for node_id in record.get("control_members", ())
+    )
+    dispatch_plan = reduce_scheduled_shader_regions(
+        graph,
+        executable_nodes,
+        max_nodes_per_region=max_nodes_per_dispatch,
+        partition_keys=partition_keys,
+        extra_dependency_edges=closure_edges,
+        control_node_ids=recursion_control_nodes,
+    )
+    executable_dispatch_nodes = tuple(
+        dispatch.node_ids
+        for dispatch in dispatch_plan.dispatches
+    )
+    control_deployment_regions = bind_control_deployments_to_regions(
+        graph.G.graph.get("control_deployment_regions", ()),
+        executable_dispatch_nodes,
+    )
+    deployment_region_preferences: dict[int, str] = {}
+    for deployment in control_deployment_regions:
+        for lane in deployment.lanes:
+            for region_index in lane.region_indices:
+                previous = deployment_region_preferences.setdefault(
+                    int(region_index), deployment.schedule_preference
+                )
+                if previous != deployment.schedule_preference:
+                    raise ValueError(
+                        "scheduled region has conflicting deployment "
+                        f"preferences: region={region_index}, "
+                        f"preferences={(previous, deployment.schedule_preference)!r}"
+                    )
+    dispatch_subgraphs = tuple(
+        _dispatch_subgraph(
+            graph,
+            node_ids,
+            required_outputs=frozenset((*closure_outputs, *return_outputs)),
+            inert_nodes=inert_nodes,
+            schedule_preference=deployment_region_preferences.get(
+                region_index, "asap"
+            ),
+        )
+        for region_index, node_ids in enumerate(executable_dispatch_nodes)
+        if node_ids
+    )
+    for subgraph, dispatch in zip(
+        dispatch_subgraphs,
+        dispatch_plan.dispatches,
+    ):
+        subgraph.G.graph["rewrite_history"] = dispatch.rewrite_history
+    loop_region_indices = {
+        plan.loop.node_id: tuple(
+            region_index
+            for region_index, subgraph in enumerate(dispatch_subgraphs)
+            if set(
+                subgraph.G.graph.get("deployment_nodes", ())
+            ).intersection(plan.loop.body_nodes)
+        )
+        for plan in loop_plans
+    }
+    loop_shader_reductions = analyze_shader_loop_reductions(
+        graph,
+        loop_plans,
+        executable_dispatch_nodes,
+    )
+    deep_compilers = tuple(
+        GraphDeepCompiler(
+            subgraph,
+            dict(abstract_tensor_funcs),
+            abstract_tensor_sigs,
+            node_observer=_observe_process_graph_node,
+        )
+        for subgraph in dispatch_subgraphs
+    )
+    ephemeral_callables = tuple(
+        EphemeralProcessGraphCallable(
+            subgraph,
+            compiler=compiler,
+            eager=False,
+        )
+        for subgraph, compiler in zip(
+            dispatch_subgraphs,
+            deep_compilers,
+        )
+    )
+
     executable_node_ids = {
         node_id
         for node_ids in executable_dispatch_nodes
@@ -14819,125 +15321,42 @@ class ProcessGraphGLSLDeployment:
         for node_id, location in dispatch_plan.node_locations.items()
         if node_id in executable_node_ids
     }
-    namespace = {
-        "replace": replace,
-        "__process_graph__": graph,
-        "__external_function_table__": getattr(
-            graph,
-            "external_function_table",
-            None,
-        ),
-        "__static_python_bindings__": dict(
-            getattr(graph, "python_bindings", {}) or {}
-        ),
-        "__dispatch_plan__": dispatch_plan,
-        "__loop_plans__": loop_plans,
-        "__loop_shader_reductions__": loop_shader_reductions,
-        "__control_deployment_regions__": control_deployment_regions,
-        "__loop_region_indices__": loop_region_indices,
-        "__process_graph_boundary__": process_graph_boundary,
-        "__python_callable__": python_callable,
-        "__dispatch_subgraphs__": dispatch_subgraphs,
-        "__deep_compilers__": deep_compilers,
-        "__ephemeral_callables__": ephemeral_callables,
-        "__reference_tables__": reference_tables,
-        "__source_node_count__": graph.G.number_of_nodes(),
-        "__primitive_count__": sum(
-            len(node_ids)
-            for node_ids in executable_dispatch_nodes
-        ),
-        "__loop_count__": sum(
-            1
-            for _node_id, data in graph.G.nodes(data=True)
-            if str(data.get("type")) in {"For", "AsyncFor", "While"}
-        ),
-        "__dispatch_count__": len(dispatch_subgraphs),
-        "__max_nodes_per_dispatch__": int(max_nodes_per_dispatch),
-        "__deployment_batches__": node_locations,
-        "DeploymentFIFO": DeploymentFIFO,
-        "DeploymentProfiler": DeploymentProfiler,
-        "time": time,
-        "gc": gc,
-        "GLSLFusedProgramNetwork": GLSLFusedProgramNetwork,
-        "PrecompileObserverTensorOperations": (
-            PrecompileObserverTensorOperations
-        ),
-        "CapturedFusedProgram": CapturedFusedProgram,
-        "FusedProgram": FusedProgram,
-        "Meta": Meta,
-        "compile_recorded_fused_tape": (
-            compile_recorded_fused_tape
-        ),
-        "emit_multi_output_program_source": (
-            emit_multi_output_program_source
-        ),
-        "compose_control_shader": compose_control_shader,
-        "build_control_shader_artifact": build_control_shader_artifact,
-        "InstalledGLSLControlShell": InstalledGLSLControlShell,
-        "ControlProgram": ControlProgram,
-        "SequenceBlock": SequenceBlock,
-        "overlay_scheduled_control": overlay_scheduled_control,
-        "project_control_regions": project_control_regions,
-        "ordered_feed_ids": ordered_feed_ids,
-        "_compiler_input_name": _compiler_input_name,
-        "_bind_capture_tape": _bind_capture_tape,
-        "_capture_storage_identity": _capture_storage_identity,
-        "_remap_captured_program": _remap_captured_program,
-        "_remap_captured_all_ids": _remap_captured_all_ids,
-        "_project_captured_program": _project_captured_program,
-        "_capture_feed_aliases": _capture_feed_aliases,
-        "_wire_planned_step_inputs": _wire_planned_step_inputs,
-        "_collapse_planned_collection_materializations": (
-            _collapse_planned_collection_materializations
-        ),
-        "_unique_runtime_feed_aliases": _unique_runtime_feed_aliases,
-        "_coordinate_scheduled_capture": _coordinate_scheduled_capture,
-        "_use_scheduled_capture_backend": _use_scheduled_capture_backend,
-        "_compile_whole_process_graph": _compile_whole_process_graph,
-        "_source_static_value": _source_static_value,
-        "_callsite_specialized_shell_type": (
-            _callsite_specialized_shell_type
-        ),
-        "_constant_value": _constant_value,
-        "_attach_profiler": _attach_profiler,
-        "_walk_planned_shells": _walk_planned_shells,
-        "_deployment_program_table_lines": _deployment_program_table_lines,
-        "_build_shell_hierarchy_plan": _build_shell_hierarchy_plan,
-        "_refresh_hierarchy_control_captures": (
-            _refresh_hierarchy_control_captures
-        ),
-        "_declared_output_terminals": _declared_output_terminals,
-        "_validation_control_blocks": _validation_control_blocks,
-        "_build_hierarchical_glsl_artifact": (
-            _build_hierarchical_glsl_artifact
-        ),
-        "assign_hierarchy_ids": assign_hierarchy_ids,
-        "_diagnostic_value_summary": _diagnostic_value_summary,
-        "_captured_storage_meta": _captured_storage_meta,
-        "_shell_profile_name": _shell_profile_name,
-        # The generated class runs in this namespace only, so anything it
-        # calls has to be handed in explicitly.
-        "_resolve_binding_name": _resolve_binding_name,
-        "execute_captured_fused_program": execute_captured_fused_program,
-        "compile_captured_fused_program": compile_captured_fused_program,
-        "GLSLTensorOperations": GLSLTensorOperations,
-        "AbstractTensor": AbstractTensor,
-        "autograd": autograd,
-        "np": np,
-        "OpStep": OpStep,
-        "FusedProgram": FusedProgram,
-        "CapturedFusedProgram": CapturedFusedProgram,
-    }
-    exec(
-        compile(
-            class_ast,
-            filename="<glsl-deployment-strategy>",
-            mode="exec",
-        ),
-        namespace,
+    deployment_class = type(
+        "ProcessGraphGLSLDeployment",
+        (ProcessGraphGLSLDeployment,),
+        {
+            "process_graph": graph,
+            "external_function_table": getattr(
+                graph, "external_function_table", None
+            ),
+            "static_python_bindings": dict(
+                getattr(graph, "python_bindings", {}) or {}
+            ),
+            "dispatch_plan": dispatch_plan,
+            "loop_plans": loop_plans,
+            "loop_shader_reductions": loop_shader_reductions,
+            "control_deployment_regions": control_deployment_regions,
+            "loop_region_indices": loop_region_indices,
+            "process_graph_boundary": process_graph_boundary,
+            "python_callable": staticmethod(python_callable),
+            "dispatch_subgraphs": dispatch_subgraphs,
+            "deep_compilers": deep_compilers,
+            "ephemeral_callables": ephemeral_callables,
+            "reference_table_template": reference_tables,
+            "source_node_count": graph.G.number_of_nodes(),
+            "primitive_count": sum(
+                len(node_ids) for node_ids in executable_dispatch_nodes
+            ),
+            "loop_count": sum(
+                1
+                for _node_id, data in graph.G.nodes(data=True)
+                if str(data.get("type")) in {"For", "AsyncFor", "While"}
+            ),
+            "dispatch_count": len(dispatch_subgraphs),
+            "max_nodes_per_dispatch": int(max_nodes_per_dispatch),
+            "deployment_batches": node_locations,
+        },
     )
-    deployment_class = namespace["ProcessGraphGLSLDeployment"]
-    deployment_class.generated_ast = class_ast
     function_shell_types = {}
     function_table = getattr(graph, "function_table", None)
     table_identity = id(function_table)

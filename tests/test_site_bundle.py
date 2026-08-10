@@ -11,7 +11,10 @@ from src.compiler.site_bundle import (
     DEFAULT_WASM_CARD_OPERATIONS,
     DEFAULT_PUBLISH_ROOT,
     TURING_REPOSITORY_ROOT,
+    _compile_feed_values,
+    _content_version,
     _shader_execution_descriptor,
+    _write_program_origin,
     build_program_bundle,
     build_source_inspection_bundle,
     build_source_inspection_page,
@@ -186,6 +189,8 @@ def test_literal_source_contract_is_inspected_without_importing_source():
     assert contract.feeds["gain"]["values"] == [2.0] * 4
     assert contract.feed_expressions == {"x": "x / max(1, w - 1)"}
     assert contract.bake_mode == "whole_program"
+    assert contract.final_fused_reduction is True
+    assert contract.file_parameters == {}
     assert contract.schedule_preference == "alap"
     assert contract.constant_map == {}
     assert (contract.width, contract.height) == (16, 8)
@@ -226,6 +231,8 @@ def test_bake_mode_override_is_explicit_and_validated():
         discover_source_contract(SOURCE, bake_mode="numeric-ish")
     with pytest.raises(ValueError, match="asap.*alap"):
         discover_source_contract(SOURCE, schedule_preference="whenever")
+
+
 
 
 def test_website_builder_accepts_a_compiler_class_without_embedding_wasm(tmp_path):
@@ -306,6 +313,43 @@ def test_request_values_override_the_literal_source_contract():
     assert contract.feeds["x"] == [1.0, 2.0]
 
 
+def test_runtime_file_probe_does_not_identify_or_serialize_the_program(tmp_path: Path):
+    source = '''
+TURING_PAGE = {
+    "file_parameters": {
+        "subject": {"name": "subject-binary", "accept": ".exe"},
+    },
+}
+
+def load_subject(subject: bytes):
+    return len(subject)
+'''
+    first = discover_source_contract(source, probes={"subject": b"MZ-first"})
+    second = discover_source_contract(source, probes={"subject": b"MZ-second"})
+
+    assert first.mutable_parameters == ("subject",)
+    assert _compile_feed_values(
+        first, ("subject",), frozenset()
+    ) == {}
+    assert _content_version(source, first)[0] == _content_version(source, second)[0]
+
+    origin_path = _write_program_origin(
+        tmp_path,
+        first,
+        source,
+        "loader.py",
+        backend_targets=None,
+        include_backends=False,
+        include_mathematics=False,
+    )
+    origin = json.loads(origin_path.read_text(encoding="utf-8"))
+
+    assert origin["probes"] == {}
+    assert origin["runtime_file_parameters"] == {
+        "subject": {"name": "subject-binary", "accept": ".exe"},
+    }
+
+
 def test_slugify_never_emits_path_syntax():
     assert slugify(" ../../My Neat_Kernel.py ") == "my-neat-kernel-py"
 
@@ -359,6 +403,28 @@ def test_program_bundle_owns_page_source_wasm_manifest_and_inventory(tmp_path: P
         include_mathematics=False,
     )
     assert repeated.directory == bundle.directory
+
+
+def test_program_bundle_can_skip_final_fused_reduction(tmp_path: Path):
+    bundle = build_program_bundle(
+        SOURCE,
+        tmp_path,
+        source_filename="affine.py",
+        final_fused_reduction=False,
+        include_backends=False,
+        include_mathematics=False,
+    )
+
+    html = bundle.page_path.read_text(encoding="utf-8")
+    wasm_paths = {
+        item["path"]
+        for item in bundle.manifest["artifacts"]
+        if item["path"].endswith(".wasm")
+    }
+
+    assert bundle.manifest["compiler"]["final_fused_reduction"] is False
+    assert any(path.endswith("kernel_control_2000.wasm") for path in wasm_paths)
+    assert '"contiguous": null' in html
 
 
 def test_force_new_version_appends_instead_of_reusing(tmp_path: Path):
@@ -563,6 +629,23 @@ def test_progress_sink_receives_live_build_records_that_also_reach_the_page(tmp_
     assert ("profile", "process_graph") in kinds_and_paths
     assert ("profile", "aot") in kinds_and_paths
     assert ("log", "wasm") in kinds_and_paths
+    aot_start = next(
+        index
+        for index, record in enumerate(seen)
+        if record.path == "aot" and record.message == "AOT compile starting"
+    )
+    graph_recovery = next(
+        index
+        for index, record in enumerate(seen)
+        if record.path == "process_graph"
+        and record.message == "recover process graph from AOT deployment"
+    )
+    assert aot_start < graph_recovery
+    assert not any(
+        record.path == "process_graph"
+        and "build_from_ast" in record.message
+        for record in seen
+    )
     # "bundle published" is necessarily emitted after the page HTML is
     # already serialized -- a page cannot describe its own publish event --
     # so it is only observable live, not baked into this page's own log.

@@ -1,3 +1,7 @@
+from types import SimpleNamespace
+
+import networkx as nx
+
 from src.compiler.control_source import (
     ControlProgram,
     ControlTarget,
@@ -14,6 +18,7 @@ from src.compiler.control_source import (
     project_control_regions,
     render_python_shell,
     compile_python_shell,
+    overlay_scheduled_control,
 )
 from src.common.tensors.accelerator_backends.glsl_backend import (
     compose_control_shader,
@@ -22,6 +27,8 @@ from src.common.tensors.accelerator_backends.c_primitive_program import (
     CapturedFusedProgram,
 )
 from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
+from src.compiler.glsl_deployment_strategy import _loop_reduction_nesting_hints
+from src.compiler.loop_composer import LoopShaderReduction
 
 
 def test_same_planned_loop_renders_as_python_c_and_glsl():
@@ -216,6 +223,125 @@ def test_project_control_regions_keeps_structural_binding_for_live_loop():
     )
 
     assert projected.iterable_bindings == ((40, 41, "iteration_9"),)
+
+
+def test_overlay_uses_known_nesting_for_equal_region_sets():
+    inner = ControlProgram(
+        LoopBlock(
+            "iteration_2",
+            "0",
+            "4",
+            "1",
+            StatementBlock(("__scheduled_region_32__",)),
+        ),
+        region_indices=(32,),
+    )
+    outer = ControlProgram(
+        LoopBlock(
+            "iteration_1",
+            "0",
+            "4",
+            "1",
+            StatementBlock(("__scheduled_region_32__",)),
+        ),
+        region_indices=(32,),
+    )
+
+    overlaid = overlay_scheduled_control(
+        (32,),
+        (outer, inner),
+        known_nesting={0: (1,)},
+    )
+
+    assert isinstance(overlaid.root, SequenceBlock)
+    assert len(overlaid.root.blocks) == 1
+    outer_root = overlaid.root.blocks[0]
+    assert isinstance(outer_root, LoopBlock)
+    assert isinstance(outer_root.body, LoopBlock)
+    assert outer_root.body.induction == "iteration_2"
+
+
+def test_loop_nesting_hints_fall_back_to_unprojected_control_tree():
+    inner_loop = LoopBlock(
+        "iteration_2",
+        "0",
+        "4",
+        "1",
+        StatementBlock(("__scheduled_region_32__",)),
+    )
+    outer = LoopShaderReduction(
+        loop_node_id=1,
+        region_indices=(32,),
+        carried_bindings=(),
+        collapsible=True,
+        blockers=(),
+        estimated_dispatches_removed=1,
+        control_program=ControlProgram(
+            LoopBlock("iteration_1", "0", "4", "1", inner_loop),
+            region_indices=(32,),
+        ),
+    )
+    inner = LoopShaderReduction(
+        loop_node_id=2,
+        region_indices=(32,),
+        carried_bindings=(),
+        collapsible=True,
+        blockers=(),
+        estimated_dispatches_removed=1,
+        control_program=ControlProgram(inner_loop, region_indices=(32,)),
+    )
+
+    assert _loop_reduction_nesting_hints((outer, inner), ()) == {
+        0: frozenset({1})
+    }
+
+
+def test_loop_nesting_hints_follow_comprehension_generator_order():
+    outer = LoopShaderReduction(
+        loop_node_id=673,
+        region_indices=(32,),
+        carried_bindings=(),
+        collapsible=True,
+        blockers=(),
+        estimated_dispatches_removed=1,
+        control_program=ControlProgram(
+            LoopBlock(
+                "iteration_673",
+                "0",
+                "4",
+                "1",
+                StatementBlock(("__scheduled_region_32__",)),
+            ),
+            region_indices=(32,),
+        ),
+    )
+    inner = LoopShaderReduction(
+        loop_node_id=692,
+        region_indices=(32,),
+        carried_bindings=(),
+        collapsible=True,
+        blockers=(),
+        estimated_dispatches_removed=1,
+        control_program=ControlProgram(
+            LoopBlock(
+                "iteration_692",
+                "0",
+                "4",
+                "1",
+                StatementBlock(("__scheduled_region_32__",)),
+            ),
+            region_indices=(32,),
+        ),
+    )
+    graph = nx.DiGraph()
+    graph.add_node(
+        693,
+        parents=((688, "elt"), (673, "generators"), (692, "generators")),
+    )
+
+    assert _loop_reduction_nesting_hints(
+        (outer, inner), (), SimpleNamespace(G=graph)
+    ) == {0: frozenset({1})}
 
 
 def test_control_shader_preserves_repeated_structural_operand_slots():

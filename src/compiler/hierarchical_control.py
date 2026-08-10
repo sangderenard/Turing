@@ -40,6 +40,51 @@ def _region_marker(block: StatementBlock) -> int | None:
     return int(line[len(prefix):-2])
 
 
+def _present_loop_ids(block: ControlBlock) -> "frozenset[int]":
+    """Node ids of every ``LoopBlock`` actually present in ``block``.
+
+    A loop scheduled by ``glsl_deployment_strategy`` can be fused away
+    (its iteration space folded into a surviving outer loop) without being
+    marked in the evaporated-loop bookkeeping the hierarchy plan consulted
+    when it recorded a call's ``enclosing_loop_ids``. That id then names a
+    loop this closure's own control program never materializes. Parsing
+    the ``iteration_{node_id}`` induction convention out of the tree that
+    actually exists is the only way to tell which of a call's recorded
+    enclosing loops survived scheduling.
+    """
+
+    found: set[int] = set()
+
+    def walk(b: ControlBlock) -> None:
+        if isinstance(b, LoopBlock):
+            name = str(b.induction)
+            if name.startswith("iteration_"):
+                try:
+                    found.add(int(name[len("iteration_"):]))
+                except ValueError:
+                    pass
+            walk(b.body)
+        elif isinstance(b, WhileBlock):
+            walk(b.condition)
+            walk(b.body)
+        elif isinstance(b, SequenceBlock):
+            for child in b.blocks:
+                walk(child)
+        elif isinstance(b, StateMachineTick):
+            for _value, body in b.cases:
+                walk(body)
+            if b.default is not None:
+                walk(b.default)
+        elif isinstance(b, ParallelDeployment):
+            for lane in b.lanes:
+                walk(lane)
+        elif isinstance(b, CallBlock):
+            walk(b.callee)
+
+    walk(block)
+    return frozenset(found)
+
+
 @dataclass(frozen=True)
 class HierarchicalControl:
     program: ControlProgram
@@ -56,6 +101,36 @@ def compose_hierarchical_control(
 
     region_correlations: list[tuple[int, int, int]] = []
     next_region = 0
+    # ``assign_hierarchy_ids`` only harvests (closure, local) keys from
+    # PlanLine/PlanCall value ids -- the tensor dataflow surface known at
+    # plan time. Control-flow-only endpoints (a loop induction/predicate,
+    # a recursion-region member, a value alias) are discovered later, while
+    # composing the control program itself, so they can reference a local id
+    # the value table never assigned a global identity to. That is a real
+    # gap in the table's harvest, not a stray or corrupted value -- give it
+    # a stable per-endpoint identity here rather than raising past this
+    # otherwise-complete composition.
+    next_synthetic_value = 1 + max(
+        (global_id for _, _, global_id in values.correlations),
+        default=-1,
+    )
+    synthetic_value_ids: dict[tuple[int, int], int] = {}
+
+    def value_in(closure_id: int, local_id: int) -> int:
+        closure_id = int(closure_id)
+        local_id = int(local_id)
+        try:
+            return values.global_id(closure_id, local_id)
+        except KeyError:
+            nonlocal next_synthetic_value
+            endpoint = (closure_id, local_id)
+            synthetic = synthetic_value_ids.get(endpoint)
+            if synthetic is None:
+                synthetic = next_synthetic_value
+                next_synthetic_value += 1
+                synthetic_value_ids[endpoint] = synthetic
+            return synthetic
+
     all_uniforms: list[ControlUniform] = []
     all_aliases: list[tuple[int, int]] = []
     all_iterables: list[tuple[int, int, str]] = []
@@ -86,7 +161,7 @@ def compose_hierarchical_control(
             next_region += 1
 
         def value(local_id: int) -> int:
-            return values.global_id(closure_id, int(local_id))
+            return value_in(closure_id, local_id)
 
         recursion_region_map = {}
         for region in local.recursion_regions:
@@ -283,7 +358,7 @@ def compose_hierarchical_control(
                         tuple(
                             (
                                 value(caller),
-                                values.global_id(
+                                value_in(
                                     item.callee.closure_id, callee
                                 ),
                             )
@@ -291,7 +366,7 @@ def compose_hierarchical_control(
                         ),
                         tuple(
                             (
-                                values.global_id(
+                                value_in(
                                     item.callee.closure_id, callee
                                 ),
                                 value(caller),
@@ -319,9 +394,25 @@ def compose_hierarchical_control(
                     )
                     pending = []
         calls_at_loop_end: dict[int, list[CallBlock]] = {}
+        surviving_loop_ids = _present_loop_ids(local.root)
         for call, loop_ids in pending:
-            if loop_ids:
-                calls_at_loop_end.setdefault(loop_ids[-1], []).append(call)
+            # ``loop_ids`` is outermost-first; a loop can be fused into a
+            # surviving enclosing loop during GLSL scheduling without being
+            # marked evaporated, so the innermost id the plan recorded may
+            # name a LoopBlock this closure's control program no longer has.
+            # Anchor to the innermost enclosing loop that actually survived;
+            # only fall back to the closure boundary (like the no-loop case
+            # above) if none of them did.
+            target_loop_id = next(
+                (
+                    loop_id
+                    for loop_id in reversed(loop_ids)
+                    if loop_id in surviving_loop_ids
+                ),
+                None,
+            )
+            if target_loop_id is not None:
+                calls_at_loop_end.setdefault(target_loop_id, []).append(call)
             else:
                 calls_after.append(call)
         remaining_calls_after = list(calls_after)

@@ -478,6 +478,7 @@ def _aot_compile_mandelbrot_fortran(count: int, iterations: int, out_path: Path)
         aot.compiled_shell_program,
         aot.shell_control_program,
         region_programs=aot.region_programs,
+        hierarchy_plan=getattr(aot, "hierarchy_plan", None),
         numerical_name=numerical_name,
         control_name=control_name,
     )

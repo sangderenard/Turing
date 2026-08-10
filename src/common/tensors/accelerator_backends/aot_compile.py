@@ -98,6 +98,7 @@ import ast
 import contextlib
 import inspect
 import io
+import traceback
 import types
 from pathlib import Path
 from dataclasses import dataclass, field, replace
@@ -105,11 +106,24 @@ from collections.abc import Iterable
 from typing import Any, Callable, Mapping
 
 from ....compiler.glsl_deployment_strategy import (
+    ProcessGraphGLSLDeployment,
     _build_hierarchical_glsl_artifact,
     _control_partition_keys,
+    _find_nested_loop_node_ids_in_block,
+    _loop_reduction_nesting_hints,
+    _structural_region_program_from_subgraph,
     _walk_planned_shells,
     propagate_bound_planner_specializations,
     strategize_shell_deployment,
+)
+from ....compiler.control_source import overlay_scheduled_control
+from ....compiler.hierarchical_control import (
+    _present_loop_ids,
+    compose_hierarchical_control,
+)
+from ....compiler.hierarchical_plan import (
+    assign_hierarchy_ids,
+    reduce_hierarchy_identities,
 )
 from ....compiler.shell_reference_tables import (
     build_class_navigation_table,
@@ -124,7 +138,11 @@ from ..topological_reducer import (
 )
 from ..fused_ir import FusedProgram
 from .dual_ir_shell import DualIRShell, compose_dual_ir_shell
-from .aot_checkpoint import AOTCheckpointStore, callable_digest
+from .aot_checkpoint import (
+    AOTCheckpointStore,
+    ReductionArtifactStore,
+    callable_digest,
+)
 
 
 AOT_BAKE_MODES = frozenset({"one_shot", "whole_program"})
@@ -247,6 +265,13 @@ class AOTCompilation:
     # to find the producers of a loop's carried updates; without them a
     # program whose control shell has regions cannot be lowered.
     region_programs: Mapping[int, Any] = field(default_factory=dict)
+    # ProcessGraph-owned operator order with optional implementation evidence
+    # for each region. Tensor kernels remain FusedPrograms in
+    # ``region_programs``; plain and structural operators remain graph lines.
+    planned_operator_implementations: Mapping[int, Any] = field(
+        default_factory=dict
+    )
+    hierarchy_plan: Any = None
     region_feed_values: Mapping[int, Any] = field(default_factory=dict)
     # Retained by the reduced function ProcessGraph: source name -> complete
     # canonical value-ID history. ``function_outputs`` selects public names.
@@ -286,6 +311,34 @@ class AOTCompilation:
     # fields instead of being reduced to another dict entry.
     class_navigation: Any = None
     dependency_regions: Any = None
+
+
+class _BakeDeployment:
+    """The only thing the whole-program bake reads off a full deployment: the
+    process graph (for the inspection-panel summary).
+
+    The planning deployment that produced a program is 2.8-3.5 GB -- millions of
+    control-IR objects -- and the old resume path deserialized all of it purely
+    to hand the bake ``deployment.process_graph`` (~10 MB). Standing in this
+    light holder lets a precompile bake resume from the 79 MB captured program
+    plus the cheap source-graph checkpoint, never touching the multi-GB plan.
+    That is the difference between a resume that swaps the whole time and one
+    that does not.
+    """
+
+    __slots__ = ("process_graph",)
+
+    def __init__(self, process_graph):
+        self.process_graph = process_graph
+
+
+# Manual versions for checkpoint implementation digests. These exist so that
+# editing a phase's orchestration function (logging, resume plumbing, loop
+# shape) does NOT invalidate its multi-GB checkpoint -- only a deliberate bump,
+# or a change to one of the genuine content functions still listed in the
+# recipe, does. Bump when that phase's produced content actually changes.
+_PREPARED_RECIPE_VERSION = 1
+_CAPTURE_RECIPE_VERSION = 1
 
 
 def _apply_parameter_constant_map(
@@ -429,6 +482,131 @@ def project_public_numerical_program(compilation: AOTCompilation) -> Any:
     )
 
 
+def _mutable_feed_signature(value: Any) -> Mapping[str, Any]:
+    """Describe a runtime feed without fingerprinting its sample value."""
+
+    signature: dict[str, Any] = {
+        "runtime_type": (
+            f"{type(value).__module__}.{type(value).__qualname__}"
+        ),
+    }
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        try:
+            signature["shape"] = tuple(map(int, shape))
+        except (TypeError, ValueError):
+            pass
+    dtype = getattr(value, "dtype", None)
+    if dtype is not None:
+        signature["dtype"] = str(dtype)
+    device = getattr(value, "device", None)
+    if device is not None:
+        signature["device"] = str(device)
+    return signature
+
+
+def prepare_aot_checkpoint_store(
+    source: str,
+    entrypoint: str,
+    feeds: Mapping[str, Any],
+    *,
+    backend: str = "c",
+    remove_loops: bool = False,
+    unroll_limit: int = 8,
+    bake_mode: str = "whole_program",
+    schedule_preference: str = "alap",
+    constant_map: Mapping[str, Any] | None = None,
+    mutable_parameters: tuple[str, ...] | list[str] | set[str] = (),
+    retain: Any = (),
+    python_bindings: Mapping[str, Any] | None = None,
+    checkpoint: bool | str | Path = False,
+) -> tuple[Any, str, str, str, str, Mapping[str, Any]]:
+    """Build the checkpoint store and phase digests ``compile_ast_aot`` resumes
+    from, so a caller that already built its own ``ProcessGraph`` (site_bundle's
+    ``build_program_bundle``) can store it under the exact identity
+    ``compile_ast_aot`` will look for moments later -- instead of
+    ``compile_ast_aot`` silently rebuilding a second, independent one from the
+    same source.
+
+    Returns ``(checkpoint_store, frontend_implementation,
+    source_graph_implementation, bake_mode, schedule_preference,
+    checkpoint_feeds)``. ``bake_mode``/``schedule_preference`` are the
+    normalized forms: the checkpoint identity is keyed off them, so every
+    caller must normalize the same way or the identity silently diverges and
+    the store is never resumed.
+    """
+
+    bake_mode = normalize_aot_bake_mode(bake_mode)
+    schedule_preference = normalize_aot_schedule_preference(
+        schedule_preference
+    )
+    constant_map = dict(constant_map or {})
+    mutable_parameters = tuple(dict.fromkeys(map(str, mutable_parameters)))
+
+    frontend_implementation = callable_digest(
+        ProcessGraph.build_from_ast,
+        reduce_abstract_tensor_topology,
+        _normalize_lexical_values,
+        propagate_bound_planner_specializations,
+        build_map_dependency_regions,
+        build_class_navigation_table,
+    )
+    source_graph_implementation = callable_digest(
+        ProcessGraph.build_from_ast,
+        _apply_parameter_constant_map,
+    )
+    checkpoint_feeds = {
+        str(name): (
+            _mutable_feed_signature(value)
+            if str(name) in mutable_parameters
+            else value
+        )
+        for name, value in feeds.items()
+    }
+    if not checkpoint:
+        return (
+            None,
+            frontend_implementation,
+            source_graph_implementation,
+            bake_mode,
+            schedule_preference,
+            checkpoint_feeds,
+        )
+
+    binding_values = tuple(
+        value
+        for _name, value in sorted(
+            (python_bindings or {}).items(), key=lambda pair: str(pair[0])
+        )
+        if callable(value)
+    )
+    checkpoint_store = AOTCheckpointStore(
+        {
+            "source": source,
+            "entrypoint": entrypoint,
+            "feeds": checkpoint_feeds,
+            "backend": backend,
+            "remove_loops": bool(remove_loops),
+            "unroll_limit": int(unroll_limit),
+            "bake_mode": bake_mode,
+            "schedule_preference": schedule_preference,
+            "constant_map": constant_map,
+            "mutable_parameters": mutable_parameters,
+            "retain": retain,
+            "python_binding_sources": callable_digest(*binding_values),
+        },
+        None if checkpoint is True else checkpoint,
+    )
+    return (
+        checkpoint_store,
+        frontend_implementation,
+        source_graph_implementation,
+        bake_mode,
+        schedule_preference,
+        checkpoint_feeds,
+    )
+
+
 def compile_ast_aot(
     source: str,
     entrypoint: str,
@@ -470,58 +648,33 @@ def compile_ast_aot(
         if progress is not None:
             progress(message)
 
-    bake_mode = normalize_aot_bake_mode(bake_mode)
-    schedule_preference = normalize_aot_schedule_preference(
-        schedule_preference
-    )
     constant_map = dict(constant_map or {})
     mutable_parameters = tuple(dict.fromkeys(map(str, mutable_parameters)))
     expanded_python_bindings = _expand_python_static_bindings(
         python_bindings
     )
 
-    def mutable_feed_signature(value: Any) -> Mapping[str, Any]:
-        """Describe a runtime feed without fingerprinting its sample value."""
-
-        signature: dict[str, Any] = {
-            "runtime_type": (
-                f"{type(value).__module__}.{type(value).__qualname__}"
-            ),
-        }
-        shape = getattr(value, "shape", None)
-        if shape is not None:
-            try:
-                signature["shape"] = tuple(map(int, shape))
-            except (TypeError, ValueError):
-                pass
-        dtype = getattr(value, "dtype", None)
-        if dtype is not None:
-            signature["dtype"] = str(dtype)
-        device = getattr(value, "device", None)
-        if device is not None:
-            signature["device"] = str(device)
-        return signature
-
-    checkpoint_feeds = {
-        str(name): (
-            mutable_feed_signature(value)
-            if str(name) in mutable_parameters
-            else value
-        )
-        for name, value in feeds.items()
-    }
-    checkpoint_store = None
-    frontend_implementation = callable_digest(
-        ProcessGraph.build_from_ast,
-        reduce_abstract_tensor_topology,
-        _normalize_lexical_values,
-        propagate_bound_planner_specializations,
-        build_map_dependency_regions,
-        build_class_navigation_table,
-    )
-    source_graph_implementation = callable_digest(
-        ProcessGraph.build_from_ast,
-        _apply_parameter_constant_map,
+    (
+        checkpoint_store,
+        frontend_implementation,
+        source_graph_implementation,
+        bake_mode,
+        schedule_preference,
+        checkpoint_feeds,
+    ) = prepare_aot_checkpoint_store(
+        source,
+        entrypoint,
+        feeds,
+        backend=backend,
+        remove_loops=remove_loops,
+        unroll_limit=unroll_limit,
+        bake_mode=bake_mode,
+        schedule_preference=schedule_preference,
+        constant_map=constant_map,
+        mutable_parameters=mutable_parameters,
+        retain=retain,
+        python_bindings=python_bindings,
+        checkpoint=checkpoint,
     )
     # A compiled plan contains the frontend's resolved call identities and
     # reduced topology, not merely the scheduler's output.  Any frontend IR
@@ -532,38 +685,102 @@ def compile_ast_aot(
         _control_partition_keys,
         frontend_implementation,
     )
-    capture_implementation = callable_digest(
-        compile_ast_aot,
+    prepared_implementation = callable_digest(
+        # A manual version plus the real region builder, NOT
+        # ``prepare_graph_precompile``'s source. The prepared plan's content is
+        # the region programs ``_structural_region_program_from_subgraph``
+        # produces; ``prepare_graph_precompile`` around it is orchestration
+        # (the per-region loop, logging, the reduction-cache plumbing) whose
+        # edits must not invalidate a 3.5 GB checkpoint. Bump the version when
+        # the prepare-phase content genuinely changes.
+        _PREPARED_RECIPE_VERSION,
+        _structural_region_program_from_subgraph,
+        _loop_reduction_nesting_hints,
+        overlay_scheduled_control,
         planning_implementation,
     )
-    if checkpoint:
-        binding_values = tuple(
-            value
-            for _name, value in sorted(
-                (python_bindings or {}).items(), key=lambda pair: str(pair[0])
-            )
-            if callable(value)
-        )
-        checkpoint_store = AOTCheckpointStore(
-            {
-                "source": source,
-                "entrypoint": entrypoint,
-                "feeds": checkpoint_feeds,
-                "backend": backend,
-                "remove_loops": bool(remove_loops),
-                "unroll_limit": int(unroll_limit),
-                "bake_mode": bake_mode,
-                "schedule_preference": schedule_preference,
-                "constant_map": constant_map,
-                "mutable_parameters": mutable_parameters,
-                "retain": retain,
-                "python_binding_sources": callable_digest(*binding_values),
-            },
-            None if checkpoint is True else checkpoint,
-        )
+    capture_implementation = callable_digest(
+        # A manual version, NOT ``compile_ast_aot``'s source. This digest must
+        # invalidate when the captured program's *content* changes, and the
+        # content-affecting logic lives in the helpers listed below plus the
+        # graph recipes folded in through ``prepared_implementation`` -- while
+        # ``compile_ast_aot`` itself is orchestration (resume order, feed
+        # marshalling, checkpoint plumbing) whose inputs are already pinned by
+        # the checkpoint identity (source/entrypoint/feeds/constants). Hashing
+        # ``compile_ast_aot``'s source made the function that *loads* this
+        # checkpoint also *invalidate* it: adding a resume fast-path silently
+        # dropped a 79 MB captured program and forced a 3.5 GB plan reload.
+        # Bump this when a genuine capture-content change lands here.
+        _CAPTURE_RECIPE_VERSION,
+        _build_hierarchical_glsl_artifact,
+        # ``_build_hierarchical_glsl_artifact``'s own source is what
+        # ``callable_digest`` sees -- it does not walk call targets. These
+        # are the real hierarchy-composition dependencies whose behavior
+        # this phase's cached output actually depends on; a checkpoint must
+        # invalidate when any of them changes, not only when the one
+        # function whose name appears in this list is edited.
+        compose_hierarchical_control,
+        _present_loop_ids,
+        reduce_hierarchy_identities,
+        assign_hierarchy_ids,
+        _find_nested_loop_node_ids_in_block,
+        prepared_implementation,
+    )
 
     deployment = None
+    deployment_prepared = False
+    # Bake fast-path. A precompile bake consumes the captured program (79 MB:
+    # region_programs, shell_control_program, control_shortfalls) plus the
+    # process graph, and nothing else off the planning deployment. If the
+    # captured-program checkpoint is already on disk, resume straight from it
+    # and pair it with the cheap source-graph checkpoint for the process graph
+    # -- so the resume loads ~89 MB instead of deserializing the 2.8-3.5 GB
+    # plan it would otherwise pull in only to read one ~10 MB attribute.
+    if checkpoint_store is not None and resume and precompile_only:
+        _report("aot: probing captured-program checkpoint (bake fast-path)")
+        captured = checkpoint_store.load(
+            "captured_program", capture_implementation
+        )
+        if isinstance(captured, AOTCompilation):
+            bake_graph = getattr(captured.deployment, "process_graph", None)
+            if bake_graph is None:
+                bake_graph = checkpoint_store.load(
+                    "source_graph", source_graph_implementation
+                )
+            if bake_graph is not None:
+                _report(
+                    "aot: resumed captured-program checkpoint via bake "
+                    "fast-path (skipped multi-GB plan load)"
+                )
+                return replace(
+                    captured, deployment=_BakeDeployment(bake_graph)
+                )
+            _report(
+                "aot: bake fast-path unavailable (no process graph on disk); "
+                "falling back to full plan resume"
+            )
+        else:
+            _report(
+                "aot: captured-program checkpoint unavailable for fast-path "
+                f"({checkpoint_store.last_load_status})"
+            )
     if checkpoint_store is not None and resume:
+        _report("aot: loading prepared-plan checkpoint")
+        deployment = checkpoint_store.load(
+            "prepared_plan",
+            prepared_implementation,
+        )
+        if deployment is not None:
+            deployment_prepared = True
+            _report("aot: resumed prepared-plan checkpoint")
+            graph = deployment.process_graph
+            map_ir = dict(graph.G.graph.get("map_ir") or {})
+        else:
+            _report(
+                "aot: prepared-plan checkpoint unavailable "
+                f"({checkpoint_store.last_load_status})"
+            )
+    if deployment is None and checkpoint_store is not None and resume:
         _report("aot: loading compiled-plan checkpoint")
         deployment = checkpoint_store.load(
             "compiled_plan",
@@ -722,8 +939,10 @@ def compile_ast_aot(
         frontend_implementation=frontend_implementation,
         source_graph_implementation=source_graph_implementation,
         planning_implementation=planning_implementation,
+        prepared_implementation=prepared_implementation,
         capture_implementation=capture_implementation,
         deployment=deployment,
+        deployment_prepared=deployment_prepared,
         frontend_ready=frontend_ready,
         class_navigation=class_navigation,
         dependency_regions=dependency_regions,
@@ -754,8 +973,10 @@ def _lower_process_graph_to_compilation(
     frontend_implementation: str,
     source_graph_implementation: str,
     planning_implementation: str,
+    prepared_implementation: str,
     capture_implementation: str,
     deployment: Any,
+    deployment_prepared: bool,
     frontend_ready: bool,
     class_navigation: Any,
     dependency_regions: Any,
@@ -838,12 +1059,31 @@ def _lower_process_graph_to_compilation(
             unroll_limit=unroll_limit,
             schedule_preference=schedule_preference,
         )
+        _report("aot: glsl deployment strategy selected")
     # shell_language is fixed at "glsl", the one path that actually emits
     # something distinct -- see this module's docstring. It is not derived
     # from backend= any more; there is no shell "kind" left to pick.
+        _report("aot: constructing glsl deployment plan")
         deployment = deployment_type(profiling=profiling, shell_language="glsl")
+        _report("aot: glsl deployment plan constructed")
     try:
         planned_shells = tuple(_walk_planned_shells(deployment))
+
+        def store_deployment_phase(phase: str, implementation: str) -> None:
+            saved_static_bindings = []
+            try:
+                for planned_shell in planned_shells:
+                    if "static_python_bindings" not in planned_shell.__dict__:
+                        continue
+                    saved_static_bindings.append((
+                        planned_shell,
+                        planned_shell.__dict__.pop("static_python_bindings"),
+                    ))
+                checkpoint_store.store(phase, implementation, deployment)
+            finally:
+                for planned_shell, bindings in saved_static_bindings:
+                    planned_shell.static_python_bindings = bindings
+
         for planned_shell in planned_shells:
             planned_shell.static_python_bindings = {
                 **expanded_python_bindings,
@@ -854,30 +1094,16 @@ def _lower_process_graph_to_compilation(
             deployment.compile_process_graph()
             if checkpoint_store is not None:
                 _report("aot: saving compiled-plan checkpoint")
-                saved_static_bindings = []
                 try:
-                    for planned_shell in planned_shells:
-                        if "static_python_bindings" not in planned_shell.__dict__:
-                            continue
-                        saved_static_bindings.append((
-                            planned_shell,
-                            planned_shell.__dict__.pop(
-                                "static_python_bindings"
-                            ),
-                        ))
-                    checkpoint_store.store(
+                    store_deployment_phase(
                         "compiled_plan",
                         planning_implementation,
-                        deployment,
                     )
                 except Exception as error:
                     _report(
                         "aot: compiled-plan checkpoint skipped "
                         f"({type(error).__name__}: {error})"
                     )
-                finally:
-                    for planned_shell, bindings in saved_static_bindings:
-                        planned_shell.static_python_bindings = bindings
         if checkpoint_store is not None and resume and precompile_only:
             _report("aot: loading captured-program checkpoint")
             captured_compilation = checkpoint_store.load(
@@ -923,14 +1149,55 @@ def _lower_process_graph_to_compilation(
         # module's DualIRShell.
         function_shell = deployment.function_shells.get(reference.address, deployment)
         feeds = dict(feeds)
-        _report("aot: capturing fused programs")
-        function_shell.capture_fused_programs(
-            feeds, precompile_only=precompile_only
+        missing_mutable_parameters = tuple(
+            name for name in mutable_parameters if name not in feeds
         )
+        if precompile_only and missing_mutable_parameters:
+            if deployment_prepared:
+                _report("aot: graph-only precompile already prepared")
+            else:
+                _report(
+                    "aot: preparing graph-only precompile; runtime parameters "
+                    + repr(missing_mutable_parameters)
+                )
+                # Per-region logging makes this otherwise-silent portion
+                # visible. The content-addressed catalogue that would also make
+                # it an incremental backup is intentionally OFF for now: a
+                # region's key would have to be stable across builds to ever be
+                # reused, but the build is not deterministic (node ids shift
+                # under hash randomization, and node data carries opaque objects
+                # that do not serialize stably even with a fixed seed). Writing
+                # keys that never match would only add pickling overhead and
+                # unbounded cache growth. The plumbing stays so this switches on
+                # once the build is made deterministic and regions get a sound
+                # canonical key. See the design note for the load/unload plan.
+                region_catalogue = None
+                function_shell.prepare_graph_precompile(
+                    reduction_cache=region_catalogue,
+                    progress=_report,
+                )
+                if checkpoint_store is not None:
+                    _report("aot: saving prepared-plan checkpoint")
+                    try:
+                        store_deployment_phase(
+                            "prepared_plan",
+                            prepared_implementation,
+                        )
+                    except Exception as error:
+                        _report(
+                            "aot: prepared-plan checkpoint skipped "
+                            f"({type(error).__name__}: {error})"
+                        )
+        else:
+            _report("aot: capturing fused programs")
+            function_shell.capture_fused_programs(
+                feeds, precompile_only=precompile_only
+            )
         # Planning composes once before this explicit AOT capture has filled
         # every local region.  Recompose bottom-up now that the numerical
         # programs exist; otherwise callers see local regions but an empty
         # hierarchy and cannot link nested methods/loops into a whole program.
+        hierarchy_exception = False
         for planned_shell in tuple(dict.fromkeys((
             function_shell,
             deployment,
@@ -942,6 +1209,26 @@ def _lower_process_graph_to_compilation(
                     planned_shell
                 )
             except Exception as error:
+                hierarchy_exception = True
+                failure_traceback = traceback.format_exc()
+                planned_shell.hierarchical_compose_failure = {
+                    **dict(
+                        getattr(
+                            planned_shell,
+                            "hierarchical_compose_failure",
+                            None,
+                        )
+                        or {}
+                    ),
+                    "reason": "hierarchy-recomposition-exception",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "traceback": failure_traceback,
+                }
+                _report(
+                    "aot: hierarchy recomposition traceback\n"
+                    + failure_traceback
+                )
                 if not (
                     getattr(
                         planned_shell,
@@ -1030,6 +1317,17 @@ def _lower_process_graph_to_compilation(
             if reduction.region_indices
             and reduction.control_program is None
         )
+        if control_shortfalls:
+            _report(
+                "aot: control lowering left "
+                f"{len(control_shortfalls)} loop(s) as fill-later spot(s)"
+            )
+            for item in control_shortfalls:
+                _report(
+                    "aot: control-hole "
+                    f"{item['function']} loop {item['loop_node_id']} "
+                    f"[{', '.join(item['blockers'])}]"
+                )
         entry_output_names = tuple(map(
             str,
             function_shell.process_graph.G.graph.get("function_outputs")
@@ -1309,6 +1607,26 @@ def _lower_process_graph_to_compilation(
             *tuple(program.outputs.values()),
         )
     }
+    def collect_hierarchy_values(closure: Any) -> None:
+        executable_value_ids.update(
+            map(int, getattr(closure, "captures", ()))
+        )
+        for item in getattr(closure, "items", ()):
+            executable_value_ids.update(
+                map(int, getattr(item, "inputs", ()))
+            )
+            executable_value_ids.update(
+                map(int, getattr(item, "outputs", ()))
+            )
+            if hasattr(item, "items"):
+                collect_hierarchy_values(item)
+            callee = getattr(item, "callee", None)
+            if callee is not None:
+                collect_hierarchy_values(callee)
+
+    collect_hierarchy_values(
+        getattr(source_shell, "hierarchy_plan", None)
+    )
     for parameter in function_parameters:
         history = tuple(map(int, identity_table.get(parameter, ())))
         live = tuple(
@@ -1344,6 +1662,7 @@ def _lower_process_graph_to_compilation(
         class_navigation=class_navigation,
         dependency_regions=dependency_regions,
         reference_tables=getattr(deployment, "reference_tables", None),
+        hierarchy_plan=getattr(source_shell, "hierarchy_plan", None),
     )
     compilation = AOTCompilation(
         entrypoint=entrypoint,
@@ -1356,6 +1675,15 @@ def _lower_process_graph_to_compilation(
         class_navigation=class_navigation,
         dependency_regions=dependency_regions,
         region_programs=region_programs,
+        planned_operator_implementations=dict(
+            getattr(
+                source_shell,
+                "planned_operator_implementations",
+                {},
+            )
+            or {}
+        ),
+        hierarchy_plan=getattr(source_shell, "hierarchy_plan", None),
         region_feed_values=region_feed_values,
         identity_table=identity_table,
         function_outputs=function_outputs,
@@ -1371,7 +1699,11 @@ def _lower_process_graph_to_compilation(
         constant_map=constant_map,
         mutable_parameters=mutable_parameters,
     )
-    if checkpoint_store is not None and precompile_only:
+    if (
+        checkpoint_store is not None
+        and precompile_only
+        and not hierarchy_exception
+    ):
         _report("aot: saving captured-program checkpoint")
         try:
             checkpoint_store.store(
@@ -1384,6 +1716,11 @@ def _lower_process_graph_to_compilation(
                 "aot: captured-program checkpoint skipped "
                 f"({type(error).__name__}: {error})"
             )
+    elif checkpoint_store is not None and precompile_only:
+        _report(
+            "aot: captured-program checkpoint skipped "
+            "(hierarchy recomposition raised; prepared-plan remains resumable)"
+        )
     return compilation
 
 
@@ -1472,8 +1809,10 @@ def compile_cpp_shell_aot(
         frontend_implementation="",
         source_graph_implementation="",
         planning_implementation="",
+        prepared_implementation="",
         capture_implementation="",
         deployment=None,
+        deployment_prepared=False,
         frontend_ready=False,
         class_navigation=None,
         dependency_regions=None,
@@ -1490,5 +1829,7 @@ __all__ = [
     "compile_cpp_shell_aot",
     "normalize_aot_bake_mode",
     "normalize_aot_schedule_preference",
+    "prepare_aot_checkpoint_store",
     "project_public_numerical_program",
+    "_expand_python_static_bindings",
 ]

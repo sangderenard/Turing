@@ -33,6 +33,7 @@ import importlib
 import inspect
 import io
 import json
+import sys
 import math
 import os
 from pathlib import Path
@@ -40,7 +41,6 @@ import re
 import shutil
 import tempfile
 import textwrap
-import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 
@@ -151,6 +151,7 @@ class SourceContract:
     probe_size: int
     backend: str
     bake_mode: str
+    final_fused_reduction: bool
     schedule_preference: str
     remove_loops: bool
     unroll_limit: int
@@ -160,6 +161,7 @@ class SourceContract:
     presentation_entrypoint: str | None
     shader_configuration: Mapping[str, Any]
     audio_configuration: Mapping[str, Any]
+    file_parameters: Mapping[str, Mapping[str, Any]]
     constant_map: Mapping[str, Any]
     mutable_parameters: tuple[str, ...]
 
@@ -176,6 +178,39 @@ class ProgramBundle:
     @property
     def url(self) -> str:
         return str(self.manifest["page"]["url"])
+
+
+class _TeeStream:
+    """Fan one write out to several streams.
+
+    The compile below redirects stdout/stderr into an ``io.StringIO`` so the
+    log can be folded into the bundle manifest. Redirecting alone, though,
+    makes the compile go dark: every ``aot:`` progress line, every
+    control-lowering ``fill-later`` spot, and the caller's own
+    ``progress_sink=print`` write through ``sys.stdout`` -- straight into the
+    buffer, invisible until the whole (very long) compile returns. Teeing to
+    the real stream keeps the capture for the manifest *and* lets progress
+    show live.
+    """
+
+    def __init__(self, *streams: Any) -> None:
+        self._streams = streams
+
+    def write(self, text: str) -> int:
+        for stream in self._streams:
+            try:
+                stream.write(text)
+                stream.flush()
+            except Exception:
+                pass
+        return len(text)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            try:
+                stream.flush()
+            except Exception:
+                pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -809,40 +844,6 @@ def slugify(value: str) -> str:
     return slug[:80].rstrip("-")
 
 
-def _with_heartbeat(
-    progress: "Callable[[str], None] | None",
-    label: str,
-    call: "Callable[[], Any]",
-    *,
-    interval: float = 1.0,
-) -> Any:
-    """Run one call that cannot itself be subdivided (a single C-level
-    ``ast.parse``/``ast.literal_eval`` invocation) while a background
-    thread keeps emitting proof of life on its own timer. There is no real
-    sub-step to report from inside a call like that -- this does not
-    invent one -- it only makes silence during it distinguishable from a
-    hang by continuing to report elapsed time until the call returns.
-    """
-
-    if progress is None:
-        return call()
-    started = time.monotonic()
-    stop = threading.Event()
-
-    def _beat() -> None:
-        while not stop.wait(interval):
-            progress(f"{label}: still running ({time.monotonic() - started:.1f}s elapsed)")
-
-    heartbeat = threading.Thread(target=_beat, daemon=True)
-    heartbeat.start()
-    try:
-        return call()
-    finally:
-        stop.set()
-        heartbeat.join()
-        progress(f"{label}: finished ({time.monotonic() - started:.1f}s total)")
-
-
 def _literal_page_config(
     module: ast.Module,
     progress: "Callable[[str], None] | None" = None,
@@ -858,10 +859,7 @@ def _literal_page_config(
         if progress is not None:
             progress("found TURING_PAGE assignment; literal_eval-ing its value")
         try:
-            value = _with_heartbeat(
-                progress, "TURING_PAGE literal_eval",
-                lambda: ast.literal_eval(statement.value),
-            )
+            value = ast.literal_eval(statement.value)
         except (TypeError, ValueError) as error:
             raise ValueError("TURING_PAGE must be a literal dictionary") from error
         if not isinstance(value, dict):
@@ -882,6 +880,7 @@ def discover_source_contract(
     slug: str | None = None,
     probes: Mapping[str, Any] | None = None,
     bake_mode: str | None = None,
+    final_fused_reduction: bool | None = None,
     schedule_preference: str | None = None,
     progress: "Callable[[str], None] | None" = None,
 ) -> SourceContract:
@@ -891,7 +890,7 @@ def discover_source_contract(
     arguments override it.  No source code is imported or executed here.
     """
 
-    module = _with_heartbeat(progress, "ast.parse", lambda: ast.parse(source))
+    module = ast.parse(source)
     config = _literal_page_config(module, progress)
     functions = [node for node in module.body if isinstance(node, ast.FunctionDef)]
     public = [node for node in functions if not node.name.startswith("_")]
@@ -936,10 +935,7 @@ def discover_source_contract(
             size = len(value) if isinstance(value, (list, tuple, dict, set)) else 1
             progress(f"validating constant {name!r} ({size} element(s))")
         try:
-            _with_heartbeat(
-                progress, f"validating constant {name!r}",
-                lambda value=value: ast.literal_eval(ast.parse(repr(value), mode="eval").body),
-            )
+            ast.literal_eval(ast.parse(repr(value), mode="eval").body)
         except (SyntaxError, ValueError, TypeError) as error:
             raise ValueError(
                 f"configured constant {name!r} must be a Python literal"
@@ -991,6 +987,20 @@ def discover_source_contract(
     audio_config = config.get("audio", {})
     if not isinstance(audio_config, dict):
         raise ValueError("TURING_PAGE['audio'] must be a mapping")
+    file_parameters = config.get("file_parameters", {})
+    if not isinstance(file_parameters, dict) or not all(
+        isinstance(name, str) and isinstance(specification, dict)
+        for name, specification in file_parameters.items()
+    ):
+        raise ValueError(
+            "TURING_PAGE['file_parameters'] must map parameter names to mappings"
+        )
+    unknown_file_parameters = set(file_parameters) - set(parameters)
+    if unknown_file_parameters:
+        raise ValueError(
+            "configured file parameters name unknown parameters: "
+            f"{sorted(unknown_file_parameters)!r}"
+        )
 
     page_title = str(title or config.get("title") or selected.replace("_", " ").title())
     page_slug = slugify(str(slug or config.get("slug") or selected))
@@ -1006,6 +1016,11 @@ def discover_source_contract(
         schedule_preference if schedule_preference is not None
         else config.get("schedule_preference", "alap")
     ).strip().lower()
+    selected_final_fused_reduction = bool(
+        config.get("final_fused_reduction", True)
+        if final_fused_reduction is None
+        else final_fused_reduction
+    )
     render_fps = float(config.get("render_fps", 30.0))
     if min(width, height, probe_size) < 1:
         raise ValueError("width, height, and probe_size must be positive")
@@ -1040,6 +1055,7 @@ def discover_source_contract(
         probe_size=probe_size,
         backend=str(config.get("backend", "c")),
         bake_mode=selected_bake_mode,
+        final_fused_reduction=selected_final_fused_reduction,
         schedule_preference=selected_schedule_preference,
         remove_loops=bool(config.get("remove_loops", True)),
         unroll_limit=unroll_limit,
@@ -1049,8 +1065,15 @@ def discover_source_contract(
         presentation_entrypoint=presentation_entrypoint,
         shader_configuration=dict(shader_config),
         audio_configuration=dict(audio_config),
+        file_parameters={
+            name: dict(specification)
+            for name, specification in file_parameters.items()
+        },
         constant_map=dict(constant_map),
-        mutable_parameters=tuple(state_feedback),
+        mutable_parameters=tuple(dict.fromkeys((
+            *state_feedback,
+            *file_parameters,
+        ))),
     )
 
 
@@ -1062,13 +1085,26 @@ def _probe_value(specification: Any, size: int):
             return specification["literal"]
         if set(specification) == {"values"}:
             return np.asarray(specification["values"], dtype=np.float64)
-        raise ValueError("a feed mapping must contain exactly 'literal' or 'values'")
+        if set(specification) == {"file"}:
+            # A real binary/file input has no JSON-safe literal form (raw
+            # bytes are not JSON-representable), so this spec names a path
+            # instead -- read once, passed through exactly like a literal.
+            return Path(specification["file"]).read_bytes()
+        raise ValueError(
+            "a feed mapping must contain exactly 'literal', 'values', or 'file'"
+        )
     if isinstance(specification, (list, tuple)):
         return np.asarray(specification, dtype=np.float64)
     if specification is None:
         return np.zeros(size, dtype=np.float64)
     if isinstance(specification, (bool, int, float)):
         return np.full(size, specification, dtype=np.float64)
+    # Raw bytes (a real subject binary, a real file's contents) is exactly
+    # the same "real, already-constructed input" case as a live class
+    # instance below -- there is no numeric probe shape to approximate it
+    # with. Pass it through unchanged.
+    if isinstance(specification, (bytes, bytearray)):
+        return bytes(specification)
     # A live class instance is a real, already-constructed input, not a
     # numeric probe shape -- the caller built it, and how is the class's
     # own concern, not something to reconstruct or approximate here. Pass
@@ -1099,59 +1135,10 @@ def _entrypoint_parameters(source: str, entrypoint: str) -> tuple[str, ...]:
     )
 
 
-_ABSTRACT_TENSOR_RANDOM_METHODS = frozenset(
-    {
-        "random", "randint", "uniform", "choice", "shuffle", "sample",
-        "gauss", "standard_normal",
-    }
-)
-
-_RANDOM_SOURCE_IMPORT_NAME = "_AbstractTensor_random_source"
-
-
-def _stdlib_random_module_aliases(module: ast.Module) -> frozenset[str]:
-    """Local names this module binds to the stdlib ``random`` module.
-
-    Only reads this module's own top-level ``import`` statements -- never
-    follows an alias into whatever it points at -- so there is nothing to
-    recurse through even if some other name in the file happens to shadow
-    or re-import ``random`` again.
-    """
-
-    aliases: set[str] = set()
-    for node in module.body:
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name == "random":
-                    aliases.add(alias.asname or alias.name)
-    return frozenset(aliases)
-
-
-def _stdlib_random_attribute(
-    expression: ast.expr | None, random_aliases: frozenset[str]
-) -> str | None:
-    """``attr`` if ``expression`` is literally ``<random alias>.attr``.
-
-    A single fixed-depth structural check -- no execution, no walking into
-    what the name might transitively resolve to -- so it always terminates;
-    that is the whole "recursion check" this needs, since the shape it is
-    matching (``random.random``, ``random.uniform``, ...) is never more
-    than one attribute access deep in real source.
-    """
-
-    if (
-        isinstance(expression, ast.Attribute)
-        and isinstance(expression.value, ast.Name)
-        and expression.value.id in random_aliases
-    ):
-        return expression.attr
-    return None
-
-
 def _synthesize_state_defaults(
     source: str, entrypoint: str, unconfigured: Iterable[str],
 ) -> tuple[str, frozenset[str]]:
-    """An unconfigured, annotated parameter -> real ``T()`` construction.
+    """An unconfigured, annotated parameter -> its real default, constructed.
 
     Detects the case directly: this parameter has no probe/config value at
     all, and it has a written type. Nothing here touches ``state_feedback``
@@ -1160,24 +1147,24 @@ def _synthesize_state_defaults(
     numeric-probe default, exactly as before. Only a parameter that is both
     unconfigured *and* annotated is rewritten.
 
-    The rewrite is real source text -- ``if x is None: x = T()`` inserted
-    at the top of the function body -- traced by the ordinary compiler the
-    same way any other call is. Nothing here executes Python outside the
-    compiler; ``ast.unparse`` only prints a tree. A type with no
-    zero-argument constructor is a real, honestly reportable fact once the
-    compiler traces the call -- not something this guesses a workaround for.
+    The rewrite is real source text -- ``if x is None: x = <default>``
+    inserted at the top of the function body -- traced by the ordinary
+    compiler the same way any other call is. Nothing here executes Python
+    outside the compiler; ``ast.unparse`` only prints a tree.
 
-    One shape is special-cased ahead of the blind ``T()`` rule: a parameter
-    whose own real default is a stdlib ``random.<name>`` reference (for
-    example ``random_source: Callable[[], float] = random.random``) is not
-    a constructible type at all -- ``Callable[[], float]()`` is not valid
-    Python. Obtaining a random value is never an arbitrary synthesizable
-    value either: it has to stay a real, tracked operation rather than a
-    number frozen from whichever draw discovery happened to observe. So
-    this redirects the guard to ``AbstractTensor``'s own random generator
-    (a complete, deterministic Xoroshiro128** PRNG -- see
-    ``abstraction_methods/random.py``) instead of leaving the stdlib
-    reference in place or trying to construct the annotation.
+    ``<default>`` is the parameter's own real default expression when it
+    has one (``random.random``, ``ForkExplorationPolicy()``, ...) -- never
+    a reconstruction from the annotation. Reconstructing from the
+    annotation instead (``Callable[[], float]()``) is not just less
+    accurate, it is sometimes not even valid Python: a generic alias is not
+    a constructor. Whatever the real default expression resolves to
+    (``random.random`` included) is the ingestion layer's concern from
+    here, the same as any other expression this rewrite did not invent --
+    this only supplies the parameter's own written default in the one
+    place ``None`` needs replacing with it. A parameter with no real
+    default at all falls back to constructing the annotation, a real,
+    honestly reportable fact once the compiler traces that call -- not
+    something this guesses a workaround for.
     """
 
     module = ast.parse(source)
@@ -1211,11 +1198,8 @@ def _synthesize_state_defaults(
         }
     )
 
-    random_aliases = _stdlib_random_module_aliases(module)
-
     rewritten: set[str] = set()
     guards: list[ast.stmt] = []
-    needs_random_import = False
     for argument in (
         *function.args.posonlyargs,
         *function.args.args,
@@ -1224,53 +1208,25 @@ def _synthesize_state_defaults(
         if argument.arg not in wanted or argument.annotation is None:
             continue
 
-        attribute = _stdlib_random_attribute(
-            default_map.get(argument.arg), random_aliases
+        real_default = default_map.get(argument.arg)
+        replacement = (
+            ast.unparse(real_default)
+            if real_default is not None
+            else f"{ast.unparse(argument.annotation)}()"
         )
-        if attribute in _ABSTRACT_TENSOR_RANDOM_METHODS:
-            needs_random_import = True
-            guards.append(ast.parse(
-                f"if {argument.arg} is None:\n    {argument.arg} = "
-                f"{_RANDOM_SOURCE_IMPORT_NAME}.random.{attribute}\n",
-            ).body[0])
-            rewritten.add(argument.arg)
-            continue
-
         guards.append(ast.parse(
             f"if {argument.arg} is None:\n    {argument.arg} = "
-            f"{ast.unparse(argument.annotation)}()\n",
+            f"{replacement}\n",
         ).body[0])
         rewritten.add(argument.arg)
 
     if not rewritten:
         return source, frozenset()
 
-    if needs_random_import:
-        import_statement = ast.parse(
-            "from ..common.tensors.abstraction import "
-            f"AbstractTensor as {_RANDOM_SOURCE_IMPORT_NAME}\n"
-        ).body[0]
-        insert_at = 0
-        for index, statement in enumerate(module.body):
-            if (
-                isinstance(statement, ast.Expr)
-                and isinstance(statement.value, ast.Constant)
-                and isinstance(statement.value.value, str)
-            ):
-                insert_at = index + 1
-                continue
-            if (
-                isinstance(statement, ast.ImportFrom)
-                and statement.module == "__future__"
-            ):
-                insert_at = index + 1
-                continue
-            break
-        module.body.insert(insert_at, import_statement)
-
-    # Discovery always supplies an explicit feed for every parameter, so the
-    # signature does not need a `= None` default; only the body needs the
-    # guard to replace the `None` fed in with a real instance.
+    # Synthesized parameters receive an explicit ``None`` feed, so their
+    # signatures do not need a ``= None`` default; only the body needs the
+    # replacement guard. Declared runtime file parameters are excluded from
+    # ``unconfigured`` before this rewrite and receive no discovery feed.
     function.body = [*guards, *function.body]
     ast.fix_missing_locations(module)
     return ast.unparse(module), frozenset(rewritten)
@@ -1290,6 +1246,20 @@ def _feed_value(contract: "SourceContract", name: str, synthesized: frozenset[st
     if name in synthesized:
         return None
     return _probe_value(contract.feeds.get(name), contract.probe_size)
+
+
+def _compile_feed_values(
+    contract: "SourceContract",
+    parameter_names: Iterable[str],
+    synthesized: frozenset[str],
+) -> dict[str, Any]:
+    """Build discovery feeds without binding runtime file resources."""
+
+    return {
+        name: _feed_value(contract, name, synthesized)
+        for name in parameter_names
+        if name not in contract.file_parameters
+    }
 
 
 def _dereference_object_octets(
@@ -1375,10 +1345,15 @@ def _content_version(
         "compiler_implementation_sha256": _bundle_compiler_digest(),
         "source_sha256": source_digest,
         "entrypoint": contract.entrypoint,
-        "feeds": contract.feeds,
+        "feeds": {
+            name: value
+            for name, value in contract.feeds.items()
+            if name not in contract.file_parameters
+        },
         "feed_expressions": contract.feed_expressions,
         "backend": contract.backend,
         "bake_mode": contract.bake_mode,
+        "final_fused_reduction": contract.final_fused_reduction,
         "schedule_preference": contract.schedule_preference,
         "remove_loops": contract.remove_loops,
         "unroll_limit": contract.unroll_limit,
@@ -1388,6 +1363,10 @@ def _content_version(
         "presentation_entrypoint": contract.presentation_entrypoint,
         "contract_shader_configuration": dict(contract.shader_configuration),
         "audio_configuration": dict(contract.audio_configuration),
+        "file_parameters": {
+            name: dict(specification)
+            for name, specification in contract.file_parameters.items()
+        },
         "constant_map": dict(contract.constant_map),
         "presentation_shader_sha256": (
             hashlib.sha256(presentation_shader.encode("utf-8")).hexdigest()
@@ -1627,7 +1606,15 @@ def _write_program_origin(
         "entrypoint": contract.entrypoint,
         "source": source,
         "source_filename": Path(source_filename).name,
-        "probes": contract.feeds,
+        "probes": {
+            name: value
+            for name, value in contract.feeds.items()
+            if name not in contract.file_parameters
+        },
+        "runtime_file_parameters": {
+            name: dict(specification)
+            for name, specification in contract.file_parameters.items()
+        },
         "backend_targets": (
             sorted(str(item).lower() for item in backend_targets)
             if backend_targets else None
@@ -1970,6 +1957,7 @@ def build_program_bundle(
     presentation_document: str | None = None,
     shader_configuration: Mapping[str, Any] | None = None,
     bake_mode: str | None = None,
+    final_fused_reduction: bool | None = None,
     schedule_preference: str | None = None,
     progress_sink: Callable[[Any], None] | None = None,
     force_new_version: bool = False,
@@ -2049,6 +2037,7 @@ def build_program_bundle(
         slug=slug,
         probes=probes,
         bake_mode=bake_mode,
+        final_fused_reduction=final_fused_reduction,
         schedule_preference=schedule_preference,
         progress=lambda message: channel.log(message, path="contract"),
     )
@@ -2065,6 +2054,7 @@ def build_program_bundle(
         set(_entrypoint_parameters(source, contract.entrypoint))
         - set(contract.feeds)
         - set(contract.constant_map)
+        - set(contract.file_parameters)
     )
     source, synthesized = _synthesize_state_defaults(
         source, contract.entrypoint, unconfigured,
@@ -2074,16 +2064,24 @@ def build_program_bundle(
             f"synthesized default construction for {sorted(synthesized)!r}",
             path="contract",
         )
-        # The object survives to the next call the same way any other
-        # persistent state does: fed back from an equally-named output. It
-        # is the constructed object itself that has to be returned whole
-        # (`return counter`), not a value derived from it (`return
-        # counter.value`) -- only the whole object carries next call's
-        # accumulated state forward.
-        contract = replace(
-            contract,
-            state_feedback={**contract.state_feedback, **{n: n for n in synthesized}},
-        )
+        # Every synthesized parameter is deterministically constructed on
+        # entry, every call, unconditionally -- that happens right here,
+        # in the guard ``_synthesize_state_defaults`` already inserted,
+        # and nothing below this block changes that. What varies is
+        # whether the *result* also needs to persist across calls.  A
+        # parameter that is also returned (an accumulator, like
+        # ``counter``) does: it is fed back from an equally-named output
+        # (see the ``aot.function_outputs`` swap below, once the real
+        # outputs are known). A parameter that is rebuilt fresh from its
+        # default every call and never returned (a policy object, a
+        # random generator) has nothing to round-trip -- there is no
+        # second call's input for it to become. Marking it in
+        # state_feedback anyway demanded a WASM input/output pair the
+        # compiled ABI correctly has no reason to carry, which is exactly
+        # the missing-inputs/missing-outputs failure this produced.
+        # Whether each synthesized name actually round-trips is decided
+        # below, against the real ``aot.function_outputs`` -- not assumed
+        # uniformly here.
     contract_shader_configuration = {
         **dict(contract.shader_configuration),
         **dict(shader_configuration or {}),
@@ -2117,8 +2115,6 @@ def build_program_bundle(
             compile_ast_aot,
             project_public_numerical_program,
         )
-        from ..common.tensors.topological_reducer import reduce_abstract_tensor_topology
-        from ..transmogrifier.graph.graph_express2 import ProcessGraph
         from .backend_sources import BackendSourceSet, collect_backend_sources
         from .fused_program_wasm_backend import emit_wasm_module, required_steps
         from .fused_program_webgl_backend import emit_webgl_fragment_module
@@ -2141,38 +2137,25 @@ def build_program_bundle(
         from .wasm_html_shell import emit_html_shell
 
         parameter_names = _entrypoint_parameters(source, contract.entrypoint)
-        feeds = {
-            name: _feed_value(contract, name, synthesized)
-            for name in parameter_names
-        }
-        with contextlib.redirect_stdout(compile_log), contextlib.redirect_stderr(compile_log):
+        feeds = _compile_feed_values(contract, parameter_names, synthesized)
+        _live_out, _live_err = sys.stdout, sys.stderr
+        with contextlib.redirect_stdout(
+            _TeeStream(_live_out, compile_log)
+        ), contextlib.redirect_stderr(
+            _TeeStream(_live_err, compile_log)
+        ):
             # ``channel.timed(...)`` only emits a record when the block
             # finishes (success or failure) -- it never announces that it
             # started, which made a slow block look identical to nothing
-            # having happened yet. An explicit "starting" log plus a
-            # heartbeat on the one genuinely long, opaque call (AOT compile
-            # can run for minutes with no sub-step to report) closes that
-            # gap the same way ast.parse's heartbeat did.
-            channel.log("build process graph starting", path="process_graph")
-            with channel.timed("build process graph", path="process_graph"):
-                graph = ProcessGraph(materialize_memory=False)
-                graph.python_package = python_package
-                channel.log("process_graph: build_from_ast starting", path="process_graph")
-                graph.build_from_ast(
-                    ast.parse(source),
-                    resolve_unresolved_parents=True,
-                    progress=lambda message: channel.log(message, path="process_graph"),
-                )
-                channel.log("process_graph: build_from_ast finished", path="process_graph")
-                channel.log("process_graph: reduce_abstract_tensor_topology starting", path="process_graph")
-                reduce_abstract_tensor_topology(graph)
-                channel.log("process_graph: reduce_abstract_tensor_topology finished", path="process_graph")
+            # having happened yet. An explicit "starting" log closes that
+            # gap; ``compile_ast_aot``'s own ``progress`` callback below
+            # supplies the real, meaningful sub-step logs during the call
+            # itself.
             channel.log(
                 "AOT compile starting", path="aot",
                 entrypoint=contract.entrypoint,
             )
             with channel.timed("AOT compile", path="aot", entrypoint=contract.entrypoint):
-                channel.log("AOT compile starting", path="aot", entrypoint=contract.entrypoint)
                 aot = compile_ast_aot(
                     source,
                     contract.entrypoint,
@@ -2181,29 +2164,67 @@ def build_program_bundle(
                     remove_loops=contract.remove_loops,
                     unroll_limit=contract.unroll_limit,
                     precompile_only=True,
-                    python_bindings=globals(),
                     python_package=python_package,
                     bake_mode=contract.bake_mode,
                     schedule_preference=contract.schedule_preference,
                     constant_map=contract.constant_map,
                     mutable_parameters=contract.mutable_parameters,
                     progress=lambda message: channel.log(message, path="aot"),
+                    checkpoint=True,
                 )
                 channel.log("AOT compile finished", path="aot", entrypoint=contract.entrypoint)
+            channel.log(
+                "recover process graph from AOT deployment",
+                path="process_graph",
+            )
+            with channel.timed(
+                "recover process graph from AOT deployment",
+                path="process_graph",
+            ):
+                graph = getattr(aot.deployment, "process_graph", None)
+                if graph is None:
+                    raise RuntimeError(
+                        "AOT compilation did not retain its process graph"
+                    )
             if (
                 contract.bake_mode == "whole_program"
                 and aot.control_shortfalls
             ):
-                details = "; ".join(
-                    f"{item['function']} loop {item['loop_node_id']}: "
-                    + ", ".join(item["blockers"])
-                    for item in aot.control_shortfalls
+                # Piece-at-a-time bake. A loop whose control could not yet be
+                # lowered (a `raise` that belongs to the shell, an opaque
+                # state effect, an unresolved dynamic bound) is not a reason to
+                # throw the whole program away and emit nothing. We lower every
+                # region that *did* resolve and leave each unresolved loop as a
+                # marked, durable spot -- a structured telemetry record naming
+                # the function, the loop node, and exactly which blockers are
+                # still open -- so the bundle builds now and the holes get
+                # filled incrementally as each blocker is solved. These records
+                # ride the same channel into the shell's inspection panel, so
+                # the work we don't otherwise see is surfaced, not swallowed.
+                lowered_loops = len(
+                    getattr(aot.shell_control_program, "region_indices", ()) or ()
                 )
-                raise RuntimeError(
-                    "WebAssembly whole-program bake refused an incomplete "
-                    "control lowering; emitting the discovery-time numerical "
-                    f"trace would not be the source program ({details})"
+                open_loops = len(aot.control_shortfalls)
+                channel.progress(
+                    "whole-program control lowering: filling resolved loops, "
+                    "leaving unresolved loops as fill-later spots",
+                    done=lowered_loops,
+                    total=lowered_loops + open_loops,
+                    path="control-hole",
                 )
+                for item in aot.control_shortfalls:
+                    channel.log(
+                        "control-lowering spot left for a later pass: "
+                        f"{item['function']} loop {item['loop_node_id']} "
+                        f"({', '.join(item['blockers'])})",
+                        path="control-hole",
+                        status="fill-later",
+                        function=item["function"],
+                        loop_node_id=item["loop_node_id"],
+                        source_type=item.get("source_type"),
+                        blockers=list(item["blockers"]),
+                        captured_regions=item.get("captured_regions"),
+                    )
             if synthesized:
                 # A synthesized state parameter's whole-object name never
                 # resolves to one scalar terminal -- ``counter``'s identity
@@ -2277,13 +2298,34 @@ def build_program_bundle(
                         f"{len(aot.region_programs or {})}, region_indices="
                         f"{getattr(aot.shell_control_program, 'region_indices', ())!r})"
                     )
-            program = project_public_numerical_program(aot)
-            channel.log("emitting wasm module", path="wasm", entrypoint=contract.entrypoint)
-            module = emit_wasm_module(
-                program, name=contract.entrypoint, dtype="float64"
+            real_control = (
+                aot.shell_control_program
+                if contract.bake_mode == "whole_program"
+                and aot.shell_control_program is not None
+                and aot.shell_control_program.region_indices
+                and aot.region_programs
+                else None
             )
-            channel.log("wasm module emitted", path="wasm", operations=len(required_steps(program)))
-            if contract.state_feedback:
+            program = None
+            module = None
+            if contract.final_fused_reduction:
+                program = project_public_numerical_program(aot)
+                channel.log("emitting wasm module", path="wasm", entrypoint=contract.entrypoint)
+                module = emit_wasm_module(
+                    program, name=contract.entrypoint, dtype="float64"
+                )
+                channel.log("wasm module emitted", path="wasm", operations=len(required_steps(program)))
+            elif real_control is None:
+                raise RuntimeError(
+                    "final fused reduction is disabled, but compilation "
+                    "produced no retained control regions for WebAssembly"
+                )
+            else:
+                channel.log(
+                    "final fused reduction disabled; retaining control-region Wasm",
+                    path="wasm",
+                )
+            if contract.state_feedback and module is not None:
                 entry = module.api.entry_points[0]
                 input_names = {
                     item.name for item in entry.parameters if item.role == "input"
@@ -2352,7 +2394,6 @@ def build_program_bundle(
                     remove_loops=contract.remove_loops,
                     unroll_limit=contract.unroll_limit,
                     precompile_only=True,
-                    python_bindings=globals(),
                     bake_mode=contract.bake_mode,
                     schedule_preference=contract.schedule_preference,
                     progress=lambda message: channel.log(message, path="presentation"),
@@ -2389,7 +2430,7 @@ def build_program_bundle(
                         input_name = presentation_parameters[value_id]
                     bindings[item["uniform"]] = str(input_name)
                 effective_shader_configuration["output_feed_bindings"] = bindings
-        if not module.complete:
+        if module is not None and not module.complete:
             raise RuntimeError(module.shortfall_report())
 
         # A trivial identity shader (display red/green/blue as-is) compiled
@@ -2418,7 +2459,6 @@ def build_program_bundle(
             remove_loops=True,
             unroll_limit=contract.unroll_limit,
             precompile_only=True,
-            python_bindings=globals(),
         )
         passthrough_program = project_public_numerical_program(passthrough_aot)
         passthrough_module = emit_webgl_fragment_module(
@@ -2528,6 +2568,8 @@ def build_program_bundle(
         # as WebGL-safe scalar code. A page author never authors a shader
         # function unless they want something other than plain display.
         if (
+            module is not None
+            and
             contract.presentation_entrypoint is None
             and passthrough_module.complete
             and effective_presentation_shader is None
@@ -2556,17 +2598,13 @@ def build_program_bundle(
 
         card_directory = Path("wasm") / f"size-{DEFAULT_WASM_CARD_OPERATIONS}"
         channel.log("partitioning program into wasm regions", path="regions")
-        real_control = (
-            aot.shell_control_program
-            if contract.bake_mode == "whole_program"
-            and aot.shell_control_program is not None
-            and aot.shell_control_program.region_indices
-            and aot.region_programs
-            else None
-        )
         effective_region_programs = dict(aot.region_programs)
         thread_topology = None
-        if real_control is not None and len(real_control.region_indices) == 1:
+        if (
+            program is not None
+            and real_control is not None
+            and len(real_control.region_indices) == 1
+        ):
             source_region = int(real_control.region_indices[0])
             source_program = effective_region_programs.get(source_region)
             if source_program is not None:
@@ -2594,14 +2632,47 @@ def build_program_bundle(
                 "emitting control region modules", path="regions",
                 regions=len(real_control.region_indices),
             )
+            # Per-region logging surfaces the final-reduction progress. The
+            # content-addressed reduction cache (an incremental backup of each
+            # lowered region) stays OFF until the build is deterministic: a
+            # region program's key is not stable across builds today, so caching
+            # would only add overhead and never reuse. The `reduction_cache`
+            # parameter remains so this switches on with build determinism.
             card_modules, card_manifest = emit_control_region_modules(
                 real_control,
                 effective_region_programs,
                 owner_name=contract.entrypoint,
                 module_dir=card_directory.as_posix(),
                 dtype="float64",
+                reduction_cache=None,
+                progress=lambda region, cached: channel.log(
+                    f"region {region} reduction lowered",
+                    path="reductions", region=int(region),
+                ),
             )
-            channel.log("control region modules emitted", path="regions", modules=len(card_modules))
+            # Record every region into the persistent master algorithm table,
+            # grouped by canonical topology (value-id-invariant), and report how
+            # far the regions collapse: how many distinct algorithms are present
+            # and how many unique kernels the byte-dedup emitted.
+            from .topology_catalogue import TopologyCatalogue
+            catalogue = TopologyCatalogue()
+            for region in real_control.region_indices:
+                region_program = effective_region_programs.get(int(region))
+                if region_program is not None:
+                    catalogue.record(
+                        getattr(region_program, "program", region_program)
+                    )
+            try:
+                catalogue.save()
+            except Exception:
+                pass
+            channel.log(
+                "control region modules emitted", path="regions",
+                modules=len(card_modules),
+                regions=card_manifest.get("region_count"),
+                topologies=len(catalogue.entries),
+                unique_kernels=card_manifest.get("unique_kernels"),
+            )
             producer = {
                 int(value_id): (
                     entry["name"], str(output_name)
@@ -2685,6 +2756,7 @@ def build_program_bundle(
             )
             channel.log("browser thread plan built", path="regions")
         else:
+            assert program is not None
             channel.log("partitioning reduced program (no parallel regions)", path="regions")
             specs = partition_reduced_program(
                 program,
@@ -2743,6 +2815,106 @@ def build_program_bundle(
                 "reserved_bytes": module.api.metadata.get("reserved_bytes", 0),
                 "operation_count": len(required_steps(program)),
             }
+        if module is None:
+            from .compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter
+            from .fused_program_wasm_backend import WasmModule
+            from .shell_io import (
+                ShellIOManifest,
+                ShellIORequest,
+                SystemPort,
+                attach_shell_io,
+            )
+
+            logical_inputs = tuple(card_manifest.get("logical_inputs", {}))
+            logical_outputs = tuple(card_manifest.get("logical_outputs", {}))
+            coordinator_parameters = (
+                Parameter(
+                    name="count",
+                    role="extent",
+                    dtype="i32",
+                    c_type="int32_t",
+                    ctypes_name="c_int32",
+                    passing="value",
+                ),
+                *(
+                    Parameter(
+                        name=name,
+                        role="input",
+                        dtype=(
+                            "u8" if name in contract.file_parameters else "f64"
+                        ),
+                        c_type=(
+                            "uint8_t" if name in contract.file_parameters else "double"
+                        ),
+                        ctypes_name=(
+                            "c_uint8" if name in contract.file_parameters else "c_double"
+                        ),
+                        passing="reference",
+                        extent="count",
+                        source_name=name,
+                    )
+                    for name in logical_inputs
+                ),
+                *(
+                    Parameter(
+                        name=name,
+                        role="output",
+                        dtype="f64",
+                        c_type="double",
+                        ctypes_name="c_double",
+                        passing="reference",
+                        extent="count",
+                        source_name=name,
+                    )
+                    for name in logical_outputs
+                ),
+            )
+            coordinator_api = CompiledProgramAPI(
+                module=coordinator.name,
+                language="wasm",
+                entry=contract.entrypoint,
+                entry_points=(EntryPoint(
+                    name=contract.entrypoint,
+                    symbol="run_range",
+                    kind="control",
+                    parameters=coordinator_parameters,
+                    note="whole program retained as control and region modules",
+                ),),
+                metadata={
+                    "shared_memory_import": True,
+                    "memory_import": {"module": "env", "field": "memory"},
+                    "class_manifest": (card_directory / "class-inventory.json").as_posix(),
+                },
+            )
+            if contract.file_parameters:
+                coordinator_api = attach_shell_io(
+                    coordinator_api,
+                    ShellIOManifest(
+                        (ShellIORequest.create("files"),),
+                        system_ports=tuple(
+                            SystemPort.create(
+                                str(specification.get("name") or name),
+                                "file",
+                                "input",
+                                entry_point=contract.entrypoint,
+                                fields={"data": name, "length": "count"},
+                                attributes={
+                                    key: value
+                                    for key, value in specification.items()
+                                    if key != "name"
+                                },
+                            )
+                            for name, specification
+                            in contract.file_parameters.items()
+                        ),
+                    ),
+                )
+            module = WasmModule(
+                name=coordinator.name,
+                source=coordinator.wat,
+                api=coordinator_api,
+                binary=coordinator.binary,
+            )
         card_manifest.update({
             "region_steps": DEFAULT_WASM_CARD_OPERATIONS,
             "class_inventory": inventory.to_mapping(),
@@ -2760,12 +2932,20 @@ def build_program_bundle(
         card_output_directory = temporary / card_directory
         card_output_directory.mkdir(parents=True, exist_ok=True)
         if real_control is not None:
+            # Byte-identical kernels share one file (the manifest points every
+            # such region's URL at it); write each unique kernel once. Per-region
+            # method cards still import it under their own name.
+            written_kernels: set[str] = set()
             for region, region_module in card_modules.items():
                 entry = next(
                     item for item in card_manifest["modules"]
                     if int(item["region_index"]) == int(region)
                 )
-                (card_output_directory / f"{entry['name']}.wasm").write_bytes(
+                kernel = entry.get("kernel", entry["name"])
+                if kernel in written_kernels:
+                    continue
+                written_kernels.add(kernel)
+                (card_output_directory / f"{kernel}.wasm").write_bytes(
                     region_module.binary
                 )
         else:
@@ -2794,9 +2974,14 @@ def build_program_bundle(
         )
 
         sources = None
-        if include_backends:
+        if include_backends and program is not None:
             channel.log("collecting backend sources", path="sources")
-            with contextlib.redirect_stdout(compile_log), contextlib.redirect_stderr(compile_log):
+            _live_out2, _live_err2 = sys.stdout, sys.stderr
+            with contextlib.redirect_stdout(
+                _TeeStream(_live_out2, compile_log)
+            ), contextlib.redirect_stderr(
+                _TeeStream(_live_err2, compile_log)
+            ):
                 sources = collect_backend_sources(
                     aot,
                     numerical_name=contract.entrypoint,
@@ -2919,7 +3104,7 @@ def build_program_bundle(
         # this bundle's own backend tab.  Exported-memory numeric modules only;
         # imported-memory region modules are driven by the control path.
         wasm_verification = None
-        if module.binary is not None and not (
+        if program is not None and module.binary is not None and not (
             module.api.metadata or {}
         ).get("shared_memory_import"):
             from ..common.tensors.fused_ir import ordered_feed_ids
@@ -2976,7 +3161,7 @@ def build_program_bundle(
 
         mathematics = None
         math_error = ""
-        if include_mathematics:
+        if include_mathematics and program is not None:
             channel.log("rendering sympy mathematics model", path="mathematics")
             try:
                 document = render_reduced_program_mathematics(
@@ -3027,7 +3212,9 @@ def build_program_bundle(
                 "bundle schema": BUNDLE_SCHEMA,
                 "content version": version,
                 "source SHA-256": source_digest,
-                "steps": len(required_steps(program)),
+                "steps": (
+                    len(required_steps(program)) if program is not None else None
+                ),
             },
             default_width=contract.width,
             default_height=contract.height,
@@ -3098,6 +3285,11 @@ def build_program_bundle(
             "compiler": {
                 "backend": contract.backend,
                 "bake_mode": contract.bake_mode,
+                "final_fused_reduction": contract.final_fused_reduction,
+                "file_parameters": {
+                    name: dict(specification)
+                    for name, specification in contract.file_parameters.items()
+                },
                 "schedule_preference": contract.schedule_preference,
                 "program_record_mode": aot.program_record_mode,
                 "constant_map": dict(aot.constant_map),

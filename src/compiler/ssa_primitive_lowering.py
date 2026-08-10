@@ -171,6 +171,10 @@ def lower_ssa_to_fused_program(
                 available.add(result_id)
             continue
 
+        if op == "random_source":
+            append_step(op, result_id, [], dict(instr.attributes))
+            continue
+
         op_lower = op.lower() if isinstance(op, str) else op
         if op_lower in _FILL_DEFAULTS:
             default_value = _FILL_DEFAULTS[op_lower]

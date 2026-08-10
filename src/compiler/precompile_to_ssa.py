@@ -24,11 +24,16 @@ from .control_source import (
     WhileBlock,
 )
 from .deployment_frame import DeploymentJoin
+from .hierarchical_plan import (
+    PlanClosure,
+    plan_region_to_ssa_instrs,
+)
 from .precompile_ssa_validator import (
     PrecompileSSAValidationResult,
     ssa_handler_for_precompile,
     validate_precompile_ssa_compatibility,
 )
+from .ssa_features import XOROSHIRO128SS_FILL, link_required_ssa_features
 from ..common.tensors.fused_ir import FusedProgram, Meta, OpStep
 from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
     LLVM_SSA_MODULE,
@@ -205,6 +210,8 @@ def lower_fused_program_to_ssa(
         return count
 
     def tensor_algorithm(step: OpStep) -> str | None:
+        if step.op_name == "random_source":
+            return XOROSHIRO128SS_FILL
         translations = translations_for_operation(step.op_name)
         if not translations:
             return None
@@ -2007,6 +2014,7 @@ def lower_precompile_and_control_to_ssa(
     numerical_name: str = "numerical_precompile",
     control_name: str = "planned_control",
     region_programs: dict[int, Any] | None = None,
+    hierarchy_plan: PlanClosure | None = None,
     identity_table: Mapping[str, tuple[int, ...]] | None = None,
     function_outputs: tuple[str, ...] = (),
     function_parameters: tuple[str, ...] = (),
@@ -2067,6 +2075,51 @@ def lower_precompile_and_control_to_ssa(
         for value_id, meta in (region_program.meta or {}).items():
             region_value_meta.setdefault(int(value_id), meta)
         region_shortfalls.extend(shortfalls)
+    if hierarchy_plan is not None:
+        for region in hierarchy_plan.items:
+            if not (
+                isinstance(region, PlanClosure)
+                and region.name.startswith("region_")
+            ):
+                continue
+            region_index = int(region.name.split("_", 1)[1])
+            if region_index in region_callees:
+                continue
+            region_name = f"planned_region_{region_index}"
+            instructions = list(plan_region_to_ssa_instrs(region))
+            produced = {
+                int(instruction.res.id) for instruction in instructions
+            }
+            consumed = {
+                int(argument.id)
+                for instruction in instructions
+                for argument in instruction.args
+            }
+            outputs = tuple(sorted(produced - consumed)) or tuple(
+                sorted(produced)
+            )
+            arguments = [SSAValue(int(value_id)) for value_id in region.captures]
+            functions[region_name] = Function(
+                region_name,
+                arguments,
+                {"entry": BasicBlock("entry", instructions)},
+            )
+            region_callees[region_index] = region_name
+            region_signatures[region_index] = (
+                tuple(int(value_id) for value_id in region.captures),
+                outputs,
+            )
+            known_operations = {handler.value for handler in Handler}
+            region_shortfalls.extend(
+                SSALoweringShortfall(
+                    "planned-region",
+                    str(instruction.op),
+                    f"{region_name}:entry",
+                    "operator has no repository SSA handler",
+                )
+                for instruction in instructions
+                if str(instruction.op) not in known_operations
+            )
     if not region_callees:
         region_callees = {
             int(region_index): numerical.name
@@ -2092,7 +2145,7 @@ def lower_precompile_and_control_to_ssa(
     )
     functions[control_function.name] = control_function
     module = IRModule(
-        functions,
+        link_required_ssa_features(functions),
         recursion_table={
             name: dict(function.metadata.get("recursion_table", {}))
             for name, function in functions.items()

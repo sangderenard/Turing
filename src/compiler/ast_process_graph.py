@@ -36,6 +36,35 @@ _CALLS = {
     "sum": "sum", "topk": "topk", "transpose": "transpose",
 }
 
+_RANDOM_REQUESTS = {
+    "getrandbits": ("bits", "integer"),
+    "integers": ("integer", "tensor"),
+    "normal": ("normal", "tensor"),
+    "rand": ("uniform", "tensor"),
+    "rand_like": ("uniform", "tensor_like"),
+    "randint": ("integer", "tensor"),
+    "randint_like": ("integer", "tensor_like"),
+    "randn": ("normal", "tensor"),
+    "random": ("uniform", "scalar_or_tensor"),
+    "random_sample": ("uniform", "scalar_or_tensor"),
+    "random_source": ("uniform", "scalar"),
+    "random_tensor": ("uniform", "tensor"),
+    "randoms": ("uniform", "tensor"),
+    "randrange": ("integer", "scalar"),
+    "sample": ("uniform", "scalar_or_tensor"),
+    "standard_normal": ("normal", "tensor"),
+    "uniform": ("uniform_range", "scalar_or_tensor"),
+}
+
+
+def _call_spelling(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        owner = _call_spelling(node.value)
+        return node.attr if owner is None else f"{owner}.{node.attr}"
+    return None
+
 
 def build_semantic_ast(graph, tree: ast.AST, *, filename: str | None = None):
     """Lower one Python function/module into ``graph`` using existing ops."""
@@ -135,9 +164,33 @@ def build_semantic_ast(graph, tree: ast.AST, *, filename: str | None = None):
                 source=span(node),
             ) if op is not None else opaque(node))
         if isinstance(node, ast.Call):
+            qualified = _call_spelling(node.func)
             spelling = (node.func.id if isinstance(node.func, ast.Name)
                         else node.func.attr if isinstance(node.func, ast.Attribute)
                         else None)
+            random_request = _RANDOM_REQUESTS.get(spelling)
+            if random_request is not None:
+                distribution, result_kind = random_request
+                arguments = [expression(arg) for arg in node.args]
+                attrs = {
+                    "request": qualified or spelling,
+                    "distribution": distribution,
+                    "result_kind": result_kind,
+                    "arguments": tuple(ast.unparse(arg) for arg in node.args),
+                }
+                for keyword in node.keywords:
+                    key = keyword.arg or "**"
+                    try:
+                        attrs[key] = ast.literal_eval(keyword.value)
+                    except (ValueError, TypeError):
+                        attrs[key] = ast.unparse(keyword.value)
+                return add_node(
+                    "random_source",
+                    zip(arguments, (f"arg{i}" for i in range(len(arguments)))),
+                    label="random_source",
+                    attributes=attrs,
+                    source=span(node),
+                )
             canonical = _CALLS.get(spelling)
             arguments = []
             if canonical is not None and isinstance(node.func, ast.Attribute):

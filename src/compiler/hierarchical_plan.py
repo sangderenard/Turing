@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import Any, Mapping
 
+from ..transmogrifier.ssa import Instr, SSAValue
+
 
 @dataclass(frozen=True)
 class PlanLine:
@@ -17,6 +19,7 @@ class PlanLine:
     inputs: tuple[int, ...] = ()
     outputs: tuple[int, ...] = ()
     attributes: tuple[tuple[str, Any], ...] = ()
+    input_roles: tuple[str, ...] = ()
 
     @classmethod
     def create(
@@ -26,12 +29,14 @@ class PlanLine:
         inputs=(),
         outputs=(),
         attributes: Mapping[str, Any] | None = None,
+        input_roles=(),
     ) -> "PlanLine":
         return cls(
             str(opcode),
             tuple(int(value) for value in inputs),
             tuple(int(value) for value in outputs),
             tuple(sorted((attributes or {}).items())),
+            tuple(str(role) for role in input_roles),
         )
 
 
@@ -62,6 +67,34 @@ class PlanCall:
 
 
 PlanItem = PlanLine | PlanClosure | PlanCall
+
+
+def plan_region_to_ssa_instrs(region: PlanClosure) -> tuple[Instr, ...]:
+    """Lower one planner-owned flat region to repository SSA instructions."""
+
+    values: dict[int, SSAValue] = {}
+    instructions = []
+    for item in region.items:
+        if not isinstance(item, PlanLine):
+            raise ValueError(
+                f"{region.name!r} is not a flat operator region"
+            )
+        if len(item.outputs) != 1:
+            raise ValueError(
+                f"{item.opcode!r} must publish one SSA result"
+            )
+        result_id = int(item.outputs[0])
+        instructions.append(Instr(
+            item.opcode,
+            [
+                values.setdefault(int(value_id), SSAValue(int(value_id)))
+                for value_id in item.inputs
+            ],
+            values.setdefault(result_id, SSAValue(result_id)),
+            arg_roles=list(item.input_roles),
+            attributes=dict(item.attributes),
+        ))
+    return tuple(instructions)
 
 
 @dataclass(frozen=True)
@@ -337,12 +370,14 @@ def render_plan_ascii(root: PlanClosure) -> str:
             return
         inputs = ",".join(map(str, item.inputs)) or "-"
         outputs = ",".join(map(str, item.outputs)) or "-"
+        roles = ",".join(item.input_roles) or "-"
         attributes = " ".join(
             f"{name}={value!r}" for name, value in item.attributes
         )
         suffix = f" {attributes}" if attributes else ""
         lines.append(
-            f"{prefix}{branch}{item.opcode} in=[{inputs}] out=[{outputs}]"
+            f"{prefix}{branch}{item.opcode} in=[{inputs}] roles=[{roles}] "
+            f"out=[{outputs}]"
             f"{suffix}"
         )
 
@@ -360,4 +395,5 @@ __all__ = [
     "assign_hierarchy_ids",
     "reduce_hierarchy_identities",
     "render_plan_ascii",
+    "plan_region_to_ssa_instrs",
 ]

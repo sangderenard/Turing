@@ -2129,8 +2129,20 @@ async function computeViaSelectedRunner(feeds, count) {
   if (!manifest) throw new Error("choose an execution shape before running");
   for (const logicalName of Object.keys(manifest.logical_inputs || {})) {
     const paramIndex = inputs.findIndex(p => p.name === logicalName);
-    if (paramIndex < 0) throw new Error("logical input " + logicalName + " is not in the API");
-    logicalInputs[logicalName] = feeds[paramIndex];
+    if (paramIndex >= 0) {
+      logicalInputs[logicalName] = feeds[paramIndex];
+      continue;
+    }
+    const binding = SYSTEM_FIELDS.get(logicalName);
+    if (!binding || binding.port.kind !== "file") {
+      throw new Error("logical input " + logicalName + " is not in the API");
+    }
+    const file = systemPorts.files.get(binding.port.name);
+    if (!file) throw new Error("required file input is not loaded: " + binding.port.name);
+    if (binding.field !== "data") throw new Error(
+      "logical file input must bind the data field: " + logicalName
+    );
+    logicalInputs[logicalName] = file.bytes;
   }
   if (activeExecutionMode === "contiguous") {
     if (!contiguousRunner) throw new Error("no contiguous compile is published");
@@ -2177,11 +2189,16 @@ async function runClassGraphMode() {
     await advanceFeedback(feedbackTicks);
     let activeFeeds = inputs.map(p => feedValues(p, d.n, d, frameIndex));
     applyFeedbackFeed(activeFeeds, d.n);
+    const loadedFileLengths = Array.from(SYSTEM_FIELDS.values())
+      .filter(binding => binding.port.kind === "file" && binding.field === "data")
+      .map(binding => systemPorts.files.get(binding.port.name))
+      .filter(Boolean)
+      .map(file => file.bytes.byteLength);
     const count = anyExpression
       ? d.n
       : (activeFeeds.length
           ? Math.min(...activeFeeds.map(feed => feed.length))
-          : d.n);
+          : (loadedFileLengths.length ? Math.min(...loadedFileLengths) : d.n));
     if (!count) throw new Error("no elements to run");
     const repeats = Math.max(0, Number($("repeats").value) | 0);
     const continuous = repeats === 0;

@@ -679,6 +679,13 @@ def _abstract_tensor_static(name):
     return apply
 
 
+def _abstract_tensor_random_source(*values):
+    from ..common.tensors.abstraction import AbstractTensor
+
+    shape = tuple(int(value) for value in values) or (1,)
+    return AbstractTensor.random_tensor(shape)
+
+
 def _abstract_tensor_constant(value):
     def build(*_values):
         from ..common.tensors.abstraction import AbstractTensor
@@ -864,6 +871,11 @@ _at_matmul = _abstract_tensor_reduce(lambda left, right: left @ right)
 _at_and = _abstract_tensor_reduce(lambda left, right: left & right)
 _at_or = _abstract_tensor_reduce(lambda left, right: left | right)
 _at_xor = _abstract_tensor_reduce(lambda left, right: left ^ right)
+# ``<<``/``>>`` resolve their result type through AbstractTensor's own
+# operators (``__lshift__``/``__rshift__``), exactly as the bitwise ops above
+# do -- no forced integer cast here.
+_at_shl = _abstract_tensor_reduce(lambda left, right: left << right)
+_at_shr = _abstract_tensor_reduce(lambda left, right: left >> right)
 
 abstract_tensor_funcs = {
     # SymPy/ProcessGraph spellings.
@@ -880,6 +892,8 @@ abstract_tensor_funcs = {
     "MatMult": _at_matmul,
     "And": _at_and,
     "Or": _at_or,
+    "LShift": _at_shl,
+    "RShift": _at_shr,
     "Not": _abstract_tensor_method("logical_not"),
     "Equality": _abstract_tensor_reduce(lambda left, right: left == right),
     "Unequality": _abstract_tensor_reduce(lambda left, right: left != right),
@@ -930,9 +944,12 @@ abstract_tensor_funcs = {
     "mod": _at_mod,
     "pow": _at_pow,
     "matmul": _at_matmul,
+    "random_source": _abstract_tensor_random_source,
     "bitand": _at_and,
     "bitor": _at_or,
     "bitxor": _at_xor,
+    "shl": _at_shl,
+    "shr": _at_shr,
     "logical_and": _at_and,
     "logical_or": _at_or,
     "logical_not": _abstract_tensor_method("logical_not"),
@@ -1080,10 +1097,7 @@ for _name in sorted(CANONICAL_ABSTRACT_TENSOR_OPERATORS):
     abstract_tensor_funcs[_name] = _handler
 
 for _alias, _canonical in OPERATOR_ALIASES.items():
-    abstract_tensor_funcs.setdefault(
-        _alias,
-        abstract_tensor_funcs[_canonical],
-    )
+    abstract_tensor_funcs[_alias] = abstract_tensor_funcs[_canonical]
 
 _abstract_tensor_unary_names = {
     "Sin", "Cos", "Tan", "Exp", "Log", "Sqrt", "Abs", "Not",
@@ -1102,9 +1116,11 @@ _abstract_tensor_binary_names = {
     "And", "Or", "Equality", "Unequality", "StrictLessThan",
     "LessThanOrEqual", "StrictGreaterThan", "GreaterThanOrEqual",
     "add", "sub", "mul", "div", "truediv", "mod", "pow", "matmul",
-    "bitand", "bitor", "bitxor", "logical_and", "logical_or", "equal",
+    "bitand", "bitor", "bitxor", "shl", "shr", "logical_and", "logical_or",
+    "equal",
     "not_equal", "less", "less_equal", "greater", "greater_equal",
     "maximum", "minimum", "allclose", "dot", "cross", "solve",
+    "LShift", "RShift",
 }
 _abstract_tensor_constant_names = {
     "BooleanTrue", "BooleanFalse", "Half", "Pi", "E", "ImaginaryUnit",

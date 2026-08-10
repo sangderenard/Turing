@@ -121,6 +121,9 @@ _ELEMENTWISE_TEMPLATES: dict[str, str] = {
     "bitand": "{0} & {1}",
     "bitor": "{0} | {1}",
     "bitxor": "{0} ^ {1}",
+    "shl": "{0} << {1}",
+    "shr": "{0} >> {1}",
+    "invert": "~{0}",
     "logical_and": "{0} & {1}",
     "logical_or": "{0} | {1}",
 }

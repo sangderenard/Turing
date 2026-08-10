@@ -34,6 +34,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--result-json", type=Path)
     parser.add_argument("--no-backends", action="store_true")
     parser.add_argument("--no-mathematics", action="store_true")
+    parser.add_argument("--no-final-fused-reduction", action="store_true")
     return parser.parse_args()
 
 
@@ -66,10 +67,24 @@ def _announce(message: str) -> None:
     stream.flush()
 
 
+def _infer_python_package(source: Path) -> str | None:
+    package_parts = []
+    directory = source.resolve().parent
+    while (directory / "__init__.py").is_file():
+        package_parts.append(directory.name)
+        directory = directory.parent
+    if not package_parts:
+        return None
+    return ".".join(reversed(package_parts))
+
+
 def main() -> int:
     _announce("build_site_page.py starting")
     arguments = _arguments()
     _announce(f"arguments parsed: --source {arguments.source}")
+    python_package = _infer_python_package(arguments.source)
+    if python_package is not None:
+        _announce(f"inferred Python package: {python_package}")
     probes = json.loads(arguments.probes_json)
     if not isinstance(probes, dict):
         raise SystemExit("--probes-json must decode to an object")
@@ -101,12 +116,16 @@ def main() -> int:
             source,
             arguments.destination,
             source_filename=arguments.source.name,
+            python_package=python_package,
             entrypoint=arguments.entrypoint or None,
             title=arguments.title or None,
             slug=arguments.slug or None,
             probes=probes,
             include_backends=not arguments.no_backends,
             include_mathematics=not arguments.no_mathematics,
+            final_fused_reduction=(
+                False if arguments.no_final_fused_reduction else None
+            ),
             progress_sink=_print_progress,
         )
     _announce(f"build_program_bundle returned: {bundle.page_path}")

@@ -1,10 +1,27 @@
 from hashlib import sha256
 
+import pytest
+
 from examples.reversible_demo_subject import DEMO_ENTRY_CODE, build_reversible_demo_subject
+from src.compiler.binary_ingestion import BinaryFormatError
+from src.compiler.reversible_forest_from_binary import open_decode_step_and_fork
 from examples.reversible_machine_web_host import _new_machine_bytes
 from src.compiler.machine_state_buffer import MachineRunDirection
 from src.compiler.machine_web_publication import build_machine_web_publication
 from src.compiler.wasm_html_shell import HtmlShell
+
+
+def test_binary_forest_entrypoint_runs_a_valid_pe_to_a_halted_head():
+    heads = open_decode_step_and_fork(build_reversible_demo_subject())
+
+    assert len(heads) == 1
+    assert heads[0].head_id == 0
+    assert heads[0].status.value == "halted"
+
+
+def test_binary_forest_entrypoint_rejects_malformed_pe_bytes():
+    with pytest.raises(BinaryFormatError, match="truncated DOS header"):
+        open_decode_step_and_fork(b"not a pe")
 
 
 def test_demo_subject_recompiles_and_reverses_a_multi_instruction_prefix():

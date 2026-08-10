@@ -1203,7 +1203,24 @@ def dispatch_region_to_fused_program(
         data = graph.G.nodes[node_id]
         raw_op = _operation(graph, node_id)
         reduction = raw_op in AXIS_REDUCTION_FOLDS
-        op = raw_op if reduction else canonical_elementwise_op(raw_op)[0]
+        # The builder is a faithful transcriber, not a translator: an op that is
+        # neither a fused-elementwise op nor an axis reduction (a reshape/view/
+        # cast/native kernel) is emitted under its own name with its operands
+        # and attributes intact, exactly as reductions are. Its *semantics* --
+        # a reshape being a view, say -- are the SSA-stage translator's job, not
+        # this adapter's. Only genuine elementwise ops are canonicalized (and
+        # only they carry the right_scalar operand form).
+        if reduction:
+            elementwise = False
+            op = raw_op
+        else:
+            try:
+                op = canonical_elementwise_op(raw_op)[0]
+                elementwise = True
+            except KeyError:
+                op = raw_op
+                elementwise = False
+        structural = not reduction and not elementwise
         parents = list(data.get("parents") or ())
         value_parents: list[int] = []
         scalar_parent: tuple[int, Any] | None = None
@@ -1212,7 +1229,11 @@ def dispatch_region_to_fused_program(
             if _operation(graph, parent_id) == "const":
                 constant = parent_data.get("constant")
                 scalar = uniform_tensor_constant(constant)
-                if scalar is not None:
+                # A non-elementwise op has no right_scalar operand slot; keep
+                # every constant parent as a plain constant input so the op's
+                # arguments (a reshape's target extent, a pad's width) survive
+                # verbatim for the translator to interpret.
+                if scalar is not None and not structural:
                     if scalar_parent is not None:
                         # FusedProgram represents a binary scalar operand in
                         # right_scalar, so two constant operands cannot both
@@ -1234,7 +1255,7 @@ def dispatch_region_to_fused_program(
                 value_parents.append(parent_id)
         attrs: dict[str, Any] = (
             copy.deepcopy(dict(data.get("attributes") or {}))
-            if reduction else {}
+            if reduction or structural else {}
         )
         if scalar_parent is not None:
             if reduction:
