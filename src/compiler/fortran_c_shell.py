@@ -626,9 +626,12 @@ static void turing_display_close(void) {
         "",
         r'''#if defined(_WIN32)
 /* GCC 16's MinGW static libgfortran uses the POSIX strndup entry point, while
- * the Windows CRT does not export it. Keep the standalone runtime archive
- * resolvable without introducing another redistributable DLL. */
-char *strndup(const char *source, size_t maximum) {
+ * an older Windows CRT does not export it. Keep the standalone runtime archive
+ * resolvable without introducing another redistributable DLL. The definition is
+ * WEAK: a newer mingw CRT (or the toolchain's own CRT shim) that supplies a
+ * strong strndup overrides this one, so linking both never multiply-defines the
+ * symbol; when nothing else provides it, this fills the reference. */
+__attribute__((weak)) char *strndup(const char *source, size_t maximum) {
     size_t length = 0;
     char *copy;
     while (length < maximum && source[length] != '\0') ++length;
@@ -890,6 +893,7 @@ def compile_ast_fortran_c_shell(
     checkpoint: bool | str | Path = False,
     mutable_parameters: tuple[str, ...] | list[str] | set[str] = (),
     retain_card_program: bool = True,
+    compilation: Any | None = None,
 ) -> FortranCShellExecutable:
     """Compile Python AST through the registered Fortran target and C shell.
 
@@ -898,6 +902,12 @@ def compile_ast_fortran_c_shell(
     compiler's public numerical program, and only then selects Fortran.
     Dotted aggregate feed names such as ``state.u`` are resolved from the
     caller's object without flattening or copying its arena in Python source.
+
+    ``compilation`` lets a caller that already ran the whole-program no-bake
+    ``compile_ast_aot`` (e.g. to first release the backend-neutral dual-IR
+    checkpoint) hand that exact ``AOTCompilation`` in, so the Fortran shell
+    runs the already-produced dual IR instead of compiling the program a
+    second time.
     """
 
     from ..common.tensors.accelerator_backends.aot_compile import (
@@ -913,7 +923,7 @@ def compile_ast_fortran_c_shell(
         attach_shell_io,
     )
 
-    compilation = compile_ast_aot(
+    compilation = compilation if compilation is not None else compile_ast_aot(
         source,
         entrypoint,
         dict(feeds),
