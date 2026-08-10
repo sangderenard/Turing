@@ -1721,6 +1721,31 @@ def _lower_process_graph_to_compilation(
             "aot: captured-program checkpoint skipped "
             "(hierarchy recomposition raised; prepared-plan remains resumable)"
         )
+
+    # Central, backend-neutral topology cataloguing. The region programs on the
+    # AOTCompilation are the common artifact every target (WASM, C/native/PE,
+    # Fortran, LLVM) emits from, so the master algorithm table is recorded ONCE
+    # here at the AOT boundary rather than inside any one backend's bake. Every
+    # backend then inherits the same persistent, deduplicated, named and
+    # algebraically-profiled catalogue. Best-effort: it never affects the
+    # compilation it is observing.
+    try:
+        from ....compiler.topology_catalogue import TopologyCatalogue
+
+        catalogue = TopologyCatalogue()
+        for region_program in (compilation.region_programs or {}).values():
+            catalogue.record(
+                getattr(region_program, "program", region_program)
+            )
+        catalogue.save()
+        if compilation.region_programs:
+            _report(
+                "aot: catalogued "
+                f"{len(compilation.region_programs)} regions -> "
+                f"{len(catalogue.entries)} topologies (central master table)"
+            )
+    except Exception:
+        pass
     return compilation
 
 
