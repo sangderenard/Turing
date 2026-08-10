@@ -2605,11 +2605,19 @@ def build_program_bundle(
         # idioms to single ops, then intern every string word to its universal
         # content token (recording the token -> word table for reverse lookup).
         from .ir_byte_idioms import fold_byte_string_idioms
-        from .ir_string_interning import intern_string_constants
+        from .ir_string_interning import intern_string_constants, fold_string_split
         from .string_table import StringTable
         _string_table = StringTable()
+
+        def _fold_strings(program):
+            # Order matters: the byte-idiom fold consumes literal-bytes delimiters
+            # first; the general split fold turns the rest into split-part-hash
+            # ops; then string constants intern to tokens.
+            return intern_string_constants(
+                fold_string_split(fold_byte_string_idioms(program)), _string_table)
+
         effective_region_programs = {
-            index: intern_string_constants(fold_byte_string_idioms(program), _string_table)
+            index: _fold_strings(program)
             for index, program in aot.region_programs.items()
         }
         _string_table.save()

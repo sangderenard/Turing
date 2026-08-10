@@ -16,8 +16,80 @@ comparison) is per-backend, exactly like the container ops.
 from __future__ import annotations
 
 from ..common.tensors.fused_ir import FusedProgram, OpStep
+from .ir_string_ops import STRING_SPLIT_PART_HASH
 
 STRING_TOKEN = "string_token"
+
+
+def _delim_byte(step: OpStep | None):
+    """The delimiter byte of a split's separator constant -- a one-char str or a
+    one-byte bytes."""
+    if step is None or step.op_name != "tensor_from_list":
+        return None
+    v = step.attrs.get("values")
+    if isinstance(v, (bytes, bytearray)) and len(v) == 1:
+        return int(v[0])
+    if isinstance(v, str) and len(v) == 1:
+        return ord(v)
+    return None
+
+
+def _const_int(step: OpStep | None):
+    if step is None or step.op_name != "tensor_from_list":
+        return None
+    try:
+        return int(step.attrs.get("values"))
+    except (TypeError, ValueError):
+        return None
+
+
+def fold_string_split(program: FusedProgram) -> FusedProgram:
+    """Collapse ``x.split(delim, 1)[part]`` (part in {0,1}) into one
+    ``string_split_part_hash`` op over ``x`` as a string view. ``delim`` may be a
+    one-char str or one-byte bytes constant. The split subject ``x`` flows as a
+    fat-pointer view (like a container base flows as a heap address); the
+    coordinator seeds it, the op dereferences it. Value ids are preserved (the
+    op reuses the idiom's output id) so cross-region wiring is intact.
+    """
+
+    steps = list(program.steps)
+    by_result = {s.result_id: s for s in steps}
+    dropped: set[int] = set()
+    added: list[OpStep] = []
+    for split in steps:
+        if split.op_name != "split" or len(split.input_ids) < 2:
+            continue
+        delim = _delim_byte(by_result.get(split.input_ids[1]))
+        if delim is None:
+            continue
+        view_id = split.input_ids[0]
+        final = next(
+            (t for t in steps
+             if t.op_name in ("Indexed", "gather") and len(t.input_ids) == 2
+             and t.input_ids[0] == split.result_id
+             and _const_int(by_result.get(t.input_ids[1])) in (0, 1)),
+            None,
+        )
+        if final is None:
+            continue
+        part = _const_int(by_result.get(final.input_ids[1]))
+        dropped.update({split.result_id, final.result_id,
+                        split.input_ids[1], final.input_ids[1]})
+        if len(split.input_ids) >= 3:
+            dropped.add(split.input_ids[2])
+        added.append(OpStep(step_id=final.step_id, op_name=STRING_SPLIT_PART_HASH,
+                            input_ids=[view_id], attrs={"delim": int(delim), "part": int(part)},
+                            result_id=final.result_id))
+    if not added:
+        return program
+    kept = [s for s in steps if s.result_id not in dropped]
+    kept.extend(added)
+    kept.sort(key=lambda s: s.step_id)
+    return FusedProgram(
+        version=program.version, feeds=set(program.feeds), steps=kept,
+        outputs=dict(program.outputs), state_in=program.state_in,
+        meta=program.meta, extras=program.extras,
+    )
 
 
 def _string_of(step: OpStep | None):

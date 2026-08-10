@@ -1923,6 +1923,14 @@ def _step_instructions(
         elif value_type != "i64":
             lines.append(f"      {value_type}.reinterpret_i64")
         return lines
+    if op == "string_split_part_hash":
+        # The split-part hash's byte-scanning loop is authoritative in the binary
+        # emitter; the WAT is a placeholder producing a balanced value.
+        return [
+            f"      ;; string_split_part_hash(part={step.attrs.get('part')}) "
+            "-- lowered in the binary",
+            f"      {_typed_constant(value_type, 0)}",
+        ]
     integral = _is_integer_type(value_type)
     if op in _NO_WASM_INSTRUCTION and not (
         integral
@@ -2449,6 +2457,32 @@ def _assemble(
             builder.i64_const(int(step.attrs["token"]))
             if value_type == "f64":
                 builder.raw(0xBF)  # f64.reinterpret_i64
+            builder.local_set(local)
+            return
+        if step.op_name == "string_split_part_hash":
+            # x.split(delim,1)[part] -> its token. x is a fat-pointer view held in
+            # the working type; the part is a sub-range view, hashed in place.
+            from .wasm_sequence import emit_string_split_part_hash
+            view = builder.declare_local("i64")
+            builder.local_get(locals_for[step.input_ids[0]])
+            if value_type == "f64":
+                builder.raw(0xBD)  # i64.reinterpret_f64 -> fat pointer
+            builder.local_set(view)
+            token = builder.declare_local("i64")
+            ptr, length, pos, start, end, index, byte = (
+                builder.declare_local("i32") for _ in range(7)
+            )
+            delim = builder.declare_local("i32")
+            builder.i32_const(int(step.attrs["delim"])).local_set(delim)
+            emit_string_split_part_hash(
+                builder, view_local=view, delim_local=delim,
+                part=int(step.attrs["part"]), result_local=token, ptr_local=ptr,
+                length_local=length, pos_local=pos, start_local=start,
+                end_local=end, index_local=index, byte_local=byte,
+            )
+            builder.local_get(token)
+            if value_type == "f64":
+                builder.raw(0xBF)  # f64.reinterpret_i64 (hold token in working type)
             builder.local_set(local)
             return
         if step.attrs.get("string_compare") and step.op_name in ("equal", "not_equal"):

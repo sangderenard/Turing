@@ -77,6 +77,11 @@ STRING_SLICE = "string_slice"        # ref, a, b   -> ref (ref[a:b])
 STRING_CONCAT = "string_concat"      # a, b        -> ref (a + b)
 STRING_SPLIT_PART = "string_split_part"  # ref, delim, part -> ref (split(delim,1)[part])
 
+# Fused split-then-hash: the common terminal shape (a split part is taken and
+# immediately compared/keyed), so the view is never even named. Inputs [view];
+# attrs {delim: byte, part: 0|1}. Result is the part's token.
+STRING_SPLIT_PART_HASH = "string_split_part_hash"
+
 #: The complete basic set, for a backend to check it lowers every operator, and
 #: for a fold to know which names are string operators.
 STRING_OPERATORS = frozenset({
