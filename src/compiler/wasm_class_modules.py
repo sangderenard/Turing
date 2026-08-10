@@ -98,6 +98,28 @@ def _diagnose_region(program, region, module_name) -> str:
     meta = program.meta or {}
     origins = (program.extras or {}).get("capture_feed_origins", {})
     state_in = program.state_in or set()
+
+    # Non-numeric constants (str/bytes) a scalar kernel cannot represent, and
+    # what reads them -- so a "found str/bytes" shortfall says which literal it
+    # was and how it is used (a dict key vs a compared/stored value), which
+    # decides whether it interns to a hash or needs real byte handling.
+    consumers: dict[int, list] = {}
+    for step in program.steps:
+        for operand in step.input_ids:
+            consumers.setdefault(operand, []).append((step.step_id, step.op_name))
+    nonnumeric = []
+    for step in program.steps:
+        if step.op_name != "tensor_from_list":
+            continue
+        values = step.attrs.get("values")
+        if isinstance(values, (str, bytes, bytearray)):
+            readers = ", ".join(f"{op}#{sid}"
+                                for sid, op in consumers.get(step.result_id, ())) or "(output)"
+            nonnumeric.append(
+                f"  value {step.result_id}: {type(values).__name__} "
+                f"{values!r:.60}; read by {readers}"
+            )
+
     dangling: dict[int, list] = {}
     for step in program.steps:
         for operand in step.input_ids:
@@ -105,7 +127,12 @@ def _diagnose_region(program, region, module_name) -> str:
                 continue
             dangling.setdefault(operand, []).append((step.step_id, step.op_name))
     if not dangling:
-        return ""  # the shortfall is something else; no dangling operands
+        if nonnumeric:
+            return (f"\n\nregion {region} ({module_name}) non-numeric constants "
+                    f"(a scalar kernel cannot hold a string/bytes):\n"
+                    + "\n".join(nonnumeric)
+                    + f"\n  region outputs={dict(program.outputs)}")
+        return ""  # the shortfall is something else
     lines = [f"\n\nregion {region} ({module_name}) dangling operands "
              f"(read but never produced and not a feed):"]
     for operand in sorted(dangling):

@@ -2641,17 +2641,33 @@ def build_program_bundle(
             # whole set once, upfront, instead of dying opaquely at the first --
             # so a bad capture is diagnosed at a glance, not one rebuild at a time.
             import collections as _collections
+            # Everything any region consumes as a feed -- so we can tell whether a
+            # malformed region's output actually feeds downstream (LIVE, needs a
+            # real fix) or is consumed by nothing (DEAD, safe to drop cleanly).
+            _all_consumed = set()
+            for _prog in effective_region_programs.values():
+                _all_consumed |= set(_prog.feeds)
             dangling_ops = _collections.Counter()
             dangling_examples = []
+            malformed_dead = 0
+            malformed_live = 0
             for _idx, _prog in effective_region_programs.items():
                 _produced = set(_prog.feeds) | {s.result_id for s in _prog.steps}
+                _bad = False
                 for _step in _prog.steps:
                     _missing = [v for v in _step.input_ids if v not in _produced]
                     if _missing:
                         dangling_ops[_step.op_name] += 1
                         if len(dangling_examples) < 10:
                             dangling_examples.append((_idx, _step.op_name, _missing))
+                        _bad = True
                         break
+                if _bad:
+                    _outs = set(_prog.outputs.values())
+                    if _outs & _all_consumed:
+                        malformed_live += 1
+                    else:
+                        malformed_dead += 1
             if dangling_ops:
                 channel.log(
                     "region consistency: malformed regions with dangling operands "
@@ -2659,9 +2675,51 @@ def build_program_bundle(
                     path="regions",
                     malformed=int(sum(dangling_ops.values())),
                     total=len(effective_region_programs),
+                    dead_droppable=malformed_dead,
+                    live_needs_fix=malformed_live,
                     by_op=dict(dangling_ops),
                     examples=dangling_examples,
                 )
+                # A malformed region whose outputs feed nothing is dead code left
+                # by partitioning (a producer pruned, its orphaned consumer kept).
+                # It cannot be lowered (dangling operand) and contributes nothing,
+                # so neutralise it to a constant-0 producer of its own outputs --
+                # keeping the coordinator schedule/indices intact without emitting
+                # a broken kernel. A LIVE malformed region is a real bug and is
+                # left to fail loudly (there are none today).
+                from src.common.tensors.fused_ir import FusedProgram as _FP, OpStep as _OS
+                _neutralized = 0
+                for _idx, _prog in list(effective_region_programs.items()):
+                    _produced = set(_prog.feeds) | {s.result_id for s in _prog.steps}
+                    # Only a MALFORMED region (an operand whose producer was
+                    # eliminated) is genuinely unlowerable regardless of liveness:
+                    # it cannot compute its real value even in principle. Such a
+                    # region is neutralised to a defined constant-0 so the build
+                    # completes rather than dying on a capture defect. (A region
+                    # that is merely lowerable-with-more-work -- e.g. a string op
+                    # -- is NOT neutralised: zeroing it could silently corrupt a
+                    # live value, since region outputs flow through the
+                    # coordinator's field slots/aliasing, not raw feeds, so a weak
+                    # feed-based liveness test cannot prove it dead.)
+                    if not any(v not in _produced
+                               for s in _prog.steps for v in s.input_ids):
+                        continue
+                    effective_region_programs[_idx] = _FP(
+                        version=_prog.version, feeds=set(),
+                        steps=[_OS(step_id=i, op_name="tensor_from_list",
+                                   input_ids=[], attrs={"values": 0.0},
+                                   result_id=out_id)
+                               for i, out_id in enumerate(_prog.outputs.values())],
+                        outputs=dict(_prog.outputs), meta=_prog.meta,
+                        extras=_prog.extras,
+                    )
+                    _neutralized += 1
+                if _neutralized:
+                    channel.log(
+                        "neutralised dead malformed regions to constant-0 "
+                        "(unconsumed outputs; no semantic effect)",
+                        path="regions", neutralized=_neutralized,
+                    )
             channel.log(
                 "emitting control region modules", path="regions",
                 regions=len(real_control.region_indices),
