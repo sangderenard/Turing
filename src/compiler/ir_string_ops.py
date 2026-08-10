@@ -15,16 +15,26 @@ Two value models, bridged by ``string_hash``
   extracted from bytes hashes to, so the two collapse to one identity. Held in
   the numeric working type as reinterpreted bits.
 
-* **String ref** -- a heap value carrying the actual bytes: a block
-  ``[length:i32][bytes...]`` whose i32 base offset is the value. Needed whenever
-  the bytes themselves are operated on (slice, concatenate, index a character,
-  split and keep a part). Materialised in the bump heap alongside the container
-  maps (``wasm_container``); a constant string ref lives in static data.
+* **String view (a fat pointer)** -- the actual bytes referenced without owning
+  them: an i64 packing ``(byte_ptr:i32 in the high 32, length:i32 in the low
+  32)``, held in the working type as reinterpreted bits like a token. The bytes
+  live wherever they already are -- inside ``subject``, inside another string,
+  or a heap block -- and the view just points at a range of them. This is the
+  research answer (JavaScript's sliced strings, Perl's COW): read-only string
+  work should COPY NOTHING. ``slice`` and ``split-part`` are pure repacks of a
+  sub-range -- O(1), no allocation. Only an operation that must produce NEW
+  contiguous bytes (``concat``, an in-place mutation) MATERIALISES: it allocates
+  bytes in the same bump heap the container maps use and returns a view of them.
+  The default is a view; materialisation is the forced case, and mutation takes
+  an explicit in-place flag (the string analogue of the container store's
+  in-place aliasing).
 
-``string_hash(ref) -> token`` bridges them: any bytes reduce to their identity,
-so an operator that produces a ref (a split part, a slice) can still be compared
-or used as a key. The reverse (``token -> bytes``) is only for display and goes
-through the ``StringTable`` recorded at compile time, never at run time.
+``string_hash(view) -> token`` bridges them: any range of bytes reduces to its
+identity, so an operator that produces a view (a split part, a slice) can still
+be compared or used as a key -- and since decoder strings are almost always
+extracted-then-hashed, the view is consumed without ever materialising. The
+reverse (``token -> bytes``) is only for display and goes through the
+``StringTable`` recorded at compile time, never at run time.
 
 Operator set
 ------------
@@ -33,21 +43,23 @@ Identity / bridge:
   ``string_hash(ref) -> token``                             (bytes -> identity)
   ``string_compare(a, b) {op: equal|not_equal} -> bool``    (identity test)
 
-Bytes (produce/consume a string ref):
-  ``string_const(text=const) -> ref``                       (constant -> heap/static)
-  ``string_length(ref) -> i32``
-  ``string_char(ref, i) -> byte``                           (ref[i])
-  ``string_find(ref, delim) {from: i32=0} -> i32``          (index of delim, or length)
-  ``string_slice(ref, start, stop) -> ref``                 (ref[start:stop])
-  ``string_concat(a, b) -> ref``                            (a + b)
-  ``string_split_part(ref, delim, part) -> ref``            (ref.split(delim, 1)[part])
+Bytes (a "view" is the i64 fat pointer above; only ``concat``/materialise copy):
+  ``string_const(text=const) -> view``                      (constant -> static bytes)
+  ``string_length(view) -> i32``                            (the low half)
+  ``string_char(view, i) -> byte``                          (view[i])
+  ``string_find(view, delim) {from: i32=0} -> i32``         (index of delim, or length)
+  ``string_slice(view, start, stop) -> view``               (repack a sub-range; free)
+  ``string_concat(a, b) {in_place: bool=false} -> view``    (a + b; MATERIALISES)
+  ``string_split_part(view, delim, part) -> view``          (split(delim,1)[part]; free)
 
-Every operator is pure over its inputs and deterministic; the runtime string
-values live in the heap the container ABI already owns, so string and dict state
-share one arena. A backend supplies a lowering per operator name; the recognition
-of source idioms into these operators is a central fold (``ir_string_interning``
-for tokens/compare, ``ir_byte_idioms`` for the null-terminated hash, extended
-here for the general split), never per-backend.
+Every operator is pure over its inputs and deterministic; a materialised string's
+bytes live in the heap the container ABI already owns, so string and dict state
+share one arena, and a view points into ``subject`` or that heap without copying.
+A backend supplies a lowering per operator name -- the universal path is native
+(the WASM backend may additionally choose to defer to its JS host's strings as a
+special case). Recognition of source idioms into these operators is a central
+fold (``ir_string_interning`` for tokens/compare, ``ir_byte_idioms`` for the
+null-terminated hash, extended for the general split), never per-backend.
 """
 from __future__ import annotations
 
@@ -72,14 +84,19 @@ STRING_OPERATORS = frozenset({
     STRING_FIND, STRING_SLICE, STRING_CONCAT, STRING_SPLIT_PART,
 })
 
-# --- String-ref heap block layout (shared with wasm_container's bump heap) -----
-#: A string ref points at this block; the length precedes the bytes so a ref
-#: alone is enough to read the whole string.
-STRING_REF_LENGTH_OFFSET = 0     # i32 length at the block's start
-STRING_REF_BYTES_OFFSET = 4      # bytes follow immediately
+# --- String view fat-pointer packing ------------------------------------------
+#: A string value is an i64: byte pointer in the high 32 bits, length in the low
+#: 32. The bytes are wherever they already live (subject, another string, or a
+#: materialised heap block); the view just points at a range, so slice/split are
+#: pure repacks with no allocation. Materialised bytes live in the same bump heap
+#: the container maps use (wasm_container), so string and dict state share one arena.
 
 
-def string_ref_block_bytes(length: int) -> int:
-    """Total heap bytes for a string ref holding ``length`` bytes (4-byte header
-    plus the bytes, rounded up to 4 for the next block's alignment)."""
-    return ((STRING_REF_BYTES_OFFSET + int(length)) + 3) & ~3
+def pack_string_view(byte_ptr: int, length: int) -> int:
+    """The i64 fat pointer for a range of bytes."""
+    return ((int(byte_ptr) & 0xFFFFFFFF) << 32) | (int(length) & 0xFFFFFFFF)
+
+
+def unpack_string_view(fat: int) -> tuple[int, int]:
+    """(byte_ptr, length) from a fat pointer."""
+    return (fat >> 32) & 0xFFFFFFFF, fat & 0xFFFFFFFF

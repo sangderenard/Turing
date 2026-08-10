@@ -74,15 +74,15 @@ def test_null_terminated_prefix_hash_matches_compile_time(name, tmp_path):
 
 def _split_part_module(part):
     from src.compiler.wasm_sequence import emit_string_split_part_hash
-    b = CodeBuilder(value_type="i64", parameter_count=3)  # ref, delim, out
+    b = CodeBuilder(value_type="i64", parameter_count=3)  # view(i64), delim, out
     result = b.declare_local("i64")
-    locs = [b.declare_local("i32") for _ in range(6)]  # pos,length,start,end,index,byte
+    locs = [b.declare_local("i32") for _ in range(7)]  # ptr,length,pos,start,end,index,byte
     emit_string_split_part_hash(
-        b, ref_local=0, delim_local=1, part=part, result_local=result,
-        pos_local=locs[0], length_local=locs[1], start_local=locs[2],
-        end_local=locs[3], index_local=locs[4], byte_local=locs[5])
+        b, view_local=0, delim_local=1, part=part, result_local=result,
+        ptr_local=locs[0], length_local=locs[1], pos_local=locs[2],
+        start_local=locs[3], end_local=locs[4], index_local=locs[5], byte_local=locs[6])
     b.local_get(2).local_get(result).i64_store()
-    return build_module(function_name="run", parameter_types=["i32", "i32", "i32"],
+    return build_module(function_name="run", parameter_types=["i64", "i32", "i32"],
                         body=b, memory_pages=1)
 
 
@@ -90,23 +90,25 @@ def _split_part_module(part):
 @pytest.mark.parametrize("part,word", [(0, "key"), (1, "value")])
 def test_string_split_part_hash_matches_constant_token(part, word, tmp_path):
     # split('key:value', ':', 1)[part] hashes to the same token as the constant
-    # word -- so a runtime-split part and a constant compare/key consistently.
+    # word. The string is a fat-pointer VIEW over bytes already in memory -- the
+    # split part is a sub-range view, never copied.
     from src.compiler.string_table import string_token
+    from src.compiler.ir_string_ops import pack_string_view
     wasm = tmp_path / "sp.wasm"
     wasm.write_bytes(_split_part_module(part))
     s = "key:value"
+    BYTES = 200
+    view = pack_string_view(BYTES, len(s))
     script = tmp_path / "run.mjs"
     script.write_text(
         f"""
         import {{readFileSync}} from "node:fs";
         const {{run, memory}} = (await WebAssembly.instantiate(
           readFileSync(process.argv[2]), {{}})).instance.exports;
-        const REF = 64, DELIM = 58, OUT = 128;  // ':' == 58
-        const i32 = new Int32Array(memory.buffer), u8 = new Uint8Array(memory.buffer);
-        i32[REF / 4] = {len(s)};
-        {list(s.encode())}.forEach((c, i) => u8[REF + 4 + i] = c);
-        run(REF, DELIM, OUT);
-        console.log(new BigInt64Array(memory.buffer)[OUT / 8].toString());
+        const u8 = new Uint8Array(memory.buffer);
+        {list(s.encode())}.forEach((c, i) => u8[{BYTES} + i] = c);
+        run({view}n, 58, 128);   // view fat pointer, ':' == 58, out at 128
+        console.log(new BigInt64Array(memory.buffer)[128 / 8].toString());
         """,
         encoding="utf-8",
     )

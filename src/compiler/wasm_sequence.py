@@ -32,40 +32,56 @@ _I32_LOAD8_U = 0x2D
 _I32_LOAD = 0x28
 _I64_XOR = 0x85
 _I64_MUL = 0x7E
+_I64_SHR_U = 0x88
+_I64_SHL = 0x86
+_I64_OR = 0x84
+_I64_EXTEND_I32_U = 0xAD
+_I32_WRAP_I64 = 0xA7
 
 
-def emit_string_length(builder: CodeBuilder, *, ref_local: int, result_local: int) -> None:
-    """``string_length``: result(i32) = the length header at the ref's start."""
-    from .ir_string_ops import STRING_REF_LENGTH_OFFSET
-    builder.local_get(ref_local)
-    builder.raw(_I32_LOAD, 0x02, STRING_REF_LENGTH_OFFSET)  # i32.load align=2
+def emit_string_unpack(builder: CodeBuilder, *, view_local: int,
+                       ptr_local: int, length_local: int) -> None:
+    """From a fat-pointer view (i64: byte_ptr<<32 | length) extract the byte
+    pointer and length into i32 locals. No memory touched -- a view is a value."""
+    builder.local_get(view_local).i64_const(32).raw(_I64_SHR_U).raw(_I32_WRAP_I64)
+    builder.local_set(ptr_local)
+    builder.local_get(view_local).raw(_I32_WRAP_I64)  # low 32 bits = length
+    builder.local_set(length_local)
+
+
+def emit_string_length(builder: CodeBuilder, *, view_local: int, result_local: int) -> None:
+    """``string_length``: result(i32) = the length half of the fat pointer."""
+    builder.local_get(view_local).raw(_I32_WRAP_I64).local_set(result_local)
+
+
+def emit_string_slice(builder: CodeBuilder, *, ptr_local: int, start_local: int,
+                      stop_local: int, result_local: int) -> None:
+    """``string_slice``: result(i64 view) = the bytes [start, stop) at ptr+start,
+    as a fat pointer. A pure repack -- nothing is copied (JS's sliced string)."""
+    builder.local_get(ptr_local).local_get(start_local).raw(_I32_ADD)   # newptr
+    builder.raw(_I64_EXTEND_I32_U).i64_const(32).raw(_I64_SHL)
+    builder.local_get(stop_local).local_get(start_local).raw(_I32_SUB)  # newlen
+    builder.raw(_I64_EXTEND_I32_U).raw(_I64_OR)
     builder.local_set(result_local)
 
 
 def emit_string_find(
-    builder: CodeBuilder, *, ref_local: int, delim_local: int, from_local: int,
-    result_local: int, length_local: int, index_local: int, byte_local: int,
+    builder: CodeBuilder, *, ptr_local: int, length_local: int, delim_local: int,
+    from_local: int, result_local: int, index_local: int, byte_local: int,
 ) -> None:
-    """``string_find``: result(i32) = the index of the first ``delim`` byte in the
-    string ref at or after ``from``, or the string length if absent. ``delim`` is
-    a byte value; the scratch locals are i32."""
-    from .ir_string_ops import STRING_REF_BYTES_OFFSET
-    emit_string_length(builder, ref_local=ref_local, result_local=length_local)
+    """``string_find``: result(i32) = index of the first ``delim`` byte at ``ptr``
+    at/after ``from``, or ``length`` if absent. All locals i32; ``delim`` a byte."""
     builder.local_get(from_local).local_set(index_local)
     builder.block()          # done
     builder.loop()           # scan
-    # if index >= length: result = length; break
     builder.local_get(index_local).local_get(length_local).raw(_I32_GE_S)
     builder.if_()
     builder.local_get(length_local).local_set(result_local)
     builder.br(2)
     builder.end()
-    # byte = load8_u(ref + bytes_offset + index)
-    builder.local_get(ref_local).i32_const(STRING_REF_BYTES_OFFSET).raw(_I32_ADD)
-    builder.local_get(index_local).raw(_I32_ADD)
+    builder.local_get(ptr_local).local_get(index_local).raw(_I32_ADD)
     builder.raw(_I32_LOAD8_U, 0x00, 0x00)
     builder.local_set(byte_local)
-    # if byte == delim: result = index; break
     builder.local_get(byte_local).local_get(delim_local).raw(_I32_EQ)
     builder.if_()
     builder.local_get(index_local).local_set(result_local)
@@ -78,25 +94,23 @@ def emit_string_find(
 
 
 def emit_string_hash_range(
-    builder: CodeBuilder, *, ref_local: int, start_local: int, end_local: int,
+    builder: CodeBuilder, *, ptr_local: int, start_local: int, end_local: int,
     result_local: int, index_local: int, byte_local: int,
 ) -> None:
-    """``string_hash`` over a sub-range: result(i64) = FNV-1a of the string ref's
-    bytes ``[start, end)`` -- the same token a constant word interns to, so a
-    slice/part can be compared or used as a key. Scratch locals are i32."""
-    from .ir_string_ops import STRING_REF_BYTES_OFFSET
+    """``string_hash`` over a range: result(i64 token) = FNV-1a of the bytes
+    ``[start, end)`` at ``ptr`` -- the token a slice/part interns to, so a view
+    can be compared or keyed without ever materialising."""
     builder.i64_const(_FNV64_OFFSET_SIGNED).local_set(result_local)
     builder.local_get(start_local).local_set(index_local)
     builder.block()          # done
     builder.loop()           # fold
     builder.local_get(index_local).local_get(end_local).raw(_I32_GE_S)
     builder.br_if(1)
-    builder.local_get(ref_local).i32_const(STRING_REF_BYTES_OFFSET).raw(_I32_ADD)
-    builder.local_get(index_local).raw(_I32_ADD)
+    builder.local_get(ptr_local).local_get(index_local).raw(_I32_ADD)
     builder.raw(_I32_LOAD8_U, 0x00, 0x00)
     builder.local_set(byte_local)
     builder.local_get(result_local)
-    builder.local_get(byte_local).raw(0xAD)  # i64.extend_i32_u
+    builder.local_get(byte_local).raw(_I64_EXTEND_I32_U)
     builder.raw(_I64_XOR)
     builder.i64_const(_FNV64_PRIME).raw(_I64_MUL)
     builder.local_set(result_local)
@@ -107,38 +121,35 @@ def emit_string_hash_range(
 
 
 def emit_string_split_part_hash(
-    builder: CodeBuilder, *, ref_local: int, delim_local: int, part: int,
-    result_local: int, pos_local: int, length_local: int, start_local: int,
-    end_local: int, index_local: int, byte_local: int,
+    builder: CodeBuilder, *, view_local: int, delim_local: int, part: int,
+    result_local: int, ptr_local: int, length_local: int, pos_local: int,
+    start_local: int, end_local: int, index_local: int, byte_local: int,
 ) -> None:
-    """``string_hash(string_split_part(ref, delim, part))`` for ``part`` in {0,1}:
-    the token of the prefix before the first ``delim`` (part 0) or the suffix
-    after it (part 1). This is the general delimiter split -- the null-terminated
-    name hash is the special case ``part=0``. Scratch locals are i32 except
-    ``result_local`` (i64)."""
+    """``string_hash(string_split_part(view, delim, part))`` for ``part`` in
+    {0,1}: the token of the prefix before the first ``delim`` (part 0) or the
+    suffix after it (part 1). The part is a free sub-range view of the same
+    bytes, hashed in place -- no copy. ``result_local`` is i64; the rest i32."""
     if part not in (0, 1):
         raise ValueError("only split(delim, 1)[0] / [1] are lowered")
-    # pos = find(delim, from=0); length = len(ref). start_local is scratch for
-    # the from-offset here before it becomes the range start below.
-    builder.i32_const(0).local_set(start_local)
-    emit_string_find(builder, ref_local=ref_local, delim_local=delim_local,
-                     from_local=start_local, result_local=pos_local,
-                     length_local=length_local, index_local=index_local,
+    emit_string_unpack(builder, view_local=view_local, ptr_local=ptr_local,
+                       length_local=length_local)
+    builder.i32_const(0).local_set(start_local)  # from = 0 for find
+    emit_string_find(builder, ptr_local=ptr_local, length_local=length_local,
+                     delim_local=delim_local, from_local=start_local,
+                     result_local=pos_local, index_local=index_local,
                      byte_local=byte_local)
     if part == 0:
         builder.i32_const(0).local_set(start_local)
         builder.local_get(pos_local).local_set(end_local)
     else:
-        # suffix starts just past the delimiter, or at length if the delimiter is
-        # absent (pos == length). select(a, b, cond) keeps a when cond != 0:
-        # start = (pos >= length) ? length : pos + 1.
-        builder.local_get(length_local)                       # a = length
-        builder.local_get(pos_local).i32_const(1).raw(_I32_ADD)  # b = pos + 1
-        builder.local_get(pos_local).local_get(length_local).raw(_I32_GE_S)  # cond
+        # start = (pos >= length) ? length : pos + 1 ; end = length.
+        builder.local_get(length_local)
+        builder.local_get(pos_local).i32_const(1).raw(_I32_ADD)
+        builder.local_get(pos_local).local_get(length_local).raw(_I32_GE_S)
         builder.select()
         builder.local_set(start_local)
         builder.local_get(length_local).local_set(end_local)
-    emit_string_hash_range(builder, ref_local=ref_local, start_local=start_local,
+    emit_string_hash_range(builder, ptr_local=ptr_local, start_local=start_local,
                            end_local=end_local, result_local=result_local,
                            index_local=index_local, byte_local=byte_local)
 
