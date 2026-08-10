@@ -1267,11 +1267,9 @@ def emit_wasm_module(
             ))
             continue
         _data_id, value_id, selectors = descriptor
-        if len(selectors) != 1:
-            shortfalls.append(WasmShortfall(
-                step.step_id, step.op_name,
-                "only 1-D subscript stores are lowered so far",
-            ))
+        strides, reason = _store_dimension_strides(step, selectors, program.meta)
+        if strides is None:
+            shortfalls.append(WasmShortfall(step.step_id, step.op_name, reason))
             continue
         out_pos = output_ids.index(step.result_id)
         out_width, _, out_store, out_kind = _memory_ops(step.result_id)
@@ -1281,25 +1279,33 @@ def emit_wasm_module(
                 step.step_id, step.op_name, "subscript value was never produced",
             ))
             continue
-        # addr = out + selector*width  (constant folds; a runtime operand loads
-        # its per-cell local and narrows to an i32 address).
+        # addr = out + (sum_d selector_d * stride_d) * width. Constant subscripts
+        # fold into one byte offset; each runtime subscript loads its per-cell
+        # local, narrows to an i32, and scales by its dimension's byte stride.
         emit = [f"      local.get $out{out_pos}"]
-        kind, selector = selectors[0]
-        if kind == "const":
-            if selector:
-                emit += [f"      i32.const {selector * out_width}", "      i32.add"]
-        else:
+        const_bytes = 0
+        missing = False
+        for (kind, selector), stride in zip(selectors, strides):
+            byte_stride = stride * out_width
+            if kind == "const":
+                const_bytes += selector * byte_stride
+                continue
             index_local = names.get(selector)
             if index_local is None:
                 shortfalls.append(WasmShortfall(
                     step.step_id, step.op_name, "subscript index was never produced",
                 ))
-                continue
+                missing = True
+                break
             emit.append(f"      local.get {index_local}")
             conversion = _INDEX_TO_I32.get(value_type)
             if conversion is not None:
                 emit.append(f"      {conversion}")
-            emit += [f"      i32.const {out_width}", "      i32.mul", "      i32.add"]
+            emit += [f"      i32.const {byte_stride}", "      i32.mul", "      i32.add"]
+        if missing:
+            continue
+        if const_bytes:
+            emit += [f"      i32.const {const_bytes}", "      i32.add"]
         emit.append(f"      local.get {value_local}")
         if out_kind is not None:
             conversion = _FROM_WORKING_TYPE.get((value_type, out_kind))
@@ -1446,6 +1452,50 @@ def _slice_selectors(step: OpStep):
             [("runtime", value_id) for value_id in step.input_ids[1:-1]],
         )
     return None
+
+
+def _row_major_strides(shape) -> list[int]:
+    """Element strides for a row-major (C-order) tensor: the innermost axis has
+    stride 1 and each outer axis multiplies by the extent of the axis inside it.
+    ``(R, C)`` -> ``[C, 1]`` so element ``[i, j]`` sits at ``i*C + j``.
+    """
+
+    strides = [1] * len(shape)
+    for dim in range(len(shape) - 2, -1, -1):
+        strides[dim] = strides[dim + 1] * int(shape[dim + 1])
+    return strides
+
+
+def _store_dimension_strides(step: OpStep, selectors, meta):
+    """Row-major element strides for a subscript store's indexed dimensions, or
+    ``(None, reason)``.
+
+    A subscript store ``out[i0, i1, ...] = value`` writes the single element at
+    ``sum(i_d * stride_d)``. The 1-D case needs no shape metadata (a lone
+    selector addresses elements directly, stride 1). A higher-rank store flattens
+    against the output tensor's row-major strides; a *partial*-rank index (fewer
+    subscripts than dimensions) would write a whole sub-block rather than one
+    element and is an honest shortfall until a block copy is lowered.
+    """
+
+    if len(selectors) == 1:
+        return [1], None
+    entry = meta.get(step.result_id) if meta is not None else None
+    shape = (
+        tuple(entry.shape)
+        if entry is not None and getattr(entry, "shape", None) is not None
+        else None
+    )
+    if shape is None:
+        return None, (
+            "N-D subscript store output has no shape metadata to flatten against"
+        )
+    if len(selectors) != len(shape):
+        return None, (
+            f"only full-rank scalar subscript stores are lowered; "
+            f"{len(selectors)} indices into shape {tuple(shape)}"
+        )
+    return _row_major_strides(shape), None
 
 
 # WebAssembly memory addresses are i32; a subscript operand in the working type
@@ -2454,26 +2504,30 @@ def _assemble(
                 "store into a region output"
             )
         _data_id, value_id, selectors = descriptor
-        if len(selectors) != 1:
-            raise WasmEmissionError(
-                f"{step.op_name} step {step.step_id}: only 1-D subscript stores "
-                "are lowered so far"
-            )
+        strides, reason = _store_dimension_strides(step, selectors, program.meta)
+        if strides is None:
+            raise WasmEmissionError(f"{step.op_name} step {step.step_id}: {reason}")
         slot = output_ids.index(step.result_id)
         out_width, out_kind = _memory_ops(step.result_id)
+        # addr = out + (sum_d selector_d * stride_d) * width, mirroring the text
+        # emitter: constant subscripts fold into one byte offset, runtime ones
+        # scale by their dimension's byte stride.
         builder.local_get(output_params[slot])
-        kind, selector = selectors[0]
-        if kind == "const":
-            if selector:
-                builder.i32_const(selector * out_width)
-                builder.raw(0x6A)  # i32.add
-        else:
+        const_bytes = 0
+        for (kind, selector), stride in zip(selectors, strides):
+            byte_stride = stride * out_width
+            if kind == "const":
+                const_bytes += selector * byte_stride
+                continue
             builder.local_get(locals_for[selector])
             narrow = _INDEX_TO_I32_OPCODE.get(value_type)
             if narrow is not None:
                 builder.raw(narrow)
-            builder.i32_const(out_width)
+            builder.i32_const(byte_stride)
             builder.raw(0x6C)  # i32.mul
+            builder.raw(0x6A)  # i32.add
+        if const_bytes:
+            builder.i32_const(const_bytes)
             builder.raw(0x6A)  # i32.add
         builder.local_get(locals_for[value_id])
         _convert_from_working(out_kind)
