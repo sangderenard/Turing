@@ -1183,6 +1183,13 @@ def _lower_process_graph_to_compilation(
                             "prepared_plan",
                             prepared_implementation,
                         )
+                        # compiled_plan is now superseded; drop the ~2.7 GB.
+                        reclaimed = checkpoint_store.prune("compiled_plan")
+                        if reclaimed:
+                            _report(
+                                "aot: pruned superseded compiled-plan checkpoint "
+                                f"({reclaimed // (1024 * 1024)} MB reclaimed)"
+                            )
                     except Exception as error:
                         _report(
                             "aot: prepared-plan checkpoint skipped "
@@ -1711,6 +1718,14 @@ def _lower_process_graph_to_compilation(
                 capture_implementation,
                 replace(compilation, deployment=None),
             )
+            # The bake fast-path resumes from captured_program + source_graph
+            # alone, so the multi-GB intermediate plans are now dead weight.
+            reclaimed = checkpoint_store.prune("prepared_plan", "compiled_plan")
+            if reclaimed:
+                _report(
+                    "aot: pruned superseded plan checkpoints "
+                    f"({reclaimed // (1024 * 1024)} MB reclaimed)"
+                )
         except Exception as error:
             _report(
                 "aot: captured-program checkpoint skipped "

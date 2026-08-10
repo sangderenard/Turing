@@ -141,6 +141,28 @@ class AOTCheckpointStore:
     def _paths(self, phase: str) -> tuple[Path, Path]:
         return self.directory / f"{phase}.pkl", self.directory / f"{phase}.json"
 
+    def prune(self, *phases: str) -> int:
+        """Delete superseded phase checkpoints, returning the bytes reclaimed.
+
+        The multi-GB ``compiled_plan``/``prepared_plan`` are intermediate: once a
+        downstream phase (``prepared_plan``, then ``captured_program``) is on
+        disk they are never loaded again -- the bake fast-path resumes from
+        ``captured_program`` + ``source_graph`` alone. Pruning them the moment
+        they are superseded keeps steady-state disk at ~85 MB instead of ~6 GB,
+        while still allowing an interrupted build to resume from whatever
+        checkpoint currently exists.
+        """
+
+        reclaimed = 0
+        for phase in phases:
+            for path in self._paths(phase):
+                try:
+                    reclaimed += path.stat().st_size
+                except OSError:
+                    continue
+                path.unlink(missing_ok=True)
+        return reclaimed
+
     def load(self, phase: str, implementation: str) -> Any | None:
         payload_path, manifest_path = self._paths(phase)
         try:
