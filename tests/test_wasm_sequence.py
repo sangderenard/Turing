@@ -70,3 +70,46 @@ def test_null_terminated_prefix_hash_matches_compile_time(name, tmp_path):
     assert int(completed.stdout.strip()) == expected, (
         f"name={name!r} got {completed.stdout.strip()} expected {expected}"
     )
+
+
+def _split_part_module(part):
+    from src.compiler.wasm_sequence import emit_string_split_part_hash
+    b = CodeBuilder(value_type="i64", parameter_count=3)  # ref, delim, out
+    result = b.declare_local("i64")
+    locs = [b.declare_local("i32") for _ in range(6)]  # pos,length,start,end,index,byte
+    emit_string_split_part_hash(
+        b, ref_local=0, delim_local=1, part=part, result_local=result,
+        pos_local=locs[0], length_local=locs[1], start_local=locs[2],
+        end_local=locs[3], index_local=locs[4], byte_local=locs[5])
+    b.local_get(2).local_get(result).i64_store()
+    return build_module(function_name="run", parameter_types=["i32", "i32", "i32"],
+                        body=b, memory_pages=1)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+@pytest.mark.parametrize("part,word", [(0, "key"), (1, "value")])
+def test_string_split_part_hash_matches_constant_token(part, word, tmp_path):
+    # split('key:value', ':', 1)[part] hashes to the same token as the constant
+    # word -- so a runtime-split part and a constant compare/key consistently.
+    from src.compiler.string_table import string_token
+    wasm = tmp_path / "sp.wasm"
+    wasm.write_bytes(_split_part_module(part))
+    s = "key:value"
+    script = tmp_path / "run.mjs"
+    script.write_text(
+        f"""
+        import {{readFileSync}} from "node:fs";
+        const {{run, memory}} = (await WebAssembly.instantiate(
+          readFileSync(process.argv[2]), {{}})).instance.exports;
+        const REF = 64, DELIM = 58, OUT = 128;  // ':' == 58
+        const i32 = new Int32Array(memory.buffer), u8 = new Uint8Array(memory.buffer);
+        i32[REF / 4] = {len(s)};
+        {list(s.encode())}.forEach((c, i) => u8[REF + 4 + i] = c);
+        run(REF, DELIM, OUT);
+        console.log(new BigInt64Array(memory.buffer)[OUT / 8].toString());
+        """,
+        encoding="utf-8",
+    )
+    out = subprocess.run(["node", str(script), str(wasm)],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    assert int(out) == string_token(word), (out, string_token(word))
