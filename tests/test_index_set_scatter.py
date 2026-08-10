@@ -104,6 +104,53 @@ def test_index_set_output_aliases_its_data_slot_in_place():
     assert method.output_slots[0] == method.input_slots[0]
 
 
+def _read_region(op):
+    """A subscript READ (``gather``/``Indexed``): ``table[index]``."""
+    from src.common.tensors.fused_ir import FusedProgram, OpStep
+    return FusedProgram(
+        version=1, feeds={1, 2},
+        steps=[OpStep(0, op, [1, 2], {"dim": 0}, 99)], outputs={"r": 99},
+        extras={"capture_feed_origins": {
+            1: {"binding_name": "table"}, 2: {"binding_name": "index"}}},
+    )
+
+
+@pytest.mark.parametrize("op", ["gather", "Indexed"])
+def test_subscript_read_emits_complete(op):
+    module = emit_wasm_module(_read_region(op), name=op, dtype="int64")
+    assert module.complete, module.shortfall_report()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+@pytest.mark.parametrize("op", ["gather", "Indexed"])
+def test_subscript_read_runs_correctly_in_the_binary(op, tmp_path):
+    # The BINARY (not just the WAT) must compute table[index]; a prior gap made
+    # the binary emitter return the index instead of the read value.
+    module = emit_wasm_module(_read_region(op), name=op, dtype="int64")
+    wasm = tmp_path / f"{op}.wasm"
+    wasm.write_bytes(module.binary)
+    script = tmp_path / "run.mjs"
+    script.write_text(
+        """
+        import {readFileSync} from "node:fs";
+        const mod = await WebAssembly.instantiate(readFileSync(process.argv[2]), {});
+        const {run, memory} = mod.instance.exports;
+        const mem = new BigInt64Array(memory.buffer);
+        [10n,20n,30n,40n].forEach((v,i)=>mem[0+i]=v);  // table @ 0
+        [2n,2n,2n,2n].forEach((v,i)=>mem[8+i]=v);      // index @ 64
+        for (let i=0;i<4;i++) mem[16+i]=0n;            // out @ 128
+        run(4, 0, 64, 128);
+        const out=[]; for (let i=0;i<4;i++) out.push(Number(mem[16+i]));
+        console.log(JSON.stringify(out));
+        """,
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        ["node", str(script), str(wasm)], capture_output=True, text=True, check=True,
+    )
+    assert completed.stdout.strip().endswith("[30,30,30,30]"), completed.stdout
+
+
 def _indexed_store_runtime_region():
     """A reference-path ``IndexedStore`` with a RUNTIME index operand."""
     from src.common.tensors.fused_ir import FusedProgram, OpStep

@@ -2654,23 +2654,28 @@ def build_program_bundle(
             # grouped by canonical topology (value-id-invariant), and report how
             # far the regions collapse: how many distinct algorithms are present
             # and how many unique kernels the byte-dedup emitted.
-            from .topology_catalogue import TopologyCatalogue
-            catalogue = TopologyCatalogue()
-            for region in real_control.region_indices:
-                region_program = effective_region_programs.get(int(region))
-                if region_program is not None:
-                    catalogue.record(
-                        getattr(region_program, "program", region_program)
-                    )
+            # Purely observational: recording the master algorithm table must
+            # never decide whether the bundle compiles, so the whole thing is
+            # best-effort and any failure is swallowed.
+            topology_count = None
             try:
+                from .topology_catalogue import TopologyCatalogue
+                catalogue = TopologyCatalogue()
+                for region in real_control.region_indices:
+                    region_program = effective_region_programs.get(int(region))
+                    if region_program is not None:
+                        catalogue.record(
+                            getattr(region_program, "program", region_program)
+                        )
                 catalogue.save()
+                topology_count = len(catalogue.entries)
             except Exception:
                 pass
             channel.log(
                 "control region modules emitted", path="regions",
                 modules=len(card_modules),
                 regions=card_manifest.get("region_count"),
-                topologies=len(catalogue.entries),
+                topologies=topology_count,
                 unique_kernels=card_manifest.get("unique_kernels"),
             )
             producer = {

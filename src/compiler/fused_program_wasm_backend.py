@@ -1620,7 +1620,7 @@ def _step_instructions(
             return None
         return [f"      local.get {left}", f"      {value_type}.{instruction}"]
 
-    if op == "gather" and len(step.input_ids) == 2:
+    if op in ("gather", "Indexed") and len(step.input_ids) == 2:
         # table[index]: a read at a *computed* offset rather than at the
         # elementwise walk's own cursor. This is what a table-driven decoder
         # is made of -- an opcode byte selecting a row of an encoding table --
@@ -2001,6 +2001,35 @@ def _assemble(
                     "subscript store"
                 )
             builder.local_get(locals_for[descriptor[0]])
+            builder.local_set(local)
+            return
+        if step.op_name in ("gather", "Indexed") and len(step.input_ids) == 2:
+            # table[index]: a read at a computed offset (the binary counterpart
+            # of the WAT's gather_address). addr = table + offset + index*stride.
+            if int(step.attrs.get("dim", 0)) != 0:
+                raise WasmEmissionError(
+                    f"{step.op_name} step {step.step_id}: only dim=0 is lowered"
+                )
+            source_id = resolve_view_source(program.meta, step.input_ids[0])
+            if source_id not in feed_params:
+                raise WasmEmissionError(
+                    f"{step.op_name} source is not an addressable feed buffer"
+                )
+            offset, stride = view_offset_stride(program.meta, step.input_ids[0])
+            width, kind = _memory_ops(source_id)
+            builder.local_get(feed_params[source_id])
+            if offset * width:
+                builder.i32_const(offset * width)
+                builder.raw(0x6A)  # i32.add
+            builder.local_get(locals_for[step.input_ids[1]])
+            narrow = _INDEX_TO_I32_OPCODE.get(value_type)
+            if narrow is not None:
+                builder.raw(narrow)
+            builder.i32_const(stride * width)
+            builder.raw(0x6C)  # i32.mul
+            builder.raw(0x6A)  # i32.add
+            _typed_load(width, kind)
+            _convert_to_working(kind)
             builder.local_set(local)
             return
         left = locals_for[step.input_ids[0]]
