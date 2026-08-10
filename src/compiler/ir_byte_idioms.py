@@ -17,6 +17,7 @@ Currently folded:
 from __future__ import annotations
 
 from ..common.tensors.fused_ir import FusedProgram, OpStep
+from .ir_container_ops import fnv1a_64  # noqa: F401 -- shared key identity
 
 HASH_DELIMITED_PREFIX = "hash_delimited_prefix"
 

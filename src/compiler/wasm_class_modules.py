@@ -346,8 +346,12 @@ def emit_control_region_modules(
         emit_wasm_module,
         program_feed_order,
         required_steps,
-        _pure_container_store,
-        _pure_container_read,
+    )
+    # Container recognition is shared, backend-neutral IR analysis -- take it from
+    # the central module, not from another backend.
+    from .ir_container_ops import (
+        pure_container_store as _pure_container_store,
+        pure_container_read as _pure_container_read,
     )
     from .wasm_binary import WasmImport
     from .wasm_container import (

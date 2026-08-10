@@ -74,6 +74,19 @@ from .wasm_container import (
     emit_nested_map_store,
 )
 from .ir_byte_idioms import HASH_DELIMITED_PREFIX
+# Container recognition is backend-neutral IR analysis, shared from a central
+# module; this backend only supplies the lowering. Kept under the old private
+# names so internal callers and existing tests are unaffected.
+from .ir_container_ops import (
+    is_shapeless as _is_shapeless,
+    fnv1a_64 as _fnv1a_64,
+    string_constant as _string_constant,
+    constant_scalar_index as _constant_scalar_index,
+    slice_selectors as _slice_selectors,
+    container_key_spec as _container_key_spec,
+    pure_container_store as _pure_container_store,
+    pure_container_read as _pure_container_read,
+)
 
 # f64 bits reinterpreted as i64 read the raw 8 bytes unchanged, so a map key or
 # value keeps its exact identity whether it logically holds an integer (an RVA)
@@ -987,111 +1000,6 @@ def _emit_reduction_body_wat(
         body.append("      )")
 
 
-def _is_shapeless(program: FusedProgram, value_id: int) -> bool:
-    """A value with no tensor shape (``()`` or absent) -- a scalar reference into
-    a dict/list container, not a shaped tensor buffer."""
-
-    meta = (program.meta or {}).get(int(value_id))
-    shape = tuple(meta.shape) if meta is not None and getattr(meta, "shape", None) else None
-    return not shape
-
-
-# FNV-1a 64-bit: a stable compile-time string hash so the same dict key interns
-# to the same i64 map key in every region, without a shared intern table.
-_FNV64_OFFSET = 0xCBF29CE484222325
-_FNV64_PRIME = 0x100000001B3
-
-
-def _fnv1a_64(text: str) -> int:
-    h = _FNV64_OFFSET
-    for byte in text.encode("utf-8"):
-        h = ((h ^ byte) * _FNV64_PRIME) & 0xFFFFFFFFFFFFFFFF
-    return h - 2 ** 64 if h >= 2 ** 63 else h  # fold to signed i64
-
-
-def _string_constant(step: OpStep | None) -> str | None:
-    """The Python string a ``tensor_from_list`` step materialises, else None."""
-    if step is None or step.op_name != "tensor_from_list":
-        return None
-    values = step.attrs.get("values")
-    return values if isinstance(values, str) else None
-
-
-def _pure_container_store(program: FusedProgram, live: Sequence[OpStep]):
-    """A region that is one *shapeless* subscript store into a dict/list.
-
-    Returns ``(data_id, value_spec, key_specs, result_id)`` or ``None``. Each
-    spec is ``("imm", i64)`` (a constant int subscript, or a string key/value
-    hashed to i64) or ``("feed", value_id)`` (read from a field at run time).
-    Shapeless means the target is a container (the decoder's opcode maps and
-    token tables, keyed by unbounded RVAs/addresses or by string names), lowered
-    to the heap open-addressing map ABI rather than a strided buffer scatter.
-
-    The store may be surrounded by ``tensor_from_list`` constant steps (its
-    string/number key or value materialised inline). Two subscripts are always a
-    nested container; a single subscript is a container only when its key is a
-    string (a numeric single subscript is ambiguous with a 1-D buffer scatter,
-    so it stays on the strided path).
-    """
-
-    stores = [s for s in live if s.op_name in ("index_set", "IndexedStore")]
-    if len(stores) != 1:
-        return None
-    step = stores[0]
-    by_result = {s.result_id: s for s in live}
-    # Every non-store live step must be a constant materialisation feeding it.
-    for other in live:
-        if other is not step and other.op_name != "tensor_from_list":
-            return None
-    descriptor = _slice_selectors(step)
-    if descriptor is None:
-        return None
-    data_id, value_id, selectors = descriptor
-    if not _is_shapeless(program, step.result_id) or not _is_shapeless(program, data_id):
-        return None
-    if list(program.outputs.values()) != [step.result_id]:
-        return None
-    feeds = set(program.feeds)
-    if data_id not in feeds:
-        return None
-
-    def operand_spec(kind: str, ref):
-        """Normalise a subscript/value operand to ('imm', i64) | ('feed', id)."""
-        if kind == "const":
-            return ("imm", int(ref)), False
-        producer = by_result.get(ref)
-        text = _string_constant(producer)
-        if text is not None:
-            return ("imm", _fnv1a_64(text)), True
-        if ref in feeds:
-            return ("feed", ref), False
-        if producer is not None and producer.op_name == "tensor_from_list":
-            scalar = _constant_scalar_index(producer.attrs.get("values"))
-            if scalar is not None:
-                return ("imm", int(scalar)), False
-        return None, False
-
-    key_specs = []
-    has_string_key = False
-    for kind, ref in selectors:
-        spec, is_string = operand_spec(kind, ref)
-        if spec is None:
-            return None
-        key_specs.append(spec)
-        has_string_key = has_string_key or is_string
-    value_spec, _ = operand_spec("runtime", value_id)
-    if value_spec is None:
-        return None
-
-    if len(key_specs) == 2:
-        pass  # nested container
-    elif len(key_specs) == 1 and has_string_key:
-        pass  # single string-keyed dict store (unambiguous)
-    else:
-        return None
-    return data_id, value_spec, key_specs, step.result_id
-
-
 def _emit_container_store_module(
     program: FusedProgram,
     *,
@@ -1213,79 +1121,6 @@ def _emit_container_store_module(
         name=name, source=source, shortfalls=(), parameters=tuple(parameters),
         value_type=value_type, api=api, binary=binary,
     )
-
-
-def _container_key_spec(program, by_result, feeds, ref):
-    """Normalise a subscript operand to ('imm', i64) | ('feed', id), plus whether
-    it was a string key. Shared by the container store and read detectors."""
-    producer = by_result.get(ref)
-    text = _string_constant(producer)
-    if text is not None:
-        return ("imm", _fnv1a_64(text)), True
-    if ref in feeds:
-        return ("feed", ref), False
-    if producer is not None and producer.op_name == "tensor_from_list":
-        scalar = _constant_scalar_index(producer.attrs.get("values"))
-        if scalar is not None:
-            return ("imm", int(scalar)), False
-    return None, False
-
-
-def _pure_container_read(program: FusedProgram, live: Sequence[OpStep]):
-    """A region that is one *shapeless* subscript read from a dict/list.
-
-    Returns ``(container_id, key_specs, result_id)`` or ``None``. The read
-    counterpart of ``_pure_container_store``: a chain of ``Indexed`` gathers
-    ``table[gx]`` (single) or ``table[gx][gy]`` (nested, two gathers) rooted at a
-    shapeless container feed, ending at the sole region output, surrounded only
-    by ``tensor_from_list`` key constants. Two levels are always a container; a
-    single level only when the key is a string (a numeric single gather is a
-    genuine buffer read, left on the strided path).
-    """
-
-    gathers = [s for s in live if s.op_name in ("Indexed", "gather")]
-    if not gathers:
-        return None
-    for other in live:
-        if other not in gathers and other.op_name != "tensor_from_list":
-            return None
-    outputs = list(program.outputs.values())
-    if len(outputs) != 1:
-        return None
-    by_result = {s.result_id: s for s in live}
-    feeds = set(program.feeds)
-
-    # Walk the gather chain backwards from the output to its container root.
-    chain: list[OpStep] = []
-    current = by_result.get(outputs[0])
-    while current is not None and current.op_name in ("Indexed", "gather"):
-        if len(current.input_ids) != 2:
-            return None
-        chain.append(current)
-        current = by_result.get(current.input_ids[0])
-    chain.reverse()
-    if not (1 <= len(chain) <= 2) or len(chain) != len(gathers):
-        return None
-    # Each link's source must be the previous link's result (a real chain).
-    for parent, child in zip(chain, chain[1:]):
-        if child.input_ids[0] != parent.result_id:
-            return None
-    container_id = chain[0].input_ids[0]
-    if container_id not in feeds:
-        return None
-    if not _is_shapeless(program, container_id) or not _is_shapeless(program, outputs[0]):
-        return None
-    key_specs = []
-    has_string = False
-    for gather in chain:
-        spec, is_string = _container_key_spec(program, by_result, feeds, gather.input_ids[1])
-        if spec is None:
-            return None
-        key_specs.append(spec)
-        has_string = has_string or is_string
-    if len(key_specs) == 2 or (len(key_specs) == 1 and has_string):
-        return container_id, key_specs, outputs[0]
-    return None
 
 
 def _pure_delimited_name_hash(program: FusedProgram, live: Sequence[OpStep]):
@@ -1995,70 +1830,6 @@ def emit_wasm_module(
         api=api,
         binary=binary,
     )
-
-
-def _constant_scalar_index(slices: Any) -> int | None:
-    """The single integer subscript in an ``index_set``/``Indexed`` ``slices``
-    attribute, or ``None`` if it is not a compile-time scalar.
-
-    ``slices`` may be a plain int, an ``AbstractTensor``/ndarray wrapping one
-    element, or a nested wrapper. A non-scalar (fancy or runtime index) returns
-    ``None`` so the caller records an honest shortfall rather than guessing.
-    """
-
-    candidates = [slices, getattr(slices, "data", None)]
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        try:
-            return int(candidate)
-        except (TypeError, ValueError):
-            pass
-        item = getattr(candidate, "item", None)
-        if callable(item):
-            try:
-                return int(item())
-            except Exception:
-                pass
-    try:
-        import numpy as np
-
-        array = np.asarray(slices)
-        if array.size == 1:
-            return int(array.reshape(()))
-    except Exception:
-        pass
-    return None
-
-
-def _slice_selectors(step: OpStep):
-    """Defunctionalized subscript descriptor -- one shape for both capture
-    conventions of ``target[slices] = value``.
-
-    ``index_set`` (from ``AbstractTensor.__setitem__``) carries inputs
-    ``[data, value]`` with the subscript a constant in the ``slices`` attr.
-    ``IndexedStore`` (the reference ``SubscriptStore`` path) carries the
-    subscript as dataflow operands: ``[data, index0, (index1, ...), value]``.
-
-    Returns ``(data_id, value_id, selectors)`` where each selector is
-    ``("const", int)`` or ``("runtime", value_id)``, or ``None`` when the store
-    is not (yet) lowerable this way -- e.g. a runtime ``index_set`` whose index
-    lives only in the attr, never threaded as an operand.
-    """
-
-    op = step.op_name
-    if op == "index_set" and len(step.input_ids) == 2:
-        index = _constant_scalar_index(step.attrs.get("slices"))
-        if index is None:
-            return None
-        return step.input_ids[0], step.input_ids[1], [("const", index)]
-    if op == "IndexedStore" and len(step.input_ids) >= 3:
-        return (
-            step.input_ids[0],
-            step.input_ids[-1],
-            [("runtime", value_id) for value_id in step.input_ids[1:-1]],
-        )
-    return None
 
 
 def _row_major_strides(shape) -> list[int]:

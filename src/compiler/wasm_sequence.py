@@ -16,11 +16,12 @@ kernel counterpart of ``hash(data[start:start+maxlen].split(delim, 1)[0])``.
 from __future__ import annotations
 
 from .wasm_binary import CodeBuilder
+from .ir_container_ops import FNV64_OFFSET, FNV64_PRIME
 
-# Must match fused_program_wasm_backend._fnv1a_64 so a runtime-hashed name and a
+# Must match the central ir_container_ops.fnv1a_64 so a runtime-hashed name and a
 # compile-time-hashed string constant collide iff the bytes are equal.
-_FNV64_OFFSET_SIGNED = 0xCBF29CE484222325 - 2 ** 64  # fold to signed i64
-_FNV64_PRIME = 0x100000001B3
+_FNV64_OFFSET_SIGNED = FNV64_OFFSET - 2 ** 64  # fold to signed i64
+_FNV64_PRIME = FNV64_PRIME
 
 _I32_ADD = 0x6A
 _I32_GE_S = 0x4E
