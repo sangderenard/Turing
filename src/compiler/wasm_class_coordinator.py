@@ -240,17 +240,32 @@ class StorageRedirect:
 
 @dataclass(frozen=True)
 class ClassMethodCard:
-    """One method and the field slots bound to its pointer parameters."""
+    """One *invocation*: a shared kernel plus the field slots bound to it.
+
+    ``module`` is this invocation's per-region identity (unique; it names the
+    field-slot wiring). ``kernel`` is the byte-identical kernel it executes --
+    many invocations share one kernel. The coordinator imports each unique
+    kernel once and dispatches every invocation that references it, passing
+    that invocation's own slots. This is the kernel/invocation split: kernel =
+    structure/bytes (shared), invocation = per-region slot binding (distinct).
+    """
 
     index: int
     module: str
     entry: str
     input_slots: tuple[int, ...]
     output_slots: tuple[int, ...]
+    kernel: str = ""
 
     @property
     def parameter_count(self) -> int:
         return 1 + len(self.input_slots) + len(self.output_slots)
+
+    @property
+    def import_module(self) -> str:
+        """The kernel actually imported/instantiated for this invocation."""
+
+        return self.kernel or self.module
 
 
 @dataclass(frozen=True)
@@ -276,6 +291,7 @@ class ClassInventory:
                 {
                     "index": method.index,
                     "module": method.module,
+                    "kernel": method.import_module,
                     "entry": method.entry,
                     "input_slots": list(method.input_slots),
                     "output_slots": list(method.output_slots),
@@ -372,6 +388,7 @@ def build_class_inventory(manifest: Mapping[str, object]) -> ClassInventory:
             entry=str(module["entry"]),
             input_slots=tuple(inputs),
             output_slots=outputs,
+            kernel=str(module.get("kernel", module["name"])),
         ))
     return ClassInventory(
         fields=tuple(
@@ -479,8 +496,21 @@ def emit_wasm_class_coordinator(
         function_name="coordinate_class_range",
         parameters=("memory", "inventory", "count", "start", "end"),
     )
+    # Kernel/invocation split: many invocations (regions) share one kernel's
+    # bytes. The coordinator imports each unique kernel ONCE and every
+    # invocation that references it dispatches to that single import, passing
+    # its own field slots. A program that repeats one operation over 78k
+    # regions imports ~137 kernels instead of 78k per-region functions.
+    kernel_import_index: dict[str, int] = {}
+    for method in inventory.methods:
+        kernel_import_index.setdefault(method.import_module, len(kernel_import_index))
+    kernel_arity: dict[str, int] = {}
+    kernel_entry: dict[str, str] = {}
+    for method in inventory.methods:
+        kernel_arity.setdefault(method.import_module, method.parameter_count)
+        kernel_entry.setdefault(method.import_module, method.entry)
     region_callees = {
-        method.index: f"{method.module}.{method.entry}"
+        method.index: f"{method.import_module}.{method.entry}"
         for method in inventory.methods
     }
     # Field-slot IDs are the resident values visible at every method seam.
@@ -503,14 +533,17 @@ def emit_wasm_class_coordinator(
         details = "; ".join(item.reason for item in shortfalls)
         raise ValueError(f"coordinator control did not lower completely: {details}")
 
+    # One import per UNIQUE kernel, in first-appearance order. Import function
+    # indices therefore run 0..len(unique kernels)-1; the memory import lives
+    # in the memory index space and does not shift them.
     imports = [
         WasmImport(
-            module=method.module,
-            field=method.entry,
+            module=kernel_name,
+            field=kernel_entry[kernel_name],
             kind="func",
-            parameter_types=("i32",) * method.parameter_count,
+            parameter_types=("i32",) * kernel_arity[kernel_name],
         )
-        for method in inventory.methods
+        for kernel_name in kernel_import_index
     ]
     imports.append(WasmImport(
         module="env", field="memory", kind="memory", memory_pages=1,
@@ -524,7 +557,7 @@ def emit_wasm_class_coordinator(
         body.local_get(0)
         for slot in (*method.input_slots, *method.output_slots):
             body.local_get(1).i32_load(offset=slot * 4)
-        body.call(method.index).end()
+        body.call(kernel_import_index[method.import_module]).end()
     binary = build_module(
         function_name="run_range",
         parameter_types=("i32", "i32", "i32", "i32"),

@@ -1758,15 +1758,25 @@ class ClassGraphRunner {
     if (!this.manifest.coordinator) throw new Error(
       "class manifest has no translated coordinator"
     );
-    const pairs = await Promise.all(this.manifest.modules.map(async spec => [
-      spec, await this.instantiateCard(spec)
-    ]));
+    // Kernel/invocation split: instantiate each UNIQUE kernel once and key the
+    // import object by kernel name, matching the coordinator binary's deduped
+    // import section. Many invocations (methods) share one kernel.
+    const kernelSpecs = new Map();
+    for (const spec of this.manifest.modules) {
+      const kernel = spec.kernel || spec.name;
+      if (!kernelSpecs.has(kernel)) kernelSpecs.set(kernel, spec);
+    }
+    const kernelInstances = new Map(await Promise.all(
+      [...kernelSpecs.entries()].map(async ([kernel, spec]) =>
+        [kernel, await this.instantiateCard(spec)])
+    ));
     const imports = {env: {memory: this.memory}};
     for (const method of this.manifest.class_inventory.methods || []) {
-      const pair = pairs.find(([spec]) => spec.name === method.module);
-      if (!pair) throw new Error("inventory method module not loaded: " + method.module);
-      if (!imports[method.module]) imports[method.module] = {};
-      imports[method.module][method.entry] = pair[1].exports[method.entry];
+      const kernel = method.kernel || method.module;
+      const instance = kernelInstances.get(kernel);
+      if (!instance) throw new Error("inventory kernel not loaded: " + kernel);
+      if (!imports[kernel]) imports[kernel] = {};
+      imports[kernel][method.entry] = instance.exports[method.entry];
     }
     const bytes = await this.binary(
       this.manifest.coordinator.url, "class coordinator"
