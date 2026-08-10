@@ -1149,10 +1149,27 @@ def _lower_process_graph_to_compilation(
         # module's DualIRShell.
         function_shell = deployment.function_shells.get(reference.address, deployment)
         feeds = dict(feeds)
+        # Capturing a PROGRAM (precompile_only) keeps every mutable parameter a
+        # parameter -- symbolic, never observed. A value that happens to be passed
+        # must not turn the parameter into a baked constant: that is what the tape
+        # path does when it observes concrete values to fuse subregions (kernels),
+        # and it is exactly why the tape cannot capture a program. Treating all
+        # mutable parameters as missing here forces the graph-ingestion path
+        # (prepare_graph_precompile), which transcribes the graph portion
+        # faithfully, for the whole program capture -- the tape is reserved for
+        # the kernel/runtime path (precompile_only=False).
         missing_mutable_parameters = tuple(
-            name for name in mutable_parameters if name not in feeds
+            name for name in mutable_parameters
+            if precompile_only or name not in feeds
         )
-        if precompile_only and missing_mutable_parameters:
+        # A PROGRAM capture (precompile_only) ALWAYS goes through the graph
+        # ingestion, never the tape -- the tape linearises an observed run and
+        # cannot carry a graph portion's full operand/output set, which is why
+        # it drops boundary operands and pins a region to a single terminal
+        # value. missing_mutable_parameters (all of them, kept symbolic above)
+        # is now only the set of runtime parameters to report; it no longer
+        # gates whether the tape is allowed to stand in for the graph.
+        if precompile_only:
             if deployment_prepared:
                 _report("aot: graph-only precompile already prepared")
             else:
