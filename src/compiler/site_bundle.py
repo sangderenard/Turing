@@ -2598,7 +2598,14 @@ def build_program_bundle(
 
         card_directory = Path("wasm") / f"size-{DEFAULT_WASM_CARD_OPERATIONS}"
         channel.log("partitioning program into wasm regions", path="regions")
-        effective_region_programs = dict(aot.region_programs)
+        # Backend-neutral IR fold: collapse byte-string idioms (e.g. the
+        # null-terminated name extraction) to single general ops before any
+        # backend emits, so the reduction is shared, not WASM-bespoke.
+        from .ir_byte_idioms import fold_byte_string_idioms
+        effective_region_programs = {
+            index: fold_byte_string_idioms(program)
+            for index, program in aot.region_programs.items()
+        }
         thread_topology = None
         if (
             program is not None

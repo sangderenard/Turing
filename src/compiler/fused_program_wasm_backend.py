@@ -73,6 +73,7 @@ from .wasm_container import (
     emit_map_set,
     emit_nested_map_store,
 )
+from .ir_byte_idioms import HASH_DELIMITED_PREFIX
 
 # f64 bits reinterpreted as i64 read the raw 8 bytes unchanged, so a map key or
 # value keeps its exact identity whether it logically holds an integer (an RVA)
@@ -1287,6 +1288,142 @@ def _pure_container_read(program: FusedProgram, live: Sequence[OpStep]):
     return None
 
 
+def _pure_delimited_name_hash(program: FusedProgram, live: Sequence[OpStep]):
+    """A region that is the single general ``hash_delimited_prefix`` op (folded
+    from ``subject[start].split(delim,1)[0]`` by ir_byte_idioms).
+
+    Returns ``(subject_id, start_id, delim, result_id, maxlen)`` or ``None``.
+    The recognition lives centrally in the IR fold; this only lowers the one op,
+    which a scalar kernel cannot express as-is because it reads a RUN of bytes
+    out of the subject buffer and folds them to one hash."""
+
+    if len(live) != 1 or live[0].op_name != HASH_DELIMITED_PREFIX:
+        return None
+    step = live[0]
+    if len(step.input_ids) != 2:
+        return None
+    subject_id, start_id = step.input_ids
+    feeds = set(program.feeds)
+    if subject_id not in feeds or start_id not in feeds:
+        return None
+    if list(program.outputs.values()) != [step.result_id]:
+        return None
+    return (subject_id, start_id, int(step.attrs.get("delim", 0)),
+            step.result_id, int(step.attrs.get("maxlen", 8)))
+
+
+def _emit_name_hash_module(
+    program: FusedProgram,
+    *,
+    name: str,
+    function_name: str,
+    value_type: str,
+    element_bytes: int,
+    parameter_feed_ids: Sequence[int],
+    output_ids: Sequence[int],
+    labels: Sequence[str],
+    imports: Sequence[object],
+    static_data_offset: int,
+    descriptor,
+) -> "WasmModule":
+    """Emit a kernel that hashes a null-terminated byte prefix of the subject.
+
+    This is the material break from scalar-only kernels: it reads up to
+    ``_SECTION_NAME_WIDTH`` bytes out of the subject buffer at a computed start,
+    folding them into one FNV-1a hash and stopping at the delimiter -- many
+    bytes in, one identity out."""
+
+    from .wasm_binary import CodeBuilder, build_module
+    from .wasm_sequence import emit_hash_delimited_prefix
+
+    subject_id, start_id, delim, result_id, maxlen = descriptor
+    parameter_count = 1 + len(parameter_feed_ids) + len(output_ids)
+    builder = CodeBuilder(value_type=value_type, parameter_count=parameter_count)
+
+    def feed_param(vid: int) -> int:
+        return 1 + list(parameter_feed_ids).index(resolve_view_source(program.meta, vid))
+
+    buf_addr = builder.declare_local("i32")
+    start = builder.declare_local("i32")
+    maxlen_local = builder.declare_local("i32")
+    delim_local = builder.declare_local("i32")
+    result = builder.declare_local("i64")
+    index = builder.declare_local("i32")
+    byte = builder.declare_local("i32")
+
+    # buf_addr = subject buffer base (+ its view byte offset, usually 0). The
+    # subject is read byte-by-byte, so its element width is 1.
+    subject_off, _ = view_offset_stride(program.meta, subject_id)
+    builder.local_get(feed_param(subject_id))
+    if subject_off:
+        builder.i32_const(subject_off).raw(0x6A)
+    builder.local_set(buf_addr)
+
+    # start = the numeric offset operand, read from its field and narrowed to i32.
+    start_off, _ = view_offset_stride(program.meta, start_id)
+    builder.local_get(feed_param(start_id))
+    if start_off:
+        builder.i32_const(start_off * element_bytes).raw(0x6A)
+    if value_type == "f64":
+        builder.load()
+        builder.raw(0xAA)  # i32.trunc_f64_s
+    else:  # i64 working type
+        builder.i64_load()
+        builder.raw(0xA7)  # i32.wrap_i64
+    builder.local_set(start)
+
+    builder.i32_const(int(maxlen)).local_set(maxlen_local)
+    builder.i32_const(int(delim)).local_set(delim_local)
+
+    emit_hash_delimited_prefix(
+        builder, buf_addr_local=buf_addr, start_local=start, maxlen_local=maxlen_local,
+        delim_local=delim_local, result_local=result, index_local=index,
+        byte_local=byte,
+    )
+
+    out_param = 1 + len(parameter_feed_ids) + list(output_ids).index(result_id)
+    builder.local_get(out_param)
+    builder.local_get(result)
+    if value_type == "f64":
+        builder.raw(0xBF)  # f64.reinterpret_i64
+        builder.store()
+    else:
+        builder.i64_store()
+
+    binary = build_module(
+        function_name=function_name,
+        parameter_types=["i32"] * parameter_count,
+        body=builder, imports=imports,
+    )
+    memory_import = next(
+        (e for e in imports if getattr(e, "kind", None) == "memory"), None
+    )
+    api = _describe(
+        name, function_name, list(parameter_feed_ids), list(output_ids),
+        value_type, element_bytes, 0, static_data_offset=static_data_offset,
+        shared_memory_import=(
+            {"module": memory_import.module, "field": memory_import.field}
+            if memory_import is not None else None
+        ),
+        input_names=list(labels), output_names=list(program.outputs.keys()),
+    )
+    parameters = (
+        ["$count"] + [f"${label}" for label in labels]
+        + [f"$out{i}" for i in range(len(output_ids))]
+    )
+    source = (
+        f"(module ;; {name} -- null-terminated name hash lowered in the binary\n"
+        f"  ;; folds up to {int(maxlen)} subject bytes (many bytes -> one\n"
+        f"  ;; hash), stopping at delimiter {int(delim)}. Binary is authoritative.\n"
+        f"  (func (export \"{function_name}\")"
+        + "".join(f" (param {p} i32)" for p in parameters) + ")\n)\n"
+    )
+    return WasmModule(
+        name=name, source=source, shortfalls=(), parameters=tuple(parameters),
+        value_type=value_type, api=api, binary=binary,
+    )
+
+
 def _emit_container_load_module(
     program: FusedProgram,
     *,
@@ -1452,7 +1589,11 @@ def emit_wasm_module(
             None if container_store is not None
             else _pure_container_read(program, live)
         )
-        if container_store is not None or container_read is not None:
+        name_hash = (
+            None if (container_store is not None or container_read is not None)
+            else _pure_delimited_name_hash(program, live)
+        )
+        if container_store is not None or container_read is not None or name_hash is not None:
             container_feed_ids = program_feed_order(program)
             container_output_ids = list(program.outputs.values())
             container_param_feeds: list[int] = []
@@ -1462,10 +1603,12 @@ def emit_wasm_module(
                 if source_id not in seen_container_sources:
                     seen_container_sources.add(source_id)
                     container_param_feeds.append(source_id)
-            emit = (
-                _emit_container_store_module if container_store is not None
-                else _emit_container_load_module
-            )
+            if container_store is not None:
+                emit, descriptor = _emit_container_store_module, container_store
+            elif container_read is not None:
+                emit, descriptor = _emit_container_load_module, container_read
+            else:
+                emit, descriptor = _emit_name_hash_module, name_hash
             return emit(
                 program, name=name, function_name=function_name,
                 value_type=value_type, element_bytes=element_bytes,
@@ -1473,7 +1616,7 @@ def emit_wasm_module(
                 output_ids=container_output_ids,
                 labels=feed_names(program, container_param_feeds),
                 imports=imports, static_data_offset=static_data_offset,
-                descriptor=container_store or container_read,
+                descriptor=descriptor,
             )
 
     static_data = plan_static_data(
