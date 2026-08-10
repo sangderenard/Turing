@@ -2641,33 +2641,37 @@ def build_program_bundle(
             # whole set once, upfront, instead of dying opaquely at the first --
             # so a bad capture is diagnosed at a glance, not one rebuild at a time.
             import collections as _collections
-            # Everything any region consumes as a feed -- so we can tell whether a
-            # malformed region's output actually feeds downstream (LIVE, needs a
-            # real fix) or is consumed by nothing (DEAD, safe to drop cleanly).
-            _all_consumed = set()
-            for _prog in effective_region_programs.values():
-                _all_consumed |= set(_prog.feeds)
+
+            def _mutates_state(_prog):
+                # A container/field write (a subscript store) is a side effect on
+                # shared state that OTHER regions read THROUGH the container via
+                # the coordinator's field slots -- NOT via this region's declared
+                # output feed. So such a region is valuable even when its output
+                # is consumed by nothing: value is not "does an output flow out",
+                # it is "does this change observable state". Output consumption
+                # alone under-counts value; state mutation must count too.
+                return any(s.op_name in ("index_set", "IndexedStore", "SetAttr")
+                           for s in _prog.steps)
+
+            def _is_malformed(_prog):
+                _produced = set(_prog.feeds) | {s.result_id for s in _prog.steps}
+                return any(v not in _produced
+                           for s in _prog.steps for v in s.input_ids)
+
             dangling_ops = _collections.Counter()
             dangling_examples = []
-            malformed_dead = 0
-            malformed_live = 0
+            malformed_side_effecting = 0  # unlowerable AND mutates state
             for _idx, _prog in effective_region_programs.items():
                 _produced = set(_prog.feeds) | {s.result_id for s in _prog.steps}
-                _bad = False
                 for _step in _prog.steps:
                     _missing = [v for v in _step.input_ids if v not in _produced]
                     if _missing:
                         dangling_ops[_step.op_name] += 1
                         if len(dangling_examples) < 10:
                             dangling_examples.append((_idx, _step.op_name, _missing))
-                        _bad = True
+                        if _mutates_state(_prog):
+                            malformed_side_effecting += 1
                         break
-                if _bad:
-                    _outs = set(_prog.outputs.values())
-                    if _outs & _all_consumed:
-                        malformed_live += 1
-                    else:
-                        malformed_dead += 1
             if dangling_ops:
                 channel.log(
                     "region consistency: malformed regions with dangling operands "
@@ -2675,34 +2679,27 @@ def build_program_bundle(
                     path="regions",
                     malformed=int(sum(dangling_ops.values())),
                     total=len(effective_region_programs),
-                    dead_droppable=malformed_dead,
-                    live_needs_fix=malformed_live,
+                    # These mutate shared state, so neutralising them DROPS a write
+                    # (already broken, since an operand is missing) -- a real loss
+                    # to fix at the capture, not merely dead code.
+                    state_mutating_writes_lost=malformed_side_effecting,
                     by_op=dict(dangling_ops),
                     examples=dangling_examples,
                 )
-                # A malformed region whose outputs feed nothing is dead code left
-                # by partitioning (a producer pruned, its orphaned consumer kept).
-                # It cannot be lowered (dangling operand) and contributes nothing,
-                # so neutralise it to a constant-0 producer of its own outputs --
-                # keeping the coordinator schedule/indices intact without emitting
-                # a broken kernel. A LIVE malformed region is a real bug and is
-                # left to fail loudly (there are none today).
+                # A malformed region cannot compute its real value even in
+                # principle (an operand's producer is gone), so it is neutralised
+                # to a defined constant-0 producer of its own outputs, letting the
+                # build complete over a capture defect rather than dying at the
+                # first. State-mutating malformed regions lose their (already
+                # broken) write -- reported above -- to fix at the capture. A
+                # region that is merely harder to lower (e.g. a string op) is NOT
+                # neutralised: value flows through the coordinator's field slots/
+                # aliasing, not raw feeds, so it cannot be proven dead and zeroing
+                # it could corrupt a live value or drop a live state mutation.
                 from src.common.tensors.fused_ir import FusedProgram as _FP, OpStep as _OS
                 _neutralized = 0
                 for _idx, _prog in list(effective_region_programs.items()):
-                    _produced = set(_prog.feeds) | {s.result_id for s in _prog.steps}
-                    # Only a MALFORMED region (an operand whose producer was
-                    # eliminated) is genuinely unlowerable regardless of liveness:
-                    # it cannot compute its real value even in principle. Such a
-                    # region is neutralised to a defined constant-0 so the build
-                    # completes rather than dying on a capture defect. (A region
-                    # that is merely lowerable-with-more-work -- e.g. a string op
-                    # -- is NOT neutralised: zeroing it could silently corrupt a
-                    # live value, since region outputs flow through the
-                    # coordinator's field slots/aliasing, not raw feeds, so a weak
-                    # feed-based liveness test cannot prove it dead.)
-                    if not any(v not in _produced
-                               for s in _prog.steps for v in s.input_ids):
+                    if not _is_malformed(_prog):
                         continue
                     effective_region_programs[_idx] = _FP(
                         version=_prog.version, feeds=set(),
@@ -2716,9 +2713,10 @@ def build_program_bundle(
                     _neutralized += 1
                 if _neutralized:
                     channel.log(
-                        "neutralised dead malformed regions to constant-0 "
-                        "(unconsumed outputs; no semantic effect)",
+                        "neutralised malformed regions to constant-0 (unlowerable: "
+                        "an operand's producer was eliminated; capture-side fix)",
                         path="regions", neutralized=_neutralized,
+                        state_writes_lost=malformed_side_effecting,
                     )
             channel.log(
                 "emitting control region modules", path="regions",
