@@ -11557,6 +11557,7 @@ def _compile_whole_process_graph(
     shell: Any,
     *,
     device: Any = None,
+    prepare_ephemerals: bool = False,
     _visited: set[int] | None = None,
 ) -> Any:
     if getattr(shell, "process_graph_boundary", None):
@@ -11600,10 +11601,22 @@ def _compile_whole_process_graph(
 
     functions = []
     sources = []
-    for ephemeral in shell.ephemeral_callables:
-        ephemeral.prepare(device=device)
-        functions.append(ephemeral)
-        sources.append(ephemeral.generated_source)
+    # An ephemeral is a GraphDeepCompiler-built PYTHON callable for a numeric
+    # region -- only useful when a numeric region has to stay executable as
+    # Python (runtime execution). Deriving the dual IR (the whole-program,
+    # no-bake precompile) does not execute anything, so it does not need them,
+    # and eagerly building them here forces the deep compiler over the whole
+    # graph -- including control/binding constructs (a walrus, an annotation)
+    # that are not tensor operators and have no op-table entry -- which is the
+    # wrong question to ask of them. So prepare them only when explicitly asked.
+    # The runtime consumer falls back to the ephemeral itself (prepared lazily
+    # on first call) when compiled_dispatch_functions is empty, so leaving them
+    # unprepared here is safe.
+    if prepare_ephemerals:
+        for ephemeral in shell.ephemeral_callables:
+            ephemeral.prepare(device=device)
+            functions.append(ephemeral)
+            sources.append(ephemeral.generated_source)
     direct_callees = [
         (node_id, int(reference))
         for node_id, data in shell.process_graph.G.nodes(data=True)
@@ -11626,6 +11639,7 @@ def _compile_whole_process_graph(
         _compile_whole_process_graph(
             function_shell,
             device=device,
+            prepare_ephemerals=prepare_ephemerals,
             _visited=visited,
         )
     shell.compiled_dispatch_functions = tuple(functions)
@@ -13397,9 +13411,11 @@ class ProcessGraphGLSLDeployment:
             raise error
         return None
 
-    def compile_process_graph(self, *, device=None):
+    def compile_process_graph(self, *, device=None, prepare_ephemerals=False):
         try:
-            return _compile_whole_process_graph(self, device=device)
+            return _compile_whole_process_graph(
+                self, device=device, prepare_ephemerals=prepare_ephemerals
+            )
         except Exception as error:
             self._profiler.record_exception(
                 error,
