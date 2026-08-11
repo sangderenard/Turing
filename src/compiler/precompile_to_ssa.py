@@ -2046,6 +2046,117 @@ def find_ssa_cycles(function: Function) -> tuple[SSACycle, ...]:
     return tuple(sorted(cycles))
 
 
+def lower_control_sections_to_ssa(
+    control: ControlProgram,
+    *,
+    hierarchy_plan: PlanClosure | None = None,
+    control_name: str = "planned_control",
+    identity_table: Mapping[str, tuple[int, ...]] | None = None,
+    function_outputs: tuple[str, ...] = (),
+    function_parameters: tuple[str, ...] = (),
+) -> tuple[
+    IRModule,
+    tuple[SSALoweringShortfall, ...],
+    dict[str, tuple[SSAValue, ...]],
+]:
+    """Lower one method's control + planner regions to SSA -- no numeric projection.
+
+    This is the whole-object emission path.  A class method is control (field
+    get/set, calls, returns) plus zero or more flat operator regions the planner
+    already carved out.  Neither needs a fused numerical program: the regions
+    come straight from the hierarchy plan via ``plan_region_to_ssa_instrs`` and
+    the control program lowers directly.  Nothing here builds or validates a
+    ``FusedProgram``, so a method with no numeric region (a void ``__init__``)
+    and a method with one (``scale``'s ``mul``) both lower the same way.
+
+    Returns the module, any shortfalls, and ``section_outputs`` -- the output
+    SSA values of each region function, which the target must declare as that
+    function's ``intent(out)`` dummies (a region has no explicit return).
+    """
+
+    functions: dict[str, Function] = {}
+    region_callees: dict[int, str] = {}
+    region_signatures: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}
+    section_outputs: dict[str, tuple[SSAValue, ...]] = {}
+    shortfalls: list[SSALoweringShortfall] = []
+    if hierarchy_plan is not None:
+        for region in hierarchy_plan.items:
+            if not (
+                isinstance(region, PlanClosure)
+                and region.name.startswith("region_")
+            ):
+                continue
+            region_index = int(region.name.split("_", 1)[1])
+            if region_index in region_callees:
+                continue
+            # Namespace regions by their owning method so two methods that each
+            # carve a ``region_0`` do not collide in one shared library, and so
+            # the control call the lowering emits already targets this symbol.
+            region_name = f"{control_name}__planned_region_{region_index}"
+            instructions = list(plan_region_to_ssa_instrs(region))
+            produced = {int(instr.res.id) for instr in instructions}
+            consumed = {
+                int(argument.id)
+                for instr in instructions
+                for argument in instr.args
+            }
+            outputs = tuple(sorted(produced - consumed)) or tuple(
+                sorted(produced)
+            )
+            # The region's formal parameters are its captures only. Its outputs
+            # are declared as ``intent(out)`` dummies by the target from the
+            # ``outputs`` map (returned below as ``section_outputs``), exactly as
+            # the fused numerical region path does -- never by placing them in
+            # ``args``, which would misread an output as an in/out alias.
+            arguments = [SSAValue(int(vid)) for vid in region.captures]
+            functions[region_name] = Function(
+                region_name,
+                arguments,
+                {"entry": BasicBlock("entry", instructions)},
+            )
+            region_callees[region_index] = region_name
+            region_signatures[region_index] = (
+                tuple(int(vid) for vid in region.captures),
+                outputs,
+            )
+            section_outputs[region_name] = tuple(
+                SSAValue(int(vid)) for vid in outputs
+            )
+            known_operations = {handler.value for handler in Handler}
+            shortfalls.extend(
+                SSALoweringShortfall(
+                    "planned-region",
+                    str(instr.op),
+                    f"{region_name}:entry",
+                    "operator has no repository SSA handler",
+                )
+                for instr in instructions
+                if str(instr.op) not in known_operations
+            )
+    control_function, control_shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name=control_name,
+        region_callees=region_callees,
+        region_signatures=region_signatures,
+        named_output_histories={
+            str(name): tuple(map(int, (identity_table or {}).get(name, ())))
+            for name in function_outputs
+        },
+        value_name_histories=identity_table,
+        parameter_names=function_parameters,
+    )
+    functions[control_function.name] = control_function
+    module = IRModule(
+        link_required_ssa_features(functions),
+        recursion_table={
+            name: dict(function.metadata.get("recursion_table", {}))
+            for name, function in functions.items()
+            if function.metadata.get("recursion_table")
+        },
+    )
+    return module, tuple((*shortfalls, *control_shortfalls)), section_outputs
+
+
 def lower_precompile_and_control_to_ssa(
     artifact: Any,
     control: ControlProgram,
@@ -2276,6 +2387,7 @@ __all__ = [
     "find_ssa_cycles",
     "lower_class_navigation_to_ssa",
     "lower_control_program_to_ssa",
+    "lower_control_sections_to_ssa",
     "lower_fused_program_to_ssa",
     "lower_precompile_and_control_to_ssa",
     "ssa_module_dictionary",

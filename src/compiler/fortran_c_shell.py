@@ -902,6 +902,100 @@ def compile_fortran_module_c_shell(
     )
 
 
+def _emit_class_surface_module(compilation: Any, artifact_name: str):
+    """Emit every planned method of a whole object as one ``bind(C)`` library.
+
+    This is the whole-object emission path and it performs NO numeric
+    projection.  Each method lowers its own control program plus the operator
+    regions the planner already carved out -- straight through
+    ``lower_control_sections_to_ssa`` -- so a method with no numeric region (a
+    void constructor) and a method with one (a ``mul``) lower the same way, and
+    neither builds or validates a ``FusedProgram``.  Every method becomes its
+    own linkable export; nothing is folded into a single entry and nothing is
+    pruned.
+
+    Returns ``(FortranModule, export_symbols)`` or ``(None, ())`` when the
+    deployment exposes no planned methods (so the caller can fall through).
+    """
+
+    from ..transmogrifier.ssa import IRModule
+    from .glsl_deployment_strategy import _walk_planned_shells
+    from .precompile_to_ssa import lower_control_sections_to_ssa
+    from .ssa_fortran_backend import emit_module
+
+    all_functions: dict[str, Any] = {}
+    section_outputs: dict[str, tuple[Any, ...]] = {}
+    export_symbols: list[str] = []
+    for shell in _walk_planned_shells(compilation.deployment):
+        graph = getattr(shell, "process_graph", None)
+        graph_obj = graph.G if graph is not None else None
+        function_name = (
+            graph_obj.graph.get("function_name") if graph_obj is not None else None
+        )
+        if function_name is None:
+            continue
+        control = getattr(shell, "shell_control_program", None)
+        if control is None:
+            continue
+        symbol = f"{artifact_name}__{function_name}"
+        module_ir, shortfalls, shell_section_outputs = (
+            lower_control_sections_to_ssa(
+                control,
+                hierarchy_plan=getattr(shell, "hierarchy_plan", None),
+                control_name=symbol,
+                identity_table=dict(graph_obj.graph.get("identity_table") or {}),
+                function_outputs=tuple(
+                    graph_obj.graph.get("function_outputs") or ()
+                ),
+                function_parameters=tuple(
+                    graph_obj.graph.get("function_parameters") or ()
+                ),
+            )
+        )
+        if shortfalls:
+            raise FortranEmissionError(
+                f"method {symbol!r} has operators without an SSA handler: "
+                + "; ".join(str(item.opcode) for item in shortfalls)
+            )
+        all_functions.update(module_ir.functions)
+        section_outputs.update(shell_section_outputs)
+        export_symbols.append(symbol)
+    if not export_symbols:
+        return None, ()
+
+    def emit_outputs(name: str, function: Any) -> tuple[Any, ...]:
+        # A flat operator region has no explicit return: its outputs come from
+        # the lowerer as ``intent(out)`` dummies the target appends. A control
+        # function names its outputs with a return instruction.
+        if name in section_outputs:
+            return section_outputs[name]
+        returns = tuple(
+            instruction.args
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in {"Ret", "ret", "Return", "return"}
+        )
+        return tuple(returns[-1]) if returns else ()
+
+    emitted = emit_module(
+        IRModule(all_functions),
+        name=f"{artifact_name}_fortran",
+        outputs={
+            name: emit_outputs(name, function)
+            for name, function in all_functions.items()
+        },
+        # A library exports its whole surface: keep and export every method and
+        # region function, not just the ones one nominal entry reaches.
+        extra_roots=tuple(all_functions),
+    )
+    if not emitted.complete:
+        raise FortranEmissionError(
+            "class surface could not emit hierarchical object program: "
+            + "; ".join(item.format() for item in emitted.shortfalls)
+        )
+    return emitted, tuple(export_symbols)
+
+
 def compile_ast_fortran_c_shell(
     source: str,
     entrypoint: str,
@@ -990,6 +1084,34 @@ def compile_ast_fortran_c_shell(
 
     artifact_name = str(name or entrypoint)
     module = None
+
+    # Whole-object library build: emit every planned method as its own export
+    # via the non-numeric control-sections path. A class has no program-level
+    # return surface, so it never reaches the numeric emission below -- and it
+    # must not, because that path projects and validates a numerical program the
+    # object does not have. This early return skips all of the single-entry
+    # native-input/card machinery, which does not apply to a multi-method
+    # library.
+    if library:
+        class_module, export_symbols = _emit_class_surface_module(
+            compilation, artifact_name
+        )
+        if class_module is not None:
+            if progress is not None:
+                progress(
+                    f"emitted object surface {artifact_name}: "
+                    f"exports {list(export_symbols)}"
+                )
+            return compile_fortran_module_c_shell(
+                class_module,
+                {},
+                directory,
+                entrypoint=export_symbols[0],
+                name=artifact_name,
+                standalone=standalone,
+                library=True,
+            )
+
     if hierarchical_outputs and compilation.region_programs:
         from ..transmogrifier.ssa import IRModule
         from .precompile_to_ssa import lower_precompile_and_control_to_ssa
