@@ -1145,6 +1145,16 @@ def _lower_process_graph_to_compilation(
             else None
         ) or graph.function_table.reference(entrypoint)
         if reference is None:
+            # A qualified method name (``ClassName.method``) lives in the
+            # function table's qualified map, not the bare-name bindings that
+            # ``reference()`` checks -- so a class-section entrypoint resolves
+            # through ``entry()`` (the same qualified lookup the dependency
+            # seeds use), not the bare-name path.
+            try:
+                reference = graph.function_table.entry(entrypoint).reference
+            except (KeyError, AttributeError):
+                reference = None
+        if reference is None:
             raise ValueError(
                 f"{entrypoint!r} is not a defined function in source"
             )
