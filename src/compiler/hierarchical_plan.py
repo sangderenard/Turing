@@ -46,6 +46,10 @@ class PlanClosure:
     captures: tuple[int, ...]
     items: tuple["PlanItem", ...]
     closure_id: int = -1
+    # Shape (and dtype) of the region's values, carried from the process graph's
+    # per-node domain so the lowered SSA values are the arrays they are, not
+    # shapeless scalars. ``(value_id, shape, dtype)`` per value.
+    value_shapes: tuple[tuple[int, tuple[int, ...], str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -70,7 +74,33 @@ PlanItem = PlanLine | PlanClosure | PlanCall
 
 
 def plan_region_to_ssa_instrs(region: PlanClosure) -> tuple[Instr, ...]:
-    """Lower one planner-owned flat region to repository SSA instructions."""
+    """Lower one planner-owned flat region to repository SSA instructions.
+
+    Each SSA value carries the shape and dtype recorded for it on the region
+    (``value_shapes``, from the process graph's per-node domain), so a value is
+    the array it is and array ops lower as array ops rather than scalars.
+    """
+
+    shape_of = {
+        int(value_id): tuple(int(dimension) for dimension in shape)
+        for value_id, shape, _dtype in region.value_shapes
+    }
+    dtype_of = {
+        int(value_id): dtype for value_id, _shape, dtype in region.value_shapes
+    }
+
+    def value(value_id: int) -> SSAValue:
+        value_id = int(value_id)
+        existing = values.get(value_id)
+        if existing is not None:
+            return existing
+        made = SSAValue(
+            value_id,
+            dtype=dtype_of.get(value_id, "float64"),
+            shape=shape_of.get(value_id, ()),
+        )
+        values[value_id] = made
+        return made
 
     values: dict[int, SSAValue] = {}
     instructions = []
@@ -86,11 +116,8 @@ def plan_region_to_ssa_instrs(region: PlanClosure) -> tuple[Instr, ...]:
         result_id = int(item.outputs[0])
         instructions.append(Instr(
             item.opcode,
-            [
-                values.setdefault(int(value_id), SSAValue(int(value_id)))
-                for value_id in item.inputs
-            ],
-            values.setdefault(result_id, SSAValue(result_id)),
+            [value(value_id) for value_id in item.inputs],
+            value(result_id),
             arg_roles=list(item.input_roles),
             attributes=dict(item.attributes),
         ))

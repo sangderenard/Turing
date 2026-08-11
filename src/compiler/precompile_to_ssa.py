@@ -2396,12 +2396,6 @@ def lower_control_sections_to_ssa(
             output_value_ids=output_value_ids,
         )
     functions[control_function.name] = control_function
-    # Decompose derived tensor ops (square, reciprocal, cbrt, casts) into the
-    # primitive set every backend already lowers, once at the SSA level, so no
-    # target needs a per-op spelling for a composition of primitives.
-    from .ir_tensor_ops import lower_derived_ops_to_ssa
-
-    lower_derived_ops_to_ssa(functions)
     # Lower subscript ops (Indexed/IndexedStore) to the universal address
     # vocabulary (GetElementPtr + Load/Store) that every backend already speaks,
     # so the subscript lowering lives once at the SSA level, not per backend.

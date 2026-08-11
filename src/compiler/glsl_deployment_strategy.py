@@ -1496,10 +1496,27 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                         "region": region_index,
                     },
                 ))
+        # Carry each region value's shape/dtype from its process-graph node's
+        # domain so the lowered SSA is shaped: a value that is an array lowers
+        # as an array, not a scalar. A domain padded with size-1 dims (a scalar
+        # is (1, 1, 1)) squeezes to its logical shape -- () for a scalar.
+        def _value_shape_dtype(value_id):
+            node = graph.G.nodes.get(int(value_id), {})
+            domain = node.get("domain_node")
+            shape = tuple(getattr(domain, "shape", ()) or ())
+            logical = tuple(int(dim) for dim in shape if int(dim) != 1)
+            dtype = str(node.get("dtype") or "float64")
+            return (int(value_id), logical, dtype)
+
+        value_shapes = tuple(
+            _value_shape_dtype(value_id)
+            for value_id in (*region_nodes, *region_captures)
+        )
         items.append(PlanClosure(
             name=f"region_{region_index}",
             captures=region_captures,
             items=(*const_lines, *compute_lines),
+            value_shapes=value_shapes,
         ))
     control_values = set()
     control = getattr(shell, "shell_control_program", None)
