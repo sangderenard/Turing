@@ -627,6 +627,7 @@ def compile_ast_aot(
     progress: "Callable[[str], None] | None" = None,
     checkpoint: bool | str | Path = False,
     resume: bool = True,
+    dependency_seeds: tuple[str, ...] = (),
 ) -> AOTCompilation:
     """Compile ``entrypoint`` in ``source`` ahead-of-time and execute it once.
 
@@ -948,6 +949,7 @@ def compile_ast_aot(
         dependency_regions=dependency_regions,
         map_ir=map_ir,
         resume=resume,
+        dependency_seeds=dependency_seeds,
     )
 
 
@@ -982,6 +984,7 @@ def _lower_process_graph_to_compilation(
     dependency_regions: Any,
     map_ir: Mapping[str, Any] | None,
     resume: bool,
+    dependency_seeds: tuple[str, ...] = (),
 ) -> AOTCompilation:
     """Lower an already-built ``ProcessGraph`` into a real ``AOTCompilation``.
 
@@ -1012,7 +1015,9 @@ def _lower_process_graph_to_compilation(
             mutable_parameters=mutable_parameters,
         )
         _report("aot: building map dependency regions")
-        dependency_regions = build_map_dependency_regions(graph, entrypoint)
+        dependency_regions = build_map_dependency_regions(
+            graph, entrypoint, extra_seeds=dependency_seeds
+        )
         map_ir = dict(graph.G.graph.get("map_ir") or {})
         map_ir["dependency_regions"] = {
             "runtime": dependency_regions.runtime,

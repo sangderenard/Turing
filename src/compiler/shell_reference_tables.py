@@ -19,7 +19,7 @@ from __future__ import annotations
 import ast
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from ..transmogrifier.graph.graph_express2 import instance_attribute_slot
 
@@ -359,19 +359,36 @@ def build_class_navigation_table(graph: Any) -> ClassNavigationTable:
     return ClassNavigationTable(tuple(records))
 
 
-def build_map_dependency_regions(graph: Any, entrypoint: str) -> MapDependencyRegions:
-    """Combine strict runtime closure with map-level class retention."""
+def build_map_dependency_regions(
+    graph: Any,
+    entrypoint: str,
+    *,
+    extra_seeds: "Iterable[str]" = (),
+) -> MapDependencyRegions:
+    """Combine strict runtime closure with map-level class retention.
+
+    The closure is seeded from ``entrypoint`` and every name in ``extra_seeds``.
+    A single entrypoint reduces to one program's runtime closure, as before. A
+    class that has no privileged entry compiles as the union of the closures of
+    all its methods -- constructors (``__init__``/``__new__``) included -- by
+    passing them as seeds: the whole object is retained as one general
+    dependency, no method treated as "the" entry.
+    """
 
     function_table = getattr(graph, "function_table", None)
     if function_table is None:
         raise ValueError("dependency regions require a function table")
-    try:
-        entry = function_table.entry(entrypoint)
-    except KeyError as exc:
-        raise ValueError(f"unknown dependency entrypoint {entrypoint!r}") from exc
+
+    seed_names = (entrypoint, *extra_seeds)
+    seed_addresses: list[int] = []
+    for name in seed_names:
+        try:
+            seed_addresses.append(int(function_table.entry(name).reference.address))
+        except KeyError as exc:
+            raise ValueError(f"unknown dependency entrypoint {name!r}") from exc
 
     runtime: set[int] = set()
-    pending = [int(entry.reference.address)]
+    pending = list(seed_addresses)
     while pending:
         reference = pending.pop()
         if reference in runtime:

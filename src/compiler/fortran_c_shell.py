@@ -920,6 +920,7 @@ def compile_ast_fortran_c_shell(
     retain_card_program: bool = True,
     compilation: Any | None = None,
     library: bool = False,
+    dependency_seeds: tuple[str, ...] = (),
 ) -> FortranCShellExecutable:
     """Compile Python AST through the registered Fortran target and C shell.
 
@@ -964,6 +965,7 @@ def compile_ast_fortran_c_shell(
         progress=progress,
         checkpoint=checkpoint,
         mutable_parameters=tuple(mutable_parameters),
+        dependency_seeds=tuple(dependency_seeds),
     )
     hierarchical_outputs = dict(compilation.public_output_value_ids)
     hierarchical_inputs = dict(compilation.public_input_value_ids)
