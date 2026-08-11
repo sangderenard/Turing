@@ -86,6 +86,7 @@ _RECIPES = {
     "float": _copy_first,
     "double": _copy_first,
     "to": _copy_first,
+    "astype": _copy_first,
     "long": _trunc_first,
     "int": _trunc_first,
     **{name: _copy_first for name in VIEW_OPS},
