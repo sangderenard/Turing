@@ -1041,7 +1041,7 @@ def _emit_class_surface_module(compilation: Any, artifact_name: str):
         if shortfalls:
             raise FortranEmissionError(
                 f"method {symbol!r} has operators without an SSA handler: "
-                + "; ".join(str(item.opcode) for item in shortfalls)
+                + "; ".join(f"{item.name} ({item.reason})" for item in shortfalls)
             )
         all_functions.update(module_ir.functions)
         section_outputs.update(shell_section_outputs)

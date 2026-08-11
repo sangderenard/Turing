@@ -1429,40 +1429,77 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
             int(value)
             for value in subgraph.G.graph.get("deployment_nodes", ())
         )
-        items.append(PlanClosure(
-            name=f"region_{region_index}",
-            captures=tuple(
-                int(value)
-                for value in subgraph.G.graph.get("deployment_inputs", ())
-            ),
-            items=tuple(
-                PlanLine.create(
-                    str(
-                        graph.G.nodes[value].get("op")
-                        or graph.G.nodes[value].get("type")
+        region_captures = tuple(
+            int(value)
+            for value in subgraph.G.graph.get("deployment_inputs", ())
+        )
+        compute_lines = tuple(
+            PlanLine.create(
+                str(
+                    graph.G.nodes[value].get("op")
+                    or graph.G.nodes[value].get("type")
+                ),
+                inputs=tuple(
+                    int(parent)
+                    for parent, _role in (
+                        graph.G.nodes[value].get("parents") or ()
+                    )
+                ),
+                outputs=(value,),
+                attributes={
+                    **dict(
+                        graph.G.nodes[value].get("attributes") or {}
                     ),
-                    inputs=tuple(
-                        int(parent)
-                        for parent, _role in (
-                            graph.G.nodes[value].get("parents") or ()
-                        )
-                    ),
-                    outputs=(value,),
+                    "region": region_index,
+                },
+                input_roles=tuple(
+                    str(role)
+                    for _parent, role in (
+                        graph.G.nodes[value].get("parents") or ()
+                    )
+                ),
+            )
+            for value in region_nodes
+        )
+        # A constant operand (``self.n + 1``) is a leaf the region consumes but
+        # neither produces nor captures -- it is not a runtime input, so it never
+        # entered ``deployment_inputs``. The fused capture folds it into a scalar
+        # attribute; the plan lines reference it by value id, so without a
+        # defining line it is a dangling SSA value the backend emits as an
+        # undeclared variable. Materialise each such constant as its own ``const``
+        # line, ahead of the consumers, so the region is self-contained.
+        produced = set(region_nodes)
+        captured = set(region_captures)
+        const_lines = []
+        materialised: set[int] = set()
+        for value in region_nodes:
+            for parent, _role in (graph.G.nodes[value].get("parents") or ()):
+                parent = int(parent)
+                if (
+                    parent in produced
+                    or parent in captured
+                    or parent in materialised
+                ):
+                    continue
+                parent_data = graph.G.nodes.get(parent, {})
+                if (
+                    parent_data.get("op") or parent_data.get("type")
+                ) not in ("const", "Constant"):
+                    continue
+                materialised.add(parent)
+                const_lines.append(PlanLine.create(
+                    "Const",
+                    inputs=(),
+                    outputs=(parent,),
                     attributes={
-                        **dict(
-                            graph.G.nodes[value].get("attributes") or {}
-                        ),
+                        **dict(parent_data.get("attributes") or {}),
                         "region": region_index,
                     },
-                    input_roles=tuple(
-                        str(role)
-                        for _parent, role in (
-                            graph.G.nodes[value].get("parents") or ()
-                        )
-                    ),
-                )
-                for value in region_nodes
-            ),
+                ))
+        items.append(PlanClosure(
+            name=f"region_{region_index}",
+            captures=region_captures,
+            items=(*const_lines, *compute_lines),
         ))
     control_values = set()
     control = getattr(shell, "shell_control_program", None)
