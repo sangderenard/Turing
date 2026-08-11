@@ -32,6 +32,30 @@ class _StaticPythonReference:
     path: str
 
 
+def _reference_has_pursuable_source(value: Any) -> bool:
+    """Whether a resolved Python object still has source to pursue into.
+
+    This is the same test the frontend's pursuit
+    (``graph_express2._source_ast_definition``) uses to decide the irreducible
+    boundary: a function or class whose ``inspect.getsource`` succeeds is
+    pursuable; a module, builtin, C-extension, or anything with no readable
+    source is irreducible -- terminal. Kept here (not imported) so the reducer
+    carries no dependency on the frontend module.
+    """
+
+    import inspect
+
+    if inspect.ismethod(value):
+        value = value.__func__
+    if not (inspect.isfunction(value) or inspect.isclass(value)):
+        return False
+    try:
+        inspect.getsource(value)
+    except (OSError, TypeError):
+        return False
+    return True
+
+
 # The export table: which graph node types are runnable definitions
 # (functions/methods), and how to read each one's own name off it. Python's
 # three cases are the built-in defaults; a foreign language's ingestion
@@ -2640,17 +2664,36 @@ def _normalize_lexical_values(
             # contract.
             _remove_node(graph, node_id)
 
-    # A compile-time reference (e.g. a module imported only for a type check,
-    # like ``torch`` in ``isinstance(x, torch.Tensor)``) can be left as a root
-    # when nothing consumes it at runtime. It carries no runtime value, so it is
-    # not a runtime output: drop it from the roots (and, if it exists as a node,
-    # remove it) rather than emit it. This is what lets a real module compile as
-    # standalone source without its imports having to be runtime values. Such a
-    # reference is never a runtime PARENT (that would be a genuine bug), so those
-    # remain hard invariants below. Done before the invariant scan so the scan
-    # sees the cleaned graph.
+    # A compile-time reference left as a root is one nothing consumes at
+    # runtime. Whether that is correct depends entirely on whether it is
+    # IRREDUCIBLE: pursue into whatever is demanded, and terminate only at
+    # content that cannot be reduced further -- never drop something that still
+    # has source to pursue.
+    #
+    #  * Irreducible (a module/builtin/C-extension used only at compile time,
+    #    e.g. ``torch`` in ``isinstance(x, torch.Tensor)``): no readable source,
+    #    no runtime value. It is a terminal external, not a runtime output, so
+    #    drop it from the roots (and remove its node if present).
+    #  * Pursuable (a function/class whose source we CAN read): reaching
+    #    reduction as an unconsumed root means the pursuit
+    #    (``_expand_unresolved_ast_parents``) did not follow it. Dropping that
+    #    would silently delete real content, so SURFACE it instead of hiding it.
+    #
+    # Done before the invariant scan so the scan sees the cleaned graph. A
+    # compile-time reference is never a runtime PARENT (that would be a genuine
+    # bug), so those remain hard invariants below.
     compile_time_roots = [root for root in graph.roots if type(root) is not int]
     if compile_time_roots:
+        pursuable_roots = [
+            root for root in compile_time_roots
+            if _reference_has_pursuable_source(getattr(root, "value", root))
+        ]
+        if pursuable_roots:
+            raise ValueError(
+                "demanded reference(s) reached reduction unresolved but still "
+                "have source to pursue -- the frontend pursuit did not follow "
+                f"them into their content: {pursuable_roots!r}"
+            )
         graph.roots = [root for root in graph.roots if type(root) is int]
         for root in compile_time_roots:
             if root in graph.G:
