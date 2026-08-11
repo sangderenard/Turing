@@ -2066,22 +2066,50 @@ def _inject_field_slot_access(
     joins it as the object arena. A backend that indexes arrays renders the slot
     accesses as ``self(slot + 1)`` and marks a written arena ``intent(inout)``.
 
-    Only a single-block control function is rewritten; a method whose control
-    already branches or loops is returned unchanged (slot access through
-    structured control is future work, not a silent miscompile).
+    Reads are placed in the entry block, which dominates every other block, so a
+    method that branches or loops is fine as long as it only reads fields. Writes
+    are placed before the single return, so a straight-line mutator is fine too.
+    The shapes that genuinely need a field op's causal position -- more than one
+    return with writes, or a read and a write of the same slot (a read-after-
+    write whose order the entry/exit placement cannot express) -- raise rather
+    than emit a plausible-looking wrong answer.
     """
 
-    if len(control_function.blocks) != 1:
+    if not control_function.blocks:
         return control_function
-    (block,) = control_function.blocks.values()
+    entry_block = control_function.blocks.get("entry") or next(
+        iter(control_function.blocks.values())
+    )
+    return_ops = {Handler.Ret.value, "ret", "Return", "return"}
+    return_blocks = [
+        block
+        for block in control_function.blocks.values()
+        if block.instrs and block.instrs[-1].op in return_ops
+    ]
+    read_slots = {slot for _, slot in field_reads}
+    write_slots = {slot for _, slot in field_writes}
+    if field_writes:
+        if len(return_blocks) != 1:
+            raise ValueError(
+                f"field-slot lowering of {control_function.name!r} needs exactly "
+                f"one return block to place its writes; found "
+                f"{len(return_blocks)} -- a mutator with multiple exits needs the "
+                "write's causal position, not entry/exit placement"
+            )
+        conflicting = sorted(read_slots & write_slots)
+        if conflicting:
+            raise ValueError(
+                f"field-slot lowering of {control_function.name!r} both reads and "
+                f"writes slot(s) {conflicting}; ordering that read-after-write "
+                "needs the field op's causal position, not yet modelled"
+            )
+    write_block = return_blocks[0] if field_writes else None
 
-    existing_ids = {
-        int(value.id) for value in control_function.args
-    } | {
-        int(instruction.res.id)
-        for instruction in block.instrs
-        if instruction.res is not None
-    }
+    existing_ids = {int(value.id) for value in control_function.args}
+    for block in control_function.blocks.values():
+        for instruction in block.instrs:
+            if instruction.res is not None:
+                existing_ids.add(int(instruction.res.id))
     existing_ids.add(int(self_value_id))
     existing_ids.update(int(pid) for pid in non_self_param_ids)
     next_id = max(existing_ids, default=-1) + 1
@@ -2123,21 +2151,26 @@ def _inject_field_slot_access(
             Instr("Store", [SSAValue(int(source_id), dtype=dtype), address], None)
         )
 
-    terminators = {
-        Handler.Ret.value, Handler.Br.value, Handler.CondBr.value,
-        "ret", "Return", "return",
-    }
-    body = [
-        instruction
-        for instruction in block.instrs
-        if instruction.op not in terminators
-    ]
-    tail = [
-        instruction
-        for instruction in block.instrs
-        if instruction.op in terminators
-    ]
-    new_instrs = [*read_loads, *body, *write_stores, *tail]
+    new_blocks: dict[str, BasicBlock] = {}
+    for name, block in control_function.blocks.items():
+        instructions = list(block.instrs)
+        # Reads go at entry: it dominates every block, so the loaded field value
+        # is defined on every path that consumes it.
+        if block is entry_block:
+            instructions = [*read_loads, *instructions]
+        # Writes go just before the single return so they run after the body.
+        if block is write_block:
+            insert_at = len(instructions)
+            for position in range(len(instructions) - 1, -1, -1):
+                if instructions[position].op in return_ops:
+                    insert_at = position
+                    break
+            instructions = [
+                *instructions[:insert_at],
+                *write_stores,
+                *instructions[insert_at:],
+            ]
+        new_blocks[name] = BasicBlock(name, instructions)
 
     # ``self`` first, then the non-self parameters in declared order; the read
     # field values are no longer parameters because the loads produce them.
@@ -2149,7 +2182,7 @@ def _inject_field_slot_access(
     return Function(
         control_function.name,
         arguments,
-        {block.name: BasicBlock(block.name, new_instrs)},
+        new_blocks,
         metadata=dict(control_function.metadata),
     )
 
