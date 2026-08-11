@@ -457,6 +457,100 @@ def fold_constant_getattr(tree: ast.AST) -> ast.AST:
     return tree
 
 
+def _slice_value(element: ast.AST) -> ast.AST:
+    """An index element as a value expression. An ``ast.Slice`` is only legal
+    directly inside a subscript; once the index is built as an ordinary tuple
+    value (to splice the ellipsis expansion in) each slice must become an
+    explicit ``slice(a, b, c)`` call."""
+
+    if isinstance(element, ast.Slice):
+        return ast.Call(
+            ast.Name("slice", ast.Load()),
+            [
+                element.lower or ast.Constant(None),
+                element.upper or ast.Constant(None),
+                element.step or ast.Constant(None),
+            ],
+            [],
+        )
+    return element
+
+
+def _full_slice_call() -> ast.AST:
+    """``slice(None, None, None)`` -- a full ``:`` as a value expression."""
+
+    return ast.Call(
+        ast.Name("slice", ast.Load()),
+        [ast.Constant(None), ast.Constant(None), ast.Constant(None)],
+        [],
+    )
+
+
+class _EllipsisExpander(ast.NodeTransformer):
+    """Expand ``obj[..., k]`` into an explicit, ndim-driven full-slice index.
+
+    ``...`` means "as many full slices as ``obj`` has dimensions, minus the
+    explicit index elements". That count is ``obj.ndim - (len(before) + len(
+    after))``, so the ellipsis becomes ``[slice(None)] * that`` and the index is
+    ``(before) + tuple(that) + (after)``. When ``obj.ndim`` is known at compile
+    time the multiply folds to concrete slices; when it is not, it stays an
+    ndim-driven expression rather than a wrong fixed guess (``... -> :`` would
+    miscompile ``x[..., k]`` on rank > 2). ``obj[...]`` alone becomes
+    ``obj[tuple([slice(None)] * obj.ndim)]`` -- correct for every rank, 0-d
+    included (an empty index, i.e. the whole value).
+    """
+
+    def visit_Subscript(self, node):  # noqa: N802
+        node = self.generic_visit(node)
+        index = node.slice
+        elements = list(index.elts) if isinstance(index, ast.Tuple) else [index]
+        positions = [
+            position
+            for position, element in enumerate(elements)
+            if isinstance(element, ast.Constant) and element.value is Ellipsis
+        ]
+        if len(positions) != 1:
+            # No ellipsis, or the illegal multi-ellipsis form -- leave as is.
+            return node
+        cut = positions[0]
+        before = elements[:cut]
+        after = elements[cut + 1:]
+        import copy
+
+        count = ast.BinOp(
+            ast.Attribute(copy.deepcopy(node.value), "ndim", ast.Load()),
+            ast.Sub(),
+            ast.Constant(len(before) + len(after)),
+        )
+        expansion = ast.Call(
+            ast.Name("tuple", ast.Load()),
+            [ast.BinOp(ast.List([_full_slice_call()], ast.Load()), ast.Mult(), count)],
+            [],
+        )
+        index_expr = ast.BinOp(
+            ast.BinOp(
+                ast.Tuple([_slice_value(e) for e in before], ast.Load()),
+                ast.Add(),
+                expansion,
+            ),
+            ast.Add(),
+            ast.Tuple([_slice_value(e) for e in after], ast.Load()),
+        )
+        return ast.copy_location(
+            ast.Subscript(value=node.value, slice=index_expr, ctx=node.ctx),
+            node,
+        )
+
+
+def expand_ellipsis_subscripts(tree: ast.AST) -> ast.AST:
+    """Rewrite ``...`` subscripts into explicit ndim-driven full-slice indices
+    (in place), so no inexpressible ``Ellipsis`` literal reaches a backend."""
+
+    _EllipsisExpander().visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def tensor_operation_name(node: Any) -> Optional[str]:
     """Canonical tensor-op name for a call node, else ``None``.
 

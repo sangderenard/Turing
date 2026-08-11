@@ -19,6 +19,7 @@ from ..ilpscheduler import ILPScheduler
 from ..function_table import ExternalFunctionTable, FunctionTable
 from .node_special_cases import (
     annotate_types,
+    expand_ellipsis_subscripts,
     fold_constant_getattr,
     hoist_walrus_assignments,
     interpret_special_case,
@@ -2009,6 +2010,11 @@ class ProcessGraph:
         # names the source declares) so it resolves structurally instead of
         # surviving as a string constant a numeric backend cannot express.
         tree = fold_constant_getattr(tree)
+        # ``obj[...]`` carries an inexpressible Ellipsis; expand it to an
+        # ndim-driven full-slice index so the subscript grows an explicit
+        # dependency on ``obj.ndim`` (known deterministically before it fires)
+        # instead of an opaque literal.
+        tree = expand_ellipsis_subscripts(tree)
         self.G.graph["type_annotations"] = {
             **(self.G.graph.get("type_annotations") or {}),
             **annotate_types(tree),
