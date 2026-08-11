@@ -910,11 +910,12 @@ def _field_slot_ops(graph_obj: Any):
     process graph's field-op nodes and returns, for one method:
 
     * ``self_value_id`` -- the value id of the ``self`` arena, or ``None``;
-    * ``reads`` -- ``(result_value_id, slot)`` for every ``self.attr`` read
-      (``GetAttr``), so the value the method already consumes is produced by a
-      load from the slot instead of arriving as a free input;
-    * ``writes`` -- ``(source_value_id, slot)`` for every ``self.attr = value``
-      (``setattr``), a store of the source into the slot;
+    * ``field_ops`` -- ``(kind, value_id, slot)`` for every field access in the
+      graph's own schedule order, ``kind`` being ``"read"`` (a ``GetAttr``, whose
+      ``value_id`` is the result the method already consumes) or ``"write"`` (a
+      ``setattr``, whose ``value_id`` is the stored source). Keeping reads and
+      writes in one ordered list preserves their interleaving, so a store and a
+      later read of one slot stay in the order the source wrote them;
     * ``field_count`` -- the arena length, so ``self`` is a sized array.
     """
 
@@ -932,24 +933,14 @@ def _field_slot_ops(graph_obj: Any):
     self_history = identity.get("self") or ()
     self_value_id = int(self_history[-1]) if self_history else None
 
-    # Walk the field-op nodes in the graph's own schedule so reads and writes
-    # come out in execution order. The reducer already cached that order; fall
-    # back to a topological sort if this graph has not been ordered yet.
-    import networkx as nx
-
-    cached = graph_obj.graph.get("_dependency_order_cache")
-    if cached is not None:
-        schedule = cached[1]
-    else:
-        schedule = tuple(
-            nx.lexicographical_topological_sort(
-                graph_obj, key=lambda value_id: int(value_id)
-            )
-        )
-
-    reads: list[tuple[int, int]] = []
-    writes: list[tuple[int, int]] = []
-    for node_id in schedule:
+    # Order field ops by SOURCE order (node id), not the data-dependency
+    # schedule. Memory ordering between a write and a later read of the same
+    # field is a real dependency the AST wrote but the graph does not carry as a
+    # data edge, so a topological sort is free to float the read ahead of the
+    # write. Nodes are created in source order, so their ids preserve the order
+    # the programmer wrote -- which is the order the memory operations must run.
+    field_ops: list[tuple[str, int, int]] = []
+    for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         node_type = data.get("op") or data.get("type")
         attribute = (data.get("attributes") or {}).get("attribute")
@@ -957,7 +948,7 @@ def _field_slot_ops(graph_obj: Any):
             continue
         if node_type == "GetAttr":
             result_id = data.get("value_id", node_id)
-            reads.append((int(result_id), slot_of[attribute]))
+            field_ops.append(("read", int(result_id), slot_of[attribute]))
         elif node_type in ("setattr", "SetAttr"):
             source_parent = next(
                 (
@@ -972,8 +963,8 @@ def _field_slot_ops(graph_obj: Any):
             source_id = graph_obj.nodes[source_parent].get(
                 "value_id", source_parent
             )
-            writes.append((int(source_id), slot_of[attribute]))
-    return self_value_id, tuple(reads), tuple(writes), len(fields)
+            field_ops.append(("write", int(source_id), slot_of[attribute]))
+    return self_value_id, tuple(field_ops), len(fields)
 
 
 def _emit_class_surface_module(compilation: Any, artifact_name: str):
@@ -1017,9 +1008,7 @@ def _emit_class_surface_module(compilation: Any, artifact_name: str):
         # store. In whole-program precompile mode the field-op region is never
         # built (gated behind ``not precompile_only``), so recover the field ops
         # from the process graph and hand them to the lowerer as slot access.
-        self_id, field_reads, field_writes, field_count = _field_slot_ops(
-            graph_obj
-        )
+        self_id, field_ops, field_count = _field_slot_ops(graph_obj)
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
@@ -1033,8 +1022,7 @@ def _emit_class_surface_module(compilation: Any, artifact_name: str):
                     graph_obj.graph.get("function_parameters") or ()
                 ),
                 self_value_id=self_id,
-                field_reads=field_reads,
-                field_writes=field_writes,
+                field_ops=field_ops,
                 field_count=field_count,
             )
         )

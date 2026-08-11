@@ -2051,9 +2051,9 @@ def _inject_field_slot_access(
     *,
     self_value_id: int,
     non_self_param_ids: tuple[int, ...],
-    field_reads: tuple[tuple[int, int], ...],
-    field_writes: tuple[tuple[int, int], ...],
+    field_ops: tuple[tuple[str, int, int], ...],
     field_count: int,
+    output_value_ids: tuple[int, ...] = (),
     dtype: str = "float64",
 ) -> Function:
     """Rewrite a method's control function to pass instance state as a slot arena.
@@ -2086,6 +2086,11 @@ def _inject_field_slot_access(
                 existing_ids.add(int(instruction.res.id))
     existing_ids.add(int(self_value_id))
     existing_ids.update(int(pid) for pid in non_self_param_ids)
+    # The field ops name values that come from the graph, not the control body
+    # (a read's result, a write's source), so a fresh Const/address id must
+    # dodge those too or it collides with a load result.
+    existing_ids.update(int(value_id) for _kind, value_id, _slot in field_ops)
+    existing_ids.update(int(value_id) for value_id in output_value_ids)
     next_id = max(existing_ids, default=-1) + 1
 
     def fresh() -> int:
@@ -2125,27 +2130,59 @@ def _inject_field_slot_access(
 
     entry_name = next(iter(control_function.blocks))
 
-    # (insert-position, order-within-position, home-block, instructions)
+    # A method that returns a field value (a getter, ``return self.x``) has no
+    # producer for that value in the control body -- it is one of these loads.
+    # The control lowering could not wire it as an output because it did not yet
+    # exist, so treat the return as the load's consumer and add the value to the
+    # return below.
+    return_ops = {Handler.Ret.value, "ret", "Return", "return"}
+    return_position = next(
+        (
+            position
+            for position in range(len(flat) - 1, -1, -1)
+            if flat[position][1].op in return_ops
+        ),
+        None,
+    )
+    output_ids = tuple(int(value_id) for value_id in output_value_ids)
+    output_id_set = set(output_ids)
+
+    # (insert-position, schedule-order, home-block, instructions). The second
+    # key is the field op's index in the schedule, so two ops that land at the
+    # same instruction keep the order the source wrote -- a store before the
+    # read that must observe it.
     insertions: list[tuple[int, int, str, list[Instr]]] = []
-    field_read_ids: set[int] = set()
-    for result_id, slot in field_reads:
+    field_read_ids: set[int] = {
+        int(value_id) for kind, value_id, _slot in field_ops if kind == "read"
+    }
+    for schedule_index, (kind, value_id, slot) in enumerate(field_ops):
         prelude, address = slot_address(slot)
-        group = [*prelude, Instr("Load", [address], SSAValue(int(result_id), dtype=dtype))]
-        field_read_ids.add(int(result_id))
-        position = first_consumer_position.get(int(result_id))
-        if position is None:
-            continue  # a field read nothing consumes has no place and no effect
-        insertions.append((position, 0, flat[position][0], group))
-    for source_id, slot in field_writes:
-        prelude, address = slot_address(slot)
-        group = [*prelude, Instr("Store", [SSAValue(int(source_id), dtype=dtype), address], None)]
-        producer = producer_position.get(int(source_id))
-        # After the producer; a parameter source has none, so at the top.
-        position = producer + 1 if producer is not None else 0
+        if kind == "read":
+            group = [
+                *prelude,
+                Instr("Load", [address], SSAValue(int(value_id), dtype=dtype)),
+            ]
+            position = first_consumer_position.get(int(value_id))
+            if position is None and int(value_id) in output_id_set:
+                position = return_position  # returned but otherwise unconsumed
+            if position is None:
+                continue  # a read nothing consumes has no place and no effect
+        else:
+            group = [
+                *prelude,
+                Instr(
+                    "Store",
+                    [SSAValue(int(value_id), dtype=dtype), address],
+                    None,
+                ),
+            ]
+            producer = producer_position.get(int(value_id))
+            # After the producer; a parameter source has none, so at the top.
+            position = producer + 1 if producer is not None else 0
         home = flat[position][0] if position < len(flat) else (
             flat[-1][0] if flat else entry_name
         )
-        insertions.append((position, 1, home, group))
+        insertions.append((position, schedule_index, home, group))
 
     from collections import defaultdict
 
@@ -2155,12 +2192,32 @@ def _inject_field_slot_access(
     ):
         inserts_at[position].append(group)
 
+    # Field values that are returned but were not already on the return
+    # instruction (the control lowering could not see them): append them so the
+    # target declares them as outputs, keeping function-output order.
+    existing_return_arg_ids = (
+        {int(argument.id) for argument in flat[return_position][1].args}
+        if return_position is not None
+        else set()
+    )
+    returned_field_values = [
+        SSAValue(int(value_id), dtype=dtype)
+        for value_id in output_ids
+        if value_id in field_read_ids and value_id not in existing_return_arg_ids
+    ]
+
     rebuilt: dict[str, list[Instr]] = {
         name: [] for name in control_function.blocks
     }
     for position, (name, instruction) in enumerate(flat):
         for group in inserts_at.get(position, ()):
             rebuilt[name].extend(group)
+        if position == return_position and returned_field_values:
+            instruction = Instr(
+                instruction.op,
+                [*instruction.args, *returned_field_values],
+                instruction.res,
+            )
         rebuilt[name].append(instruction)
     trailing = inserts_at.get(len(flat), ())
     if trailing:
@@ -2197,8 +2254,7 @@ def lower_control_sections_to_ssa(
     function_outputs: tuple[str, ...] = (),
     function_parameters: tuple[str, ...] = (),
     self_value_id: int | None = None,
-    field_reads: tuple[tuple[int, int], ...] = (),
-    field_writes: tuple[tuple[int, int], ...] = (),
+    field_ops: tuple[tuple[str, int, int], ...] = (),
     field_count: int = 0,
 ) -> tuple[
     IRModule,
@@ -2279,9 +2335,23 @@ def lower_control_sections_to_ssa(
                 for instr in instructions
                 if str(instr.op) not in known_operations
             )
+    # The control lowering mints synthetic values (aggregate handles, index
+    # constants) for the region-call convention. They must not reuse a graph
+    # value id, or a synthetic const collides with a field value the injection
+    # below references by that same id. Start them above every graph id in play.
+    graph_value_ids = [0]
+    for history in (identity_table or {}).values():
+        graph_value_ids.extend(int(value_id) for value_id in history)
+    for feeds, outputs in region_signatures.values():
+        graph_value_ids.extend(int(value_id) for value_id in feeds)
+        graph_value_ids.extend(int(value_id) for value_id in outputs)
+    graph_value_ids.extend(int(value_id) for _kind, value_id, _slot in field_ops)
+    if self_value_id is not None:
+        graph_value_ids.append(int(self_value_id))
     control_function, control_shortfalls = lower_control_program_to_ssa(
         control,
         function_name=control_name,
+        first_value_id=max(graph_value_ids) + 1,
         region_callees=region_callees,
         region_signatures=region_signatures,
         named_output_histories={
@@ -2291,19 +2361,24 @@ def lower_control_sections_to_ssa(
         value_name_histories=identity_table,
         parameter_names=function_parameters,
     )
-    if self_value_id is not None and (field_reads or field_writes):
+    if self_value_id is not None and field_ops:
         non_self_param_ids = tuple(
             int((identity_table or {}).get(name, (None,))[-1])
             for name in function_parameters
             if name != "self" and (identity_table or {}).get(name)
         )
+        output_value_ids = tuple(
+            int((identity_table or {}).get(name, (None,))[-1])
+            for name in function_outputs
+            if (identity_table or {}).get(name)
+        )
         control_function = _inject_field_slot_access(
             control_function,
             self_value_id=int(self_value_id),
             non_self_param_ids=non_self_param_ids,
-            field_reads=field_reads,
-            field_writes=field_writes,
+            field_ops=field_ops,
             field_count=int(field_count),
+            output_value_ids=output_value_ids,
         )
     functions[control_function.name] = control_function
     module = IRModule(
