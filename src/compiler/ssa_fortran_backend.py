@@ -1669,6 +1669,25 @@ class _FunctionEmitter:
         args = [self._operand(a) for a in instr.args]
         constant = instr.attributes.get("constant", None)
 
+        # A string word is its 64-bit fnv1a token, carried in the f64 working
+        # type as reinterpreted bits (transfer), so a constant word costs a
+        # constant like any other and needs no string type in the ABI.
+        if op == "string_token":
+            token = int(instr.attributes["token"])
+            return f"transfer({token}_c_int64_t, 0._c_double)"
+
+        # A token comparison is an identity test on the 64 bits, reinterpreted to
+        # i64 first: an f64 == would be NaN-unsafe and would compare float value,
+        # not content identity.
+        if instr.attributes.get("string_compare") and op in (
+            "equal", "not_equal", "Eq", "Ne"
+        ) and len(args) == 2:
+            comparator = "==" if op in ("equal", "Eq") else "/="
+            return (
+                f"(transfer({args[0]}, 0_c_int64_t) {comparator} "
+                f"transfer({args[1]}, 0_c_int64_t))"
+            )
+
         if op in ("Const", "const"):
             if constant is None and "llvm_literal" in instr.attributes:
                 return _literal(_llvm_literal(instr.attributes["llvm_literal"]))

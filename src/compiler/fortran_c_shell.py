@@ -987,6 +987,11 @@ def _emit_class_surface_module(compilation: Any, artifact_name: str):
     from .glsl_deployment_strategy import _walk_planned_shells
     from .precompile_to_ssa import lower_control_sections_to_ssa
     from .ssa_fortran_backend import emit_module
+    from .string_table import StringTable
+
+    # One table for the whole object: every method's string constants tokenize
+    # into it, and it persists token -> word for reverse lookup.
+    string_table = StringTable()
 
     all_functions: dict[str, Any] = {}
     section_outputs: dict[str, tuple[Any, ...]] = {}
@@ -1024,6 +1029,7 @@ def _emit_class_surface_module(compilation: Any, artifact_name: str):
                 self_value_id=self_id,
                 field_ops=field_ops,
                 field_count=field_count,
+                string_table=string_table,
             )
         )
         if shortfalls:
@@ -1036,6 +1042,11 @@ def _emit_class_surface_module(compilation: Any, artifact_name: str):
         export_symbols.append(symbol)
     if not export_symbols:
         return None, ()
+    # Persist token -> word so the emitted object's words are reversible.
+    try:
+        string_table.save()
+    except Exception:  # noqa: BLE001 -- reverse-lookup cache, never fatal
+        pass
 
     def emit_outputs(name: str, function: Any) -> tuple[Any, ...]:
         # A flat operator region has no explicit return: its outputs come from

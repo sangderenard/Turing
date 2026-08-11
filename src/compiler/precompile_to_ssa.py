@@ -2256,6 +2256,7 @@ def lower_control_sections_to_ssa(
     self_value_id: int | None = None,
     field_ops: tuple[tuple[str, int, int], ...] = (),
     field_count: int = 0,
+    string_table: Any = None,
 ) -> tuple[
     IRModule,
     tuple[SSALoweringShortfall, ...],
@@ -2376,6 +2377,12 @@ def lower_control_sections_to_ssa(
             output_value_ids=output_value_ids,
         )
     functions[control_function.name] = control_function
+    # Tokenize every string constant to its universal fnv1a token before
+    # emission, so a word is a 64-bit value the target expresses like any other
+    # constant instead of an inexpressible literal.
+    from .ir_string_interning import tokenize_ssa_string_constants
+
+    tokenize_ssa_string_constants(functions, string_table)
     module = IRModule(
         link_required_ssa_features(functions),
         recursion_table={

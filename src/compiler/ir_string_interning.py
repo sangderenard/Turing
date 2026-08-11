@@ -17,8 +17,67 @@ from __future__ import annotations
 
 from ..common.tensors.fused_ir import FusedProgram, OpStep
 from .ir_string_ops import STRING_SPLIT_PART_HASH
+from .string_table import string_token as _string_token
 
 STRING_TOKEN = "string_token"
+
+
+def tokenize_ssa_string_constants(functions, table=None) -> None:
+    """Tokenize string constants across SSA functions, in place.
+
+    The SSA-level analogue of :func:`intern_string_constants` (which folds a
+    ``FusedProgram``), for the non-fused whole-object emission path. Every
+    ``Const`` holding a Python ``str`` becomes a ``string_token`` op carrying the
+    word's fnv1a-64 token; every ``equal``/``not_equal`` that consumes such a
+    token is tagged ``string_compare`` so a backend compares the 64-bit
+    identities rather than the float bits the token is held as. ``table`` (an
+    optional ``StringTable``) records token -> word for reverse lookup; the token
+    itself is content-addressed, so tokenizing never depends on it.
+
+    ``functions`` is a mapping of name -> repository SSA ``Function``.
+    """
+
+    import dataclasses
+
+    _COMPARES = ("equal", "not_equal", "Eq", "Ne")
+    for function in functions.values():
+        token_result_ids: set[int] = set()
+        for block in function.blocks.values():
+            rewritten = []
+            for instruction in block.instrs:
+                value = instruction.attributes.get("value")
+                if value is None:
+                    value = instruction.attributes.get("constant")
+                if instruction.op in ("Const", "const") and isinstance(value, str):
+                    token = table.intern(value) if table is not None else _string_token(value)
+                    attributes = dict(instruction.attributes)
+                    attributes.pop("value", None)
+                    attributes.pop("constant", None)
+                    attributes["token"] = int(token)
+                    attributes["text"] = value
+                    rewritten.append(
+                        dataclasses.replace(
+                            instruction, op=STRING_TOKEN, attributes=attributes
+                        )
+                    )
+                    if instruction.res is not None:
+                        token_result_ids.add(int(instruction.res.id))
+                else:
+                    rewritten.append(instruction)
+            block.instrs = rewritten
+        if not token_result_ids:
+            continue
+        for block in function.blocks.values():
+            for index, instruction in enumerate(block.instrs):
+                if instruction.op in _COMPARES and any(
+                    int(argument.id) in token_result_ids
+                    for argument in instruction.args
+                ):
+                    attributes = dict(instruction.attributes)
+                    attributes["string_compare"] = True
+                    block.instrs[index] = dataclasses.replace(
+                        instruction, attributes=attributes
+                    )
 
 
 def _delim_byte(step: OpStep | None):
