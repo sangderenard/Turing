@@ -2377,6 +2377,12 @@ def lower_control_sections_to_ssa(
             output_value_ids=output_value_ids,
         )
     functions[control_function.name] = control_function
+    # Lower subscript ops (Indexed/IndexedStore) to the universal address
+    # vocabulary (GetElementPtr + Load/Store) that every backend already speaks,
+    # so the subscript lowering lives once at the SSA level, not per backend.
+    from .ir_indexing import lower_indexing_to_ssa_addressing
+
+    lower_indexing_to_ssa_addressing(functions)
     # Tokenize every string constant to its universal fnv1a token before
     # emission, so a word is a 64-bit value the target expresses like any other
     # constant instead of an inexpressible literal.
