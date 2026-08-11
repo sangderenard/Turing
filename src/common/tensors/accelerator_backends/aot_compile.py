@@ -649,6 +649,24 @@ def compile_ast_aot(
         if progress is not None:
             progress(message)
 
+    # Multiple targets submitted at the very beginning: the graph is built to
+    # preserve EVERY target, not just one entry with the rest folded in as
+    # closure. ``entrypoint`` accepts a single name or a sequence of target
+    # names (e.g. every public method of a class). The first is the primary
+    # (nominal naming/ABI); all of them seed the dependency closure and are
+    # recorded as the graph's compile targets.
+    targets = (
+        (str(entrypoint),)
+        if isinstance(entrypoint, str)
+        else tuple(dict.fromkeys(map(str, entrypoint)))
+    )
+    if not targets:
+        raise ValueError("compile_ast_aot requires at least one target")
+    entrypoint = targets[0]
+    dependency_seeds = tuple(dict.fromkeys((
+        *map(str, dependency_seeds),
+        *targets[1:],
+    )))
     constant_map = dict(constant_map or {})
     mutable_parameters = tuple(dict.fromkeys(map(str, mutable_parameters)))
     expanded_python_bindings = _expand_python_static_bindings(
@@ -950,6 +968,7 @@ def compile_ast_aot(
         map_ir=map_ir,
         resume=resume,
         dependency_seeds=dependency_seeds,
+        compile_targets=targets,
     )
 
 
@@ -985,6 +1004,7 @@ def _lower_process_graph_to_compilation(
     map_ir: Mapping[str, Any] | None,
     resume: bool,
     dependency_seeds: tuple[str, ...] = (),
+    compile_targets: tuple[str, ...] = (),
 ) -> AOTCompilation:
     """Lower an already-built ``ProcessGraph`` into a real ``AOTCompilation``.
 
@@ -1005,6 +1025,10 @@ def _lower_process_graph_to_compilation(
             progress(message)
 
     if not frontend_ready:
+        # Record every submitted target on the graph so reduction preserves each
+        # one's outputs (multi-target), not just the primary entry's.
+        if compile_targets:
+            graph.G.graph["compile_targets"] = tuple(compile_targets)
         _report("aot: reducing abstract tensor topology")
         reduce_abstract_tensor_topology(graph)
         _report("aot: propagating bound planner specializations")
