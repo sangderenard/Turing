@@ -485,10 +485,19 @@ class _FunctionEmitter:
         callee_inout_pairs: Mapping[
             str, Sequence[tuple[int, int]]
         ] | None = None,
+        array_base_ids: Sequence[int] = (),
+        mutated_base_ids: Sequence[int] = (),
     ):
         self.function = function
         self.dtype = dtype
         self.outputs = tuple(outputs)
+        # Value ids used as an address base anywhere in the module (dynamic
+        # arrays), and those a store mutates -- shared across a method's
+        # functions by id, so every function that names one declares it as the
+        # assumed-size array it is, with matching intent, and caller and callee
+        # agree on rank without positional signature matching.
+        self.array_base_ids = {int(value_id) for value_id in array_base_ids}
+        self.mutated_base_ids = {int(value_id) for value_id in mutated_base_ids}
         self.callee_extents = dict(callee_extents or {})
         self.callee_arity = dict(callee_arity or {})
         self.callee_inout_pairs = {
@@ -1378,9 +1387,12 @@ class _FunctionEmitter:
             return None
         collection, positions = producer
         self._consumed.add(address.id)
-        # SSA induction values are 0-based; Fortran subscripts start at 1.
+        # SSA induction values are 0-based; Fortran subscripts start at 1. A
+        # subscript must be an integer, but an index carried in the f64 working
+        # type is a real, so truncate it explicitly rather than lean on the
+        # legacy real-index extension.
         subscripts = ", ".join(
-            f"{self._operand(position)} + 1" for position in positions
+            f"int({self._operand(position)}) + 1" for position in positions
         )
         return [
             f"    {self._operand(collection)}({subscripts})"
@@ -1715,7 +1727,7 @@ class _FunctionEmitter:
             if producer is not None:
                 collection, positions = producer
                 subscripts = ", ".join(
-                    f"{self._operand(position)} + 1" for position in positions
+                    f"int({self._operand(position)}) + 1" for position in positions
                 )
                 return f"{self._operand(collection)}({subscripts})"
 
@@ -2017,8 +2029,25 @@ class _FunctionEmitter:
             f"    integer(c_int), intent(in), value :: {extent}"
             for extent in extent_names
         ]
+        # A parameter used as an address base but with no compile-time shape is
+        # a DYNAMIC array: a runtime-sized buffer indexed by a runtime value.
+        # bind(C) forbids assumed-shape (needs a descriptor the C caller cannot
+        # build), but assumed-size ``d(*)`` -- a bare base pointer the callee
+        # indexes without knowing the extent -- is interoperable and is exactly
+        # this case. So compile it as-is, no reduction to a fixed size and no
+        # passed extent.
         for argument in self.function.args:
             kind = _DTYPE_KIND.get(argument.dtype or self.dtype, "real(c_double)")
+            if int(argument.id) in self.array_base_ids and not _is_array(argument):
+                mutated = (
+                    int(argument.id) in self.mutated_base_ids
+                    or argument.id in output_ids
+                )
+                intent = "inout" if mutated else "in"
+                declarations.append(
+                    f"    {kind}, intent({intent}) :: {_name(argument)}(*)"
+                )
+                continue
             if argument.id in output_ids:
                 if _is_array(argument):
                     declarations.append(
@@ -2115,6 +2144,8 @@ def emit_function(
     callee_inout_pairs: Mapping[
         str, Sequence[tuple[int, int]]
     ] | None = None,
+    array_base_ids: Sequence[int] = (),
+    mutated_base_ids: Sequence[int] = (),
 ) -> FortranSubroutine:
     """Translate one SSA function into a bind(C) Fortran subroutine.
 
@@ -2134,6 +2165,8 @@ def emit_function(
         callee_extents=callee_extents,
         callee_arity=callee_arity,
         callee_inout_pairs=callee_inout_pairs,
+        array_base_ids=array_base_ids,
+        mutated_base_ids=mutated_base_ids,
     ).emit()
 
 
@@ -2276,6 +2309,41 @@ def emit_module(
         )
         for function_name, function in functions.items()
     }
+    # A dynamic array's base is the same value id across ONE method's functions
+    # (a region's captured base is the id the control passes it), but value ids
+    # are only unique within a method -- a region and its control share them,
+    # different methods reuse the same low ids. So group the functions by method
+    # (a region ``M__planned_region_k`` belongs to control ``M``) and collect the
+    # address bases and store-mutated bases per group; every function then sees
+    # exactly its own method's arrays, not another method's collisions.
+    def _method_of(function_name: str) -> str:
+        marker = "__planned_region_"
+        return function_name.split(marker, 1)[0] if marker in function_name else function_name
+
+    method_array_bases: dict[str, set[int]] = {}
+    method_mutated_bases: dict[str, set[int]] = {}
+    for function_name, function in functions.items():
+        method = _method_of(function_name)
+        array_bases = method_array_bases.setdefault(method, set())
+        mutated_bases = method_mutated_bases.setdefault(method, set())
+        address_to_base: dict[int, int] = {}
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    instruction.op in ("GetElementPtr", "getelementptr")
+                    and instruction.args
+                ):
+                    array_bases.add(int(instruction.args[0].id))
+                    if instruction.res is not None:
+                        address_to_base[int(instruction.res.id)] = int(
+                            instruction.args[0].id
+                        )
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.op in ("Store", "store") and len(instruction.args) == 2:
+                    base = address_to_base.get(int(instruction.args[1].id))
+                    if base is not None:
+                        mutated_bases.add(base)
     subroutines = tuple(
         emit_function(
             function,
@@ -2284,6 +2352,8 @@ def emit_module(
             callee_extents=callee_extents,
             callee_arity=callee_arity,
             callee_inout_pairs=callee_inout_pairs,
+            array_base_ids=method_array_bases.get(_method_of(function_name), set()),
+            mutated_base_ids=method_mutated_bases.get(_method_of(function_name), set()),
         )
         for function_name, function in functions.items()
     )
