@@ -1260,11 +1260,21 @@ def dispatch_region_to_fused_program(
         if scalar_parent is not None:
             if reduction:
                 raise ValueError(f"{op} cannot consume a scalar constant operand")
-            if len(value_parents) != 1:
+            if len(value_parents) == 0:
+                # A unary op whose only operand is a constant (log(const)) has a
+                # tensor value operand, not the right-hand scalar of a binary
+                # a-OP-scalar form. Keep the constant as an ordinary tensor
+                # constant input rather than forcing it into the scalar slot.
+                append_tensor_constant(
+                    scalar_parent[0], graph.G.nodes[scalar_parent[0]]
+                )
+                value_parents.append(scalar_parent[0])
+            elif len(value_parents) != 1:
                 raise ValueError(f"{op} has an invalid scalar operand layout")
-            attrs["right_scalar"] = scalar_parent[1]
-            if parents[0][0] == scalar_parent[0]:
-                attrs["reverse"] = True
+            else:
+                attrs["right_scalar"] = scalar_parent[1]
+                if parents[0][0] == scalar_parent[0]:
+                    attrs["reverse"] = True
         steps.append(
             OpStep(
                 step_id=len(steps),
