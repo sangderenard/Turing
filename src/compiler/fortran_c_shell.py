@@ -932,9 +932,25 @@ def _field_slot_ops(graph_obj: Any):
     self_history = identity.get("self") or ()
     self_value_id = int(self_history[-1]) if self_history else None
 
+    # Walk the field-op nodes in the graph's own schedule so reads and writes
+    # come out in execution order. The reducer already cached that order; fall
+    # back to a topological sort if this graph has not been ordered yet.
+    import networkx as nx
+
+    cached = graph_obj.graph.get("_dependency_order_cache")
+    if cached is not None:
+        schedule = cached[1]
+    else:
+        schedule = tuple(
+            nx.lexicographical_topological_sort(
+                graph_obj, key=lambda value_id: int(value_id)
+            )
+        )
+
     reads: list[tuple[int, int]] = []
     writes: list[tuple[int, int]] = []
-    for node_id, data in graph_obj.nodes(data=True):
+    for node_id in schedule:
+        data = graph_obj.nodes[node_id]
         node_type = data.get("op") or data.get("type")
         attribute = (data.get("attributes") or {}).get("attribute")
         if attribute is None or attribute not in slot_of:

@@ -2066,44 +2066,18 @@ def _inject_field_slot_access(
     joins it as the object arena. A backend that indexes arrays renders the slot
     accesses as ``self(slot + 1)`` and marks a written arena ``intent(inout)``.
 
-    Reads are placed in the entry block, which dominates every other block, so a
-    method that branches or loops is fine as long as it only reads fields. Writes
-    are placed before the single return, so a straight-line mutator is fine too.
-    The shapes that genuinely need a field op's causal position -- more than one
-    return with writes, or a read and a write of the same slot (a read-after-
-    write whose order the entry/exit placement cannot express) -- raise rather
-    than emit a plausible-looking wrong answer.
+    Placement follows the schedule the graph already fixed, carried here by SSA
+    data flow: a load goes right before the first instruction that consumes its
+    value, a store right after the instruction that produces its source (or at
+    the top, for a source that is a plain parameter). That is exactly the order
+    the source wrote, so a read and a write of one slot -- ``self.x = v; return
+    self.x`` -- emits store-then-load and reads back ``v`` with no special case.
+    ``field_reads``/``field_writes`` arrive in schedule order so any two ops that
+    land at the same point keep it.
     """
 
     if not control_function.blocks:
         return control_function
-    entry_block = control_function.blocks.get("entry") or next(
-        iter(control_function.blocks.values())
-    )
-    return_ops = {Handler.Ret.value, "ret", "Return", "return"}
-    return_blocks = [
-        block
-        for block in control_function.blocks.values()
-        if block.instrs and block.instrs[-1].op in return_ops
-    ]
-    read_slots = {slot for _, slot in field_reads}
-    write_slots = {slot for _, slot in field_writes}
-    if field_writes:
-        if len(return_blocks) != 1:
-            raise ValueError(
-                f"field-slot lowering of {control_function.name!r} needs exactly "
-                f"one return block to place its writes; found "
-                f"{len(return_blocks)} -- a mutator with multiple exits needs the "
-                "write's causal position, not entry/exit placement"
-            )
-        conflicting = sorted(read_slots & write_slots)
-        if conflicting:
-            raise ValueError(
-                f"field-slot lowering of {control_function.name!r} both reads and "
-                f"writes slot(s) {conflicting}; ordering that read-after-write "
-                "needs the field op's causal position, not yet modelled"
-            )
-    write_block = return_blocks[0] if field_writes else None
 
     existing_ids = {int(value.id) for value in control_function.args}
     for block in control_function.blocks.values():
@@ -2133,44 +2107,71 @@ def _inject_field_slot_access(
             address,
         )
 
-    read_loads: list[Instr] = []
-    field_read_ids = set()
+    # The blocks are already in schedule order, so number every instruction once
+    # across them; producer and first-consumer positions in that numbering are
+    # where each store and load belong.
+    flat = [
+        (name, instruction)
+        for name, block in control_function.blocks.items()
+        for instruction in block.instrs
+    ]
+    producer_position: dict[int, int] = {}
+    first_consumer_position: dict[int, int] = {}
+    for position, (_name, instruction) in enumerate(flat):
+        if instruction.res is not None:
+            producer_position.setdefault(int(instruction.res.id), position)
+        for argument in instruction.args:
+            first_consumer_position.setdefault(int(argument.id), position)
+
+    entry_name = next(iter(control_function.blocks))
+
+    # (insert-position, order-within-position, home-block, instructions)
+    insertions: list[tuple[int, int, str, list[Instr]]] = []
+    field_read_ids: set[int] = set()
     for result_id, slot in field_reads:
         prelude, address = slot_address(slot)
-        read_loads.extend(prelude)
-        read_loads.append(
-            Instr("Load", [address], SSAValue(int(result_id), dtype=dtype))
-        )
+        group = [*prelude, Instr("Load", [address], SSAValue(int(result_id), dtype=dtype))]
         field_read_ids.add(int(result_id))
-
-    write_stores: list[Instr] = []
+        position = first_consumer_position.get(int(result_id))
+        if position is None:
+            continue  # a field read nothing consumes has no place and no effect
+        insertions.append((position, 0, flat[position][0], group))
     for source_id, slot in field_writes:
         prelude, address = slot_address(slot)
-        write_stores.extend(prelude)
-        write_stores.append(
-            Instr("Store", [SSAValue(int(source_id), dtype=dtype), address], None)
+        group = [*prelude, Instr("Store", [SSAValue(int(source_id), dtype=dtype), address], None)]
+        producer = producer_position.get(int(source_id))
+        # After the producer; a parameter source has none, so at the top.
+        position = producer + 1 if producer is not None else 0
+        home = flat[position][0] if position < len(flat) else (
+            flat[-1][0] if flat else entry_name
         )
+        insertions.append((position, 1, home, group))
 
-    new_blocks: dict[str, BasicBlock] = {}
-    for name, block in control_function.blocks.items():
-        instructions = list(block.instrs)
-        # Reads go at entry: it dominates every block, so the loaded field value
-        # is defined on every path that consumes it.
-        if block is entry_block:
-            instructions = [*read_loads, *instructions]
-        # Writes go just before the single return so they run after the body.
-        if block is write_block:
-            insert_at = len(instructions)
-            for position in range(len(instructions) - 1, -1, -1):
-                if instructions[position].op in return_ops:
-                    insert_at = position
-                    break
-            instructions = [
-                *instructions[:insert_at],
-                *write_stores,
-                *instructions[insert_at:],
-            ]
-        new_blocks[name] = BasicBlock(name, instructions)
+    from collections import defaultdict
+
+    inserts_at: dict[int, list[list[Instr]]] = defaultdict(list)
+    for position, _order, _home, group in sorted(
+        insertions, key=lambda item: (item[0], item[1])
+    ):
+        inserts_at[position].append(group)
+
+    rebuilt: dict[str, list[Instr]] = {
+        name: [] for name in control_function.blocks
+    }
+    for position, (name, instruction) in enumerate(flat):
+        for group in inserts_at.get(position, ()):
+            rebuilt[name].extend(group)
+        rebuilt[name].append(instruction)
+    trailing = inserts_at.get(len(flat), ())
+    if trailing:
+        tail_block = flat[-1][0] if flat else entry_name
+        for group in trailing:
+            rebuilt[tail_block].extend(group)
+
+    new_blocks = {
+        name: BasicBlock(name, rebuilt[name])
+        for name in control_function.blocks
+    }
 
     # ``self`` first, then the non-self parameters in declared order; the read
     # field values are no longer parameters because the loads produce them.
