@@ -753,8 +753,16 @@ def compile_fortran_module_c_shell(
     extent_overrides: Mapping[str, int] | None = None,
     name: str = "turing_fortran_c_shell",
     standalone: bool = True,
+    library: bool = False,
 ) -> FortranCShellExecutable:
-    """Compile generated Fortran plus the generic profiled C main."""
+    """Compile generated Fortran plus the generic profiled C main.
+
+    ``library=True`` instead builds a SHARED LIBRARY (.dll/.so) from just the
+    Fortran module -- the compiled section exported for other programs to link
+    against, "recognize without lowering". It skips the C-shell main and all of
+    the runtime input/state machinery (a DLL of a section has no run harness and
+    no initial state), so a parameterful section compiles without feeds.
+    """
 
     compiler = fortran_compiler()
     if compiler is None:
@@ -775,31 +783,34 @@ def compile_fortran_module_c_shell(
         for port in file_ports
         for parameter in (port["data"], port["length"])
     }
-    missing = {
-        _source_name(parameter)
-        for parameter in input_parameters
-        if parameter.name not in system_parameters
-        if _source_name(parameter) not in inputs
-    }
-    if missing:
-        raise ValueError("missing C-shell inputs: " + ", ".join(sorted(missing)))
-
     state_bytes = bytearray()
-    for parameter in input_parameters:
-        if parameter.name in system_parameters:
-            continue
-        source_name = _source_name(parameter)
-        dtype = _NUMPY_DTYPES.get(str(parameter.dtype).casefold())
-        if dtype is None:
-            raise ValueError(f"unsupported C-shell dtype {parameter.dtype!r}")
-        value = np.asarray(inputs[source_name], dtype=dtype)
-        expected = _element_count(parameter, extents)
-        if value.size != expected:
+    if not library:
+        missing = {
+            _source_name(parameter)
+            for parameter in input_parameters
+            if parameter.name not in system_parameters
+            if _source_name(parameter) not in inputs
+        }
+        if missing:
             raise ValueError(
-                f"input {source_name!r} has {value.size} elements; "
-                f"compiled ABI requires {expected}"
+                "missing C-shell inputs: " + ", ".join(sorted(missing))
             )
-        state_bytes.extend(np.ascontiguousarray(value).tobytes())
+
+        for parameter in input_parameters:
+            if parameter.name in system_parameters:
+                continue
+            source_name = _source_name(parameter)
+            dtype = _NUMPY_DTYPES.get(str(parameter.dtype).casefold())
+            if dtype is None:
+                raise ValueError(f"unsupported C-shell dtype {parameter.dtype!r}")
+            value = np.asarray(inputs[source_name], dtype=dtype)
+            expected = _element_count(parameter, extents)
+            if value.size != expected:
+                raise ValueError(
+                    f"input {source_name!r} has {value.size} elements; "
+                    f"compiled ABI requires {expected}"
+                )
+            state_bytes.extend(np.ascontiguousarray(value).tobytes())
 
     fortran_path = output / f"{name}.f90"
     c_path = output / f"{name}.c"
@@ -821,7 +832,10 @@ def compile_fortran_module_c_shell(
     module.api.write(api_path)
     state_path.write_bytes(bytes(state_bytes))
 
-    suffix = ".exe" if os.name == "nt" else ""
+    if library:
+        suffix = ".dll" if os.name == "nt" else ".so"
+    else:
+        suffix = ".exe" if os.name == "nt" else ""
     executable = output / f"{name}{suffix}"
     fortran_object = output / f"{name}.fortran.o"
     c_object = output / f"{name}.shell.o"
@@ -838,20 +852,31 @@ def compile_fortran_module_c_shell(
         )
     except ValueError as error:
         raise FortranEmissionError(str(error)) from error
-    commands = (
-        [compiler, *fortran_flags, "-c", str(fortran_path), "-o", str(fortran_object)],
-        [gcc, *c_flags, "-std=c11", "-c", str(c_path), "-o", str(c_object)],
-        [
-            compiler, str(c_object), str(fortran_object),
-            *standalone_runtime_shim_sources(compiler, output, standalone),
-            "-o", str(executable),
-            *link_flags,
-            *(
-                ["-mwindows", "-lgdi32", "-luser32"]
-                if _display_configuration(module, entry) else []
-            ),
-        ],
-    )
+    if library:
+        # A shared library of the section: compile the Fortran module and link
+        # it -shared, exporting its symbols. No C-shell main, no runtime input.
+        commands = (
+            [compiler, *fortran_flags, "-c", str(fortran_path), "-o", str(fortran_object)],
+            [
+                compiler, "-shared", "-o", str(executable), str(fortran_object),
+                *standalone_runtime_shim_sources(compiler, output, standalone),
+            ],
+        )
+    else:
+        commands = (
+            [compiler, *fortran_flags, "-c", str(fortran_path), "-o", str(fortran_object)],
+            [gcc, *c_flags, "-std=c11", "-c", str(c_path), "-o", str(c_object)],
+            [
+                compiler, str(c_object), str(fortran_object),
+                *standalone_runtime_shim_sources(compiler, output, standalone),
+                "-o", str(executable),
+                *link_flags,
+                *(
+                    ["-mwindows", "-lgdi32", "-luser32"]
+                    if _display_configuration(module, entry) else []
+                ),
+            ],
+        )
     for command in commands:
         completed = subprocess.run(
             command,
@@ -894,8 +919,13 @@ def compile_ast_fortran_c_shell(
     mutable_parameters: tuple[str, ...] | list[str] | set[str] = (),
     retain_card_program: bool = True,
     compilation: Any | None = None,
+    library: bool = False,
 ) -> FortranCShellExecutable:
     """Compile Python AST through the registered Fortran target and C shell.
+
+    ``library=True`` builds a shared library (.dll/.so) of the compiled section
+    -- the section exported for other programs to link against -- instead of a
+    standalone C-shell executable. See ``compile_fortran_module_c_shell``.
 
     This is the application-neutral native entrypoint.  It accepts authored
     Python, runs the ordinary ProcessGraph/AOT compiler, projects that
@@ -1190,32 +1220,36 @@ def compile_ast_fortran_c_shell(
             current = int(alias)
         raise KeyError(value_id)
 
+    # A library build has no run harness and no initial state, so it needs no
+    # concrete input values -- the section's parameters stay symbolic library
+    # arguments. Skip resolving native inputs entirely.
     entry = module.api.entry_point(artifact_name)
-    for parameter in entry.parameters:
-        if parameter.role != "input":
-            continue
-        source_name = str(parameter.source_name or parameter.name)
-        try:
-            native_inputs[source_name] = resolve_source_name(source_name)
-        except (AttributeError, KeyError) as error:
-            if parameter.name.startswith("t"):
-                try:
-                    value_id = int(parameter.name[1:])
-                except ValueError:
-                    value_id = -1
-                try:
-                    native_inputs[source_name] = resolve_compiled_value(
-                        value_id
-                    )
-                except (AttributeError, KeyError):
-                    pass
-                else:
-                    continue
-            raise ValueError(
-                f"compiled input {source_name!r} ({parameter.shape!r}) "
-                "has no value in feeds or the captured region cache; "
-                f"endpoint={compilation.hierarchical_value_diagnostics.get(value_id)!r}"
-            ) from error
+    if not library:
+        for parameter in entry.parameters:
+            if parameter.role != "input":
+                continue
+            source_name = str(parameter.source_name or parameter.name)
+            try:
+                native_inputs[source_name] = resolve_source_name(source_name)
+            except (AttributeError, KeyError) as error:
+                if parameter.name.startswith("t"):
+                    try:
+                        value_id = int(parameter.name[1:])
+                    except ValueError:
+                        value_id = -1
+                    try:
+                        native_inputs[source_name] = resolve_compiled_value(
+                            value_id
+                        )
+                    except (AttributeError, KeyError):
+                        pass
+                    else:
+                        continue
+                raise ValueError(
+                    f"compiled input {source_name!r} ({parameter.shape!r}) "
+                    "has no value in feeds or the captured region cache; "
+                    f"endpoint={compilation.hierarchical_value_diagnostics.get(value_id)!r}"
+                ) from error
     resolved_feedback = dict(state_feedback or {})
     abi_source_names = {
         str(parameter.source_name or parameter.name)
@@ -1298,6 +1332,7 @@ def compile_ast_fortran_c_shell(
         state_feedback=resolved_feedback,
         name=artifact_name,
         standalone=standalone,
+        library=library,
     )
 
 
