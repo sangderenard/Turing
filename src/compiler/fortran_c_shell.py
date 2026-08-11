@@ -902,6 +902,64 @@ def compile_fortran_module_c_shell(
     )
 
 
+def _field_slot_ops(graph_obj: Any):
+    """Recover a method's instance-field accesses as slot loads and stores.
+
+    A class's field layout is declared once (``class_table[class]['fields']``),
+    giving each field a fixed slot. ``self`` is that field arena. This reads the
+    process graph's field-op nodes and returns, for one method:
+
+    * ``self_value_id`` -- the value id of the ``self`` arena, or ``None``;
+    * ``reads`` -- ``(result_value_id, slot)`` for every ``self.attr`` read
+      (``GetAttr``), so the value the method already consumes is produced by a
+      load from the slot instead of arriving as a free input;
+    * ``writes`` -- ``(source_value_id, slot)`` for every ``self.attr = value``
+      (``setattr``), a store of the source into the slot;
+    * ``field_count`` -- the arena length, so ``self`` is a sized array.
+    """
+
+    class_table = dict(graph_obj.graph.get("class_table") or {})
+    owner = graph_obj.graph.get("method_owner")
+    record = (
+        class_table.get(owner)
+        if owner in class_table
+        else (next(iter(class_table.values())) if len(class_table) == 1 else None)
+    )
+    fields = tuple((record or {}).get("fields") or ())
+    slot_of = {name: index for index, name in enumerate(fields)}
+
+    identity = dict(graph_obj.graph.get("identity_table") or {})
+    self_history = identity.get("self") or ()
+    self_value_id = int(self_history[-1]) if self_history else None
+
+    reads: list[tuple[int, int]] = []
+    writes: list[tuple[int, int]] = []
+    for node_id, data in graph_obj.nodes(data=True):
+        node_type = data.get("op") or data.get("type")
+        attribute = (data.get("attributes") or {}).get("attribute")
+        if attribute is None or attribute not in slot_of:
+            continue
+        if node_type == "GetAttr":
+            result_id = data.get("value_id", node_id)
+            reads.append((int(result_id), slot_of[attribute]))
+        elif node_type in ("setattr", "SetAttr"):
+            source_parent = next(
+                (
+                    parent
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) == "value"
+                ),
+                None,
+            )
+            if source_parent is None:
+                continue
+            source_id = graph_obj.nodes[source_parent].get(
+                "value_id", source_parent
+            )
+            writes.append((int(source_id), slot_of[attribute]))
+    return self_value_id, tuple(reads), tuple(writes), len(fields)
+
+
 def _emit_class_surface_module(compilation: Any, artifact_name: str):
     """Emit every planned method of a whole object as one ``bind(C)`` library.
 
@@ -938,6 +996,14 @@ def _emit_class_surface_module(compilation: Any, artifact_name: str):
         if control is None:
             continue
         symbol = f"{artifact_name}__{function_name}"
+        # Instance fields flow through the object's field arena: ``self`` is a
+        # slot array, a field read is a load from its slot, a field write a
+        # store. In whole-program precompile mode the field-op region is never
+        # built (gated behind ``not precompile_only``), so recover the field ops
+        # from the process graph and hand them to the lowerer as slot access.
+        self_id, field_reads, field_writes, field_count = _field_slot_ops(
+            graph_obj
+        )
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
@@ -950,6 +1016,10 @@ def _emit_class_surface_module(compilation: Any, artifact_name: str):
                 function_parameters=tuple(
                     graph_obj.graph.get("function_parameters") or ()
                 ),
+                self_value_id=self_id,
+                field_reads=field_reads,
+                field_writes=field_writes,
+                field_count=field_count,
             )
         )
         if shortfalls:

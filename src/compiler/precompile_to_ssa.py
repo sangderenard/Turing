@@ -2046,6 +2046,114 @@ def find_ssa_cycles(function: Function) -> tuple[SSACycle, ...]:
     return tuple(sorted(cycles))
 
 
+def _inject_field_slot_access(
+    control_function: Function,
+    *,
+    self_value_id: int,
+    non_self_param_ids: tuple[int, ...],
+    field_reads: tuple[tuple[int, int], ...],
+    field_writes: tuple[tuple[int, int], ...],
+    field_count: int,
+    dtype: str = "float64",
+) -> Function:
+    """Rewrite a method's control function to pass instance state as a slot arena.
+
+    ``self`` becomes a sized field array. Each field read is a ``Load`` from its
+    slot (producing the value the body already consumes, so it is no longer a
+    free input); each field write is a ``Store`` of its source into the slot. The
+    parameter list is rebuilt as ``(self, *non-self params)`` -- the read field
+    values leave the signature because the loads now produce them, and ``self``
+    joins it as the object arena. A backend that indexes arrays renders the slot
+    accesses as ``self(slot + 1)`` and marks a written arena ``intent(inout)``.
+
+    Only a single-block control function is rewritten; a method whose control
+    already branches or loops is returned unchanged (slot access through
+    structured control is future work, not a silent miscompile).
+    """
+
+    if len(control_function.blocks) != 1:
+        return control_function
+    (block,) = control_function.blocks.values()
+
+    existing_ids = {
+        int(value.id) for value in control_function.args
+    } | {
+        int(instruction.res.id)
+        for instruction in block.instrs
+        if instruction.res is not None
+    }
+    existing_ids.add(int(self_value_id))
+    existing_ids.update(int(pid) for pid in non_self_param_ids)
+    next_id = max(existing_ids, default=-1) + 1
+
+    def fresh() -> int:
+        nonlocal next_id
+        value_id = next_id
+        next_id += 1
+        return value_id
+
+    self_array = SSAValue(int(self_value_id), dtype=dtype, shape=(field_count,))
+
+    def slot_address(slot: int) -> tuple[list[Instr], SSAValue]:
+        index = SSAValue(fresh(), dtype="int64")
+        address = SSAValue(fresh())
+        return (
+            [
+                Instr("Const", [], index, attributes={"value": int(slot)}),
+                Instr("GetElementPtr", [self_array, index], address),
+            ],
+            address,
+        )
+
+    read_loads: list[Instr] = []
+    field_read_ids = set()
+    for result_id, slot in field_reads:
+        prelude, address = slot_address(slot)
+        read_loads.extend(prelude)
+        read_loads.append(
+            Instr("Load", [address], SSAValue(int(result_id), dtype=dtype))
+        )
+        field_read_ids.add(int(result_id))
+
+    write_stores: list[Instr] = []
+    for source_id, slot in field_writes:
+        prelude, address = slot_address(slot)
+        write_stores.extend(prelude)
+        write_stores.append(
+            Instr("Store", [SSAValue(int(source_id), dtype=dtype), address], None)
+        )
+
+    terminators = {
+        Handler.Ret.value, Handler.Br.value, Handler.CondBr.value,
+        "ret", "Return", "return",
+    }
+    body = [
+        instruction
+        for instruction in block.instrs
+        if instruction.op not in terminators
+    ]
+    tail = [
+        instruction
+        for instruction in block.instrs
+        if instruction.op in terminators
+    ]
+    new_instrs = [*read_loads, *body, *write_stores, *tail]
+
+    # ``self`` first, then the non-self parameters in declared order; the read
+    # field values are no longer parameters because the loads produce them.
+    arguments = [self_array]
+    for param_id in non_self_param_ids:
+        if int(param_id) not in field_read_ids:
+            arguments.append(SSAValue(int(param_id), dtype=dtype))
+
+    return Function(
+        control_function.name,
+        arguments,
+        {block.name: BasicBlock(block.name, new_instrs)},
+        metadata=dict(control_function.metadata),
+    )
+
+
 def lower_control_sections_to_ssa(
     control: ControlProgram,
     *,
@@ -2054,6 +2162,10 @@ def lower_control_sections_to_ssa(
     identity_table: Mapping[str, tuple[int, ...]] | None = None,
     function_outputs: tuple[str, ...] = (),
     function_parameters: tuple[str, ...] = (),
+    self_value_id: int | None = None,
+    field_reads: tuple[tuple[int, int], ...] = (),
+    field_writes: tuple[tuple[int, int], ...] = (),
+    field_count: int = 0,
 ) -> tuple[
     IRModule,
     tuple[SSALoweringShortfall, ...],
@@ -2145,6 +2257,20 @@ def lower_control_sections_to_ssa(
         value_name_histories=identity_table,
         parameter_names=function_parameters,
     )
+    if self_value_id is not None and (field_reads or field_writes):
+        non_self_param_ids = tuple(
+            int((identity_table or {}).get(name, (None,))[-1])
+            for name in function_parameters
+            if name != "self" and (identity_table or {}).get(name)
+        )
+        control_function = _inject_field_slot_access(
+            control_function,
+            self_value_id=int(self_value_id),
+            non_self_param_ids=non_self_param_ids,
+            field_reads=field_reads,
+            field_writes=field_writes,
+            field_count=int(field_count),
+        )
     functions[control_function.name] = control_function
     module = IRModule(
         link_required_ssa_features(functions),
