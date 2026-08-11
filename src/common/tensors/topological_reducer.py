@@ -2640,6 +2640,22 @@ def _normalize_lexical_values(
             # contract.
             _remove_node(graph, node_id)
 
+    # A compile-time reference (e.g. a module imported only for a type check,
+    # like ``torch`` in ``isinstance(x, torch.Tensor)``) can be left as a root
+    # when nothing consumes it at runtime. It carries no runtime value, so it is
+    # not a runtime output: drop it from the roots (and, if it exists as a node,
+    # remove it) rather than emit it. This is what lets a real module compile as
+    # standalone source without its imports having to be runtime values. Such a
+    # reference is never a runtime PARENT (that would be a genuine bug), so those
+    # remain hard invariants below. Done before the invariant scan so the scan
+    # sees the cleaned graph.
+    compile_time_roots = [root for root in graph.roots if type(root) is not int]
+    if compile_time_roots:
+        graph.roots = [root for root in graph.roots if type(root) is int]
+        for root in compile_time_roots:
+            if root in graph.G:
+                _remove_node(graph, root)
+
     # Stable topological relabeling turns opaque Python object identities into
     # compact monotonic value IDs without changing the faithfully captured AST.
     invalid_node_ids = [
@@ -2651,9 +2667,6 @@ def _normalize_lexical_values(
         for parent_id, _role in data.get("parents", ())
         if type(parent_id) is not int
     ]
-    invalid_roots = [
-        root for root in graph.roots if type(root) is not int
-    ]
     assert not invalid_node_ids, (
         "compile-time references must be represented by integer-keyed "
         f"StaticReference nodes, not graph keys: {invalid_node_ids!r}"
@@ -2661,10 +2674,6 @@ def _normalize_lexical_values(
     assert not invalid_parent_ids, (
         "compile-time references must not appear as runtime parent IDs: "
         f"{invalid_parent_ids!r}"
-    )
-    assert not invalid_roots, (
-        "compile-time references must not appear as graph roots: "
-        f"{invalid_roots!r}"
     )
     source_position = {
         node_id: (
@@ -3740,21 +3749,24 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     for node_id, data in list(graph.G.nodes(data=True)):
         if data.get("type") != "Expr":
             continue
+        # An Expr statement wraps its value(s) and is dissolved: every consumer
+        # of the wrapper is reconnected directly to the wrapped value(s). There
+        # is no artificial cap of one value -- a wrapper standing in for several
+        # values (e.g. a call whose arguments the builder attached directly)
+        # fans its slot out to all of them, preserving their order.
         predecessors = tuple(graph.G.predecessors(node_id))
         successors = tuple(graph.G.successors(node_id))
-        if len(predecessors) > 1:
-            raise ValueError("Expr wrapper must contain at most one value")
-        predecessor = predecessors[0] if predecessors else None
         for successor in successors:
             successor_data = graph.G.nodes[successor]
             replacement_parents = []
             for parent_id, role in successor_data.get("parents", ()):
                 if parent_id != node_id:
                     replacement_parents.append((parent_id, role))
-                elif predecessor is not None:
-                    replacement_parents.append((predecessor, role))
+                else:
+                    for predecessor in predecessors:
+                        replacement_parents.append((predecessor, role))
             successor_data["parents"] = replacement_parents
-            if predecessor is not None:
+            for predecessor in predecessors:
                 graph.G.add_edge(predecessor, successor)
                 predecessor_children = graph.G.nodes[predecessor].setdefault(
                     "children", []
@@ -3763,7 +3775,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     child_id for child_id, _role in predecessor_children
                 }:
                     predecessor_children.append((successor, "output"))
-        if predecessor is not None:
+        for predecessor in predecessors:
             graph.G.nodes[predecessor]["children"] = [
                 (child_id, role)
                 for child_id, role in graph.G.nodes[predecessor].get(
@@ -3771,21 +3783,28 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 )
                 if child_id != node_id
             ]
+        # Roots holding the wrapper are replaced by every value it wrapped
+        # (deduplicated, order preserved); a wrapper with no value is dropped.
+        new_roots: list = []
+        for root_id in graph.roots:
+            if root_id != node_id:
+                new_roots.append(root_id)
+            else:
+                new_roots.extend(predecessors)
+        seen: set = set()
         graph.roots = [
-            predecessor if root_id == node_id and predecessor is not None
-            else root_id
-            for root_id in graph.roots
-            if root_id != node_id or predecessor is not None
+            root for root in new_roots if not (root in seen or seen.add(root))
         ]
         graph.G.remove_node(node_id)
 
     for node_id, data in list(graph.G.nodes(data=True)):
         if data.get("type") != "Return":
             continue
+        # A Return wrapper carries its returned value(s) and is dissolved into
+        # them. There is no artificial cap of one value -- a multi-value return
+        # (a tuple of results) publishes every one of its values as a root,
+        # order preserved.
         predecessors = tuple(graph.G.predecessors(node_id))
-        if len(predecessors) > 1:
-            raise ValueError("Return wrapper must contain at most one value")
-        returned = predecessors[0] if predecessors else None
         for successor in tuple(graph.G.successors(node_id)):
             graph.G.nodes[successor]["parents"] = [
                 (parent_id, role)
@@ -3794,7 +3813,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 )
                 if parent_id != node_id
             ]
-        if returned is not None:
+        for returned in predecessors:
             graph.G.nodes[returned]["children"] = [
                 (child_id, role)
                 for child_id, role in graph.G.nodes[returned].get(
