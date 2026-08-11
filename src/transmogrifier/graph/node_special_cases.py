@@ -235,6 +235,147 @@ def dissolve_spans(tree: ast.AST) -> ast.AST:
     return tree
 
 
+class _WalrusHoister(ast.NodeTransformer):
+    """Hoist a walrus ``(n := expr)`` out of a once-evaluated statement position
+    into a preceding ordinary ``n = expr``, replacing the expression with a load
+    of ``n``.
+
+    The reducer lowers a ``NamedExpr`` when ``resolve_expression`` reaches one,
+    but a walrus buried in an ``if``/``return``/assignment expression is not
+    always traversed there and then leaks to the deep compiler as a raw
+    ``NamedExpr`` (``if (name := f()) is not None:`` is the shape that leaks).
+    Hoisting it into a plain assignment -- a position always lowered -- fixes it
+    at the syntax level.
+
+    Only positions evaluated **exactly once and unconditionally** are hoisted
+    (an ``if`` test, a ``return`` value, an assignment's value, a bare
+    expression statement). A walrus inside a re-evaluated test (``while``), a
+    short-circuit ``and``/``or``, a ternary, a comprehension, or a lambda is
+    left untouched -- hoisting those would change evaluation semantics.
+    """
+
+    _SCOPE_OR_SHORTCIRCUIT = (
+        ast.BoolOp, ast.Lambda, ast.IfExp,
+        ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+    )
+
+    def _hoist(self, expression):
+        assigns: list = []
+        outer = self
+
+        class _Extract(ast.NodeTransformer):
+            def visit_NamedExpr(self, node):  # noqa: N802
+                node.value = self.visit(node.value)  # nested walrus first
+                assigns.append(
+                    ast.copy_location(
+                        ast.Assign(targets=[node.target], value=node.value),
+                        node,
+                    )
+                )
+                return ast.copy_location(
+                    ast.Name(id=node.target.id, ctx=ast.Load()), node
+                )
+
+            def visit(self, node):
+                if isinstance(node, outer._SCOPE_OR_SHORTCIRCUIT):
+                    return node
+                return super().visit(node)
+
+        rewritten = _Extract().visit(expression)
+        return assigns, rewritten
+
+    def _prefix(self, node, assigns):
+        for assign in assigns:
+            ast.copy_location(assign, node)
+        return [*assigns, node] if assigns else node
+
+    def visit_If(self, node):  # noqa: N802
+        node = self.generic_visit(node)
+        assigns, node.test = self._hoist(node.test)
+        return self._prefix(node, assigns)
+
+    def visit_Return(self, node):  # noqa: N802
+        node = self.generic_visit(node)
+        if node.value is None:
+            return node
+        assigns, node.value = self._hoist(node.value)
+        return self._prefix(node, assigns)
+
+    def visit_Assign(self, node):  # noqa: N802
+        node = self.generic_visit(node)
+        assigns, node.value = self._hoist(node.value)
+        return self._prefix(node, assigns)
+
+    def visit_Expr(self, node):  # noqa: N802
+        node = self.generic_visit(node)
+        assigns, node.value = self._hoist(node.value)
+        return self._prefix(node, assigns)
+
+
+def hoist_walrus_assignments(tree: ast.AST) -> ast.AST:
+    """Hoist safely-hoistable walruses in ``tree`` (in place), so no raw
+    ``NamedExpr`` reaches the deep compiler from a once-evaluated position."""
+
+    _WalrusHoister().visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
+class _TypeAnnotator(ast.NodeTransformer):
+    """Turn an annotated assignment into an ordinary assignment PLUS captured
+    type metadata -- a real type annotator, not a discard.
+
+    ``x: T = v`` becomes ``x = v`` and records ``x -> T``; ``x: T`` (declaration
+    only) is dropped as runtime code but still records ``x -> T``. The captured
+    annotation is the source's own declared type, exactly the information the
+    dtype system needs (it is where an ``int`` parameter's integer-ness comes
+    from), so it is preserved as metadata instead of thrown away.
+
+    Only executable bodies are rewritten. A class body's own ``AnnAssign`` is its
+    field schema -- name/type/default, read off the untouched ``ClassDef`` by
+    the class-table builder -- so ``visit_ClassDef`` normalizes each method body
+    without touching the class's own direct-child statements.
+    """
+
+    def __init__(self) -> None:
+        self.annotations: dict[str, str] = {}
+
+    def _record(self, target, annotation) -> None:
+        if isinstance(target, ast.Name) and annotation is not None:
+            try:
+                self.annotations[target.id] = ast.unparse(annotation)
+            except Exception:  # noqa: BLE001 -- metadata only, never fatal
+                pass
+
+    def visit_ClassDef(self, node):  # noqa: N802
+        node.body = [
+            self.visit(member)
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            else member
+            for member in node.body
+        ]
+        return node
+
+    def visit_AnnAssign(self, node):  # noqa: N802
+        node = self.generic_visit(node)
+        self._record(node.target, node.annotation)
+        if node.value is None:
+            return ast.copy_location(ast.Pass(), node)
+        return ast.copy_location(
+            ast.Assign(targets=[node.target], value=node.value), node
+        )
+
+
+def annotate_types(tree: ast.AST) -> dict:
+    """Rewrite annotated assignments in ``tree`` (in place) to ordinary
+    assignments and return the captured ``name -> annotation`` type metadata."""
+
+    annotator = _TypeAnnotator()
+    annotator.visit(tree)
+    ast.fix_missing_locations(tree)
+    return annotator.annotations
+
+
 def tensor_operation_name(node: Any) -> Optional[str]:
     """Canonical tensor-op name for a call node, else ``None``.
 

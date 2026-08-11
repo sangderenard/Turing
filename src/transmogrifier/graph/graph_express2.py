@@ -18,6 +18,8 @@ from ..operator_defs import default_funcs, operator_signatures, role_schemas
 from ..ilpscheduler import ILPScheduler
 from ..function_table import ExternalFunctionTable, FunctionTable
 from .node_special_cases import (
+    annotate_types,
+    hoist_walrus_assignments,
     interpret_special_case,
     dissolve_spans,
     tensor_operation_name,
@@ -543,37 +545,6 @@ def _map_ir_from_ast(tree):
         ),
         "permissions": (),
     }
-
-
-class _RuntimeAnnAssignNormalizer(ast.NodeTransformer):
-    """Translate annotation syntax to the ordinary assignment operator.
-
-    Only inside executable bodies. A class body's own ``AnnAssign`` is its
-    field schema -- name, type, default -- which the class-table builder
-    reads directly off the untouched ``ClassDef`` AST later. Recursing into
-    it here would silently erase every locally-defined dataclass's field
-    list (``fields``/``field_defaults``) before anything ever reads it, so
-    ``visit_ClassDef`` normalizes each method body without touching the
-    class's own direct-child statements.
-    """
-
-    def visit_ClassDef(self, node):
-        node.body = [
-            self.visit(member)
-            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
-            else member
-            for member in node.body
-        ]
-        return node
-
-    def visit_AnnAssign(self, node):
-        node = self.generic_visit(node)
-        if node.value is None:
-            return ast.copy_location(ast.Pass(), node)
-        return ast.copy_location(
-            ast.Assign(targets=[node.target], value=node.value),
-            node,
-        )
 
 
 def _ast_definition_bindings(value):
@@ -2025,7 +1996,18 @@ class ProcessGraph:
             from ...compiler.ast_process_graph import build_semantic_ast
 
             return build_semantic_ast(self, tree, filename=filename)
-        tree = ast.fix_missing_locations(_RuntimeAnnAssignNormalizer().visit(tree))
+        # Special-cased statement constructs, handled in the ingestion
+        # special-cases area (node_special_cases): a walrus in a once-evaluated
+        # position is hoisted to a plain assignment so no raw NamedExpr leaks to
+        # the deep compiler, and an annotated assignment becomes an ordinary
+        # assignment whose declared type is captured as metadata (the real type
+        # annotator) rather than discarded.
+        tree = hoist_walrus_assignments(tree)
+        self.G.graph["type_annotations"] = {
+            **(self.G.graph.get("type_annotations") or {}),
+            **annotate_types(tree),
+        }
+        tree = ast.fix_missing_locations(tree)
 
         if profile_verbose:
             print(
