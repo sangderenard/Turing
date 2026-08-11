@@ -376,6 +376,87 @@ def annotate_types(tree: ast.AST) -> dict:
     return annotator.annotations
 
 
+class _DeclaredAttributeCollector(ast.NodeVisitor):
+    """Every attribute name the source declares: a class's methods/properties,
+    its annotated or assigned class-level fields, and any ``obj.name = ...``
+    write. The union is what a constant-name ``getattr`` may be folded against --
+    a name written or defined somewhere is a real attribute, not a dynamic probe.
+    """
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_ClassDef(self, node):  # noqa: N802
+        for member in node.body:
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.names.add(member.name)
+            elif isinstance(member, ast.AnnAssign) and isinstance(
+                member.target, ast.Name
+            ):
+                self.names.add(member.target.id)
+            elif isinstance(member, ast.Assign):
+                for target in member.targets:
+                    if isinstance(target, ast.Name):
+                        self.names.add(target.id)
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node):  # noqa: N802
+        if isinstance(getattr(node, "ctx", None), ast.Store):
+            self.names.add(node.attr)
+        self.generic_visit(node)
+
+
+class _GetattrFolder(ast.NodeTransformer):
+    """Fold ``getattr(obj, "name"[, default])`` into the attribute access
+    ``obj.name`` when ``"name"`` is a constant identifier the source declares.
+
+    A constant-name ``getattr`` is not a dynamic lookup -- it names a specific
+    attribute at compile time, exactly what ``obj.name`` means -- but left as a
+    call it carries the name as a string constant a numeric backend cannot
+    express, and never resolves to the attribute's structure (``x.shape`` -> its
+    dimension extents). Folding routes it through the ordinary ``GetAttr`` path.
+    The ``default`` argument is dropped: for an attribute the class declares it
+    is provably present, so the default is dead in typed AOT (a genuinely
+    missing attribute is a type error that should surface, not be defaulted).
+    """
+
+    def __init__(self, declared: set[str]) -> None:
+        self.declared = declared
+
+    def visit_Call(self, node):  # noqa: N802
+        node = self.generic_visit(node)  # fold nested getattrs first
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) in (2, 3)
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+            and node.args[1].value.isidentifier()
+            and node.args[1].value in self.declared
+        ):
+            return ast.copy_location(
+                ast.Attribute(
+                    value=node.args[0],
+                    attr=node.args[1].value,
+                    ctx=ast.Load(),
+                ),
+                node,
+            )
+        return node
+
+
+def fold_constant_getattr(tree: ast.AST) -> ast.AST:
+    """Fold constant-name ``getattr`` calls into attribute accesses (in place),
+    gated to attribute names the source declares, so a static attribute lookup
+    resolves structurally instead of surviving as an inexpressible string."""
+
+    collector = _DeclaredAttributeCollector()
+    collector.visit(tree)
+    _GetattrFolder(collector.names).visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def tensor_operation_name(node: Any) -> Optional[str]:
     """Canonical tensor-op name for a call node, else ``None``.
 

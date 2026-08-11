@@ -2324,17 +2324,12 @@ def lower_control_sections_to_ssa(
             section_outputs[region_name] = tuple(
                 SSAValue(int(vid)) for vid in outputs
             )
-            known_operations = {handler.value for handler in Handler}
-            shortfalls.extend(
-                SSALoweringShortfall(
-                    "planned-region",
-                    str(instr.op),
-                    f"{region_name}:entry",
-                    "operator has no repository SSA handler",
-                )
-                for instr in instructions
-                if str(instr.op) not in known_operations
-            )
+            # Do NOT gate region ops on the repository ``Handler`` enum here: that
+            # is the LLVM/repository vocabulary, but this path emits through the
+            # selected target (Fortran), whose op set is broader -- e.g. it
+            # renders ``equal`` as ``(a == b)`` though ``Handler`` only knows
+            # ``Eq``. The target's own emit reports any op it genuinely cannot
+            # express, with a message accurate to that target.
     # The control lowering mints synthetic values (aggregate handles, index
     # constants) for the region-call convention. They must not reuse a graph
     # value id, or a synthetic const collides with a field value the injection

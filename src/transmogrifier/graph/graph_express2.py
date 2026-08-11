@@ -19,6 +19,7 @@ from ..ilpscheduler import ILPScheduler
 from ..function_table import ExternalFunctionTable, FunctionTable
 from .node_special_cases import (
     annotate_types,
+    fold_constant_getattr,
     hoist_walrus_assignments,
     interpret_special_case,
     dissolve_spans,
@@ -2003,6 +2004,11 @@ class ProcessGraph:
         # assignment whose declared type is captured as metadata (the real type
         # annotator) rather than discarded.
         tree = hoist_walrus_assignments(tree)
+        # A constant-name ``getattr(obj, "field", default)`` is a static
+        # attribute access spelled defensively; fold it to ``obj.field`` (for
+        # names the source declares) so it resolves structurally instead of
+        # surviving as a string constant a numeric backend cannot express.
+        tree = fold_constant_getattr(tree)
         self.G.graph["type_annotations"] = {
             **(self.G.graph.get("type_annotations") or {}),
             **annotate_types(tree),
