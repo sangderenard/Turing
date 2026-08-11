@@ -1068,6 +1068,9 @@ def compile_ast_fortran_c_shell(
                 function_name: returned_values(function)
                 for function_name, function in functions.items()
             },
+            # A library exports its whole surface: keep and export every section
+            # function, not just the ones the entry reaches.
+            extra_roots=tuple(functions) if library else (),
         )
         if not module.complete:
             raise FortranEmissionError(

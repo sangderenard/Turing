@@ -2155,10 +2155,15 @@ def emit_module(
     name: str = "turing_ssa",
     dtype: str = DEFAULT_DTYPE,
     outputs: Mapping[str, Sequence[SSAValue]] | None = None,
+    extra_roots: Sequence[str] = (),
 ) -> FortranModule:
     """Translate an SSA module into one Fortran module.
 
     ``outputs`` maps a function name to the SSA values it returns.
+    ``extra_roots`` names additional functions to keep and export (each becomes
+    its own ``bind(C)`` entry) even when nothing reachable from the ordinary
+    roots calls them -- a library exports its whole surface, not just the
+    functions the entry happens to reach.
     """
 
     functions = (
@@ -2199,6 +2204,7 @@ def emit_module(
         if function.metadata.get("named_outputs")
         or function.metadata.get("control_ir")
     )
+    roots.update(str(root) for root in extra_roots if str(root) in functions)
     if roots:
         reachable = set()
         pending = list(sorted(roots))
