@@ -67,6 +67,18 @@ def _trunc_first(args, res, fresh):
 
 #: op name -> recipe(args, res, fresh) -> list[Instr]. The universal derived-op
 #: translation matrix; every recipe emits only primitives all backends lower.
+# View ops -- shape relabels that leave contiguous data untouched -- are
+# identity on the data (a reshape only changes the shape label). This is the one
+# canonical set, defined here at the SSA level; backends consume it instead of
+# each carrying their own copy (the WASM backend's _lower_view_ops, the WebGPU
+# _SHAPE_ONLY, ...). Data-REORDERING ops (transpose, permute, repeat_interleave)
+# are deliberately NOT here: they move data and need index remapping no backend
+# lowers yet.
+VIEW_OPS = frozenset({
+    "reshape", "view", "clone", "flatten", "ravel",
+    "unsqueeze", "squeeze", "contiguous",
+})
+
 _RECIPES = {
     "square": _square,
     "reciprocal": _reciprocal,
@@ -76,19 +88,7 @@ _RECIPES = {
     "to": _copy_first,
     "long": _trunc_first,
     "int": _trunc_first,
-    # View ops -- shape relabels that leave contiguous data untouched -- are
-    # identity (the WASM/WebGPU/Fortran-JIT backends all treat them so). Data
-    # REORDERING ops (transpose, permute, repeat_interleave) are deliberately
-    # NOT here: they genuinely move data and need index remapping, which no
-    # backend lowers yet.
-    "reshape": _copy_first,
-    "view": _copy_first,
-    "clone": _copy_first,
-    "flatten": _copy_first,
-    "ravel": _copy_first,
-    "unsqueeze": _copy_first,
-    "squeeze": _copy_first,
-    "contiguous": _copy_first,
+    **{name: _copy_first for name in VIEW_OPS},
 }
 
 

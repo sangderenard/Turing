@@ -443,8 +443,13 @@ def program_feed_order(program: FusedProgram) -> tuple[int, ...]:
 #     (N int64 -> 8N uint8) is the host's view of those same bytes, not a
 #     kernel computation.
 #
-# Each backend owns the lowering of its own tensor ops; this is WebAssembly's.
-_VIEW_OPS = frozenset({"reshape", "view", "clone", "tobytes"})
+# The view-op SET is now defined once at the SSA level (ir_tensor_ops.VIEW_OPS);
+# this backend consumes it rather than carrying its own copy. ``tobytes`` is
+# WebAssembly-specific here -- a host-boundary reinterpret that is identity
+# kernel-side -- so it is added to the shared data-view set.
+from .ir_tensor_ops import VIEW_OPS as _SSA_VIEW_OPS
+
+_VIEW_OPS = _SSA_VIEW_OPS | {"tobytes"}
 
 
 def _lower_view_ops(steps: Sequence[OpStep]) -> list[OpStep]:
