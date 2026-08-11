@@ -35,13 +35,17 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 
-# --- the segment / kind map ---------------------------------------------------
-#: The ordered wire "kinds" the pipeline flows through. A provider consumes one
-#: kind and produces a later one; the distance between them is its span. This is
-#: the full segment map -- most seams have no Python provider wired yet; they are
-#: the iteration targets (register a provider consuming/producing that kind to
-#: light the segment up).
-KIND_ORDER: tuple[str, ...] = (
+# --- the kind schema ----------------------------------------------------------
+#: A pipeline's schema is just an ordered tuple of wire "kinds": a provider
+#: consumes one and produces a later one, and the distance between them is its
+#: span. The core engine is schema-agnostic -- pass any project's kind sequence
+#: to ``Pipeline(kinds=...)`` and it is a general staged-build rig. The compiler
+#: is one instantiation of it (``COMPILER_KINDS`` below).
+#:
+#: This is the compiler's full segment map -- most seams have no Python provider
+#: wired yet; they are the iteration targets (register a provider consuming/
+#: producing that kind to light the segment up).
+COMPILER_KINDS: tuple[str, ...] = (
     "source",           # utf-8 Python text (+ entrypoint/params in the context)
     "process_graph",    # structural AST ProcessGraph (build_from_ast)
     "annotated_graph",  # + topology reduction, map_ir, class nav, dep regions
@@ -52,7 +56,8 @@ KIND_ORDER: tuple[str, ...] = (
     "target_source",    # emitted backend source (Fortran / WASM / C / GLSL)
     "executable",       # built native artifact / bundle
 )
-_KIND_INDEX = {kind: index for index, kind in enumerate(KIND_ORDER)}
+#: Back-compat / default schema alias.
+KIND_ORDER = COMPILER_KINDS
 
 #: Provider tiers, lowest is preferred (fastest / most compiled).
 TIER_NATIVE = 0   # a compiled DLL span
@@ -66,15 +71,13 @@ class PipelineError(RuntimeError):
 # --- artifacts flowing between stages -----------------------------------------
 @dataclass
 class Artifact:
-    """One value on the wire between stages, tagged with its kind."""
+    """One value on the wire between stages, tagged with its kind. The kind is a
+    bare string validated against the owning pipeline's schema when it is built,
+    not globally -- so an artifact is not tied to any one project's kinds."""
 
     kind: str
     value: Any
     meta: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if self.kind not in _KIND_INDEX:
-            raise PipelineError(f"unknown artifact kind {self.kind!r}")
 
 
 @dataclass
@@ -111,29 +114,6 @@ class Provider:
     run: Callable[[Artifact, BuildContext], Artifact]
     tier: int = TIER_PYTHON
     cache: bool = False
-
-    @property
-    def start(self) -> int:
-        return _KIND_INDEX[self.consumes]
-
-    @property
-    def end(self) -> int:
-        return _KIND_INDEX[self.produces]
-
-    @property
-    def span(self) -> int:
-        return self.end - self.start
-
-    def __post_init__(self) -> None:
-        if self.consumes not in _KIND_INDEX or self.produces not in _KIND_INDEX:
-            raise PipelineError(
-                f"provider {self.name!r} references unknown kind(s)"
-            )
-        if self.span <= 0:
-            raise PipelineError(
-                f"provider {self.name!r} must produce a later kind than it "
-                f"consumes ({self.consumes} -> {self.produces})"
-            )
 
 
 @dataclass
@@ -240,13 +220,38 @@ class Pipeline:
     from a source artifact; the planner chooses providers preferring native
     over Python and, within a tier, the largest fused span."""
 
-    def __init__(self, checkpoints: Optional[ArtifactCheckpointStore] = None):
+    def __init__(
+        self,
+        kinds: Sequence[str] = COMPILER_KINDS,
+        checkpoints: Optional[ArtifactCheckpointStore] = None,
+    ):
+        self.kinds: tuple[str, ...] = tuple(kinds)
+        self._index = {kind: i for i, kind in enumerate(self.kinds)}
+        if len(self._index) != len(self.kinds):
+            raise PipelineError("pipeline kinds must be unique")
         self._providers: list[Provider] = []
         self._foundations: list[Foundation] = []
         self.checkpoints = checkpoints or ArtifactCheckpointStore()
 
+    def _idx(self, kind: str) -> int:
+        try:
+            return self._index[kind]
+        except KeyError:
+            raise PipelineError(
+                f"kind {kind!r} is not in this pipeline's schema {self.kinds}"
+            )
+
+    def span(self, provider: Provider) -> int:
+        return self._idx(provider.produces) - self._idx(provider.consumes)
+
     # -- registration --
     def register(self, provider: Provider) -> Provider:
+        start, end = self._idx(provider.consumes), self._idx(provider.produces)
+        if end <= start:
+            raise PipelineError(
+                f"provider {provider.name!r} must produce a later kind than it "
+                f"consumes ({provider.consumes} -> {provider.produces})"
+            )
         self._providers.append(provider)
         return provider
 
@@ -308,7 +313,7 @@ class Pipeline:
         spans. A DAG DP over KIND_ORDER, so it never dead-ends on a locally
         greedy pick."""
 
-        start, target = _KIND_INDEX[source_kind], _KIND_INDEX[target_kind]
+        start, target = self._idx(source_kind), self._idx(target_kind)
         if target < start:
             raise PipelineError(
                 f"cannot go backwards: {source_kind} -> {target_kind}"
@@ -321,18 +326,19 @@ class Pipeline:
                 continue
             base = best[index]
             for provider in self._providers:
-                if provider.start != index or provider.end > target:
+                p_start, p_end = self._idx(provider.consumes), self._idx(provider.produces)
+                if p_start != index or p_end > target:
                     continue
                 candidate = (
                     base[0] + provider.tier,
                     base[1] + 1,
-                    base[2] - provider.span,
+                    base[2] - (p_end - p_start),
                 )
-                if provider.end not in best or candidate < best[provider.end]:
-                    best[provider.end] = candidate
-                    prev[provider.end] = (index, provider)
+                if p_end not in best or candidate < best[p_end]:
+                    best[p_end] = candidate
+                    prev[p_end] = (index, provider)
         if target not in best:
-            reachable = ", ".join(sorted(KIND_ORDER[i] for i in best))
+            reachable = ", ".join(sorted(self.kinds[i] for i in best))
             raise PipelineError(
                 f"no provider path from {source_kind} to {target_kind}; "
                 f"reachable so far: {reachable}. Register a provider that "
@@ -516,13 +522,18 @@ def _run_source_to_executable(artifact: Artifact, context: BuildContext) -> Arti
     return Artifact("executable", executable)
 
 
-def default_pipeline() -> Pipeline:
-    """A pipeline with the Python providers that work today registered. Native
-    DLL spans (``register_dll_span``) and substrate foundations
+def compiler_pipeline() -> Pipeline:
+    """The compiler as one instantiation of the general rig: a pipeline over
+    ``COMPILER_KINDS`` with the Python providers that work today. Native DLL
+    spans (``register_dll_span``) and substrate foundations
     (``register_foundation``) are added as they are compiled; the planner will
-    prefer them automatically."""
+    prefer them automatically.
 
-    pipeline = Pipeline()
+    A different large project scaffolds its own pipeline the same way:
+    ``Pipeline(kinds=(...its stages...))`` plus its own providers -- the engine
+    (planning, checkpointing, native/DLL preference) is unchanged."""
+
+    pipeline = Pipeline(COMPILER_KINDS)
     pipeline.register_span(
         "python:aot-capture", "source", "dual_ir",
         _run_source_to_dual_ir, tier=TIER_PYTHON, cache=True,
@@ -538,7 +549,13 @@ def default_pipeline() -> Pipeline:
     return pipeline
 
 
+#: Back-compat alias -- the compiler pipeline was the first (and default) rig.
+def default_pipeline() -> Pipeline:
+    return compiler_pipeline()
+
+
 __all__ = [
+    "COMPILER_KINDS",
     "KIND_ORDER",
     "TIER_NATIVE",
     "TIER_PYTHON",
@@ -549,5 +566,6 @@ __all__ = [
     "Pipeline",
     "ArtifactCheckpointStore",
     "PipelineError",
+    "compiler_pipeline",
     "default_pipeline",
 ]
