@@ -49,9 +49,13 @@ def _cbrt(args, res, fresh):
 
 
 def _copy_first(args, res, fresh):
-    # A float/double/to cast in the f64 working kernel is the working type
-    # already -- identity over the tensor operand (extra device/dtype operands
-    # do not change the values).
+    # Identity over the tensor operand, dropping any trailing shape/dtype/device
+    # operands (which then fall out of the dependency walk as dead). A view op
+    # (reshape/flatten/unsqueeze/...) only relabels shape on a contiguous buffer,
+    # and a float/double/to cast in the f64 working kernel is the working type
+    # already -- both are identity on the data. This mirrors the WASM backend's
+    # _lower_view_ops (view -> add(x, 0)) and the WebGPU _SHAPE_ONLY set, but at
+    # the SSA level so every backend inherits it.
     return [Instr("copy", [args[0]], res)]
 
 
@@ -72,6 +76,19 @@ _RECIPES = {
     "to": _copy_first,
     "long": _trunc_first,
     "int": _trunc_first,
+    # View ops -- shape relabels that leave contiguous data untouched -- are
+    # identity (the WASM/WebGPU/Fortran-JIT backends all treat them so). Data
+    # REORDERING ops (transpose, permute, repeat_interleave) are deliberately
+    # NOT here: they genuinely move data and need index remapping, which no
+    # backend lowers yet.
+    "reshape": _copy_first,
+    "view": _copy_first,
+    "clone": _copy_first,
+    "flatten": _copy_first,
+    "ravel": _copy_first,
+    "unsqueeze": _copy_first,
+    "squeeze": _copy_first,
+    "contiguous": _copy_first,
 }
 
 
