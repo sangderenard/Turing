@@ -72,6 +72,67 @@ def compile_class_to_dll(source, class_name, outdir, *, progress=None):
     )
 
 
+def _public_surface_classes(module) -> list:
+    """The public classes a module defines itself (not imported): the public
+    surface to export. A leading underscore marks a name private."""
+
+    import inspect
+
+    return [
+        obj
+        for name, obj in vars(module).items()
+        if not name.startswith("_")
+        and inspect.isclass(obj)
+        and getattr(obj, "__module__", None) == module.__name__
+    ]
+
+
+def export_public_surface(module_name: str, outdir, *, progress=None):
+    """Ingest a module by name and export its whole public surface as a DLL.
+
+    The public classes the module defines are ``retain``ed, which pulls in each
+    class's FULL method surface -- body methods and methods bound onto the class
+    from other modules (``_attach_external_methods``) -- and fills those regions
+    out. ``library=True`` then emits every one as a linkable export. This is the
+    foundational-library pattern: a module's public API compiled to a shared
+    object other compiled programs link against as externals.
+    """
+
+    import ast
+    import importlib
+    import inspect
+
+    from src.compiler.fortran_c_shell import compile_ast_fortran_c_shell
+
+    module = importlib.import_module(module_name)
+    source = inspect.getsource(module)
+    classes = _public_surface_classes(module)
+    if not classes:
+        raise ValueError(f"{module_name!r} defines no public classes to export")
+
+    # Nominal entrypoint (naming/ABI only): a method of the first public class,
+    # resolved by its qualified name. retain fills out every retained class.
+    tree = ast.parse(source)
+    first = classes[0].__name__
+    first_methods = _class_method_names(source, first)
+    if not first_methods:
+        raise ValueError(f"public class {first!r} defines no methods")
+    nominal = (
+        f"{first}.__init__" if "__init__" in first_methods
+        else f"{first}.{first_methods[0]}"
+    )
+    if progress is not None:
+        progress(
+            f"exporting public surface of {module_name}: "
+            f"{[c.__name__ for c in classes]}"
+        )
+    return compile_ast_fortran_c_shell(
+        source, nominal, {}, outdir,
+        name=module_name.rsplit(".", 1)[-1],
+        library=True, retain=tuple(classes), progress=progress,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 3:

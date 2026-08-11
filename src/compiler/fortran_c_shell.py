@@ -921,6 +921,7 @@ def compile_ast_fortran_c_shell(
     compilation: Any | None = None,
     library: bool = False,
     dependency_seeds: tuple[str, ...] = (),
+    retain: Any = (),
 ) -> FortranCShellExecutable:
     """Compile Python AST through the registered Fortran target and C shell.
 
@@ -966,6 +967,7 @@ def compile_ast_fortran_c_shell(
         checkpoint=checkpoint,
         mutable_parameters=tuple(mutable_parameters),
         dependency_seeds=tuple(dependency_seeds),
+        retain=retain,
     )
     hierarchical_outputs = dict(compilation.public_output_value_ids)
     hierarchical_inputs = dict(compilation.public_input_value_ids)
@@ -1038,10 +1040,15 @@ def compile_ast_fortran_c_shell(
                 lowering.shortfall_report()
                 + f"; format_issues={lowering.validation.format_issues!r}"
             )
+        # A single-entry build exports just its entry (plus its numeric
+        # regions). A library build of a whole class exports EVERY function the
+        # lowering produced -- each method is a linkable export -- so an app can
+        # link any of them, not only the nominal entry.
         functions = {
             function_name: function
             for function_name, function in lowering.module.functions.items()
-            if function_name == artifact_name
+            if library
+            or function_name == artifact_name
             or function_name.startswith("numerical_region_")
         }
 
