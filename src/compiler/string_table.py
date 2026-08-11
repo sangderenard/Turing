@@ -36,6 +36,15 @@ def string_token(text: str) -> int:
     return fnv1a_64(text)
 
 
+#: The sentinel for Python ``None`` -- the "absence" singleton. It is a value
+#: like any other in the 64-bit working type (a reserved, content-addressed
+#: token distinct from real data), so ``x = None``, a ``None`` field, or a
+#: returned ``None`` is expressible and comparable rather than an inexpressible
+#: literal. Reserved via the same fnv namespace as every other token, so no
+#: real word or byte buffer can collide with it by construction of the marker.
+NONE_TOKEN = fnv1a_64("\x00turing.sentinel.None\x00")
+
+
 class StringTable:
     """Persistent token -> string map for the lowered common representation."""
 

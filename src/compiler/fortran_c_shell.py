@@ -940,6 +940,7 @@ def _field_slot_ops(graph_obj: Any):
     # write. Nodes are created in source order, so their ids preserve the order
     # the programmer wrote -- which is the order the memory operations must run.
     field_ops: list[tuple[str, int, int]] = []
+    const_sources: dict[int, Any] = {}
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         node_type = data.get("op") or data.get("type")
@@ -960,11 +961,22 @@ def _field_slot_ops(graph_obj: Any):
             )
             if source_parent is None:
                 continue
-            source_id = graph_obj.nodes[source_parent].get(
-                "value_id", source_parent
-            )
+            source_data = graph_obj.nodes[source_parent]
+            source_id = source_data.get("value_id", source_parent)
             field_ops.append(("write", int(source_id), slot_of[attribute]))
-    return self_value_id, tuple(field_ops), len(fields)
+            # A constant field write (``self.x = None`` / ``5`` / ``"s"``) has
+            # no producer in the control body, so carry the constant value; the
+            # injection materialises it before the store (None becomes the
+            # absence sentinel via the tokenizer).
+            if (source_data.get("op") or source_data.get("type")) in (
+                "const",
+                "Constant",
+            ):
+                attrs = source_data.get("attributes") or {}
+                const_sources[int(source_id)] = attrs.get(
+                    "value", source_data.get("constant")
+                )
+    return self_value_id, tuple(field_ops), const_sources, len(fields)
 
 
 def _emit_class_surface_module(compilation: Any, artifact_name: str):
@@ -1013,7 +1025,9 @@ def _emit_class_surface_module(compilation: Any, artifact_name: str):
         # store. In whole-program precompile mode the field-op region is never
         # built (gated behind ``not precompile_only``), so recover the field ops
         # from the process graph and hand them to the lowerer as slot access.
-        self_id, field_ops, field_count = _field_slot_ops(graph_obj)
+        self_id, field_ops, const_sources, field_count = _field_slot_ops(
+            graph_obj
+        )
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
@@ -1028,6 +1042,7 @@ def _emit_class_surface_module(compilation: Any, artifact_name: str):
                 ),
                 self_value_id=self_id,
                 field_ops=field_ops,
+                field_const_sources=const_sources,
                 field_count=field_count,
                 string_table=string_table,
             )

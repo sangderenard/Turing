@@ -17,9 +17,11 @@ from __future__ import annotations
 
 from ..common.tensors.fused_ir import FusedProgram, OpStep
 from .ir_string_ops import STRING_SPLIT_PART_HASH
-from .string_table import string_token as _string_token
+from .string_table import string_token as _string_token, NONE_TOKEN as _NONE_TOKEN
 
 STRING_TOKEN = "string_token"
+
+_ABSENT = object()
 
 
 def tokenize_ssa_string_constants(functions, table=None) -> None:
@@ -45,18 +47,34 @@ def tokenize_ssa_string_constants(functions, table=None) -> None:
         for block in function.blocks.values():
             rewritten = []
             for instruction in block.instrs:
-                value = instruction.attributes.get("value")
-                if value is None:
-                    value = instruction.attributes.get("constant")
-                if instruction.op in ("Const", "const") and isinstance(
-                    value, (str, bytes)
-                ):
-                    token = table.intern(value) if table is not None else _string_token(value)
+                is_const = instruction.op in ("Const", "const")
+                has_array = (
+                    "values" in instruction.attributes
+                    or "llvm_literal" in instruction.attributes
+                )
+                value = instruction.attributes.get("value", _ABSENT)
+                if value is _ABSENT:
+                    value = instruction.attributes.get("constant", _ABSENT)
+                token = None
+                text = None
+                if is_const and not has_array:
+                    if value is None:
+                        # the None literal -- the absence sentinel
+                        token = _NONE_TOKEN
+                        text = "None"
+                    elif isinstance(value, (str, bytes)):
+                        token = (
+                            table.intern(value)
+                            if table is not None
+                            else _string_token(value)
+                        )
+                        text = value
+                if token is not None:
                     attributes = dict(instruction.attributes)
                     attributes.pop("value", None)
                     attributes.pop("constant", None)
                     attributes["token"] = int(token)
-                    attributes["text"] = value
+                    attributes["text"] = text
                     rewritten.append(
                         dataclasses.replace(
                             instruction, op=STRING_TOKEN, attributes=attributes

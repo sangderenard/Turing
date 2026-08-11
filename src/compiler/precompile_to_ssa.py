@@ -2053,6 +2053,7 @@ def _inject_field_slot_access(
     non_self_param_ids: tuple[int, ...],
     field_ops: tuple[tuple[str, int, int], ...],
     field_count: int,
+    field_const_sources: Mapping[int, Any] | None = None,
     output_value_ids: tuple[int, ...] = (),
     dtype: str = "float64",
 ) -> Function:
@@ -2100,6 +2101,7 @@ def _inject_field_slot_access(
         return value_id
 
     self_array = SSAValue(int(self_value_id), dtype=dtype, shape=(field_count,))
+    const_sources = dict(field_const_sources or {})
 
     def slot_address(slot: int) -> tuple[list[Instr], SSAValue]:
         index = SSAValue(fresh(), dtype="int64")
@@ -2168,7 +2170,22 @@ def _inject_field_slot_access(
             if position is None:
                 continue  # a read nothing consumes has no place and no effect
         else:
-            group = [
+            group = []
+            # A constant field write (self.x = None / 5 / "s") has no producer
+            # in the control body, so materialise its source here -- the
+            # tokenizer then turns a None/str/bytes const into a token.
+            if int(value_id) in const_sources and int(value_id) not in (
+                producer_position
+            ):
+                group.append(
+                    Instr(
+                        "Const",
+                        [],
+                        SSAValue(int(value_id), dtype=dtype),
+                        attributes={"value": const_sources[int(value_id)]},
+                    )
+                )
+            group += [
                 *prelude,
                 Instr(
                     "Store",
@@ -2255,6 +2272,7 @@ def lower_control_sections_to_ssa(
     function_parameters: tuple[str, ...] = (),
     self_value_id: int | None = None,
     field_ops: tuple[tuple[str, int, int], ...] = (),
+    field_const_sources: Mapping[int, Any] | None = None,
     field_count: int = 0,
     string_table: Any = None,
 ) -> tuple[
@@ -2373,6 +2391,7 @@ def lower_control_sections_to_ssa(
             self_value_id=int(self_value_id),
             non_self_param_ids=non_self_param_ids,
             field_ops=field_ops,
+            field_const_sources=field_const_sources or {},
             field_count=int(field_count),
             output_value_ids=output_value_ids,
         )
