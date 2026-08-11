@@ -15045,6 +15045,22 @@ class ProcessGraphGLSLDeployment:
         return False
 
 
+def _is_runtime_value_id(value_id: Any) -> bool:
+    """Whether ``value_id`` names a runtime value node (an integer id or its
+    digit spelling). A compile-time reference (a resolved type/module left as a
+    _StaticPythonReference) is not a runtime value id -- it is a compile-time
+    constant, and must be excluded from runtime value-id sets rather than forced
+    through ``int()``."""
+
+    if isinstance(value_id, bool):
+        return False
+    if isinstance(value_id, int):
+        return True
+    if isinstance(value_id, str):
+        return value_id.lstrip("-").isdigit()
+    return False
+
+
 def strategize_shell_deployment(
     graph: Any,
     *,
@@ -15201,6 +15217,12 @@ def strategize_shell_deployment(
     )
     inert_nodes = _inert_routing_nodes(graph)
     closure_edges, closure_outputs = _closure_routing_dependencies(graph)
+    # A method may ``return`` a compile-time reference (a type or module, e.g.
+    # ``return torch.float32``). That resolves to a _StaticPythonReference, not a
+    # runtime value node id -- it is a compile-time constant, not a runtime
+    # output -- so it is excluded from the runtime return-liveness set here
+    # (int() would fail on it), the same way compile-time references are not
+    # runtime roots.
     return_outputs = frozenset(
         int(value_id)
         for value_id in (
@@ -15213,7 +15235,7 @@ def strategize_shell_deployment(
             ),
             *(graph.G.graph.get("return_value_nodes", {}) or {}).values(),
         )
-        if int(value_id) in graph.G
+        if _is_runtime_value_id(value_id) and int(value_id) in graph.G
     )
     recursion_control_nodes = frozenset(
         int(node_id)
