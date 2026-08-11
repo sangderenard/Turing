@@ -48,7 +48,9 @@ def tokenize_ssa_string_constants(functions, table=None) -> None:
                 value = instruction.attributes.get("value")
                 if value is None:
                     value = instruction.attributes.get("constant")
-                if instruction.op in ("Const", "const") and isinstance(value, str):
+                if instruction.op in ("Const", "const") and isinstance(
+                    value, (str, bytes)
+                ):
                     token = table.intern(value) if table is not None else _string_token(value)
                     attributes = dict(instruction.attributes)
                     attributes.pop("value", None)

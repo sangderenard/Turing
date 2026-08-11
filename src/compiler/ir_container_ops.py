@@ -32,9 +32,12 @@ FNV64_OFFSET = 0xCBF29CE484222325
 FNV64_PRIME = 0x100000001B3
 
 
-def fnv1a_64(text: str) -> int:
+def fnv1a_64(text) -> int:
+    # A word or a raw byte buffer hash the same way -- a str is its UTF-8 bytes,
+    # so ``b'abc'`` and ``'abc'`` are one content identity.
+    data = text.encode("utf-8") if isinstance(text, str) else bytes(text)
     h = FNV64_OFFSET
-    for byte in text.encode("utf-8"):
+    for byte in data:
         h = ((h ^ byte) * FNV64_PRIME) & 0xFFFFFFFFFFFFFFFF
     return h - 2 ** 64 if h >= 2 ** 63 else h  # fold to signed i64
 
