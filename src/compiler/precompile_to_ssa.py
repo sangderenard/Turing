@@ -47,6 +47,10 @@ from ..transmogrifier.ssa import (
     Function,
     IRModule,
     Instr,
+    SSAClassDefinition,
+    SSAClassField,
+    SSAClassMethod,
+    SSAClassTable,
     SSADeploymentLane,
     SSADeploymentRegion,
     SSAValue,
@@ -1965,7 +1969,42 @@ def lower_class_navigation_to_ssa(
         function.blocks["entry"].instrs[0].attributes.setdefault(
             "class_navigation_lut", lut,
         )
-    return IRModule({function.name: function for function in functions})
+
+    # Hold the class DEFINITIONS in the module, not only the reference LUTs: each
+    # class's instance-field layout and its methods (with the function-table
+    # reference to each method's body). A backend reads this to emit a class's
+    # methods as real, individually linkable functions -- the SSA counterpart of
+    # the frontend ClassNavigationTable.
+    class_definitions = []
+    for record in classes:
+        members = record.get("members", ())
+        fields = tuple(
+            SSAClassField(name=str(member["name"]), slot=int(member["slot"]))
+            for member in members
+            if member.get("kind") == "attribute"
+            and member.get("storage") == "instance"
+            and member.get("slot") is not None
+        )
+        methods = tuple(
+            SSAClassMethod(
+                name=str(member["name"]),
+                function_reference=int(member["function_reference"]),
+            )
+            for member in members
+            if member.get("function_reference") is not None
+        )
+        class_definitions.append(
+            SSAClassDefinition(
+                identity=str(record.get("identity", "")),
+                fields=fields,
+                methods=methods,
+            )
+        )
+    class_table = SSAClassTable(classes=tuple(class_definitions))
+    return IRModule(
+        {function.name: function for function in functions},
+        class_table=class_table,
+    )
 
 
 def find_ssa_cycles(function: Function) -> tuple[SSACycle, ...]:

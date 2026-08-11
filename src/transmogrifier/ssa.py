@@ -97,6 +97,57 @@ class Function:
 
 
 @dataclass(frozen=True)
+class SSAClassMethod:
+    """One method of a class as the SSA layer holds it: its dot-name, the
+    function-table reference to its body, and -- once that body is lowered into
+    the module -- the SSA function that implements it."""
+
+    name: str
+    function_reference: int
+    function_name: str | None = None
+
+
+@dataclass(frozen=True)
+class SSAClassField:
+    """One instance field's addressable slot in a class's layout."""
+
+    name: str
+    slot: int
+
+
+@dataclass(frozen=True)
+class SSAClassDefinition:
+    """A class definition the SSA module holds: its identity, its instance-field
+    layout, and its methods (each pointing at the function that implements it)."""
+
+    identity: str
+    fields: tuple[SSAClassField, ...] = ()
+    methods: tuple[SSAClassMethod, ...] = ()
+
+    def method(self, name: str) -> "SSAClassMethod | None":
+        for member in self.methods:
+            if member.name == name:
+                return member
+        return None
+
+
+@dataclass(frozen=True)
+class SSAClassTable:
+    """Every class definition carried into the SSA module -- the SSA-level
+    counterpart of the frontend ``ClassNavigationTable``. Holding the definitions
+    (not only reference LUTs) is what lets a backend emit a class's methods as
+    real, individually linkable functions."""
+
+    classes: tuple[SSAClassDefinition, ...] = ()
+
+    def by_identity(self, identity: str) -> "SSAClassDefinition | None":
+        for record in self.classes:
+            if record.identity == identity:
+                return record
+        return None
+
+
+@dataclass(frozen=True)
 class SSADeploymentLane:
     """One independently schedulable lane retained after SSA lowering."""
 
@@ -151,6 +202,10 @@ class SSADeploymentRegion:
 class IRModule:
     functions: Dict[str, Function]
     function_table: FunctionTable = field(default_factory=FunctionTable)
+    # Class definitions the module holds (identity -> fields + methods). Empty
+    # for a plain function module; populated when a class navigation table is
+    # lowered, so a backend can emit each method as its own function.
+    class_table: SSAClassTable = field(default_factory=SSAClassTable)
     # Backend-neutral cache of CFG recursion regions.  Keys are function
     # names; region records identify loop headers, latches, Phi values, and
     # the ProcessGraph SCC from which each loop was lowered.
