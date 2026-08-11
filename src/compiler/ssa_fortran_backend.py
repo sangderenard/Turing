@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..transmogrifier.ssa import BasicBlock, Function, Instr, IRModule, SSAValue
+from .string_table import NONE_TOKEN as _NONE_TOKEN, string_token as _string_token
 
 # Fortran intrinsic (or expression template) for each SSA operation.  ``{0}``
 # and ``{1}`` are the operand expressions.  Anything absent is reported as an
@@ -422,6 +423,15 @@ def _array_literal(
 
 
 def _literal(value: Any) -> str:
+    # None and words are 64-bit tokens in the working type, carried as
+    # reinterpreted bits. Realise them at the one point every literal passes
+    # through to become Fortran, so no emission path can leak an inexpressible
+    # None/str/bytes -- the SSA tokenizer is the primary path; this is the
+    # universal backstop.
+    if value is None:
+        return f"transfer({_NONE_TOKEN}_c_int64_t, 0._c_double)"
+    if isinstance(value, (str, bytes)):
+        return f"transfer({_string_token(value)}_c_int64_t, 0._c_double)"
     if isinstance(value, bool):
         return ".true._c_bool" if value else ".false._c_bool"
     if isinstance(value, int):
