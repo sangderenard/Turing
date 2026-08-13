@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import struct
+from functools import lru_cache
 from typing import Any, Iterable, Mapping
 
 
@@ -39,7 +40,51 @@ _C_BACKEND_PATH = Path(__file__).with_name("c_backend.py")
 # ``slice`` is emitted by the numerical precompiler after Python indexing has
 # already been normalized.  It is intentionally not a public AbstractTensor
 # method name, but it still needs the same real C -> LLVM algorithm registry.
-PRECOMPILE_INTERNAL_OPERATORS = frozenset({"slice"})
+PRECOMPILE_INTERNAL_OPERATORS = frozenset({"slice", "index_set"})
+
+# Explicit output-buffer positions in the authored low-level SSA signatures.
+# Scalar-returning helpers (binary_value, sum_double, count_true_double) carry
+# a repository-SSA ``return_value`` instead and therefore do not appear here.
+C_SSA_OUTPUT_ARGUMENTS = {
+    "fill_double": 0,
+    "binary_double": 2,
+    "binary_scalar_double": 2,
+    "unary_double": 1,
+    "matmul_double": 2,
+    "where_double": 3,
+    "broadcast_double": 1,
+    "reduce_dim_double": 1,
+    "transpose_double": 1,
+    "cumsum_dim_double": 1,
+    "stack_double": 5,
+    "cat_double": 6,
+    "pad_double_nd": 1,
+    "slice_copy_double": 1,
+    "index_select_double": 1,
+    "index_assign_double": 0,
+    "sign_double": 1,
+    "mask_select_double": 2,
+    "increment_mask_double": 0,
+    "cast_double_to_int_values": 1,
+    "cast_double_to_float_values": 1,
+    "create_arange": 3,
+}
+
+# LLVM opaque pointers erase pointee types.  Repository SSA and its Fortran
+# ABI still need to distinguish integer metadata vectors from double tensor
+# buffers, so retain that finite part of the authored C signatures here.
+C_SSA_I32_POINTER_ARGUMENTS = {
+    "pad_double_nd": (2, 3, 4),
+    "slice_copy_double": (2,),
+    "index_select_double": (2, 5),
+    "index_assign_double": (1, 3, 4),
+    "cumsum_dim_double": (2,),
+    "reduce_dim_double": (2,),
+    "transpose_double": (2, 3),
+    "broadcast_double": (2, 4),
+    "stack_double": (2,),
+    "cat_double": (1, 3),
+}
 
 
 # These values are consumed by the handwritten switch instructions below.
@@ -87,6 +132,13 @@ C_TENSOR_OPCODE_ORDER = (
     "ACOSH",
     "ATANH",
 )
+
+C_SSA_EXTERNAL_PRIMITIVES = frozenset({
+    "acos", "acosh", "asin", "asinh", "atan", "atanh", "cos", "cosh",
+    "exp", "llvm.ceil.f64", "llvm.fabs.f64", "llvm.fcmp.ord",
+    "llvm.fcmp.uno", "llvm.floor.f64", "llvm.round.f64", "llvm.sqrt.f64",
+    "llvm.trunc.f64", "log", "pow", "sin", "sinh", "tan", "tanh",
+})
 
 
 # Classification covers names discovered from ctensor_ops.c.  Validation below
@@ -185,6 +237,100 @@ loop.body:
   store double %value, ptr %dst, align 8
   %i.next = add nsw i32 %i, 1
   br label %loop.header
+
+exit:
+  ret void
+}
+
+define void @pad_double_nd(
+    ptr %input, ptr %output, ptr %shape, ptr %new_shape,
+    ptr %left_pad, i32 %dims, double %value) {
+entry:
+  br label %output.product.header
+
+output.product.header:
+  %output.dimension = phi i32 [ 0, %entry ], [ %output.dimension.next, %output.product.body ]
+  %total.out = phi i32 [ 1, %entry ], [ %total.out.next, %output.product.body ]
+  %output.product.continue = icmp slt i32 %output.dimension, %dims
+  br i1 %output.product.continue, label %output.product.body, label %fill.header
+
+output.product.body:
+  %output.dimension64 = sext i32 %output.dimension to i64
+  %output.extent.ptr = getelementptr inbounds i32, ptr %new_shape, i64 %output.dimension64
+  %output.extent = load i32, ptr %output.extent.ptr, align 4
+  %total.out.next = mul nsw i32 %total.out, %output.extent
+  %output.dimension.next = add nsw i32 %output.dimension, 1
+  br label %output.product.header
+
+fill.header:
+  %fill.index = phi i32 [ 0, %output.product.header ], [ %fill.index.next, %fill.body ]
+  %fill.continue = icmp slt i32 %fill.index, %total.out
+  br i1 %fill.continue, label %fill.body, label %input.product.header
+
+fill.body:
+  %fill.index64 = sext i32 %fill.index to i64
+  %fill.ptr = getelementptr inbounds double, ptr %output, i64 %fill.index64
+  store double %value, ptr %fill.ptr, align 8
+  %fill.index.next = add nsw i32 %fill.index, 1
+  br label %fill.header
+
+input.product.header:
+  %input.dimension = phi i32 [ 0, %fill.header ], [ %input.dimension.next, %input.product.body ]
+  %input.size = phi i32 [ 1, %fill.header ], [ %input.size.next, %input.product.body ]
+  %input.product.continue = icmp slt i32 %input.dimension, %dims
+  br i1 %input.product.continue, label %input.product.body, label %copy.header
+
+input.product.body:
+  %input.dimension64 = sext i32 %input.dimension to i64
+  %input.extent.ptr = getelementptr inbounds i32, ptr %shape, i64 %input.dimension64
+  %input.extent = load i32, ptr %input.extent.ptr, align 4
+  %input.size.next = mul nsw i32 %input.size, %input.extent
+  %input.dimension.next = add nsw i32 %input.dimension, 1
+  br label %input.product.header
+
+copy.header:
+  %input.index = phi i32 [ 0, %input.product.header ], [ %input.index.next, %copy.store ]
+  %copy.continue = icmp slt i32 %input.index, %input.size
+  br i1 %copy.continue, label %coordinate.entry, label %exit
+
+coordinate.entry:
+  %last.dimension = sub nsw i32 %dims, 1
+  br label %coordinate.header
+
+coordinate.header:
+  %dimension = phi i32 [ %last.dimension, %coordinate.entry ], [ %dimension.next, %coordinate.body ]
+  %remaining = phi i32 [ %input.index, %coordinate.entry ], [ %remaining.next, %coordinate.body ]
+  %output.index = phi i32 [ 0, %coordinate.entry ], [ %output.index.next, %coordinate.body ]
+  %output.stride = phi i32 [ 1, %coordinate.entry ], [ %output.stride.next, %coordinate.body ]
+  %coordinate.continue = icmp sge i32 %dimension, 0
+  br i1 %coordinate.continue, label %coordinate.body, label %copy.store
+
+coordinate.body:
+  %dimension64 = sext i32 %dimension to i64
+  %shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %dimension64
+  %shape.value = load i32, ptr %shape.ptr, align 4
+  %coordinate = srem i32 %remaining, %shape.value
+  %remaining.next = sdiv i32 %remaining, %shape.value
+  %left.ptr = getelementptr inbounds i32, ptr %left_pad, i64 %dimension64
+  %left.value = load i32, ptr %left.ptr, align 4
+  %padded.coordinate = add nsw i32 %coordinate, %left.value
+  %coordinate.offset = mul nsw i32 %padded.coordinate, %output.stride
+  %output.index.next = add nsw i32 %output.index, %coordinate.offset
+  %new.shape.ptr = getelementptr inbounds i32, ptr %new_shape, i64 %dimension64
+  %new.shape.value = load i32, ptr %new.shape.ptr, align 4
+  %output.stride.next = mul nsw i32 %output.stride, %new.shape.value
+  %dimension.next = sub nsw i32 %dimension, 1
+  br label %coordinate.header
+
+copy.store:
+  %input.index64 = sext i32 %input.index to i64
+  %output.index64 = sext i32 %output.index to i64
+  %input.ptr = getelementptr inbounds double, ptr %input, i64 %input.index64
+  %output.ptr = getelementptr inbounds double, ptr %output, i64 %output.index64
+  %input.value = load double, ptr %input.ptr, align 8
+  store double %input.value, ptr %output.ptr, align 8
+  %input.index.next = add nsw i32 %input.index, 1
+  br label %copy.header
 
 exit:
   ret void
@@ -511,6 +657,119 @@ loop.body:
   store double %result, ptr %out.ptr, align 8
   %i.next = add nsw i32 %i, 1
   br label %loop.header
+
+exit:
+  ret void
+}
+
+define void @broadcast_double(
+    ptr %input, ptr %output, ptr %input_shape, i32 %input_ndim,
+    ptr %output_shape, i32 %output_ndim) {
+entry:
+  br label %total.header
+
+total.header:
+  %total.axis = phi i32 [ 0, %entry ], [ %total.axis.next, %total.body ]
+  %total = phi i32 [ 1, %entry ], [ %total.next, %total.body ]
+  %total.continue = icmp slt i32 %total.axis, %output_ndim
+  br i1 %total.continue, label %total.body, label %flat.header
+
+total.body:
+  %total.axis64 = sext i32 %total.axis to i64
+  %total.extent.ptr = getelementptr inbounds i32, ptr %output_shape, i64 %total.axis64
+  %total.extent = load i32, ptr %total.extent.ptr, align 4
+  %total.next = mul nsw i32 %total, %total.extent
+  %total.axis.next = add nsw i32 %total.axis, 1
+  br label %total.header
+
+flat.header:
+  %flat = phi i32 [ 0, %total.header ], [ %flat.next, %flat.latch ]
+  %flat.continue = icmp slt i32 %flat, %total
+  br i1 %flat.continue, label %axis.header, label %exit
+
+axis.header:
+  %axis = phi i32 [ 0, %flat.header ], [ %axis.next, %axis.latch ]
+  %remaining = phi i32 [ %flat, %flat.header ], [ %remaining.next, %axis.latch ]
+  %input.flat = phi i32 [ 0, %flat.header ], [ %input.flat.next, %axis.latch ]
+  %axis.continue = icmp slt i32 %axis, %output_ndim
+  br i1 %axis.continue, label %output.stride.entry, label %store
+
+output.stride.entry:
+  %output.later.start = add nsw i32 %axis, 1
+  br label %output.stride.header
+
+output.stride.header:
+  %output.later = phi i32 [ %output.later.start, %output.stride.entry ], [ %output.later.next, %output.stride.body ]
+  %output.stride = phi i32 [ 1, %output.stride.entry ], [ %output.stride.next, %output.stride.body ]
+  %output.later.continue = icmp slt i32 %output.later, %output_ndim
+  br i1 %output.later.continue, label %output.stride.body, label %coordinate
+
+output.stride.body:
+  %output.later64 = sext i32 %output.later to i64
+  %output.extent.ptr = getelementptr inbounds i32, ptr %output_shape, i64 %output.later64
+  %output.extent = load i32, ptr %output.extent.ptr, align 4
+  %output.stride.next = mul nsw i32 %output.stride, %output.extent
+  %output.later.next = add nsw i32 %output.later, 1
+  br label %output.stride.header
+
+coordinate:
+  %coordinate.value = sdiv i32 %remaining, %output.stride
+  %remaining.next = srem i32 %remaining, %output.stride
+  %offset = sub nsw i32 %output_ndim, %input_ndim
+  %input.axis = sub nsw i32 %axis, %offset
+  %input.axis.valid = icmp sge i32 %input.axis, 0
+  br i1 %input.axis.valid, label %input.extent.block, label %axis.noinput
+
+input.extent.block:
+  %input.axis64 = sext i32 %input.axis to i64
+  %input.extent.ptr = getelementptr inbounds i32, ptr %input_shape, i64 %input.axis64
+  %input.extent = load i32, ptr %input.extent.ptr, align 4
+  %input.broadcast = icmp eq i32 %input.extent, 1
+  br i1 %input.broadcast, label %axis.noinput, label %input.stride.entry
+
+input.stride.entry:
+  %input.later.start = add nsw i32 %input.axis, 1
+  br label %input.stride.header
+
+input.stride.header:
+  %input.later = phi i32 [ %input.later.start, %input.stride.entry ], [ %input.later.next, %input.stride.body ]
+  %input.stride = phi i32 [ 1, %input.stride.entry ], [ %input.stride.next, %input.stride.body ]
+  %input.later.continue = icmp slt i32 %input.later, %input_ndim
+  br i1 %input.later.continue, label %input.stride.body, label %axis.input
+
+input.stride.body:
+  %input.later64 = sext i32 %input.later to i64
+  %input.later.extent.ptr = getelementptr inbounds i32, ptr %input_shape, i64 %input.later64
+  %input.later.extent = load i32, ptr %input.later.extent.ptr, align 4
+  %input.stride.next = mul nsw i32 %input.stride, %input.later.extent
+  %input.later.next = add nsw i32 %input.later, 1
+  br label %input.stride.header
+
+axis.input:
+  %input.contribution = mul nsw i32 %coordinate.value, %input.stride
+  %input.flat.with = add nsw i32 %input.flat, %input.contribution
+  br label %axis.latch
+
+axis.noinput:
+  br label %axis.latch
+
+axis.latch:
+  %input.flat.next = phi i32 [ %input.flat, %axis.noinput ], [ %input.flat.with, %axis.input ]
+  %axis.next = add nsw i32 %axis, 1
+  br label %axis.header
+
+store:
+  %input.flat64 = sext i32 %input.flat to i64
+  %flat64 = sext i32 %flat to i64
+  %input.ptr = getelementptr inbounds double, ptr %input, i64 %input.flat64
+  %output.ptr = getelementptr inbounds double, ptr %output, i64 %flat64
+  %value = load double, ptr %input.ptr, align 8
+  store double %value, ptr %output.ptr, align 8
+  br label %flat.latch
+
+flat.latch:
+  %flat.next = add nsw i32 %flat, 1
+  br label %flat.header
 
 exit:
   ret void
@@ -1740,6 +1999,12 @@ TRANSLATIONS = (
         "elementwise conditional selection",
     ),
     CBackendLLVMSSA(
+        "broadcast_double",
+        "broadcast_double",
+        ("broadcast_to", "expand"),
+        "row-major singleton-axis broadcast materialization",
+    ),
+    CBackendLLVMSSA(
         "reduce_dim_double",
         "reduce_dim_double",
         ("sum", "prod", "min", "max", "any", "all"),
@@ -2640,6 +2905,58 @@ def covered_operations() -> frozenset[str]:
     )
 
 
+@lru_cache(maxsize=1)
+def c_backend_repository_ssa_reference():
+    """Return the C computational core as one repository-SSA code reference.
+
+    The C functions and handwritten LLVM are provenance.  The returned object
+    contains only Turing repository SSA and canonical operation→entrypoint
+    references; it cannot execute or dispatch tensor operations.
+    """
+
+    from ....transmogrifier.tensor_ssa_reference import (
+        SSATensorCodeReference,
+        SSATensorOperationReference,
+    )
+    from .llvm_repository_ssa import import_llvm_to_repository_ssa
+
+    imported = import_llvm_to_repository_ssa(
+        LLVM_SSA_MODULE,
+        include_declarations=False,
+    )
+    if not imported.complete:
+        raise ValueError(imported.shortfall_report())
+    for symbol, output_index in C_SSA_OUTPUT_ARGUMENTS.items():
+        function = imported.module.functions[symbol]
+        output = function.args[int(output_index)]
+        function.metadata["named_outputs"] = (("out", int(output.id)),)
+        function.metadata["ssa_output_argument"] = int(output_index)
+    for symbol, argument_indices in C_SSA_I32_POINTER_ARGUMENTS.items():
+        function = imported.module.functions[symbol]
+        for argument_index in argument_indices:
+            function.args[int(argument_index)].dtype = "int32"
+    entrypoints_by_op: dict[str, list[str]] = {}
+    for translation in TRANSLATIONS:
+        for operation in translation.abstract_tensor_operations:
+            entrypoints_by_op.setdefault(str(operation), []).append(
+                str(translation.llvm_symbol)
+            )
+    operations = {
+        operation: SSATensorOperationReference(
+            operation,
+            tuple(dict.fromkeys(entrypoints)),
+        )
+        for operation, entrypoints in entrypoints_by_op.items()
+    }
+    return SSATensorCodeReference(
+        "c-backend-computational-core",
+        imported.module,
+        operations,
+        "c_backend_llvm_ssa.LLVM_SSA_MODULE",
+        C_SSA_EXTERNAL_PRIMITIVES,
+    )
+
+
 def c_dispatch_operations() -> frozenset[str]:
     """Operations in the real C backend's scalar opcode dictionaries.
 
@@ -2651,6 +2968,22 @@ def c_dispatch_operations() -> frozenset[str]:
 
     binary, unary = _c_backend_operator_codes()
     return frozenset(binary) | frozenset(unary)
+
+
+def c_tensor_opcode(operation: str) -> tuple[str, int] | None:
+    """Return ``(kind, fixed opcode)`` for one scalar C tensor operation."""
+
+    binary, unary = _c_backend_operator_codes()
+    name = str(operation)
+    if name in binary:
+        opcode_name = binary[name]
+        kind = "binary"
+    elif name in unary:
+        opcode_name = unary[name]
+        kind = "unary"
+    else:
+        return None
+    return kind, C_TENSOR_OPCODE_ORDER.index(opcode_name)
 
 
 def validate_translation_table(
@@ -2692,11 +3025,16 @@ __all__ = [
     "TapeLLVMModule",
     "TapeLLVMShortfall",
     "C_TENSOR_OPCODE_ORDER",
+    "C_SSA_OUTPUT_ARGUMENTS",
+    "C_SSA_I32_POINTER_ARGUMENTS",
+    "C_SSA_EXTERNAL_PRIMITIVES",
     "LLVM_SSA_MODULE",
     "PRECOMPILE_INTERNAL_OPERATORS",
     "TRANSLATIONS",
     "c_dispatch_operations",
+    "c_tensor_opcode",
     "covered_operations",
+    "c_backend_repository_ssa_reference",
     "discover_c_backend_functions",
     "extract_c_function",
     "extract_llvm_function",

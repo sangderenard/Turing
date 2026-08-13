@@ -377,6 +377,7 @@ class MachineTranslatedOperation:
     execute: Callable[[MachineExecutionState], MachineExecutionResult] = field(
         repr=False, compare=False,
     )
+    symbolic_effect: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -528,6 +529,8 @@ class MachineExecutionOrchestrator:
     def _translate_operation(self, instruction: Any) -> MachineTranslatedOperation:
         """Pre-bind the hot non-control dispatch performed by ``step``."""
 
+        from .machine_symbolic_effects import translated_symbolic_effect
+
         semantic = instruction.semantic
         if self._ends_translated_block(semantic):
             execute = lambda state: self._execute_decoded(state, instruction)
@@ -564,6 +567,7 @@ class MachineExecutionOrchestrator:
                     ))
         return MachineTranslatedOperation(
             int(instruction.address), instruction, execute,
+            translated_symbolic_effect(instruction),
         )
 
     def _instruction_bytes_match(
@@ -637,15 +641,12 @@ class MachineExecutionOrchestrator:
                         region.base // 4096, (region.end + 4095) // 4096,
                     ))
         executable_pages = self._executable_pages | dynamic_executable_pages
-        touched: set[int] = set()
-        for address, before, after in _memory_changed_ranges(source.memory, result.state.memory):
-            length = max(len(before or b""), len(after or b""))
-            if not length:
-                continue
-            touched.update(
-                page for page in range(address // 4096, (address + length - 1) // 4096 + 1)
-                if page in executable_pages
+        touched = {
+            page for page in _memory_changed_pages(
+                source.memory, result.state.memory,
             )
+            if page in executable_pages
+        }
         if not touched:
             return result
         system_state = dict(result.state.system_state)
@@ -676,6 +677,23 @@ class MachineExecutionOrchestrator:
         return self._reconcile_execution_result(
             state, self._step_decoded(state, instruction),
         )
+
+    def execute_decoded(
+        self, state: MachineExecutionState, instruction: Any,
+    ) -> MachineExecutionResult:
+        """Apply one already-framed instruction to the live machine state.
+
+        This is the public insertion boundary for instruction-stream heads.
+        The caller owns framing and exact decoding; this executor owns all
+        architectural effects and executable-page reconciliation.  It is not
+        a native-call escape hatch and it does not bypass machine semantics.
+        """
+
+        if int(instruction.address) != int(state.pc):
+            raise ValueError(
+                "decoded instruction address does not match the live program counter"
+            )
+        return self._execute_decoded(state, instruction)
 
     def translated_block(
         self,
@@ -747,18 +765,22 @@ class MachineExecutionOrchestrator:
             return (self.step(state),)
         active = state
         results: list[MachineExecutionResult] = []
+        generation = self._translation_generation
         for operation in block.operations[:limit]:
             if active.pc != operation.address:
-                break
-            if not self._instruction_bytes_match(active, operation.instruction):
-                if self._translated_blocks.pop(block.entry_address, None) is not None:
-                    self._translation_generation += 1
                 break
             result = operation.execute(active)
             results.append(result)
             if result.status is not MachineExecutionStatus.RUNNING:
                 break
             active = result.state
+            # The block was validated against guest memory as a unit before
+            # execution.  Reconciliation increments the generation for any
+            # write to executable memory; stop before dispatching a possibly
+            # modified successor rather than rereading every instruction's
+            # bytes on the normal path.
+            if self._translation_generation != generation:
+                break
         return tuple(results) or (self.step(state),)
 
     def recompile_block_wasm(
@@ -1735,6 +1757,34 @@ def _memory_equal(left: Mapping[int, int], right: Mapping[int, int]) -> bool:
             and left_pages == right_pages
         )
     return left == right
+
+
+def _memory_changed_pages(
+    before: Mapping[int, int], after: Mapping[int, int],
+) -> tuple[int, ...]:
+    """Return changed 4 KiB pages, using immediate COW provenance when valid."""
+
+    if before is after:
+        return ()
+    before_pages = getattr(before, "pages", None)
+    after_pages = getattr(after, "pages", None)
+    before_page_size = getattr(before, "page_size", None)
+    after_page_size = getattr(after, "page_size", None)
+    if (
+        before_pages is not None
+        and after_pages is not None
+        and before_page_size == after_page_size == 4096
+        and getattr(after, "_parent_pages_identity", 0) == id(before_pages)
+    ):
+        return tuple(getattr(after, "_changed_pages", ()))
+    changed: set[int] = set()
+    for address, old, new in _memory_changed_ranges(before, after):
+        length = max(len(old or b""), len(new or b""))
+        if length:
+            changed.update(range(
+                address // 4096, (address + length - 1) // 4096 + 1,
+            ))
+    return tuple(sorted(changed))
 
 
 def _memory_changed_ranges(

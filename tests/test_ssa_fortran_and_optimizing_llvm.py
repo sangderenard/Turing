@@ -51,6 +51,40 @@ exit:
 """
 
 
+def test_fortran_call_folds_nested_row_address_to_array_section():
+    child = SSAValue(0, "int", (12,))
+    offset = SSAValue(1, "int")
+    row = SSAValue(2, "int", (3,))
+    callee_row = SSAValue(3, "int", (3,))
+    callee = Function(
+        "consume_row",
+        [callee_row],
+        {"entry": BasicBlock("entry", [], None)},
+    )
+    caller = Function(
+        "select_row",
+        [child, offset],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("GetElementPtr", [child, offset], row),
+                    Instr(
+                        "Call", [row], None,
+                        attributes={"callee": "consume_row"},
+                    ),
+                ],
+                None,
+            )
+        },
+    )
+
+    source = emit_module({callee.name: callee, caller.name: caller}).source
+
+    assert "call consume_row(" in source
+    assert "t0(t1 + 1)" in source
+
+
 def _elementwise_function():
     a = SSAValue(0, "float64", (64,))
     b = SSAValue(1, "float64", (64,))
@@ -115,6 +149,76 @@ def _loop_function():
         "exit": BasicBlock("exit", [Instr("Ret", [], SSAValue(93))]),
     }
     return Function("accumulate", [x, n], blocks), acc
+
+
+def test_fortran_emits_integer_bitwise_operators_without_numeric_projection():
+    left = SSAValue(0, "int64")
+    right = SSAValue(1, "int64")
+    union = SSAValue(2, "int64")
+    function = Function(
+        "bitwise_union",
+        [left, right],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("bitor", [left, right], union),
+                    Instr("Ret", [union], SSAValue(3)),
+                ],
+            )
+        },
+    )
+
+    source = emit_function(function, outputs=[union]).source
+
+    assert "ior(" in source
+    assert "real(ior(" not in source
+
+
+def test_fortran_nested_bitwise_operands_use_one_integer_kind():
+    left = SSAValue(0, "int")
+    right = SSAValue(1, "int")
+    mask = SSAValue(2, "float64")
+    union = SSAValue(3, "int")
+    inverted = SSAValue(4, "int")
+    result = SSAValue(5, "int")
+    function = Function(
+        "nested_bits",
+        [left, right, mask],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("bitor", [left, right], union),
+                    Instr("invert", [mask], inverted),
+                    Instr("bitand", [union, inverted], result),
+                    Instr("Ret", [result], SSAValue(6)),
+                ],
+            )
+        },
+    )
+
+    source = emit_function(function, outputs=[result]).source
+
+    assert "ior(int(t0, c_int64_t), int(t1, c_int64_t))" in source
+    assert "iand(int(" in source
+
+
+def test_repository_integer_or_is_not_coerced_through_logical_merge():
+    left = SSAValue(0, "int", ())
+    right = SSAValue(1, "int", ())
+    result = SSAValue(2, "int", ())
+    function = Function(
+        "integer_or",
+        [left, right],
+        {"entry": BasicBlock("entry", [Instr("Or", [left, right], result)])},
+    )
+
+    emitted = emit_function(function, outputs=[result])
+
+    assert emitted.complete, [item.format() for item in emitted.shortfalls]
+    assert "ior(" in emitted.source
+    assert "merge(" not in emitted.source
 
 
 # ---------------------------------------------------------------- Fortran
@@ -662,6 +766,192 @@ def test_unsupported_operation_is_reported_not_guessed():
     assert not subroutine.complete
     assert subroutine.shortfalls[0].op == "einsum"
     assert "UNSUPPORTED einsum" in subroutine.source
+
+
+def test_shapeless_axis_operation_is_reported_instead_of_dividing_by_zero():
+    value = SSAValue(0, "float64", ())
+    result = SSAValue(1, "float64", ())
+    function = Function(
+        "shapeless_stack",
+        [value],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [Instr(
+                    "Call",
+                    [value],
+                    result,
+                    attributes={"tensor_operation": "stack", "dim": 0},
+                )],
+            )
+        },
+    )
+
+    subroutine = emit_function(function, outputs=[result])
+
+    assert not subroutine.complete
+    assert subroutine.shortfalls[0].op == "stack"
+    assert "UNSUPPORTED Call" in subroutine.source
+
+
+def test_control_markers_and_validation_failure_emit_without_external_symbols():
+    function = Function(
+        "guarded_deployment",
+        [],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("Deploy", [], None),
+                    Instr("Join", [], None),
+                    Instr(
+                        "Call",
+                        [],
+                        None,
+                        attributes={
+                            "callee": "turing_validation_error",
+                            "error_code": 7,
+                        },
+                    ),
+                    Instr("Ret", [], SSAValue(0)),
+                ],
+            )
+        },
+        metadata={"control_ir": True},
+    )
+
+    module = emit_module(IRModule({function.name: function}))
+
+    assert module.complete, [item.format() for item in module.shortfalls]
+    assert "! Deploy deployment boundary" in module.source
+    assert "! Join deployment boundary" in module.source
+    assert "error stop 7" in module.source
+    assert "call turing_validation_error" not in module.source
+
+
+def test_extent_uses_inferred_rank_for_a_lossy_control_value_occurrence():
+    resident = SSAValue(0, "float64", (8,))
+    rank_lost_reference = SSAValue(0, "float64", ())
+    extent = SSAValue(1, "int32", ())
+    function = Function(
+        "resident_extent",
+        [resident],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr(
+                        "Call",
+                        [rank_lost_reference],
+                        extent,
+                        attributes={"tensor_operation": "extent", "dim": 0},
+                    ),
+                    Instr("Ret", [], SSAValue(2)),
+                ],
+            )
+        },
+    )
+
+    subroutine = emit_function(function, outputs=[extent])
+
+    assert subroutine.complete, [item.format() for item in subroutine.shortfalls]
+    assert "t1 = size(t0, 1)" in subroutine.source
+
+
+def test_dynamic_array_extent_is_an_explicit_pointer_length_abi_pair():
+    values = SSAValue(0, "float64", ())
+    extent = SSAValue(1, "int32", ())
+    function = Function(
+        "dynamic_extent",
+        [values],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr(
+                        "Call",
+                        [values],
+                        extent,
+                        attributes={"tensor_operation": "extent", "dim": 0},
+                    ),
+                    Instr("Ret", [], SSAValue(2)),
+                ],
+            )
+        },
+    )
+
+    # Whole-object assembly supplies this set from address use across the
+    # method.  Exercise the per-function emitter directly with that fact too.
+    subroutine = emit_function(
+        function,
+        outputs=[extent],
+        array_base_ids={values.id},
+    )
+
+    assert subroutine.complete, [item.format() for item in subroutine.shortfalls]
+    assert "extent_dynamic_0" in subroutine.extent_names
+    assert "intent(in) :: t0(*)" in subroutine.source
+    assert "t1 = extent_dynamic_0" in subroutine.source
+
+
+def test_resident_representation_boundaries_and_native_transpose_emit_directly():
+    matrix = SSAValue(0, "float64", (2, 3))
+    detached = SSAValue(1, "float64", (2, 3))
+    host = SSAValue(2, "float64", (2, 3))
+    listed = SSAValue(3, "float64", (2, 3))
+    transposed = SSAValue(4, "float64", (3, 2))
+    function = Function(
+        "representation_boundaries",
+        [matrix],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("Call", [matrix], detached, attributes={"tensor_operation": "detach"}),
+                    Instr("Call", [detached], host, attributes={"tensor_operation": "cpu"}),
+                    Instr("Call", [host], listed, attributes={"tensor_operation": "tolist"}),
+                    Instr(
+                        "Call",
+                        [listed],
+                        transposed,
+                        attributes={
+                            "tensor_operation": "transpose",
+                            "dim0": 0,
+                            "dim1": 1,
+                        },
+                    ),
+                    Instr("Ret", [], SSAValue(5)),
+                ],
+            )
+        },
+    )
+
+    subroutine = emit_function(function, outputs=[transposed])
+
+    assert subroutine.complete, [item.format() for item in subroutine.shortfalls]
+    assert "transpose(t0)" in subroutine.source
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expression"),
+    [("bool", "(.not. t0)"), ("int32", "not(t0)")],
+)
+def test_invert_uses_the_dtype_appropriate_fortran_operation(dtype, expression):
+    source = SSAValue(0, dtype, ())
+    result = SSAValue(1, dtype, ())
+    function = Function(
+        "invert_value",
+        [source],
+        {"entry": BasicBlock("entry", [Instr(
+            "Call", [source], result,
+            attributes={"tensor_operation": "invert"},
+        )])},
+    )
+
+    subroutine = emit_function(function, outputs=[result])
+
+    assert subroutine.complete, [item.format() for item in subroutine.shortfalls]
+    assert expression in subroutine.source
 
 
 @pytest.mark.skipif(

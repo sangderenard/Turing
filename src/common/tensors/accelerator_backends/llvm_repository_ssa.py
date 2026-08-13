@@ -41,7 +41,7 @@ _DIRECT_HANDLERS = {
     "xor": Handler.Xor,
     "shl": Handler.Shl,
     "lshr": Handler.Shr,
-    "ashr": Handler.Shr,
+    "ashr": Handler.AShr,
     "load": Handler.Load,
     "store": Handler.Store,
     "alloca": Handler.Alloca,
@@ -67,13 +67,13 @@ _INTEGER_PREDICATES = {
     "eq": Handler.Eq,
     "ne": Handler.Ne,
     "slt": Handler.Lt,
-    "ult": Handler.Lt,
+    "ult": Handler.ULt,
     "sle": Handler.Le,
-    "ule": Handler.Le,
+    "ule": Handler.ULe,
     "sgt": Handler.Gt,
-    "ugt": Handler.Gt,
+    "ugt": Handler.UGt,
     "sge": Handler.Ge,
-    "uge": Handler.Ge,
+    "uge": Handler.UGe,
 }
 
 _FLOAT_PREDICATES = {
@@ -156,13 +156,17 @@ class _FunctionImporter:
             arguments.append(value)
         for block in self.llvm_function.blocks:
             for instruction in block.instructions:
+                # Terminators have LLVM type ``void`` but still carry scalar
+                # operands: switch case literals and ``ret`` values are the
+                # two important examples.  Register their constants before
+                # deciding whether the instruction itself defines a value.
+                for operand in instruction.operands:
+                    self._register_constant(operand)
                 if str(instruction.type) == "void":
                     continue
                 self.values[self._value_key(instruction)] = self.fresh(
                     str(instruction.type)
                 )
-                for operand in instruction.operands:
-                    self._register_constant(operand)
         return arguments
 
     def _register_constant(self, operand: Any) -> None:
@@ -359,8 +363,24 @@ class _FunctionImporter:
                     self._switch(instruction, block)
                 else:
                     self._ordinary_instruction(instruction, block)
+        return_type = str(self.llvm_function.global_value_type).split(
+            "(", 1
+        )[0].strip()
+        metadata: dict[str, Any] = {
+            "llvm_argument_names": tuple(
+                str(argument.name) for argument in self.llvm_function.arguments
+            ),
+            "llvm_return_dtype": return_type,
+        }
+        if return_type != "void":
+            metadata["return_value"] = self.fresh(return_type)
         return (
-            Function(str(self.llvm_function.name), arguments, self.blocks),
+            Function(
+                str(self.llvm_function.name),
+                arguments,
+                self.blocks,
+                metadata=metadata,
+            ),
             tuple(self.shortfalls),
             self.next_value_id,
         )

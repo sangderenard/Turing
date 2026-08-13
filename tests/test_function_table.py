@@ -10,6 +10,11 @@ from src.common.tensors.topological_reducer import (
 from src.transmogrifier.function_table import (
     FunctionResolutionState,
     FunctionTable,
+    ParameterAccess,
+    ParameterContract,
+    ParameterScope,
+    ParameterStorage,
+    ParameterTransfer,
 )
 from src.transmogrifier.graph.graph_deep_compiler import GraphDeepCompiler
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
@@ -30,6 +35,118 @@ def test_function_table_exposes_recursive_resolution_as_one_backedge():
     table.resolve_graph(reference, graph)
     assert entry.state == FunctionResolutionState.RESOLVED
     assert entry.graph is graph
+
+
+def test_function_entry_carries_ordered_raw_memory_parameter_contracts():
+    table = FunctionTable()
+    reference = table.declare(
+        "remove_node",
+        parameter_contracts=(
+            ParameterContract(
+                "graph",
+                transfer=ParameterTransfer.ALIAS,
+                access=ParameterAccess.INOUT,
+                storage=ParameterStorage.TABLE,
+                scope=ParameterScope.CALLER,
+            ),
+            ParameterContract("node_id"),
+        ),
+    )
+
+    graph, node_id = table.entry(reference).parameter_contracts
+    assert graph == ParameterContract(
+        "graph",
+        transfer=ParameterTransfer.ALIAS,
+        access=ParameterAccess.INOUT,
+        storage=ParameterStorage.TABLE,
+        scope=ParameterScope.CALLER,
+    )
+    assert node_id == ParameterContract("node_id")
+
+
+def test_parameter_contracts_accept_checkpoint_friendly_string_flags():
+    table = FunctionTable()
+    reference = table.declare(
+        "extend",
+        parameter_contracts=(
+            {
+                "name": "destination",
+                "transfer": "alias",
+                "access": "inout",
+                "storage": "span",
+                "scope": "caller",
+            },
+        ),
+    )
+
+    contract = table.entry(reference).parameter_contracts[0]
+    assert contract.transfer is ParameterTransfer.ALIAS
+    assert contract.access is ParameterAccess.INOUT
+    assert contract.storage is ParameterStorage.SPAN
+    assert contract.scope is ParameterScope.CALLER
+
+
+def test_redeclaration_preserves_contracts_unless_explicitly_replaced():
+    table = FunctionTable()
+    reference = table.declare(
+        "consume",
+        qualified_name="module.consume",
+        parameter_contracts=(ParameterContract("value"),),
+    )
+
+    assert table.declare(
+        "consume",
+        qualified_name="module.consume",
+        metadata={"source_node": 10},
+    ) == reference
+    assert table.entry(reference).parameter_contracts == (
+        ParameterContract("value"),
+    )
+
+    table.set_parameter_contracts(
+        reference,
+        (
+            ParameterContract(
+                "value",
+                transfer="copy",
+                storage="record",
+                scope="retained",
+            ),
+        ),
+    )
+    assert table.entry(reference).parameter_contracts[0].transfer is (
+        ParameterTransfer.COPY
+    )
+
+
+def test_parameter_contract_names_are_unique_within_a_signature():
+    table = FunctionTable()
+
+    try:
+        table.declare(
+            "invalid",
+            parameter_contracts=(
+                ParameterContract("value"),
+                ParameterContract("value"),
+            ),
+        )
+    except ValueError as exc:
+        assert "unique" in str(exc)
+    else:
+        raise AssertionError("duplicate parameter contracts were accepted")
+
+
+def test_function_entry_defaults_contracts_when_loading_an_old_checkpoint():
+    table = FunctionTable()
+    reference = table.declare("legacy")
+    entry = table.entry(reference)
+    old_state = dict(entry.__dict__)
+    old_state.pop("parameter_contracts")
+
+    restored = object.__new__(type(entry))
+    restored.__setstate__(old_state)
+
+    assert restored.parameter_contracts == ()
 
 
 def test_reference_by_bare_name_silently_picks_the_last_declared_collision():
@@ -149,6 +266,12 @@ def render_value(x):
     assert not any(
         data.get("type") == "keyword"
         for _node_id, data in render_graph.G.nodes(data=True)
+    )
+    assert not any(
+        data.get("type") == "StaticReference"
+        and render_graph.G.out_degree(node_id) == 0
+        and node_id not in render_graph.roots
+        for node_id, data in render_graph.G.nodes(data=True)
     )
 
     definitions = GraphDeepCompiler.assemble_function_table(

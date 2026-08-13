@@ -542,6 +542,43 @@ def entry(value):
     assert not (checkpoint_directory / "captured_program.json").exists()
 
 
+def test_complete_method_lowering_skips_captured_hierarchy_projection(
+    monkeypatch,
+):
+    from src.common.tensors.accelerator_backends import aot_compile
+
+    def reject_projection(_shell):
+        raise AssertionError("captured hierarchy projection must not run")
+
+    monkeypatch.setattr(
+        aot_compile,
+        "_build_hierarchical_glsl_artifact",
+        reject_projection,
+    )
+    progress = []
+    compilation = aot_compile.compile_ast_aot(
+        """
+def increment(value):
+    return value + 1
+
+def entry(value):
+    return increment(value)
+""",
+        "entry",
+        {"value": 1},
+        backend="fortran",
+        precompile_only=True,
+        project_captured_hierarchy=False,
+        progress=progress.append,
+    )
+
+    assert compilation.deployment is not None
+    assert any(
+        "skipping captured-region hierarchy projection" in message
+        for message in progress
+    )
+
+
 def test_aot_checkpoint_reports_why_a_plan_cannot_resume(tmp_path):
     source = """
 def entry(value):

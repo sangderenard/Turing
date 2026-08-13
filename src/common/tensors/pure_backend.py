@@ -1663,4 +1663,27 @@ class PurePythonTensorOperations(AbstractTensor):
 
     # _tensor_from_list is provided centrally by AbstractTensor; do not duplicate here.
 
+
+def pure_python_tensor_code_references():
+    """Return canonical tensor operations mapped to their Python source.
+
+    These references are compiler inputs.  They are not runtime callbacks:
+    ``ProcessGraph.build_from_ast`` uses each callable only to retrieve and
+    ingest its AST definition, after which the normal FunctionTable graph and
+    SSA lowering own the implementation.
+    """
+
+    from .operator_catalog import CANONICAL_ABSTRACT_TENSOR_OPERATORS
+
+    references = {}
+    for canonical_op in sorted(CANONICAL_ABSTRACT_TENSOR_OPERATORS):
+        implementation = getattr(
+            PurePythonTensorOperations,
+            f"{canonical_op}_",
+            None,
+        )
+        if callable(implementation):
+            references[str(canonical_op)] = implementation
+    return references
+
 register_backend("pure_python", PurePythonTensorOperations)

@@ -90,6 +90,10 @@ def compile_source_autogenesis(
 ) -> AutogenesisCompilation:
     """Compile once while recording exact cross-IR component lineage."""
 
+    from .compiler_entrypoints import warn_legacy_source_compiler
+
+    warn_legacy_source_compiler("compile_source_autogenesis")
+
     from ..common.tensors.accelerator_backends.aot_compile import compile_ast_aot
     from .glsl_deployment_strategy import _walk_planned_shells
     from .precompile_to_ssa import lower_precompile_and_control_to_ssa

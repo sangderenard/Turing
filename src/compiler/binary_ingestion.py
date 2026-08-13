@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag
+from hashlib import sha256
 import operator
 from types import MappingProxyType
 from typing import Iterable
@@ -43,12 +44,14 @@ from .x86_tensor_read_head import (
     ReadPhase,
     ReadStatus,
     X86EncodingRow,
+    X86EncodingFields,
     X86ReadBatch,
     X86ReadHeadConfig,
     X86ReadHeadState,
     X86ReversibleReadHead,
     X86TensorReadHead,
     controlled_x86_64_read_head_config,
+    controlled_x86_64_read_head_profile,
 )
 
 
@@ -101,6 +104,127 @@ class BinaryEquivalence:
     target_tokens: tuple[str, ...]
     coverage: str
     constraints: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReverseBinarySelection:
+    """An elective, proof-gated repository-SSA to ISA selection.
+
+    These records do not participate in ingestion and never rewrite SSA on
+    their own.  A host lowering may request candidates only after proving all
+    required facts.  This keeps exact machine-state recovery distinct from a
+    later decision to select a denser machine encoding.
+    """
+
+    source_tokens: tuple[str, ...]
+    target_token: int
+    encoded_form: str
+    lane_count: int
+    lane_width: int
+    required_facts: frozenset[str]
+    preserved_state: frozenset[str]
+    canonical_meaning: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReverseBinarySelectionPlan:
+    """One audited decision to retain or newly select a PE instruction.
+
+    Exact-byte retention is available only when every SSA instruction in the
+    group carries the same decoded address/token/bytes provenance and those
+    bytes decode back to the selected token.  Transformed SSA can still select
+    an encoding template, but cannot claim byte identity.
+    """
+
+    selection: ReverseBinarySelection
+    source_operations: tuple[str, ...]
+    source_value_ids: tuple[int, ...]
+    machine_address: int | None
+    encoded: bytes | None
+    mode: str
+    witness: str
+
+
+SSA_PE_REVERSE_SELECTION_TABLE: tuple[ReverseBinarySelection, ...] = (
+    ReverseBinarySelection(
+        (Handler.Add.value,),
+        int(X86InstructionToken.ADD_R64_IMM8),
+        "REX.W 83 /0 ib", 1, 64,
+        frozenset({
+            "register-or-memory-destination", "signed-immediate-8",
+            "width-64", "modulo-2^64", "all-add-flags-exact",
+        }),
+        frozenset({"xmm", "mxcsr"}),
+        "64-bit modular add of a sign-extended immediate with exact integer flags",
+    ),
+    ReverseBinarySelection(
+        (Handler.VectorAddModulo.value,),
+        int(X86InstructionToken.PADDQ_XMM_XMMM128),
+        "66 0f d4 /r", 2, 64,
+        frozenset({
+            "two-independent-lanes",
+            "modulo-2^64",
+            "no-cross-lane-carry",
+            "xmm-destination-available",
+        }),
+        frozenset({"rflags", "mxcsr", "upper-xmm-outside-128"}),
+        "two independent repository-SSA uint64 modular additions",
+    ),
+    ReverseBinarySelection(
+        (Handler.VectorSubtractModulo.value,),
+        int(X86InstructionToken.PSUBQ_XMM_XMMM128),
+        "66 0f fb /r", 2, 64,
+        frozenset({
+            "two-independent-lanes",
+            "modulo-2^64",
+            "no-cross-lane-borrow",
+            "xmm-destination-available",
+        }),
+        frozenset({"rflags", "mxcsr", "upper-xmm-outside-128"}),
+        "two independent repository-SSA uint64 modular subtractions",
+    ),
+    ReverseBinarySelection(
+        (Handler.StridedMemoryCopy.value,),
+        int(X86InstructionToken.REP_MOVSQ),
+        "f3 REX.W a5", 1, 64,
+        frozenset({
+            "source-register-rsi", "destination-register-rdi",
+            "count-register-rcx", "direction-flag-df",
+            "ordered-overlap-semantics", "qword-elements",
+        }),
+        frozenset({"rflags-except-df", "xmm", "mxcsr"}),
+        "ordered RCX-counted qword copy from RSI to RDI with DF stride",
+    ),
+    ReverseBinarySelection(
+        (
+            Handler.AtomicExchangeAddObserved.value,
+            Handler.AtomicExchangeAddMemory.value,
+        ),
+        int(X86InstructionToken.XADD_RM32_R32),
+        "f0 0f c1 /r", 1, 32,
+        frozenset({
+            "memory-destination", "register-source", "width-32",
+            "sequentially-consistent", "locked",
+            "source-receives-observed", "all-add-flags-exact",
+        }),
+        frozenset({"xmm", "mxcsr"}),
+        "locked 32-bit atomic exchange-add with observed source result",
+    ),
+    ReverseBinarySelection(
+        (
+            Handler.Shr.value, Handler.And.value,
+            Handler.Shl.value, Handler.Xor.value,
+        ),
+        int(X86InstructionToken.BTC_RM32_IMM8),
+        "0f ba /7 ib", 1, 32,
+        frozenset({
+            "width-32", "immediate-bit-index", "destination-bit-complement",
+            "cf-is-prior-bit", "other-flags-preserved",
+        }),
+        frozenset({"of", "sf", "zf", "af", "pf", "xmm", "mxcsr"}),
+        "32-bit selected-bit complement with prior bit copied to CF",
+    ),
+)
 
 
 PE_EQUIVALENCE_TABLE: tuple[BinaryEquivalence, ...] = (
@@ -819,7 +943,7 @@ X86_SSA_EQUIVALENCE_TABLE: tuple[BinaryEquivalence, ...] = (
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVE_R16_RM16), "66 0f 44 /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "16-bit conditional move", "requires ZF"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.ROL_RM8_IMM8), "c0 /0 ib", MachineSemanticToken.ROTATE_LEFT.name, BinaryLayer.MACHINE_SEMANTIC, ("rotate_left",), "8-bit immediate rotate", "count and flag semantics are explicit"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SCASB), "ae", MachineSemanticToken.STRING_COMPARE.name, BinaryLayer.MACHINE_SEMANTIC, ("scan_byte",), "compare AL against byte at RDI", "DF, flags, and RDI state are explicit"),
-    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.PSRLDQ_XMM_IMM8), "66 0f 73 /3 ib", MachineSemanticToken.VECTOR_SHIFT_RIGHT_LOGICAL.name, BinaryLayer.MACHINE_SEMANTIC, ("vector_byte_shift_right",), "128-bit XMM byte shift", "mandatory prefix and register-only destination"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.PSRLDQ_XMM_IMM8), "66 0f 73 /3 ib", MachineSemanticToken.VECTOR_SHIFT_RIGHT_LOGICAL.name, BinaryLayer.REPOSITORY_SSA, (Handler.Shr.value,), "128-bit XMM byte shift", "count is scaled by eight; counts at least sixteen produce zero; flags and MXCSR unchanged"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.ADD_RM16_IMM8), "66 83 /0 ib", MachineSemanticToken.INTEGER_ADD.name, BinaryLayer.REPOSITORY_SSA, (Handler.Add.value,), "16-bit immediate add", "writes flags"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SETLE_RM8), "0f 9e /0", MachineSemanticToken.CONDITIONAL_SET.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value, Handler.Trunc.value), "signed-less-or-equal byte", "requires ZF, SF, OF"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMPXCHG_RM64_R64), "f0 REX.W 0f b1 /r", MachineSemanticToken.ATOMIC_COMPARE_EXCHANGE.name, BinaryLayer.MACHINE_SEMANTIC, ("atomic_compare_exchange_64",), "locked 64-bit compare exchange", "memory ordering, RAX, destination, source, and flags are effects"),
@@ -833,7 +957,7 @@ X86_SSA_EQUIVALENCE_TABLE: tuple[BinaryEquivalence, ...] = (
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SHL_RM16_IMM8), "66 c1 /4 ib", MachineSemanticToken.SHIFT_LEFT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Shl.value,), "16-bit immediate shift", "count is masked and flags are written"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SHL_RM32_IMM8), "c1 /4 ib", MachineSemanticToken.SHIFT_LEFT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Shl.value,), "32-bit immediate shift", "count is masked and flags are written"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVBE_R32_RM32), "0f 46 /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "32-bit unsigned-below-or-equal move", "requires CF and ZF"),
-    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.REP_MOVSQ), "f3 REX.W a5", MachineSemanticToken.STRING_MOVE.name, BinaryLayer.MACHINE_SEMANTIC, ("repeat_move_qword",), "RCX-counted RSI-to-RDI move", "DF and versioned memory are explicit"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.REP_MOVSQ), "f3 REX.W a5", MachineSemanticToken.STRING_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.StridedMemoryCopy.value, Handler.Add.value, Handler.Mul.value), "RCX-counted RSI-to-RDI move", "ordered overlap behavior, DF, RCX, RSI, RDI, and versioned memory are explicit"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SETNS_RM8), "0f 99 /0", MachineSemanticToken.CONDITIONAL_SET.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value, Handler.Trunc.value), "nonnegative predicate byte", "requires SF"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.MOVSX_R64_RM16), "REX.W 0f bf /r", MachineSemanticToken.SIGN_EXTEND.name, BinaryLayer.REPOSITORY_SSA, (Handler.SExt.value,), "16-to-64-bit sign extension", "memory source width is 16 bits"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVLE_R32_RM32), "0f 4e /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "32-bit signed-less-or-equal move", "requires ZF, SF, OF"),
@@ -841,14 +965,14 @@ X86_SSA_EQUIVALENCE_TABLE: tuple[BinaryEquivalence, ...] = (
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.IMUL_R32_RM32_IMM8), "6b /r ib", MachineSemanticToken.INTEGER_MULTIPLY.name, BinaryLayer.REPOSITORY_SSA, (Handler.Mul.value,), "32-bit signed multiply with immediate", "writes CF and OF"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SHR_RM64_IMM8), "REX.W c1 /5 ib", MachineSemanticToken.SHIFT_RIGHT_LOGICAL.name, BinaryLayer.REPOSITORY_SSA, (Handler.Shr.value,), "64-bit logical shift", "count is masked and flags are written"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.OR_R8_RM8), "0a /r", MachineSemanticToken.BITWISE_OR.name, BinaryLayer.REPOSITORY_SSA, (Handler.Or.value,), "8-bit register destination", "legacy high-byte sources remain distinct"),
-    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.XADD_RM32_R32), "f0 0f c1 /r", MachineSemanticToken.ATOMIC_EXCHANGE_ADD.name, BinaryLayer.MACHINE_SEMANTIC, ("atomic_exchange_add_32",), "locked exchange-add", "memory order, both destinations, and flags are effects"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.XADD_RM32_R32), "f0 0f c1 /r", MachineSemanticToken.ATOMIC_EXCHANGE_ADD.name, BinaryLayer.REPOSITORY_SSA, (Handler.AtomicExchangeAddObserved.value, Handler.AtomicExchangeAddMemory.value, Handler.Add.value), "locked exchange-add", "sequential consistency, observed value, result memory, source register, and arithmetic flags are explicit"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.OR_EAX_IMM32), "0d id", MachineSemanticToken.BITWISE_OR.name, BinaryLayer.REPOSITORY_SSA, (Handler.Or.value,), "32-bit accumulator immediate OR", "writes flags"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.AND_R8_RM8), "22 /r", MachineSemanticToken.BITWISE_AND.name, BinaryLayer.REPOSITORY_SSA, (Handler.And.value,), "8-bit register destination", "legacy high-byte sources remain distinct"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.LOCK_ADD_RM8_R8), "f0 00 /r", MachineSemanticToken.ATOMIC_ADD.name, BinaryLayer.MACHINE_SEMANTIC, ("atomic_add_8",), "locked byte add", "memory order, destination, and flags are effects"),
-    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.MOVQ_RM64_XMM), "66 REX.W 0f 7e /r", MachineSemanticToken.VECTOR_MOVE.name, BinaryLayer.MACHINE_SEMANTIC, ("xmm_low64_store",), "low XMM qword to GPR or memory", "destination width is 64 bits"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.MOVQ_RM64_XMM), "66 REX.W 0f 7e /r", MachineSemanticToken.VECTOR_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Trunc.value, Handler.Store.value), "low XMM qword to GPR or memory", "low 64 encoded bits transfer to the authored GPR or versioned memory destination; flags and MXCSR unchanged"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.XCHG_RM64_R64), "REX.W 87 /r", MachineSemanticToken.EXCHANGE.name, BinaryLayer.MACHINE_SEMANTIC, ("exchange_64",), "64-bit exchange", "memory form is implicitly atomic"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.AND_RM16_IMM16), "66 81 /4 iw", MachineSemanticToken.BITWISE_AND.name, BinaryLayer.REPOSITORY_SSA, (Handler.And.value,), "16-bit immediate AND", "writes flags"),
-    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.BTC_RM32_IMM8), "0f ba /7 ib", MachineSemanticToken.BIT_TEST_COMPLEMENT.name, BinaryLayer.MACHINE_SEMANTIC, ("bit_test_complement",), "32-bit selected-bit complement", "writes prior bit to CF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.BTC_RM32_IMM8), "0f ba /7 ib", MachineSemanticToken.BIT_TEST_COMPLEMENT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Shr.value, Handler.And.value, Handler.Shl.value, Handler.Xor.value), "32-bit selected-bit complement", "addressed word, selected bit mutation, and prior bit in CF are explicit"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.DIV_RM64), "REX.W f7 /6", MachineSemanticToken.INTEGER_DIVIDE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Div.value,), "unsigned RDX:RAX division", "quotient, remainder, and trap are effects"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.OR_RM16_R16), "66 09 /r", MachineSemanticToken.BITWISE_OR.name, BinaryLayer.REPOSITORY_SSA, (Handler.Or.value,), "16-bit destination OR", "writes flags"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.LOCK_DEC_RM32), "f0 ff /1", MachineSemanticToken.INTEGER_DECREMENT.name, BinaryLayer.MACHINE_SEMANTIC, ("atomic_decrement_32",), "locked decrement", "memory order and flags are effects"),
@@ -866,6 +990,99 @@ X86_SSA_EQUIVALENCE_TABLE: tuple[BinaryEquivalence, ...] = (
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.XOR_RM32_R32), "31 /r", MachineSemanticToken.BITWISE_XOR.name, BinaryLayer.REPOSITORY_SSA, (Handler.Xor.value,), "32-bit destination XOR", "writes flags"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SHL_RM64_CL), "REX.W d3 /4", MachineSemanticToken.SHIFT_LEFT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Shl.value,), "64-bit shift by CL", "count is masked and flags are written"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.NOT_RM8), "f6 /2", MachineSemanticToken.BITWISE_NOT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Not.value,), "8-bit complement", "does not write flags; legacy high-byte registers remain distinct"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SAR_RM64_IMM8), "REX.W c1 /7 ib", MachineSemanticToken.SHIFT_RIGHT_ARITHMETIC.name, BinaryLayer.REPOSITORY_SSA, (Handler.AShr.value,), "64-bit immediate arithmetic shift", "count is masked and flags are explicit"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.JNS_REL32), "0f 89 cd", MachineSemanticToken.CONDITIONAL_RELATIVE_JUMP.name, BinaryLayer.REPOSITORY_SSA, (Handler.CondBr.value,), "near nonnegative branch", "requires SF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.MOVSX_R64_RM8), "REX.W 0f be /r", MachineSemanticToken.SIGN_EXTEND.name, BinaryLayer.REPOSITORY_SSA, (Handler.SExt.value,), "8-to-64-bit sign extension", "memory source width is 8 bits"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.IMUL_R64_RM64), "REX.W 0f af /r", MachineSemanticToken.INTEGER_MULTIPLY.name, BinaryLayer.MACHINE_SEMANTIC, ("signed_multiply_low_64",), "two-operand signed multiply", "exact CF/OF fit test needs the full signed 128-bit product"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.OR_RM8_IMM8), "80 /1 ib", MachineSemanticToken.BITWISE_OR.name, BinaryLayer.REPOSITORY_SSA, (Handler.Or.value,), "byte immediate OR", "legacy high-byte destinations remain distinct"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SUB_RM32_IMM32), "81 /5 id", MachineSemanticToken.INTEGER_SUBTRACT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Sub.value,), "32-bit immediate subtract", "writes arithmetic flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.XOR_RM64_IMM8), "REX.W 83 /6 ib", MachineSemanticToken.BITWISE_XOR.name, BinaryLayer.REPOSITORY_SSA, (Handler.Xor.value,), "64-bit sign-extended immediate XOR", "writes logical flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVG_R32_RM32), "0f 4f /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "32-bit signed-greater conditional move", "requires ZF, SF, and OF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVG_R64_RM64), "REX.W 0f 4f /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "64-bit signed-greater conditional move", "requires ZF, SF, and OF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVNS_R32_RM32), "0f 49 /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "32-bit nonnegative conditional move", "requires SF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.ADD_EAX_IMM32), "05 id", MachineSemanticToken.INTEGER_ADD.name, BinaryLayer.REPOSITORY_SSA, (Handler.Add.value,), "32-bit accumulator immediate add", "writes arithmetic flags and zero-extends EAX"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SUB_EAX_IMM32), "2d id", MachineSemanticToken.INTEGER_SUBTRACT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Sub.value,), "32-bit accumulator immediate subtract", "writes arithmetic flags and zero-extends EAX"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.OR_AL_IMM8), "0c ib", MachineSemanticToken.BITWISE_OR.name, BinaryLayer.REPOSITORY_SSA, (Handler.Or.value,), "AL immediate OR", "preserves the upper 56 bits of RAX"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SUB_RM8_IMM8), "80 /5 ib", MachineSemanticToken.INTEGER_SUBTRACT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Sub.value,), "byte immediate subtract", "legacy high-byte destinations remain distinct"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.OR_R16_RM16), "66 0b /r", MachineSemanticToken.BITWISE_OR.name, BinaryLayer.REPOSITORY_SSA, (Handler.Or.value,), "16-bit register-destination OR", "operand-size override is required"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SUB_RM64_R64), "REX.W 29 /r", MachineSemanticToken.INTEGER_SUBTRACT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Sub.value,), "64-bit register-to-memory subtract", "writes arithmetic flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVLE_R64_RM64), "REX.W 0f 4e /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "64-bit signed-less-or-equal conditional move", "requires ZF, SF, and OF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SETAE_RM8), "0f 93 /0", MachineSemanticToken.CONDITIONAL_SET.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value, Handler.Trunc.value), "unsigned-above-or-equal byte result", "requires CF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.XCHG_RM32_R32), "87 /r", MachineSemanticToken.EXCHANGE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Load.value, Handler.Store.value), "32-bit register or memory exchange", "memory form is implicitly atomic"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CDQ), "99", MachineSemanticToken.SIGN_EXTEND_ACCUMULATOR.name, BinaryLayer.MACHINE_SEMANTIC, ("sign_extend_eax_into_edx_eax",), "sign-extend EAX into EDX:EAX", "produces the high dividend half"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.IDIV_RM32), "f7 /7", MachineSemanticToken.INTEGER_DIVIDE_SIGNED.name, BinaryLayer.MACHINE_SEMANTIC, ("signed_divide_edx_eax",), "signed EDX:EAX division", "quotient, remainder, and divide-error trap are effects"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.BSR_R32_RM32), "0f bd /r", MachineSemanticToken.BIT_SCAN_REVERSE.name, BinaryLayer.MACHINE_SEMANTIC, ("bit_scan_reverse_32",), "index of the highest set bit", "zero sets ZF and leaves destination architecturally undefined"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CVTSI2SD_XMM_RM64), "f2 REX.W 0f 2a /r", MachineSemanticToken.SIGNED_INTEGER_TO_SCALAR_FLOAT64.name, BinaryLayer.MACHINE_SEMANTIC, ("signed_int64_to_scalar_float64",), "signed integer to low double lane", "legacy form preserves the upper XMM lane"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.MOVQ_XMM_RM64), "66 REX.W 0f 6e /r", MachineSemanticToken.VECTOR_MOVE_LOW_ZERO_UPPER.name, BinaryLayer.MACHINE_SEMANTIC, ("move_qword_to_xmm_zero_upper",), "integer qword to low XMM lane", "upper XMM lane is cleared"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.MOVSX_R32_RM8), "0f be /r", MachineSemanticToken.SIGN_EXTEND.name, BinaryLayer.REPOSITORY_SSA, (Handler.SExt.value,), "8-to-32-bit sign extension", "32-bit destination write clears its upper half"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SHR_RM64_CL), "REX.W d3 /5", MachineSemanticToken.SHIFT_RIGHT_LOGICAL.name, BinaryLayer.MACHINE_SEMANTIC, ("shift_right_logical_dynamic",), "64-bit logical shift by masked CL", "zero count preserves destination and all flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SETL_RM8), "0f 9c /0", MachineSemanticToken.CONDITIONAL_SET.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "signed-less byte result", "requires SF and OF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SETS_RM8), "0f 98 /0", MachineSemanticToken.CONDITIONAL_SET.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "negative-sign byte result", "requires SF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVNS_R64_RM64), "REX.W 0f 49 /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "64-bit nonnegative conditional move", "requires SF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVA_R64_RM64), "REX.W 0f 47 /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "64-bit unsigned-above conditional move", "requires CF and ZF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SHR_RM32_CL), "d3 /5", MachineSemanticToken.SHIFT_RIGHT_LOGICAL.name, BinaryLayer.MACHINE_SEMANTIC, ("shift_right_logical_dynamic_32",), "32-bit logical shift by masked CL", "zero count preserves destination and all flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SAR_RM32_IMM8), "c1 /7 ib", MachineSemanticToken.SHIFT_RIGHT_ARITHMETIC.name, BinaryLayer.REPOSITORY_SSA, (Handler.AShr.value,), "32-bit arithmetic shift by immediate", "masked nonzero immediate has explicit CF/OF/ZF/SF/PF semantics"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.AND_AX_IMM16), "66 25 iw", MachineSemanticToken.BITWISE_AND.name, BinaryLayer.REPOSITORY_SSA, (Handler.And.value,), "16-bit accumulator immediate AND", "preserves the upper 48 bits of RAX"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.MOV_RM16_IMM16), "66 c7 /0 iw", MachineSemanticToken.REGISTER_WRITE_IMMEDIATE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Store.value,), "16-bit immediate register or memory write", "register form preserves upper bits"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.XOR_RM64_IMM32), "REX.W 81 /6 id", MachineSemanticToken.BITWISE_XOR.name, BinaryLayer.REPOSITORY_SSA, (Handler.Xor.value,), "64-bit XOR with sign-extended imm32", "writes logical flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.BSR_R64_RM64), "REX.W 0f bd /r", MachineSemanticToken.BIT_SCAN_REVERSE.name, BinaryLayer.MACHINE_SEMANTIC, ("bit_scan_reverse_64",), "index of the highest set bit", "zero sets ZF and leaves destination architecturally undefined"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.DEC_RM8), "fe /1", MachineSemanticToken.INTEGER_DECREMENT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Sub.value,), "byte decrement", "preserves CF and updates arithmetic flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.INC_RM8), "fe /0", MachineSemanticToken.INTEGER_INCREMENT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Add.value,), "byte increment", "preserves CF and updates arithmetic flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SUB_R8_RM8), "2a /r", MachineSemanticToken.INTEGER_SUBTRACT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Sub.value,), "byte register-destination subtract", "updates arithmetic flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.UCOMISD_XMM_XMMM64), "66 0f 2e /r", MachineSemanticToken.SCALAR_FLOAT64_COMPARE_UNORDERED.name, BinaryLayer.MACHINE_SEMANTIC, ("scalar_float64_compare_unordered",), "unordered scalar double comparison", "sets ZF/PF/CF and clears OF/SF/AF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.MOVQ_XMM_XMMM64), "f3 0f 7e /r", MachineSemanticToken.VECTOR_MOVE_LOW_ZERO_UPPER.name, BinaryLayer.MACHINE_SEMANTIC, ("move_qword_to_xmm_zero_upper",), "qword load into low XMM lane", "clears the upper lane"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.ADDSD_XMM_XMMM64), "f2 0f 58 /r", MachineSemanticToken.SCALAR_FLOAT64_ADD.name, BinaryLayer.MACHINE_SEMANTIC, ("scalar_float64_add",), "scalar double addition", "preserves the destination upper lane"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.PUNPCKLQDQ_XMM_XMMM128), "66 0f 6c /r", MachineSemanticToken.VECTOR_UNPACK_LOW_QWORDS.name, BinaryLayer.MACHINE_SEMANTIC, ("vector_unpack_low_qwords",), "interleave low qwords", "destination low qword is retained below source low qword"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SHL_RM8_IMM8), "c0 /4 ib", MachineSemanticToken.SHIFT_LEFT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Shl.value,), "byte logical left shift", "masked immediate has explicit flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.ADD_RM8_IMM8), "80 /0 ib", MachineSemanticToken.INTEGER_ADD.name, BinaryLayer.REPOSITORY_SSA, (Handler.Add.value,), "byte immediate add", "updates arithmetic flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.JP_REL8), "7a cb", MachineSemanticToken.CONDITIONAL_RELATIVE_JUMP.name, BinaryLayer.REPOSITORY_SSA, (Handler.CondBr.value,), "branch when parity flag is set", "requires explicit PF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.PUNPCKLBW_XMM_XMMM128), "66 0f 60 /r", MachineSemanticToken.VECTOR_UNPACK_LOW_BYTES.name, BinaryLayer.MACHINE_SEMANTIC, ("vector_unpack_low_bytes",), "interleave low bytes", "eight lanes from each operand form sixteen destination bytes"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.MULSD_XMM_XMMM64), "f2 0f 59 /r", MachineSemanticToken.SCALAR_FLOAT64_MULTIPLY.name, BinaryLayer.MACHINE_SEMANTIC, ("scalar_float64_multiply",), "scalar double multiplication", "MXCSR rounding and exceptions are explicit machine state"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.PADDQ_XMM_XMMM128), "66 0f d4 /r", MachineSemanticToken.VECTOR_ADD_QWORDS.name, BinaryLayer.MACHINE_SEMANTIC, ("vector_add_qwords",), "packed qword addition", "two independent modular 64-bit lanes"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.IMUL_R64_RM64_IMM32), "REX.W 69 /r id", MachineSemanticToken.INTEGER_MULTIPLY.name, BinaryLayer.MACHINE_SEMANTIC, ("signed_multiply_64_imm32",), "signed 64-bit multiply with sign-extended imm32", "CF/OF indicate whether the full product fits the retained destination"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.COMISD_XMM_XMMM64), "66 0f 2f /r", MachineSemanticToken.SCALAR_FLOAT64_COMPARE_ORDERED.name, BinaryLayer.MACHINE_SEMANTIC, ("scalar_float64_compare_ordered",), "ordered scalar double comparison", "NaN updates MXCSR invalid state and comparison flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.PUNPCKLWD_XMM_XMMM128), "66 0f 61 /r", MachineSemanticToken.VECTOR_UNPACK_LOW_WORDS.name, BinaryLayer.MACHINE_SEMANTIC, ("vector_unpack_low_words",), "interleave low words", "four lanes from each operand form eight destination words"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.MOVD_XMM_RM32), "66 0f 6e /r", MachineSemanticToken.VECTOR_MOVE_LOW_ZERO_UPPER.name, BinaryLayer.MACHINE_SEMANTIC, ("move_dword_to_xmm_zero_upper",), "integer dword into low XMM lane", "clears bits 32 through 127"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVGE_R64_RM64), "REX.W 0f 4d /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "64-bit signed-greater-or-equal conditional move", "requires SF and OF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SUB_AL_IMM8), "2c ib", MachineSemanticToken.INTEGER_SUBTRACT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Sub.value,), "8-bit accumulator immediate subtract", "preserves upper RAX bits and writes arithmetic flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.ADD_R8_RM8), "02 /r", MachineSemanticToken.INTEGER_ADD.name, BinaryLayer.REPOSITORY_SSA, (Handler.Add.value,), "8-bit register-destination add", "legacy high-byte operands remain distinct and arithmetic flags are explicit"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.IMUL_RM64), "REX.W f7 /5", MachineSemanticToken.INTEGER_MULTIPLY.name, BinaryLayer.REPOSITORY_SSA, (Handler.SMulLow.value,), "signed accumulator-form 64-bit multiply", "produces the full signed product in RDX:RAX and defines CF/OF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVBE_R64_RM64), "REX.W 0f 46 /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "64-bit unsigned-below-or-equal conditional move", "requires CF and ZF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.ADD_RM16_R16), "66 01 /r", MachineSemanticToken.INTEGER_ADD.name, BinaryLayer.REPOSITORY_SSA, (Handler.Add.value,), "16-bit register-to-register-or-memory add", "preserves upper register bits and writes arithmetic flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CVTSI2SS_XMM_RM64), "f3 REX.W 0f 2a /r", MachineSemanticToken.SIGNED_INTEGER_TO_SCALAR_FLOAT32.name, BinaryLayer.REPOSITORY_SSA, (Handler.SInt64ToFloat32Bits.value,), "signed integer to low binary32 XMM lane", "MXCSR rounding and precision exception are explicit; upper 96 bits are preserved"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.ADDSS_XMM_XMMM32), "f3 0f 58 /r", MachineSemanticToken.SCALAR_FLOAT32_ADD.name, BinaryLayer.REPOSITORY_SSA, (Handler.Float32AddBits.value, Handler.MXCSRFloat32Add.value), "scalar binary32 addition into low XMM lane", "encoded IEEE result and MXCSR status/trap transition are explicit; upper 96 bits are preserved"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.DIVSS_XMM_XMMM32), "f3 0f 5e /r", MachineSemanticToken.SCALAR_FLOAT32_DIVIDE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Float32DivideBits.value, Handler.MXCSRFloat32Divide.value), "scalar binary32 division into low XMM lane", "encoded IEEE result and ordered MXCSR status/trap transition are explicit; upper 96 bits are preserved"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.COMISS_XMM_XMMM32), "0f 2f /r", MachineSemanticToken.SCALAR_FLOAT32_COMPARE_ORDERED.name, BinaryLayer.REPOSITORY_SSA, (Handler.Float32IsNaNBits.value, Handler.Float32BitsLt.value, Handler.Float32BitsEq.value, Handler.MXCSRInvalid.value), "ordered scalar binary32 comparison into flags", "encoded comparisons, invalid status/trap, and CF/PF/ZF with OF/SF/AF clearing are explicit"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVS_R64_RM64), "REX.W 0f 48 /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "64-bit sign-flag conditional move", "reads SF and preserves destination when clear"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.DIVSD_XMM_XMMM64), "f2 0f 5e /r", MachineSemanticToken.SCALAR_FLOAT64_DIVIDE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Float64DivideBits.value, Handler.MXCSRFloat64Divide.value), "scalar binary64 division into low XMM lane", "encoded IEEE result and ordered MXCSR status/trap transition are explicit; upper 64 bits are preserved"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMPXCHG_RM32_R32), "f0 0f b1 /r", MachineSemanticToken.ATOMIC_COMPARE_EXCHANGE.name, BinaryLayer.REPOSITORY_SSA, (Handler.AtomicCompareExchangeObserved.value, Handler.AtomicCompareExchangeSuccess.value, Handler.AtomicCompareExchangeMemory.value), "locked 32-bit compare exchange", "memory ordering, EAX, destination, source, and arithmetic flags remain explicit"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.AND_RM64_IMM32), "REX.W 81 /4 id", MachineSemanticToken.BITWISE_AND.name, BinaryLayer.REPOSITORY_SSA, (Handler.And.value,), "64-bit AND with sign-extended imm32", "destination and logical flags are explicit"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.BSWAP_R32), "0f c8+rd", MachineSemanticToken.BYTE_SWAP.name, BinaryLayer.REPOSITORY_SSA, (Handler.ByteSwap.value,), "reverse four bytes in a 32-bit register", "32-bit destination write zeroes the upper register half and leaves flags unchanged"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.ROR_RM16_IMM8), "66 c1 /1 ib", MachineSemanticToken.ROTATE_RIGHT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Shl.value, Handler.Shr.value, Handler.Or.value), "16-bit immediate right rotate", "effective count and CF/OF rules are explicit; other flags preserved"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SUBSD_XMM_XMMM64), "f2 0f 5c /r", MachineSemanticToken.SCALAR_FLOAT64_SUBTRACT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Float64SubtractBits.value, Handler.MXCSRFloat64Subtract.value), "scalar binary64 subtraction into low XMM lane", "encoded IEEE result and ordered MXCSR status/trap transition are explicit; upper 64 bits are preserved"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVS_R32_RM32), "0f 48 /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "32-bit sign-flag conditional move", "reads SF; selected 32-bit destination write zeroes its upper register half"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CVTTSD2SI_R64_XMMM64), "f2 REX.W 0f 2c /r", MachineSemanticToken.SCALAR_FLOAT64_TO_SIGNED_INT64_TRUNCATE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Float64ToSInt64TruncBits.value, Handler.MXCSRFloat64ToSIntInvalid.value), "truncate encoded scalar binary64 toward zero into signed int64", "rounding control is ignored; NaN/infinity/out-of-range produce integer-indefinite and explicit MXCSR invalid status/trap"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SUB_RM32_R32), "29 /r", MachineSemanticToken.INTEGER_SUBTRACT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Sub.value,), "32-bit register-source subtraction", "destination, arithmetic flags, and 32-bit register zero-extension are explicit"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.PCMPEQQ_XMM_XMMM128), "66 0f 38 29 /r", MachineSemanticToken.VECTOR_COMPARE_EQUAL_QWORDS.name, BinaryLayer.REPOSITORY_SSA, (Handler.VectorCompareEqualMask.value,), "two independent signedness-neutral qword equality masks", "each true lane becomes all 64 one-bits; false becomes zero; flags and MXCSR unchanged"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SAR_RM32_1), "d1 /7", MachineSemanticToken.SHIFT_RIGHT_ARITHMETIC.name, BinaryLayer.REPOSITORY_SSA, (Handler.Shr.value,), "32-bit arithmetic right shift by one", "sign-fill and CF/OF behavior are explicit"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.PSUBQ_XMM_XMMM128), "66 0f fb /r", MachineSemanticToken.VECTOR_SUBTRACT_QWORDS.name, BinaryLayer.REPOSITORY_SSA, (Handler.VectorSubtractModulo.value,), "two independent modular 64-bit lane subtractions", "borrows never cross lane boundaries; flags and MXCSR unchanged"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SBB_R8_RM8), "1a /r", MachineSemanticToken.INTEGER_SUBTRACT_WITH_BORROW.name, BinaryLayer.REPOSITORY_SSA, (Handler.Sub.value,), "8-bit subtract source and incoming carry from destination", "result width, CF/OF/SF/ZF/AF/PF, and preserved upper register bits are explicit"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.ADD_AL_IMM8), "04 ib", MachineSemanticToken.INTEGER_ADD.name, BinaryLayer.REPOSITORY_SSA, (Handler.Add.value,), "8-bit accumulator immediate addition", "preserves upper RAX bits and writes exact arithmetic flags"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.IMUL_R32_RM32_IMM32), "69 /r id", MachineSemanticToken.INTEGER_MULTIPLY.name, BinaryLayer.REPOSITORY_SSA, (Handler.SMulLow.value, Handler.SMulOverflow.value), "32-bit signed multiply with immediate", "CF/OF report truncation; other arithmetic flags remain architecturally undefined/preserved"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.ANDPS_XMM_XMMM128), "0f 54 /r", MachineSemanticToken.VECTOR_AND.name, BinaryLayer.REPOSITORY_SSA, (Handler.And.value,), "128-bit XMM bit-pattern conjunction", "all 128 encoded bits participate; flags and MXCSR unchanged"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVGE_R32_RM32), "0f 4d /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "32-bit signed-greater-or-equal conditional move", "condition is SF==OF; selected 32-bit destination write zeroes upper half"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.IMUL_RM32), "f7 /5", MachineSemanticToken.INTEGER_MULTIPLY.name, BinaryLayer.REPOSITORY_SSA, (Handler.SMulLow.value, Handler.SMulHigh.value, Handler.SMulOverflow.value), "signed accumulator-form 32-bit multiply", "full signed product is written to EDX:EAX and CF/OF report sign-extension fit"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.PSHUFD_XMM_XMMM128_IMM8), "66 0f 70 /r ib", MachineSemanticToken.VECTOR_SHUFFLE_DWORDS.name, BinaryLayer.REPOSITORY_SSA, (Handler.VectorShuffle.value,), "four-lane 32-bit source permutation", "each destination lane selects the source lane named by its two control bits; flags and MXCSR unchanged"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CVTTSD2SI_R32_XMMM64), "f2 0f 2c /r", MachineSemanticToken.SCALAR_FLOAT64_TO_SIGNED_INT32_TRUNCATE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Float64ToSInt32TruncBits.value, Handler.MXCSRFloat64ToSIntInvalid.value), "truncate encoded scalar binary64 toward zero into signed int32", "rounding control is ignored; NaN/infinity/out-of-range produce 0x80000000 and explicit MXCSR invalid status/trap"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CVTDQ2PD_XMM_XMMM64), "f3 0f e6 /r", MachineSemanticToken.VECTOR_SIGNED_INT32_TO_FLOAT64.name, BinaryLayer.REPOSITORY_SSA, (Handler.VectorSInt32ToFloat64Bits.value, Handler.MXCSRVectorSInt32ToFloat64.value), "two signed int32 lanes to two encoded binary64 lanes", "both int32 inputs are exactly representable in binary64; MXCSR state transition is explicit and host floating arithmetic is unused"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.MOVD_RM32_XMM), "66 0f 7e /r", MachineSemanticToken.VECTOR_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.And.value, Handler.Store.value), "low XMM dword to GPR or memory", "low 32 encoded bits transfer to the authored destination; GPR write zeroes upper 32 bits; flags and MXCSR unchanged"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.ROR_RM64_CL), "REX.W d3 /1", MachineSemanticToken.ROTATE_RIGHT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Shl.value, Handler.Shr.value, Handler.Or.value, Handler.Select.value), "64-bit right rotate by masked CL", "zero count preserves destination and all flags; one-bit count defines OF; CF follows the rotated high bit"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.LOCK_INC_RM32), "f0 ff /0", MachineSemanticToken.ATOMIC_INCREMENT.name, BinaryLayer.REPOSITORY_SSA, (Handler.AtomicExchangeAddObserved.value, Handler.AtomicExchangeAddMemory.value), "locked 32-bit memory increment", "sequentially consistent atomic read-modify-write preserves CF and updates OF/SF/ZF/AF/PF"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.VINSERTF128_YMM_YMM_XMMM128_IMM8), "VEX.256.66.0f3a.W0 18 /r ib", MachineSemanticToken.VECTOR_INSERT_128_LANE.name, BinaryLayer.REPOSITORY_SSA, (Handler.And.value, Handler.Shl.value, Handler.Or.value), "insert one 128-bit source lane into a selected half of a 256-bit destination", "guest AVX is decomposed into exact repository bit operations and is never a host pass-through requirement"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.VMOVDQA_YMMM256_YMM), "VEX.256.66.0f.WIG 7f /r", MachineSemanticToken.VECTOR_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Store.value,), "move one 256-bit YMM bit pattern to register or memory", "guest AVX store is explicit repository memory state and never requires host SIMD execution"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.STOSB), "aa", MachineSemanticToken.STRING_STORE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Store.value, Handler.Select.value, Handler.Add.value), "store AL at RDI and advance by direction flag", "single iteration does not read or write RCX"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.VMOVNTDQ_M256_YMM), "VEX.256.66.0f.WIG e7 /r", MachineSemanticToken.VECTOR_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Store.value,), "non-temporal 256-bit YMM bit-pattern store", "non-temporal is an ordering/cache hint; repository memory state receives the exact 256 bits without host AVX forwarding"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.REP_STOSB), "f3 aa", MachineSemanticToken.STRING_STORE.name, BinaryLayer.REPOSITORY_SSA, (Handler.StridedStoreFill.value, Handler.Select.value, Handler.Mul.value, Handler.Add.value), "repeat AL byte fill from RDI for RCX elements", "explicit iterative memory operation consumes RCX and advances RDI under DF"),
 )
 
 
@@ -911,6 +1128,124 @@ def equivalences_targeting(
         row for row in BINARY_EQUIVALENCE_TABLE
         if row.target_layer is target_layer and target_token in row.target_tokens
     )
+
+
+def eligible_reverse_selections(
+    source_tokens: Iterable[str],
+    *,
+    proven_facts: Iterable[str] = (),
+    allow_multi_lane: bool = False,
+) -> tuple[ReverseBinarySelection, ...]:
+    """Return explicitly enabled, fully proved SSA-to-PE selections.
+
+    The opt-in flag is intentionally false by default.  Token equality is
+    exact and every semantic/state fact on the record must be supplied, so a
+    caller cannot collapse scalar or machine-state operations merely because
+    their arithmetic spelling happens to match.
+    """
+
+    if not allow_multi_lane:
+        return ()
+    tokens = tuple(str(token) for token in source_tokens)
+    facts = frozenset(str(fact) for fact in proven_facts)
+    return tuple(
+        row for row in SSA_PE_REVERSE_SELECTION_TABLE
+        if row.source_tokens == tokens and row.required_facts <= facts
+    )
+
+
+def plan_reverse_selection(
+    instructions: Iterable[object],
+    *,
+    proven_facts: Iterable[str] = (),
+    allow_multi_lane: bool = False,
+) -> ReverseBinarySelectionPlan | None:
+    """Produce a proof-gated reverse plan for one authored SSA group."""
+
+    group = tuple(instructions)
+    operations = tuple(str(getattr(item, "op")) for item in group)
+    facts = frozenset(str(fact) for fact in proven_facts)
+
+    def ordered_subsequence(needles: tuple[str, ...]) -> bool:
+        cursor = iter(operations)
+        return all(any(item == needle for item in cursor) for needle in needles)
+
+    candidates = tuple(
+        row for row in SSA_PE_REVERSE_SELECTION_TABLE
+        if allow_multi_lane
+        and row.required_facts <= facts
+        and ordered_subsequence(row.source_tokens)
+    )
+    if len(candidates) != 1:
+        return None
+    selection = candidates[0]
+    result_ids = tuple(
+        int(item.res.id) for item in group
+        if getattr(item, "res", None) is not None
+    )
+    provenance = tuple(
+        (
+            getattr(item, "attributes", {}).get("machine_address"),
+            getattr(item, "attributes", {}).get("machine_token"),
+            getattr(item, "attributes", {}).get("machine_bytes"),
+        )
+        for item in group
+    )
+    exact = None
+    address = None
+    if provenance and len(set(provenance)) == 1:
+        raw_address, raw_token, raw_encoded = provenance[0]
+        if raw_address is not None and raw_encoded:
+            try:
+                encoded = bytes.fromhex(str(raw_encoded))
+                decoded, end = X86ReferenceDecoder().decode_one(
+                    memoryview(encoded), 0, base_address=int(raw_address),
+                )
+            except (ValueError, VocabularyDecodeError):
+                pass
+            else:
+                if (
+                    end == len(encoded)
+                    and int(decoded.token) == int(selection.target_token)
+                    and int(raw_token) == int(decoded.token)
+                ):
+                    head = X86TensorReadHead.from_profile(
+                        controlled_x86_64_read_head_profile(),
+                    )
+                    exact = head.rewrite_instruction(
+                        int(decoded.token), decoded.encoded,
+                    )
+                    address = int(raw_address)
+    mode = "exact-retention" if exact is not None else "template-selection"
+    digest = sha256()
+    digest.update(mode.encode("ascii"))
+    digest.update(repr(operations).encode("utf-8"))
+    digest.update(repr(tuple(sorted(facts))).encode("utf-8"))
+    digest.update(str(selection.target_token).encode("ascii"))
+    digest.update(exact or b"")
+    return ReverseBinarySelectionPlan(
+        selection, operations, result_ids, address, exact, mode,
+        digest.hexdigest(),
+    )
+
+
+def write_reverse_selection(
+    plan: ReverseBinarySelectionPlan,
+    fields: X86EncodingFields | None = None,
+) -> bytes:
+    """Write a proof-gated selection through the bidirectional x86 head.
+
+    Exact retention revalidates and rewrites the preserved instruction fields.
+    A transformed selection must provide its newly allocated operand fields;
+    the API never guesses registers, addresses, or immediates from SSA names.
+    """
+
+    head = X86TensorReadHead.from_profile(controlled_x86_64_read_head_profile())
+    if fields is None:
+        if plan.encoded is None:
+            raise ValueError("transformed reverse selection requires encoding fields")
+        return head.rewrite_instruction(plan.selection.target_token, plan.encoded)
+    return head.write_instruction(plan.selection.target_token, fields)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1913,7 +2248,11 @@ __all__ = [
     "VocabularyAuditReport",
     "VocabularyStatistics",
     "X86_SSA_EQUIVALENCE_TABLE",
+    "SSA_PE_REVERSE_SELECTION_TABLE",
+    "ReverseBinarySelection",
+    "ReverseBinarySelectionPlan",
     "X86InstructionToken",
+    "X86EncodingFields",
     "X86EncodingRow",
     "X86ReadBatch",
     "X86ReadHeadConfig",
@@ -1923,7 +2262,11 @@ __all__ = [
     "X86Register",
     "X86TensorReadHead",
     "controlled_x86_64_read_head_config",
+    "controlled_x86_64_read_head_profile",
     "equivalences_targeting",
+    "eligible_reverse_selections",
+    "plan_reverse_selection",
+    "write_reverse_selection",
     "parse_pe_image",
     "pe_runtime_function_region",
     "raise_binary_region_to_ssa",

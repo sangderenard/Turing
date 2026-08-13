@@ -2,6 +2,8 @@ import sympy
 import networkx as nx
 import numpy as np
 import ast
+import builtins
+import copy
 import importlib
 import inspect
 import math
@@ -108,20 +110,210 @@ SIMD_DEFAULT_CONCURRENCY = 4  # default concurrency for SIMD operations
 from collections.abc import Callable
 
 
-def _resolve_ast_parent_reference(expression, bindings):
+@dataclass(frozen=True)
+class _ASTReferenceAlternatives:
+    """Compile-time-only alternatives for conservative source lookup."""
+
+    values: tuple
+
+
+def _same_ast_reference(left, right):
+    if left is right:
+        return True
+    left_callable = left.__func__ if inspect.ismethod(left) else left
+    right_callable = right.__func__ if inspect.ismethod(right) else right
+    if left_callable is right_callable:
+        return True
+    if isinstance(left, _ASTReferenceAlternatives) and isinstance(
+        right,
+        _ASTReferenceAlternatives,
+    ):
+        return len(left.values) == len(right.values) and all(
+            _same_ast_reference(left_value, right_value)
+            for left_value, right_value in zip(left.values, right.values)
+        )
+    if isinstance(left, (str, bytes, int, float, bool, type(None))):
+        return type(left) is type(right) and left == right
+    return False
+
+
+def _merge_ast_reference(left, right):
+    values = []
+    for value in (
+        *(left.values if isinstance(left, _ASTReferenceAlternatives) else (left,)),
+        *(right.values if isinstance(right, _ASTReferenceAlternatives) else (right,)),
+    ):
+        if not any(_same_ast_reference(value, existing) for existing in values):
+            values.append(value)
+    return values[0] if len(values) == 1 else _ASTReferenceAlternatives(tuple(values))
+
+
+def _merge_ast_bindings(bindings, additions):
+    merged = dict(bindings)
+    changed = False
+    for name, value in additions.items():
+        if value is None:
+            continue
+        if name not in merged:
+            merged[name] = value
+            changed = True
+            continue
+        combined = _merge_ast_reference(merged[name], value)
+        if not _same_ast_reference(combined, merged[name]):
+            merged[name] = combined
+            changed = True
+    return merged, changed
+
+
+def _ast_aggregate_kind(value):
+    """Return a proven aggregate storage kind from source-binding identity.
+
+    Local literal recovery deliberately records the constructor class itself
+    (``items = []`` -> ``items: list``), because no ingestion-time container
+    object is created.  Call binding then forwards that exact identity onto a
+    callee formal.  Treat the class and a rare already-materialized structural
+    value equivalently, and accept alternatives only when every call site
+    proves the same kind.
+    """
+
+    aggregate_types = {list, set, dict, tuple, bytes, bytearray}
+    if isinstance(value, _ASTReferenceAlternatives):
+        kinds = {_ast_aggregate_kind(option) for option in value.values}
+        kinds.discard(None)
+        return kinds.pop() if len(kinds) == 1 and all(
+            _ast_aggregate_kind(option) is not None for option in value.values
+        ) else None
+    if value in aggregate_types if isinstance(value, type) else False:
+        return value.__name__
+    value_type = type(value)
+    return value_type.__name__ if value_type in aggregate_types else None
+
+
+def _class_field_reference(owner, attribute, seen):
+    """Infer a field's constructor provenance without constructing an object."""
+
+    key = (owner, attribute)
+    if key in seen:
+        return None
+    definition = _source_ast_definition(owner)
+    if not isinstance(definition, ast.ClassDef):
+        return None
+    field_bindings = _import_ast_bindings(
+        definition,
+        _ast_definition_bindings(owner),
+        package=str(getattr(inspect.getmodule(owner), "__package__", "") or ""),
+    )
+    field_bindings.setdefault("self", owner)
+    field_bindings.setdefault("cls", owner)
+    values = []
+    unresolved = False
+    next_seen = {*seen, key}
+    for statement in ast.walk(definition):
+        if isinstance(statement, ast.Assign):
+            value = statement.value
+            matched = any(
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id in {"self", "cls"}
+                and target.attr == attribute
+                for target in statement.targets
+            )
+        elif isinstance(statement, ast.AnnAssign):
+            value = statement.value
+            target = statement.target
+            matched = (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id in {"self", "cls"}
+                and target.attr == attribute
+            )
+        else:
+            continue
+        if value is None or not matched:
+            continue
+        resolved = _resolve_ast_value_reference(value, field_bindings, next_seen)
+        if resolved is None:
+            unresolved = True
+        else:
+            values.append(resolved)
+    if unresolved or not values:
+        return None
+    result = values[0]
+    for value in values[1:]:
+        result = _merge_ast_reference(result, value)
+    return result
+
+
+def _resolve_ast_value_reference(expression, bindings, seen=frozenset()):
+    """Resolve source identity only; never evaluate application behavior."""
+
+    if isinstance(expression, ast.Constant) and expression.value is None:
+        # ``None`` is a known union alternative. Represent its structural type
+        # so it is distinct from failure to resolve source provenance.
+        return type(None)
+    if isinstance(expression, ast.Call):
+        target = _resolve_ast_parent_reference(expression.func, bindings, seen)
+        if target is None and isinstance(expression.func, ast.Name):
+            target = {
+                "bytearray": bytearray,
+                "bytes": bytes,
+                "dict": dict,
+                "list": list,
+                "set": set,
+                "tuple": tuple,
+            }.get(expression.func.id)
+        return target if inspect.isclass(target) else None
+    if isinstance(expression, ast.IfExp):
+        left = _resolve_ast_value_reference(expression.body, bindings, seen)
+        right = _resolve_ast_value_reference(expression.orelse, bindings, seen)
+        if left is None or right is None:
+            return None
+        return _merge_ast_reference(left, right)
+    return _resolve_ast_parent_reference(expression, bindings, seen)
+
+
+def _resolve_ast_parent_reference(expression, bindings, seen=frozenset()):
     """Resolve only enough Python context to obtain a callee's source AST."""
 
     if isinstance(expression, ast.Name):
         return bindings.get(expression.id)
     if not isinstance(expression, ast.Attribute):
         return None
-    owner = _resolve_ast_parent_reference(expression.value, bindings)
+    owner = _resolve_ast_parent_reference(expression.value, bindings, seen)
     if owner is None:
         return None
+    if isinstance(owner, _ASTReferenceAlternatives):
+        resolved = tuple(
+            value
+            for value in (
+            _resolve_ast_parent_reference(
+                ast.Attribute(value=ast.Name(id="owner"), attr=expression.attr),
+                {"owner": candidate},
+                seen,
+            )
+            for candidate in owner.values
+            )
+            if value is not None
+        )
+        # Attribute lookup itself narrows a union to alternatives that carry
+        # that field/method. An alternative lacking it would raise before this
+        # source dependency could run; it is not a competing method target.
+        if not resolved:
+            return None
+        result = resolved[0]
+        for value in resolved[1:]:
+            if not _same_ast_reference(result, value):
+                return None
+        return result
     try:
         return getattr(owner, expression.attr)
     except AttributeError:
+        if inspect.isclass(owner):
+            return _class_field_reference(owner, expression.attr, seen)
         return None
+
+
+_SOURCE_AST_TEMPLATE_CACHE = {}
 
 
 def _source_ast_definition(value):
@@ -131,6 +323,21 @@ def _source_ast_definition(value):
         value = value.__func__
     if not (inspect.isfunction(value) or inspect.isclass(value)):
         return None
+    code = getattr(value, "__code__", None)
+    try:
+        source_file = str(inspect.getsourcefile(value) or "")
+    except (OSError, TypeError):
+        return None
+    cache_key = (
+        str(getattr(value, "__module__", "")),
+        str(getattr(value, "__qualname__", getattr(value, "__name__", ""))),
+        source_file,
+        int(getattr(code, "co_firstlineno", -1)),
+        id(code) if code is not None else id(value),
+    )
+    cached = _SOURCE_AST_TEMPLATE_CACHE.get(cache_key)
+    if cached is not None:
+        return copy.deepcopy(cached)
     try:
         source = textwrap.dedent(inspect.getsource(value))
     except (OSError, TypeError):
@@ -139,7 +346,7 @@ def _source_ast_definition(value):
         source,
         filename=str(inspect.getsourcefile(value) or "<resolved-parent>"),
     )
-    return next(
+    definition = next(
         (
             statement
             for statement in parsed.body
@@ -150,6 +357,10 @@ def _source_ast_definition(value):
         ),
         None,
     )
+    if definition is not None:
+        _SOURCE_AST_TEMPLATE_CACHE[cache_key] = definition
+        return copy.deepcopy(definition)
+    return None
 
 
 def _attach_external_methods(retained_class, definition):
@@ -223,7 +434,13 @@ def _filter_discovered_definition(definition, module):
         for member in definition.body
         if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    retained_methods = requested_attributes | {"__new__", "__init__"}
+    # Keep the two mandatory constructor spellings explicit in the authored
+    # membership data.  A set-union expression here was faithfully ingested as
+    # ``bitor``; later numerical lowering then had no right to project this
+    # structural set operation into scalar arithmetic.
+    retained_methods = set(requested_attributes)
+    retained_methods.add("__new__")
+    retained_methods.add("__init__")
     pending = list(retained_methods)
     while pending:
         method_name = pending.pop()
@@ -329,20 +546,26 @@ def _class_schema_from_ast(definition):
                     add_attribute(target.id, None, "class")
     for method in methods:
         for statement in ast.walk(method):
-            targets = (
-                ((statement.target, statement.annotation),)
-                if isinstance(statement, ast.AnnAssign)
-                else ((target, None) for target in statement.targets)
-                if isinstance(statement, ast.Assign)
-                else ()
-            )
-            for target, annotation in targets:
+            if isinstance(statement, ast.Assign):
+                for target in statement.targets:
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "self"
+                    ):
+                        add_attribute(target.attr, None, "instance")
+            elif isinstance(statement, ast.AnnAssign):
+                target = statement.target
                 if (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
                     and target.value.id == "self"
                 ):
-                    add_attribute(target.attr, annotation, "instance")
+                    add_attribute(
+                        target.attr,
+                        statement.annotation,
+                        "instance",
+                    )
     source_identity = getattr(definition, "_python_source_identity", None)
     class_identity = (
         ".".join(part for part in source_identity if part)
@@ -607,6 +830,105 @@ def _ast_definition_bindings(value):
     return bindings
 
 
+def _ast_call_argument_bindings(call, target, call_bindings):
+    """Map resolvable actual source identities onto a callee's formal names."""
+
+    definition = _source_ast_definition(target)
+    if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return {}
+    parameters = [*definition.args.posonlyargs, *definition.args.args]
+    actuals = []
+    if isinstance(call.func, ast.Attribute):
+        receiver = _resolve_ast_value_reference(call.func.value, call_bindings)
+        actuals.append(receiver)
+    actuals.extend(
+        _resolve_ast_value_reference(argument, call_bindings)
+        for argument in call.args
+    )
+    def source_identity(actual):
+        if actual is None or isinstance(actual, _ASTReferenceAlternatives):
+            return actual
+        if inspect.isclass(actual) or inspect.ismodule(actual):
+            return actual
+        owner = type(actual)
+        return owner if _source_ast_definition(owner) is not None else actual
+
+    resolved = {
+        parameter.arg: source_identity(actual)
+        for parameter, actual in zip(parameters, actuals)
+        if actual is not None
+    }
+    parameter_names = {parameter.arg for parameter in parameters}
+    resolved.update(
+        {
+            keyword.arg: source_identity(value)
+            for keyword in call.keywords
+            if keyword.arg in parameter_names
+            and (
+                value := _resolve_ast_value_reference(
+                    keyword.value,
+                    call_bindings,
+                )
+            )
+            is not None
+        }
+    )
+    return resolved
+
+
+def _ast_local_constructor_bindings(definition, bindings):
+    """Recover local storage kinds from explicit constructors and literals."""
+
+    def lexical_nodes():
+        pending = list(reversed(getattr(definition, "body", ())))
+        while pending:
+            node = pending.pop()
+            yield node
+            if isinstance(
+                node,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+            ):
+                continue
+            pending.extend(reversed(tuple(ast.iter_child_nodes(node))))
+
+    resolved = dict(bindings)
+    changed = True
+    while changed:
+        changed = False
+        for statement in lexical_nodes():
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = statement.value
+            reference = None
+            if isinstance(value, ast.List):
+                reference = list
+            elif isinstance(value, ast.Set):
+                reference = set
+            elif isinstance(value, ast.Dict):
+                reference = dict
+            elif isinstance(value, ast.Tuple):
+                reference = tuple
+            elif value is not None:
+                reference = _resolve_ast_value_reference(value, resolved)
+            if reference is None:
+                continue
+            if isinstance(statement, ast.Assign):
+                for target_node in statement.targets:
+                    if (
+                        isinstance(target_node, ast.Name)
+                        and target_node.id not in resolved
+                    ):
+                        resolved[target_node.id] = reference
+                        changed = True
+            elif (
+                isinstance(statement.target, ast.Name)
+                and statement.target.id not in resolved
+            ):
+                resolved[statement.target.id] = reference
+                changed = True
+    return resolved
+
+
 def _import_ast_bindings(tree, bindings, package=None):
     """Make imports and literal module constants visible to source discovery."""
 
@@ -647,10 +969,8 @@ def _import_ast_bindings(tree, bindings, package=None):
     module_body = tree.body if isinstance(tree, ast.Module) else ()
     for statement in module_body:
         if isinstance(statement, ast.Assign):
-            targets = statement.targets
             value_node = statement.value
         elif isinstance(statement, ast.AnnAssign):
-            targets = (statement.target,)
             value_node = statement.value
         else:
             continue
@@ -660,9 +980,12 @@ def _import_ast_bindings(tree, bindings, package=None):
             value = ast.literal_eval(value_node)
         except (TypeError, ValueError, SyntaxError):
             continue
-        for target in targets:
-            if isinstance(target, ast.Name):
-                resolved[target.id] = value
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if isinstance(target, ast.Name):
+                    resolved[target.id] = value
+        elif isinstance(statement.target, ast.Name):
+            resolved[statement.target.id] = value
     return resolved
 
 
@@ -728,12 +1051,61 @@ def _walk_definitions_with_depth(node, depth=1):
             yield from _walk_definitions_with_depth(child, depth)
 
 
+class _ConsumedGeneratorLoopLowerer(ast.NodeTransformer):
+    """Turn a directly consumed one-clause generator into ordinary control.
+
+    ``for result in (expr for item in source if predicate): body`` has no
+    need for a runtime generator object: its producer and consumer are one
+    lexical loop.  Preserve the filter as an ordinary ``if`` and the yielded
+    expression as an ordinary assignment, leaving all scheduling to the
+    existing retained-loop planner. Multi-clause generators remain explicit
+    until nested-loop break/else ownership is represented.
+    """
+
+    def visit_For(self, node):
+        node = self.generic_visit(node)
+        iterator = node.iter
+        if not (
+            isinstance(iterator, ast.GeneratorExp)
+            and len(iterator.generators) == 1
+            and not iterator.generators[0].is_async
+        ):
+            return node
+        generator = iterator.generators[0]
+        assignment = ast.copy_location(
+            ast.Assign(targets=[node.target], value=iterator.elt),
+            iterator.elt,
+        )
+        body = [assignment, *node.body]
+        for predicate in reversed(generator.ifs):
+            body = [ast.copy_location(
+                ast.If(test=predicate, body=body, orelse=[]),
+                predicate,
+            )]
+        lowered = ast.For(
+            target=generator.target,
+            iter=generator.iter,
+            body=body,
+            orelse=node.orelse,
+            type_comment=node.type_comment,
+        )
+        return ast.copy_location(lowered, node)
+
+
+def _lower_consumed_generator_loops(tree):
+    lowered = _ConsumedGeneratorLoopLowerer().visit(tree)
+    ast.fix_missing_locations(lowered)
+    return lowered
+
+
 def _expand_unresolved_ast_parents(
     tree,
     bindings,
     *,
     package=None,
     include=None,
+    pursuit_roots=None,
+    tensor_code_references=None,
     profile_verbose=False,
     progress=None,
 ):
@@ -774,12 +1146,40 @@ def _expand_unresolved_ast_parents(
             progress(message)
 
     root_bindings = _import_ast_bindings(module, bindings, package=package)
+    # Built-ins are ordinary lexical fallback bindings in Python.  Put them
+    # through the same source/host-code implementation resolver as imports and
+    # globals so a source-less builtin can be decompiled rather than becoming
+    # an unexplained callee token later in reduction.
+    for builtin_name, builtin_value in vars(builtins).items():
+        root_bindings.setdefault(str(builtin_name), builtin_value)
+    tensor_code_references = {
+        str(name): reference
+        for name, reference in dict(tensor_code_references or {}).items()
+    }
+
+    def call_target(call, call_bindings):
+        """Resolve lexical storage/method identity before tensor references.
+
+        The mapping contains source-code references, not runtime handlers.  Its
+        callable is used only long enough to retrieve the referenced AST and
+        its definition bindings; the ProcessGraph/FunctionTable owns the body
+        after ingestion.
+        """
+
+        lexical_target = _resolve_ast_parent_reference(call.func, call_bindings)
+        if lexical_target is not None:
+            return lexical_target
+        tensor_name = tensor_operation_name(call)
+        if tensor_name is not None:
+            referenced = tensor_code_references.get(str(tensor_name))
+            if referenced is not None:
+                call._tensor_code_reference = str(tensor_name)
+                return referenced
+        return None
     # Resolution context belongs to the definition containing a call.  Never
     # merge module globals from one discovered function into another
     # function's namespace: globals are lookup material, not dependency edges.
-    node_bindings = {
-        id(member): root_bindings for member in ast.walk(module)
-    }
+    node_bindings = {id(member): root_bindings for member in ast.walk(module)}
     definitions = [
         node
         for node in ast.walk(module)
@@ -790,95 +1190,303 @@ def _expand_unresolved_ast_parents(
     ]
     definitions_by_name = {}
     for definition in definitions:
-        definition._python_bindings = root_bindings
+        definition_bindings = _ast_local_constructor_bindings(
+            definition,
+            root_bindings,
+        )
+        definition._python_bindings = definition_bindings
+        for member in ast.walk(definition):
+            node_bindings[id(member)] = definition_bindings
         definitions_by_name.setdefault(definition.name, []).append(definition)
 
     unavailable_identities = set()
     target_definitions = {}
+    target_bindings = {}
     started = time.perf_counter()
-    pass_index = 0
-    while True:
-        pass_index += 1
-        added_definition = False
-        if profile_verbose:
-            print(
-                "[ast-parent-profile] "
-                f"pass={pass_index} definitions={len(definitions)} "
-                f"calls={sum(isinstance(node, ast.Call) for node in ast.walk(module))} "
-                f"elapsed={time.perf_counter() - started:.3f}s",
-                flush=True,
+    def lexical_calls(definition):
+        """Calls executed by one definition, excluding nested definitions.
+
+        A nested function/class body is source available to its enclosing
+        definition, but it is not executed merely because the enclosing
+        definition runs.  Its calls join the worklist only when a reachable
+        call admits that nested definition itself.
+        """
+
+        calls = []
+
+        class Visitor(ast.NodeVisitor):
+            def visit_Call(self, node):
+                calls.append(node)
+                self.generic_visit(node)
+
+            def visit_FunctionDef(self, node):
+                if node is definition:
+                    for statement in node.body:
+                        self.visit(statement)
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_ClassDef(self, node):
+                if node is definition:
+                    for statement in node.body:
+                        if not isinstance(statement, (
+                            ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                        )):
+                            self.visit(statement)
+
+            def visit_Lambda(self, node):
+                return
+
+        Visitor().visit(definition)
+        return tuple(calls)
+
+    def root_definition(identity):
+        parts = tuple(part for part in str(identity).split(".") if part)
+        if not parts:
+            return None
+        candidates = [
+            definition for definition in module.body
+            if isinstance(definition, (
+                ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+            ))
+            and definition.name == parts[0]
+        ]
+        for part in parts[1:]:
+            candidates = [
+                member
+                for candidate in candidates
+                for member in getattr(candidate, "body", ())
+                if isinstance(member, (
+                    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                ))
+                and member.name == part
+            ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    roots = tuple(dict.fromkeys(map(str, pursuit_roots or ())))
+    if roots:
+        root_definitions = tuple(root_definition(root) for root in roots)
+        missing_roots = tuple(
+            root for root, definition in zip(roots, root_definitions)
+            if definition is None
+        )
+        if missing_roots:
+            raise ValueError(
+                "source-pursuit roots are absent or ambiguous: "
+                f"{missing_roots!r}"
             )
-        for node in tuple(ast.walk(module)):
-            if not isinstance(node, ast.Call):
+        pending_calls = deque(
+            call
+            for definition in root_definitions
+            for call in lexical_calls(definition)
+        )
+    else:
+        pending_calls = deque(
+            node for node in ast.walk(module) if isinstance(node, ast.Call)
+        )
+    all_calls = list(pending_calls)
+    call_owners = {}
+    for definition in definitions:
+        for call in (
+            member for member in ast.walk(definition)
+            if isinstance(member, ast.Call)
+        ):
+            call_owners[id(call)] = definition
+    binding_revisions = {}
+    processed_revisions = {}
+    work_items = 0
+
+    def definition_calls(definition):
+        return lexical_calls(definition)
+
+    def install_definition_bindings(definition, definition_bindings):
+        definition._python_bindings = definition_bindings
+        aggregate_kinds = dict(
+            getattr(definition, "_python_aggregate_binding_kinds", {}) or {}
+        )
+        aggregate_kinds.update({
+            str(name): kind
+            for name, value in definition_bindings.items()
+            if (kind := _ast_aggregate_kind(value)) is not None
+        })
+        definition._python_aggregate_binding_kinds = aggregate_kinds
+        for member in ast.walk(definition):
+            node_bindings[id(member)] = definition_bindings
+
+    def requeue_definition(definition):
+        definition_id = id(definition)
+        binding_revisions[definition_id] = (
+            binding_revisions.get(definition_id, 0) + 1
+        )
+        calls = definition_calls(definition)
+        for call in calls:
+            call_owners[id(call)] = definition
+        all_calls.extend(calls)
+        pending_calls.extend(calls)
+
+    while pending_calls:
+        node = pending_calls.popleft()
+        work_items += 1
+        call_bindings = node_bindings.get(id(node), root_bindings)
+        owner_definition = call_owners.get(id(node))
+        revision = binding_revisions.get(
+            id(owner_definition) if owner_definition is not None else 0,
+            0,
+        )
+        process_key = (id(node), revision)
+        if process_key in processed_revisions:
+            continue
+        processed_revisions[process_key] = True
+        call_bindings = node_bindings.get(id(node), root_bindings)
+        target = call_target(node, call_bindings)
+        identity_target = target.__func__ if inspect.ismethod(target) else target
+        if not callable(identity_target):
+            continue
+        if include is not None and not include(identity_target):
+            from ...compiler.host_code_modules import (
+                resolve_host_code_identity,
+            )
+            if resolve_host_code_identity(identity_target) is None:
                 continue
-            call_bindings = node_bindings.get(id(node), root_bindings)
-            target = _resolve_ast_parent_reference(
-                node.func,
-                call_bindings,
+        identity = (
+            str(getattr(identity_target, "__module__", "")),
+            str(getattr(
+                identity_target,
+                "__qualname__",
+                getattr(identity_target, "__name__", ""),
+            )),
+        )
+        argument_bindings = _ast_call_argument_bindings(
+            node, identity_target, call_bindings,
+        )
+        if identity in target_definitions:
+            definition = target_definitions[identity]
+            combined, bindings_changed = _merge_ast_bindings(
+                target_bindings.get(identity, {}), argument_bindings,
             )
-            identity_target = (
-                target.__func__ if inspect.ismethod(target) else target
-            )
-            if not callable(identity_target) or (
-                include is not None and not include(identity_target)
-            ):
-                continue
-            identity = (
-                str(getattr(identity_target, "__module__", "")),
-                str(
-                    getattr(
-                        identity_target,
-                        "__qualname__",
-                        getattr(identity_target, "__name__", ""),
-                    )
+            if bindings_changed:
+                target_bindings[identity] = combined
+                install_definition_bindings(definition, combined)
+                requeue_definition(definition)
+            continue
+        if identity in unavailable_identities:
+            continue
+
+        if isinstance(node.func, ast.Name):
+            call_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            call_name = node.func.attr
+        else:
+            call_name = None
+        existing = definitions_by_name.get(call_name, ())
+        if len(existing) == 1:
+            definition = existing[0]
+            target_definitions[identity] = definition
+            definition_bindings, changed = _merge_ast_bindings(
+                _ast_local_constructor_bindings(
+                    definition, _ast_definition_bindings(identity_target),
                 ),
+                argument_bindings,
             )
-            if (
-                identity in target_definitions
-                or identity in unavailable_identities
-            ):
-                continue
+            target_bindings[identity] = definition_bindings
+            install_definition_bindings(definition, definition_bindings)
+            # The old module-wide initial queue hid this admission edge: a
+            # lexical callee's calls had already been queued even when its
+            # argument bindings did not change.  Reachable pursuit must enqueue
+            # the body exactly when the call first admits the definition.
+            requeue_definition(definition)
+            continue
 
-            if isinstance(node.func, ast.Name):
-                call_name = node.func.id
-            elif isinstance(node.func, ast.Attribute):
-                call_name = node.func.attr
-            else:
-                call_name = None
-            existing = definitions_by_name.get(call_name, ())
-            if len(existing) == 1:
-                target_definitions[identity] = existing[0]
-                existing[0]._python_bindings = _ast_definition_bindings(
-                    identity_target
-                )
-                continue
-
-            source_target = identity_target
-            owner = None
-            if isinstance(node.func, ast.Attribute):
-                owner = _resolve_ast_parent_reference(
-                    node.func.value,
-                    call_bindings,
-                )
-            emit(
-                f"[ast-parent] call line={getattr(node, 'lineno', '?')} col={getattr(node, 'col_offset', '?')} "
-                f"resolving {call_name or '<unknown>'} -> {identity[1]} "
-                f"source={_safe_repr(getattr(node.func, 'id', None) or getattr(node.func, 'attr', None) or getattr(node.func, 'name', None))}"
+        source_target = identity_target
+        emit(
+            f"[ast-parent] call line={getattr(node, 'lineno', '?')} col={getattr(node, 'col_offset', '?')} "
+            f"resolving {call_name or '<unknown>'} -> {identity[1]} "
+            f"source={_safe_repr(getattr(node.func, 'id', None) or getattr(node.func, 'attr', None) or getattr(node.func, 'name', None))}"
+        )
+        source_definition = _source_ast_definition(source_target)
+        if source_definition is None:
+            # Readable source is only the first implementation source.  A
+            # source-less host callable may still have a complete binary body
+            # which the repository machine-code pipeline can raise to SSA.
+            # Attach that immutable module to this exact call occurrence; the
+            # reducer gives it an ordinary FunctionTable reference later.
+            from ...compiler.host_code_modules import (
+                extract_host_code_library,
+                materialize_host_code_library,
             )
-            source_definition = _source_ast_definition(source_target)
-            if source_definition is None:
-                unavailable_identities.add(identity)
+
+            host_library = extract_host_code_library(source_target)
+            if host_library is not None:
+                host_root = host_library.root
+                node._host_ssa_module = materialize_host_code_library(
+                    host_library
+                )
+                node._host_ssa_root = host_library.materialized_root_function
+                node._host_ssa_raw_blockers = host_library.blockers
+                node._host_ssa_blockers = host_library.effective_blockers
+                node._host_ssa_hard_blockers = host_library.hard_blockers
+                node._host_ssa_legalization_shortfalls = (
+                    host_library.legalization_shortfalls
+                )
+                node._host_machine_state_complete = (
+                    host_library.machine_state_complete
+                )
+                node._host_machine_bodies_complete = (
+                    host_library.machine_bodies_complete
+                )
+                node._host_dependency_context_complete = (
+                    host_library.dependency_context_complete
+                )
+                node._host_repository_ssa_complete = (
+                    host_library.repository_ssa_complete
+                )
+                node._host_uses_machine_state_dialect = (
+                    any(
+                        unit.result.uses_machine_state_dialect
+                        for unit in host_library.units
+                    )
+                )
+                node._host_native_module = getattr(
+                    host_root.result, "retained_native_module", None
+                )
+                node._host_ssa_cache_key = host_library.root_cache_key
+                node._host_ssa_cache_path = str(host_root.cache_path)
+                node._host_ssa_cache_hit = all(
+                    unit.cache_hit for unit in host_library.units
+                )
+                node._host_ssa_library_cache_keys = tuple(
+                    unit.cache_key for unit in host_library.units
+                )
+                node._host_ssa_library_cache_paths = tuple(
+                    str(unit.cache_path) for unit in host_library.units
+                )
+                node._host_ssa_dependency_edges = host_library.dependencies
+                node._host_ssa_unresolved_dependencies = (
+                    host_library.unresolved_dependencies
+                )
                 emit(
-                    f"[ast-parent] unresolved source for {identity[1]} "
-                    f"reason=source_unavailable"
+                    f"[ast-parent] decompiled host module for {identity[1]} "
+                    f"root={host_library.materialized_root_function!r} "
+                    f"units={len(host_library.units)} "
+                    f"functions={len(node._host_ssa_module.functions)} "
+                    f"blockers={len(host_library.effective_blockers)} "
+                    f"unresolved_dependencies="
+                    f"{len(host_library.unresolved_dependencies)} "
+                    f"cache_hit={node._host_ssa_cache_hit}"
                 )
                 continue
-            process_graph_boundary = getattr(
+            unavailable_identities.add(identity)
+            emit(
+                f"[ast-parent] unresolved source for {identity[1]} "
+                f"reason=source_unavailable"
+            )
+            continue
+        process_graph_boundary = getattr(
                 source_target,
                 "__process_graph_boundary__",
                 None,
             )
-            if process_graph_boundary is not None:
+        if process_graph_boundary is not None:
                 # Preserve an explicitly declared terminal boundary while the
                 # callable is still available for source discovery.  Ordinary
                 # discovered functions retain AST only; this callable marker
@@ -889,27 +1497,24 @@ def _expand_unresolved_ast_parents(
                 source_definition._process_graph_boundary_callable = (
                     source_target
                 )
-            source_definition = _filter_discovered_definition(
-                source_definition,
-                module,
-            )
+        source_definition = _filter_discovered_definition(source_definition, module)
             # The AST node's short ``name`` is insufficient once an unbounded
             # closure contains same-named definitions from different modules.
             # Preserve the exact live Python identity used to discover it;
             # later map/function tables can qualify without retaining the
             # callable itself.
-            source_definition._python_source_identity = identity
+        source_definition._python_source_identity = identity
 
-            module.body.append(source_definition)
-            emit(
+        module.body.append(source_definition)
+        emit(
                 f"[ast-parent] discovered definition {getattr(source_definition, 'name', identity)!r} "
-                f"from {identity[1]} pass={pass_index} "
+                f"from {identity[1]} work_item={work_items} "
                 f"kind={type(source_definition).__name__} line={getattr(source_definition, 'lineno', '?')}"
             )
-            if progress is not None:
-                bang = "!" * min(pass_index, 12)
+        if progress is not None:
+                bang = "!" * min(work_items, 12)
                 progress(
-                    f"{_heat_escape(pass_index)}[upward search L{pass_index}]{bang} "
+                    f"{_heat_escape(work_items)}[upward search W{work_items}]{bang} "
                     f"found {getattr(source_definition, 'name', identity)!r} "
                     f"(unbounded -- no constant depth limit){bang}{_HEAT_RESET}"
                 )
@@ -917,8 +1522,8 @@ def _expand_unresolved_ast_parents(
             # ``ast.walk(source_definition)`` used to yield before this loop
             # tracked depth -- it is the node the upward search just found,
             # already logged above, not a downward descent in its own right.
-            new_definitions = [source_definition]
-            for member, member_depth in _walk_definitions_with_depth(source_definition):
+        new_definitions = [source_definition]
+        for member, member_depth in _walk_definitions_with_depth(source_definition):
                 new_definitions.append(member)
                 emit(
                     f"[ast-parent] nested {type(member).__name__} {getattr(member, 'name', '?')!r} "
@@ -932,8 +1537,8 @@ def _expand_unresolved_ast_parents(
                         f"found {getattr(member, 'name', '?')!r} nested inside "
                         f"{getattr(source_definition, 'name', identity)!r}{arrows}{_HEAT_RESET}"
                     )
-            definitions.extend(new_definitions)
-            for new_definition in new_definitions:
+        definitions.extend(new_definitions)
+        for new_definition in new_definitions:
                 definitions_by_name.setdefault(
                     new_definition.name,
                     [],
@@ -945,9 +1550,9 @@ def _expand_unresolved_ast_parents(
             # Appending the whole class here makes unrelated methods look like
             # executed dependencies and recursively pulls their callees into
             # the submitted program.
-            definition = source_definition
-            target_definitions[identity] = definition
-            definition_bindings = _import_ast_bindings(
+        definition = source_definition
+        target_definitions[identity] = definition
+        definition_bindings = _import_ast_bindings(
                 source_definition,
                 _ast_definition_bindings(source_target),
                 package=str(
@@ -959,33 +1564,60 @@ def _expand_unresolved_ast_parents(
                     or ""
                 ),
             )
-            for member in ast.walk(source_definition):
-                node_bindings[id(member)] = definition_bindings
-            for new_definition in new_definitions:
-                new_definition._python_bindings = definition_bindings
-            if profile_verbose:
+        if isinstance(source_definition, ast.ClassDef):
+            # Every method in this discovered class resolves ``self``/``cls``
+            # against the class whose source was selected.  The old global
+            # rescanner happened to regain that owner on later full passes;
+            # the worklist must install it explicitly when admitting the
+            # class.  This is source identity only: no instance is created
+            # and no runtime attribute lookup is performed.
+            definition_bindings.setdefault("self", source_target)
+            definition_bindings.setdefault("cls", source_target)
+        definition_bindings = _ast_local_constructor_bindings(
+                source_definition,
+                definition_bindings,
+            )
+        definition_bindings, _changed = _merge_ast_bindings(
+                definition_bindings,
+                argument_bindings,
+            )
+        target_bindings[identity] = definition_bindings
+        install_definition_bindings(source_definition, definition_bindings)
+        for new_definition in new_definitions:
+            new_definition._python_bindings = definition_bindings
+            new_definition._python_aggregate_binding_kinds = dict(
+                getattr(source_definition, "_python_aggregate_binding_kinds", {})
+                or {}
+            )
+        requeue_definition(source_definition)
+        if profile_verbose:
                 print(
                     "[ast-parent-profile] "
                     f"resolved={identity[0]}.{identity[1]} "
                     f"new_definitions={len(new_definitions)} "
                     f"total_definitions={len(definitions)} "
-                    f"elapsed={time.perf_counter() - started:.3f}s",
+                    f"work_items={work_items} elapsed={time.perf_counter() - started:.3f}s",
                     flush=True,
                 )
-            added_definition = True
-        if not added_definition:
-            break
 
     parent_links = []
     unresolved_calls = []
-    for call in (
-        node for node in ast.walk(module) if isinstance(node, ast.Call)
-    ):
-        call_bindings = node_bindings.get(id(call), root_bindings)
-        target = _resolve_ast_parent_reference(
-            call.func,
-            call_bindings,
+    definitions_by_source_identity = {
+        tuple(map(str, source_identity)): definition
+        for definition in definitions
+        if (
+            isinstance(
+                (source_identity := getattr(
+                    definition, "_python_source_identity", None
+                )),
+                tuple,
+            )
+            and len(source_identity) == 2
         )
+    }
+    for call in tuple(dict.fromkeys(all_calls)):
+        call_bindings = node_bindings.get(id(call), root_bindings)
+        target = call_target(call, call_bindings)
         if inspect.ismethod(target):
             target = target.__func__
         definition = None
@@ -1001,6 +1633,13 @@ def _expand_unresolved_ast_parents(
                 ),
             )
             definition = target_definitions.get(identity)
+            if definition is None:
+                # Binding revisions can refine a call's receiver after its
+                # source body was admitted under an earlier worklist cache
+                # key.  The submitted AST carries the exact module/qualname
+                # identity on every discovered definition; use that durable
+                # source record before considering any spelling fallback.
+                definition = definitions_by_source_identity.get(identity)
         if definition is None and isinstance(call.func, ast.Name):
             # A lexical function name can be matched to its unique in-scope
             # definition.  An attribute spelling cannot: ``items.append`` is
@@ -1023,10 +1662,7 @@ def _expand_unresolved_ast_parents(
             unresolved_name = call.func.attr
         else:
             unresolved_name = type(call.func).__name__
-        target = _resolve_ast_parent_reference(
-            call.func,
-            call_bindings,
-        )
+        target = call_target(call, call_bindings)
         identity_target = (
             target.__func__ if inspect.ismethod(target) else target
         )
@@ -1047,6 +1683,24 @@ def _expand_unresolved_ast_parents(
                 "line": getattr(call, "lineno", None),
                 "column": getattr(call, "col_offset", None),
                 "reason": reason,
+                "target_module": (
+                    str(getattr(identity_target, "__module__", ""))
+                    if callable(identity_target) else None
+                ),
+                "target_qualname": (
+                    str(getattr(
+                        identity_target,
+                        "__qualname__",
+                        getattr(identity_target, "__name__", ""),
+                    ))
+                    if callable(identity_target) else None
+                ),
+                "owner_name": (
+                    str(getattr(call_owners.get(id(call)), "name", "")) or None
+                ),
+                "owner_source_identity": getattr(
+                    call_owners.get(id(call)), "_python_source_identity", None
+                ),
             }
         )
 
@@ -1054,7 +1708,7 @@ def _expand_unresolved_ast_parents(
     if profile_verbose:
         print(
             "[ast-parent-profile] "
-            f"complete passes={pass_index} definitions={len(definitions)} "
+            f"complete work_items={work_items} definitions={len(definitions)} "
             f"parent_links={len(parent_links)} unresolved={len(unresolved_calls)} "
             f"elapsed={time.perf_counter() - started:.3f}s",
             flush=True,
@@ -1551,246 +2205,228 @@ class ProcessGraph:
                 self.G.nodes[tgt_id]['parents'].append((src_id, consumer_role))
             self.observe_evolution_edge(src_id, tgt_id, consumer_role)
 
-    def _recurse_spec(self, nid, args, spec, direction, store_id=None, schema_repeats=None, role_indices=None, progress=None):
-        # For each role in spec, use the role_indices and a counter (schema_repeats) to determine which arg to use.
+    def _spec_build_tasks(
+        self, nid, args, spec, direction, store_id, schema_repeats,
+        role_indices,
+    ):
+        """Return schema-directed child visits without invoking traversal."""
 
         if os.environ.get("TURING_GRAPH_BUILD_VERBOSE", "").strip().lower() in {
             "1", "true", "yes", "on",
         }:
             print(spec.items())
-
+        tasks = []
         for role, param in spec.items():
+            indices = role_indices[role]
             if param == 1:
-                idx = role_indices[role][schema_repeats.get(role, 0)]
-                schema_repeats[role] = schema_repeats.get(role, 0) + 1
-                if direction == 'down':
-                    self.build_graph(
-                        args[idx],
-                        producer_id=nid,
-                        producer_role=role,
-                        consumer_role=f"arg{idx}",
-                        store_id=store_id,
-                        progress=progress,
-                    )
-                else:
-                    self.build_graph(
-                        args[idx],
-                        consumer_id=nid,
-                        producer_role="output",
-                        consumer_role=role,
-                        store_id=store_id,
-                        progress=progress,
-                    )
-            elif param == 'many':
-                indices = role_indices[role]
-                # Use all remaining indices for this role.
-                for idx in indices[schema_repeats.get(role, 0):]:
-                    if direction == 'down':
-                        self.build_graph(
-                            args[idx],
-                            producer_id=nid,
-                            producer_role=role,
-                            consumer_role=f"arg{idx}",
-                            store_id=store_id,
-                            progress=progress,
-                        )
-                    else:
-                        self.build_graph(
-                            args[idx],
-                            consumer_id=nid,
-                            producer_role="output",
-                            consumer_role=role,
-                            store_id=store_id,
-                            progress=progress,
-                        )
+                offset = schema_repeats.get(role, 0)
+                # Preserve the recursive builder's strict schema contract:
+                # a missing required role is malformed input, not an empty
+                # child list that may be silently omitted.
+                selected = (indices[offset],)
+                schema_repeats[role] = offset + 1
+            elif param == "many":
+                selected = indices[schema_repeats.get(role, 0):]
                 schema_repeats[role] = len(indices)
             elif isinstance(param, tuple):
-                num = param[1] if len(param) == 2 else param[0]
-                indices = role_indices[role]
-                for _ in range(num):
-                    idx = indices[schema_repeats.get(role, 0)]
-                    schema_repeats[role] = schema_repeats.get(role, 0) + 1
-                    if direction == 'down':
-                        self.build_graph(
-                            args[idx],
-                            producer_id=nid,
-                            producer_role=role,
-                            consumer_role=f"arg{idx}",
-                            store_id=store_id,
-                            progress=progress,
-                        )
-                    else:
-                        self.build_graph(
-                            args[idx],
-                            consumer_id=nid,
-                            producer_role="output",
-                            consumer_role=role,
-                            store_id=store_id,
-                            progress=progress,
-                        )
-        # ...existing code...
+                count = param[1] if len(param) == 2 else param[0]
+                selected = []
+                for _ in range(count):
+                    offset = schema_repeats.get(role, 0)
+                    selected.append(indices[offset])
+                    schema_repeats[role] = offset + 1
+            else:
+                selected = ()
+            for idx in selected:
+                if direction == "down":
+                    tasks.append((
+                        args[idx], nid, None, role, f"arg{idx}", store_id,
+                    ))
+                else:
+                    tasks.append((
+                        args[idx], None, nid, "output", role, store_id,
+                    ))
+        return tasks
 
-    def build_graph(self, node, producer_id=None, consumer_id=None, producer_role=None, consumer_role=None, store_id=None, progress=None):
+    def build_graph(
+        self, node, producer_id=None, consumer_id=None, producer_role=None,
+        consumer_role=None, store_id=None, progress=None,
+    ):
+        """Build a complete source graph using an explicit work stack.
+
+        A work item is either a node visit or a postorder connection.  This
+        preserves the former recursive depth-first order while making deep
+        authored expressions and cyclic object identities independent of the
+        Python call-stack limit.
+        """
+
         if not self.domain_shape:
             self.domain_shape = (1,)
-
-        self._graph_build_counter += 1
-        nid, already_defined = self.ensure_node(node, store_id)
-        node_type = type(node).__name__
-        location = ""
-        if isinstance(node, ast.AST):
-            location = (
-                f" line={getattr(node, 'lineno', '?')} col={getattr(node, 'col_offset', '?')}"
-            )
-        if hasattr(node, "name") and getattr(node, "name", None) not in {None, ""}:
-            location += f" name={node.name}"
-        detail = self._node_debug_summary(node)
-        self._emit_graph_build_log(
-            f"[graph-build #{self._graph_build_counter}] {node_type}{location} "
-            f"nid={nid} already_defined={already_defined} "
-            f"producer={producer_role or '-'} consumer={consumer_role or '-'} "
-            f"details={detail}",
-            progress=progress,
+        initial = (
+            node, producer_id, consumer_id, producer_role, consumer_role,
+            store_id,
         )
-        if already_defined:
-            # just hook up to parents or consumers and exit
-            if producer_id is not None:
-                self.connect(producer_id, nid, producer_role, consumer_role, store_id)
-            if consumer_id is not None:
-                self.connect(nid, consumer_id, producer_role, consumer_role, store_id)
-            return nid
+        pending = [("visit", initial)]
+        root_nid = None
+        graph_build_verbose = os.environ.get(
+            "TURING_GRAPH_BUILD_VERBOSE", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
-        # Both the AST and SymPy front ends converge here (dispatch is on
-        # ``type(node).__name__``).  A span dissolved at the ingestion seam
-        # arrives carrying its resolved decision on ``_special_case``;
-        # anything else is classified now by the same switch.
-        special = getattr(node, "_special_case", None)
-        if special is None:
-            special = interpret_special_case(node)
-        if special is not None:
-            data = self.G.nodes[nid]
-            data["type"] = special.type
-            data["op"] = special.type
-            data["attributes"] = special.attributes
-            data["extra_args"] = special.attributes
-            data["constant"] = special.constant
-            if special.type == "GetAttr" and isinstance(node, ast.Attribute):
-                # The GetAttr shortcut classifies this node without walking
-                # the normal schema-descent below -- but the receiver
-                # (``node.value``) is still this node's real operand.  A
-                # bare-Name receiver was tolerated without this (resolved on
-                # demand elsewhere, by lexical lookup), but a compound
-                # receiver -- another attribute access, a call, ... -- has
-                # no such fallback: skipping this recursion left it with no
-                # graph node at all, so nothing downstream could ever wire
-                # its own receiver to it.
-                self.build_graph(
-                    node.value,
-                    consumer_id=nid,
-                    producer_role="output",
-                    consumer_role="value",
-                    store_id=store_id,
-                    progress=progress,
+        while pending:
+            action, payload = pending.pop()
+            if action == "finish":
+                (
+                    nid, frame_producer, frame_consumer,
+                    frame_producer_role, frame_consumer_role, frame_store,
+                ) = payload
+                if frame_producer is not None:
+                    self.connect(
+                        frame_producer, nid, frame_producer_role,
+                        frame_consumer_role, frame_store,
+                    )
+                if frame_consumer is not None:
+                    self.connect(
+                        nid, frame_consumer, frame_producer_role,
+                        frame_consumer_role, frame_store,
+                    )
+                if frame_producer is None and frame_consumer is None:
+                    self.roots.append(nid)
+                continue
+
+            (
+                current, frame_producer, frame_consumer,
+                frame_producer_role, frame_consumer_role, frame_store,
+            ) = payload
+            self._graph_build_counter += 1
+            nid, already_defined = self.ensure_node(current, frame_store)
+            if root_nid is None:
+                root_nid = nid
+            node_type = type(current).__name__
+            location = ""
+            if isinstance(current, ast.AST):
+                location = (
+                    f" line={getattr(current, 'lineno', '?')} "
+                    f"col={getattr(current, 'col_offset', '?')}"
                 )
-            if producer_id is not None:
-                self.connect(producer_id, nid, producer_role, consumer_role, store_id)
-            if consumer_id is not None:
-                self.connect(nid, consumer_id, producer_role, consumer_role, store_id)
-            if producer_id is None and consumer_id is None:
-                self.roots.append(nid)
-            return nid
+            if (
+                hasattr(current, "name")
+                and getattr(current, "name", None) not in {None, ""}
+            ):
+                location += f" name={current.name}"
+            self._emit_graph_build_log(
+                f"[graph-build #{self._graph_build_counter}] "
+                f"{node_type}{location} nid={nid} "
+                f"already_defined={already_defined} "
+                f"producer={frame_producer_role or '-'} "
+                f"consumer={frame_consumer_role or '-'} "
+                f"details={self._node_debug_summary(current)}",
+                progress=progress,
+            )
+            if already_defined:
+                if frame_producer is not None:
+                    self.connect(
+                        frame_producer, nid, frame_producer_role,
+                        frame_consumer_role, frame_store,
+                    )
+                if frame_consumer is not None:
+                    self.connect(
+                        nid, frame_consumer, frame_producer_role,
+                        frame_consumer_role, frame_store,
+                    )
+                continue
 
-        # A call whose callee names an authoritative tensor operation is
-        # flagged here, without collapsing it, so a downstream off-tensor
-        # target can find and unroll reductions before serialization.
-        tensor_op = tensor_operation_name(node)
-        if tensor_op is not None:
-            data = self.G.nodes[nid]
-            attributes = data.get("attributes")
-            if attributes is None:
-                attributes = {}
-                data["attributes"] = attributes
-            attributes["tensor"] = tensor_op
+            finish = (
+                nid, frame_producer, frame_consumer,
+                frame_producer_role, frame_consumer_role, frame_store,
+            )
+            special = getattr(current, "_special_case", None)
+            if special is None:
+                special = interpret_special_case(current)
+            if special is not None:
+                data = self.G.nodes[nid]
+                data["type"] = special.type
+                data["op"] = special.type
+                data["attributes"] = special.attributes
+                data["extra_args"] = special.attributes
+                data["constant"] = special.constant
+                pending.append(("finish", finish))
+                if special.type == "GetAttr" and isinstance(
+                    current, ast.Attribute
+                ):
+                    pending.append(("visit", (
+                        current.value, None, nid, "output", "value",
+                        frame_store,
+                    )))
+                continue
 
-        schema = self.role_schemas.get(node_type, None)
-        # Graph ingestion can visit thousands of nodes.  Dumping every Python
-        # object here is neither shell profiling nor progress reporting: the
-        # formatting alone can dominate compilation and obscure the first
-        # useful control-shell event.  Keep the forensic dump available, but
-        # require an explicit ingestion-specific opt-in.
-        graph_build_verbose = os.environ.get("TURING_GRAPH_BUILD_VERBOSE", "").strip().lower() in {
-            "1", "true", "yes", "on",
-        }
-        if graph_build_verbose:
-            print(f"[build_graph] Node {nid} ({node_type}) with schema: {schema}")
-            print(f"[build_graph] Node {nid} args: {getattr(node, 'args', [])}")
-        args = getattr(node, 'args', [])
-        if isinstance(args, list):
-            args = list(getattr(node, 'args', []))
-        else:
-            args = [args]
-        if schema:
+            tensor_op = tensor_operation_name(current)
+            if tensor_op is not None:
+                data = self.G.nodes[nid]
+                attributes = data.get("attributes")
+                if attributes is None:
+                    attributes = {}
+                    data["attributes"] = attributes
+                attributes["tensor_candidate"] = tensor_op
+                if (
+                    isinstance(getattr(current, "func", None), ast.Name)
+                    or getattr(current, "_tensor_code_reference", None)
+                    == tensor_op
+                ):
+                    # Free tensor functions and explicitly supplied backend
+                    # source references are authoritative. Method spelling
+                    # alone is only a candidate until the receiver is proven
+                    # tensor-valued after lexical reduction/specialization.
+                    attributes["tensor"] = tensor_op
+
+            schema = self.role_schemas.get(node_type)
+            args = getattr(current, "args", [])
+            args = list(args) if isinstance(args, list) else [args]
             if graph_build_verbose:
-                from pprint import pprint
-                print("=== DEBUG: Entering build_graph with schema ===")
-                print(f"Node ID: {nid}, Type: {node_type}")
-                try:
-                    print("Node full content:")
-                    pprint(node.__dict__)
-                except Exception:
-                    print("Node representation (fallback):", repr(node))
-                print("Schema contents:")
-                pprint(schema)
-                print("Initial args:")
-                pprint(args)
-
-            # Build a mapping from each role (from schema.up and schema.down) to a list of positions in args.
-            role_indices = {}
-            all_keys = list(schema.get('up', {}).keys()) + list(schema.get('down', {}).keys())
-            for key in all_keys:
-                # If the attribute's own value is not already in args, add it
-                # (extending if a list). The membership check must compare
-                # the resolved attribute *value*, not the role-name string
-                # itself: for a node whose attribute is a plain string (e.g.
-                # ast.keyword.arg), comparing the role name against args
-                # produces a false positive whenever that string happens to
-                # equal a later role's name (e.g. an ast.keyword.arg value
-                # of "value" colliding with the keyword schema's own
-                # "value" role) -- which silently skipped appending the real
-                # attribute and pointed that role at the wrong element.
-                val = getattr(node, key, None)
-                if val not in args:
-                    if isinstance(val, list):
-                        start = len(args)
-                        args.extend(val)
-                        role_indices[key] = list(range(start, len(args)))
+                print(
+                    f"[build_graph] Node {nid} ({node_type}) with schema: "
+                    f"{schema}"
+                )
+                print(f"[build_graph] Node {nid} args: {args}")
+            child_tasks = []
+            if schema:
+                role_indices = {}
+                all_keys = (
+                    list(schema.get("up", {}).keys())
+                    + list(schema.get("down", {}).keys())
+                )
+                for key in all_keys:
+                    value = getattr(current, key, None)
+                    if value not in args:
+                        if isinstance(value, list):
+                            start = len(args)
+                            args.extend(value)
+                            role_indices[key] = list(range(start, len(args)))
+                        else:
+                            args.append(value)
+                            role_indices[key] = [len(args) - 1]
                     else:
-                        args.append(val)
-                        role_indices[key] = [len(args)-1]
-                else:
-                    # If already present, record its index (wrapped as list)
-                    role_indices[key] = [args.index(val)]
-            # Initialize a repeat counter dictionary for each role.
-            repeat_counter = { role: 0 for role in role_indices }
+                        role_indices[key] = [args.index(value)]
+                repeats = {role: 0 for role in role_indices}
+                child_tasks.extend(self._spec_build_tasks(
+                    nid, args, schema.get("up", {}), "up", frame_store,
+                    repeats, role_indices,
+                ))
+                child_tasks.extend(self._spec_build_tasks(
+                    nid, args, schema.get("down", {}), "down", frame_store,
+                    repeats, role_indices,
+                ))
+            else:
+                child_tasks.extend(
+                    (arg, None, nid, "output", f"arg{idx}", frame_store)
+                    for idx, arg in enumerate(args)
+                )
 
-            if graph_build_verbose:
-                print(f"[build_graph] Node {nid} ({node_type}) has schema: {schema}")
-            # Pass along repeat_counter and role_indices to _recurse_spec.
-            self._recurse_spec(nid, args, schema.get('up', {}), direction='up', store_id=store_id, schema_repeats=repeat_counter, role_indices=role_indices, progress=progress)
-            self._recurse_spec(nid, args, schema.get('down', {}), direction='down', store_id=store_id, schema_repeats=repeat_counter, role_indices=role_indices, progress=progress)
-        else:
-            for idx, arg in enumerate(args):
-                self.build_graph(arg, consumer_id=nid, producer_role="output", consumer_role=f'arg{idx}', store_id=store_id, progress=progress)
+            pending.append(("finish", finish))
+            pending.extend(
+                ("visit", task) for task in reversed(child_tasks)
+            )
 
-        # now that we've fully resolved, connect this node in the context given
-        if producer_id is not None:
-            self.connect(producer_id, nid, producer_role, consumer_role, store_id)
-        if consumer_id is not None:
-            self.connect(nid, consumer_id, producer_role, consumer_role, store_id)
-        if producer_id is None and consumer_id is None:
-            self.roots.append(nid)
-
-        return nid
+        return root_nid
 
     def _walk_all_fields(self, node, consumer_id=None, producer_role=None, consumer_role=None, store_id=None, verbose=True):
         """
@@ -1854,6 +2490,8 @@ class ProcessGraph:
         resolve_unresolved_parents=False,
         parent_bindings=None,
         parent_include=None,
+        pursuit_roots=None,
+        tensor_code_references=None,
         retain=(),
         profile_verbose=False,
         progress=None,
@@ -1932,6 +2570,7 @@ class ProcessGraph:
         # mapping, state-machine planning, and the normalizer each walk the
         # tree -- so a repr-expanded feed array is collapsed exactly once and
         # never seen expanded again by any downstream pass.
+        tree = _lower_consumed_generator_loops(tree)
         tree = dissolve_spans(tree)
 
         parent_links = ()
@@ -1951,6 +2590,8 @@ class ProcessGraph:
                 bindings,
                     package=getattr(self, "python_package", None),
                     include=parent_include,
+                    pursuit_roots=pursuit_roots,
+                    tensor_code_references=tensor_code_references,
                     profile_verbose=profile_verbose,
                     progress=progress,
                 )

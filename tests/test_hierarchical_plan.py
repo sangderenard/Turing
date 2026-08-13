@@ -1,3 +1,6 @@
+import ast
+import inspect
+import textwrap
 from types import SimpleNamespace
 
 import networkx as nx
@@ -43,6 +46,7 @@ def test_shell_hierarchy_plan_lists_mixed_operator_without_capture():
         0,
         type="Input",
         attributes={"binding_name": "subject"},
+        tensor={"shape": (1, 4), "dtype": "float32", "device": "glsl"},
     )
     process.add_node(
         1,
@@ -50,6 +54,7 @@ def test_shell_hierarchy_plan_lists_mixed_operator_without_capture():
         op="GetAttr",
         parents=((0, "base"),),
         attributes={"attribute": "header"},
+        tensor={"shape": (1, 2), "dtype": "float32", "device": "glsl"},
     )
     process.add_edge(0, 1)
     region = nx.DiGraph()
@@ -78,6 +83,172 @@ def test_shell_hierarchy_plan_lists_mixed_operator_without_capture():
         "region": 0,
     }
     assert _planned_operator_node_ids(plan) == (1,)
+    assert planned_region.value_shapes == (
+        (1, (1, 2), "float32"),
+        (0, (1, 4), "float32"),
+    )
+
+
+def test_region_pursues_structural_constant_expression_captures_into_source():
+    process = nx.DiGraph()
+    process.add_node(0, type="Constant", op="const", attributes={"value": 2})
+    process.add_node(
+        1, type="neg", op="neg", parents=((0, "operand"),), attributes={}
+    )
+    process.add_node(2, type="Input", op="input", attributes={"binding_name": "x"})
+    process.add_node(
+        3,
+        type="transpose",
+        op="transpose",
+        parents=((2, "operand"), (1, "arg0")),
+        attributes={"tensor": "transpose"},
+    )
+    process.add_edges_from(((0, 1), (1, 3), (2, 3)))
+    region = nx.DiGraph()
+    region.graph.update({"deployment_nodes": (3,), "deployment_inputs": (2, 1)})
+    shell = SimpleNamespace(
+        process_graph=SimpleNamespace(G=process),
+        dispatch_subgraphs=(SimpleNamespace(G=region),),
+        callsite_function_shells={},
+        loop_plans=(),
+        shell_control_program=None,
+    )
+
+    planned_region = _build_shell_hierarchy_plan(shell).items[0]
+
+    assert planned_region.captures == (2,)
+    assert planned_region.items[0].opcode == "Const"
+    assert planned_region.items[0].outputs == (1,)
+    assert dict(planned_region.items[0].attributes)["value"] == -2
+
+
+def test_structural_constant_state_does_not_use_python_object_sentinel():
+    source = textwrap.dedent(inspect.getsource(_build_shell_hierarchy_plan))
+    tree = ast.parse(source)
+
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "object"
+        for node in ast.walk(tree)
+    )
+
+
+def test_structural_none_constant_is_distinct_from_unavailable_state():
+    process = nx.DiGraph()
+    process.add_node(0, type="Constant", op="const", attributes={"value": None})
+    process.add_node(1, type="Constant", op="const", attributes={"value": 2})
+    process.add_node(
+        2,
+        type="Tuple",
+        op="Tuple",
+        parents=((0, "item0"), (1, "item1")),
+        attributes={},
+    )
+    process.add_node(3, type="Input", op="input", attributes={"binding_name": "x"})
+    process.add_node(
+        4,
+        type="reshape",
+        op="reshape",
+        parents=((3, "operand"), (2, "arg0")),
+        attributes={"tensor": "reshape"},
+    )
+    process.add_edges_from(((0, 2), (1, 2), (2, 4), (3, 4)))
+    region = nx.DiGraph()
+    region.graph.update({"deployment_nodes": (4,), "deployment_inputs": (3, 2)})
+    shell = SimpleNamespace(
+        process_graph=SimpleNamespace(G=process),
+        dispatch_subgraphs=(SimpleNamespace(G=region),),
+        callsite_function_shells={},
+        loop_plans=(),
+        shell_control_program=None,
+    )
+
+    planned_region = _build_shell_hierarchy_plan(shell).items[0]
+
+    assert planned_region.captures == (3,)
+    assert dict(planned_region.items[0].attributes)["value"] == (None, 2)
+
+
+def test_structural_constant_capture_walk_is_iterative_for_deep_source():
+    process = nx.DiGraph()
+    process.add_node(0, type="Constant", op="const", attributes={"value": 7})
+    # Above CPython's default recursion limit: the former recursive evaluator
+    # fails here, while the explicit work stack remains bounded by heap memory.
+    depth = 1050
+    for node_id in range(1, depth + 1):
+        process.add_node(
+            node_id,
+            type="pos",
+            op="pos",
+            parents=((node_id - 1, "operand"),),
+            attributes={},
+        )
+        process.add_edge(node_id - 1, node_id)
+    data_id = depth + 1
+    result_id = depth + 2
+    process.add_node(
+        data_id, type="Input", op="input", attributes={"binding_name": "x"}
+    )
+    process.add_node(
+        result_id,
+        type="reshape",
+        op="reshape",
+        parents=((data_id, "operand"), (depth, "arg0")),
+        attributes={"tensor": "reshape"},
+    )
+    process.add_edges_from(((data_id, result_id), (depth, result_id)))
+    region = nx.DiGraph()
+    region.graph.update({
+        "deployment_nodes": (result_id,),
+        "deployment_inputs": (data_id, depth),
+    })
+    shell = SimpleNamespace(
+        process_graph=SimpleNamespace(G=process),
+        dispatch_subgraphs=(SimpleNamespace(G=region),),
+        callsite_function_shells={},
+        loop_plans=(),
+        shell_control_program=None,
+    )
+
+    planned_region = _build_shell_hierarchy_plan(shell).items[0]
+
+    assert planned_region.captures == (data_id,)
+    assert dict(planned_region.items[0].attributes)["value"] == 7
+
+
+def test_feedback_capture_is_not_misclassified_as_constant_source():
+    process = nx.DiGraph()
+    process.add_node(0, type="pos", op="pos", parents=((1, "operand"),), attributes={})
+    process.add_node(1, type="pos", op="pos", parents=((0, "operand"),), attributes={})
+    process.add_node(2, type="Input", op="input", attributes={"binding_name": "x"})
+    process.add_node(
+        3,
+        type="add",
+        op="add",
+        parents=((2, "lhs"), (0, "rhs")),
+        attributes={},
+    )
+    process.add_edges_from(((0, 1), (1, 0), (2, 3), (0, 3)))
+    region = nx.DiGraph()
+    region.graph.update({"deployment_nodes": (3,), "deployment_inputs": (2, 0)})
+    shell = SimpleNamespace(
+        process_graph=SimpleNamespace(G=process),
+        dispatch_subgraphs=(SimpleNamespace(G=region),),
+        callsite_function_shells={},
+        loop_plans=(),
+        shell_control_program=None,
+    )
+
+    # Retained-loop planning supplies a stable condensation level table. This
+    # is the same contract _dependency_order uses for real feedback graphs.
+    shell.process_graph.levels = {0: 0, 1: 0, 2: 0, 3: 1}
+    process.graph["recursion_table"] = {
+        0: {"members": (0, 1), "kind": "irreducible_recursion"}
+    }
+    planned_region = _build_shell_hierarchy_plan(shell).items[0]
+
+    assert planned_region.captures == (2, 0)
 
 
 def test_planned_operators_attach_existing_tensor_kernel_and_plain_lowering():

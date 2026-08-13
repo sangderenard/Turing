@@ -29,6 +29,10 @@ for _spelling, _handler in PRECOMPILE_TO_SSA.items():
     _SSA_TO_CANONICAL.setdefault(_handler, _spelling)
 
 
+class SSAWebGLEmissionError(ValueError):
+    """Repository SSA still contains a non-WebGL compiler dialect."""
+
+
 @dataclass(frozen=True, order=True)
 class SSAWebGLShortfall:
     instruction_index: int
@@ -48,6 +52,21 @@ class SSAFusedProgramResult:
 
 def ssa_function_to_fused_program(function: Function) -> SSAFusedProgramResult:
     """Select the existing float-scalar FusedProgram subset from one function."""
+
+    from .machine_dialect_ssa import (
+        format_machine_dialect_occurrences,
+        module_machine_dialect_occurrences,
+    )
+
+    machine_residuals = module_machine_dialect_occurrences(
+        {function.name: function}
+    )
+    if machine_residuals:
+        raise SSAWebGLEmissionError(
+            "WebGL emission requires legalized repository SSA; retained "
+            "machine-state SSA remains: "
+            + format_machine_dialect_occurrences(machine_residuals)
+        )
 
     from .evolution_metagraph import (
         EvolutionComponentRef,
@@ -309,6 +328,7 @@ def emit_ssa_webgl_fragment_module(
 
 
 __all__ = [
+    "SSAWebGLEmissionError",
     "SSAFusedProgramResult",
     "SSAWebGLShortfall",
     "emit_ssa_webgl_fragment_module",

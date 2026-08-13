@@ -225,7 +225,7 @@ class BinaryMachineProgram:
         snapshots = MachineSnapshotTripleBuffer(snapshot_layout, registers)
         devices = SubjectDeviceBuffers()
         system_tape = MachineSystemTape(
-            bytes(getattr(program.image, "encoded", b"")), core_count,
+            bytes(getattr(program.image, "encoded", None) or b""), core_count,
         )
         system_tape.linked_modules = [
             MachineTapeLinkedModule(
@@ -300,6 +300,47 @@ class BinaryMachineProgram:
             return
         from .machine_wasm_runtime import MachineWasmBlockDispatcher, NodeMachineWasmHost
         self.runner.compiled_dispatcher = MachineWasmBlockDispatcher(NodeMachineWasmHost())
+
+    def install_stream_interposer(self, interposer) -> None:
+        """Put an existing read/write-head stream ahead of block execution.
+
+        The runner's currently selected compiled backend remains installed as
+        the fallback.  Thus an edited AMD64 stream owns only its trigger and
+        replacement addresses; ordinary code continues through cached Wasm
+        when enabled and through translated execution otherwise.
+        """
+
+        if self.runner.running:
+            raise RuntimeError("pause the machine before changing its stream head")
+        if len(self.machine.cores) != 1:
+            raise ValueError(
+                "stream interposition requires the runner's single-core "
+                "compiled-dispatch path"
+            )
+        from .machine_stream_interposition import MachineStreamBlockDispatcher
+
+        if isinstance(self.runner.compiled_dispatcher, MachineStreamBlockDispatcher):
+            raise RuntimeError("a machine stream interposer is already installed")
+        executor = self.machine.cores[0].executor
+        if interposer.executor is not executor:
+            raise ValueError("stream interposer must use the program's live executor")
+        self.runner.compiled_dispatcher = MachineStreamBlockDispatcher(
+            interposer,
+            fallback_dispatcher=self.runner.compiled_dispatcher,
+        )
+
+    def remove_stream_interposer(self) -> None:
+        """Restore the compiled backend that preceded stream installation."""
+
+        if self.runner.running:
+            raise RuntimeError("pause the machine before changing its stream head")
+        from .machine_stream_interposition import MachineStreamBlockDispatcher
+
+        dispatcher = self.runner.compiled_dispatcher
+        if not isinstance(dispatcher, MachineStreamBlockDispatcher):
+            return
+        self.runner.compiled_dispatcher = dispatcher.fallback_dispatcher
+        dispatcher.fallback_dispatcher = None
 
     def disable_recompilation(self) -> None:
         """Close the compiled host and return to translated Python blocks."""

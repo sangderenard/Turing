@@ -1,12 +1,27 @@
 import ast
 import contextlib
 import io
+import re
 import types
+
+import pytest
 
 from src.common.tensors.topological_reducer import (
     reduce_abstract_tensor_topology,
 )
+from src.common.tensors.accelerator_backends.aot_compile import (
+    _source_dependency_is_not_tensor_primitive,
+)
+from src.compiler.loop_composer import LoopComposer, LoopBackendCapabilities
+from src.compiler.process_graph_fusion import extract_clean_process_subgraph
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
+from src.transmogrifier.graph.node_special_cases import tensor_operation_name
+from src.transmogrifier.function_table import (
+    ParameterAccess,
+    ParameterScope,
+    ParameterStorage,
+    ParameterTransfer,
+)
 
 
 def _source_helper(value):
@@ -29,6 +44,20 @@ def _dependency_middle(value):
 
 def _dependency_root(value):
     return _dependency_middle(value) - 3
+
+
+def _extend_rows_into(rows, destination):
+    for row in rows:
+        destination.extend(row)
+    return destination
+
+
+def _first_byte(bits):
+    return bits[0]
+
+
+def _neg_tensor_code_reference(value):
+    return -value
 
 
 class _WriterSource:
@@ -58,6 +87,26 @@ class _FieldParameterCollisionSource:
 
     def encode(self, symbols):
         return symbols + 1
+
+
+class _RemovableStorageSource:
+    def remove_node(self, nid):
+        return nid + 1
+
+
+class _ReceiverForwardingSource:
+    def __init__(self):
+        self.G = _RemovableStorageSource()
+
+    def callee(self, G, nid):
+        return G.remove_node(nid)
+
+    def run(self, nid):
+        return self.callee(self.G, nid)
+
+    def sweep(self, G, nodes):
+        for nid in nodes:
+            G.remove_node(nid)
 
 
 def _scoped_dependency_a(value):
@@ -214,6 +263,49 @@ def root(value):
     assert len(graph.function_table) == 0
 
 
+def test_tensor_code_reference_is_ingested_as_a_process_graph_definition():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            ast.parse(
+                "def root(value):\n"
+                "    return value.neg()\n"
+            ),
+            resolve_unresolved_parents=True,
+            tensor_code_references={"neg": _neg_tensor_code_reference},
+        )
+
+    reference_id, _definition = _definitions(
+        graph, "_neg_tensor_code_reference"
+    )[0]
+    call_id, call = next(
+        (node_id, data)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and tensor_operation_name(data["expr_obj"]) == "neg"
+    )
+    assert graph.G.has_edge(reference_id, call_id)
+    assert call["attributes"]["resolved_ast_parent"] == reference_id
+
+    reduce_abstract_tensor_topology(graph)
+    root = graph.function_table.entry("root").graph
+    call = next(
+        data
+        for _node_id, data in root.G.nodes(data=True)
+        if data.get("op") == "neg"
+    )
+    # Reduction preserves the original graph-node correlation for provenance;
+    # the callable itself has an independent opaque FunctionTable reference.
+    callee = graph.function_table.entry("_neg_tensor_code_reference")
+    assert callee.name == "_neg_tensor_code_reference"
+    assert callee.graph is not None
+    assert any(
+        data.get("type") in {"Neg", "UnaryOp"}
+        or data.get("op") in {"neg", "Neg"}
+        for _node_id, data in callee.graph.G.nodes(data=True)
+    )
+
+
 def test_ingestion_resolves_attribute_parent_to_method_ast():
     graph = _ingest(
         """
@@ -237,6 +329,258 @@ def record(writer, frame):
     assert not _definitions(graph, "unrelated_method")
     assert not _definitions(graph, "_unrelated_dependency")
     assert len(graph.function_table) == 0
+
+
+def test_ingestion_propagates_field_receiver_identity_through_call_parameter():
+    graph = _ingest(
+        """
+def entry(source, nid):
+    return source.run(nid)
+""",
+        {"source": _ReceiverForwardingSource()},
+    )
+
+    remove_id, _definition = _definitions(graph, "remove_node")[0]
+    call_id, call = next(
+        (node_id, data)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "remove_node"
+    )
+    assert graph.G.has_edge(remove_id, call_id)
+    assert call["attributes"]["resolved_ast_parent"] == remove_id
+    assert graph.G.graph["missing_ast_parent_calls"] == ()
+
+    reduce_abstract_tensor_topology(graph)
+    contracts = graph.function_table.entry("callee").parameter_contracts
+    assert tuple(contract.name for contract in contracts) == (
+        "self", "G", "nid",
+    )
+    assert contracts[1].transfer is ParameterTransfer.ALIAS
+    assert contracts[1].access is ParameterAccess.INOUT
+    assert contracts[1].storage is ParameterStorage.RECORD
+    assert contracts[1].scope is ParameterScope.CALLER
+    assert contracts[2].storage is ParameterStorage.SCALAR
+
+
+def test_source_linked_argument_method_is_not_an_opaque_loop_effect():
+    graph = _ingest(
+        """
+def entry(source, storage, nodes):
+    source.sweep(storage, nodes)
+""",
+        {
+            "source": _ReceiverForwardingSource(),
+            "storage": _RemovableStorageSource(),
+        },
+    )
+    reduce_abstract_tensor_topology(graph)
+
+    sweep = graph.function_table.entry("sweep").graph
+    call = next(
+        data
+        for _node_id, data in sweep.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "remove_node"
+    )
+    assert call["attributes"]["method_ref"] == call["attributes"]["callee_ref"]
+    assert not any(
+        effect["operator"] == "remove_node"
+        for _node_id, data in sweep.G.nodes(data=True)
+        for effect in (data.get("attributes") or {}).get(
+            "loop_state_effects", ()
+        )
+    )
+
+
+def test_process_graph_field_provenance_pursues_digraph_remove_node_source():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"owner": ProcessGraph}
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            ast.parse("""
+def entry(owner, nid):
+    owner.deduplicate_node(owner.G, nid)
+"""),
+            resolve_unresolved_parents=True,
+            parent_include=_source_dependency_is_not_tensor_primitive,
+        )
+
+    remove_id, definition = _definitions(graph, "remove_node")[0]
+    assert getattr(definition["expr_obj"], "_python_source_identity")[1].endswith(
+        "DiGraph.remove_node"
+    )
+    call_id = next(
+        node_id
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "remove_node"
+    )
+    assert graph.G.has_edge(remove_id, call_id)
+
+    reduce_abstract_tensor_topology(graph)
+    original = graph.function_table.entry("deduplicate_node").graph
+    specialized = extract_clean_process_subgraph(original, original.G)
+    call = next(
+        data
+        for _node_id, data in specialized.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "remove_node"
+    )
+    assert call["attributes"]["method_ref"] == call["attributes"]["callee_ref"]
+    composer = LoopComposer(LoopBackendCapabilities(
+        backend="fortran",
+        native_for=True,
+        native_while=True,
+        dynamic_bounds=True,
+    ))
+    plans = composer.compose(specialized)
+    assert not any(
+        effect.operator == "remove_node"
+        for plan in plans
+        for effect in plan.loop.state_effects
+    )
+
+
+def test_set_add_is_collection_candidate_not_tensor_operation():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            ast.parse("""
+def collect(value):
+    present = set()
+    for item in value:
+        present.add(item)
+    return present
+"""),
+            resolve_unresolved_parents=True,
+            tensor_code_references={"add": _neg_tensor_code_reference},
+        )
+    call = next(
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "add"
+    )
+    attributes = call.get("attributes", {})
+    assert attributes["tensor_candidate"] == "add"
+    assert "tensor" not in attributes
+    assert getattr(call["expr_obj"], "_tensor_code_reference", None) is None
+    assert not _definitions(graph, "_neg_tensor_code_reference")
+
+    reduce_abstract_tensor_topology(graph)
+    collect = graph.function_table.entry("collect").graph
+    sequence = next(
+        data
+        for _node_id, data in collect.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Name)
+        and data["expr_obj"].func.id == "set"
+    )
+    sequence_attributes = sequence.get("attributes", {})
+    assert sequence_attributes["aggregate_kind"] == "set"
+    assert sequence_attributes["sequence_key_columns"] == (0,)
+    assert sequence_attributes["sequence_writable"] is True
+    loop = next(
+        data
+        for _node_id, data in collect.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    )
+    effects = loop.get("attributes", {})["loop_state_effects"]
+    assert len(effects) == 1
+    assert effects[0]["effect_mode"] == "sequence_mutation"
+    assert effects[0]["sequence_policy"] == "unique"
+
+
+def test_literal_aggregate_identity_reaches_pursued_callee_formal():
+    graph = _ingest(
+        """
+def root(rows):
+    destination = []
+    return _extend_rows_into(rows, destination)
+""",
+        {"_extend_rows_into": _extend_rows_into},
+    )
+
+    pursued = next(
+        data["expr_obj"]
+        for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.FunctionDef)
+        and data["expr_obj"].name == "_extend_rows_into"
+    )
+    assert pursued._python_aggregate_binding_kinds["destination"] == "list"
+
+    reduce_abstract_tensor_topology(graph)
+    callee = graph.function_table.entry("_extend_rows_into").graph
+    destination = next(
+        data
+        for _node_id, data in callee.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "destination"
+    )
+    assert destination["attributes"]["aggregate_kind"] == "list"
+    loop = next(
+        data
+        for _node_id, data in callee.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    )
+    effects = loop["attributes"]["loop_state_effects"]
+    assert [effect["effect_mode"] for effect in effects] == [
+        "sequence_mutation"
+    ]
+
+
+def test_tuple_loop_target_survives_body_rebinding_of_one_member():
+    graph = _ingest(
+        """
+def rewrite(rows, replacement):
+    result = []
+    for op, value in rows:
+        if value:
+            op = replacement
+        result.append((op, value))
+    return result
+""",
+        {},
+    )
+
+    reduce_abstract_tensor_topology(graph)
+    reduced = graph.function_table.entry("rewrite").graph
+    loop = next(
+        data
+        for _node_id, data in reduced.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    )
+    bindings = loop["attributes"]["loop_target_bindings"]
+    assert tuple(bindings) == ("op", "value")
+    assert bindings["op"] != bindings["value"]
+
+
+def test_bytearray_identity_reaches_pursued_span_parameter():
+    graph = _ingest(
+        """
+def root():
+    data = bytearray(16)
+    return _first_byte(data)
+""",
+        {"_first_byte": _first_byte},
+    )
+
+    reduce_abstract_tensor_topology(graph)
+    callee = graph.function_table.entry("_first_byte").graph
+    bits = next(
+        data
+        for _node_id, data in callee.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "bits"
+    )
+    assert bits["attributes"]["aggregate_kind"] == "bytearray"
+    assert bits["attributes"]["sequence_writable"] is True
 
 
 def test_ingestion_filters_unreferenced_class_methods_before_recursing():
@@ -285,6 +629,45 @@ class Thermostat:
     ]
     assert map_ir["permissions"] == ()
     assert all(item["permissions"] == () for item in map_ir["graphs"])
+
+
+def test_real_networkx_constructor_carries_source_factory_field_storage():
+    import networkx as nx
+    from src.common.tensors.topological_reducer import (
+        reduce_abstract_tensor_topology,
+    )
+
+    graph = _ingest(
+        "import networkx as nx\n"
+        "def make_graph():\n"
+        "    return nx.DiGraph()\n",
+        {"nx": nx},
+    )
+    reduce_abstract_tensor_topology(graph)
+    constructor = next(
+        entry.graph
+        for entry in graph.function_table
+        if entry.name == "__init__"
+        and entry.graph is not None
+        and entry.graph.G.graph.get("method_owner") == "DiGraph"
+    )
+
+    contracts = constructor.G.graph["class_field_aggregate_kinds"]
+    assert contracts == {
+        "graph": "dict",
+        "_node": "dict",
+        "_adj": "dict",
+        "_succ": "dict",
+        "_pred": "dict",
+        "__networkx_cache__": "dict",
+    }
+    assert constructor.G.graph["class_field_aliases"] == {"_succ": "_adj"}
+    assert constructor.G.graph["class_field_value_aggregate_kinds"] == {
+        "_node": "dict",
+        "_adj": "dict",
+        "_succ": "dict",
+        "_pred": "dict",
+    }
 
 
 def test_annotated_assignments_split_schema_from_runtime_assignment():
@@ -413,6 +796,66 @@ def entry(value):
     assert len(graph.function_table) == 0
 
 
+def test_pursuit_roots_exclude_unreachable_module_calls_without_bounding_closure():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"len": len}
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            ast.parse(
+                "def leaf(value):\n"
+                "    return value\n\n"
+                "def middle(value):\n"
+                "    return leaf(value)\n\n"
+                "def wanted(value):\n"
+                "    return middle(value)\n\n"
+                "def unrelated(values):\n"
+                "    return len(values)\n"
+            ),
+            resolve_unresolved_parents=True,
+            pursuit_roots=("wanted",),
+        )
+
+    assert graph.G.graph["unresolved_ast_calls"] == ()
+    linked = {
+        data["expr_obj"].func.id
+        for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Name)
+        and (data.get("attributes") or {}).get("resolved_ast_parent") is not None
+    }
+    assert linked == {"middle", "leaf"}
+
+
+def test_direct_filtered_generator_iteration_becomes_ordinary_loop_control():
+    graph = _ingest(
+        """
+def calls(module):
+    retained = []
+    for call in (
+        node for node in module if isinstance(node, int)
+    ):
+        retained.append(call)
+    return retained
+""",
+        {},
+    )
+
+    assert not any(
+        isinstance(data.get("expr_obj"), (ast.GeneratorExp, ast.comprehension))
+        for _node_id, data in graph.G.nodes(data=True)
+    )
+    loop = next(
+        data["expr_obj"]
+        for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    )
+    assert isinstance(loop.iter, ast.Name)
+    assert loop.iter.id == "module"
+    guard = loop.body[0]
+    assert isinstance(guard, ast.If)
+    assert isinstance(guard.body[0], ast.Assign)
+
+
 def test_ingestion_keeps_each_definition_globals_lexically_scoped():
     root_a = types.FunctionType(
         _scoped_root_a.__code__,
@@ -455,8 +898,140 @@ def root(value):
             "line": 3,
             "column": 11,
             "reason": "source_unavailable",
+            "target_module": "builtins",
+            "target_qualname": "len",
+            "owner_name": "root",
+            "owner_source_identity": None,
         },
     )
     assert graph.G.graph["missing_ast_parent_calls"] == ()
     assert not _definitions(graph, "len")
     assert len(graph.function_table) == 0
+
+
+def test_pursued_nested_dict_capture_lowers_sympy_find_opts_stores():
+    sympy_cse = pytest.importorskip("sympy.simplify.cse_main")
+    graph = _ingest(
+        """
+def entry(exprs):
+    return opt_cse(exprs)
+""",
+        {"opt_cse": sympy_cse.opt_cse},
+    )
+
+    reduce_abstract_tensor_topology(graph)
+    nested = graph.function_table.entry("_find_opts").graph
+    capture_inputs = [
+        data
+        for _node_id, data in nested.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "opt_subs"
+    ]
+    assert capture_inputs
+    assert all(
+        (data.get("attributes") or {}).get("binding_kind") == "closure"
+        and (data.get("attributes") or {}).get("aggregate_kind") == "dict"
+        and (data.get("attributes") or {}).get("sequence_key_columns") == (0,)
+        and (data.get("attributes") or {}).get("sequence_writable") is True
+        for data in capture_inputs
+    )
+    assert sum(
+        data.get("type") == "IndexedStore"
+        for _node_id, data in nested.G.nodes(data=True)
+    ) == 2
+
+
+def test_pursued_module_dict_keeps_external_table_kind_for_re_compile():
+    graph = _ingest(
+        """
+def entry(pattern, flags):
+    return compile_re(pattern, flags)
+""",
+        {"compile_re": re._compile},
+    )
+
+    reduce_abstract_tensor_topology(graph)
+    compiled = graph.function_table.entry("_compile").graph
+    cache_inputs = [
+        data
+        for _node_id, data in compiled.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "_cache"
+    ]
+    assert cache_inputs
+    assert all(
+        (data.get("attributes") or {}).get("binding_kind") == "external"
+        and (data.get("attributes") or {}).get("aggregate_kind") == "dict"
+        and (data.get("attributes") or {}).get("sequence_key_columns") == (0,)
+        and (data.get("attributes") or {}).get("sequence_writable") is True
+        for data in cache_inputs
+    )
+
+
+def test_worklist_resolves_sympy_instance_assigned_method_sources():
+    dpll2 = pytest.importorskip("sympy.logic.algorithms.dpll2")
+    graph = _ingest(
+        """
+def entry(clauses, variables):
+    return SATSolver(clauses, variables, set())._find_model()
+""",
+        {"SATSolver": dpll2.SATSolver},
+    )
+
+    assert graph.G.graph["missing_ast_parent_calls"] == ()
+    expected = {
+        "heur_lit_assigned": "_vsids_lit_assigned",
+        "heur_lit_unset": "_vsids_lit_unset",
+        "heur_clause_added": "_vsids_clause_added",
+    }
+    definitions = {
+        data["expr_obj"].name: node_id
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.FunctionDef)
+    }
+    for call_name, implementation_name in expected.items():
+        implementation_id = definitions[implementation_name]
+        calls = [
+            node_id
+            for node_id, data in graph.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.Call)
+            and isinstance(data["expr_obj"].func, ast.Attribute)
+            and data["expr_obj"].func.attr == call_name
+        ]
+        assert calls
+        assert all(
+            graph.G.has_edge(implementation_id, call_id)
+            for call_id in calls
+        )
+
+
+def test_worklist_resolves_sympy_same_class_method_source():
+    enumerative = pytest.importorskip("sympy.utilities.enumerative")
+    graph = _ingest(
+        """
+def entry():
+    return MultisetPartitionTraverser().enum_range([1], 1, 2)
+""",
+        {
+            "MultisetPartitionTraverser": (
+                enumerative.MultisetPartitionTraverser
+            )
+        },
+    )
+
+    decrement_id = next(
+        node_id
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.FunctionDef)
+        and data["expr_obj"].name == "decrement_part_small"
+    )
+    calls = [
+        node_id
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "decrement_part_small"
+    ]
+    assert calls
+    assert all(graph.G.has_edge(decrement_id, call_id) for call_id in calls)
+    assert graph.G.graph["missing_ast_parent_calls"] == ()

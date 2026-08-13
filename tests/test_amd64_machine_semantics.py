@@ -1,5 +1,8 @@
 from dataclasses import replace
 from types import SimpleNamespace
+import struct
+
+import pytest
 
 from src.compiler.amd64_machine_semantics import (
     PagedByteMemory,
@@ -215,6 +218,103 @@ def test_vector_xor_updates_complete_xmm_register_without_integer_flags():
     result = default_effect_handlers()[int(MachineSemanticToken.VECTOR_XOR)](state, instruction)
     assert result.vector_registers[0] == 0xFF
     assert result.flags == 0x202
+
+
+@pytest.mark.parametrize(("source", "rounding", "expected"), (
+    ((1 << 53) + 1, 0, 1 << 53),
+    ((1 << 53) + 1, 1, 1 << 53),
+    ((1 << 53) + 1, 2, (1 << 53) + 2),
+    ((1 << 53) + 1, 3, 1 << 53),
+    (-((1 << 53) + 1), 0, -(1 << 53)),
+    (-((1 << 53) + 1), 1, -((1 << 53) + 2)),
+    (-((1 << 53) + 1), 2, -(1 << 53)),
+    (-((1 << 53) + 1), 3, -(1 << 53)),
+))
+def test_cvtsi2sd_uses_mxcsr_rounding_and_sets_precision_status(
+    source, rounding, expected,
+):
+    instruction = _instruction(
+        X86InstructionToken.CVTSI2SD_XMM_RM64,
+        MachineSemanticToken.SIGNED_INTEGER_TO_SCALAR_FLOAT64,
+        (
+            VectorRegisterOperand(X86VectorRegister.XMM0),
+            RegisterOperand(X86Register.RCX, 64),
+        ),
+    )
+    registers = [0] * 16
+    registers[1] = source & ((1 << 64) - 1)
+    vectors = [0] * 16
+    vectors[0] = 0xA5A5A5A5A5A5A5A5 << 64
+    mxcsr = 0x1F80 | (rounding << 13)
+    state = MachineExecutionState(
+        pc=0, registers=tuple(registers), vector_registers=tuple(vectors),
+        system_state={"amd64.mxcsr": mxcsr},
+    )
+
+    result = default_effect_handlers()[
+        int(MachineSemanticToken.SIGNED_INTEGER_TO_SCALAR_FLOAT64)
+    ](state, instruction)
+
+    expected_bits = int.from_bytes(struct.pack("<d", float(expected)), "little")
+    assert result.vector_registers[0] >> 64 == 0xA5A5A5A5A5A5A5A5
+    assert result.vector_registers[0] & ((1 << 64) - 1) == expected_bits
+    assert result.system_state["amd64.mxcsr"] & (1 << 5)
+
+
+def test_cvtsi2sd_unmasked_precision_exception_traps_before_destination_write():
+    instruction = _instruction(
+        X86InstructionToken.CVTSI2SD_XMM_RM64,
+        MachineSemanticToken.SIGNED_INTEGER_TO_SCALAR_FLOAT64,
+        (
+            VectorRegisterOperand(X86VectorRegister.XMM0),
+            RegisterOperand(X86Register.RCX, 64),
+        ),
+    )
+    registers = [0] * 16
+    registers[1] = (1 << 53) + 1
+    state = MachineExecutionState(
+        pc=0, registers=tuple(registers),
+        system_state={"amd64.mxcsr": 0x1F80 & ~(1 << 12)},
+    )
+
+    with pytest.raises(FloatingPointError, match="precision"):
+        default_effect_handlers()[
+            int(MachineSemanticToken.SIGNED_INTEGER_TO_SCALAR_FLOAT64)
+        ](state, instruction)
+
+
+@pytest.mark.parametrize(("source", "rounding", "expected"), (
+    ((1 << 24) + 1, 0, 1 << 24),
+    ((1 << 24) + 1, 1, 1 << 24),
+    ((1 << 24) + 1, 2, (1 << 24) + 2),
+    (-((1 << 24) + 1), 1, -((1 << 24) + 2)),
+))
+def test_cvtsi2ss_uses_integer_only_mxcsr_rounding_and_preserves_upper_bits(
+    source, rounding, expected,
+):
+    instruction = _instruction(
+        X86InstructionToken.CVTSI2SS_XMM_RM64,
+        MachineSemanticToken.SIGNED_INTEGER_TO_SCALAR_FLOAT32,
+        (
+            VectorRegisterOperand(X86VectorRegister.XMM0),
+            RegisterOperand(X86Register.RCX, 64),
+        ),
+    )
+    registers = [0] * 16
+    registers[1] = source & ((1 << 64) - 1)
+    vectors = [0] * 16
+    vectors[0] = 0xA5A5A5A5A5A5A5A5A5A5A5A5 << 32
+    state = MachineExecutionState(
+        pc=0, registers=tuple(registers), vector_registers=tuple(vectors),
+        system_state={"amd64.mxcsr": 0x1F80 | (rounding << 13)},
+    )
+    result = default_effect_handlers()[
+        int(MachineSemanticToken.SIGNED_INTEGER_TO_SCALAR_FLOAT32)
+    ](state, instruction)
+    expected_bits = int.from_bytes(struct.pack("<f", float(expected)), "little")
+    assert result.vector_registers[0] >> 32 == vectors[0] >> 32
+    assert result.vector_registers[0] & 0xFFFFFFFF == expected_bits
+    assert result.system_state["amd64.mxcsr"] & (1 << 5)
 
 
 def test_unsigned_multiply_writes_implicit_rdx_rax_pair():
@@ -552,6 +652,53 @@ def test_bit_test_family_updates_carry_and_cross_word_memory_location():
     assert changed.memory.read_unsigned(0x1804, 32) == 0b1000
 
 
+def test_btc_memory_complements_selected_bit_and_preserves_other_flags():
+    decoder = X86ReferenceDecoder()
+    instruction, end = decoder.decode_one(
+        memoryview(b"\x0f\xba\x39\x05"), 0, base_address=0x1000,
+    )
+    memory = PagedByteMemory.empty().map_zeroes(0x2000, 8)
+    memory = memory.write_unsigned(0x2000, 32, 0b100000)
+    registers = [0] * 16
+    registers[1] = 0x2000
+    original_flags = (1 << 6) | (1 << 11)
+    changed = default_effect_handlers()[int(instruction.semantic)](
+        MachineExecutionState(
+            pc=instruction.address, registers=tuple(registers),
+            memory=memory, flags=original_flags,
+        ),
+        instruction,
+    )
+
+    assert end == 4
+    assert changed.memory.read_unsigned(0x2000, 32) == 0
+    assert changed.flags & 1
+    assert changed.flags & ~1 == original_flags
+
+
+def test_locked_xadd_memory_returns_observed_value_and_sets_add_flags():
+    decoder = X86ReferenceDecoder()
+    instruction, end = decoder.decode_one(
+        memoryview(b"\xf0\x0f\xc1\x11"), 0, base_address=0x1000,
+    )
+    memory = PagedByteMemory.empty().map_zeroes(0x2000, 8)
+    memory = memory.write_unsigned(0x2000, 32, 0xFFFFFFFF)
+    registers = [0] * 16
+    registers[1], registers[2] = 0x2000, 1
+    changed = default_effect_handlers()[int(instruction.semantic)](
+        MachineExecutionState(
+            pc=instruction.address, registers=tuple(registers), memory=memory,
+        ),
+        instruction,
+    )
+
+    assert end == 4
+    assert changed.memory.read_unsigned(0x2000, 32) == 0
+    assert changed.registers[2] == 0xFFFFFFFF
+    assert changed.flags & 1  # CF
+    assert changed.flags & (1 << 6)  # ZF
+
+
 def test_external_device_effect_is_part_of_reversible_machine_state():
     memory = PagedByteMemory.empty().map_zeroes(0x7000, 0x1000)
     memory = memory.write_unsigned(0x7FF8, 64, 0x2000)
@@ -591,3 +738,86 @@ def test_byte_not_decodes_and_executes_without_widening_its_operand():
     assert end == 2
     assert instruction.token is X86InstructionToken.NOT_RM8
     assert changed.registers[0] == 0x1122334455667777
+
+
+def test_addss_executes_low_binary32_lane_and_preserves_upper_lanes():
+    instruction, end = X86ReferenceDecoder().decode_one(
+        memoryview(b"\xf3\x0f\x58\xc1"), 0, base_address=0x140018600,
+    )
+    upper = 0xAABBCCDDEEFF001122334455
+    left = int.from_bytes(struct.pack("<f", 1.25), "little")
+    right = int.from_bytes(struct.pack("<f", 2.5), "little")
+    vectors = [0] * 16
+    vectors[0] = (upper << 32) | left
+    vectors[1] = right
+    changed = default_effect_handlers()[int(instruction.semantic)](
+        MachineExecutionState(pc=instruction.address, vector_registers=tuple(vectors)),
+        instruction,
+    )
+
+    assert end == 4
+    assert instruction.token is X86InstructionToken.ADDSS_XMM_XMMM32
+    expected = int.from_bytes(struct.pack("<f", 3.75), "little")
+    assert changed.vector_registers[0] == (upper << 32) | expected
+
+
+def test_vinsertf128_decodes_and_inserts_selected_ymm_lane_without_host_avx():
+    encoded = bytes.fromhex("c4 e3 7d 18 c0 01")
+    instruction, end = X86ReferenceDecoder().decode_one(
+        memoryview(encoded), 0, base_address=0x180011822,
+    )
+    low = 0x00112233445566778899AABBCCDDEEFF
+    high = 0xFFEEDDCCBBAA99887766554433221100
+    vectors = [0] * 16
+    vectors[0] = low | (high << 128)
+    changed = default_effect_handlers()[int(instruction.semantic)](
+        MachineExecutionState(
+            pc=instruction.address, vector_registers=tuple(vectors),
+        ),
+        instruction,
+    )
+
+    assert end == len(encoded)
+    assert instruction.token is X86InstructionToken.VINSERTF128_YMM_YMM_XMMM128_IMM8
+    assert instruction.semantic is MachineSemanticToken.VECTOR_INSERT_128_LANE
+    assert tuple(getattr(item, "width", None) for item in instruction.operands) == (
+        256, 256, 128, 8,
+    )
+    # Source YMM0's low XMM0 lane is copied into its upper lane.
+    assert changed.vector_registers[0] == low | (low << 128)
+
+
+def test_divss_executes_low_binary32_lane_and_records_masked_zero_division():
+    instruction, _ = X86ReferenceDecoder().decode_one(
+        memoryview(b"\xf3\x0f\x5e\xc1"), 0, base_address=0x140018610,
+    )
+    upper = 0x112233445566778899AABBCC
+    vectors = [0] * 16
+    vectors[0] = (upper << 32) | int.from_bytes(struct.pack("<f", 4.0), "little")
+    vectors[1] = int.from_bytes(struct.pack("<f", 0.0), "little")
+    changed = default_effect_handlers()[int(instruction.semantic)](
+        MachineExecutionState(pc=instruction.address, vector_registers=tuple(vectors)),
+        instruction,
+    )
+
+    assert instruction.token is X86InstructionToken.DIVSS_XMM_XMMM32
+    assert changed.vector_registers[0] == (upper << 32) | 0x7F800000
+    assert changed.system_state["amd64.mxcsr"] & (1 << 2)
+
+
+def test_comiss_executes_ordered_binary32_comparison_flags():
+    instruction, _ = X86ReferenceDecoder().decode_one(
+        memoryview(b"\x0f\x2f\xc1"), 0, base_address=0x140018620,
+    )
+    vectors = [0] * 16
+    vectors[0] = int.from_bytes(struct.pack("<f", 1.0), "little")
+    vectors[1] = int.from_bytes(struct.pack("<f", 2.0), "little")
+    changed = default_effect_handlers()[int(instruction.semantic)](
+        MachineExecutionState(pc=instruction.address, vector_registers=tuple(vectors)),
+        instruction,
+    )
+
+    assert instruction.token is X86InstructionToken.COMISS_XMM_XMMM32
+    assert changed.flags & 1
+    assert not (changed.flags & (1 << 2))
+    assert not (changed.flags & (1 << 6))

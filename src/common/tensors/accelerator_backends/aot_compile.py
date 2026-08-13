@@ -52,11 +52,10 @@ Real Fortran AOT exists, but through a different route: get
 ``sympy_expression=``.  See ``docs/PIPELINE_STAGE_DISAMBIGUATION.md`` for
 how this fits against the tape-walking JIT backends.
 
-``unroll_limit`` bounds which loops ``remove_loops`` may flatten. The
-default of 8 is low for a target that needs a flat program: a loop above
-the limit is retained rather than refused, so the caller gets a program
-that compiles and runs fewer iterations than it asked for. Set it to the
-trip count you expect.
+``unroll_limit`` bounds which loops ``remove_loops`` may flatten.  It never
+bounds source execution: a loop above the limit is retained with its original
+domain and trip count.  A backend that cannot emit that retained loop must
+report a lowering shortfall rather than shortening the program.
 
 ``source`` must be real ``def`` functions, not a lambda -- and, following
 the one verified working shape (``tests/test_glsl_fused_network.py``'s
@@ -107,6 +106,7 @@ from typing import Any, Callable, Mapping
 
 from ....compiler.glsl_deployment_strategy import (
     ProcessGraphGLSLDeployment,
+    _build_shell_hierarchy_plan,
     _build_hierarchical_glsl_artifact,
     _control_partition_keys,
     _find_nested_loop_node_ids_in_block,
@@ -184,11 +184,8 @@ def _source_dependency_is_not_tensor_primitive(value: Any) -> bool:
     """
 
     target = value.__func__ if inspect.ismethod(value) else value
-    owner = str(getattr(target, "__qualname__", "")).split(".", 1)[0]
     module = str(getattr(target, "__module__", ""))
-    if not module.startswith("src."):
-        return False
-    if module.endswith(".debug"):
+    if module.startswith("src.") and module.endswith(".debug"):
         return False
     for name in dir(AbstractTensor):
         candidate = getattr(AbstractTensor, name, None)
@@ -198,7 +195,8 @@ def _source_dependency_is_not_tensor_primitive(value: Any) -> bool:
         if target is candidate:
             return False
     return not (
-        owner == "AbstractTensor"
+        str(getattr(target, "__qualname__", "")).split(".", 1)[0]
+        == "AbstractTensor"
         and module == "src.common.tensors.abstraction"
     )
 
@@ -519,6 +517,8 @@ def prepare_aot_checkpoint_store(
     mutable_parameters: tuple[str, ...] | list[str] | set[str] = (),
     retain: Any = (),
     python_bindings: Mapping[str, Any] | None = None,
+    tensor_code_references: Mapping[str, Callable[..., Any]] | None = None,
+    runtime_closure_only: bool = False,
     checkpoint: bool | str | Path = False,
 ) -> tuple[Any, str, str, str, str, Mapping[str, Any]]:
     """Build the checkpoint store and phase digests ``compile_ast_aot`` resumes
@@ -580,6 +580,13 @@ def prepare_aot_checkpoint_store(
         )
         if callable(value)
     )
+    tensor_reference_values = tuple(
+        reference
+        for _name, reference in sorted(
+            (tensor_code_references or {}).items(),
+            key=lambda pair: str(pair[0]),
+        )
+    )
     checkpoint_store = AOTCheckpointStore(
         {
             "source": source,
@@ -593,7 +600,11 @@ def prepare_aot_checkpoint_store(
             "constant_map": constant_map,
             "mutable_parameters": mutable_parameters,
             "retain": retain,
+            "runtime_closure_only": bool(runtime_closure_only),
             "python_binding_sources": callable_digest(*binding_values),
+            "tensor_code_reference_sources": callable_digest(
+                *tensor_reference_values
+            ),
         },
         None if checkpoint is True else checkpoint,
     )
@@ -624,10 +635,14 @@ def compile_ast_aot(
     constant_map: Mapping[str, Any] | None = None,
     mutable_parameters: tuple[str, ...] | list[str] | set[str] = (),
     retain: Any = (),
+    tensor_code_references: Mapping[str, Callable[..., Any]] | None = None,
     progress: "Callable[[str], None] | None" = None,
     checkpoint: bool | str | Path = False,
     resume: bool = True,
     dependency_seeds: tuple[str, ...] = (),
+    require_planned_shells: bool = False,
+    runtime_closure_only: bool = False,
+    project_captured_hierarchy: bool = True,
 ) -> AOTCompilation:
     """Compile ``entrypoint`` in ``source`` ahead-of-time and execute it once.
 
@@ -644,6 +659,10 @@ def compile_ast_aot(
     ``ssa_fortran_backend``).  The returned ``.shell`` is the
     ``DualIRShell`` describing the same numeric/control pair.
     """
+
+    from ....compiler.compiler_entrypoints import warn_legacy_source_compiler
+
+    warn_legacy_source_compiler("compile_ast_aot")
 
     def _report(message: str) -> None:
         if progress is not None:
@@ -669,6 +688,20 @@ def compile_ast_aot(
     )))
     constant_map = dict(constant_map or {})
     mutable_parameters = tuple(dict.fromkeys(map(str, mutable_parameters)))
+    tensor_code_references = {
+        str(name): reference
+        for name, reference in dict(tensor_code_references or {}).items()
+    }
+    noncallable_references = tuple(
+        name
+        for name, reference in tensor_code_references.items()
+        if not callable(reference)
+    )
+    if noncallable_references:
+        raise TypeError(
+            "tensor code references must be callable source references: "
+            f"{noncallable_references!r}"
+        )
     expanded_python_bindings = _expand_python_static_bindings(
         python_bindings
     )
@@ -693,6 +726,8 @@ def compile_ast_aot(
         mutable_parameters=mutable_parameters,
         retain=retain,
         python_bindings=python_bindings,
+        tensor_code_references=tensor_code_references,
+        runtime_closure_only=runtime_closure_only,
         checkpoint=checkpoint,
     )
     # A compiled plan contains the frontend's resolved call identities and
@@ -701,6 +736,7 @@ def compile_ast_aot(
     # capture/coordinator-only change may continue to reuse it.
     planning_implementation = callable_digest(
         strategize_shell_deployment,
+        _build_shell_hierarchy_plan,
         _control_partition_keys,
         frontend_implementation,
     )
@@ -755,7 +791,12 @@ def compile_ast_aot(
     # and pair it with the cheap source-graph checkpoint for the process graph
     # -- so the resume loads ~89 MB instead of deserializing the 2.8-3.5 GB
     # plan it would otherwise pull in only to read one ~10 MB attribute.
-    if checkpoint_store is not None and resume and precompile_only:
+    if (
+        checkpoint_store is not None
+        and resume
+        and precompile_only
+        and not require_planned_shells
+    ):
         _report("aot: probing captured-program checkpoint (bake fast-path)")
         captured = checkpoint_store.load(
             "captured_program", capture_implementation
@@ -911,6 +952,11 @@ def compile_ast_aot(
                 module,
                 resolve_unresolved_parents=True,
                 parent_include=_source_dependency_is_not_tensor_primitive,
+                pursuit_roots=(
+                    tuple(dict.fromkeys((*targets, *dependency_seeds)))
+                    if runtime_closure_only else None
+                ),
+                tensor_code_references=tensor_code_references,
                 retain=retain,
                 progress=_report,
             )
@@ -969,6 +1015,9 @@ def compile_ast_aot(
         resume=resume,
         dependency_seeds=dependency_seeds,
         compile_targets=targets,
+        require_planned_shells=require_planned_shells,
+        runtime_closure_only=runtime_closure_only,
+        project_captured_hierarchy=project_captured_hierarchy,
     )
 
 
@@ -1005,6 +1054,9 @@ def _lower_process_graph_to_compilation(
     resume: bool,
     dependency_seeds: tuple[str, ...] = (),
     compile_targets: tuple[str, ...] = (),
+    require_planned_shells: bool = False,
+    runtime_closure_only: bool = False,
+    project_captured_hierarchy: bool = True,
 ) -> AOTCompilation:
     """Lower an already-built ``ProcessGraph`` into a real ``AOTCompilation``.
 
@@ -1087,6 +1139,7 @@ def _lower_process_graph_to_compilation(
             remove_loops=remove_loops,
             unroll_limit=unroll_limit,
             schedule_preference=schedule_preference,
+            runtime_closure_only=runtime_closure_only,
         )
         _report("aot: glsl deployment strategy selected")
     # shell_language is fixed at "glsl", the one path that actually emits
@@ -1133,7 +1186,12 @@ def _lower_process_graph_to_compilation(
                         "aot: compiled-plan checkpoint skipped "
                         f"({type(error).__name__}: {error})"
                     )
-        if checkpoint_store is not None and resume and precompile_only:
+        if (
+            checkpoint_store is not None
+            and resume
+            and precompile_only
+            and not require_planned_shells
+        ):
             _report("aot: loading captured-program checkpoint")
             captured_compilation = checkpoint_store.load(
                 "captured_program",
@@ -1261,10 +1319,17 @@ def _lower_process_graph_to_compilation(
         # programs exist; otherwise callers see local regions but an empty
         # hierarchy and cannot link nested methods/loops into a whole program.
         hierarchy_exception = False
-        for planned_shell in tuple(dict.fromkeys((
-            function_shell,
-            deployment,
-        ))):
+        hierarchy_shells = (
+            tuple(dict.fromkeys((function_shell, deployment)))
+            if project_captured_hierarchy
+            else ()
+        )
+        if not project_captured_hierarchy:
+            _report(
+                "aot: skipping captured-region hierarchy projection; "
+                "the caller consumes complete per-method control/operator IR"
+            )
+        for planned_shell in hierarchy_shells:
             if not getattr(planned_shell, "callsite_function_shells", None):
                 continue
             try:
@@ -1345,8 +1410,35 @@ def _lower_process_graph_to_compilation(
                 if control is not None and control.region_indices:
                     source_shell = candidate
                     break
-        control_shortfalls = tuple(
-            {
+        def _control_shortfall_record(candidate, reduction):
+            loop_data = candidate.process_graph.G.nodes[
+                int(reduction.loop_node_id)
+            ]
+            expression = loop_data.get("expr_obj")
+            try:
+                source = ast.unparse(expression)
+            except Exception:  # noqa: BLE001 -- diagnostic only
+                source = repr(expression)
+            effects = tuple(
+                {
+                    "state_name": str(effect.get("state_name", "?")),
+                    "operator": str(effect.get("operator", "?")),
+                    "mode": str(effect.get("effect_mode", "opaque")),
+                    "state_input_id": effect.get("state_input_id"),
+                    "effect_node_id": effect.get("effect_node_id"),
+                    "argument_value_ids": tuple(
+                        effect.get("argument_value_ids", ())
+                    ),
+                    "sequence_policy": effect.get("sequence_policy"),
+                    "argument_kind": effect.get("argument_kind"),
+                }
+                for effect in (
+                    (loop_data.get("attributes") or {}).get(
+                        "loop_state_effects", ()
+                    )
+                )
+            )
+            return {
                 "function": str(
                     candidate.process_graph.G.graph.get("function_name")
                     or "?"
@@ -1373,7 +1465,14 @@ def _lower_process_graph_to_compilation(
                         candidate.captured_region_programs or {}
                     )
                 ),
+                "source": source,
+                "source_line": getattr(expression, "lineno", None),
+                "source_header": source.splitlines()[0] if source else "",
+                "state_effects": effects,
             }
+
+        control_shortfalls = tuple(
+            _control_shortfall_record(candidate, reduction)
             for candidate in _walk_planned_shells(deployment)
             if candidate.captured_region_programs
             for reduction in candidate.loop_shader_reductions
@@ -1385,11 +1484,14 @@ def _lower_process_graph_to_compilation(
                 "aot: control lowering left "
                 f"{len(control_shortfalls)} loop(s) as fill-later spot(s)"
             )
-            for item in control_shortfalls:
+            for occurrence, item in enumerate(control_shortfalls, 1):
                 _report(
-                    "aot: control-hole "
+                    f"aot: control-hole {occurrence}/{len(control_shortfalls)} "
                     f"{item['function']} loop {item['loop_node_id']} "
-                    f"[{', '.join(item['blockers'])}]"
+                    f"[{', '.join(item['blockers'])}] "
+                    f"line={item['source_line']} "
+                    f"source={item['source_header']!r} "
+                    f"effects={item['state_effects']!r}"
                 )
         entry_output_names = tuple(map(
             str,
@@ -1690,6 +1792,34 @@ def _lower_process_graph_to_compilation(
     collect_hierarchy_values(
         getattr(source_shell, "hierarchy_plan", None)
     )
+    # A captured region may consume an attribute read whose later write is the
+    # only value retained in the lexical identity history (``state.values +=``
+    # is the canonical case).  The read and write are two SSA values sharing
+    # one authored alias path.  Recover the live read directly from the root
+    # graph expression so the ABI asks the caller for ``state.values`` rather
+    # than an anonymous ``t<ID>`` or a copied top-level ``state`` object.
+    root_graph = source_shell.process_graph.G
+    root_parameters = set(function_parameters)
+
+    def rooted_attribute_path(expression: Any) -> str | None:
+        if not isinstance(expression, ast.Attribute):
+            return None
+        parts = [str(expression.attr)]
+        current = expression.value
+        while isinstance(current, ast.Attribute):
+            parts.append(str(current.attr))
+            current = current.value
+        if not isinstance(current, ast.Name) or current.id not in root_parameters:
+            return None
+        return ".".join((current.id, *reversed(parts)))
+
+    for local_id, data in root_graph.nodes(data=True):
+        global_id = int(root_value_ids.get(int(local_id), int(local_id)))
+        if global_id not in executable_value_ids:
+            continue
+        path = rooted_attribute_path(data.get("expr_obj"))
+        if path is not None:
+            public_input_value_ids.setdefault(path, global_id)
     for parameter in function_parameters:
         history = tuple(map(int, identity_table.get(parameter, ())))
         live = tuple(
@@ -1776,7 +1906,11 @@ def _lower_process_graph_to_compilation(
             )
             # The bake fast-path resumes from captured_program + source_graph
             # alone, so the multi-GB intermediate plans are now dead weight.
-            reclaimed = checkpoint_store.prune("prepared_plan", "compiled_plan")
+            reclaimed = 0
+            if not require_planned_shells:
+                reclaimed = checkpoint_store.prune(
+                    "prepared_plan", "compiled_plan"
+                )
             if reclaimed:
                 _report(
                     "aot: pruned superseded plan checkpoints "
@@ -1849,7 +1983,10 @@ def compile_cpp_shell_aot(
     minimal wrapper needed to prove the join, not full parity.
     """
 
+    from ....compiler.compiler_entrypoints import warn_legacy_source_compiler
     from pycparser import c_ast, c_parser
+
+    warn_legacy_source_compiler("compile_cpp_shell_aot")
 
     from ....compiler.cpp_shell_desugar import desugar_cpp_shell
     from ....transmogrifier.graph.oop_language_translations import (
@@ -1914,6 +2051,7 @@ def compile_cpp_shell_aot(
         dependency_regions=None,
         map_ir=None,
         resume=False,
+        require_planned_shells=False,
     )
 
 

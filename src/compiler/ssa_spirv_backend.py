@@ -851,6 +851,19 @@ def emit_function(
     function's return value.
     """
 
+    from .machine_dialect_ssa import (
+        format_machine_dialect_occurrences,
+        module_machine_dialect_occurrences,
+    )
+    machine_residuals = module_machine_dialect_occurrences({
+        function.name: function,
+    })
+    if machine_residuals:
+        raise SPIRVEmissionError(
+            "SPIR-V emission requires legalized repository SSA; retained "
+            "machine-state SSA remains: "
+            + format_machine_dialect_occurrences(machine_residuals)
+        )
     builder = _ModuleBuilder()
     fn = _emit_function(function, builder, dtype=dtype, outputs=outputs)
     return _assemble(function.name, builder, (fn,))
@@ -871,6 +884,17 @@ def emit_module(
     """
 
     functions = module.functions if isinstance(module, IRModule) else dict(module)
+    from .machine_dialect_ssa import (
+        format_machine_dialect_occurrences,
+        module_machine_dialect_occurrences,
+    )
+    machine_residuals = module_machine_dialect_occurrences(functions)
+    if machine_residuals:
+        raise SPIRVEmissionError(
+            "SPIR-V emission requires legalized repository SSA; retained "
+            "machine-state SSA remains: "
+            + format_machine_dialect_occurrences(machine_residuals)
+        )
     named_outputs = dict(outputs or {})
     builder = _ModuleBuilder()
     fns = tuple(

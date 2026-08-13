@@ -13,6 +13,7 @@ import ast
 import os
 import sys
 import time
+import traceback
 
 
 def _class_method_names(source: str, class_name: str) -> list[str]:
@@ -54,7 +55,10 @@ def compile_class_to_dll(source, class_name, outdir, *, progress=None):
     so all export cleanly from one shared library.
     """
 
+    from src.compiler.compiler_entrypoints import warn_legacy_source_compiler
     from src.compiler.fortran_c_shell import compile_ast_fortran_c_shell
+
+    warn_legacy_source_compiler("compile_class_to_dll")
 
     methods = _class_method_names(source, class_name)
     if not methods:
@@ -69,6 +73,7 @@ def compile_class_to_dll(source, class_name, outdir, *, progress=None):
     return compile_ast_fortran_c_shell(
         source, nominal, {}, outdir, name=class_name,
         library=True, dependency_seeds=seeds, progress=progress,
+        runtime_closure_only=True,
     )
 
 
@@ -97,6 +102,10 @@ def export_public_surface(module_name: str, outdir, *, progress=None):
     foundational-library pattern: a module's public API compiled to a shared
     object other compiled programs link against as externals.
     """
+
+    from src.compiler.compiler_entrypoints import warn_legacy_source_compiler
+
+    warn_legacy_source_compiler("export_public_surface")
 
     import ast
     import importlib
@@ -158,8 +167,10 @@ def main(argv: list[str] | None = None) -> int:
             handle = compile_ast_fortran_c_shell(
                 source, entrypoint, {}, outdir, name=entrypoint,
                 library=True, progress=progress,
+                runtime_closure_only=True,
             )
     except Exception as error:  # noqa: BLE001
+        traceback.print_exc()
         print(
             f"\nERROR after {round(time.time() - started, 1)}s: "
             f"{type(error).__name__}: {error}",

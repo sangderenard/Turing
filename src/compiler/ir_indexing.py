@@ -55,14 +55,19 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
         for block in function.blocks.values():
             rewritten = []
             for instruction in block.instrs:
-                if instruction.op in _GATHER and len(instruction.args) >= 2:
+                canonical_op = str(
+                    instruction.attributes.get("tensor_operation")
+                    or instruction.attributes.get("tensor")
+                    or instruction.op
+                )
+                if canonical_op in _GATHER and len(instruction.args) >= 2:
                     base, *indices = instruction.args
                     address = fresh()
                     rewritten.append(
                         Instr("GetElementPtr", [base, *indices], address)
                     )
                     rewritten.append(Instr("Load", [address], instruction.res))
-                elif instruction.op in _SCATTER and len(instruction.args) >= 3:
+                elif canonical_op in _SCATTER and len(instruction.args) >= 3:
                     base = instruction.args[0]
                     value = instruction.args[-1]
                     indices = instruction.args[1:-1]

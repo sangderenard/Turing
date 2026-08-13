@@ -139,6 +139,10 @@ class WGSLShortfall:
         return f"{self.function}: {self.operation}: {self.reason}"
 
 
+class WGSLEmissionError(ValueError):
+    """The supplied IR is not eligible for repository-SSA WGSL emission."""
+
+
 @dataclass
 class WGSLModule:
     name: str
@@ -522,6 +526,17 @@ def emit_module(
     preferred_local_size: int = 256,
 ) -> WGSLModule:
     ir_module = module if isinstance(module, IRModule) else IRModule(dict(module))
+    from .machine_dialect_ssa import (
+        format_machine_dialect_occurrences,
+        module_machine_dialect_occurrences,
+    )
+    machine_residuals = module_machine_dialect_occurrences(ir_module)
+    if machine_residuals:
+        raise WGSLEmissionError(
+            "WebGPU emission requires legalized repository SSA; retained "
+            "machine-state SSA remains: "
+            + format_machine_dialect_occurrences(machine_residuals)
+        )
     functions = ir_module.functions
     named_outputs = dict(outputs or {})
     launch_plan = plan_wgsl_launch(count, preferred_local_size=preferred_local_size)
@@ -693,6 +708,6 @@ def emit_module(
 
 
 __all__ = [
-    "WGSLComputeLimits", "WGSLLaunchPlan", "WGSLModule", "WGSLShortfall",
+    "WGSLComputeLimits", "WGSLEmissionError", "WGSLLaunchPlan", "WGSLModule", "WGSLShortfall",
     "emit_module", "plan_wgsl_launch", "supported_tensor_operations",
 ]

@@ -161,6 +161,10 @@ def compile_to_dual_ir(
     dual IR -- the highest checkpoint we release.
     """
 
+    from .compiler_entrypoints import warn_legacy_source_compiler
+
+    warn_legacy_source_compiler("compile_to_dual_ir")
+
     from ..common.tensors.accelerator_backends.aot_compile import compile_ast_aot
     from ..common.tensors.accelerator_backends.dual_ir_shell import (
         compose_dual_ir_shell,

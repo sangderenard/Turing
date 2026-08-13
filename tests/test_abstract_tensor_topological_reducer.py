@@ -10,6 +10,32 @@ from src.common.tensors.topological_reducer import (
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
 
+def test_descendant_loop_targets_are_not_enclosing_loop_carried_state():
+    module = ast.parse(
+        """
+def kernel(rows):
+    i = 99
+    size = 88
+    for row in rows:
+        for i, size in enumerate(row):
+            pass
+    return 0
+"""
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+
+    reduce_abstract_tensor_topology(graph)
+
+    outer = module.body[0].body[2]
+    carried = (
+        graph.G.nodes[id(outer)].get("attributes") or {}
+    ).get("loop_carried_bindings", {})
+    assert "i" not in carried
+    assert "size" not in carried
+
+
 def test_only_name_assign_and_call_receive_existing_process_graph_aliases():
     graph = ProcessGraph(materialize_memory=False)
     with contextlib.redirect_stdout(io.StringIO()):
@@ -142,8 +168,8 @@ def kernel(tensor, zigzag):
     subscript = next(
         node for node in ast.walk(module) if isinstance(node, ast.Subscript)
     )
-    index_tuple = subscript.slice
-    assert isinstance(index_tuple, ast.Tuple)
+    authored_index_tuple = subscript.slice
+    assert isinstance(authored_index_tuple, ast.Tuple)
 
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(module)
@@ -151,13 +177,18 @@ def kernel(tensor, zigzag):
 
     indexed = graph.G.nodes[id(subscript)]
     assert indexed["type"] == "Indexed"
+    # Ellipsis is expanded before ingestion into one ndim-driven index value.
+    # The authored Subscript identity remains stable, while its former Tuple
+    # and Ellipsis leaves are deliberately replaced by the explicit index DAG.
     assert indexed["parents"] == [
         (id(subscript.value), "base"),
-        (id(index_tuple.elts[0]), "index"),
-        (id(index_tuple.elts[1]), "index"),
+        (id(subscript.slice), "index"),
     ]
-    assert graph.G.nodes[id(index_tuple.elts[0])]["expr_obj"].value is Ellipsis
-    assert id(index_tuple) not in graph.G
+    assert not any(
+        isinstance(node, ast.Constant) and node.value is Ellipsis
+        for node in ast.walk(subscript)
+    )
+    assert id(authored_index_tuple) not in graph.G
 
 
 def test_imports_are_retained_as_logged_contextual_requirements(caplog):
@@ -278,6 +309,83 @@ def kernel(x):
         for _node_id, data in entry.graph.G.nodes(data=True)
     )
     assert entry.graph.function_table is graph.function_table
+
+
+def test_bound_method_dereference_is_an_explicit_ssa_accessor():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Graph:
+    def connect(self, value):
+        self.last = value
+
+    def build(self, values):
+        for value in values:
+            self.connect(value)
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    build_graph = graph.function_table.entry("build").graph
+    call_id, call = next(
+        (node_id, data)
+        for node_id, data in build_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+    )
+    accessor_id, accessor = next(
+        (node_id, data)
+        for node_id, data in build_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+    )
+    method_ref = graph.G.graph["class_table"]["Graph"]["methods"][
+        "connect"
+    ]
+
+    assert call["attributes"]["method_ref"] == method_ref
+    assert accessor["attributes"]["accessor_kind"] == "method"
+    assert accessor["attributes"]["method_ref"] == method_ref
+    assert (accessor_id, "callee") in call["parents"]
+    loop = next(
+        data
+        for _node_id, data in build_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    )
+    assert not (loop.get("attributes") or {}).get("loop_state_effects")
+
+
+def test_descendant_loop_owns_its_sequence_mutation_effect():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def kernel(rows):
+    results = []
+    for row in rows:
+        for value in row:
+            results.extend((value,))
+    return results
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("kernel").graph
+    loops = {
+        data["expr_obj"].lineno: data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    }
+    assert not (loops[4].get("attributes") or {}).get(
+        "loop_state_effects"
+    )
+    inner_effect, = loops[5]["attributes"]["loop_state_effects"]
+    assert inner_effect["operator"] == "extend"
+    assert inner_effect["effect_mode"] == "sequence_mutation"
+    assert inner_effect["sequence_policy"] == "duplicates"
 
 
 def test_imported_callee_is_an_external_function_reference():

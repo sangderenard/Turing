@@ -47,6 +47,35 @@ class ControlExpression:
 
 
 @dataclass(frozen=True)
+class ConditionalBlock:
+    """Execute one compiled control body under a resident predicate."""
+
+    predicate_value_id: int
+    body: "ControlBlock"
+    orelse: "ControlBlock | None" = None
+    expect_true: bool = True
+    predicate_expression: ControlExpression | None = None
+    # (true-arm value, false-arm value, pre-branch value, merged value).
+    # A missing arm repeats the pre-branch value and is encoded by giving that
+    # arm the same id as ``initial_value_id``.
+    carried_aliases: tuple[tuple[int, int, int, int], ...] = ()
+    source_node_id: int | None = None
+
+
+@dataclass(frozen=True)
+class ControlSequenceMutation:
+    """One explicit mutation of caller-provided sequence/table storage."""
+
+    sequence_value_id: int
+    operator: str
+    argument_value_ids: tuple[int, ...]
+    effect_node_id: int
+    policy: str | None = None
+    argument_kind: str = "value"
+    predicate_expression: ControlExpression | None = None
+
+
+@dataclass(frozen=True)
 class LoopBlock:
     induction: str
     start: str
@@ -67,6 +96,7 @@ class LoopBlock:
     # with the ProcessGraph SCC from which this loop was retained.
     recursion_region_id: int | None = None
     schedule_preference: str = "alap"
+    sequence_mutations: tuple[ControlSequenceMutation, ...] = ()
 
     def __post_init__(self) -> None:
         preference = str(self.schedule_preference).lower()
@@ -93,6 +123,7 @@ class WhileBlock:
     carried_aliases: tuple[tuple[int, int], ...] = ()
     recursion_region_id: int | None = None
     predicate_expression: ControlExpression | None = None
+    sequence_mutations: tuple[ControlSequenceMutation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -229,6 +260,7 @@ class StreamPublishBlock:
 ControlBlock = (
     StatementBlock
     | SequenceBlock
+    | ConditionalBlock
     | LoopBlock
     | WhileBlock
     | LoopControlBlock
@@ -325,6 +357,11 @@ def _indent(lines: Iterable[str], spaces: int = 4) -> tuple[str, ...]:
 
 
 def _render_loop(block: LoopBlock, target: ControlTarget) -> tuple[str, ...]:
+    if block.sequence_mutations:
+        raise ValueError(
+            "sequence mutations require repository-SSA memory lowering; "
+            "direct control-source rendering would hide their arena ABI"
+        )
     body = _indent(render_control_block(block.body, target))
     if target is ControlTarget.GLSL and block.dispatch_shell == "c":
         return (
@@ -377,6 +414,11 @@ def _render_expression(
         return f"value_{int(expression.value_id)}"
     if expression.op == "const":
         return repr(expression.literal).lower() if target is not ControlTarget.PYTHON else repr(expression.literal)
+    if expression.op == "sequence_nonempty":
+        raise ValueError(
+            "sequence truth predicates require repository-SSA memory "
+            "lowering; direct source rendering would hide the length-cell ABI"
+        )
     if expression.op in {"item", "float", "int", "bool"}:
         return _render_expression(expression.operands[0], target)
     unary = {"not": "!", "neg": "-"}
@@ -394,6 +436,11 @@ def _render_expression(
 
 
 def _render_while(block: WhileBlock, target: ControlTarget) -> tuple[str, ...]:
+    if block.sequence_mutations:
+        raise ValueError(
+            "sequence mutations require repository-SSA memory lowering; "
+            "direct control-source rendering would hide their arena ABI"
+        )
     condition = render_control_block(block.condition, target)
     body = render_control_block(block.body, target)
     predicate = (
@@ -472,6 +519,41 @@ def render_control_block(
             line
             for child in block.blocks
             for line in render_control_block(child, target)
+        )
+    if isinstance(block, ConditionalBlock):
+        predicate = (
+            _render_expression(block.predicate_expression, target)
+            if block.predicate_expression is not None
+            else _predicate_spelling(block.predicate_value_id, target)
+        )
+        if not block.expect_true:
+            predicate = (
+                f"not {predicate}"
+                if target is ControlTarget.PYTHON
+                else f".not. ({predicate})"
+                if target is ControlTarget.FORTRAN
+                else f"!({predicate})"
+            )
+        body = render_control_block(block.body, target)
+        orelse = (
+            () if block.orelse is None
+            else render_control_block(block.orelse, target)
+        )
+        if target is ControlTarget.PYTHON:
+            return (
+                f"if {predicate}:", *_indent(body, 4),
+                *(("else:", *_indent(orelse, 4)) if orelse else ()),
+            )
+        if target is ControlTarget.FORTRAN:
+            return (
+                f"if ({predicate}) then", *_indent(body, 4),
+                *(("else", *_indent(orelse, 4)) if orelse else ()),
+                "end if",
+            )
+        return (
+            f"if ({predicate}) {{", *_indent(body, 4),
+            *(("} else {", *_indent(orelse, 4)) if orelse else ()),
+            "}",
         )
     if isinstance(block, LoopBlock):
         return _render_loop(block, target)
@@ -631,6 +713,16 @@ def compose_region_code(
             return region.launch_body
         if isinstance(block, SequenceBlock):
             return SequenceBlock(tuple(substitute(child) for child in block.blocks))
+        if isinstance(block, ConditionalBlock):
+            return ConditionalBlock(
+                block.predicate_value_id,
+                substitute(block.body),
+                None if block.orelse is None else substitute(block.orelse),
+                block.expect_true,
+                block.predicate_expression,
+                block.carried_aliases,
+                block.source_node_id,
+            )
         if isinstance(block, LoopBlock):
             return LoopBlock(
                 block.induction,
@@ -643,6 +735,7 @@ def compose_region_code(
                 block.dispatch_shell,
                 block.recursion_region_id,
                 block.schedule_preference,
+                block.sequence_mutations,
             )
         if isinstance(block, WhileBlock):
             return WhileBlock(
@@ -652,6 +745,7 @@ def compose_region_code(
                 block.carried_aliases,
                 block.recursion_region_id,
                 block.predicate_expression,
+                block.sequence_mutations,
             )
         if isinstance(block, LoopControlBlock):
             return block
@@ -740,16 +834,48 @@ def project_control_regions(
                 if (projected := project(child)) is not None
             )
             return SequenceBlock(children) if children else None
+        if isinstance(block, ConditionalBlock):
+            body = project(block.body)
+            orelse = (
+                None if block.orelse is None else project(block.orelse)
+            )
+            if body is None and orelse is None:
+                return None
+            return ConditionalBlock(
+                block.predicate_value_id,
+                body or SequenceBlock(()),
+                orelse,
+                block.expect_true,
+                block.predicate_expression,
+                tuple(
+                    carried for carried in block.carried_aliases
+                    if retained_values is None
+                    or all(
+                        int(value_id) in retained_values
+                        for value_id in carried
+                    )
+                ),
+                block.source_node_id,
+            )
         if isinstance(block, LoopBlock):
             body = project(block.body)
-            if body is None:
+            has_structural_body = any(
+                str(binding[2]) == str(block.induction)
+                and str(binding[3]) == "induction"
+                for binding in program.projected_iterable_bindings
+            )
+            if (
+                body is None
+                and not block.sequence_mutations
+                and not has_structural_body
+            ):
                 return None
             return LoopBlock(
                 block.induction,
                 block.start,
                 block.stop,
                 block.step,
-                body,
+                body or SequenceBlock(()),
                 tuple(
                     (updated, initial)
                     for updated, initial in block.carried_aliases
@@ -763,6 +889,7 @@ def project_control_regions(
                 block.dispatch_shell,
                 block.recursion_region_id,
                 block.schedule_preference,
+                block.sequence_mutations,
             )
         if isinstance(block, WhileBlock):
             condition = project(block.condition)
@@ -786,6 +913,7 @@ def project_control_regions(
                 ),
                 block.recursion_region_id,
                 block.predicate_expression,
+                block.sequence_mutations,
             )
         if isinstance(block, LoopControlBlock):
             if (
@@ -1038,12 +1166,41 @@ def overlay_scheduled_control(
                 projected, consumed = embed(
                     child, nested_root, nested_regions
                 )
-                if consumed and not inserted:
+                # A leaf marker returns ``None`` after consuming the nested
+                # region span, so this sequence owns insertion at that exact
+                # lexical position.  A composite child returns its rewritten
+                # block and ``consumed=True`` because it already inserted the
+                # nested root internally; inserting again here duplicates the
+                # complete subtree beside itself.
+                if consumed and projected is None and not inserted:
                     children.append(nested_root)
                     inserted = True
                 if projected is not None:
                     children.append(projected)
+                    inserted |= consumed
             return SequenceBlock(tuple(children)), inserted
+        if isinstance(block, ConditionalBlock):
+            body, body_consumed = embed(
+                block.body, nested_root, nested_regions
+            )
+            orelse = None
+            else_consumed = False
+            if block.orelse is not None:
+                orelse, else_consumed = embed(
+                    block.orelse, nested_root, nested_regions
+                )
+            return (
+                ConditionalBlock(
+                    block.predicate_value_id,
+                    body or SequenceBlock(()),
+                    orelse,
+                    block.expect_true,
+                    block.predicate_expression,
+                    block.carried_aliases,
+                    block.source_node_id,
+                ),
+                body_consumed or else_consumed,
+            )
         if isinstance(block, LoopBlock):
             body, consumed = embed(
                 block.body, nested_root, nested_regions
@@ -1062,6 +1219,7 @@ def overlay_scheduled_control(
                     block.dispatch_shell,
                     block.recursion_region_id,
                     block.schedule_preference,
+                    block.sequence_mutations,
                 ),
                 consumed,
             )
@@ -1086,6 +1244,7 @@ def overlay_scheduled_control(
                     block.carried_aliases,
                     block.recursion_region_id,
                     block.predicate_expression,
+                    block.sequence_mutations,
                 ),
                 condition_consumed or body_consumed,
             )
@@ -1199,14 +1358,6 @@ def overlay_scheduled_control(
     ]
     for index, control in enumerate(controls):
         controlled = tuple(control.region_indices)
-        if not controlled:
-            continue
-        missing = set(controlled) - set(order)
-        if missing:
-            raise ValueError(
-                "control overlay does not partition the schedule: "
-                f"missing={sorted(missing)!r}"
-            )
         uniforms.extend(control.uniforms)
         aliases.extend(control.value_aliases)
         iterable_bindings.extend(control.iterable_bindings)
@@ -1224,6 +1375,14 @@ def overlay_scheduled_control(
             replace(region, region_id=deployment_base + offset)
             for offset, region in enumerate(control.deployment_regions)
         )
+        if not controlled:
+            continue
+        missing = set(controlled) - set(order)
+        if missing:
+            raise ValueError(
+                "control overlay does not partition the schedule: "
+                f"missing={sorted(missing)!r}"
+            )
         if index not in maximal:
             continue
         overlap = set(controlled) & covered
@@ -1235,7 +1394,34 @@ def overlay_scheduled_control(
         first = min(controlled, key=positions.__getitem__)
         replacements[first] = nested_root(index)
         covered.update(controlled)
-    blocks = []
+    # Controls with no numerical region can still own complete compiled work:
+    # resident sequence mutation, or an empty loop body into which hierarchy
+    # composition will insert a source-linked CallBlock.  They have no schedule
+    # marker to replace, so retain their roots explicitly.  A genuinely empty
+    # loop remains filtered unless its induction appears in a projected
+    # iterable binding, which is the loop composer's structural proof that a
+    # retained body construct still owns this iteration.
+    call_only_inductions = {
+        str(induction)
+        for control in controls
+        for _iterable, _target, induction, projection
+        in control.projected_iterable_bindings
+        if str(projection) == "induction"
+    }
+    blocks = [
+        control.root
+        for control in controls
+        if not control.region_indices
+        and (
+            isinstance(control.root, LoopBlock)
+            and (
+                bool(control.root.sequence_mutations)
+                or str(control.root.induction) in call_only_inductions
+            )
+            or isinstance(control.root, WhileBlock)
+            and bool(control.root.sequence_mutations)
+        )
+    ]
     for region_index in order:
         replacement = replacements.get(region_index)
         if replacement is not None:
@@ -1407,6 +1593,7 @@ __all__ = [
     "ControlDeploymentLane",
     "ControlDeploymentRegion",
     "ControlExpression",
+    "ControlSequenceMutation",
     "CallBlock",
     "ValidationBlock",
     "ControlProgram",

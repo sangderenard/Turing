@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import ast
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 import networkx as nx
 
 from .control_source import (
     CallBlock,
+    ConditionalBlock,
     ControlBlock,
     ControlExpression,
     ControlProgram,
+    ControlSequenceMutation,
     LoopControlBlock,
     LoopBlock,
     ParallelDeployment,
@@ -25,6 +28,7 @@ from .control_source import (
 )
 from .deployment_frame import DeploymentJoin
 from .hierarchical_plan import (
+    PlanCall,
     PlanClosure,
     plan_region_to_ssa_instrs,
 )
@@ -51,8 +55,12 @@ from ..transmogrifier.ssa import (
     SSAClassField,
     SSAClassMethod,
     SSAClassTable,
+    SSAChildTablePoolDescriptor,
     SSADeploymentLane,
     SSADeploymentRegion,
+    SSASequenceCapacityPolicy,
+    SSASequenceDescriptor,
+    SSASequenceTable,
     SSAValue,
 )
 from ..transmogrifier.ssa_registry import Handler
@@ -423,10 +431,31 @@ class _ControlSSABuilder:
             int, tuple[tuple[int, ...], tuple[int, ...]]
         ] | None,
         region_value_meta: Mapping[int, Meta] | None = None,
+        value_aliases: Mapping[int, int] | None = None,
         output_value_ids: tuple[int, ...] = (),
         named_output_histories: Mapping[str, tuple[int, ...]] | None = None,
         value_name_histories: Mapping[str, tuple[int, ...]] | None = None,
         parameter_names: tuple[str, ...] = (),
+        sequence_initializations: tuple[tuple[int, str, int], ...] = (),
+        sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
+        sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
+        table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
+        table_stores: tuple[
+            tuple[int, int | tuple[int, ...], int, int], ...
+        ] = (),
+        table_deletions: tuple[
+            tuple[int, int | tuple[int, ...], int | None, str], ...
+        ] = (),
+        retained_sequence_ids: tuple[int, ...] = (),
+        nested_sequence_ids: tuple[int, ...] = (),
+        nested_row_target_ids: tuple[int, ...] = (),
+        selected_nested_sequence_ids: tuple[int, ...] = (),
+        variant_projected_target_ids: tuple[int, ...] = (),
+        region_array_feed_ids: Mapping[int, tuple[int, ...]] | None = None,
+        nested_row_projections: tuple[tuple[int, int, int, str], ...] = (),
+        table_region_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
+        table_region_post_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
+        table_epilogue_operations: tuple[tuple[str, tuple[Any, ...]], ...] = (),
     ):
         from .evolution_metagraph import (
             active_evolution_metagraph,
@@ -444,6 +473,10 @@ class _ControlSSABuilder:
         self._evolution_source = None
         self._evolution_instruction = 0
         self.region_value_meta = dict(region_value_meta or {})
+        self.value_aliases = {
+            int(alias): int(source)
+            for alias, source in (value_aliases or {}).items()
+        }
         self.output_value_ids = tuple(map(int, output_value_ids))
         self.named_output_histories = {
             str(name): tuple(map(int, history))
@@ -463,6 +496,62 @@ class _ControlSSABuilder:
         self.region_signatures = dict(region_signatures or {})
         self.arguments: list[SSAValue] = []
         self.external_values: dict[int, SSAValue] = {}
+        self.declared_parameter_only_ids: set[int] = set()
+        self.sequence_descriptors: dict[int, SSASequenceDescriptor] = {}
+        self.sequence_storage_values: dict[int, tuple[SSAValue, ...]] = {}
+        self.sequence_status_values: dict[int, SSAValue] = {}
+        self.sequence_helper_functions: dict[str, Function] = {}
+        # Heterogeneous destructured rows are columnar at the repository ABI:
+        # (resident source, projection) -> independently typed arena.  Column
+        # zero retains the source identity; later columns receive fresh SSA
+        # identities and share its extent.
+        self.projected_row_columns: dict[tuple[int, int], SSAValue] = {}
+        self.nested_row_target_ids = set(map(int, nested_row_target_ids))
+        self.selected_nested_sequence_ids = set(map(
+            int, selected_nested_sequence_ids
+        ))
+        self.variant_projected_target_ids = set(map(
+            int, variant_projected_target_ids
+        ))
+        self.region_array_feed_ids = {
+            int(region): set(map(int, value_ids))
+            for region, value_ids in (region_array_feed_ids or {}).items()
+        }
+        self.nested_row_projections = tuple(
+            (int(base), int(column), int(result), str(induction))
+            for base, column, result, induction in nested_row_projections
+        )
+        self.variant_row_values: dict[int, SSAValue] = {}
+        self.variant_handle_columns: dict[tuple[int, int], SSAValue] = {}
+        # An iterable element (or one projected field of a destructured row)
+        # may itself be a sequence/record.  Its outer column stores an integer
+        # child handle; caller-owned flattened arenas and strides turn that
+        # handle into the row base passed to the consuming region.  The key
+        # retains the exact authored source relationship instead of relying on
+        # the target's spelling or inferred Python class.
+        self.nested_child_rows: dict[
+            tuple[str, int, int],
+            tuple[SSAValue, SSAValue, SSAValue, SSAValue],
+        ] = {}
+        self.nested_iterable_targets = {
+            int(iterable_id): int(target_id)
+            for iterable_id, target_id, _induction in program.iterable_bindings
+            if int(target_id) in self.nested_row_target_ids
+        }
+        self.child_table_selections: dict[
+            int, tuple[SSAChildTablePoolDescriptor, SSAValue]
+        ] = {}
+        self.table_region_operations = {
+            int(region): tuple(operations)
+            for region, operations in (table_region_operations or {}).items()
+        }
+        self.table_region_post_operations = {
+            int(region): tuple(operations)
+            for region, operations in (
+                table_region_post_operations or {}
+            ).items()
+        }
+        self.table_epilogue_operations = tuple(table_epilogue_operations)
         self.uniform_values: dict[str, SSAValue] = {}
         # Lexical control names (currently loop induction variables) are SSA
         # values too.  Keeping them here lets a StateMachineTick dispatch on
@@ -528,6 +617,25 @@ class _ControlSSABuilder:
             self.uniform_values[str(uniform.name)] = value
             self.external_values[int(uniform.value_id)] = value
             self.arguments.append(value)
+        # A source parameter is part of the authored function ABI even when
+        # its only consumer is a PlanCall that will be materialized after all
+        # method/control functions have been lowered.  Waiting for an ordinary
+        # region/control use drops call-only parameters, leaving the later
+        # static linker with an empty callee signature and no caller value to
+        # bind.  Preserve the initial identity (the input before any authored
+        # reassignment); sequence/table lowering may refine that same identity
+        # to its richer storage contract below.
+        for name in self.parameter_names:
+            history = self.value_name_histories.get(str(name), ())
+            if not history:
+                continue
+            value_id = int(history[0])
+            if value_id in self.external_values:
+                continue
+            value = self._value_from_meta(value_id)
+            self.external_values[value_id] = value
+            self.arguments.append(value)
+            self.declared_parameter_only_ids.add(value_id)
         if self.external_values:
             self.next_value_id = max(
                 self.next_value_id,
@@ -543,7 +651,748 @@ class _ControlSSABuilder:
                 self.next_value_id,
                 max(signature_ids) + 1,
             )
+        # A specialized callee may receive a heterogeneous payload directly,
+        # after its owning loop has already been split into the caller.  Such
+        # a value still has two ABI columns: its authored scalar identity and
+        # a separate row arena.  Projected loop bindings populate these later;
+        # create only the unbound row columns here.
+        projected_variant_targets = {
+            int(target_id)
+            for _iterable_id, target_id, _induction, _projection
+            in program.projected_iterable_bindings
+        }
+        for value_id in sorted(
+            self.variant_projected_target_ids - projected_variant_targets
+        ):
+            row = self.fresh_value(
+                dtype=str(self._value_from_meta(value_id).dtype or "unknown")
+            )
+            row.accounting.update({
+                "unbound_variant_source_id": int(value_id),
+                "variant_column": "row",
+            })
+            self.arguments.append(row)
+            self.variant_row_values[int(value_id)] = row
         self.current = self.new_block("entry")
+        deletion_sequence_ids = {
+            int(sequence_id)
+            for _effect_id, _key_id, sequence_id, _storage_identity
+            in table_deletions
+            if sequence_id is not None
+        }
+        deletion_sequence_ids.update(map(int, retained_sequence_ids))
+        nested_sequence_ids = set(map(int, nested_sequence_ids))
+        nested_value_dtypes: dict[int, str] = {}
+        lookup_sequence_by_result = {
+            int(result_id): int(sequence_id)
+            for result_id, _query_id, sequence_id in table_lookups
+        }
+        for iterable_id, target_id, _induction in program.iterable_bindings:
+            sequence_id = lookup_sequence_by_result.get(int(iterable_id))
+            target_meta = self.region_value_meta.get(int(target_id))
+            if sequence_id is not None and target_meta is not None:
+                nested_value_dtypes[sequence_id] = str(target_meta.dtype)
+        for sequence_id, policy, column_count, writable in sequence_declarations:
+            column_dtypes: list[str | None] = [None] * int(column_count)
+            for _result_id, query_id, lookup_sequence_id in table_lookups:
+                if int(lookup_sequence_id) != int(sequence_id):
+                    continue
+                query_ids = query_id if isinstance(query_id, tuple) else (query_id,)
+                for column, query_value_id in enumerate(query_ids):
+                    meta = self.region_value_meta.get(int(query_value_id))
+                    if meta is not None and column < len(column_dtypes):
+                        column_dtypes[column] = str(meta.dtype)
+            for _effect_id, key_id, value_id, store_sequence_id in table_stores:
+                if int(store_sequence_id) != int(sequence_id):
+                    continue
+                key_ids = key_id if isinstance(key_id, tuple) else (key_id,)
+                for column, key_value_id in enumerate(key_ids):
+                    meta = self.region_value_meta.get(int(key_value_id))
+                    if meta is not None and column < len(column_dtypes):
+                        column_dtypes[column] = str(meta.dtype)
+                value_meta = self.region_value_meta.get(int(value_id))
+                if value_meta is not None and column_dtypes:
+                    column_dtypes[-1] = str(value_meta.dtype)
+            self._sequence_descriptor(
+                int(sequence_id),
+                policy=str(policy),
+                writable=bool(writable),
+                location=f"{function_name}.sequence_declaration",
+                column_count=int(column_count),
+                retains_deleted_rows=int(sequence_id) in deletion_sequence_ids,
+                nested_table=int(sequence_id) in nested_sequence_ids,
+                nested_value_dtype=nested_value_dtypes.get(int(sequence_id)),
+                column_dtypes=tuple(column_dtypes),
+            )
+        for sequence_id, policy, column_count in sequence_initializations:
+            descriptor_policy = (
+                "duplicates" if str(policy).startswith("fill=") else str(policy)
+            )
+            element_dtype = None
+            if str(policy).startswith("fill=") and ";count=" in str(policy):
+                fill_literal = ast.literal_eval(
+                    str(policy).split(";", 1)[0].split("=", 1)[1]
+                )
+                element_dtype = (
+                    "bool" if isinstance(fill_literal, bool)
+                    else "int" if isinstance(fill_literal, int)
+                    else "float64" if isinstance(fill_literal, float)
+                    else "int64" if fill_literal is None
+                    else None
+                )
+            descriptor = self._sequence_descriptor(
+                int(sequence_id),
+                policy=descriptor_policy,
+                writable=True,
+                location=f"{function_name}.sequence_initialization",
+                column_count=int(column_count),
+                retains_deleted_rows=int(sequence_id) in deletion_sequence_ids,
+                nested_table=int(sequence_id) in nested_sequence_ids,
+                nested_value_dtype=nested_value_dtypes.get(int(sequence_id)),
+                element_dtype=element_dtype,
+            )
+            if descriptor is None:
+                continue
+            zero = self.constant_value(0)
+            zero_index = self.constant_value(0)
+            length_address = self.fresh_value(dtype="ptr")
+            self.emit(
+                Handler.GetElementPtr,
+                [
+                    self.sequence_storage_values[int(sequence_id)][
+                        len(descriptor.column_value_ids)
+                    ],
+                    zero_index,
+                ],
+                length_address,
+                attributes={"binding": "ssa_sequence_length"},
+            )
+            self.emit(
+                Handler.Store,
+                [zero, length_address],
+                attributes={"binding": "ssa_sequence_initialize_length"},
+            )
+        for result_id, query_id, sequence_id, negate in sequence_memberships:
+            descriptor = self.sequence_descriptors.get(int(sequence_id))
+            if descriptor is None or not descriptor.key_columns:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence",
+                    "contains",
+                    f"{function_name}.sequence_membership[{result_id}]",
+                    "membership requires a declared key-column table",
+                ))
+                continue
+            from .ir_sequence_tables import lower_sequence_contains
+
+            helper_name = f"ssa_sequence_{int(sequence_id)}_contains"
+            lowering = lower_sequence_contains(
+                descriptor, function_name=helper_name
+            )
+            self.sequence_helper_functions.update(
+                (function.name, function) for function in lowering.functions
+            )
+            query = self.external_value(int(query_id))
+            call_result = (
+                self.fresh_value(dtype="bool")
+                if negate else SSAValue(int(result_id), dtype="bool")
+            )
+            if not negate:
+                self.next_value_id = max(self.next_value_id, int(result_id) + 1)
+                self.external_values[int(result_id)] = call_result
+            self.emit(
+                Handler.Call,
+                [*self.sequence_storage_values[int(sequence_id)], query],
+                call_result,
+                attributes={
+                    "callee": helper_name,
+                    "source_linked": True,
+                    "ssa_sequence_operation": "contains",
+                    "sequence_id": int(sequence_id),
+                },
+            )
+            if negate:
+                result = SSAValue(int(result_id), dtype="bool")
+                self.next_value_id = max(self.next_value_id, int(result_id) + 1)
+                self.external_values[int(result_id)] = result
+                self.emit(Handler.LNot, [call_result], result)
+        scheduled_table_operations = {
+            (str(kind), tuple(operation))
+            for operations in (
+                *self.table_region_operations.values(),
+                self.table_epilogue_operations,
+            )
+            for kind, operation in operations
+        }
+        for result_id, query_id, sequence_id in table_lookups:
+            if ("lookup", (result_id, query_id, sequence_id)) in scheduled_table_operations:
+                continue
+            self._emit_table_lookup(result_id, query_id, sequence_id)
+        for effect_id, key_id, value_id, sequence_id in table_stores:
+            if ("store", (effect_id, key_id, value_id, sequence_id)) in scheduled_table_operations:
+                continue
+            self._emit_table_store(effect_id, key_id, value_id, sequence_id)
+        for effect_id, key_id, sequence_id, storage_identity in table_deletions:
+            if ("delete", (effect_id, key_id, sequence_id, storage_identity)) in scheduled_table_operations:
+                continue
+            self._emit_table_delete(effect_id, key_id, sequence_id, storage_identity)
+
+    def _table_query_values(
+        self, query_ids: int | tuple[int, ...]
+    ) -> tuple[SSAValue, ...]:
+        return tuple(
+            self.external_value(int(value_id))
+            for value_id in (
+                query_ids if isinstance(query_ids, tuple) else (query_ids,)
+            )
+        )
+
+    def _emit_table_lookup(
+        self, result_id: int, query_id: int | tuple[int, ...], sequence_id: int
+    ) -> None:
+        descriptor = self.sequence_descriptors.get(int(sequence_id))
+        if descriptor is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-table", "lookup", self.function_name,
+                f"table {sequence_id} has no sequence descriptor",
+            ))
+            return
+        from .ir_sequence_tables import lower_table_lookup
+
+        helper_name = f"ssa_sequence_{int(sequence_id)}_lookup"
+        lowering = lower_table_lookup(descriptor, function_name=helper_name)
+        self.sequence_helper_functions.update(
+            (function.name, function) for function in lowering.functions
+        )
+        result = SSAValue(
+            int(result_id),
+            dtype=("int" if descriptor.child_table_pool is not None
+                   else descriptor.column_dtypes[
+                       next(
+                           column
+                           for column in range(len(descriptor.column_value_ids))
+                           if column not in descriptor.key_columns
+                       )
+                   ]),
+        )
+        self.next_value_id = max(self.next_value_id, int(result_id) + 1)
+        self.external_values[int(result_id)] = result
+        self.emit(
+            Handler.Call,
+            [
+                *self.sequence_storage_values[int(sequence_id)],
+                self.sequence_status_values[int(sequence_id)],
+                *self._table_query_values(query_id),
+            ],
+            result,
+            attributes={
+                "callee": helper_name,
+                "source_linked": True,
+                "ssa_sequence_operation": "lookup",
+                "sequence_id": int(sequence_id),
+            },
+        )
+        if descriptor.child_table_pool is not None:
+            self.child_table_selections[int(result_id)] = (
+                descriptor.child_table_pool, result
+            )
+    def _emit_table_store(
+        self, _effect_id: int, key_id: int | tuple[int, ...],
+        value_id: int, sequence_id: int
+    ) -> None:
+        descriptor = self.sequence_descriptors.get(int(sequence_id))
+        if descriptor is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-table", "store", self.function_name,
+                f"table {sequence_id} has no sequence descriptor",
+            ))
+            return
+        from .ir_sequence_tables import lower_table_store
+
+        helper_name = f"ssa_sequence_{int(sequence_id)}_store"
+        lowering = lower_table_store(descriptor, function_name=helper_name)
+        self.sequence_helper_functions.update(
+            (function.name, function) for function in lowering.functions
+        )
+        self.emit(
+            Handler.Call,
+            [
+                *self.sequence_storage_values[int(sequence_id)],
+                self.sequence_status_values[int(sequence_id)],
+                *self._table_query_values(key_id),
+                self.external_value(int(value_id)),
+            ],
+            None,
+            attributes={
+                "callee": helper_name,
+                "source_linked": True,
+                "ssa_sequence_operation": "table_store",
+                "sequence_id": int(sequence_id),
+            },
+        )
+    def _emit_table_delete(
+        self, effect_id: int, key_id: int | tuple[int, ...],
+        sequence_id: int | None, storage_identity: str
+    ) -> None:
+        if sequence_id is None:
+            match = re.fullmatch(r"nested-table-value:(\d+)", storage_identity)
+            selection = (
+                self.child_table_selections.get(int(match.group(1)))
+                if match is not None else None
+            )
+            if selection is not None:
+                pool, handle = selection
+                from .ir_sequence_tables import lower_child_table_delete
+
+                helper_name = (
+                    f"ssa_child_table_{int(match.group(1))}_delete"
+                )
+                lowering = lower_child_table_delete(
+                    pool, function_name=helper_name
+                )
+                self.sequence_helper_functions.update(
+                    (function.name, function)
+                    for function in lowering.functions
+                )
+                pool_arguments = [
+                    self.external_value(value_id)
+                    for value_id in (
+                        *pool.column_value_ids,
+                        pool.length_value_id,
+                        pool.capacity_value_id,
+                        pool.row_stride_value_id,
+                        pool.status_value_id,
+                        pool.live_flags_value_id,
+                    )
+                ]
+                self.emit(
+                    Handler.Call,
+                    [*pool_arguments, handle, *self._table_query_values(key_id)],
+                    None,
+                    attributes={
+                        "callee": helper_name,
+                        "source_linked": True,
+                        "ssa_sequence_operation": "child_table_delete",
+                        "child_handle_value_id": int(match.group(1)),
+                    },
+                )
+                return
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-table", "delitem",
+                f"{self.function_name}.table_delete[{effect_id}]",
+                "nested table deletion requires a resident nested-table "
+                f"descriptor: storage={storage_identity}, key_value_id={key_id}",
+            ))
+            return
+        descriptor = self.sequence_descriptors.get(int(sequence_id))
+        if descriptor is None or descriptor.live_flags_value_id is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-table", "delitem",
+                f"{self.function_name}.table_delete[{effect_id}]",
+                f"table {sequence_id} has no tombstone-enabled descriptor",
+            ))
+            return
+        from .ir_sequence_tables import lower_table_delete
+
+        first_live = isinstance(key_id, tuple) and not key_id
+        if first_live:
+            from .ir_sequence_tables import lower_table_delete_first
+            helper_name = f"ssa_sequence_{int(sequence_id)}_delete_first"
+            lowering = lower_table_delete_first(
+                descriptor, function_name=helper_name
+            )
+        else:
+            helper_name = f"ssa_sequence_{int(sequence_id)}_delete"
+            lowering = lower_table_delete(descriptor, function_name=helper_name)
+        self.sequence_helper_functions.update(
+            (function.name, function) for function in lowering.functions
+        )
+        self.emit(
+            Handler.Call,
+            [
+                *self.sequence_storage_values[int(sequence_id)],
+                self.sequence_status_values[int(sequence_id)],
+                *(self._table_query_values(key_id) if not first_live else ()),
+            ],
+            None,
+            attributes={
+                "callee": helper_name,
+                "source_linked": True,
+                "ssa_sequence_operation": (
+                    "table_delete_first" if first_live else "table_delete"
+                ),
+                "sequence_id": int(sequence_id),
+            },
+        )
+
+    def _emit_sequence_fill(
+        self, sequence_id: int, literal: bool | int | float | None, count_id: int
+    ) -> None:
+        descriptor = self.sequence_descriptors.get(int(sequence_id))
+        if descriptor is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-sequence", "fill", self.function_name,
+                f"sequence {sequence_id} has no descriptor",
+            ))
+            return
+        from .ir_sequence_tables import lower_sequence_fill
+
+        helper_name = f"ssa_sequence_{int(sequence_id)}_fill"
+        lowering = lower_sequence_fill(descriptor, function_name=helper_name)
+        self.sequence_helper_functions.update(
+            (function.name, function) for function in lowering.functions
+        )
+        value = self.fresh_value(dtype=str(descriptor.column_dtypes[0]))
+        self.emit(Handler.Const, [], value, attributes={"value": literal})
+        status = self.fresh_value(dtype="int")
+        self.emit(
+            Handler.Call,
+            [
+                *self.sequence_storage_values[int(sequence_id)],
+                value,
+                self.external_value(int(count_id), dtype="int"),
+            ],
+            status,
+            attributes={
+                "callee": helper_name,
+                "source_linked": True,
+                "ssa_sequence_operation": "fill",
+                "sequence_id": int(sequence_id),
+            },
+        )
+        self.emit(
+            Handler.Store,
+            [status, self._sequence_status_address(
+                self.sequence_status_values[int(sequence_id)]
+            )],
+            attributes={"binding": "ssa_sequence_status"},
+        )
+
+    def _emit_sequence_append_fill(
+        self, sequence_id: int, literal: bool | int | float | None,
+        count_id: int,
+    ) -> None:
+        descriptor = self.sequence_descriptors.get(int(sequence_id))
+        if descriptor is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-sequence", "append_fill", self.function_name,
+                f"sequence {sequence_id} has no descriptor",
+            ))
+            return
+        from .ir_sequence_tables import lower_sequence_append_fill
+
+        helper_name = f"ssa_sequence_{int(sequence_id)}_append_fill"
+        lowering = lower_sequence_append_fill(
+            descriptor, function_name=helper_name
+        )
+        self.sequence_helper_functions.update(
+            (function.name, function) for function in lowering.functions
+        )
+        value = self.fresh_value(dtype=str(descriptor.column_dtypes[0]))
+        self.emit(Handler.Const, [], value, attributes={"value": literal})
+        status = self.fresh_value(dtype="int")
+        self.emit(
+            Handler.Call,
+            [
+                *self.sequence_storage_values[int(sequence_id)],
+                value,
+                self.external_value(int(count_id), dtype="int"),
+            ],
+            status,
+            attributes={
+                "callee": helper_name,
+                "source_linked": True,
+                "ssa_sequence_operation": "append_fill",
+                "sequence_id": int(sequence_id),
+            },
+        )
+        self.emit(
+            Handler.Store,
+            [status, self._sequence_status_address(
+                self.sequence_status_values[int(sequence_id)]
+            )],
+            attributes={"binding": "ssa_sequence_status"},
+        )
+
+    def _emit_sequence_append_slice(
+        self, destination_id: int, source_id: int,
+        lower_id: int, upper_id: int,
+    ) -> None:
+        destination = self.sequence_descriptors.get(int(destination_id))
+        source = self.sequence_descriptors.get(int(source_id))
+        if destination is None or source is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-sequence", "append_slice", self.function_name,
+                "slice append requires resident source and destination "
+                f"descriptors: destination={destination_id}, source={source_id}",
+            ))
+            return
+        from .ir_sequence_tables import lower_sequence_append_slice
+
+        helper_name = (
+            f"ssa_sequence_{int(destination_id)}_append_slice_"
+            f"{int(source_id)}"
+        )
+        lowering = lower_sequence_append_slice(
+            destination, source, function_name=helper_name
+        )
+        if not lowering.complete:
+            self.shortfalls.extend(
+                SSALoweringShortfall(
+                    "ssa-sequence", item.code.value, self.function_name,
+                    item.reason,
+                )
+                for item in lowering.shortfalls
+            )
+            return
+        self.sequence_helper_functions.update(
+            (function.name, function) for function in lowering.functions
+        )
+        storage = tuple({
+            value.id: value
+            for value in (
+                *self.sequence_storage_values[int(destination_id)],
+                *self.sequence_storage_values[int(source_id)],
+            )
+        }.values())
+        status = self.fresh_value(dtype="int")
+        self.emit(
+            Handler.Call,
+            [
+                *storage,
+                self.external_value(int(lower_id), dtype="int"),
+                self.external_value(int(upper_id), dtype="int"),
+            ],
+            status,
+            attributes={
+                "callee": helper_name,
+                "source_linked": True,
+                "ssa_sequence_operation": "append_slice",
+                "sequence_id": int(destination_id),
+                "source_sequence_id": int(source_id),
+            },
+        )
+        self.emit(
+            Handler.Store,
+            [status, self._sequence_status_address(
+                self.sequence_status_values[int(destination_id)]
+            )],
+            attributes={"binding": "ssa_sequence_status"},
+        )
+
+    def _emit_sequence_pack_bits(
+        self, destination_id: int, source_id: int, width_id: int,
+        width_literal: bool = False,
+        callee_reference: int | None = None,
+        plan_callsite_id: int | None = None,
+    ) -> None:
+        destination = self.sequence_descriptors.get(int(destination_id))
+        source = self.sequence_descriptors.get(int(source_id))
+        if destination is None or source is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-sequence", "pack_bits", self.function_name,
+                "bit packing requires resident source and destination "
+                f"descriptors: destination={destination_id}, source={source_id}",
+            ))
+            return
+        from .ir_sequence_tables import lower_sequence_pack_bits
+
+        helper_name = (
+            f"ssa_sequence_{int(destination_id)}_pack_bits_{int(source_id)}"
+        )
+        lowering = lower_sequence_pack_bits(
+            destination, source, function_name=helper_name
+        )
+        if not lowering.complete:
+            self.shortfalls.extend(
+                SSALoweringShortfall(
+                    "ssa-sequence", item.code.value, self.function_name,
+                    item.reason,
+                ) for item in lowering.shortfalls
+            )
+            return
+        self.sequence_helper_functions.update(
+            (function.name, function) for function in lowering.functions
+        )
+        storage = tuple({
+            value.id: value
+            for value in (
+                *self.sequence_storage_values[int(destination_id)],
+                *self.sequence_storage_values[int(source_id)],
+            )
+        }.values())
+        status = self.fresh_value(dtype="int")
+        if width_literal:
+            width = self.fresh_value(dtype="int")
+            self.emit(
+                Handler.Const, [], width,
+                attributes={"value": int(width_id)},
+            )
+        else:
+            width = self.external_value(int(width_id), dtype="int")
+        self.emit(
+            Handler.Call,
+            [*storage, width],
+            status,
+            attributes={
+                "callee": helper_name,
+                "source_linked": True,
+                "ssa_sequence_operation": "pack_bits",
+                "sequence_id": int(destination_id),
+                "source_sequence_id": int(source_id),
+                "decomposed_plan_call": callee_reference is not None,
+                "callee_reference": callee_reference,
+                "plan_callsite_id": plan_callsite_id,
+            },
+        )
+        self.emit(
+            Handler.Store,
+            [status, self._sequence_status_address(
+                self.sequence_status_values[int(destination_id)]
+            )],
+            attributes={"binding": "ssa_sequence_status"},
+        )
+
+    def _emit_sequence_prepend(
+        self, sequence_id: int, value_id: int,
+    ) -> None:
+        descriptor = self.sequence_descriptors.get(int(sequence_id))
+        if descriptor is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-sequence", "prepend", self.function_name,
+                f"sequence {sequence_id} has no descriptor",
+            ))
+            return
+        from .ir_sequence_tables import lower_sequence_prepend
+
+        helper_name = f"ssa_sequence_{int(sequence_id)}_prepend"
+        lowering = lower_sequence_prepend(
+            descriptor, function_name=helper_name
+        )
+        self.sequence_helper_functions.update(
+            (function.name, function) for function in lowering.functions
+        )
+        status = self.fresh_value(dtype="int")
+        self.emit(
+            Handler.Call,
+            [
+                *self.sequence_storage_values[int(sequence_id)],
+                self.external_value(int(value_id), dtype=str(
+                    descriptor.column_dtypes[0]
+                )),
+            ],
+            status,
+            attributes={
+                "callee": helper_name,
+                "source_linked": True,
+                "ssa_sequence_operation": "prepend",
+                "sequence_id": int(sequence_id),
+            },
+        )
+        self.emit(
+            Handler.Store,
+            [status, self._sequence_status_address(
+                self.sequence_status_values[int(sequence_id)]
+            )],
+            attributes={"binding": "ssa_sequence_status"},
+        )
+
+    def _emit_sequence_prepend_packed_bytes(
+        self, destination_id: int, source_id: int,
+        prefix_id: int, byte_width: int,
+        plan_callsite_id: int | None = None,
+    ) -> None:
+        destination = self.sequence_descriptors.get(int(destination_id))
+        source = self.sequence_descriptors.get(int(source_id))
+        if destination is None or source is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-sequence", "prepend_packed_bytes", self.function_name,
+                "packed prepend requires resident source and destination "
+                f"descriptors: destination={destination_id}, source={source_id}",
+            ))
+            return
+        from .ir_sequence_tables import lower_sequence_prepend_packed_bytes
+
+        helper_name = (
+            f"ssa_sequence_{int(destination_id)}_prepend_packed_"
+            f"{int(source_id)}"
+        )
+        lowering = lower_sequence_prepend_packed_bytes(
+            destination, source, function_name=helper_name
+        )
+        self.sequence_helper_functions.update(
+            (function.name, function) for function in lowering.functions
+        )
+        storage = tuple({
+            value.id: value
+            for value in (
+                *self.sequence_storage_values[int(destination_id)],
+                *self.sequence_storage_values[int(source_id)],
+            )
+        }.values())
+        width_value = self.fresh_value(dtype="int")
+        self.emit(
+            Handler.Const, [], width_value,
+            attributes={"value": int(byte_width)},
+        )
+        status = self.fresh_value(dtype="int")
+        self.emit(
+            Handler.Call,
+            [
+                *storage,
+                self.external_value(int(prefix_id), dtype=str(
+                    destination.column_dtypes[0]
+                )),
+                width_value,
+            ],
+            status,
+            attributes={
+                "callee": helper_name,
+                "source_linked": True,
+                "ssa_sequence_operation": "prepend_packed_bytes",
+                "sequence_id": int(destination_id),
+                "source_sequence_id": int(source_id),
+                "decomposed_plan_call": True,
+                "plan_callsite_id": plan_callsite_id,
+            },
+        )
+        self.emit(
+            Handler.Store,
+            [status, self._sequence_status_address(
+                self.sequence_status_values[int(destination_id)]
+            )],
+            attributes={"binding": "ssa_sequence_status"},
+        )
+
+    def emit_table_region_operations(self, region_index: int) -> bool:
+        operations = self.table_region_operations.get(int(region_index), ())
+        if not operations:
+            return False
+        for kind, arguments in operations:
+            if kind == "lookup":
+                self._emit_table_lookup(*arguments)
+            elif kind == "store":
+                self._emit_table_store(*arguments)
+            elif kind == "delete":
+                self._emit_table_delete(*arguments)
+            elif kind == "fill":
+                self._emit_sequence_fill(*arguments)
+            elif kind == "append_fill":
+                self._emit_sequence_append_fill(*arguments)
+            elif kind == "append_slice":
+                self._emit_sequence_append_slice(*arguments)
+            elif kind == "prepend":
+                self._emit_sequence_prepend(*arguments)
+            elif kind == "prepend_packed_bytes":
+                self._emit_sequence_prepend_packed_bytes(*arguments)
+            elif kind == "pack_bits":
+                self._emit_sequence_pack_bits(*arguments)
+            elif kind == "structural_consumed":
+                # Its only result is consumed by a later structural helper.
+                # The source region has no independent runtime effect.
+                pass
+            else:
+                raise ValueError(f"unknown scheduled table operation {kind!r}")
+        return True
 
     def fresh_value(
         self,
@@ -562,11 +1411,32 @@ class _ControlSSABuilder:
         dtype: str | None = None,
     ) -> SSAValue:
         value_id = int(value_id)
+        seen: set[int] = set()
+        while value_id in self.value_aliases and value_id not in seen:
+            seen.add(value_id)
+            value_id = int(self.value_aliases[value_id])
+        self.declared_parameter_only_ids.discard(value_id)
         value = self.external_values.get(value_id)
         if value is None:
             value = self._value_from_meta(value_id, dtype=dtype)
             self.external_values[value_id] = value
             self.arguments.append(value)
+        elif dtype is not None and str(value.dtype or "unknown") != str(dtype):
+            # A structural control use can carry a stronger contract than an
+            # earlier generic region capture.  Refine the one SSA identity
+            # before the Function signature is assembled.
+            refined = SSAValue(
+                value.id,
+                dtype=str(dtype),
+                shape=tuple(value.shape),
+                device=value.device,
+                accounting=dict(value.accounting),
+            )
+            self.external_values[value_id] = refined
+            self.arguments[:] = [
+                refined if item is value else item for item in self.arguments
+            ]
+            value = refined
         return value
 
     def _value_from_meta(
@@ -583,7 +1453,16 @@ class _ControlSSABuilder:
         meta = self.region_value_meta.get(int(value_id))
         if meta is None:
             return SSAValue(int(value_id), dtype=dtype)
-        return _ssa_value(int(value_id), meta)
+        value = _ssa_value(int(value_id), meta)
+        if dtype is None:
+            return value
+        return SSAValue(
+            value.id,
+            dtype=str(dtype),
+            shape=tuple(value.shape),
+            device=value.device,
+            accounting=dict(value.accounting),
+        )
 
     def produced_value(
         self,
@@ -642,7 +1521,118 @@ class _ControlSSABuilder:
         self.emit(Handler.Load, [address], result, attributes=attributes)
         return result
 
+    def bind_nested_row(
+        self,
+        source: SSAValue,
+        induction: SSAValue,
+        target_id: int,
+        *,
+        child_key: tuple[str, int, int],
+        attributes: dict[str, Any],
+    ) -> SSAValue:
+        """Bind one caller-owned child row selected by an integer handle.
+
+        Nested collections cross the repository ABI as two ordinary tables:
+        the outer column contains integer row handles and a flattened child
+        arena contains the rows.  This emits the complete address calculation
+        into SSA; neither the backend nor a runtime language reconstructs an
+        object for the selected row.
+        """
+
+        selected_sequence = int(child_key[1]) in (
+            self.selected_nested_sequence_ids
+        )
+        if selected_sequence:
+            handle = source
+        else:
+            handle_address = self.fresh_value(dtype="ptr")
+            handle = self.fresh_value(dtype="int")
+            handle_attributes = {
+                **attributes, "binding": "nested_row_handle"
+            }
+            self.emit(
+                Handler.GetElementPtr,
+                [source, induction],
+                handle_address,
+                attributes=handle_attributes,
+            )
+            self.emit(
+                Handler.Load,
+                [handle_address],
+                handle,
+                attributes=handle_attributes,
+            )
+        child = self._nested_child_storage(child_key, target_id)
+        child_data, _child_lengths, sequence_stride, row_stride = child
+        row_index = induction
+        if selected_sequence:
+            sequence_offset = self.fresh_value(dtype="int")
+            row_index = self.fresh_value(dtype="int")
+            self.emit(
+                Handler.Mul,
+                [handle, sequence_stride],
+                sequence_offset,
+                attributes={
+                    **attributes, "binding": "nested_sequence_offset"
+                },
+            )
+            self.emit(
+                Handler.Add,
+                [sequence_offset, induction],
+                row_index,
+                attributes={
+                    **attributes, "binding": "nested_sequence_row"
+                },
+            )
+        offset = self.fresh_value(dtype="int")
+        row_base = self.fresh_value(dtype=str(child_data.dtype or "unknown"))
+        row_base.accounting["source_value_id"] = int(target_id)
+        self.emit(
+            Handler.Mul,
+            [row_index if selected_sequence else handle, row_stride],
+            offset,
+            attributes={**attributes, "binding": "nested_row_offset"},
+        )
+        self.emit(
+            Handler.GetElementPtr,
+            [child_data, offset],
+            row_base,
+            attributes={**attributes, "binding": "nested_row_base"},
+        )
+        self.external_values[int(target_id)] = row_base
+        return row_base
+
+    def _nested_child_storage(
+        self,
+        child_key: tuple[str, int, int],
+        target_id: int,
+    ) -> tuple[SSAValue, SSAValue, SSAValue, SSAValue]:
+        child = self.nested_child_rows.get(child_key)
+        if child is None:
+            target_meta = self.region_value_meta.get(int(target_id))
+            child_data = self.fresh_value(dtype=(
+                None if target_meta is None else str(target_meta.dtype)
+            ))
+            child_lengths = self.fresh_value(dtype="int")
+            sequence_stride = self.fresh_value(dtype="int")
+            row_stride = self.fresh_value(dtype="int")
+            child_data.accounting.update({
+                "nested_row_source_kind": str(child_key[0]),
+                "nested_row_source_id": int(child_key[1]),
+                "nested_row_projection": int(child_key[2]),
+            })
+            self.arguments.extend((
+                child_data, child_lengths, sequence_stride, row_stride
+            ))
+            child = (
+                child_data, child_lengths, sequence_stride, row_stride
+            )
+            self.nested_child_rows[child_key] = child
+        return child
+
     def emit_region_call(self, region_index: int, *, location: str) -> None:
+        if self.emit_table_region_operations(region_index):
+            return
         callee = self.region_callees.get(
             region_index,
             f"numerical_region_{region_index}",
@@ -650,7 +1640,13 @@ class _ControlSSABuilder:
         feeds, outputs = self.region_signatures.get(
             region_index, ((), ())
         )
-        arguments = [self.external_value(value_id) for value_id in feeds]
+        array_feeds = self.region_array_feed_ids.get(int(region_index), set())
+        arguments = [
+            self.variant_row_values.get(int(value_id), self.external_value(value_id))
+            if int(value_id) in array_feeds
+            else self.external_value(value_id)
+            for value_id in feeds
+        ]
         aggregate = (
             self.fresh_value(dtype="ssa.aggregate")
             if outputs
@@ -668,20 +1664,57 @@ class _ControlSSABuilder:
                 "result_convention": "ssa.aggregate",
             },
         )
-        if aggregate is None:
-            return
-        for output_index, output_id in enumerate(outputs):
-            index = self.constant_value(output_index)
-            self.indexed_load(
-                aggregate,
-                index,
-                output_id,
-                attributes={
-                    "region_index": region_index,
-                    "aggregate_index": output_index,
-                    "source_output_id": output_id,
-                },
-            )
+        if aggregate is not None:
+            for output_index, output_id in enumerate(outputs):
+                index = self.constant_value(output_index)
+                self.indexed_load(
+                    aggregate,
+                    index,
+                    output_id,
+                    attributes={
+                        "region_index": region_index,
+                        "aggregate_index": output_index,
+                        "source_output_id": output_id,
+                    },
+                )
+        for kind, table_arguments in self.table_region_post_operations.get(
+            int(region_index), ()
+        ):
+            if kind == "lookup":
+                self._emit_table_lookup(*table_arguments)
+            elif kind == "store":
+                self._emit_table_store(*table_arguments)
+            elif kind == "delete":
+                self._emit_table_delete(*table_arguments)
+            elif kind == "fill":
+                self._emit_sequence_fill(*table_arguments)
+            elif kind == "append_fill":
+                self._emit_sequence_append_fill(*table_arguments)
+            elif kind == "append_slice":
+                self._emit_sequence_append_slice(*table_arguments)
+            elif kind == "prepend":
+                self._emit_sequence_prepend(*table_arguments)
+            elif kind == "prepend_packed_bytes":
+                self._emit_sequence_prepend_packed_bytes(*table_arguments)
+            elif kind == "pack_bits":
+                self._emit_sequence_pack_bits(*table_arguments)
+            elif kind == "extend":
+                effect_id, destination_id, source_id = table_arguments
+                self.lower_sequence_mutation(
+                    ControlSequenceMutation(
+                        sequence_value_id=int(destination_id),
+                        operator="extend",
+                        argument_value_ids=(int(source_id),),
+                        effect_node_id=int(effect_id),
+                        policy="duplicates",
+                        argument_kind="sequence",
+                    ),
+                    path=f"{location}.structural",
+                )
+            else:
+                raise ValueError(
+                    f"unknown post-region table operation {kind!r}"
+                )
 
     def new_block(self, stem: str) -> BasicBlock:
         count = self.block_counts.get(stem, 0)
@@ -807,6 +1840,42 @@ class _ControlSSABuilder:
         )
         if iterable_extent is not None:
             iterable_id = int(iterable_extent.group(1))
+            child_selection = self.child_table_selections.get(iterable_id)
+            if child_selection is not None:
+                pool, handle = child_selection
+                length_address = self.fresh_value(dtype="ptr")
+                extent = self.fresh_value(dtype="int")
+                self.emit(
+                    Handler.GetElementPtr,
+                    [self.external_value(pool.length_value_id), handle],
+                    length_address,
+                    attributes={"binding": "child_table_length"},
+                )
+                self.emit(
+                    Handler.Load, [length_address], extent,
+                    attributes={"binding": "child_table_length"},
+                )
+                return extent
+            nested_target_id = self.nested_iterable_targets.get(iterable_id)
+            if nested_target_id is not None:
+                child_key = ("iterable", iterable_id, -1)
+                _child_data, child_lengths, _sequence_stride, _row_stride = (
+                    self._nested_child_storage(child_key, nested_target_id)
+                )
+                handle = self.external_value(iterable_id, dtype="int")
+                length_address = self.fresh_value(dtype="ptr")
+                extent = self.fresh_value(dtype="int")
+                self.emit(
+                    Handler.GetElementPtr,
+                    [child_lengths, handle],
+                    length_address,
+                    attributes={"binding": "nested_row_length"},
+                )
+                self.emit(
+                    Handler.Load, [length_address], extent,
+                    attributes={"binding": "nested_row_length"},
+                )
+                return extent
             source = self.external_value(iterable_id)
             extent = self.fresh_value(dtype="int")
             self.emit(
@@ -833,6 +1902,9 @@ class _ControlSSABuilder:
         try:
             literal = int(spelling, 10)
         except ValueError:
+            lowered = self._control_arithmetic_value(spelling)
+            if lowered is not None:
+                return lowered
             value = self.fresh_value(dtype="int")
             self.emit(
                 Handler.Load,
@@ -859,6 +1931,92 @@ class _ControlSSABuilder:
         )
         return value
 
+    def _control_arithmetic_value(self, spelling: str) -> SSAValue | None:
+        """Lower planner-authored scalar arithmetic to ordinary SSA.
+
+        Dynamic loop bounds are retained as small expressions over resident
+        ``u_control_<id>`` values (for example ``((u_control_6 -
+        u_control_8) / u_control_4) + 1``).  They are compiler IR, not host
+        Python to evaluate.  Parse only the closed arithmetic vocabulary the
+        planner emits and return ``None`` for every other shape so the caller
+        preserves its explicit symbolic-load shortfall.
+        """
+
+        try:
+            expression = ast.parse(spelling, mode="eval").body
+        except (SyntaxError, ValueError):
+            return None
+
+        binary_handlers = {
+            ast.Add: Handler.Add,
+            ast.Sub: Handler.Sub,
+            ast.Mult: Handler.Mul,
+            ast.Div: Handler.Div,
+            ast.FloorDiv: Handler.FloorDiv,
+            ast.Mod: Handler.Mod,
+        }
+
+        def lower(node: ast.AST) -> SSAValue | None:
+            if isinstance(node, ast.Constant) and isinstance(
+                node.value, (bool, int, float)
+            ):
+                value = self.fresh_value(
+                    dtype="bool" if isinstance(node.value, bool)
+                    else "int" if isinstance(node.value, int)
+                    else "float64"
+                )
+                self.emit(
+                    Handler.Const, [], value,
+                    attributes={"value": node.value},
+                )
+                return value
+            if isinstance(node, ast.Name):
+                control = re.fullmatch(r"u_control_(\d+)", node.id)
+                if control is not None:
+                    return self.external_value(int(control.group(1)))
+                value = re.fullmatch(r"value_(\d+)", node.id)
+                if value is not None:
+                    return self.external_value(int(value.group(1)))
+                return self.uniform_values.get(node.id) or (
+                    self.local_control_values.get(node.id)
+                )
+            if isinstance(node, ast.UnaryOp) and isinstance(
+                node.op, (ast.UAdd, ast.USub)
+            ):
+                operand = lower(node.operand)
+                if operand is None:
+                    return None
+                if isinstance(node.op, ast.UAdd):
+                    return operand
+                result = self.fresh_value(
+                    dtype=operand.dtype,
+                    shape=operand.shape,
+                )
+                self.emit(Handler.Neg, [operand], result)
+                return result
+            if isinstance(node, ast.BinOp):
+                handler = binary_handlers.get(type(node.op))
+                if handler is None:
+                    return None
+                left = lower(node.left)
+                right = lower(node.right)
+                if left is None or right is None:
+                    return None
+                result = self.fresh_value(
+                    dtype=left.dtype or right.dtype,
+                    shape=left.shape or right.shape,
+                )
+                self.emit(
+                    handler,
+                    [left, right],
+                    result,
+                    attributes={"binding": "control_expression"},
+                )
+                return result
+            return None
+
+        return lower(expression)
+
     def lower_control_expression(
         self,
         expression: ControlExpression,
@@ -874,6 +2032,46 @@ class _ControlSSABuilder:
             self.emit(
                 Handler.Const, [], result,
                 attributes={"value": expression.literal},
+            )
+            return result
+        if expression.op == "sequence_nonempty":
+            if expression.value_id is None:
+                raise ValueError("sequence truth predicate requires a value id")
+            sequence_id = int(expression.value_id)
+            descriptor = self._sequence_descriptor(
+                sequence_id,
+                policy=("unique" if bool(expression.literal) else "duplicates"),
+                writable=True,
+                location=f"control.sequence_nonempty[{sequence_id}]",
+            )
+            if descriptor is None:
+                raise ValueError(
+                    "cannot lower sequence truth predicate with conflicting "
+                    f"storage policy for value {sequence_id}"
+                )
+            length_address = self.sequence_storage_values[sequence_id][
+                len(descriptor.column_value_ids)
+            ]
+            length = self.fresh_value(dtype="int")
+            self.emit(
+                Handler.Load,
+                [length_address],
+                length,
+                attributes={
+                    "binding": "ssa_sequence_length",
+                    "sequence_value_id": sequence_id,
+                },
+            )
+            zero = self.constant_value(0)
+            result = result_override or self.fresh_value(dtype="bool")
+            self.emit(
+                Handler.Gt,
+                [length, zero],
+                result,
+                attributes={
+                    "binding": "sequence_nonempty",
+                    "sequence_value_id": sequence_id,
+                },
             )
             return result
         operand_values = [
@@ -981,6 +2179,9 @@ class _ControlSSABuilder:
             return
         if isinstance(block, LoopBlock):
             self.lower_loop(block, path=path)
+            return
+        if isinstance(block, ConditionalBlock):
+            self.lower_conditional(block, path=path)
             return
         if isinstance(block, WhileBlock):
             self.lower_while(block, path=path)
@@ -1092,6 +2293,402 @@ class _ControlSSABuilder:
             return
         raise TypeError(f"unknown control block {type(block).__name__}")
 
+    def _sequence_descriptor(
+        self,
+        value_id: int,
+        *,
+        policy: str,
+        writable: bool,
+        location: str,
+        column_count: int = 1,
+        retains_deleted_rows: bool = False,
+        nested_table: bool = False,
+        nested_value_dtype: str | None = None,
+        element_dtype: str | None = None,
+        column_dtypes: tuple[str | None, ...] = (),
+    ) -> SSASequenceDescriptor | None:
+        value_id = int(value_id)
+        key_columns = (
+            tuple(range(max(1, int(column_count) - 1)))
+            if policy == "unique" else ()
+        )
+        existing = self.sequence_descriptors.get(value_id)
+        if existing is not None:
+            if existing.key_columns != key_columns:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence",
+                    "conflicting-policy",
+                    location,
+                    f"sequence value {value_id} is used with both unique and duplicate policies",
+                ))
+                return None
+            if len(existing.column_value_ids) != int(column_count):
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence",
+                    "conflicting-width",
+                    location,
+                    f"sequence value {value_id} is used with both "
+                    f"{len(existing.column_value_ids)} and {int(column_count)} columns",
+                ))
+                return None
+            if retains_deleted_rows and existing.live_flags_value_id is None:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", "conflicting-retention", location,
+                    f"sequence value {value_id} requires deletion retention "
+                    "after storage was declared without live flags",
+                ))
+                return None
+            return existing
+        first_dtype = element_dtype or (
+            column_dtypes[0] if column_dtypes else None
+        )
+        data = self.external_value(value_id, dtype=first_dtype)
+        extra_columns = tuple(
+            self.fresh_value(dtype=(
+                "int"
+                if nested_table and index == int(column_count) - 2
+                else str(
+                    column_dtypes[index + 1]
+                    if index + 1 < len(column_dtypes)
+                    and column_dtypes[index + 1] is not None
+                    else data.dtype or "unknown"
+                )
+            ))
+            for index in range(max(0, int(column_count) - 1))
+        )
+        self.arguments.extend(extra_columns)
+        # Mutable scalar cells are one-element typed arenas at the C ABI, not
+        # opaque pointer-typed scalars (which the Fortran emitter would have
+        # no element type for and could accidentally pass by value).
+        length_address = self.fresh_value(dtype="int", shape=(1,))
+        capacity = self.fresh_value(dtype="int")
+        requires_status = bool(writable) or policy == "unique"
+        status_address = (
+            self.fresh_value(dtype="int", shape=(1,))
+            if requires_status else None
+        )
+        self.arguments.extend((length_address, capacity))
+        if status_address is not None:
+            self.arguments.append(status_address)
+        live_flags = (
+            self.fresh_value(dtype="bool") if retains_deleted_rows else None
+        )
+        if live_flags is not None:
+            self.arguments.append(live_flags)
+        child_table_pool = None
+        child_pool_values: tuple[SSAValue, ...] = ()
+        if nested_table:
+            child_keys = self.fresh_value(dtype="unknown")
+            child_values = self.fresh_value(
+                dtype=nested_value_dtype or "unknown"
+            )
+            child_lengths = self.fresh_value(dtype="int")
+            child_capacity = self.fresh_value(dtype="int")
+            child_stride = self.fresh_value(dtype="int")
+            child_status = self.fresh_value(dtype="int")
+            child_live = self.fresh_value(dtype="bool")
+            child_pool_values = (
+                child_keys, child_values, child_lengths, child_capacity,
+                child_stride, child_status, child_live,
+            )
+            self.arguments.extend(child_pool_values)
+            self.external_values.update(
+                (int(value.id), value) for value in child_pool_values
+            )
+            child_table_pool = SSAChildTablePoolDescriptor(
+                handle_column=1,
+                column_value_ids=(int(child_keys.id), int(child_values.id)),
+                length_value_id=int(child_lengths.id),
+                capacity_value_id=int(child_capacity.id),
+                row_stride_value_id=int(child_stride.id),
+                status_value_id=int(child_status.id),
+                live_flags_value_id=int(child_live.id),
+                column_dtypes=(
+                    "unknown", nested_value_dtype or "unknown"
+                ),
+                key_columns=(0,),
+                writable=bool(writable),
+            )
+        descriptor = SSASequenceDescriptor(
+            sequence_id=value_id,
+            column_value_ids=(int(data.id), *(
+                int(column.id) for column in extra_columns
+            )),
+            length_address_id=int(length_address.id),
+            capacity_value_id=int(capacity.id),
+            status_address_id=(
+                None if status_address is None else int(status_address.id)
+            ),
+            column_dtypes=(
+                str(data.dtype or "unknown"),
+                *(str(column.dtype or "unknown") for column in extra_columns),
+            ),
+            key_columns=key_columns,
+            live_flags_value_id=(
+                None if live_flags is None else int(live_flags.id)
+            ),
+            capacity_policy=SSASequenceCapacityPolicy.FIXED,
+            writable=bool(writable),
+            child_table_pool=child_table_pool,
+        )
+        self.sequence_descriptors[value_id] = descriptor
+        self.sequence_storage_values[value_id] = (
+            data, *extra_columns, length_address, capacity,
+            *((live_flags,) if live_flags is not None else ()),
+        )
+        if status_address is not None:
+            self.sequence_status_values[value_id] = status_address
+        return descriptor
+
+    def _sequence_status_address(self, status_arena: SSAValue) -> SSAValue:
+        zero = self.constant_value(0)
+        address = self.fresh_value(dtype="ptr")
+        self.emit(
+            Handler.GetElementPtr,
+            [status_arena, zero],
+            address,
+            attributes={"binding": "ssa_sequence_status"},
+        )
+        return address
+
+    def lower_sequence_mutation(
+        self,
+        mutation: ControlSequenceMutation,
+        *,
+        path: str,
+    ) -> None:
+        if mutation.predicate_expression is None:
+            self._lower_sequence_mutation_body(mutation, path=path)
+            return
+        predicate = self.lower_control_expression(
+            mutation.predicate_expression
+        )
+        selected = self.new_block("sequence_mutation_selected")
+        skipped = self.new_block("sequence_mutation_skipped")
+        complete = self.new_block("sequence_mutation_merge")
+        self.conditional_branch(predicate, selected, skipped)
+        self.current = skipped
+        self.branch(complete)
+        self.current = selected
+        self._lower_sequence_mutation_body(mutation, path=path)
+        if not self.current.successors:
+            self.branch(complete)
+        self.current = complete
+
+    def _lower_sequence_mutation_body(
+        self,
+        mutation: ControlSequenceMutation,
+        *,
+        path: str,
+    ) -> None:
+        operation = str(mutation.operator)
+        location = f"{path}.sequence_mutation[{mutation.effect_node_id}]"
+        if mutation.policy is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-sequence",
+                operation,
+                location,
+                "destination uniqueness policy is unresolved",
+            ))
+            return
+        if not mutation.argument_value_ids:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-sequence",
+                operation,
+                location,
+                "sequence mutation has no explicit source value",
+            ))
+            return
+        destination = self._sequence_descriptor(
+            mutation.sequence_value_id,
+            policy=mutation.policy,
+            writable=True,
+            location=location,
+        )
+        if destination is None:
+            return
+
+        from .ir_sequence_tables import (
+            lower_sequence_add,
+            lower_sequence_append,
+            lower_sequence_extend,
+        )
+
+        call_arguments: tuple[SSAValue, ...]
+        if operation in {"append", "add"}:
+            if len(mutation.argument_value_ids) != 1:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", operation, location,
+                    "row insertion currently requires exactly one value column",
+                ))
+                return
+            function_name = (
+                f"ssa_sequence_{destination.sequence_id}_{operation}"
+            )
+            lowering = (
+                lower_sequence_append(destination, function_name=function_name)
+                if operation == "append"
+                else lower_sequence_add(destination, function_name=function_name)
+            )
+            call_arguments = (
+                *self.sequence_storage_values[destination.sequence_id],
+                self.external_value(mutation.argument_value_ids[0]),
+            )
+        elif operation == "extend":
+            if mutation.argument_kind == "generator":
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence",
+                    operation,
+                    location,
+                    "generator-backed extend requires the SSA iterator contract",
+                ))
+                return
+            if mutation.argument_kind == "filtered_sequence":
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence",
+                    operation,
+                    location,
+                    "filtered list-comprehension extend requires predicated compact materialization before eager insertion",
+                ))
+                return
+            if len(mutation.argument_value_ids) != 1:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", operation, location,
+                    "extend currently requires one resident source sequence",
+                ))
+                return
+            source_id = int(mutation.argument_value_ids[0])
+            source = self._sequence_descriptor(
+                source_id,
+                policy="duplicates",
+                writable=False,
+                location=location,
+            )
+            if source is None:
+                return
+            function_name = (
+                f"ssa_sequence_{destination.sequence_id}_extend_"
+                f"{source.sequence_id}"
+            )
+            lowering = lower_sequence_extend(
+                destination, source, function_name=function_name
+            )
+            call_arguments = tuple({
+                value.id: value
+                for value in (
+                    *self.sequence_storage_values[destination.sequence_id],
+                    *self.sequence_storage_values[source.sequence_id],
+                )
+            }.values())
+        else:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-sequence", operation, location,
+                "unknown sequence mutation operator",
+            ))
+            return
+
+        if not lowering.complete:
+            self.shortfalls.extend(
+                SSALoweringShortfall(
+                    "ssa-sequence",
+                    item.code.value,
+                    location,
+                    item.reason,
+                )
+                for item in lowering.shortfalls
+            )
+            return
+        for helper in lowering.functions:
+            self.sequence_helper_functions[helper.name] = helper
+        callee = lowering.functions[-1].name
+        status = self.fresh_value(dtype="int")
+        self.emit(
+            Handler.Call,
+            list(call_arguments),
+            status,
+            attributes={
+                "callee": callee,
+                "source_linked": True,
+                "ssa_sequence_operation": operation,
+                "sequence_id": int(destination.sequence_id),
+            },
+        )
+        self.emit(
+            Handler.Store,
+            [
+                status,
+                self._sequence_status_address(
+                    self.sequence_status_values[destination.sequence_id]
+                ),
+            ],
+            attributes={"binding": "ssa_sequence_status"},
+        )
+
+    def lower_conditional(
+        self, conditional: ConditionalBlock, *, path: str,
+    ) -> None:
+        """Lower one authored branch and publish its lexical merge values."""
+
+        predicate = (
+            self.lower_control_expression(conditional.predicate_expression)
+            if conditional.predicate_expression is not None
+            else self.external_value(
+                conditional.predicate_value_id, dtype="bool"
+            )
+        )
+        true_block = self.new_block("if_true")
+        false_block = self.new_block("if_false")
+        merge_block = self.new_block("if_merge")
+        self.conditional_branch(
+            predicate,
+            true_block if conditional.expect_true else false_block,
+            false_block if conditional.expect_true else true_block,
+        )
+
+        self.current = true_block
+        self.lower(conditional.body, path=f"{path}.body")
+        true_exit = self.current
+        if not true_exit.successors:
+            self.branch(merge_block)
+
+        self.current = false_block
+        if conditional.orelse is not None:
+            self.lower(conditional.orelse, path=f"{path}.orelse")
+        false_exit = self.current
+        if not false_exit.successors:
+            self.branch(merge_block)
+
+        self.current = merge_block
+        for (
+            true_value_id, false_value_id, initial_value_id, merged_value_id,
+        ) in conditional.carried_aliases:
+            initial = self.external_value(int(initial_value_id))
+            true_value = (
+                initial if int(true_value_id) == int(initial_value_id)
+                else self.external_value(int(true_value_id), dtype=initial.dtype)
+            )
+            false_value = (
+                initial if int(false_value_id) == int(initial_value_id)
+                else self.external_value(int(false_value_id), dtype=initial.dtype)
+            )
+            merged = SSAValue(
+                int(merged_value_id),
+                dtype=initial.dtype,
+                shape=initial.shape,
+            )
+            self.emit(
+                Handler.Phi,
+                [true_value, false_value],
+                merged,
+                attributes={
+                    "incoming_blocks": (true_exit.name, false_exit.name),
+                    "binding": "conditional_carried",
+                    "initial_value_id": int(initial_value_id),
+                },
+            )
+            self.external_values[int(merged_value_id)] = merged
+            self.external_values[int(initial_value_id)] = merged
+
     def lower_loop(self, loop: LoopBlock, *, path: str) -> None:
         recursion_region_id = loop.recursion_region_id
         deployment_id = None
@@ -1179,6 +2776,7 @@ class _ControlSSABuilder:
                 "recursion_region_id": recursion_region_id,
             },
         )
+        carried_phis: dict[int, Instr] = {}
         for (
             updated_id,
             initial_id,
@@ -1198,6 +2796,7 @@ class _ControlSSABuilder:
                     "recursion_region_id": recursion_region_id,
                 },
             )
+            carried_phis[updated_id] = self.current.instrs[-1]
             self.external_values[initial_id] = current_value
         condition = self.fresh_value(dtype="bool")
         self.emit(Handler.Lt, [induction, stop], condition)
@@ -1221,6 +2820,59 @@ class _ControlSSABuilder:
             restored_values[int(target_id)] = self.external_values.get(
                 int(target_id)
             )
+            child_selection = self.child_table_selections.get(int(iterable_id))
+            if child_selection is not None:
+                pool, handle = child_selection
+                base_offset = self.fresh_value(dtype="int")
+                offset = self.fresh_value(dtype="int")
+                address = self.fresh_value(dtype="ptr")
+                target = self.produced_value(int(target_id), dtype="unknown")
+                self.emit(
+                    Handler.Mul,
+                    [handle, self.external_value(pool.row_stride_value_id)],
+                    base_offset,
+                    attributes={"binding": "child_table_offset"},
+                )
+                self.emit(
+                    Handler.Add, [base_offset, induction], offset,
+                    attributes={"binding": "child_table_offset"},
+                )
+                if pool.live_flags_value_id is not None:
+                    live_address = self.fresh_value(dtype="ptr")
+                    live = self.fresh_value(dtype="bool")
+                    active = self.new_block("child_table_live")
+                    self.emit(
+                        Handler.GetElementPtr,
+                        [self.external_value(pool.live_flags_value_id), offset],
+                        live_address,
+                        attributes={"binding": "child_table_live"},
+                    )
+                    self.emit(
+                        Handler.Load, [live_address], live,
+                        attributes={"binding": "child_table_live"},
+                    )
+                    self.conditional_branch(live, active, latch)
+                    self.current = active
+                self.emit(
+                    Handler.GetElementPtr,
+                    [self.external_value(pool.column_value_ids[0]), offset],
+                    address,
+                    attributes={"binding": "child_table_key"},
+                )
+                self.emit(
+                    Handler.Load, [address], target,
+                    attributes={"binding": "child_table_key"},
+                )
+                continue
+            if int(target_id) in self.nested_row_target_ids:
+                self.bind_nested_row(
+                    self.external_value(iterable_id, dtype="int"),
+                    induction,
+                    int(target_id),
+                    child_key=("iterable", int(iterable_id), -1),
+                    attributes={"induction": loop.induction},
+                )
+                continue
             self.indexed_load(
                 self.external_value(iterable_id),
                 induction,
@@ -1241,17 +2893,122 @@ class _ControlSSABuilder:
             if projection == "induction":
                 self.external_values[int(target_id)] = induction
                 continue
-            indices = [induction]
+            source = self.external_value(iterable_id)
             if projection is not None:
-                indices.append(self.constant_value(int(projection)))
+                column_key = (int(iterable_id), int(projection))
+                source = self.projected_row_columns.get(column_key)
+                if source is None:
+                    target_meta = self.region_value_meta.get(int(target_id))
+                    target_dtype = (
+                        None if target_meta is None else str(target_meta.dtype)
+                    )
+                    if (
+                        int(target_id) in self.nested_row_target_ids
+                        and int(target_id)
+                        not in self.variant_projected_target_ids
+                    ):
+                        target_dtype = "int"
+                    if int(projection) == 0:
+                        source = self.external_value(
+                            iterable_id, dtype=target_dtype
+                        )
+                    else:
+                        source = self.fresh_value(dtype=target_dtype)
+                        source.accounting.update({
+                            "projected_row_source_id": int(iterable_id),
+                            "projected_row_column": int(projection),
+                        })
+                        self.arguments.append(source)
+                    self.projected_row_columns[column_key] = source
+                if int(target_id) in self.variant_projected_target_ids:
+                    scalar_source = source
+                    handle_source = self.variant_handle_columns.get(column_key)
+                    if handle_source is None:
+                        handle_source = self.fresh_value(dtype="int")
+                        handle_source.accounting.update({
+                            "projected_variant_source_id": int(iterable_id),
+                            "projected_variant_column": int(projection),
+                        })
+                        self.arguments.append(handle_source)
+                        self.variant_handle_columns[column_key] = handle_source
+                    scalar_value = self.indexed_load(
+                        scalar_source,
+                        induction,
+                        target_id,
+                        attributes={
+                            "binding": "projected_variant_scalar",
+                            "induction": loop.induction,
+                            "projection": projection,
+                        },
+                    )
+                    self.bind_nested_row(
+                        handle_source,
+                        induction,
+                        int(target_id),
+                        child_key=(
+                            "projected", int(iterable_id), int(projection)
+                        ),
+                        attributes={
+                            "induction": loop.induction,
+                            "projection": projection,
+                            "variant": True,
+                        },
+                    )
+                    self.variant_row_values[int(target_id)] = (
+                        self.external_values[int(target_id)]
+                    )
+                    # Scalar regions continue to consume the scalar column.
+                    self.external_values[int(target_id)] = scalar_value
+                    continue
+            if (
+                projection is not None
+                and int(target_id) in self.nested_row_target_ids
+            ):
+                self.bind_nested_row(
+                    source,
+                    induction,
+                    int(target_id),
+                    child_key=(
+                        "projected", int(iterable_id), int(projection)
+                    ),
+                    attributes={
+                        "induction": loop.induction,
+                        "projection": projection,
+                    },
+                )
+                continue
             self.indexed_load(
-                self.external_value(iterable_id),
-                indices,
+                source,
+                induction,
                 target_id,
                 attributes={
                     "binding": "projected_iterable",
                     "induction": loop.induction,
                     "projection": projection,
+                },
+            )
+        for base_id, column, result_id, induction_name in (
+            self.nested_row_projections
+        ):
+            if induction_name != loop.induction:
+                continue
+            base = self.external_values.get(int(base_id))
+            if base is None:
+                continue
+            column_value = self.fresh_value(dtype="int")
+            self.emit(
+                Handler.Const, [], column_value,
+                attributes={"value": int(column)},
+            )
+            self.indexed_load(
+                base,
+                column_value,
+                int(result_id),
+                attributes={
+                    "binding": "nested_row_projection",
+                    "induction": loop.induction,
+                    "projection": int(column),
+                    "source_value_id": int(base_id),
                 },
             )
         for iterable_id, target_id, induction_name, values in (
@@ -1312,8 +3069,22 @@ class _ControlSSABuilder:
             )
         try:
             self.lower(loop.body, path=f"{path}.body")
+            for mutation in loop.sequence_mutations:
+                self.lower_sequence_mutation(mutation, path=path)
         finally:
             self.loop_targets.pop()
+        # A nested retained loop may carry the same source state as this loop.
+        # Its exit Phi is then the value produced by this iteration, but the
+        # nested lowering necessarily replaced ``external_values[updated_id]``
+        # with that inner value.  Point the enclosing Phi's latch operand at
+        # the value the body actually published instead of requiring the
+        # placeholder object reserved before the body was lowered.
+        carried_updates: dict[int, SSAValue] = {}
+        for updated_id, _initial_id, _initial, reserved, _current in carried:
+            published = self.external_values.get(updated_id, reserved)
+            carried_updates[updated_id] = published
+            if published is not reserved:
+                carried_phis[updated_id].args[1] = published
         produced_results = {
             id(instruction.res)
             for basic_block in self.blocks.values()
@@ -1321,7 +3092,7 @@ class _ControlSSABuilder:
             if instruction.res is not None
         }
         for updated_id, _initial_id, _initial, updated, _current in carried:
-            if id(updated) not in produced_results:
+            if id(carried_updates[updated_id]) not in produced_results:
                 self.shortfalls.append(
                     SSALoweringShortfall(
                         "control",
@@ -1489,6 +3260,8 @@ class _ControlSSABuilder:
         self.loop_targets.append((latch, exit_block))
         try:
             self.lower(loop.body, path=f"{path}.body")
+            for mutation in loop.sequence_mutations:
+                self.lower_sequence_mutation(mutation, path=path)
         finally:
             self.loop_targets.pop()
         if not self.current.successors:
@@ -1602,7 +3375,10 @@ class _ControlSSABuilder:
                 for value_id in reversed(history)
                 if value_id in self.external_values
             ), None)
-            if value is not None:
+            if (
+                value is not None
+                and int(value.id) not in self.declared_parameter_only_ids
+            ):
                 value_names.append((name, int(value.id)))
         parameter_value_names = tuple(
             (name, value_id)
@@ -1702,6 +3478,83 @@ class _ControlSSABuilder:
                     "parameter_names": parameter_value_names,
                     "control_ir": True,
                     "deployment_regions": tuple(deployment_regions),
+                    "sequence_table": SSASequenceTable(
+                        dict(self.sequence_descriptors)
+                    ),
+                    "sequence_helper_functions": tuple(
+                        self.sequence_helper_functions.values()
+                    ),
+                    "sequence_array_argument_ids": tuple(dict.fromkeys(
+                        [
+                            int(value.id)
+                            for value in self.projected_row_columns.values()
+                        ] + [
+                            int(value.id)
+                            for value in self.variant_row_values.values()
+                        ] + [
+                        int(value_id)
+                        for descriptor in self.sequence_descriptors.values()
+                        for value_id in (
+                            *descriptor.column_value_ids,
+                            descriptor.length_address_id,
+                            *(
+                                (descriptor.status_address_id,)
+                                if descriptor.status_address_id is not None else ()
+                            ),
+                            *(
+                                (descriptor.live_flags_value_id,)
+                                if descriptor.live_flags_value_id is not None else ()
+                            ),
+                            *(
+                                (
+                                    *descriptor.child_table_pool.column_value_ids,
+                                    descriptor.child_table_pool.length_value_id,
+                                    *((descriptor.child_table_pool.status_value_id,)
+                                      if descriptor.child_table_pool.status_value_id is not None else ()),
+                                    *((descriptor.child_table_pool.live_flags_value_id,)
+                                      if descriptor.child_table_pool.live_flags_value_id is not None else ()),
+                                )
+                                if descriptor.child_table_pool is not None else ()
+                            ),
+                        )]
+                    )),
+                    "scalar_variant_argument_ids": tuple(sorted(
+                        self.variant_projected_target_ids
+                    )),
+                    "projected_row_tables": tuple(
+                        (
+                            int(source_id), int(projection), int(value.id),
+                            str(value.dtype or "unknown"),
+                        )
+                        for (source_id, projection), value
+                        in self.projected_row_columns.items()
+                    ),
+                    "nested_child_tables": tuple(
+                        (
+                            str(source_kind), int(source_id), int(projection),
+                            int(data.id), int(lengths.id),
+                            int(sequence_stride.id), int(row_stride.id),
+                        )
+                        for (source_kind, source_id, projection), (
+                            data, lengths, sequence_stride, row_stride
+                        )
+                        in self.nested_child_rows.items()
+                    ),
+                    # Exact authored identities for the resident sequence
+                    # arenas.  Several names may intentionally alias one
+                    # sequence id; retain every occurrence in source-table
+                    # order instead of choosing a convenient spelling.
+                    "sequence_value_names": tuple(
+                        (
+                            int(sequence_id),
+                            tuple(
+                                name
+                                for name, history in self.value_name_histories.items()
+                                if int(sequence_id) in history
+                            ),
+                        )
+                        for sequence_id in self.sequence_descriptors
+                    ),
                 },
         )
         if self.evolution is not None and self.ssa_evolution is not None:
@@ -1720,10 +3573,31 @@ def lower_control_program_to_ssa(
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] | None = None,
     region_value_meta: Mapping[int, Meta] | None = None,
+    value_aliases: Mapping[int, int] | None = None,
     output_value_ids: tuple[int, ...] = (),
     named_output_histories: Mapping[str, tuple[int, ...]] | None = None,
     value_name_histories: Mapping[str, tuple[int, ...]] | None = None,
     parameter_names: tuple[str, ...] = (),
+    sequence_initializations: tuple[tuple[int, str, int], ...] = (),
+    sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
+    sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
+    table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
+    table_stores: tuple[
+        tuple[int, int | tuple[int, ...], int, int], ...
+    ] = (),
+    table_deletions: tuple[
+        tuple[int, int | tuple[int, ...], int | None, str], ...
+    ] = (),
+    retained_sequence_ids: tuple[int, ...] = (),
+    nested_sequence_ids: tuple[int, ...] = (),
+    nested_row_target_ids: tuple[int, ...] = (),
+    selected_nested_sequence_ids: tuple[int, ...] = (),
+    variant_projected_target_ids: tuple[int, ...] = (),
+    region_array_feed_ids: Mapping[int, tuple[int, ...]] | None = None,
+    nested_row_projections: tuple[tuple[int, int, int, str], ...] = (),
+    table_region_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
+    table_region_post_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
+    table_epilogue_operations: tuple[tuple[str, tuple[Any, ...]], ...] = (),
 ) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
     builder = _ControlSSABuilder(
         program,
@@ -1732,13 +3606,75 @@ def lower_control_program_to_ssa(
         region_callees=region_callees,
         region_signatures=region_signatures,
         region_value_meta=region_value_meta,
+        value_aliases=value_aliases,
         output_value_ids=output_value_ids,
         named_output_histories=named_output_histories,
         value_name_histories=value_name_histories,
         parameter_names=parameter_names,
+        sequence_initializations=sequence_initializations,
+        sequence_declarations=sequence_declarations,
+        sequence_memberships=sequence_memberships,
+        table_lookups=table_lookups,
+        table_stores=table_stores,
+        table_deletions=table_deletions,
+        retained_sequence_ids=retained_sequence_ids,
+        nested_sequence_ids=nested_sequence_ids,
+        nested_row_target_ids=nested_row_target_ids,
+        selected_nested_sequence_ids=selected_nested_sequence_ids,
+        variant_projected_target_ids=variant_projected_target_ids,
+        region_array_feed_ids=region_array_feed_ids,
+        nested_row_projections=nested_row_projections,
+        table_region_operations=table_region_operations,
+        table_region_post_operations=table_region_post_operations,
+        table_epilogue_operations=table_epilogue_operations,
     )
     builder.lower(program.root)
+    for kind, arguments in builder.table_epilogue_operations:
+        if kind == "delete":
+            builder._emit_table_delete(*arguments)
+        elif kind == "store":
+            builder._emit_table_store(*arguments)
+        elif kind == "pack_bits":
+            builder._emit_sequence_pack_bits(*arguments)
+        else:
+            raise ValueError(f"unknown table epilogue operation {kind!r}")
     return builder.finish()
+
+
+def _sequence_artifacts_from_control(
+    function: Function,
+) -> tuple[dict[str, Function], dict[str, SSASequenceTable]]:
+    """Recover source-linked sequence helpers and their function-local tables."""
+
+    helpers = {
+        helper.name: helper
+        for helper in function.metadata.get("sequence_helper_functions", ())
+    }
+    table = function.metadata.get("sequence_table")
+    if not isinstance(table, SSASequenceTable) or not table.sequences:
+        return helpers, {}
+    tables = {function.name: table}
+    for helper in helpers.values():
+        metadata = helper.metadata
+        sequence_ids = tuple(dict.fromkeys(
+            int(sequence_id)
+            for sequence_id in (
+                metadata.get("sequence_id"),
+                metadata.get("destination_sequence_id"),
+                metadata.get("source_sequence_id"),
+            )
+            if sequence_id is not None
+        ))
+        helper_table = SSASequenceTable({
+            sequence_id: replace(
+                table.sequences[sequence_id], child_table_pool=None
+            )
+            for sequence_id in sequence_ids
+            if sequence_id in table.sequences
+        })
+        if helper_table.sequences:
+            tables[helper.name] = helper_table
+    return helpers, tables
 
 
 def lower_class_navigation_to_ssa(
@@ -2250,9 +4186,24 @@ def _inject_field_slot_access(
     # ``self`` first, then the non-self parameters in declared order; the read
     # field values are no longer parameters because the loads produce them.
     arguments = [self_array]
+    seen_argument_ids = {int(self_value_id)}
+    for argument in control_function.args:
+        argument_id = int(argument.id)
+        if (
+            argument_id in seen_argument_ids
+            or argument_id in field_read_ids
+        ):
+            continue
+        arguments.append(argument)
+        seen_argument_ids.add(argument_id)
+    # A source parameter unused by the current specialized body may not have
+    # been materialized by control lowering, but it remains part of the public
+    # method signature. Add only those absent declared parameters; all sequence
+    # and child-pool ABI arguments above retain their exact shapes and dtypes.
     for param_id in non_self_param_ids:
-        if int(param_id) not in field_read_ids:
+        if int(param_id) not in seen_argument_ids and int(param_id) not in field_read_ids:
             arguments.append(SSAValue(int(param_id), dtype=dtype))
+            seen_argument_ids.add(int(param_id))
 
     return Function(
         control_function.name,
@@ -2274,7 +4225,42 @@ def lower_control_sections_to_ssa(
     field_ops: tuple[tuple[str, int, int], ...] = (),
     field_const_sources: Mapping[int, Any] | None = None,
     field_count: int = 0,
+    field_names: tuple[str, ...] = (),
+    record_identity: str | None = None,
+    sequence_initializations: tuple[tuple[int, str, int], ...] = (),
+    field_aliases: tuple[tuple[int, int], ...] = (),
+    sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
+    sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
+    table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
+    table_stores: tuple[
+        tuple[int, int | tuple[int, ...], int, int], ...
+    ] = (),
+    table_deletions: tuple[
+        tuple[int, int | tuple[int, ...], int | None, str], ...
+    ] = (),
+    retained_sequence_ids: tuple[int, ...] = (),
+    nested_sequence_ids: tuple[int, ...] = (),
+    nested_record_fields: tuple[tuple[int, str, int], ...] = (),
+    sequence_augassigns: tuple[tuple[int, int, int], ...] = (),
+    sequence_append_fills: tuple[
+        tuple[int, int, int | float | bool | None, int, int], ...
+    ] = (),
+    sequence_append_slices: tuple[
+        tuple[int, int, int, int, int, int], ...
+    ] = (),
+    sequence_bit_packs: tuple[
+        tuple[int, int, int, tuple[int, ...]], ...
+    ] = (),
+    sequence_prepends: tuple[tuple[int, int, int, int, int], ...] = (),
+    sequence_prepend_packed_calls: tuple[
+        tuple[int, int, int, int, int, int, int], ...
+    ] = (),
+    sequence_inplace_bit_pack_calls: tuple[
+        tuple[int, int, int, int, int], ...
+    ] = (),
+    nested_row_projections: tuple[tuple[int, int, int, str], ...] = (),
     string_table: Any = None,
+    tensor_ssa_reference: Any = None,
 ) -> tuple[
     IRModule,
     tuple[SSALoweringShortfall, ...],
@@ -2298,8 +4284,390 @@ def lower_control_sections_to_ssa(
     functions: dict[str, Function] = {}
     region_callees: dict[int, str] = {}
     region_signatures: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}
+    region_value_meta: dict[int, Meta] = {}
+    nested_row_target_ids: set[int] = set()
+    selected_nested_sequence_ids: set[int] = set()
+    variant_projected_target_ids: set[int] = set()
+    region_array_feed_ids: dict[int, set[int]] = {}
     section_outputs: dict[str, tuple[SSAValue, ...]] = {}
     shortfalls: list[SSALoweringShortfall] = []
+    table_sequence_ids = {
+        int(sequence_id)
+        for sequence_id, policy, column_count, _writable
+        in sequence_declarations
+        if str(policy) == "unique" and int(column_count) > 1
+    }
+    declared_sequence_ids = {
+        int(sequence_id)
+        for sequence_id, _policy, _column_count, _writable
+        in sequence_declarations
+    }
+    table_lookup_result_ids = {
+        int(result_id) for result_id, _query_id, _sequence_id in table_lookups
+    }
+    table_store_effect_ids = {
+        int(effect_id)
+        for effect_id, _key_id, _value_id, _sequence_id in table_stores
+    }
+    sequence_fills = {
+        int(sequence_id): (
+            int(sequence_id),
+            ast.literal_eval(str(policy).split(";", 1)[0].split("=", 1)[1]),
+            int(str(policy).split("count=", 1)[1]),
+        )
+        for sequence_id, policy, _column_count in sequence_initializations
+        if str(policy).startswith("fill=") and ";count=" in str(policy)
+    }
+    sequence_augment_by_result = {
+        int(result_id): (int(destination_id), int(source_id))
+        for result_id, destination_id, source_id in sequence_augassigns
+    }
+    sequence_append_fill_by_result = {
+        int(result_id): (
+            int(destination_id), literal, int(count_id)
+        )
+        for result_id, destination_id, literal, count_id, _source_result_id
+        in sequence_append_fills
+    }
+    append_fill_source_result_ids = {
+        int(source_result_id)
+        for _result_id, _destination_id, _literal, _count_id, source_result_id
+        in sequence_append_fills
+    }
+    sequence_append_slice_by_result = {
+        int(result_id): (
+            int(destination_id), int(source_id), int(lower_id), int(upper_id)
+        )
+        for (
+            result_id, destination_id, source_id, lower_id, upper_id,
+            _source_result_id,
+        ) in sequence_append_slices
+    }
+    append_slice_source_result_ids = {
+        int(source_result_id)
+        for (
+            _result_id, _destination_id, _source_id, _lower_id, _upper_id,
+            source_result_id,
+        ) in sequence_append_slices
+    }
+    for (
+        _result_id, destination_id, source_id, _lower_id, _upper_id, _slice_id,
+    ) in sequence_append_slices:
+        for value_id in (int(destination_id), int(source_id)):
+            region_value_meta[value_id] = Meta((), "int")
+            for history in (identity_table or {}).values():
+                if value_id in tuple(map(int, history)):
+                    for alias_id in history:
+                        region_value_meta[int(alias_id)] = Meta((), "int")
+    for (
+        _result_id, _destination_id, _source_id, lower_id, upper_id, _slice_id,
+    ) in sequence_append_slices:
+        # Slice bounds are address arithmetic.  State that contract before the
+        # numerical region producing e.g. ``i + width`` is typed, so its result
+        # and operands remain integer across the region/helper boundary.
+        region_value_meta[int(lower_id)] = Meta((), "int")
+        region_value_meta[int(upper_id)] = Meta((), "int")
+    bit_pack_consumed_ids = {
+        int(value_id)
+        for _destination_id, _source_id, _width_id, consumed_ids
+        in sequence_bit_packs
+        for value_id in consumed_ids
+    }
+    for destination_id, source_id, width_id, _consumed_ids in sequence_bit_packs:
+        region_value_meta[int(destination_id)] = Meta((), "int")
+        region_value_meta[int(source_id)] = Meta((), "int")
+        region_value_meta[int(width_id)] = Meta((), "int")
+    prepend_by_result = {
+        int(concat_result_id): (int(sequence_id), int(value_id))
+        for (
+            _store_result_id, sequence_id, value_id, concat_result_id,
+            _tail_result_id,
+        ) in sequence_prepends
+    }
+    prepend_store_result_ids = {
+        int(store_result_id)
+        for store_result_id, _sequence_id, _value_id, _concat_id, _tail_id
+        in sequence_prepends
+    }
+    packed_concat_ids = {
+        int(concat_result_id)
+        for (
+            _store_result_id, _destination_id, _prefix_id, _source_id,
+            concat_result_id, _tail_result_id, _callsite_id,
+        ) in sequence_prepend_packed_calls
+    }
+    packed_store_ids = {
+        int(store_result_id)
+        for (
+            store_result_id, _destination_id, _prefix_id, _source_id,
+            _concat_result_id, _tail_result_id, _callsite_id,
+        ) in sequence_prepend_packed_calls
+    }
+    packed_by_concat = {
+        int(concat_result_id): (
+            int(destination_id), int(source_id), int(prefix_id),
+            int(callsite_id),
+        )
+        for (
+            _store_result_id, destination_id, prefix_id, source_id,
+            concat_result_id, _tail_result_id, callsite_id,
+        ) in sequence_prepend_packed_calls
+    }
+    packed_by_store = {
+        int(store_result_id): (
+            int(destination_id), int(source_id), int(prefix_id),
+            int(callsite_id),
+        )
+        for (
+            store_result_id, destination_id, prefix_id, source_id,
+            _concat_result_id, _tail_result_id, callsite_id,
+        ) in sequence_prepend_packed_calls
+    }
+    # A packed-call replacement supersedes the scalar-only prepend view of the
+    # same authored concatenation/store pair.
+    for concat_id in packed_concat_ids:
+        prepend_by_result.pop(concat_id, None)
+    prepend_store_result_ids.difference_update(packed_store_ids)
+    inplace_pack_by_result = {
+        int(result_id): (
+            int(sequence_id), int(width), int(callee_reference),
+            int(callsite_id),
+        )
+        for result_id, sequence_id, width, callee_reference, callsite_id
+        in sequence_inplace_bit_pack_calls
+    }
+    for _result_id, sequence_id, _width, _reference, _callsite_id in (
+        sequence_inplace_bit_pack_calls
+    ):
+        region_value_meta[int(sequence_id)] = Meta((), "int")
+    for _result_id, destination_id, literal, _count_id, _source_id in (
+        sequence_append_fills
+    ):
+        element_dtype = "int" if isinstance(literal, int) else "float64"
+        destination_id = int(destination_id)
+        region_value_meta[destination_id] = Meta((), element_dtype)
+        for history in (identity_table or {}).values():
+            if destination_id not in tuple(map(int, history)):
+                continue
+            for value_id in history:
+                region_value_meta[int(value_id)] = Meta((), element_dtype)
+    # Sequence replication is a structural memory contract.  Its destination
+    # element and requested extent must agree in every numerical region and in
+    # the control/helper function that surrounds those regions.
+    for sequence_id, literal, count_id in sequence_fills.values():
+        element_dtype = (
+            "bool" if isinstance(literal, bool)
+            else "int" if isinstance(literal, int)
+            else "float64" if isinstance(literal, float)
+            else "int64" if literal is None
+            else "unknown"
+        )
+        region_value_meta[int(sequence_id)] = Meta((), element_dtype)
+        region_value_meta[int(count_id)] = Meta((), "int")
+    for _iterable_id, target_id, _induction_name, projection in (
+        control.projected_iterable_bindings
+    ):
+        if projection == "induction":
+            region_value_meta[int(target_id)] = Meta((), "int")
+    # Settle strict scalar roles across the complete method before constructing
+    # any one region signature.  The same SSA identity can cross several
+    # regions; whichever region proves it is an address index or predicate must
+    # inform every caller/callee occurrence, independent of traversal order.
+    if hierarchy_plan is not None:
+        semantic_instructions: list[Instr] = []
+        for planned in hierarchy_plan.items:
+            if not (
+                isinstance(planned, PlanClosure)
+                and planned.name.startswith("region_")
+            ):
+                continue
+            planned_instructions = plan_region_to_ssa_instrs(planned)
+            semantic_instructions.extend(planned_instructions)
+            for instruction in planned_instructions:
+                for value in (
+                    *instruction.args,
+                    *((instruction.res,) if instruction.res is not None else ()),
+                ):
+                    if str(value.dtype) in {"bool", "int", "int32", "int64"}:
+                        region_value_meta[int(value.id)] = Meta(
+                            tuple(value.shape), str(value.dtype)
+                        )
+        integer_ids = {
+            int(argument.id)
+            for instruction in semantic_instructions
+            if instruction.op == "GetElementPtr"
+            for argument in instruction.args[1:]
+        }
+        iterable_target_ids = {
+            int(target_id)
+            for _iterable_id, target_id, _induction
+            in control.iterable_bindings
+        }
+        iterable_target_ids.update({
+            int(target_id)
+            for _iterable_id, target_id, _induction, projection
+            in control.projected_iterable_bindings
+            if projection != "induction"
+        })
+        nested_row_target_ids.update(
+            int(instruction.args[0].id)
+            for instruction in semantic_instructions
+            if instruction.op in {"Indexed", "IndexedStore", "GetElementPtr"}
+            and instruction.args
+            and int(instruction.args[0].id) in iterable_target_ids
+        )
+        scalar_use_ids = {
+            int(argument.id)
+            for instruction in semantic_instructions
+            for argument in (
+                instruction.args[1:]
+                if instruction.op in {
+                    "Indexed", "IndexedStore", "GetElementPtr"
+                }
+                else instruction.args
+            )
+        }
+        indexed_base_ids = {
+            int(instruction.args[0].id)
+            for instruction in semantic_instructions
+            if instruction.op in {"Indexed", "IndexedStore", "GetElementPtr"}
+            and instruction.args
+        }
+        variant_projected_target_ids.update(
+            target_id
+            for target_id in nested_row_target_ids
+            if target_id in scalar_use_ids
+        )
+        # The same heterogeneous contract is required when source pursuit has
+        # specialized away the owning loop and left its payload as a direct
+        # method input.  Its uses, not its spelling, prove the two columns.
+        variant_projected_target_ids.update(
+            (indexed_base_ids & scalar_use_ids) - declared_sequence_ids
+        )
+        for planned in hierarchy_plan.items:
+            if not (
+                isinstance(planned, PlanClosure)
+                and planned.name.startswith("region_")
+            ):
+                continue
+            region_index = int(planned.name.rsplit("_", 1)[1])
+            instructions = plan_region_to_ssa_instrs(planned)
+            region_array_feed_ids[region_index] = {
+                int(instruction.args[0].id)
+                for instruction in instructions
+                if instruction.op in {"Indexed", "IndexedStore", "GetElementPtr"}
+                and instruction.args
+                and int(instruction.args[0].id) in variant_projected_target_ids
+            }
+        nested_iterable_source_ids = {
+            int(iterable_id)
+            for iterable_id, target_id, _induction
+            in control.iterable_bindings
+            if int(target_id) in nested_row_target_ids
+        }
+        selected_nested_sequence_ids.update(
+            int(instruction.res.id)
+            for instruction in semantic_instructions
+            if instruction.op in {"Indexed", "Load"}
+            and instruction.res is not None
+            and int(instruction.res.id) in nested_iterable_source_ids
+        )
+        for selected_id in selected_nested_sequence_ids:
+            region_value_meta[selected_id] = Meta((), "int")
+        integer_ops = {
+            "And", "Or", "Xor", "Shl", "Shr", "FloorDiv", "Mod",
+            "bitand", "bitor", "bitxor", "shl", "shr", "floordiv", "mod",
+        }
+        arithmetic_ops = {"Add", "Sub", "Mul", "add", "sub", "mul"}
+        changed = True
+        while changed:
+            changed = False
+            for instruction in semantic_instructions:
+                result_id = (
+                    None if instruction.res is None else int(instruction.res.id)
+                )
+                argument_ids = tuple(int(value.id) for value in instruction.args)
+                if instruction.op in integer_ops:
+                    candidates = (*argument_ids, *((result_id,) if result_id is not None else ()))
+                elif instruction.op in arithmetic_ops and (
+                    (result_id is not None and result_id in integer_ids)
+                    or (argument_ids and all(value_id in integer_ids for value_id in argument_ids))
+                ):
+                    candidates = (*argument_ids, *((result_id,) if result_id is not None else ()))
+                else:
+                    continue
+                for value_id in candidates:
+                    if value_id not in integer_ids:
+                        integer_ids.add(value_id)
+                        changed = True
+        for value_id in integer_ids:
+            current = region_value_meta.get(value_id)
+            region_value_meta[value_id] = Meta(
+                () if current is None else tuple(current.shape), "int"
+            )
+    table_region_operations: dict[
+        int, list[tuple[str, tuple[Any, ...]]]
+    ] = {}
+    table_region_post_operations: dict[
+        int, list[tuple[str, tuple[Any, ...]]]
+    ] = {}
+    region_value_aliases: dict[int, int] = {}
+    # An in-place pursued call can publish a result identity that is never an
+    # operand of a later numerical region: the resident arena itself carries
+    # the effect.  Such calls still execute at their authored position.  Use
+    # the next retained region as the control anchor, exactly as hierarchical
+    # call composition does, instead of waiting for a nonexistent data use.
+    if hierarchy_plan is not None and inplace_pack_by_result:
+        planned_items = tuple(hierarchy_plan.items)
+        consumed_result_ids = {
+            int(argument.id)
+            for item in planned_items
+            if isinstance(item, PlanClosure)
+            and item.name.startswith("region_")
+            for instruction in plan_region_to_ssa_instrs(item)
+            for argument in instruction.args
+        }
+        call_item_positions = {
+            int(item.callsite_id): position
+            for position, item in enumerate(planned_items)
+            if isinstance(item, PlanCall)
+        }
+        for result_id, (
+            sequence_id, width, callee_reference, callsite_id,
+        ) in inplace_pack_by_result.items():
+            if int(result_id) in consumed_result_ids:
+                continue
+            position = call_item_positions.get(int(callsite_id))
+            if position is None:
+                continue
+            next_region = next((
+                item for item in planned_items[position + 1:]
+                if isinstance(item, PlanClosure)
+                and item.name.startswith("region_")
+            ), None)
+            if next_region is None:
+                continue
+            region_index = int(next_region.name.rsplit("_", 1)[1])
+            region_value_aliases[int(result_id)] = int(sequence_id)
+            table_region_operations.setdefault(region_index, []).append((
+                "pack_bits",
+                (
+                    sequence_id, sequence_id, width, True,
+                    callee_reference, callsite_id,
+                ),
+            ))
+    lookup_by_result = {
+        int(result_id): (int(result_id), query_id, int(sequence_id))
+        for result_id, query_id, sequence_id in table_lookups
+    }
+    store_by_effect = {
+        int(effect_id): (
+            int(effect_id), key_id, int(value_id), int(sequence_id)
+        )
+        for effect_id, key_id, value_id, sequence_id in table_stores
+    }
+    region_source_values: list[tuple[int, int]] = []
+    handled_table_region_indices: set[int] = set()
     if hierarchy_plan is not None:
         for region in hierarchy_plan.items:
             if not (
@@ -2315,7 +4683,439 @@ def lower_control_sections_to_ssa(
             # the control call the lowering emits already targets this symbol.
             region_name = f"{control_name}__planned_region_{region_index}"
             instructions = list(plan_region_to_ssa_instrs(region))
-            produced = {int(instr.res.id) for instr in instructions}
+            if any(
+                instruction.res is not None
+                and int(instruction.res.id) in (
+                    append_fill_source_result_ids
+                    | append_slice_source_result_ids
+                )
+                for instruction in instructions
+            ):
+                table_region_operations.setdefault(region_index, []).append((
+                    "structural_consumed", (),
+                ))
+                continue
+            if any(
+                instruction.res is not None
+                and int(instruction.res.id) in bit_pack_consumed_ids
+                for instruction in instructions
+            ):
+                table_region_operations.setdefault(region_index, []).append((
+                    "structural_consumed", (),
+                ))
+                continue
+            fill_instructions = tuple(
+                instruction for instruction in instructions
+                if instruction.res is not None
+                and int(instruction.res.id) in sequence_fills
+                and instruction.op in {"Mul", "Mult", "mul"}
+            )
+            if fill_instructions:
+                removed_ids = {
+                    int(instruction.res.id)
+                    for instruction in fill_instructions
+                }
+                # The list literal feeding replication is structural input to
+                # the fill helper; remove its now-dead Const from the region.
+                fill_operand_ids = {
+                    int(argument.id)
+                    for instruction in fill_instructions
+                    for argument in instruction.args
+                }
+                instructions = [
+                    instruction for instruction in instructions
+                    if instruction not in fill_instructions
+                    and not (
+                        instruction.op == "Const"
+                        and instruction.res is not None
+                        and int(instruction.res.id) in fill_operand_ids
+                        and isinstance(instruction.attributes.get("value"), (list, tuple))
+                    )
+                ]
+                for result_id in removed_ids:
+                    table_region_post_operations.setdefault(
+                        region_index, []
+                    ).append(("fill", sequence_fills[result_id]))
+            augment_instructions = tuple(
+                instruction
+                for instruction in instructions
+                if instruction.res is not None
+                and int(instruction.res.id) in sequence_augment_by_result
+                and instruction.op in {"Add", "add"}
+            )
+            if augment_instructions:
+                for instruction in augment_instructions:
+                    result_id = int(instruction.res.id)
+                    destination_id, source_id = sequence_augment_by_result[
+                        result_id
+                    ]
+                    region_value_aliases[result_id] = destination_id
+                    table_region_post_operations.setdefault(
+                        region_index, []
+                    ).append((
+                        "extend",
+                        (result_id, destination_id, source_id),
+                    ))
+                instructions = [
+                    instruction for instruction in instructions
+                    if instruction not in augment_instructions
+                    and not (
+                        instruction.op == "Const"
+                        and instruction.res is not None
+                        and not any(
+                            int(instruction.res.id) == int(argument.id)
+                            for remaining in instructions
+                            if remaining not in augment_instructions
+                            for argument in remaining.args
+                        )
+                    )
+                ]
+            append_fill_instructions = tuple(
+                instruction
+                for instruction in instructions
+                if instruction.res is not None
+                and int(instruction.res.id)
+                in sequence_append_fill_by_result
+                and instruction.op in {"Add", "add"}
+            )
+            if append_fill_instructions:
+                for instruction in append_fill_instructions:
+                    result_id = int(instruction.res.id)
+                    destination_id, literal, count_id = (
+                        sequence_append_fill_by_result[result_id]
+                    )
+                    region_value_aliases[result_id] = destination_id
+                    table_region_post_operations.setdefault(
+                        region_index, []
+                    ).append((
+                        "append_fill",
+                        (destination_id, literal, count_id),
+                    ))
+                instructions = [
+                    instruction for instruction in instructions
+                    if instruction not in append_fill_instructions
+                ]
+            append_slice_instructions = tuple(
+                instruction
+                for instruction in instructions
+                if instruction.res is not None
+                and int(instruction.res.id) in sequence_append_slice_by_result
+                and instruction.op in {"Add", "add"}
+            )
+            if append_slice_instructions:
+                for instruction in append_slice_instructions:
+                    result_id = int(instruction.res.id)
+                    destination_id, source_id, lower_id, upper_id = (
+                        sequence_append_slice_by_result[result_id]
+                    )
+                    region_value_aliases[result_id] = destination_id
+                    table_region_post_operations.setdefault(
+                        region_index, []
+                    ).append((
+                        "append_slice",
+                        (destination_id, source_id, lower_id, upper_id),
+                    ))
+                instructions = [
+                    instruction for instruction in instructions
+                    if instruction not in append_slice_instructions
+                ]
+            prepend_instructions = tuple(
+                instruction for instruction in instructions
+                if instruction.res is not None
+                and int(instruction.res.id) in prepend_by_result
+                and instruction.op in {"Add", "add"}
+            )
+            if prepend_instructions:
+                for instruction in prepend_instructions:
+                    result_id = int(instruction.res.id)
+                    sequence_id, value_id = prepend_by_result[result_id]
+                    region_value_aliases[result_id] = sequence_id
+                    table_region_post_operations.setdefault(
+                        region_index, []
+                    ).append(("prepend", (sequence_id, value_id)))
+                instructions = [
+                    instruction for instruction in instructions
+                    if instruction not in prepend_instructions
+                ]
+            packed_instructions = tuple(
+                instruction for instruction in instructions
+                if instruction.res is not None
+                and int(instruction.res.id) in packed_by_concat
+                and instruction.op in {"Add", "add"}
+            )
+            if packed_instructions:
+                for instruction in packed_instructions:
+                    result_id = int(instruction.res.id)
+                    (
+                        destination_id, source_id, prefix_id,
+                        packed_callsite_id,
+                    ) = packed_by_concat[
+                        result_id
+                    ]
+                    region_value_aliases[result_id] = destination_id
+                instructions = [
+                    instruction for instruction in instructions
+                    if instruction not in packed_instructions
+                ]
+            packed_store_instructions = tuple(
+                instruction for instruction in instructions
+                if instruction.res is not None
+                and int(instruction.res.id) in packed_by_store
+            )
+            if packed_store_instructions:
+                for instruction in packed_store_instructions:
+                    store_result_id = int(instruction.res.id)
+                    (
+                        destination_id, source_id, prefix_id,
+                        packed_callsite_id,
+                    ) = packed_by_store[
+                        store_result_id
+                    ]
+                    # Preserve authored call order at the splice boundary:
+                    # bitmap-pack destination, then prepend the prefix and
+                    # packed mapping words, then consume the slice store.
+                    prior_pack = next((
+                        inplace_pack_by_result[result_id]
+                        for result_id in sorted(inplace_pack_by_result)
+                        if result_id in {int(value.id) for value in instruction.args}
+                    ), None)
+                    if prior_pack is not None:
+                        (
+                            sequence_id, width, callee_reference,
+                            pack_callsite_id,
+                        ) = prior_pack
+                        region_value_aliases[next(
+                            result_id for result_id, contract
+                            in inplace_pack_by_result.items()
+                            if contract == prior_pack
+                            and result_id in {
+                                int(value.id) for value in instruction.args
+                            }
+                        )] = sequence_id
+                        table_region_operations.setdefault(
+                            region_index, []
+                        ).append((
+                            "pack_bits",
+                            (
+                                sequence_id, sequence_id, width, True,
+                                callee_reference, pack_callsite_id,
+                            ),
+                        ))
+                    table_region_operations.setdefault(
+                        region_index, []
+                    ).append((
+                        "prepend_packed_bytes",
+                        (
+                            destination_id, source_id, prefix_id, 4,
+                            packed_callsite_id,
+                        ),
+                    ))
+                table_region_operations.setdefault(region_index, []).append((
+                    "structural_consumed", (),
+                ))
+                continue
+            if any(
+                instruction.res is not None
+                and int(instruction.res.id) in prepend_store_result_ids
+                for instruction in instructions
+            ):
+                # The following zero-width slice store is the authored splice;
+                # prepend has already performed it in resident memory.
+                table_region_operations.setdefault(region_index, []).append((
+                    "structural_consumed", (),
+                ))
+                continue
+            # A pursued structural bit-pack call publishes the same resident
+            # arena under its call result ID.  Schedule the helper at the first
+            # region that consumes that result, before that region executes.
+            consumed_pack_results = tuple(sorted({
+                int(argument.id)
+                for instruction in instructions
+                for argument in instruction.args
+                if int(argument.id) in inplace_pack_by_result
+            }))
+            for result_id in consumed_pack_results:
+                (
+                    sequence_id, width, callee_reference,
+                    pack_callsite_id,
+                ) = inplace_pack_by_result[
+                    result_id
+                ]
+                region_value_aliases[result_id] = sequence_id
+                table_region_operations.setdefault(region_index, []).append((
+                    "pack_bits",
+                    (
+                        sequence_id, sequence_id, width, True,
+                        callee_reference, pack_callsite_id,
+                    ),
+                ))
+            for instruction in instructions:
+                if (
+                    instruction.op == "IndexedStore"
+                    and instruction.res is not None
+                    and instruction.args
+                ):
+                    # IndexedStore versions resident memory; it does not return
+                    # a new scalar payload.  Preserve the authored result ID as
+                    # an alias of the base arena across subsequent regions.
+                    region_value_aliases[int(instruction.res.id)] = int(
+                        instruction.args[0].id
+                    )
+            region_source_values.extend(
+                (int(instruction.res.id), region_index)
+                for instruction in instructions
+                if instruction.res is not None
+            )
+            table_index_instructions = tuple(
+                instruction
+                for instruction in instructions
+                if instruction.op in {"Indexed", "IndexedStore"}
+                and instruction.res is not None
+                and (
+                    int(instruction.res.id) in table_lookup_result_ids
+                    or int(instruction.res.id) in table_store_effect_ids
+                )
+            )
+            if table_index_instructions:
+                if (
+                    len(table_index_instructions) == len(instructions) == 1
+                    and table_index_instructions[0].op == "Indexed"
+                    and table_index_instructions[0].res is not None
+                    and int(table_index_instructions[0].res.id)
+                    in table_lookup_result_ids
+                ):
+                    handled_table_region_indices.add(region_index)
+                    table_region_operations.setdefault(region_index, []).append((
+                        "lookup",
+                        lookup_by_result[int(table_index_instructions[0].res.id)],
+                    ))
+                    continue
+                if (
+                    len(table_index_instructions) == len(instructions) == 1
+                    and table_index_instructions[0].op == "IndexedStore"
+                    and table_index_instructions[0].res is not None
+                    and int(table_index_instructions[0].res.id)
+                    in table_store_effect_ids
+                ):
+                    handled_table_region_indices.add(region_index)
+                    table_region_operations.setdefault(region_index, []).append((
+                        "store",
+                        store_by_effect[int(table_index_instructions[0].res.id)],
+                    ))
+                    continue
+                table_ids = {
+                    int(instruction.res.id)
+                    for instruction in table_index_instructions
+                    if instruction.res is not None
+                }
+                remaining = [
+                    instruction for instruction in instructions
+                    if instruction not in table_index_instructions
+                ]
+                if any(
+                    int(argument.id) in table_ids
+                    for instruction in remaining
+                    for argument in instruction.args
+                ):
+                    for instruction in table_index_instructions:
+                        shortfalls.append(SSALoweringShortfall(
+                            "ssa-table",
+                            instruction.op,
+                            f"{control_name}.region_{region_index}",
+                            "mixed region consumes a keyed table operation's "
+                            "result before structural table replacement",
+                        ))
+                    continue
+                instructions = remaining
+                for instruction in table_index_instructions:
+                    effect_id = int(instruction.res.id)
+                    if instruction.op == "Indexed":
+                        table_region_post_operations.setdefault(
+                            region_index, []
+                        ).append(("lookup", lookup_by_result[effect_id]))
+                    else:
+                        table_region_post_operations.setdefault(
+                            region_index, []
+                        ).append(("store", store_by_effect[effect_id]))
+            instruction_values = {
+                int(value.id): value
+                for instruction in instructions
+                for value in (
+                    *instruction.args,
+                    *((instruction.res,) if instruction.res is not None else ()),
+                )
+            }
+            # A variant payload has parallel scalar and child-row columns.
+            # Its authored ID remains scalar in regions that use it as a value
+            # or index; only regions that dereference it receive the row-base
+            # address selected by the control caller.
+            for value_id in variant_projected_target_ids:
+                if value_id in region_array_feed_ids.get(region_index, set()):
+                    region_value_meta[value_id] = Meta((), "float64")
+                elif value_id in instruction_values:
+                    region_value_meta[value_id] = Meta((), "float64")
+            region_values = {}
+            for value_id, shape, dtype in region.value_shapes:
+                authoritative = region_value_meta.get(int(value_id))
+                semantic = instruction_values.get(int(value_id))
+                region_values[int(value_id)] = SSAValue(
+                    int(value_id),
+                    dtype=(
+                        str(authoritative.dtype)
+                        if authoritative is not None else str(dtype)
+                        if semantic is None or semantic.dtype is None
+                        else str(semantic.dtype)
+                    ),
+                    shape=(
+                        tuple(map(int, authoritative.shape))
+                        if authoritative is not None
+                        else tuple(semantic.shape)
+                        if semantic is not None and semantic.shape
+                        else tuple(map(int, shape))
+                    ),
+                )
+            for value_id, shape, dtype in region.value_shapes:
+                semantic = instruction_values.get(int(value_id))
+                region_value_meta.setdefault(
+                    int(value_id),
+                    Meta(
+                        shape=(
+                            tuple(semantic.shape)
+                            if semantic is not None and semantic.shape
+                            else tuple(map(int, shape))
+                        ),
+                        dtype=(
+                            str(semantic.dtype)
+                            if semantic is not None and semantic.dtype is not None
+                            else str(dtype)
+                        ),
+                    ),
+                )
+
+            def typed_region_value(value_id: int) -> SSAValue:
+                return region_values.get(
+                    int(value_id),
+                    instruction_values.get(
+                        int(value_id), SSAValue(int(value_id))
+                    ),
+                )
+
+            # One SSA identity has one contract inside the function.  Rebind
+            # the instruction graph itself, not only its formal arguments and
+            # outputs, so target inference cannot see a stale float result and
+            # an integer function output for the same value ID.
+            for instruction in instructions:
+                instruction.args = [
+                    typed_region_value(value.id) for value in instruction.args
+                ]
+                if instruction.res is not None:
+                    instruction.res = typed_region_value(instruction.res.id)
+
+            produced = {
+                int(instr.res.id)
+                for instr in instructions
+                if instr.res is not None
+            }
             consumed = {
                 int(argument.id)
                 for instr in instructions
@@ -2324,24 +5124,39 @@ def lower_control_sections_to_ssa(
             outputs = tuple(sorted(produced - consumed)) or tuple(
                 sorted(produced)
             )
+            outputs = tuple(
+                value_id for value_id in outputs
+                if value_id not in region_value_aliases
+            )
             # The region's formal parameters are its captures only. Its outputs
             # are declared as ``intent(out)`` dummies by the target from the
             # ``outputs`` map (returned below as ``section_outputs``), exactly as
             # the fused numerical region path does -- never by placing them in
             # ``args``, which would misread an output as an in/out alias.
-            arguments = [SSAValue(int(vid)) for vid in region.captures]
-            functions[region_name] = Function(
+            arguments = [typed_region_value(vid) for vid in region.captures]
+            region_function = Function(
                 region_name,
                 arguments,
                 {"entry": BasicBlock("entry", instructions)},
             )
+            region_function.metadata["scalar_variant_argument_ids"] = tuple(
+                sorted(
+                    value_id
+                    for value_id in variant_projected_target_ids
+                    if value_id in region.captures
+                    and value_id not in region_array_feed_ids.get(
+                        region_index, set()
+                    )
+                )
+            )
+            functions[region_name] = region_function
             region_callees[region_index] = region_name
             region_signatures[region_index] = (
                 tuple(int(vid) for vid in region.captures),
                 outputs,
             )
             section_outputs[region_name] = tuple(
-                SSAValue(int(vid)) for vid in outputs
+                typed_region_value(vid) for vid in outputs
             )
             # Do NOT gate region ops on the repository ``Handler`` enum here: that
             # is the LLVM/repository vocabulary, but this path emits through the
@@ -2349,6 +5164,39 @@ def lower_control_sections_to_ssa(
             # renders ``equal`` as ``(a == b)`` though ``Handler`` only knows
             # ``Eq``. The target's own emit reports any op it genuinely cannot
             # express, with a message accurate to that target.
+    table_epilogue_operations: list[tuple[str, tuple[Any, ...]]] = []
+    iterable_source_ids = {
+        int(binding[0]) for binding in control.iterable_bindings
+    }
+    for deletion in table_deletions:
+        effect_id = int(deletion[0])
+        preceding = [
+            (value_id, region_index)
+            for value_id, region_index in region_source_values
+            if value_id < effect_id
+        ]
+        following = [
+            (value_id, region_index)
+            for value_id, region_index in region_source_values
+            if value_id > effect_id
+        ]
+        if deletion[2] is None and preceding:
+            _value_id, region_index = max(preceding)
+            table_region_operations.setdefault(region_index, []).append(("delete", deletion))
+        elif preceding and max(preceding)[0] in iterable_source_ids:
+            _value_id, region_index = max(preceding)
+            table_region_operations.setdefault(region_index, []).append(("delete", deletion))
+        elif following:
+            _value_id, region_index = min(following)
+            table_region_operations.setdefault(region_index, []).insert(0, ("delete", deletion))
+        else:
+            table_epilogue_operations.append(("delete", deletion))
+    for destination_id, source_id, width_id, _consumed_ids in sequence_bit_packs:
+        table_epilogue_operations.append((
+            "pack_bits", (
+                int(destination_id), int(source_id), int(width_id)
+            ),
+        ))
     # The control lowering mints synthetic values (aggregate handles, index
     # constants) for the region-call convention. They must not reuse a graph
     # value id, or a synthetic const collides with a field value the injection
@@ -2368,14 +5216,96 @@ def lower_control_sections_to_ssa(
         first_value_id=max(graph_value_ids) + 1,
         region_callees=region_callees,
         region_signatures=region_signatures,
+        region_value_meta=region_value_meta,
+        value_aliases=region_value_aliases,
         named_output_histories={
             str(name): tuple(map(int, (identity_table or {}).get(name, ())))
             for name in function_outputs
         },
         value_name_histories=identity_table,
         parameter_names=function_parameters,
+        sequence_initializations=sequence_initializations,
+        sequence_declarations=sequence_declarations,
+        sequence_memberships=sequence_memberships,
+        table_lookups=table_lookups,
+        table_stores=table_stores,
+        table_deletions=table_deletions,
+        retained_sequence_ids=retained_sequence_ids,
+        nested_sequence_ids=nested_sequence_ids,
+        nested_row_target_ids=tuple(sorted(
+            nested_row_target_ids
+        )),
+        selected_nested_sequence_ids=tuple(sorted(
+            selected_nested_sequence_ids
+        )),
+        variant_projected_target_ids=tuple(sorted(
+            variant_projected_target_ids
+        )),
+        region_array_feed_ids={
+            region: tuple(sorted(value_ids))
+            for region, value_ids in region_array_feed_ids.items()
+            if value_ids
+        },
+        nested_row_projections=nested_row_projections,
+        table_region_operations={
+            region: tuple(operations)
+            for region, operations in table_region_operations.items()
+        },
+        table_region_post_operations={
+            region: tuple(operations)
+            for region, operations in table_region_post_operations.items()
+        },
+        table_epilogue_operations=tuple(table_epilogue_operations),
     )
-    if self_value_id is not None and field_ops:
+    sequence_helpers, sequence_tables = _sequence_artifacts_from_control(
+        control_function
+    )
+    control_sequence_table = sequence_tables.get(control_function.name)
+    control_sequences = (
+        dict(control_sequence_table.sequences)
+        if control_sequence_table is not None else {}
+    )
+    sequence_field_slots: dict[int, int] = {}
+    for _kind, value_id, slot in field_ops:
+        if int(value_id) in control_sequences:
+            sequence_field_slots[int(slot)] = int(value_id)
+    for alias_slot, target_slot in field_aliases:
+        if int(target_slot) in sequence_field_slots:
+            sequence_field_slots[int(alias_slot)] = sequence_field_slots[
+                int(target_slot)
+            ]
+    scalar_slots = tuple(
+        slot for slot in range(int(field_count))
+        if slot not in sequence_field_slots
+    )
+    compact_slot = {slot: index for index, slot in enumerate(scalar_slots)}
+    scalar_field_ops = tuple(
+        (kind, value_id, compact_slot[slot])
+        for kind, value_id, slot in field_ops
+        if slot in compact_slot
+    )
+    # ``self`` is a compile-time record correlation, not an opaque runtime
+    # object.  When every field is already represented by explicit sequence
+    # arenas, the receiver has no remaining scalar storage and must not become
+    # an otherwise-unused ABI argument.  Method-call linking correlates the
+    # authored receiver identity to the record descriptor and passes the field
+    # arenas themselves.
+    if (
+        self_value_id is not None
+        and record_identity is not None
+        and not scalar_slots
+        and not any(
+            int(argument.id) == int(self_value_id)
+            for block in control_function.blocks.values()
+            for instruction in block.instrs
+            for argument in instruction.args
+        )
+    ):
+        control_function.args = [
+            argument for argument in control_function.args
+            if int(argument.id) != int(self_value_id)
+        ]
+    if self_value_id is not None and scalar_slots:
         non_self_param_ids = tuple(
             int((identity_table or {}).get(name, (None,))[-1])
             for name in function_parameters
@@ -2390,12 +5320,21 @@ def lower_control_sections_to_ssa(
             control_function,
             self_value_id=int(self_value_id),
             non_self_param_ids=non_self_param_ids,
-            field_ops=field_ops,
+            field_ops=scalar_field_ops,
             field_const_sources=field_const_sources or {},
-            field_count=int(field_count),
+            field_count=len(scalar_slots),
             output_value_ids=output_value_ids,
         )
+        # Field injection rebuilds the function but preserves its sequence
+        # metadata, so refresh the table/function correlation after rewriting.
+        sequence_helpers, sequence_tables = _sequence_artifacts_from_control(
+            control_function
+        )
     functions[control_function.name] = control_function
+    functions.update(sequence_helpers)
+    from .ir_sequence_tables import lower_sequence_aggregate_constants
+
+    lower_sequence_aggregate_constants(functions, sequence_tables)
     # Lower subscript ops (Indexed/IndexedStore) to the universal address
     # vocabulary (GetElementPtr + Load/Store) that every backend already speaks,
     # so the subscript lowering lives once at the SSA level, not per backend.
@@ -2408,6 +5347,91 @@ def lower_control_sections_to_ssa(
     from .ir_string_interning import tokenize_ssa_string_constants
 
     tokenize_ssa_string_constants(functions, string_table)
+    record_tables = {}
+    if record_identity is not None and field_names:
+        from ..transmogrifier.ssa import (
+            SSARecordDescriptor,
+            SSARecordFieldDescriptor,
+            SSARecordFieldStorage,
+            SSARecordTable,
+        )
+
+        record_fields = []
+        nested_record_by_slot = {
+            int(slot): (str(identity), int(value_id))
+            for slot, identity, value_id in nested_record_fields
+        }
+        alias_targets = {int(alias): int(target) for alias, target in field_aliases}
+        for old_slot, name in enumerate(field_names):
+            canonical_slot = alias_targets.get(old_slot, old_slot)
+            canonical_name = (
+                field_names[canonical_slot]
+                if 0 <= canonical_slot < len(field_names)
+                else name
+            )
+            storage_identity = f"{record_identity}.{canonical_name}"
+            sequence_id = sequence_field_slots.get(old_slot)
+            nested_record = nested_record_by_slot.get(old_slot)
+            if nested_record is not None:
+                nested_identity, nested_value_id = nested_record
+                record_fields.append(SSARecordFieldDescriptor(
+                    name,
+                    SSARecordFieldStorage.RECORD,
+                    storage_identity=storage_identity,
+                    # The nested record id is a descriptor correlation, not a
+                    # physical SSA value.  Its leaf fields name the actual
+                    # caller-owned arenas.
+                    value_ids=(),
+                    record_id=nested_value_id,
+                    dtype=nested_identity,
+                ))
+            elif sequence_id is not None:
+                descriptor = control_sequences[sequence_id]
+                value_ids = (
+                    *descriptor.column_value_ids,
+                    descriptor.length_address_id,
+                    descriptor.capacity_value_id,
+                    *((descriptor.status_address_id,) if descriptor.status_address_id is not None else ()),
+                    *((descriptor.live_flags_value_id,) if descriptor.live_flags_value_id is not None else ()),
+                    *(
+                        (
+                            *descriptor.child_table_pool.column_value_ids,
+                            descriptor.child_table_pool.length_value_id,
+                            descriptor.child_table_pool.capacity_value_id,
+                            descriptor.child_table_pool.row_stride_value_id,
+                            *((descriptor.child_table_pool.status_value_id,)
+                              if descriptor.child_table_pool.status_value_id is not None else ()),
+                            *((descriptor.child_table_pool.live_flags_value_id,)
+                              if descriptor.child_table_pool.live_flags_value_id is not None else ()),
+                        )
+                        if descriptor.child_table_pool is not None else ()
+                    ),
+                )
+                record_fields.append(SSARecordFieldDescriptor(
+                    name,
+                    SSARecordFieldStorage.SEQUENCE,
+                    storage_identity=storage_identity,
+                    value_ids=tuple(dict.fromkeys(map(int, value_ids))),
+                    sequence_id=sequence_id,
+                    writable=descriptor.writable,
+                ))
+            elif old_slot in compact_slot and self_value_id is not None:
+                record_fields.append(SSARecordFieldDescriptor(
+                    name,
+                    SSARecordFieldStorage.SCALAR,
+                    storage_identity=storage_identity,
+                    value_ids=(int(self_value_id),),
+                    offset=compact_slot[old_slot],
+                ))
+        if record_fields:
+            record_tables[control_function.name] = SSARecordTable({
+                int(self_value_id if self_value_id is not None else max(graph_value_ids) + 1):
+                    SSARecordDescriptor(
+                        int(self_value_id if self_value_id is not None else max(graph_value_ids) + 1),
+                        record_identity,
+                        tuple(record_fields),
+                    )
+            })
     module = IRModule(
         link_required_ssa_features(functions),
         recursion_table={
@@ -2415,8 +5439,29 @@ def lower_control_sections_to_ssa(
             for name, function in functions.items()
             if function.metadata.get("recursion_table")
         },
+        sequence_tables=sequence_tables,
+        record_tables=record_tables,
     )
-    return module, tuple((*shortfalls, *control_shortfalls)), section_outputs
+    tensor_reference_shortfalls = ()
+    if tensor_ssa_reference is not None:
+        from .tensor_ssa_lowering import lower_tensor_calls_to_repository_ssa
+
+        tensor_reference_shortfalls = tuple(
+            SSALoweringShortfall(
+                "tensor-ssa-reference",
+                item.operation,
+                f"{item.function}:{item.block}",
+                item.reason,
+            )
+            for item in lower_tensor_calls_to_repository_ssa(
+                module, tensor_ssa_reference
+            )
+        )
+    return module, tuple((
+        *shortfalls,
+        *control_shortfalls,
+        *tensor_reference_shortfalls,
+    )), section_outputs
 
 
 def lower_precompile_and_control_to_ssa(
@@ -2430,6 +5475,7 @@ def lower_precompile_and_control_to_ssa(
     identity_table: Mapping[str, tuple[int, ...]] | None = None,
     function_outputs: tuple[str, ...] = (),
     function_parameters: tuple[str, ...] = (),
+    tensor_ssa_reference: Any = None,
 ) -> PrecompileSSALoweringResult:
     validation = validate_precompile_ssa_compatibility(artifact)
     program = getattr(artifact, "program", artifact)
@@ -2500,7 +5546,9 @@ def lower_precompile_and_control_to_ssa(
             region_name = f"planned_region_{region_index}"
             instructions = list(plan_region_to_ssa_instrs(region))
             produced = {
-                int(instruction.res.id) for instruction in instructions
+                int(instruction.res.id)
+                for instruction in instructions
+                if instruction.res is not None
             }
             consumed = {
                 int(argument.id)
@@ -2555,7 +5603,14 @@ def lower_precompile_and_control_to_ssa(
         value_name_histories=identity_table,
         parameter_names=function_parameters,
     )
+    sequence_helpers, sequence_tables = _sequence_artifacts_from_control(
+        control_function
+    )
     functions[control_function.name] = control_function
+    functions.update(sequence_helpers)
+    from .ir_sequence_tables import lower_sequence_aggregate_constants
+
+    lower_sequence_aggregate_constants(functions, sequence_tables)
     module = IRModule(
         link_required_ssa_features(functions),
         recursion_table={
@@ -2563,7 +5618,23 @@ def lower_precompile_and_control_to_ssa(
             for name, function in functions.items()
             if function.metadata.get("recursion_table")
         },
+        sequence_tables=sequence_tables,
     )
+    tensor_reference_shortfalls = ()
+    if tensor_ssa_reference is not None:
+        from .tensor_ssa_lowering import lower_tensor_calls_to_repository_ssa
+
+        tensor_reference_shortfalls = tuple(
+            SSALoweringShortfall(
+                "tensor-ssa-reference",
+                item.operation,
+                f"{item.function}:{item.block}",
+                item.reason,
+            )
+            for item in lower_tensor_calls_to_repository_ssa(
+                module, tensor_ssa_reference
+            )
+        )
     cycles = (
         *find_ssa_cycles(numerical),
         *find_ssa_cycles(control_function),
@@ -2575,6 +5646,7 @@ def lower_precompile_and_control_to_ssa(
             *numerical_shortfalls,
             *region_shortfalls,
             *control_shortfalls,
+            *tensor_reference_shortfalls,
             *(
                 SSALoweringShortfall(
                     "llvm",

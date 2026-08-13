@@ -88,6 +88,34 @@ def plan_region_to_ssa_instrs(region: PlanClosure) -> tuple[Instr, ...]:
     dtype_of = {
         int(value_id): dtype for value_id, _shape, dtype in region.value_shapes
     }
+    # The graph domain is deliberately permissive and often records scalar
+    # control values with its default numerical dtype.  Operator semantics are
+    # authoritative where they are stricter: comparisons/logical operations
+    # produce predicates, and address indices/extents are integers.  Retain
+    # these contracts in repository SSA rather than asking a target emitter to
+    # reverse-engineer them from syntax.
+    predicate_ops = {
+        "eq", "equal", "ne", "not_equal", "lt", "less", "le",
+        "less_equal", "gt", "greater", "ge", "greater_equal",
+        "land", "logical_and", "lor", "logical_or", "lnot",
+        "logical_not", "is", "is_not", "contains", "not_contains",
+    }
+    integer_result_ops = {"len", "length", "extent"}
+    for item in region.items:
+        if not isinstance(item, PlanLine):
+            continue
+        opcode = str(item.opcode).casefold()
+        if item.outputs and opcode in predicate_ops:
+            dtype_of[int(item.outputs[0])] = "bool"
+        elif item.outputs and opcode in integer_result_ops:
+            dtype_of[int(item.outputs[0])] = "int"
+        if opcode == "getelementptr":
+            # Only repository address arithmetic requires integer indices.
+            # High-level Indexed/IndexedStore may be a dictionary lookup whose
+            # key retains any authored type and is lowered through a table.
+            index_inputs = item.inputs[1:]
+            for value_id in index_inputs:
+                dtype_of[int(value_id)] = "int"
 
     def value(value_id: int) -> SSAValue:
         value_id = int(value_id)
@@ -109,15 +137,17 @@ def plan_region_to_ssa_instrs(region: PlanClosure) -> tuple[Instr, ...]:
             raise ValueError(
                 f"{region.name!r} is not a flat operator region"
             )
-        if len(item.outputs) != 1:
+        if len(item.outputs) > 1:
             raise ValueError(
-                f"{item.opcode!r} must publish one SSA result"
+                f"{item.opcode!r} may publish at most one SSA result"
             )
-        result_id = int(item.outputs[0])
+        result = (
+            value(int(item.outputs[0])) if item.outputs else None
+        )
         instructions.append(Instr(
             item.opcode,
             [value(value_id) for value_id in item.inputs],
-            value(result_id),
+            result,
             arg_roles=list(item.input_roles),
             attributes=dict(item.attributes),
         ))
@@ -211,6 +241,7 @@ def reduce_hierarchy_identities(
                 closure.captures,
                 tuple(items),
                 closure.closure_id,
+                closure.value_shapes,
             )
 
         updated = rewrite(current)
@@ -265,6 +296,7 @@ def assign_hierarchy_ids(
             closure.captures,
             items,
             closure_id,
+            closure.value_shapes,
         )
 
     planned = number(root)

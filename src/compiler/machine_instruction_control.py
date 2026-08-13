@@ -1,4 +1,12 @@
-"""Breakpoint/hook/patch/resume control on top of the reversible executor.
+"""Legacy breakpoint and mapped-byte patch control.
+
+.. deprecated::
+   This module changes guest memory and therefore is not executor-stream
+   interposition. New read/edit/write/execute work must use
+   :mod:`machine_stream_interposition`, where original and written bytes pass
+   through the tensor read head and the guest image remains unchanged.
+
+Breakpoint/hook/patch/resume control sits on top of the reversible executor.
 
 This adds no new execution semantics to ``ReversibleMachineExecutor`` or
 ``MachineExecutionOrchestrator`` -- it is a thin driver built entirely from
@@ -17,12 +25,12 @@ existing primitives, verified to already exist for this purpose:
   completing a guest call" -- the same mechanism used elsewhere (thread-wait
   bookkeeping in ``binary_machine_program.py``) to reversibly replace the
   current state with an edited one.
-- Inserting binary instructions: ``MachineExecutionOrchestrator._decode_instruction_from_state``
+- Patching mapped binary instructions: ``MachineExecutionOrchestrator._decode_instruction_from_state``
   (machine_execution.py:582) already prefers a *dynamic* decode straight
   from ``state.memory`` at the target address whenever the static
   ``self.instructions`` table doesn't have a byte-matching entry there --
   this is the same path ordinary self-modifying/JIT'd guest code already
-  goes through. So "insert an instruction" reduces to: write the desired
+  goes through. This legacy API writes the desired
   bytes into guest memory (reversibly, via a new committed state) at an
   address the executor already considers executable. It does not attempt
   to fabricate a *new* executable region -- ``VirtualMemoryEffect`` only

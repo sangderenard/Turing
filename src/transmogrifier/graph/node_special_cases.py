@@ -536,10 +536,14 @@ class _EllipsisExpander(ast.NodeTransformer):
             ast.Add(),
             ast.Tuple([_slice_value(e) for e in after], ast.Load()),
         )
-        return ast.copy_location(
-            ast.Subscript(value=node.value, slice=index_expr, ctx=node.ctx),
-            node,
-        )
+        # Keep the authored Subscript object's identity.  ProcessGraph node
+        # ids are the AST object ids captured by callers before this seam;
+        # replacing the node here makes the expanded operation unreachable by
+        # that stable source identity even though its semantics are unchanged.
+        # The expansion only changes the index expression, so mutate that
+        # field in place and retain the original value/context/location.
+        node.slice = index_expr
+        return node
 
 
 def expand_ellipsis_subscripts(tree: ast.AST) -> ast.AST:

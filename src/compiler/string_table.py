@@ -16,9 +16,9 @@ representation accrues across builds. The token itself is
 runtime null-terminated-name primitive already fold with -- so strings, dict
 keys, and extracted names all live in one namespace.
 
-Interning strings does NOT by itself solve lowering: a token is a 64-bit value,
-which the float64 working kernel holds as reinterpreted bits and compares in i64
-(see the backend). What lives here is only the universal, backend-neutral
+Interning strings does NOT by itself solve lowering: a token is a typed signed
+64-bit identity and the structural ABI must retain it as such. What lives here
+is only the universal, backend-neutral
 question of *which token a word is* and *what word a token was*.
 """
 from __future__ import annotations

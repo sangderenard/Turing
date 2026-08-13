@@ -17,6 +17,80 @@ class Handler(Enum):
     Add           = "Add"
     Sub           = "Sub"
     Mul           = "Mul"
+    # Fixed-width signed multiplication primitives. ``SMulLow`` returns the
+    # low ``width`` bits; ``SMulOverflow`` reports whether the mathematical
+    # signed product is not the sign extension of those retained bits.  They
+    # keep machine legalization exact without presuming host int128 support.
+    SMulLow       = "SMulLow"
+    SMulOverflow  = "SMulOverflow"
+    SMulHigh      = "SMulHigh"
+    # Exact halves of an unsigned fixed-width product.  Keeping the high half
+    # explicit is required by accumulator-form MUL and avoids assuming that a
+    # destination backend has a native integer twice the operand width.
+    UMulLow       = "UMulLow"
+    UMulHigh      = "UMulHigh"
+    # The AMD64 DIV/IDIV dividend is the concatenated high:low register pair.
+    # The guard is an ordered, may-trap dependency which checks zero divisors
+    # and quotient range before the totalized quotient/remainder projections.
+    WideDivCheck     = "WideDivCheck"
+    WideDivQuotient  = "WideDivQuotient"
+    WideDivRemainder = "WideDivRemainder"
+    # Zero-totalized most-significant-set-bit index. It returns zero for a
+    # zero input so callers can explicitly select their architecture's
+    # undefined/preserved destination behavior without an eager trap.
+    MsbIndex      = "MsbIndex"
+    # Interleave the low half of two 128-bit bit patterns at an explicit lane
+    # width. This is a machine-neutral vector permutation, not numeric fusion.
+    VectorUnpackLow = "VectorUnpackLow"
+    # Independent modular addition of fixed-width lanes in a vector bit
+    # pattern. Carries never cross lane boundaries.
+    VectorAddModulo = "VectorAddModulo"
+    VectorSubtractModulo = "VectorSubtractModulo"
+    VectorCompareEqualMask = "VectorCompareEqualMask"
+    VectorShuffle = "VectorShuffle"
+    # IEEE-754 binary64 operations over encoded 64-bit lanes. These do not
+    # consult the host process floating environment.
+    Float64IsNaNBits = "Float64IsNaNBits"
+    Float64IsSignalingNaNBits = "Float64IsSignalingNaNBits"
+    Float64BitsLt = "Float64BitsLt"
+    Float64BitsGt = "Float64BitsGt"
+    Float64BitsEq = "Float64BitsEq"
+    Float32IsNaNBits = "Float32IsNaNBits"
+    Float32IsSignalingNaNBits = "Float32IsSignalingNaNBits"
+    Float32BitsLt = "Float32BitsLt"
+    Float32BitsEq = "Float32BitsEq"
+    # Set MXCSR invalid status when requested; trap when its invalid mask is
+    # clear. The returned value is the post-operation MXCSR state.
+    MXCSRInvalid = "MXCSRInvalid"
+    SInt64ToFloat64Bits = "SInt64ToFloat64Bits"
+    SInt64ToFloat32Bits = "SInt64ToFloat32Bits"
+    MXCSRPrecision = "MXCSRPrecision"
+    # Exact IEEE binary64 addition under the supplied MXCSR rounding/DAZ/FTZ
+    # state, plus its ordered status/trap transition. These operate on encoded
+    # bits and do not consult the compiler host's floating environment.
+    Float64AddBits = "Float64AddBits"
+    MXCSRFloat64Add = "MXCSRFloat64Add"
+    Float64MultiplyBits = "Float64MultiplyBits"
+    MXCSRFloat64Multiply = "MXCSRFloat64Multiply"
+    Float32AddBits = "Float32AddBits"
+    MXCSRFloat32Add = "MXCSRFloat32Add"
+    Float32DivideBits = "Float32DivideBits"
+    MXCSRFloat32Divide = "MXCSRFloat32Divide"
+    Float64DivideBits = "Float64DivideBits"
+    MXCSRFloat64Divide = "MXCSRFloat64Divide"
+    Float64SubtractBits = "Float64SubtractBits"
+    MXCSRFloat64Subtract = "MXCSRFloat64Subtract"
+    Float64ToSInt64TruncBits = "Float64ToSInt64TruncBits"
+    MXCSRFloat64ToSIntInvalid = "MXCSRFloat64ToSIntInvalid"
+    Float64ToSInt32TruncBits = "Float64ToSInt32TruncBits"
+    VectorSInt32ToFloat64Bits = "VectorSInt32ToFloat64Bits"
+    MXCSRVectorSInt32ToFloat64 = "MXCSRVectorSInt32ToFloat64"
+    ByteSwap = "ByteSwap"
+    AtomicCompareExchangeObserved = "AtomicCompareExchangeObserved"
+    AtomicCompareExchangeSuccess = "AtomicCompareExchangeSuccess"
+    AtomicCompareExchangeMemory = "AtomicCompareExchangeMemory"
+    AtomicExchangeAddObserved = "AtomicExchangeAddObserved"
+    AtomicExchangeAddMemory = "AtomicExchangeAddMemory"
     Div           = "Div"
     FloorDiv      = "FloorDiv"
     Mod           = "Mod"
@@ -32,6 +106,7 @@ class Handler(Enum):
     Not           = "Not"
     Shl           = "Shl"
     Shr           = "Shr"
+    AShr          = "AShr"
 
     # Logical
     LAnd          = "LAnd"
@@ -45,12 +120,27 @@ class Handler(Enum):
     Le            = "Le"
     Gt            = "Gt"
     Ge            = "Ge"
+    # Integer comparisons over fixed-width bit patterns.  These are distinct
+    # from the language-level signed/real comparisons above; AMD64 carry and
+    # LLVM icmp unsigned predicates depend on the distinction.
+    ULt           = "ULt"
+    ULe           = "ULe"
+    UGt           = "UGt"
+    UGe           = "UGe"
 
     # Memory & Indexing
     Load          = "Load"
     Store         = "Store"
     Alloca        = "Alloca"
     Fill          = "Fill"          # span-memory initialisation; zero-fill == calloc
+    # Store one fixed-width scalar ``count`` times starting at an address with
+    # an explicit signed byte stride.  This models string-store instructions
+    # without hiding iteration, direction, or memory state in a host callback.
+    StridedStoreFill = "StridedStoreFill"
+    # Sequential fixed-width copies over versioned memory.  Source and
+    # destination addresses advance by the same explicit signed byte stride;
+    # iteration order is observable when the regions overlap.
+    StridedMemoryCopy = "StridedMemoryCopy"
     GetElementPtr = "GetElementPtr"
 
     # Casts & Conversions
@@ -67,6 +157,14 @@ class Handler(Enum):
     Phi           = "Phi"
     Br            = "Br"
     CondBr        = "CondBr"
+    # Computed control transfer with an explicit target and complete carried
+    # state. Backends must implement or reject it; it is never converted into
+    # a host-language callback.
+    IndirectBr    = "IndirectBr"
+    # Explicit non-returning architectural trap.  The vector and provenance
+    # are data on the instruction; this is not a host exception or runtime
+    # callback.
+    Trap          = "Trap"
     Ret           = "Ret"
     Call          = "Call"
     Deploy        = "Deploy"

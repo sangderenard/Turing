@@ -322,6 +322,14 @@ class LiveMachineSnapshotController:
         try:
             self.machine.runner.tick(0)
             self._publish()
+            initial_direction = getattr(
+                self.machine.runner, "direction", MachineRunDirection.FORWARD,
+            )
+            if initial_direction is MachineRunDirection.PAUSED:
+                # A live owner starts a newly loaded subject.  ``PAUSED`` is
+                # still honored after an explicit pause control, and subject
+                # replacement below deliberately waits for a new command.
+                self.machine.set_direction(MachineRunDirection.FORWARD)
             may_advance = True
             while not self._stop.is_set():
                 changed = False

@@ -35,10 +35,12 @@ import numpy as np
 from .deployment_fifo import DeploymentFIFO
 from .control_source import (
     CallBlock,
+    ControlExpression,
     ControlProgram,
     LoopBlock,
     ParallelDeployment,
     SequenceBlock,
+    StatementBlock,
     StateMachineTick,
     StreamPublishBlock,
     ValidationBlock,
@@ -64,6 +66,7 @@ from .loop_composer import (
     evaporate_unrolled_loops,
     materialize_retained_loop_ports,
 )
+from .loop_ir import LoopStateEffectMode
 from .process_graph_callable import EphemeralProcessGraphCallable
 from .process_graph_fusion import (
     DispatchRegion,
@@ -844,8 +847,19 @@ def _attach_profiler(
         )
 
 
-def _walk_planned_shells(shell: Any):
-    """Yield every planner-created shell instance exactly once."""
+def _walk_planned_shells(
+    shell: Any,
+    *,
+    include_function_registry: bool = True,
+):
+    """Yield planner-created shell instances exactly once.
+
+    ``function_shells`` is the definition catalogue;
+    ``callsite_function_shells`` is one selected program's activation tree.
+    Compilation/capture of one entrypoint passes
+    ``include_function_registry=False`` so catalogue entries are not mistaken
+    for executed children.  Administrative callers retain the broad default.
+    """
     pending = [shell]
     seen = set()
     while pending:
@@ -854,9 +868,27 @@ def _walk_planned_shells(shell: Any):
             continue
         seen.add(id(current))
         yield current
-        pending.extend(
-            getattr(current, "function_shells", {}).values()
-        )
+        if include_function_registry:
+            pending.extend(
+                getattr(current, "function_shells", {}).values()
+            )
+        elif (
+            getattr(current, "runtime_closure_only", False)
+            and getattr(current, "_owns_function_shells", False)
+        ):
+            # In runtime-root mode this shell is an administrative owner of
+            # the definition catalogue.  Its executable children are exactly
+            # the submitted activation roots, not every catalogued definition
+            # and not zero children.  Each selected root then exposes its full
+            # explicit callsite tree below.
+            function_shells = getattr(current, "function_shells", {})
+            pending.extend(
+                function_shells[int(reference)]
+                for reference in reversed(tuple(
+                    getattr(current, "activation_root_references", ())
+                ))
+                if int(reference) in function_shells
+            )
         pending.extend(
             getattr(current, "callsite_function_shells", {}).values()
         )
@@ -1259,7 +1291,6 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         int(node_id): index
         for index, node_id in enumerate(topological_nodes)
     }
-
     def source_position(node_id: int) -> tuple[int, int] | None:
         expression = graph.G.nodes[int(node_id)].get("expr_obj")
         line = getattr(expression, "lineno", None)
@@ -1272,6 +1303,8 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
     for node_id in topological_nodes:
         child = shell.callsite_function_shells.get(node_id)
         if child is not None:
+            call_attributes = graph.G.nodes[node_id].get("attributes") or {}
+            constructor_call = call_attributes.get("constructor_ref") is not None
             call_parents = tuple(
                 (int(parent), str(role))
                 for parent, role in (
@@ -1288,6 +1321,18 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                 _method_parameter_layout(child_graph)
             )
             argument_bindings = []
+            if constructor_call and receiver_parameter is not None:
+                receiver_identities = child_identities.get(
+                    receiver_parameter, ()
+                )
+                if receiver_identities:
+                    # The class-call result is the caller-owned record identity
+                    # initialized by __init__/__new__.  It is both the
+                    # constructor callsite and the concrete ``self`` binding;
+                    # its fields remain ordinary caller-owned arena values.
+                    argument_bindings.append((
+                        int(node_id), int(receiver_identities[0])
+                    ))
             for parent, role in call_parents:
                 position = _positional_argument_index(role)
                 if position is not None:
@@ -1429,38 +1474,208 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
             int(value)
             for value in subgraph.G.graph.get("deployment_nodes", ())
         )
-        region_captures = tuple(
-            int(value)
-            for value in subgraph.G.graph.get("deployment_inputs", ())
-        )
-        compute_lines = tuple(
-            PlanLine.create(
-                str(
-                    graph.G.nodes[value].get("op")
-                    or graph.G.nodes[value].get("type")
-                ),
-                inputs=tuple(
+        region_node_set = set(region_nodes)
+        # Loop-port materialization can rewrite a region's live parents after
+        # its dispatch subgraph was first carved. Recompute region captures
+        # from the authoritative current graph instead of
+        # reusing stale deployment_inputs from the numeric view.
+        region_captures = tuple(dict.fromkeys((
+            *(
+                int(parent)
+                for node_id in region_nodes
+                for parent, _role in (
+                    graph.G.nodes[node_id].get("parents") or ()
+                )
+                if int(parent) not in region_node_set
+            ),
+        )))
+
+        # A region capture is not necessarily a runtime input. Structural
+        # arguments such as ``transpose(-2, -1)`` often sit just outside the
+        # tensor region as a tiny constant-expression chain (Const -> neg, or
+        # several constants -> Tuple). Preserve that source closure in the
+        # region instead of promoting its terminal to an unexplained ABI
+        # parameter. This is graph-source pursuit, not value specialization:
+        # only expressions whose complete producer closure is literal are
+        # admitted here.
+        # Keep evaluator state separate from its values.  A Python ``object()``
+        # sentinel used to be written into this runtime-indexed cache for an
+        # unavailable producer.  When this planner itself is ingested, that is
+        # a static Python reference flowing through dynamic table storage --
+        # something complete SSA correctly refuses to pretend is data.
+        _CONSTANT_KNOWN = 1
+        _CONSTANT_UNAVAILABLE = 2
+        _constant_status: dict[int, int] = {}
+        _constant_values: dict[int, Any] = {}
+
+        def _constant_expression(value_id: int):
+            """Evaluate a literal producer closure without Python recursion.
+
+            A retained loop can expose feedback in the ProcessGraph, and a
+            large whole-object compile can contain a perfectly acyclic closure
+            deeper than Python's call-stack limit. Neither makes the capture a
+            constant. Use an explicit post-order walk, marking every active
+            frame nonconstant if a feedback edge is encountered.
+            """
+
+            root = int(value_id)
+            if root in _constant_status:
+                return (
+                    _constant_status[root] == _CONSTANT_KNOWN,
+                    _constant_values.get(root),
+                )
+
+            # 0/absent = unseen, 1 = active DFS frame, 2 = evaluated.
+            states: dict[int, int] = {}
+            stack: list[tuple[int, bool]] = [(root, False)]
+            while stack:
+                current, expanded = stack.pop()
+                if current in _constant_status:
+                    states[current] = 2
+                    continue
+                node = graph.G.nodes.get(current, {})
+                opcode = str(node.get("op") or node.get("type") or "")
+                attributes = dict(node.get("attributes") or {})
+                parents = tuple(
                     int(parent)
-                    for parent, _role in (
-                        graph.G.nodes[value].get("parents") or ()
-                    )
-                ),
-                outputs=(value,),
+                    for parent, _role in (node.get("parents") or ())
+                )
+
+                if not expanded:
+                    if states.get(current) == 1:
+                        # This node is already on the active producer path: a
+                        # feedback closure cannot be a literal expression.
+                        for active, state in tuple(states.items()):
+                            if state == 1:
+                                _constant_status[active] = (
+                                    _CONSTANT_UNAVAILABLE
+                                )
+                                states[active] = 2
+                        continue
+                    states[current] = 1
+                    if opcode in {"const", "Const", "Constant"}:
+                        expression = node.get("expr_obj")
+                        if "value" in attributes:
+                            value = attributes["value"]
+                            known = True
+                        elif "constant" in node:
+                            value = node["constant"]
+                            known = True
+                        elif isinstance(expression, ast.Constant):
+                            value = expression.value
+                            known = True
+                        else:
+                            value = None
+                            known = False
+                        if known:
+                            _constant_values[current] = value
+                            _constant_status[current] = _CONSTANT_KNOWN
+                        else:
+                            _constant_status[current] = (
+                                _CONSTANT_UNAVAILABLE
+                            )
+                        states[current] = 2
+                        continue
+                    stack.append((current, True))
+                    for parent in reversed(parents):
+                        if parent in _constant_status:
+                            continue
+                        if states.get(parent) == 1:
+                            for active, state in tuple(states.items()):
+                                if state == 1:
+                                    _constant_status[active] = (
+                                        _CONSTANT_UNAVAILABLE
+                                    )
+                                    states[active] = 2
+                            break
+                        stack.append((parent, False))
+                    continue
+
+                if states.get(current) == 2:
+                    continue
+                if any(
+                    _constant_status.get(parent) != _CONSTANT_KNOWN
+                    for parent in parents
+                ):
+                    known = False
+                elif opcode in {"neg", "USub"} and len(parents) == 1:
+                    values = tuple(_constant_values[parent] for parent in parents)
+                    value = -values[0]
+                    known = True
+                elif opcode in {"pos", "UAdd"} and len(parents) == 1:
+                    values = tuple(_constant_values[parent] for parent in parents)
+                    value = +values[0]
+                    known = True
+                elif opcode in {"Tuple", "tuple"}:
+                    values = tuple(_constant_values[parent] for parent in parents)
+                    value = tuple(values)
+                    known = True
+                elif opcode in {"List", "list"}:
+                    values = tuple(_constant_values[parent] for parent in parents)
+                    value = list(values)
+                    known = True
+                elif opcode in {"add", "Add"} and len(parents) == 2:
+                    values = tuple(_constant_values[parent] for parent in parents)
+                    value = values[0] + values[1]
+                    known = True
+                elif opcode in {"sub", "Sub"} and len(parents) == 2:
+                    values = tuple(_constant_values[parent] for parent in parents)
+                    value = values[0] - values[1]
+                    known = True
+                elif opcode in {"mul", "Mul"} and len(parents) == 2:
+                    values = tuple(_constant_values[parent] for parent in parents)
+                    value = values[0] * values[1]
+                    known = True
+                else:
+                    known = False
+                if known:
+                    _constant_values[current] = value
+                    _constant_status[current] = _CONSTANT_KNOWN
+                else:
+                    _constant_status[current] = _CONSTANT_UNAVAILABLE
+                states[current] = 2
+            return (
+                _constant_status.get(root) == _CONSTANT_KNOWN,
+                _constant_values.get(root),
+            )
+
+        capture_constants = {}
+        for value_id in region_captures:
+            known, value = _constant_expression(value_id)
+            if known:
+                capture_constants[value_id] = value
+        region_captures = tuple(
+            value_id
+            for value_id in region_captures
+            if value_id not in capture_constants
+        )
+        compute_lines = []
+        for value in region_nodes:
+            node_data = graph.G.nodes[value]
+            expression = node_data.get("expr_obj")
+            parents = tuple(
+                (int(parent), str(role))
+                for parent, role in (node_data.get("parents") or ())
+            )
+            opcode = str(node_data.get("op") or node_data.get("type"))
+            line_attributes = dict(node_data.get("attributes") or {})
+            if isinstance(expression, ast.Attribute):
+                # The graph may retain the frontend spelling ``Attribute``;
+                # repository SSA uses the semantic memory operation and must
+                # retain the selected field name in its record ABI.
+                opcode = "GetAttr"
+                line_attributes.setdefault("attribute", expression.attr)
+            compute_lines.append(PlanLine.create(
+                opcode,
+                inputs=tuple(parent for parent, _role in parents),
+                outputs=(int(value),),
                 attributes={
-                    **dict(
-                        graph.G.nodes[value].get("attributes") or {}
-                    ),
+                    **line_attributes,
                     "region": region_index,
                 },
-                input_roles=tuple(
-                    str(role)
-                    for _parent, role in (
-                        graph.G.nodes[value].get("parents") or ()
-                    )
-                ),
-            )
-            for value in region_nodes
-        )
+                input_roles=tuple(role for _parent, role in parents),
+            ))
+        compute_lines = tuple(compute_lines)
         # A constant operand (``self.n + 1``) is a leaf the region consumes but
         # neither produces nor captures -- it is not a runtime input, so it never
         # entered ``deployment_inputs``. The fused capture folds it into a scalar
@@ -1472,6 +1687,14 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         captured = set(region_captures)
         const_lines = []
         materialised: set[int] = set()
+        for value_id, value in capture_constants.items():
+            materialised.add(int(value_id))
+            const_lines.append(PlanLine.create(
+                "Const",
+                inputs=(),
+                outputs=(int(value_id),),
+                attributes={"value": value, "region": region_index},
+            ))
         for value in region_nodes:
             for parent, _role in (graph.G.nodes[value].get("parents") or ()):
                 parent = int(parent)
@@ -1500,13 +1723,163 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         # domain so the lowered SSA is shaped: a value that is an array lowers
         # as an array, not a scalar. A domain padded with size-1 dims (a scalar
         # is (1, 1, 1)) squeezes to its logical shape -- () for a scalar.
+        _shape_dtype_cache: dict[int, tuple[tuple[int, ...], str]] = {}
+
         def _value_shape_dtype(value_id):
-            node = graph.G.nodes.get(int(value_id), {})
-            domain = node.get("domain_node")
-            shape = tuple(getattr(domain, "shape", ()) or ())
-            logical = tuple(int(dim) for dim in shape if int(dim) != 1)
-            dtype = str(node.get("dtype") or "float64")
-            return (int(value_id), logical, dtype)
+            """Infer one value record with a bounded explicit producer stack.
+
+            Feedback is a retained-loop boundary.  When the work stack sees a
+            parent already active, it seeds that loop-carried record from the
+            parent's declared tensor/domain metadata and does not expand the
+            edge again.  This is finite even for irreducible recursion and does
+            not turn a loop into an unbounded source expansion.
+            """
+
+            root = int(value_id)
+
+            def declared(current: int):
+                node = graph.G.nodes.get(int(current), {})
+                tensor = node.get("tensor") or {}
+                domain = node.get("domain_node")
+                attributes = dict(node.get("attributes") or {})
+                binding_name = attributes.get("binding_name")
+                specialization = (
+                    (graph.G.graph.get("planner_specializations") or {}).get(
+                        str(binding_name)
+                    )
+                    if binding_name is not None else None
+                )
+                specialized_shape = tuple(
+                    int(extent)
+                    for extent in (
+                        getattr(specialization, "shape", ()) or ()
+                    )
+                )
+                shape = tuple(
+                    tensor.get("shape") or specialized_shape or ()
+                )
+                if not shape:
+                    shape = tuple(getattr(domain, "shape", ()) or ())
+                logical = (
+                    tuple(map(int, shape))
+                    if tensor.get("shape") is not None or specialized_shape
+                    else tuple(int(dim) for dim in shape if int(dim) != 1)
+                )
+                dtype = str(
+                    tensor.get("dtype")
+                    or getattr(specialization, "dtype", None)
+                    or node.get("dtype")
+                    or getattr(domain, "dtype", None)
+                    or "float64"
+                )
+                operation = str(
+                    attributes.get("tensor")
+                    or attributes.get("tensor_operation")
+                    or node.get("op")
+                    or node.get("type")
+                    or ""
+                ).casefold()
+                parents = tuple(
+                    int(parent)
+                    for parent, _role in (node.get("parents") or ())
+                    if int(parent) in graph.G
+                )
+                return node, tensor, attributes, logical, dtype, operation, parents
+
+            states: dict[int, int] = {}
+            stack: list[tuple[int, bool]] = [(root, False)]
+            while stack:
+                current, expanded = stack.pop()
+                if current in _shape_dtype_cache:
+                    states[current] = 2
+                    continue
+                (
+                    _node,
+                    tensor,
+                    attributes,
+                    logical,
+                    dtype,
+                    operation,
+                    parents,
+                ) = declared(current)
+                if not expanded:
+                    states[current] = 1
+                    stack.append((current, True))
+                    for parent in reversed(parents):
+                        if parent in _shape_dtype_cache:
+                            continue
+                        if states.get(parent) == 1:
+                            # The edge closes a retained loop. Its declared
+                            # record is the finite boundary condition.
+                            (_n, _t, _a, parent_shape, parent_dtype, _o, _p) = (
+                                declared(parent)
+                            )
+                            _shape_dtype_cache[parent] = (
+                                parent_shape, parent_dtype
+                            )
+                            states[parent] = 2
+                            continue
+                        stack.append((parent, False))
+                    continue
+                if states.get(current) == 2:
+                    continue
+                parent_records = [
+                    (parent, *_shape_dtype_cache[parent])
+                    for parent in parents
+                    if parent in _shape_dtype_cache
+                ]
+                parent_shapes = [record[1] for record in parent_records]
+                parent_dtypes = [record[2] for record in parent_records]
+                # DomainNode historically pads scalars with unit axes. If it
+                # says scalar but a canonical tensor op consumes a shaped
+                # tensor, carry that shape through.
+                if operation in {
+                    "neg", "abs", "sqrt", "exp", "log", "round", "trunc",
+                    "floor", "ceil", "isfinite", "isnan", "isinf",
+                    "logical_not", "tanh", "sin", "cos", "tan", "asin",
+                    "acos", "atan", "sinh", "cosh", "asinh", "acosh",
+                    "atanh", "sign", "add", "sub", "mul", "truediv",
+                    "floordiv", "mod", "pow", "less", "less_equal",
+                    "greater", "greater_equal", "equal", "not_equal",
+                    "maximum", "minimum", "where", "float", "double",
+                    "long", "int", "to", "to_dtype", "astype", "cbrt",
+                }:
+                    shaped = [candidate for candidate in parent_shapes if candidate]
+                    if shaped:
+                        logical = max(
+                            shaped,
+                            key=lambda candidate: (len(candidate), candidate),
+                        )
+                    if parent_dtypes and not tensor.get("dtype"):
+                        dtype = parent_dtypes[0]
+                if operation in {"sum", "prod", "min", "max", "any", "all"}:
+                    axis = attributes.get("axis", attributes.get("dim"))
+                    source_shape = next(
+                        (candidate for candidate in parent_shapes if candidate),
+                        (),
+                    )
+                    if axis is None:
+                        logical = ()
+                    elif source_shape:
+                        normalized = int(axis) % len(source_shape)
+                        logical = (
+                            source_shape[:normalized]
+                            + source_shape[normalized + 1:]
+                        )
+                if operation == "matmul" and len(parent_shapes) >= 2:
+                    left_shape, right_shape = parent_shapes[:2]
+                    if (
+                        len(left_shape) == 2
+                        and len(right_shape) == 2
+                        and left_shape[1] == right_shape[0]
+                    ):
+                        logical = (left_shape[0], right_shape[1])
+                _shape_dtype_cache[current] = (logical, dtype)
+                states[current] = 2
+            logical, dtype = _shape_dtype_cache.get(
+                root, declared(root)[3:5]
+            )
+            return (root, logical, dtype)
 
         value_shapes = tuple(
             _value_shape_dtype(value_id)
@@ -4753,6 +5126,14 @@ def _inert_routing_nodes(graph: Any) -> frozenset[int]:
     or deletion target, and never a call or statement with no consumer.
     """
 
+    fingerprint = (
+        graph.G.number_of_nodes(),
+        graph.G.number_of_edges(),
+        tuple(map(int, getattr(graph, "roots", ()) or ())),
+    )
+    cached = graph.G.graph.get("_inert_routing_nodes_cache")
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
     roots = set(getattr(graph, "roots", ()) or ())
     children = _semantic_children(graph)
     inert: set[int] = set()
@@ -4768,7 +5149,9 @@ def _inert_routing_nodes(graph: Any) -> frozenset[int]:
             continue
         if all(child in inert for child in children[node_id]):
             inert.add(node_id)
-    return frozenset(inert)
+    result = frozenset(inert)
+    graph.G.graph["_inert_routing_nodes_cache"] = (fingerprint, result)
+    return result
 
 
 def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
@@ -4932,6 +5315,14 @@ def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
             loop_target_initializers
         )
     loop_target_initializer = node_id in loop_target_initializers
+    attributes = data.get("attributes") or {}
+    ungrounded_tensor_method = (
+        attributes.get("tensor_candidate") is not None
+        and attributes.get("tensor") is None
+        and str(attributes.get("tensor_candidate")) in {"split"}
+        and isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+    )
     return (
         bool(
             (data.get("attributes") or {}).get(
@@ -4989,7 +5380,10 @@ def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
         (
             isinstance(data.get("expr_obj"), ast.Call)
             and isinstance(data["expr_obj"].func, ast.Attribute)
-            and node_type not in abstract_tensor_funcs
+            and (
+                node_type not in abstract_tensor_funcs
+                or ungrounded_tensor_method
+            )
         )
         or
         bool(
@@ -5337,6 +5731,210 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
     }
 
 
+def _ordinary_conditional_control_programs(
+    graph: Any,
+    retained_regions: Iterable[int],
+    dispatch_subgraphs: Iterable[Any],
+) -> tuple[ControlProgram, ...]:
+    """Preserve ordinary source ``if`` arms and their lexical SSA merges."""
+
+    from .control_source import ConditionalBlock
+
+    retained = frozenset(map(int, retained_regions))
+    subgraphs = tuple(dispatch_subgraphs)
+    memberships = _branch_compartments(graph)
+    node_by_value = {
+        int(data.get("value_id", node_id)): int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("value_id", node_id), int)
+    }
+    programs = []
+    for control_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        if not isinstance(expression, ast.If):
+            continue
+        parents = tuple(data.get("parents") or ())
+        predicate_id = next((
+            int(parent) for parent, role in parents if str(role) == "test"
+        ), None)
+        if predicate_id is None:
+            continue
+        predicate_value_id = int(
+            graph.G.nodes[predicate_id].get("value_id", predicate_id)
+        )
+        body_regions = tuple(
+            region_index
+            for region_index, subgraph in enumerate(subgraphs)
+            if region_index in retained
+            and any(
+                (int(control_id), "body") in memberships.get(int(node_id), ())
+                for node_id in subgraph.G.graph.get("deployment_nodes", ())
+            )
+        )
+        else_regions = tuple(
+            region_index
+            for region_index, subgraph in enumerate(subgraphs)
+            if region_index in retained
+            and any(
+                (int(control_id), "orelse") in memberships.get(int(node_id), ())
+                for node_id in subgraph.G.graph.get("deployment_nodes", ())
+            )
+        )
+        predicate_regions = tuple(
+            region_index
+            for region_index, subgraph in enumerate(subgraphs)
+            if region_index in retained
+            and int(predicate_id) in set(map(
+                int, subgraph.G.graph.get("deployment_nodes", ())
+            ))
+        )
+        if not body_regions and not else_regions:
+            continue
+
+        carried = []
+        for history in (graph.G.graph.get("identity_table") or {}).values():
+            ordered = tuple(
+                int(value_id) for value_id in history
+                if int(value_id) in node_by_value
+            )
+            if not ordered:
+                continue
+            body_values = tuple(
+                value_id for value_id in ordered
+                if (int(control_id), "body") in memberships.get(
+                    node_by_value[value_id], ()
+                )
+            )
+            else_values = tuple(
+                value_id for value_id in ordered
+                if (int(control_id), "orelse") in memberships.get(
+                    node_by_value[value_id], ()
+                )
+            )
+            if not body_values and not else_values:
+                continue
+            branch_positions = tuple(
+                ordered.index(value_id)
+                for value_id in (*body_values, *else_values)
+            )
+            first_branch = min(branch_positions)
+            last_branch = max(branch_positions)
+            initial = next((
+                ordered[position]
+                for position in range(first_branch - 1, -1, -1)
+                if ordered[position] not in {*body_values, *else_values}
+            ), ordered[0])
+            merged = next((
+                ordered[position]
+                for position in range(last_branch + 1, len(ordered))
+                if ordered[position] not in {*body_values, *else_values}
+            ), None)
+            if merged is None:
+                continue
+            carried.append((
+                body_values[-1] if body_values else initial,
+                else_values[-1] if else_values else initial,
+                initial,
+                merged,
+            ))
+        body = SequenceBlock(tuple(
+            StatementBlock((f"__scheduled_region_{index}__",))
+            for index in body_regions
+        ))
+        orelse = (
+            SequenceBlock(tuple(
+                StatementBlock((f"__scheduled_region_{index}__",))
+                for index in else_regions
+            ))
+            if else_regions else None
+        )
+        root = SequenceBlock((
+            *(
+                StatementBlock((f"__scheduled_region_{index}__",))
+                for index in predicate_regions
+            ),
+            ConditionalBlock(
+                int(predicate_value_id), body, orelse,
+                predicate_expression=ControlExpression(
+                    "value", value_id=int(predicate_value_id)
+                ),
+                carried_aliases=tuple(carried),
+                source_node_id=int(control_id),
+            ),
+        ))
+        programs.append(ControlProgram(
+            root=root,
+            region_indices=tuple(dict.fromkeys((
+                *predicate_regions, *body_regions, *else_regions,
+            ))),
+        ))
+    return tuple(programs)
+
+
+def _ordinary_conditional_nesting(
+    graph: Any,
+    programs: Iterable[ControlProgram],
+    *,
+    offset: int = 0,
+    root_index: int | None = None,
+) -> dict[int, tuple[int, ...]]:
+    """Return exact lexical parentage for source-derived conditional IR."""
+
+    from .control_source import ConditionalBlock
+
+    controls = tuple(programs)
+    blocks = tuple(
+        next((
+            block for block in program.root.blocks
+            if isinstance(block, ConditionalBlock)
+        ), None)
+        if isinstance(program.root, SequenceBlock)
+        else (
+            program.root
+            if isinstance(program.root, ConditionalBlock) else None
+        )
+        for program in controls
+    )
+    expressions = {
+        index: graph.G.nodes[int(block.source_node_id)].get("expr_obj")
+        for index, block in enumerate(blocks)
+        if block is not None and block.source_node_id is not None
+    }
+    parent_by_child: dict[int, int] = {}
+    for child_index, child_expression in expressions.items():
+        candidates = []
+        for parent_index, parent_expression in expressions.items():
+            if parent_index == child_index:
+                continue
+            descendants = {
+                id(member)
+                for statement in (
+                    *parent_expression.body, *parent_expression.orelse
+                )
+                for member in ast.walk(statement)
+            }
+            if id(child_expression) not in descendants:
+                continue
+            span = int(getattr(
+                parent_expression, "end_lineno", parent_expression.lineno
+            )) - int(parent_expression.lineno)
+            candidates.append((span, parent_index))
+        if candidates:
+            parent_by_child[child_index] = min(candidates)[1]
+    children: dict[int, list[int]] = {}
+    for child_index in range(len(blocks)):
+        parent = parent_by_child.get(child_index)
+        if parent is not None:
+            children.setdefault(offset + parent, []).append(
+                offset + child_index
+            )
+        elif root_index is not None:
+            children.setdefault(int(root_index), []).append(
+                offset + child_index
+            )
+    return {parent: tuple(items) for parent, items in children.items()}
+
+
 def _control_partition_keys(
     graph: Any,
     loop_plans: Iterable[Any],
@@ -5355,6 +5953,30 @@ def _control_partition_keys(
 
     plans = tuple(loop_plans)
     branches = _branch_compartments(graph)
+    expression_nodes = {
+        id(data.get("expr_obj")): int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.AST)
+    }
+    ordinary_if_frontiers = tuple(
+        (
+            int(control_id),
+            int(getattr(expression, "end_lineno", expression.lineno)),
+        )
+        for control_id, data in graph.G.nodes(data=True)
+        for expression in (data.get("expr_obj"),)
+        if isinstance(expression, ast.If)
+    )
+    branch_frontiers_by_node: dict[int, list[int]] = {}
+    for control_id, end_line in ordinary_if_frontiers:
+        for node_id, data in graph.G.nodes(data=True):
+            expression = data.get("expr_obj")
+            if not isinstance(expression, ast.AST):
+                continue
+            if int(getattr(expression, "lineno", -1)) > end_line:
+                branch_frontiers_by_node.setdefault(
+                    int(node_id), []
+                ).append(int(control_id))
     callsites = tuple(
         int(node_id)
         for node_id, data in graph.G.nodes(data=True)
@@ -5475,6 +6097,7 @@ def _control_partition_keys(
             tuple(callsites_by_node.get(int(node_id), ())),
             tuple(comp_desc_by_node.get(int(node_id), ())),
             tuple(frontiers_by_node.get(int(node_id), ())),
+            tuple(branch_frontiers_by_node.get(int(node_id), ())),
         )
         for node_id in node_ids
     }
@@ -6147,7 +6770,9 @@ def _resolve_binding_name(shell: Any, captured: Any, feed_id: int):
     storage = _capture_storage_identity(value) if value is not None else None
     candidates = [shell]
     try:
-        candidates.extend(_walk_planned_shells(shell))
+        candidates.extend(_walk_planned_shells(
+            shell, include_function_registry=False
+        ))
     except Exception:
         pass
     for candidate in candidates:
@@ -11632,6 +12257,41 @@ def _compile_whole_process_graph(
         return shell
     visited.add(identity)
 
+    if (
+        getattr(shell, "runtime_closure_only", False)
+        and getattr(shell, "_owns_function_shells", False)
+    ):
+        # The outer shell owns the complete source catalogue and map records;
+        # it is not a second execution of the module containing the requested
+        # entrypoint.  Compile the proven activation roots.  Their complete
+        # call topology is represented by callsite_function_shells and is
+        # recursively validated by the ordinary path below.
+        activation_roots = tuple(
+            getattr(shell, "activation_root_references", ())
+        )
+        if not activation_roots:
+            raise RuntimeError(
+                "runtime-root ProcessGraph has no activation root"
+            )
+        for reference in activation_roots:
+            function_shell = shell.function_shells.get(int(reference))
+            if function_shell is None:
+                raise RuntimeError(
+                    "ProcessGraph activation root has no deployment shell: "
+                    f"{reference}"
+                )
+            _compile_whole_process_graph(
+                function_shell,
+                device=device,
+                prepare_ephemerals=prepare_ephemerals,
+                _visited=visited,
+            )
+        shell.compiled_dispatch_functions = ()
+        shell.compiled_dispatch_sources = ()
+        shell.whole_program_compiled = True
+        shell.whole_program_device = device
+        return shell
+
     covered = {
         node_id
         for subgraph in shell.dispatch_subgraphs
@@ -11686,9 +12346,39 @@ def _compile_whole_process_graph(
             or shell.function_shells.get(reference)
         )
         if function_shell is None:
+            try:
+                referenced_entry = shell.process_graph.function_table.entry(
+                    reference
+                )
+            except (AttributeError, KeyError):
+                referenced_entry = None
+            if (
+                referenced_entry is not None
+                and referenced_entry.metadata.get("host_ssa_module") is not None
+            ):
+                # The callee is already fully represented as repository SSA;
+                # it does not need or admit a source-planning shell.
+                continue
+            function_name = shell.process_graph.G.graph.get(
+                "function_name", "?"
+            )
+            try:
+                referenced_name = (
+                    shell.process_graph.function_table.entry(reference)
+                    .qualified_name
+                )
+            except (AttributeError, KeyError):
+                referenced_name = "?"
+            node_data = shell.process_graph.G.nodes[node_id]
+            expression = node_data.get("expr_obj")
             raise RuntimeError(
                 "ProcessGraph references a function with no deployment "
-                f"shell: {reference}"
+                f"shell: {reference}; owner={function_name!r}; "
+                f"referenced={referenced_name!r}; node={node_id}; "
+                f"type={node_data.get('type')!r}; "
+                f"source={ast.dump(expression, include_attributes=False) if isinstance(expression, ast.AST) else repr(expression)}; "
+                "planned_references="
+                f"{tuple(sorted(map(int, shell.function_shells)))}"
             )
         _compile_whole_process_graph(
             function_shell,
@@ -12113,24 +12803,97 @@ def _callsite_specialized_shell_type(
     return planned
 
 
-def _resolve_unambiguous_method_references(graph: Any) -> None:
-    """Attach a method-table reference when the retained name is unique."""
+def _resolve_grounded_method_references(graph: Any) -> None:
+    """Attach internal methods only through a proven receiver class.
 
-    references_by_name: dict[str, set[int]] = {}
-    for descriptor in (
-        graph.G.graph.get("class_table") or {}
-    ).values():
-        for name, reference in (
-            descriptor.get("methods") or {}
-        ).items():
-            references_by_name.setdefault(str(name), set()).add(
-                int(reference)
+    A method name being unique in the ingested class catalogue says nothing
+    about an unrelated receiver.  In particular, ``os.environ.get`` must not
+    become ``_RandomFloatQueue.get`` merely because that is the sole authored
+    class method named ``get``.  Follow explicit value producers to a
+    ``class_ref`` instead; ambiguity or absence leaves the call external/static
+    and fully visible rather than fabricating an internal topology edge.
+    """
+
+    class_table = graph.G.graph.get("class_table") or {}
+    specializations = graph.G.graph.get("planner_specializations") or {}
+
+    def specialized_class(binding_name: str | None) -> str | None:
+        if binding_name is None or str(binding_name) not in specializations:
+            return None
+        receiver_type = type(specializations[str(binding_name)])
+        identities = {
+            receiver_type.__name__,
+            receiver_type.__qualname__,
+            f"{receiver_type.__module__}.{receiver_type.__qualname__}",
+        }
+        matches = {
+            str(identity)
+            for identity in class_table
+            if str(identity) in identities
+            or str(identity).rsplit(".", 1)[-1] == receiver_type.__name__
+        }
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    def specialized_method_reference(
+        binding_name: str | None,
+        method_name: str,
+    ) -> int | None:
+        if binding_name is None or str(binding_name) not in specializations:
+            return None
+        receiver_type = type(specializations[str(binding_name)])
+        owner_names = {
+            receiver_type.__name__,
+            receiver_type.__qualname__,
+            f"{receiver_type.__module__}.{receiver_type.__qualname__}",
+        }
+        table = getattr(graph, "function_table", None)
+        if table is None:
+            return None
+        matches = {
+            int(entry.reference.address)
+            for entry in table
+            if str(entry.name) == str(method_name)
+            and entry.graph is not None
+            and str(entry.graph.G.graph.get("method_owner")) in owner_names
+        }
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    def receiver_class(value_id: int) -> str | None:
+        pending = [int(value_id)]
+        visited = set()
+        candidates = set()
+        while pending:
+            current = pending.pop()
+            if current in visited or current not in graph.G:
+                continue
+            visited.add(current)
+            node = graph.G.nodes[current]
+            attributes = node.get("attributes") or {}
+            class_ref = attributes.get("class_ref")
+            if class_ref is not None:
+                candidates.add(str(class_ref))
+                continue
+            if str(node.get("type")) in {"Input", "input"}:
+                class_ref = specialized_class(attributes.get("binding_name"))
+                if class_ref is not None:
+                    candidates.add(class_ref)
+                    continue
+            # Only identity-routing nodes may transmit a receiver class. An
+            # arbitrary operation consuming an object does not return it.
+            if str(node.get("type")) not in {
+                "Input", "Phi", "LoopResult", "LoopExit", "Identity",
+            }:
+                continue
+            pending.extend(
+                int(parent)
+                for parent, role in (node.get("parents") or ())
+                if str(role) in {
+                    "value", "body", "orelse", "initial", "updated",
+                    "result", "operand",
+                }
             )
-    unique = {
-        name: next(iter(references))
-        for name, references in references_by_name.items()
-        if len(references) == 1
-    }
+        return next(iter(candidates)) if len(candidates) == 1 else None
+
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes") or {}
         if (
@@ -12144,13 +12907,109 @@ def _resolve_unambiguous_method_references(graph: Any) -> None:
             and isinstance(expression.func, ast.Attribute)
         ):
             continue
-        reference = unique.get(str(expression.func.attr))
+        receiver_id = next((
+            int(parent)
+            for parent, role in (data.get("parents") or ())
+            if str(role) in {"operand", "receiver"}
+        ), None)
+        if receiver_id is None:
+            continue
+        class_identity = receiver_class(receiver_id)
+        reference = None
+        if class_identity is not None:
+            reference = (
+                class_table.get(class_identity, {}).get("methods", {})
+                .get(str(expression.func.attr))
+            )
+        if (
+            reference is None
+            and isinstance(expression.func.value, ast.Name)
+        ):
+            reference = specialized_method_reference(
+                expression.func.value.id,
+                expression.func.attr,
+            )
         if reference is None:
             continue
         attributes = dict(attributes)
         attributes["method_ref"] = int(reference)
-        attributes["method_resolution"] = "unique-class-table-name"
+        attributes["method_resolution"] = "receiver-class-ref"
+        if class_identity is not None:
+            attributes["receiver_class_ref"] = class_identity
         data["attributes"] = attributes
+
+
+def _resolve_grounded_tensor_operations(graph: Any) -> None:
+    """Promote method-name candidates only along tensor-valued SSA edges."""
+
+    specializations = graph.G.graph.get("planner_specializations") or {}
+
+    def is_tensor_value(value: Any) -> bool:
+        return (
+            not isinstance(value, (str, bytes, bytearray, list, tuple, dict, set))
+            and hasattr(value, "shape")
+            and hasattr(value, "dtype")
+        )
+
+    tensor_values = {
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("tensor") is not None
+        or (
+            data.get("type") == "Input"
+            and is_tensor_value(specializations.get(str(
+                (data.get("attributes") or {}).get("binding_name", "")
+            )))
+        )
+    }
+    # These ordinary ProcessGraph operators preserve tensor-valuedness when
+    # at least one data operand is a tensor.  Keep this as provenance only:
+    # the later SSA shape pass and tensor repository lowering still decide
+    # the concrete result layout and implementation.
+    tensor_value_operators = {
+        "Add", "Sub", "Mult", "Mul", "Div", "FloorDiv", "Mod", "Pow",
+    }
+    changed = True
+    while changed:
+        changed = False
+        for node_id, data in graph.G.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            candidate = attributes.get("tensor_candidate")
+            if int(node_id) in tensor_values:
+                continue
+            if (
+                str(data.get("type") or data.get("op"))
+                in tensor_value_operators
+                and any(
+                    int(parent) in tensor_values
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) not in {"callee", "func"}
+                )
+            ):
+                tensor_values.add(int(node_id))
+                changed = True
+                continue
+            if candidate is None:
+                continue
+            expression = data.get("expr_obj")
+            if not (
+                isinstance(expression, ast.Call)
+                and isinstance(expression.func, ast.Attribute)
+            ):
+                continue
+            receiver = next((
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role) in {"operand", "receiver"}
+            ), None)
+            if receiver not in tensor_values:
+                continue
+            attributes = dict(attributes)
+            attributes["tensor"] = str(candidate)
+            attributes["tensor_resolution"] = "receiver-tensor-value"
+            data["attributes"] = attributes
+            tensor_values.add(int(node_id))
+            changed = True
 
 
 # Above this an unroll is refused rather than attempted. It is a guard
@@ -12179,6 +13038,11 @@ class ProcessGraphGLSLDeployment:
     ephemeral_callables = None
     reference_table_template = None
     function_shell_types = {}
+    runtime_closure_only = False
+    planned_function_references = ()
+    activation_root_references = ()
+    catalogued_function_references = ()
+    catalogue_only_function_references = ()
     source_node_count = None
     primitive_count = None
     loop_count = None
@@ -12251,6 +13115,18 @@ class ProcessGraphGLSLDeployment:
                 reference = attributes.get("callee_ref")
                 if reference is None:
                     reference = attributes.get("method_ref")
+                if reference is None and attributes.get("class_ref") is not None:
+                    class_record = (
+                        owner.process_graph.G.graph.get("class_table") or {}
+                    ).get(str(attributes["class_ref"]), {})
+                    methods = class_record.get("methods") or {}
+                    reference = methods.get(
+                        "__new__", methods.get("__init__")
+                    )
+                    if reference is not None:
+                        attributes = dict(attributes)
+                        attributes["constructor_ref"] = int(reference)
+                        data["attributes"] = attributes
                 if reference is None:
                     continue
                 reference = int(reference)
@@ -12272,7 +13148,15 @@ class ProcessGraphGLSLDeployment:
                     planned,
                     (*active_references, reference),
                 )
-        for function_shell in self.function_shells.values():
+        activation_roots = (
+            tuple(self.activation_root_references)
+            if self.runtime_closure_only
+            else tuple(self.function_shells)
+        )
+        for reference in activation_roots:
+            function_shell = self.function_shells.get(int(reference))
+            if function_shell is None:
+                continue
             plan_callsites(function_shell)
             (
                 function_shell.hierarchy_plan,
@@ -12280,7 +13164,13 @@ class ProcessGraphGLSLDeployment:
             ) = assign_hierarchy_ids(
                 _build_shell_hierarchy_plan(function_shell)
             )
-        plan_callsites(self)
+        if self.runtime_closure_only:
+            # The module shell owns the definition catalogue, not another
+            # execution of every function body in the source file.  Submitted
+            # target shells above are the activation roots in this mode.
+            self.callsite_function_shells = {}
+        else:
+            plan_callsites(self)
         (
             self.hierarchy_plan,
             self.hierarchy_value_table,
@@ -12555,7 +13445,8 @@ class ProcessGraphGLSLDeployment:
         return self.hierarchy_plan
 
     def prepare_graph_precompile(
-        self, *, device=None, reduction_cache=None, progress=None
+        self, *, device=None, reduction_cache=None, progress=None,
+        structural_ssa_only: bool = False,
     ):
         # Prepare graph/control IR without observing runtime parameter values.
         #
@@ -12616,16 +13507,26 @@ class ProcessGraphGLSLDeployment:
                     *target.control_deployment_regions,
                 ))),
             )
-            target.compiled_shell_program = CapturedFusedProgram(
-                FusedProgram(
-                    version=1,
-                    feeds=set(),
-                    steps=[],
-                    outputs={},
-                    meta={},
-                    extras={"kernel_kind": "graph-precompile"},
-                ),
-                {},
+            # The complete-source SSA path consumes ``hierarchy_plan`` and
+            # ``shell_control_program`` directly.  It must not manufacture a
+            # nominal FusedProgram merely to satisfy the older dual-IR shape:
+            # doing so makes a non-projecting compile indistinguishable from
+            # numerical capture.  Keep the legacy sentinel only for callers
+            # that explicitly request the dual-IR precompile product.
+            target.compiled_shell_program = (
+                None
+                if structural_ssa_only
+                else CapturedFusedProgram(
+                    FusedProgram(
+                        version=1,
+                        feeds=set(),
+                        steps=[],
+                        outputs={},
+                        meta={},
+                        extras={"kernel_kind": "graph-precompile"},
+                    ),
+                    {},
+                )
             )
             target.compiled_tapes = ()
             target.compiled_region_indices = ()
@@ -12649,10 +13550,16 @@ class ProcessGraphGLSLDeployment:
             # reduction is the kernel/invocation split -- one shared kernel
             # structure plus a per-region binding table -- not object sharing.
             # Byte-identical *kernel files* are still deduped later in the bake.
-            region_programs = {
-                region_index: _structural_region_program_from_subgraph(subgraph)
-                for region_index, subgraph in subgraphs
-            }
+            region_programs = (
+                {}
+                if structural_ssa_only
+                else {
+                    region_index: _structural_region_program_from_subgraph(
+                        subgraph
+                    )
+                    for region_index, subgraph in subgraphs
+                }
+            )
             target.captured_region_programs = region_programs
             target.compile_time_region_indices = set()
             target.planned_operator_implementations = (
@@ -12701,14 +13608,18 @@ class ProcessGraphGLSLDeployment:
             )
         targets = []
         seen = set()
-        for target in _walk_planned_shells(self):
+        for target in _walk_planned_shells(
+            self, include_function_registry=False
+        ):
             identity = id(target)
             if identity in seen or target._discovery_tape is None:
                 continue
             seen.add(identity)
             targets.append(target)
         observed_target_ids = {id(target) for target in targets}
-        for target in _walk_planned_shells(self):
+        for target in _walk_planned_shells(
+            self, include_function_registry=False
+        ):
             if id(target) in observed_target_ids:
                 continue
             # The program's one discovery sequence did not enter this
@@ -12763,7 +13674,9 @@ class ProcessGraphGLSLDeployment:
                         storage_value
                     )
 
-        for target in _walk_planned_shells(self):
+        for target in _walk_planned_shells(
+            self, include_function_registry=False
+        ):
             collect_discovery_capture_objects(
                 getattr(target, "captured_values", {})
             )
@@ -13425,7 +14338,9 @@ class ProcessGraphGLSLDeployment:
         # the one discovery execution and must lose their tape here.  Runtime
         # ownership begins only after every function shell's discovery object
         # has been destroyed.
-        for target in _walk_planned_shells(self):
+        for target in _walk_planned_shells(
+            self, include_function_registry=False
+        ):
             if target._discovery_tape_creations:
                 target._discovery_tape = None
                 target._discovery_tape_complete = True
@@ -13772,7 +14687,9 @@ class ProcessGraphGLSLDeployment:
             else self._discovery_session.get("owner")
         )
         if discovery_owner is not None:
-            for planned_shell in _walk_planned_shells(discovery_owner):
+            for planned_shell in _walk_planned_shells(
+                discovery_owner, include_function_registry=False
+            ):
                 collect_capture_objects(
                     getattr(planned_shell, "captured_values", {})
                 )
@@ -14356,6 +15273,13 @@ class ProcessGraphGLSLDeployment:
                     or reduction.collapsible
                 )
             )
+            conditional_controls = _ordinary_conditional_control_programs(
+                self.process_graph,
+                complete_regions,
+                self.dispatch_subgraphs,
+            )
+            if len(conditional_controls) > 1:
+                conditional_controls = ()
             shell_control = overlay_scheduled_control(
                 complete_regions,
                 tuple(
@@ -14365,7 +15289,7 @@ class ProcessGraphGLSLDeployment:
                         retained_value_ids=retained_value_ids,
                     )
                     for reduction in considered_reductions
-                ),
+                ) + conditional_controls,
                 known_nesting=_loop_reduction_nesting_hints(
                     considered_reductions,
                     self.loop_plans,
@@ -15145,6 +16069,7 @@ def strategize_shell_deployment(
     remove_loops: bool | None = None,
     unroll_limit: int | None = None,
     schedule_preference: str | None = None,
+    runtime_closure_only: bool = False,
     _function_table_stack: tuple[int, ...] = (),
 ) -> type:
     """Build a stateful shell around the graph's flat dispatch schedule.
@@ -15165,13 +16090,11 @@ def strategize_shell_deployment(
     ``evaporate_unrolled_loops`` unrolls every discovered loop into a flat
     instruction sequence instead of a real ``LoopBlock``.
 
-    ``unroll_limit`` is the largest trip count that may be unrolled. It was
-    fixed at 8, which is not a property of any backend -- a target that
-    wants a flat program wants *its* loops flat, whatever their length. A
-    loop above the limit is silently retained instead, which for a caller
-    that needed a flat program means a shorter program that still compiles
-    and quietly computes fewer iterations. Raise it to whatever the target
-    can actually take.
+    ``unroll_limit`` is the largest trip count that may be unrolled.  It is a
+    representation-choice threshold, never an execution bound.  A loop above
+    the threshold is retained with its complete source domain; if a target
+    cannot lower retained control, compilation must fail visibly rather than
+    dropping iterations.
     """
 
     # Inherit whatever the compilation asked for, then record it so the
@@ -15236,7 +16159,24 @@ def strategize_shell_deployment(
         int(plan.loop.node_id) for plan in evaporated_loop_plans
     }
     retained_loop_plans = tuple(
-        plan
+        (
+            replace(
+                plan,
+                strategy=LoopStrategy.NATIVE_SOURCE,
+                reason=(
+                    "resident sequence mutation requires iterative SSA "
+                    "memory effects"
+                ),
+            )
+            if (
+                plan.strategy in {LoopStrategy.UNROLL, LoopStrategy.CONSTANT}
+                and any(
+                    effect.mode is LoopStateEffectMode.SEQUENCE_MUTATION
+                    for effect in plan.loop.state_effects
+                )
+            )
+            else plan
+        )
         for plan in discovered_loop_plans
         if int(plan.loop.node_id) not in evaporated_loop_ids
         and int(plan.loop.node_id) in graph.G
@@ -15267,7 +16207,8 @@ def strategize_shell_deployment(
     python_callable = (
         None if function_entry is None else function_entry.python_callable
     )
-    _resolve_unambiguous_method_references(graph)
+    _resolve_grounded_method_references(graph)
+    _resolve_grounded_tensor_operations(graph)
     reference_tables = build_shell_reference_tables(graph)
     ordered_executable_nodes = _dependency_order(graph)
     executable_nodes = tuple(
@@ -15447,6 +16388,14 @@ def strategize_shell_deployment(
     function_shell_types = {}
     function_table = getattr(graph, "function_table", None)
     table_identity = id(function_table)
+    dependency_regions = (
+        (graph.G.graph.get("map_ir") or {}).get("dependency_regions") or {}
+    )
+    runtime_references = (
+        frozenset(map(int, dependency_regions["runtime"]))
+        if runtime_closure_only and "runtime" in dependency_regions
+        else None
+    )
     if (
         function_table is not None
         and table_identity not in _function_table_stack
@@ -15454,6 +16403,20 @@ def strategize_shell_deployment(
         nested_stack = (*_function_table_stack, table_identity)
         for entry in function_table:
             if entry.graph is None:
+                continue
+            reference = int(entry.reference.address)
+            if (
+                runtime_references is not None
+                and reference not in runtime_references
+            ):
+                # ``build_map_dependency_regions`` has already proved the
+                # strict call closure of every submitted compile target.
+                # Map-only definitions stay in FunctionTable/map/class
+                # navigation records, but they are not executable members of
+                # this program and must not receive deployment shells.  The
+                # old all-table expansion turned a 27-function program into
+                # 103 function types and thousands of callsite activations,
+                # lowering unrelated class methods as though they ran.
                 continue
             function_graph = extract_clean_process_subgraph(
                 entry.graph,
@@ -15476,7 +16439,40 @@ def strategize_shell_deployment(
                     _function_table_stack=nested_stack,
                 )
             )
+    activation_root_references = []
+    if runtime_closure_only and function_table is not None:
+        for target in graph.G.graph.get("compile_targets", ()):
+            try:
+                reference = int(
+                    function_table.entry(str(target)).reference.address
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if reference in function_shell_types:
+                activation_root_references.append(reference)
+        if not activation_root_references:
+            # A caller may provide a precomputed runtime closure without the
+            # source-level target names (for example an older checkpoint).
+            # In that case retain the complete proven runtime set rather than
+            # guessing one privileged root.
+            activation_root_references.extend(sorted(function_shell_types))
     deployment_class.function_shell_types = function_shell_types
+    deployment_class.runtime_closure_only = bool(runtime_closure_only)
+    deployment_class.planned_function_references = tuple(sorted(
+        function_shell_types
+    ))
+    deployment_class.activation_root_references = tuple(dict.fromkeys(
+        activation_root_references
+    ))
+    deployment_class.catalogued_function_references = tuple(sorted(
+        int(entry.reference.address)
+        for entry in function_table or ()
+        if entry.graph is not None
+    ))
+    deployment_class.catalogue_only_function_references = tuple(sorted(
+        set(deployment_class.catalogued_function_references)
+        - set(deployment_class.planned_function_references)
+    ))
     return deployment_class
 
 

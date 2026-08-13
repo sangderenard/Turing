@@ -4,8 +4,8 @@ Runs over the shared ``FusedProgram`` IR, after the byte-string idiom fold (whic
 consumes literal ``bytes`` delimiters) and before container detection: every
 ``tensor_from_list`` holding a Python ``str`` becomes a ``string_token`` op
 carrying its universal token (``string_table.string_token``), and every
-comparison of a token is tagged so a backend compares the 64-bit identities
-rather than the float value they are held as. A constant + constant string
+comparison of a token is tagged so a backend compares the typed 64-bit
+identities. A constant + constant string
 concatenation folds to the interned concatenation's token. Runtime string
 building (constant + a runtime string) is left untouched -- it needs a real
 string builder, not interning.
@@ -32,7 +32,7 @@ def tokenize_ssa_string_constants(functions, table=None) -> None:
     ``Const`` holding a Python ``str`` becomes a ``string_token`` op carrying the
     word's fnv1a-64 token; every ``equal``/``not_equal`` that consumes such a
     token is tagged ``string_compare`` so a backend compares the 64-bit
-    identities rather than the float bits the token is held as. ``table`` (an
+    identities. ``table`` (an
     optional ``StringTable``) records token -> word for reverse lookup; the token
     itself is content-addressed, so tokenizing never depends on it.
 
@@ -81,6 +81,10 @@ def tokenize_ssa_string_constants(functions, table=None) -> None:
                         )
                     )
                     if instruction.res is not None:
+                        # A word is an integer identity in SSA.  It must never
+                        # masquerade as f64 merely because numerical regions
+                        # historically used one working dtype.
+                        instruction.res.dtype = "int64"
                         token_result_ids.add(int(instruction.res.id))
                 else:
                     rewritten.append(instruction)

@@ -5,7 +5,9 @@ from src.compiler.control_source import (
     ControlDeploymentLane,
     ControlDeploymentRegion,
     CallBlock,
+    ConditionalBlock,
     ControlProgram,
+    ControlExpression,
     ControlUniform,
     LoopBlock,
     LoopControlBlock,
@@ -15,6 +17,7 @@ from src.compiler.control_source import (
     StatementBlock,
     StateMachineTick,
     WhileBlock,
+    overlay_scheduled_control,
 )
 from src.compiler.precompile_to_ssa import (
     find_ssa_cycles,
@@ -22,6 +25,7 @@ from src.compiler.precompile_to_ssa import (
     lower_class_navigation_to_ssa,
     lower_fused_program_to_ssa,
     lower_precompile_and_control_to_ssa,
+    lower_control_sections_to_ssa,
 )
 from src.compiler.ssa_fortran_backend import emit_module
 from src.compiler.shell_reference_tables import (
@@ -30,6 +34,7 @@ from src.compiler.shell_reference_tables import (
     ClassNavigationTable,
 )
 from src.transmogrifier.ssa import IRModule
+from src.transmogrifier.function_table import ParameterContract
 
 
 def _program(*steps):
@@ -206,6 +211,37 @@ def test_class_navigation_has_general_ssa_semantic_procedures():
     assert [value.dtype for value in resolve.blocks["entry"].instrs[-1].args] == [
         "i32", "i32", "bool",
     ]
+    emitted = emit_module(module, name="class_navigation_probe")
+    assert emitted.api.metadata["class_table_schema"] == (
+        "turing.repository-ssa-class-table.v1"
+    )
+    assert emitted.api.metadata["class_table"][0]["identity"] == "Vault"
+    reference = module.function_table.declare(
+        "read",
+        qualified_name="Vault.read",
+        parameter_contracts=(ParameterContract(
+            "self", transfer="alias", access="inout", storage="record",
+            scope="caller",
+        ),),
+    )
+    emitted = emit_module(module, name="class_navigation_function_probe")
+    assert emitted.api.metadata["function_table_schema"] == (
+        "turing.repository-ssa-function-table.v1"
+    )
+    assert emitted.api.metadata["function_table"] == [{
+        "reference": reference.address,
+        "name": "read",
+        "qualified_name": "Vault.read",
+        "state": "declared",
+        "recursive": False,
+        "parameter_contracts": [{
+            "name": "self",
+            "transfer": "alias",
+            "access": "inout",
+            "storage": "record",
+            "scope": "caller",
+        }],
+    }]
 
 
 def test_numerical_lowering_routes_scatter_through_real_llvm_algorithm():
@@ -325,6 +361,87 @@ def test_combined_lowering_uses_graph_region_without_fused_kernel():
     )
 
 
+def test_whole_object_region_signature_preserves_planner_value_shapes():
+    from src.compiler.hierarchical_plan import PlanClosure, PlanLine
+
+    control = ControlProgram(
+        StatementBlock(("__scheduled_region_4__",)),
+        region_indices=(4,),
+    )
+    hierarchy = PlanClosure(
+        "root",
+        (10,),
+        (
+            PlanClosure(
+                "region_4",
+                (10,),
+                (PlanLine.create("transpose", inputs=(10,), outputs=(11,)),),
+                value_shapes=(
+                    (10, (2, 3), "float64"),
+                    (11, (3, 2), "float64"),
+                ),
+            ),
+        ),
+    )
+
+    module, shortfalls, outputs = lower_control_sections_to_ssa(
+        control,
+        hierarchy_plan=hierarchy,
+    )
+
+    assert shortfalls == ()
+    region = module.functions["planned_control__planned_region_4"]
+    assert region.args[0].shape == (2, 3)
+    assert outputs[region.name][0].shape == (3, 2)
+
+
+def test_string_tokens_remain_typed_i64_without_numeric_projection():
+    from src.compiler.hierarchical_plan import PlanClosure, PlanLine
+    from src.compiler.string_table import string_token
+
+    control = ControlProgram(
+        StatementBlock(("__scheduled_region_0__",)),
+        region_indices=(0,),
+    )
+    hierarchy = PlanClosure(
+        "root",
+        (),
+        (
+            PlanClosure(
+                "region_0",
+                (),
+                (
+                    PlanLine.create(
+                        "Const",
+                        outputs=(3,),
+                        attributes={"value": "node-wasm"},
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    module, shortfalls, outputs = lower_control_sections_to_ssa(
+        control,
+        hierarchy_plan=hierarchy,
+    )
+    token_instruction = module.functions[
+        "planned_control__planned_region_0"
+    ].blocks["entry"].instrs[0]
+    emitted = emit_module(
+        module,
+        name="typed_string_record",
+        outputs=outputs,
+        extra_roots=tuple(module.functions),
+    )
+
+    assert shortfalls == ()
+    assert token_instruction.op == "string_token"
+    assert token_instruction.res.dtype == "int64"
+    assert f"{string_token('node-wasm')}_c_int64_t" in emitted.source
+    assert "transfer(" not in emitted.source
+
+
 def test_control_region_call_wires_feeds_and_explicit_output_producers():
     control = ControlProgram(
         StatementBlock(("__scheduled_region_3__",)),
@@ -345,6 +462,62 @@ def test_control_region_call_wires_feeds_and_explicit_output_producers():
     assert call.attributes["output_ids"] == (12, 13)
     loads = [item for item in instructions if item.op == "Load"]
     assert [item.res.id for item in loads] == [12, 13]
+
+
+def test_nested_conditionals_overlay_and_lower_each_region_exactly_once():
+    def markers(*regions):
+        return SequenceBlock(tuple(
+            StatementBlock((f"__scheduled_region_{region}__",))
+            for region in regions
+        ))
+
+    def conditional(predicate, body, orelse, regions):
+        return ControlProgram(
+            ConditionalBlock(
+                predicate,
+                markers(*body),
+                markers(*orelse),
+                predicate_expression=ControlExpression(
+                    "value", value_id=predicate
+                ),
+            ),
+            region_indices=regions,
+        )
+
+    flat = ControlProgram(markers(0, 1, 2, 3), region_indices=(0, 1, 2, 3))
+    outer = conditional(10, (0, 1), (2, 3), (0, 1, 2, 3))
+    nested_true = conditional(11, (0,), (1,), (0, 1))
+    nested_else = conditional(12, (2,), (3,), (2, 3))
+    control = overlay_scheduled_control(
+        (0, 1, 2, 3),
+        (flat, outer, nested_true, nested_else),
+        known_nesting={0: (1,), 1: (2, 3)},
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_callees={index: f"structural_region_{index}" for index in range(4)},
+        region_signatures={index: ((), ()) for index in range(4)},
+    )
+    instructions = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+
+    assert shortfalls == ()
+    assert sum(item.op == "CondBr" for item in instructions) == 3
+    calls = [
+        item.attributes.get("callee")
+        for item in instructions if item.op == "Call"
+    ]
+    assert calls == [
+        "structural_region_0",
+        "structural_region_1",
+        "structural_region_2",
+        "structural_region_3",
+    ]
 
 
 def test_control_ssa_returns_declared_region_output_for_shell_binding():
@@ -468,6 +641,61 @@ def test_projected_enumerate_binding_lowers_extent_counter_and_element():
     )
 
 
+def test_nested_iterable_row_is_handle_stride_and_child_address():
+    control = ControlProgram(
+        LoopBlock(
+            "iteration_9",
+            "0",
+            "__iterable_extent_40__",
+            "1",
+            StatementBlock(("__scheduled_region_4__",)),
+        ),
+        region_indices=(4,),
+        iterable_bindings=((40, 42, "iteration_9"),),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_callees={4: "numerical_region_4"},
+        region_signatures={4: ((42,), ())},
+        region_value_meta={
+            40: Meta((4,), "int", "cpu"),
+            42: Meta((3,), "int", "cpu"),
+        },
+        nested_row_target_ids=(42,),
+    )
+
+    assert shortfalls == ()
+    bindings = [
+        instruction.attributes.get("binding")
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+    assert bindings.count("nested_row_handle") == 2
+    assert "nested_row_offset" in bindings
+    assert "nested_row_base" in bindings
+    child_table = function.metadata["nested_child_tables"]
+    assert len(child_table) == 1
+    assert child_table[0][:3] == ("iterable", 40, -1)
+    assert len(child_table[0]) == 7
+    assert set(child_table[0][3:]) <= {value.id for value in function.args}
+    call = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("callee") == "numerical_region_4"
+    )
+    row_address = next(
+        instruction.res
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "nested_row_base"
+    )
+    assert call.args == [row_address]
+
+
 def test_loop_carried_value_is_a_phi_with_the_region_update():
     control = ControlProgram(
         LoopBlock(
@@ -502,6 +730,77 @@ def test_loop_carried_value_is_a_phi_with_the_region_update():
         instruction.res is phis[0].args[1]
         for instruction in function.blocks["loop_body"].instrs
     )
+
+
+def test_nested_loop_final_value_drives_enclosing_carried_phi():
+    inner = LoopBlock(
+        "inner",
+        "0",
+        "4",
+        "1",
+        StatementBlock(("__scheduled_region_3__",)),
+        carried_aliases=((20, 10),),
+    )
+    control = ControlProgram(
+        LoopBlock(
+            "outer",
+            "0",
+            "4",
+            "1",
+            inner,
+            carried_aliases=((20, 10),),
+        ),
+        region_indices=(3,),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_signatures={3: ((10,), (20,))},
+    )
+
+    assert shortfalls == ()
+    outer_phi = next(
+        instruction
+        for instruction in function.blocks["loop_header"].instrs
+        if instruction.attributes.get("binding") == "loop_carried"
+    )
+    inner_phi = next(
+        instruction
+        for instruction in function.blocks["loop_header.1"].instrs
+        if instruction.attributes.get("binding") == "loop_carried"
+    )
+    assert outer_phi.args[1] is inner_phi.res
+    assert any(
+        instruction.res is outer_phi.args[1]
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+
+
+def test_dynamic_arithmetic_loop_bound_lowers_to_ssa_values():
+    control = ControlProgram(
+        LoopBlock(
+            "iteration",
+            "0",
+            "(((u_control_66 - u_control_80) / u_control_48) + 1)",
+            "1",
+            StatementBlock(("__scheduled_region_3__",)),
+        ),
+        region_indices=(3,),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_signatures={3: ((), ())},
+    )
+
+    assert shortfalls == ()
+    entry_ops = [instruction.op for instruction in function.blocks["entry"].instrs]
+    assert "Sub" in entry_ops
+    assert "Div" in entry_ops
+    assert "Add" in entry_ops
 
 
 def test_recursion_table_lowers_to_phi_and_llvm_shaped_backedge():
@@ -726,3 +1025,41 @@ def test_condition_loop_break_and_switch_default_lower_to_cfg_ssa():
     assert function.metadata["recursion_table"][4]["loops"][0][
         "domain"
     ] == "condition"
+
+
+def test_sequence_while_condition_reloads_length_at_latch():
+    predicate = ControlExpression(
+        "sequence_nonempty",
+        (ControlExpression("value", value_id=10),),
+        value_id=10,
+        literal=False,
+    )
+    control = ControlProgram(
+        WhileBlock(
+            predicate_value_id=10,
+            condition=SequenceBlock(()),
+            body=SequenceBlock(()),
+            predicate_expression=predicate,
+        )
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(control)
+
+    assert shortfalls == ()
+    length_loads = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Load"
+        and instruction.attributes.get("binding") == "ssa_sequence_length"
+    ]
+    predicates = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Gt"
+        and instruction.attributes.get("binding") == "sequence_nonempty"
+    ]
+    assert len(length_loads) == 2
+    assert len(predicates) == 2
+    assert predicates[1].res is function.blocks["while_header"].instrs[0].args[1]

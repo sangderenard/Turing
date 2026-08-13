@@ -37,7 +37,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from ..transmogrifier.ssa import BasicBlock, Function, Instr, IRModule, SSAValue
+from ..transmogrifier.ssa import (
+    BasicBlock,
+    Function,
+    Instr,
+    IRModule,
+    SSAValue,
+    SSATensorTable,
+)
 from .string_table import NONE_TOKEN as _NONE_TOKEN, string_token as _string_token
 
 # Fortran intrinsic (or expression template) for each SSA operation.  ``{0}``
@@ -50,13 +57,19 @@ _BINARY: dict[str, str] = {
     "Div": "({0} / {1})",
     "Pow": "({0} ** {1})",
     "Mod": "modulo({0}, {1})",
-    "FloorDiv": "real(floor({0} / {1}), c_double)",
+    "FloorDiv": "floor({0} / {1})",
     "Eq": "({0} == {1})",
     "Ne": "({0} /= {1})",
     "Lt": "({0} < {1})",
     "Le": "({0} <= {1})",
     "Gt": "({0} > {1})",
     "Ge": "({0} >= {1})",
+    # Fortran 2008 bitwise comparison intrinsics compare the bit sequences as
+    # unsigned integers without requiring a nonstandard unsigned kind.
+    "ULt": "blt({0}, {1})",
+    "ULe": "ble({0}, {1})",
+    "UGt": "bgt({0}, {1})",
+    "UGe": "bge({0}, {1})",
     "LAnd": "({0} .and. {1})",
     "LOr": "({0} .or. {1})",
     "And": "iand({0}, {1})",
@@ -64,6 +77,7 @@ _BINARY: dict[str, str] = {
     "Xor": "ieor({0}, {1})",
     "Shl": "shiftl({0}, {1})",
     "Shr": "shiftr({0}, {1})",
+    "AShr": "shifta({0}, {1})",
     "MatMul": "matmul({0}, {1})",
     # Canonical lowercase spellings used by FusedProgram steps.
     "add": "({0} + {1})",
@@ -75,7 +89,7 @@ _BINARY: dict[str, str] = {
     "minimum": "min({0}, {1})",
     "matmul": "matmul({0}, {1})",
     "mod": "modulo({0}, {1})",
-    "floordiv": "real(floor({0} / {1}), c_double)",
+    "floordiv": "floor({0} / {1})",
     "less": "({0} < {1})",
     "less_equal": "({0} <= {1})",
     "greater": "({0} > {1})",
@@ -84,6 +98,11 @@ _BINARY: dict[str, str] = {
     "not_equal": "({0} /= {1})",
     "logical_and": "({0} .and. {1})",
     "logical_or": "({0} .or. {1})",
+    "bitand": "iand({0}, {1})",
+    "bitor": "ior({0}, {1})",
+    "bitxor": "ieor({0}, {1})",
+    "shl": "shiftl({0}, {1})",
+    "shr": "shiftr({0}, {1})",
 }
 
 _UNARY: dict[str, str] = {
@@ -185,6 +204,7 @@ _LOGICAL_RESULT_UNARY = frozenset(
 _COMPARISON = frozenset(
     {
         "Eq", "Ne", "Lt", "Le", "Gt", "Ge",
+        "ULt", "ULe", "UGt", "UGe",
         "equal", "not_equal", "less", "less_equal", "greater",
         "greater_equal",
     }
@@ -206,10 +226,16 @@ _REAL_OPERAND = frozenset(
 )
 
 _INTEGER_DTYPES = frozenset(
-    {"int", "int8", "int16", "int32", "int64", "i32", "i64", "bool", "logical"}
+    {"int", "int8", "int16", "int32", "int64", "i32", "i64", "i1", "bool", "logical"}
 )
 
+_LOGICAL_DTYPES = frozenset({"i1", "bool", "logical"})
+
 _DTYPE_KIND: dict[str, str] = {
+    "double": "real(c_double)",
+    "i64": "integer(c_int64_t)",
+    "i32": "integer(c_int32_t)",
+    "i1": "logical(c_bool)",
     "float64": "real(c_double)",
     "float32": "real(c_float)",
     "double": "real(c_double)",
@@ -221,6 +247,7 @@ _DTYPE_KIND: dict[str, str] = {
 }
 
 DEFAULT_DTYPE = "float64"
+
 
 
 def supported_tensor_operations() -> frozenset[str]:
@@ -275,6 +302,9 @@ class FortranSubroutine:
     # The extent parameters this subroutine declares, in argument order, so a
     # caller in the same module can pass exactly what it expects.
     extent_names: tuple[str, ...] = ()
+    # Rankless SSA values used as address bases are C pointers.  Any ``extent``
+    # operation over one requires an explicit companion length in the ABI.
+    dynamic_array_extents: tuple[tuple[int, str], ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -423,19 +453,21 @@ def _array_literal(
 
 
 def _literal(value: Any) -> str:
-    # None and words are 64-bit tokens in the working type, carried as
-    # reinterpreted bits. Realise them at the one point every literal passes
-    # through to become Fortran, so no emission path can leak an inexpressible
-    # None/str/bytes -- the SSA tokenizer is the primary path; this is the
-    # universal backstop.
+    # None and words are typed signed 64-bit identities.  Realise them at the
+    # one point every literal passes through to become Fortran; never project
+    # them through f64 bits.
     if value is None:
-        return f"transfer({_NONE_TOKEN}_c_int64_t, 0._c_double)"
+        return f"{_NONE_TOKEN}_c_int64_t"
     if isinstance(value, (str, bytes)):
-        return f"transfer({_string_token(value)}_c_int64_t, 0._c_double)"
+        return f"{_string_token(value)}_c_int64_t"
     if isinstance(value, bool):
         return ".true._c_bool" if value else ".false._c_bool"
     if isinstance(value, int):
-        return str(value)
+        # Libraries commonly expose protocol constants through an ``int``
+        # subclass whose string form is the authored Python name (for example
+        # ``re._constants.SUBPATTERN``).  The target knows the structural
+        # integer value, not that Python-side spelling.
+        return str(int(value))
     if isinstance(value, float):
         if math.isnan(value):
             return "ieee_value(0.0_c_double, ieee_quiet_nan)"
@@ -492,15 +524,19 @@ class _FunctionEmitter:
         outputs: Sequence[SSAValue] = (),
         callee_extents: Mapping[str, Sequence[str]] | None = None,
         callee_arity: Mapping[str, int] | None = None,
+        callee_output_count: Mapping[str, int] | None = None,
+        callee_array_arguments: Mapping[str, Sequence[int]] | None = None,
         callee_inout_pairs: Mapping[
             str, Sequence[tuple[int, int]]
         ] | None = None,
         array_base_ids: Sequence[int] = (),
         mutated_base_ids: Sequence[int] = (),
+        tensor_table: SSATensorTable | None = None,
     ):
         self.function = function
         self.dtype = dtype
         self.outputs = tuple(outputs)
+        self.tensor_table = tensor_table or SSATensorTable()
         # Value ids used as an address base anywhere in the module (dynamic
         # arrays), and those a store mutates -- shared across a method's
         # functions by id, so every function that names one declares it as the
@@ -510,13 +546,44 @@ class _FunctionEmitter:
         self.mutated_base_ids = {int(value_id) for value_id in mutated_base_ids}
         self.callee_extents = dict(callee_extents or {})
         self.callee_arity = dict(callee_arity or {})
+        self.callee_output_count = dict(callee_output_count or {})
+        self.callee_array_arguments = {
+            str(name): frozenset(int(position) for position in positions)
+            for name, positions in (callee_array_arguments or {}).items()
+        }
         self.callee_inout_pairs = {
             str(name): tuple(pairs)
             for name, pairs in (callee_inout_pairs or {}).items()
         }
         self._value_types: dict[int, SSAValue] = {}
         self._infer_control_value_types()
+        self.dynamic_array_extents = {
+            int(instr.args[0].id): f"extent_dynamic_{int(instr.args[0].id)}"
+            for block in self.function.blocks.values()
+            for instr in block.instrs
+            if (
+                (instr.attributes.get("tensor_operation") or instr.op)
+                == "extent"
+                and instr.args
+                and int(instr.args[0].id) in self.array_base_ids
+                and not self._typed(instr.args[0]).shape
+            )
+        }
         self.shortfalls: list[FortranShortfall] = []
+        for descriptor in self.tensor_table.tensors.values():
+            if descriptor.metadata_state == "unresolved":
+                self.shortfalls.append(FortranShortfall(
+                    "ssa_tensor_table",
+                    "entry",
+                    "tensor metadata is unresolved before target emission: "
+                    f"tensor_id={descriptor.tensor_id}, "
+                    f"data_value_id={descriptor.data_value_id}",
+                ))
+            elif descriptor.metadata_state == "dynamic":
+                self.array_base_ids.add(int(descriptor.data_value_id))
+                self.array_base_ids.add(int(descriptor.shape_value_id))
+                if descriptor.strides_value_id is not None:
+                    self.array_base_ids.add(int(descriptor.strides_value_id))
         self._branch_targets: set[str] = set()
         # Single-use temporaries are substituted into their consumer so one SSA
         # chain becomes one Fortran array expression.  Emitting a statement per
@@ -650,6 +717,32 @@ class _FunctionEmitter:
         inlined = self._inlined.get(value.id)
         return inlined if inlined is not None else _name(value)
 
+    def _call_operand(self, value: SSAValue, *, array_expected: bool) -> str:
+        """Render one call operand, folding a repository address to a section.
+
+        SSA represents a selected nested row as ``GetElementPtr(child, off)``.
+        Fortran has no first-class pointer arithmetic, but an array element or
+        section is a valid actual argument for an assumed-size dummy.  Folding
+        the address here preserves the same caller-owned storage ABI without a
+        temporary copy or runtime object.
+        """
+
+        if array_expected:
+            producer = self._address_producers.get(int(value.id))
+            if producer is not None:
+                collection, positions = producer
+                self._consumed.add(int(value.id))
+                subscripts = ", ".join(
+                    (
+                        f"{self._operand(position)} + 1"
+                        if str(self._typed(position).dtype) in _INTEGER_DTYPES
+                        else f"int({self._operand(position)}) + 1"
+                    )
+                    for position in positions
+                )
+                return f"{self._operand(collection)}({subscripts})"
+        return self._operand(value)
+
     def _collect_use_sites(self) -> None:
         for block in self.function.blocks.values():
             for index, instr in enumerate(block.instrs):
@@ -667,6 +760,11 @@ class _FunctionEmitter:
         """
 
         result = instr.res
+        # A shaped constant must remain an array designator.  Scalar
+        # assignment can initialise it compactly, whereas substituting the
+        # literal into a pointer/assumed-size call argument loses its rank.
+        if instr.op in ("Const", "const") and tuple(result.shape):
+            return False
         if result.id in self._bound_ids:
             return False
         if instr.op in ("Phi", "phi"):
@@ -744,10 +842,26 @@ class _FunctionEmitter:
         shape = instr.res.shape
         rank = len(shape)
 
+        if operation in ("cpu", "detach", "tolist") and len(args) == 1:
+            # These operations cross Python/backend representation boundaries.
+            # Inside an already-resident Fortran program the value is in its
+            # target representation, so the numerical value is unchanged.
+            return args[0]
+
         reduction_axis = attributes.get("dim", attributes.get("axis"))
         if operation == "extent" and len(args) == 1:
-            source_rank = len(instr.args[0].shape)
+            # Control lowering can refer to a resident collection through a
+            # scalar-shaped SSA spelling even when the same value identity
+            # has a ranked definition at the function boundary or across a
+            # region call.  Rank inference has already unified those
+            # identities; consult it here instead of the lossy occurrence.
+            source_rank = len(self._typed(instr.args[0]).shape)
             dim = int(attributes.get("dim", 0))
+            dynamic_extent = self.dynamic_array_extents.get(
+                int(instr.args[0].id)
+            )
+            if source_rank == 0 and dim == 0 and dynamic_extent is not None:
+                return dynamic_extent
             if source_rank == 0 or not (-source_rank <= dim < source_rank):
                 return None
             return f"size({args[0]}, {(dim % source_rank) + 1})"
@@ -954,6 +1068,13 @@ class _FunctionEmitter:
             extents = ", ".join(str(int(size)) for size in shape)
             return f"reshape({args[0]}, [{extents}], order=[{order}])"
 
+        if operation == "transpose" and len(args) == 1:
+            source_rank = len(self._typed(instr.args[0]).shape)
+            dim0 = int(attributes.get("dim0", 0))
+            dim1 = int(attributes.get("dim1", 1))
+            if source_rank == 2 and {dim0 % 2, dim1 % 2} == {0, 1}:
+                return f"transpose({args[0]})"
+
         return None
 
     def _is_logical(self, value: SSAValue) -> bool:
@@ -967,6 +1088,12 @@ class _FunctionEmitter:
         instruction that produced it.
         """
 
+        # LLVM's i1 is intrinsically a logical value.  Check the recorded
+        # scalar kind before examining an inlined producer: an imported
+        # ``fcmp`` is represented as an ordinary Call and would otherwise be
+        # misclassified merely because its expression was inlined.
+        if str(getattr(value, "dtype", "") or "") in _LOGICAL_DTYPES:
+            return True
         producer = self._producers.get(value.id)
         if producer is not None and value.id in self._inlined:
             operation = (
@@ -984,7 +1111,7 @@ class _FunctionEmitter:
                 return True
             # Produced by arithmetic: a number, whatever the dtype claims.
             return False
-        if str(getattr(value, "dtype", "") or "") not in ("bool", "logical"):
+        if str(getattr(value, "dtype", "") or "") not in _LOGICAL_DTYPES:
             return False
         if producer is None or value.id not in self._inlined:
             # A declared LOGICAL variable, or an argument: the declaration is
@@ -1073,6 +1200,8 @@ class _FunctionEmitter:
         """
 
         operation = instr.attributes.get("tensor_operation") or instr.op
+        if instr.res is not None and str(instr.res.dtype or "") in _LOGICAL_DTYPES:
+            return True
         if operation in _SHAPE_ONLY and instr.args:
             return self._is_logical(instr.args[0])
         # Tested against instr.op, not `operation`: a constant carries
@@ -1096,6 +1225,15 @@ class _FunctionEmitter:
                 isinstance(element, bool) for element in values
             ):
                 return True
+        if operation in {"And", "Or", "Xor"}:
+            # These repository ops are overloaded: logical operands mean
+            # boolean conjunction/disjunction, integer operands mean bitwise
+            # arithmetic.  The expression emitter already makes this same
+            # distinction; assignment coercion must not subsequently treat an
+            # integer IOR as a mask and wrap it in MERGE.
+            return bool(instr.args) and all(
+                self._is_logical(value) for value in instr.args
+            )
         return (
             operation in _COMPARISON
             or operation in _LOGICAL_BINARY
@@ -1174,7 +1312,7 @@ class _FunctionEmitter:
         """
 
         result_dtype = str(getattr(instr.res, "dtype", None) or self.dtype)
-        target_logical = result_dtype in ("bool", "logical")
+        target_logical = result_dtype in _LOGICAL_DTYPES
         source_logical = self._is_logical(value)
         if target_logical:
             if source_logical:
@@ -1351,7 +1489,15 @@ class _FunctionEmitter:
         else:
             call_values = [*instr.args, *ordered_outputs]
             extents = sorted(dimension_extents(call_values).values())
-        input_arguments = [self._operand(value) for value in instr.args]
+        array_positions = self.callee_array_arguments.get(
+            str(callee), frozenset()
+        )
+        input_arguments = [
+            self._call_operand(
+                value, array_expected=index in array_positions
+            )
+            for index, value in enumerate(instr.args)
+        ]
         output_arguments = [_name(value) for value in ordered_outputs]
         prelude = []
         aliased_output_indices = set()
@@ -1380,6 +1526,53 @@ class _FunctionEmitter:
         ]
         return [*prelude, f"    call {callee}({', '.join(arguments)})"]
 
+    def _ssa_call(self, instr: Instr) -> list[str] | None:
+        """Emit an ordinary call to another fully present SSA function."""
+
+        if instr.op not in ("Call", "call"):
+            return None
+        if instr.attributes.get("tensor_operation") is not None:
+            return None
+        callee = str(instr.attributes.get("callee") or "")
+        if not callee or callee not in self.callee_arity:
+            return None
+        if len(instr.args) != self.callee_arity[callee]:
+            return None
+        output_count = int(self.callee_output_count.get(callee, 0))
+        output_argument = instr.attributes.get("ssa_output_argument")
+        array_positions = self.callee_array_arguments.get(callee, frozenset())
+        call_operands = []
+        for position, value in enumerate(instr.args):
+            operand = self._call_operand(
+                value, array_expected=position in array_positions
+            )
+            typed = self._typed(value)
+            if position not in array_positions and tuple(typed.shape):
+                if _element_count(tuple(typed.shape)) != 1:
+                    return None
+                operand += "(" + ", ".join("1" for _ in typed.shape) + ")"
+            call_operands.append(operand)
+        arguments = [
+            *self.callee_extents.get(callee, ()),
+            *call_operands,
+        ]
+        if output_argument is not None:
+            position = int(output_argument)
+            if (
+                instr.res is None
+                or position < 0
+                or position >= len(instr.args)
+                or int(instr.args[position].id) != int(instr.res.id)
+            ):
+                return None
+            self._locals[instr.res.id] = self._typed(instr.res)
+        elif output_count == 1 and instr.res is not None:
+            self._locals[instr.res.id] = self._typed(instr.res)
+            arguments.append(_name(instr.res))
+        elif output_count != 0 or instr.res is not None:
+            return None
+        return [f"    call {callee}({', '.join(arguments)})"]
+
     def _indexed_store(self, instr: Instr) -> list[str] | None:
         """``collection[i] = value``, without materialising an address.
 
@@ -1394,7 +1587,11 @@ class _FunctionEmitter:
         source, address = instr.args
         producer = self._address_producers.get(address.id)
         if producer is None:
-            return None
+            if int(address.id) not in self.array_base_ids:
+                return None
+            return [
+                f"    {self._operand(address)}(1) = {self._operand(source)}"
+            ]
         collection, positions = producer
         self._consumed.add(address.id)
         # SSA induction values are 0-based; Fortran subscripts start at 1. A
@@ -1402,11 +1599,24 @@ class _FunctionEmitter:
         # type is a real, so truncate it explicitly rather than lean on the
         # legacy real-index extension.
         subscripts = ", ".join(
-            f"int({self._operand(position)}) + 1" for position in positions
+            (
+                f"{self._operand(position)} + 1"
+                if str(self._typed(position).dtype or "") in _INTEGER_DTYPES
+                else f"int({self._operand(position)}) + 1"
+            )
+            for position in positions
         )
+        source_expression = self._operand(source)
+        collection_dtype = str(self._typed(collection).dtype or self.dtype)
+        if collection_dtype in _LOGICAL_DTYPES and not self._is_logical(source):
+            source_expression = f"({source_expression} /= 0)"
+        elif collection_dtype in _INTEGER_DTYPES:
+            source_dtype = str(self._typed(source).dtype or self.dtype)
+            if source_dtype not in _INTEGER_DTYPES:
+                source_expression = f"int({source_expression}, c_int)"
         return [
             f"    {self._operand(collection)}({subscripts})"
-            f" = {self._operand(source)}"
+            f" = {source_expression}"
         ]
 
     def _collect_address_producers(self) -> None:
@@ -1486,7 +1696,8 @@ class _FunctionEmitter:
         if batched is not None:
             return batched
         if operation not in (
-            "cumsum", "gather", "scatter", "index_set", "pad", "stack", "concat"
+            "cumsum", "gather", "scatter", "index_set", "pad", "stack",
+            "concat", "concatenate",
         ):
             return None
         target = _name(instr.res)
@@ -1604,11 +1815,13 @@ class _FunctionEmitter:
                 f"    {target}({', '.join(subscripts)}) = {value}",
             ]
 
-        if operation == "concat":
+        if operation in ("concat", "concatenate"):
             # Concatenation writes each source into its own run of the joined
             # dimension. Fortran has no general concat intrinsic, but a
             # section assignment per source says it exactly, at any rank.
             rank = len(instr.res.shape)
+            if rank == 0:
+                return None
             dim = int(instr.attributes.get("dim", 0)) % rank
             statements = []
             offset = 0
@@ -1629,6 +1842,8 @@ class _FunctionEmitter:
             # Fortran writes. Arrays are declared in SSA dimension order, so
             # the new axis sits where the op says it does.
             rank = len(instr.res.shape)
+            if rank == 0:
+                return None
             dim = int(instr.attributes.get("dim", 0)) % rank
             statements = []
             for position, argument in enumerate(instr.args, start=1):
@@ -1643,6 +1858,8 @@ class _FunctionEmitter:
         if operation == "cumsum":
             source = self._operand(instr.args[0])
             rank = len(instr.res.shape)
+            if rank == 0:
+                return None
             dim = int(instr.attributes.get("dim", 0)) % rank
             # Arrays are declared in SSA dimension order (see dims() in
             # emit()), so Fortran subscript k+1 is SSA dim k.
@@ -1688,27 +1905,112 @@ class _FunctionEmitter:
             tensor_operation = instr.attributes.get("tensor_operation")
             if tensor_operation is not None:
                 op = str(tensor_operation)
+            else:
+                callee = str(instr.attributes.get("callee") or "")
+                intrinsic = {
+                    "pow": "{0} ** {1}",
+                    "exp": "exp({0})",
+                    "log": "log({0})",
+                    "tanh": "tanh({0})",
+                    "sin": "sin({0})",
+                    "cos": "cos({0})",
+                    "tan": "tan({0})",
+                    "asin": "asin({0})",
+                    "acos": "acos({0})",
+                    "atan": "atan({0})",
+                    "sinh": "sinh({0})",
+                    "cosh": "cosh({0})",
+                    "asinh": "asinh({0})",
+                    "acosh": "acosh({0})",
+                    "atanh": "atanh({0})",
+                    "llvm.sqrt.f64": "sqrt({0})",
+                    "llvm.fabs.f64": "abs({0})",
+                    "llvm.round.f64": "anint({0})",
+                    "llvm.trunc.f64": "aint({0})",
+                    "llvm.floor.f64": "floor({0}, kind=c_int64_t)",
+                    "llvm.ceil.f64": "ceiling({0}, kind=c_int64_t)",
+                }.get(callee)
+                if intrinsic is not None:
+                    return intrinsic.format(*(self._operand(a) for a in instr.args))
+                if callee in {"llvm.fcmp.ord", "llvm.fcmp.uno"} and len(instr.args) == 2:
+                    left, right = (self._operand(a) for a in instr.args)
+                    if callee.endswith(".ord"):
+                        return (
+                            f"((.not. ieee_is_nan({left})) .and. "
+                            f"(.not. ieee_is_nan({right})))"
+                        )
+                    return f"(ieee_is_nan({left}) .or. ieee_is_nan({right}))"
         args = [self._operand(a) for a in instr.args]
         constant = instr.attributes.get("constant", None)
 
-        # A string word is its 64-bit fnv1a token, carried in the f64 working
-        # type as reinterpreted bits (transfer), so a constant word costs a
-        # constant like any other and needs no string type in the ABI.
+        if op in {"SiToFp", "UiToFp"} and len(instr.args) == 1 and self._is_logical(instr.args[0]):
+            return _UNARY["bool_to_float64"].format(args[0])
+
+        if op in {"And", "Or", "Xor"} and len(instr.args) == 2 and all(
+            self._is_logical(value) for value in instr.args
+        ):
+            logical_operator = {
+                "And": ".and.", "Or": ".or.", "Xor": ".neqv."
+            }[op]
+            return f"({args[0]} {logical_operator} {args[1]})"
+
+        if op in {"And", "Or", "Xor"} and len(args) == 2:
+            expression = _BINARY[op].format(*(
+                f"int({argument}, c_int64_t)" for argument in args
+            ))
+            if str(instr.res.dtype or self.dtype) in _INTEGER_DTYPES:
+                return f"int({expression}, c_int)"
+            return f"real({expression}, c_double)"
+
+        if op == "invert" and len(args) == 1:
+            source_dtype = str(self._typed(instr.args[0]).dtype).casefold()
+            if source_dtype in _LOGICAL_DTYPES:
+                return f"(.not. {args[0]})"
+            if "int" in source_dtype:
+                return f"not({args[0]})"
+            # Source ``~`` is unambiguously integer even when an upstream
+            # source region has not yet refined its scalar dtype.  Preserve
+            # integer bit semantics and convert back only when the result ABI
+            # remains the generic scalar dtype.
+            expression = f"not(int({args[0]}, c_int64_t))"
+            if str(instr.res.dtype or self.dtype) in _INTEGER_DTYPES:
+                return expression
+            return f"real({expression}, c_double)"
+
+        if op in {"bitand", "bitor", "bitxor", "shl", "shr"} and len(args) == 2:
+            if all(self._is_logical(value) for value in instr.args):
+                logical = {
+                    "bitand": ".and.",
+                    "bitor": ".or.",
+                    "bitxor": ".neqv.",
+                }.get(op)
+                if logical is None:
+                    return None
+                return f"({args[0]} {logical} {args[1]})"
+            # Every nested bit expression uses one kind.  Keeping an authored
+            # c_int32 operand unchanged while widening only a generic/real
+            # neighbour lets an inlined ``ior(i32, i32)`` meet ``not(i64)`` in
+            # an outer ``iand``, which Fortran correctly rejects.
+            integer_args = [
+                f"int({argument}, c_int64_t)" for argument in args
+            ]
+            expression = _BINARY[op].format(*integer_args)
+            if str(instr.res.dtype or self.dtype) in _INTEGER_DTYPES:
+                return expression
+            return f"real({expression}, c_double)"
+
+        # A string word is its typed signed 64-bit fnv1a identity.  It is not a
+        # numerical value and is never carried through floating-point bits.
         if op == "string_token":
             token = int(instr.attributes["token"])
-            return f"transfer({token}_c_int64_t, 0._c_double)"
+            return f"{token}_c_int64_t"
 
-        # A token comparison is an identity test on the 64 bits, reinterpreted to
-        # i64 first: an f64 == would be NaN-unsafe and would compare float value,
-        # not content identity.
+        # A token comparison is a direct identity test on typed i64 values.
         if instr.attributes.get("string_compare") and op in (
             "equal", "not_equal", "Eq", "Ne"
         ) and len(args) == 2:
             comparator = "==" if op in ("equal", "Eq") else "/="
-            return (
-                f"(transfer({args[0]}, 0_c_int64_t) {comparator} "
-                f"transfer({args[1]}, 0_c_int64_t))"
-            )
+            return f"({args[0]} {comparator} {args[1]})"
 
         if op in ("Const", "const"):
             if constant is None and "llvm_literal" in instr.attributes:
@@ -1729,7 +2031,14 @@ class _FunctionEmitter:
                 # "values" on purpose: an array constant carries both keys,
                 # with a vestigial "value" of None, so testing it first would
                 # discard the real elements.
-                return _literal(instr.attributes["value"])
+                try:
+                    return _literal(instr.attributes["value"])
+                except FortranEmissionError as error:
+                    raise FortranEmissionError(
+                        f"{error}; function={self.function.name!r}; "
+                        f"result_value_id={getattr(instr.res, 'id', None)!r}; "
+                        f"attributes={instr.attributes!r}"
+                    ) from error
             return _literal(constant)
 
         if op in ("Load", "load") and len(instr.args) == 1:
@@ -1737,9 +2046,24 @@ class _FunctionEmitter:
             if producer is not None:
                 collection, positions = producer
                 subscripts = ", ".join(
-                    f"int({self._operand(position)}) + 1" for position in positions
+                    (
+                        f"{self._operand(position)} + 1"
+                        if str(self._typed(position).dtype or "") in _INTEGER_DTYPES
+                        else f"int({self._operand(position)}) + 1"
+                    )
+                    for position in positions
                 )
                 return f"{self._operand(collection)}({subscripts})"
+            if int(instr.args[0].id) in self.array_base_ids:
+                return f"{self._operand(instr.args[0])}(1)"
+
+        if op == "Cast" and len(args) == 1:
+            result_dtype = str(instr.res.dtype or self.dtype)
+            if result_dtype in {"double", "float", "float32", "float64"}:
+                return f"real({args[0]}, c_double)"
+            if result_dtype in _INTEGER_DTYPES:
+                return f"int({args[0]}, c_int)"
+            return args[0]
 
         structural = self._structural(instr, args, op)
         if structural is not None:
@@ -1775,6 +2099,24 @@ class _FunctionEmitter:
                 args = conformed
             if op not in _LOGICAL_BINARY:
                 args = self._numeric(instr, args)
+            if op in {"FloorDiv", "floordiv"} and str(
+                instr.res.dtype or self.dtype
+            ) in _INTEGER_DTYPES:
+                return f"({args[0]} / {args[1]})"
+            if op in {"Mod", "mod"} and str(
+                instr.res.dtype or self.dtype
+            ) in _INTEGER_DTYPES:
+                return f"modulo(int({args[0]}, c_int64_t), int({args[1]}, c_int64_t))"
+            if op in {
+                "And", "Or", "Xor", "bitand", "bitor", "bitxor"
+            }:
+                # Nested bitwise expressions may inline a c_int32-producing
+                # instruction beside an explicitly widened operand.  Fortran's
+                # bit intrinsics require identical kind parameters.  State the
+                # repository integer operation in one stable kind at every
+                # nesting level; assignment converts to a narrower declared
+                # result when that is the function contract.
+                args = [f"int({argument}, c_int64_t)" for argument in args]
             if instr.attributes.get("reverse"):
                 args = [args[1], args[0]]
             # A comparison landing in a numeric variable is converted at the
@@ -1812,6 +2154,27 @@ class _FunctionEmitter:
         if block.name in self._branch_targets:
             body.append(f"{self._label(block.name)} continue")
         for index, instr in enumerate(block.instrs):
+            if instr.op in ("Deploy", "Join"):
+                # Deployment boundaries describe scheduling around the
+                # numerical program.  A single native Fortran subroutine
+                # executes that program serially, so the markers have no
+                # runtime statement of their own, but retaining them as
+                # comments keeps the structural boundary visible.
+                body.append(f"    ! {instr.op} deployment boundary")
+                continue
+            if (
+                instr.op in ("Call", "call")
+                and not instr.attributes.get("tensor_operation")
+                and instr.attributes.get("callee")
+                == "turing_validation_error"
+            ):
+                # Validation calls live only in the failing CFG branch.  Use
+                # Fortran's self-contained failure operation rather than an
+                # unresolved external symbol that would make the DLL
+                # impossible to link.
+                error_code = int(instr.attributes.get("error_code", 1))
+                body.append(f"    error stop {error_code}")
+                continue
             if instr.op in ("Phi", "phi"):
                 # Phi is realised by the predecessors, not here.
                 continue
@@ -1845,6 +2208,11 @@ class _FunctionEmitter:
                 body.append("    end if")
                 continue
             if instr.op in ("Ret", "ret", "Return", "return"):
+                return_value = self.function.metadata.get("return_value")
+                if return_value is not None and instr.args:
+                    body.append(
+                        f"    {_name(return_value)} = {self._operand(instr.args[0])}"
+                    )
                 body.append("    return")
                 continue
 
@@ -1861,6 +2229,11 @@ class _FunctionEmitter:
                 body.extend(group)
                 continue
 
+            call = self._ssa_call(instr)
+            if call is not None:
+                body.extend(call)
+                continue
+
             store = self._indexed_store(instr)
             if store is not None:
                 body.extend(store)
@@ -1874,14 +2247,45 @@ class _FunctionEmitter:
 
             expression = self._expression(instr)
             if expression is None:
+                operation = str(
+                    instr.attributes.get("tensor_operation") or instr.op
+                )
+                reason = "no Fortran intrinsic or expression is registered"
+                operands = tuple(
+                    (
+                        int(source.id),
+                        tuple(source.shape),
+                        tuple(self._typed(source).shape),
+                        str(self._typed(source).dtype),
+                        int(source.id) in self.array_base_ids,
+                    )
+                    for source in instr.args
+                )
+                result = (
+                    None
+                    if instr.res is None
+                    else (
+                        int(instr.res.id),
+                        tuple(instr.res.shape),
+                        tuple(self._typed(instr.res).shape),
+                        str(self._typed(instr.res).dtype),
+                    )
+                )
+                attributes = {
+                    str(key): value
+                    for key, value in instr.attributes.items()
+                    if isinstance(value, (str, int, float, bool, tuple, list, type(None)))
+                }
+                reason += (
+                    f"; operands=(id, occurrence_shape, inferred_shape, dtype, "
+                    f"dynamic_base){operands!r}; result={result!r}; "
+                    f"attributes={attributes!r}"
+                )
                 self.shortfalls.append(
                     FortranShortfall(
-                        str(
-                            instr.attributes.get("tensor_operation")
-                            or instr.op
-                        ),
+                        operation,
                         block.name,
-                        "no Fortran intrinsic or expression is registered",
+                        reason,
                     )
                 )
                 body.append(f"    ! UNSUPPORTED {instr.op}")
@@ -1893,7 +2297,7 @@ class _FunctionEmitter:
             if (
                 self._instruction_is_logical(instr)
                 and str(instr.res.dtype or self.dtype)
-                not in ("bool", "logical")
+                not in _LOGICAL_DTYPES
             ):
                 # A mask reaching a numeric variable. Fortran will not
                 # convert LOGICAL on assignment the way it converts between
@@ -1901,7 +2305,7 @@ class _FunctionEmitter:
                 expression = _UNARY["bool_to_float64"].format(expression)
             elif (
                 not self._instruction_is_logical(instr)
-                and str(instr.res.dtype or self.dtype) in ("bool", "logical")
+                and str(instr.res.dtype or self.dtype) in _LOGICAL_DTYPES
             ):
                 # And the reverse: a number recorded as bool, reaching a
                 # variable declared LOGICAL. Non-zero is true, which is the
@@ -2023,7 +2427,11 @@ class _FunctionEmitter:
                 str(instr.attributes.get("callee") or ""), ()
             )
         }
-        extent_names = sorted(set(dim_extents.values()) | called_extent_names)
+        extent_names = sorted(
+            set(dim_extents.values())
+            | called_extent_names
+            | set(self.dynamic_array_extents.values())
+        )
         self.extent_names = tuple(extent_names)
         argument_ids = {argument.id for argument in self.function.args}
         output_ids = {value.id for value in self.outputs}
@@ -2079,7 +2487,10 @@ class _FunctionEmitter:
                         f"    {kind}, intent(inout) :: {_name(argument)}({extent})"
                     )
                     continue
-            if argument.id in self._mutated_arrays and _is_array(argument):
+            if (
+                argument.id in self._mutated_arrays
+                or int(argument.id) in self.mutated_base_ids
+            ) and _is_array(argument):
                 declarations.append(
                     f"    {kind}, intent(inout) :: {_name(argument)}({dims(argument)})"
                 )
@@ -2141,6 +2552,7 @@ class _FunctionEmitter:
             "\n".join(lines),
             tuple(self.shortfalls),
             tuple(extent_names),
+            tuple(sorted(self.dynamic_array_extents.items())),
         )
 
 
@@ -2151,11 +2563,14 @@ def emit_function(
     outputs: Sequence[SSAValue] = (),
     callee_extents: Mapping[str, Sequence[str]] | None = None,
     callee_arity: Mapping[str, int] | None = None,
+    callee_output_count: Mapping[str, int] | None = None,
+    callee_array_arguments: Mapping[str, Sequence[int]] | None = None,
     callee_inout_pairs: Mapping[
         str, Sequence[tuple[int, int]]
     ] | None = None,
     array_base_ids: Sequence[int] = (),
     mutated_base_ids: Sequence[int] = (),
+    tensor_table: SSATensorTable | None = None,
 ) -> FortranSubroutine:
     """Translate one SSA function into a bind(C) Fortran subroutine.
 
@@ -2168,15 +2583,33 @@ def emit_function(
     subroutine expects rather than extents rederived at the call site.
     """
 
+    from .machine_dialect_ssa import (
+        format_machine_dialect_occurrences,
+        module_machine_dialect_occurrences,
+    )
+
+    machine_residuals = module_machine_dialect_occurrences(
+        {function.name: function}
+    )
+    if machine_residuals:
+        raise FortranEmissionError(
+            "Fortran emission requires legalized repository SSA; retained "
+            "machine-state SSA remains: "
+            + format_machine_dialect_occurrences(machine_residuals)
+        )
+
     return _FunctionEmitter(
         function,
         dtype=dtype,
         outputs=outputs,
         callee_extents=callee_extents,
         callee_arity=callee_arity,
+        callee_output_count=callee_output_count,
+        callee_array_arguments=callee_array_arguments,
         callee_inout_pairs=callee_inout_pairs,
         array_base_ids=array_base_ids,
         mutated_base_ids=mutated_base_ids,
+        tensor_table=tensor_table,
     ).emit()
 
 
@@ -2228,12 +2661,148 @@ def emit_module(
     functions the entry happens to reach.
     """
 
+    if isinstance(module, IRModule):
+        unresolved_calls = tuple(
+            record
+            for records in getattr(module, "call_table", {}).values()
+            for record in records
+            if record.resolution == "unresolved"
+        )
+        if unresolved_calls:
+            details = "; ".join(
+                f"{record.caller}@{record.callsite_id} -> "
+                    f"{record.callee_symbol or record.callee_name} "
+                    f"missing_frame={record.unresolved_frame_value_ids!r} "
+                    f"bindings={record.frame_bindings!r} "
+                    f"boundary={record.decomposition!r}"
+                for record in unresolved_calls
+            )
+            raise FortranEmissionError(
+                "repository SSA contains unresolved source call records; "
+                "refusing to emit a DLL that omits authored execution: "
+                + details
+            )
+
+    module_tensor_tables = (
+        dict(getattr(module, "tensor_tables", {}))
+        if isinstance(module, IRModule)
+        else {}
+    )
+    module_sequence_tables = (
+        dict(getattr(module, "sequence_tables", {}))
+        if isinstance(module, IRModule)
+        else {}
+    )
+    module_class_table = (
+        getattr(module, "class_table", None)
+        if isinstance(module, IRModule)
+        else None
+    )
+    module_function_table = (
+        getattr(module, "function_table", None)
+        if isinstance(module, IRModule)
+        else None
+    )
+    module_record_tables = (
+        dict(getattr(module, "record_tables", {}))
+        if isinstance(module, IRModule)
+        else {}
+    )
     functions = (
         module.functions if isinstance(module, IRModule) else dict(module)
     )
+    # The decompiler reuses IRModule/Function as structural containers while
+    # retaining exact machine-state transitions.  Container compatibility is
+    # not repository-SSA legalization: reject every residual occurrence before
+    # target emission can mistake a machine dialect for ordinary SSA.
+    from .machine_dialect_ssa import (
+        format_machine_dialect_occurrences,
+        module_machine_dialect_occurrences,
+    )
+    machine_residuals = module_machine_dialect_occurrences(functions)
+    if machine_residuals:
+        raise FortranEmissionError(
+            "Fortran emission requires legalized repository SSA; retained "
+            "machine-state SSA remains: "
+            + format_machine_dialect_occurrences(machine_residuals)
+        )
+    for function_name, table in module_sequence_tables.items():
+        function = functions.get(function_name)
+        if function is None:
+            raise FortranEmissionError(
+                f"sequence table names absent SSA function {function_name!r}"
+            )
+        available_value_ids = {int(value.id) for value in function.args}
+        available_value_ids.update(
+            int(instruction.res.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        )
+        for descriptor in table.sequences.values():
+            pool = descriptor.child_table_pool
+            if pool is None:
+                continue
+            pool_value_ids = {
+                *map(int, pool.column_value_ids),
+                int(pool.length_value_id),
+                int(pool.capacity_value_id),
+                int(pool.row_stride_value_id),
+                *((int(pool.status_value_id),) if pool.status_value_id is not None else ()),
+                *((int(pool.live_flags_value_id),) if pool.live_flags_value_id is not None else ()),
+            }
+            missing_values = pool_value_ids - available_value_ids
+            if missing_values:
+                raise FortranEmissionError(
+                    f"sequence {descriptor.sequence_id} child-table pool names "
+                    f"absent SSA values {sorted(missing_values)} in "
+                    f"{function_name!r}"
+                )
+    for function_name, table in module_record_tables.items():
+        function = functions.get(function_name)
+        if function is None:
+            raise FortranEmissionError(
+                f"record table names absent SSA function {function_name!r}"
+            )
+        sequence_table = module_sequence_tables.get(function_name)
+        sequence_ids = set(
+            getattr(sequence_table, "descriptors", {})
+            or getattr(sequence_table, "sequences", {})
+        )
+        record_ids = set(table.records)
+        available_value_ids = {int(value.id) for value in function.args}
+        available_value_ids.update(
+            int(instruction.res.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        )
+        for descriptor in table.records.values():
+            for field in descriptor.fields:
+                missing_values = set(field.value_ids) - available_value_ids
+                if missing_values:
+                    raise FortranEmissionError(
+                        f"record {descriptor.identity!r} field {field.name!r} "
+                        "names absent SSA values "
+                        f"{sorted(missing_values)} in {function_name!r}"
+                    )
+                if field.sequence_id is not None and field.sequence_id not in sequence_ids:
+                    raise FortranEmissionError(
+                        f"record {descriptor.identity!r} field {field.name!r} "
+                        f"names absent sequence {field.sequence_id} in {function_name!r}"
+                    )
+                if field.record_id is not None and field.record_id not in record_ids:
+                    raise FortranEmissionError(
+                        f"record {descriptor.identity!r} field {field.name!r} "
+                        f"names absent record {field.record_id} in {function_name!r}"
+                    )
     named_outputs = dict(outputs or {})
     for function_name, function in functions.items():
         if function_name in named_outputs:
+            continue
+        return_value = function.metadata.get("return_value")
+        if isinstance(return_value, SSAValue):
+            named_outputs[function_name] = (return_value,)
             continue
         declared = tuple(function.metadata.get("named_outputs") or ())
         if not declared:
@@ -2288,6 +2857,32 @@ def emit_module(
                     callee = instruction.attributes.get("callee")
                     if callee in functions and callee not in reachable:
                         pending.append(str(callee))
+        # Keep ordinary wrappers that call a selected implementation.  A
+        # module containing ``cycle -> advance`` with advance as the declared
+        # output surface still needs cycle; dropping it loses the public
+        # entry that owns the call.  Settle both directions so any sibling
+        # callees required by such a wrapper are retained too.
+        changed = True
+        while changed:
+            changed = False
+            for function_name, function in functions.items():
+                callees = {
+                    str(instruction.attributes.get("callee"))
+                    for block in function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op in {"Call", "call"}
+                    and not instruction.attributes.get("tensor_operation")
+                    and instruction.attributes.get("callee") in functions
+                }
+                if function_name in reachable:
+                    additions = callees - reachable
+                elif callees & reachable:
+                    additions = {function_name}
+                else:
+                    additions = set()
+                if additions:
+                    reachable.update(additions)
+                    changed = True
         functions = {
             name: function
             for name, function in functions.items()
@@ -2296,16 +2891,23 @@ def emit_module(
     # Two passes: a subroutine that calls another must pass exactly the
     # extents that one declares, and those are only known once it has been
     # emitted. The first pass is discarded apart from its signatures.
+    callee_arity = {
+        function_name: len(function.args)
+        for function_name, function in functions.items()
+    }
+    callee_output_count = {
+        function_name: len(named_outputs.get(function_name, ()))
+        for function_name in functions
+    }
     callee_extents = {
         function_name: emit_function(
             function,
             dtype=dtype,
             outputs=named_outputs.get(function_name, ()),
+            callee_arity=callee_arity,
+            callee_output_count=callee_output_count,
+            tensor_table=module_tensor_tables.get(function_name),
         ).extent_names
-        for function_name, function in functions.items()
-    }
-    callee_arity = {
-        function_name: len(function.args)
         for function_name, function in functions.items()
     }
     callee_inout_pairs = {
@@ -2336,6 +2938,11 @@ def emit_module(
         method = _method_of(function_name)
         array_bases = method_array_bases.setdefault(method, set())
         mutated_bases = method_mutated_bases.setdefault(method, set())
+        sequence_arrays = set(map(
+            int, function.metadata.get("sequence_array_argument_ids", ())
+        ))
+        array_bases.update(sequence_arrays)
+        mutated_bases.update(sequence_arrays)
         address_to_base: dict[int, int] = {}
         for block in function.blocks.values():
             for instruction in block.instrs:
@@ -2354,6 +2961,23 @@ def emit_module(
                     base = address_to_base.get(int(instruction.args[1].id))
                     if base is not None:
                         mutated_bases.add(base)
+    callee_array_arguments = {
+        function_name: tuple(
+            position
+            for position, argument in enumerate(function.args)
+            if int(argument.id) not in set(map(
+                int,
+                function.metadata.get("scalar_variant_argument_ids", ()),
+            ))
+            and (
+                int(argument.id) in method_array_bases.get(
+                    _method_of(function_name), set()
+                )
+                or _is_array(argument)
+            )
+        )
+        for function_name, function in functions.items()
+    }
     subroutines = tuple(
         emit_function(
             function,
@@ -2361,14 +2985,29 @@ def emit_module(
             outputs=named_outputs.get(function_name, ()),
             callee_extents=callee_extents,
             callee_arity=callee_arity,
+            callee_output_count=callee_output_count,
+            callee_array_arguments=callee_array_arguments,
             callee_inout_pairs=callee_inout_pairs,
-            array_base_ids=method_array_bases.get(_method_of(function_name), set()),
+            array_base_ids=(
+                method_array_bases.get(_method_of(function_name), set())
+                - set(map(
+                    int,
+                    function.metadata.get(
+                        "scalar_variant_argument_ids", ()
+                    ),
+                ))
+            ),
             mutated_base_ids=method_mutated_bases.get(_method_of(function_name), set()),
+            tensor_table=module_tensor_tables.get(function_name),
         )
         for function_name, function in functions.items()
     )
     emitted_extents = {
         function_name: subroutine.extent_names
+        for function_name, subroutine in zip(functions, subroutines)
+    }
+    emitted_dynamic_arrays = {
+        function_name: dict(subroutine.dynamic_array_extents)
         for function_name, subroutine in zip(functions, subroutines)
     }
     lines = [
@@ -2433,6 +3072,15 @@ def emit_module(
                 kind=kind,
                 note=note,
                 source_names=source_names,
+                dynamic_array_extents=emitted_dynamic_arrays.get(
+                    function_name, {}
+                ),
+                array_argument_ids=(
+                    int(function.args[position].id)
+                    for position in callee_array_arguments.get(
+                        function_name, ()
+                    )
+                ),
             )
         )
     control_entries = [e.name for e in entry_points if e.kind == "control"]
@@ -2441,7 +3089,91 @@ def emit_module(
         language="fortran",
         entry=control_entries[0] if control_entries else None,
         entry_points=tuple(entry_points),
-        metadata={"dtype": dtype},
+        metadata={
+            "dtype": dtype,
+            "tensor_table_schema": "turing.repository-ssa-tensor-table.v1",
+            "tensor_tables": {
+                function_name: [
+                    descriptor.to_mapping()
+                    for descriptor in table.tensors.values()
+                ]
+                for function_name, table in module_tensor_tables.items()
+                if function_name in functions and table.tensors
+            },
+            # Sequence descriptors are the public memory contract for every
+            # lowered list/set/dict/table.  Publishing them beside the tensor
+            # table lets a non-Python caller allocate the exact resident
+            # columns and mutable length/status cells the emitted SSA uses;
+            # otherwise the generated signature exposes anonymous pointers
+            # without their row layout, uniqueness, or capacity semantics.
+            "sequence_table_schema": "turing.repository-ssa-sequence-table.v1",
+            "sequence_tables": {
+                function_name: [
+                    {
+                        **descriptor.to_mapping(),
+                        "source_names": list(dict(
+                            functions[function_name].metadata.get(
+                                "sequence_value_names", ()
+                            )
+                        ).get(int(descriptor.sequence_id), ())),
+                    }
+                    for descriptor in table.sequences.values()
+                ]
+                for function_name, table in module_sequence_tables.items()
+                if function_name in functions and table.sequences
+            },
+            "class_table_schema": "turing.repository-ssa-class-table.v1",
+            "class_table": [
+                {
+                    "identity": record.identity,
+                    "fields": [
+                        {"name": field.name, "slot": int(field.slot)}
+                        for field in record.fields
+                    ],
+                    "methods": [
+                        {
+                            "name": method.name,
+                            "function_reference": int(
+                                method.function_reference
+                            ),
+                            "function_name": method.function_name,
+                        }
+                        for method in record.methods
+                    ],
+                }
+                for record in getattr(module_class_table, "classes", ())
+            ],
+            "function_table_schema": "turing.repository-ssa-function-table.v1",
+            "function_table": [
+                {
+                    "reference": int(entry.reference.address),
+                    "name": entry.name,
+                    "qualified_name": entry.qualified_name,
+                    "state": entry.state.value,
+                    "recursive": bool(entry.recursive),
+                    "parameter_contracts": [
+                        {
+                            "name": contract.name,
+                            "transfer": contract.transfer.value,
+                            "access": contract.access.value,
+                            "storage": contract.storage.value,
+                            "scope": contract.scope.value,
+                        }
+                        for contract in entry.parameter_contracts
+                    ],
+                }
+                for entry in (module_function_table or ())
+            ],
+            "record_table_schema": "turing.repository-ssa-record-table.v1",
+            "record_tables": {
+                function_name: [
+                    descriptor.to_mapping()
+                    for descriptor in table.records.values()
+                ]
+                for function_name, table in module_record_tables.items()
+                if function_name in functions and table.records
+            },
+        },
     )
     return FortranModule(name, "\n".join(lines) + "\n", subroutines, api=api)
 
@@ -2522,6 +3254,12 @@ def compile_module(
     shim_sources = standalone_runtime_shim_sources(
         compiler, workdir, standalone
     )
+    if shim_sources and os.name == "nt":
+        # GCC's LTO plugin publishes the shim's weak PE symbol as a different
+        # symbol type from the archive reference.  Compile this small static
+        # runtime link without LTO; ordinary optimized modules keep LTO.
+        compile_flags = tuple(flag for flag in compile_flags if flag != "-flto")
+        link_flags = tuple(flag for flag in link_flags if flag != "-flto")
     command = [
         compiler,
         "-shared",

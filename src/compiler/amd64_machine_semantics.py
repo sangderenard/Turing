@@ -10,9 +10,10 @@ can restore an exact predecessor without running an inverse instruction.
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 import re
+import struct
 
 from .machine_execution import (
     MACHINE_LOADER_CALLBACK_RETURN,
@@ -48,6 +49,15 @@ class PagedByteMemory(Mapping[int, int]):
 
     pages: Mapping[int, bytes]
     page_size: int = 4096
+    # Runtime-only provenance for the immediately preceding copy-on-write
+    # update.  It lets the executor identify touched pages in O(writes)
+    # instead of comparing every mapped page after every instruction.  The
+    # identity check deliberately fails after serialization or reconstruction,
+    # where callers fall back to the exact structural comparison.
+    _parent_pages_identity: int = field(default=0, repr=False, compare=False)
+    _changed_pages: tuple[int, ...] = field(
+        default=(), repr=False, compare=False,
+    )
 
     @classmethod
     def empty(cls, *, page_size: int = 4096) -> "PagedByteMemory":
@@ -74,16 +84,27 @@ class PagedByteMemory(Mapping[int, int]):
         if not raw:
             return self
         pages = dict(self.pages)
+        changed_pages: list[int] = []
         cursor = 0
         while cursor < len(raw):
             absolute = int(address) + cursor
             page_index, page_offset = divmod(absolute, self.page_size)
             count = min(self.page_size - page_offset, len(raw) - cursor)
-            page = bytearray(pages.get(page_index, bytes(self.page_size)))
+            page_was_mapped = page_index in pages
+            previous = pages.get(page_index, bytes(self.page_size))
+            page = bytearray(previous)
             page[page_offset:page_offset + count] = raw[cursor:cursor + count]
-            pages[page_index] = bytes(page)
+            updated = bytes(page)
+            if not page_was_mapped or updated != previous:
+                pages[page_index] = updated
+                changed_pages.append(page_index)
             cursor += count
-        return PagedByteMemory(MappingProxyType(pages), self.page_size)
+        if not changed_pages:
+            return self
+        return PagedByteMemory(
+            MappingProxyType(pages), self.page_size,
+            id(self.pages), tuple(changed_pages),
+        )
 
     def map_zeroes(self, address: int, size: int) -> "PagedByteMemory":
         if size < 0:
@@ -94,9 +115,21 @@ class PagedByteMemory(Mapping[int, int]):
         if address % self.page_size or size < 0 or size % self.page_size:
             raise ValueError("unmapped region must be page aligned")
         pages = dict(self.pages)
-        for page in range(address // self.page_size, (address + size) // self.page_size):
-            pages.pop(page, None)
-        return PagedByteMemory(MappingProxyType(pages), self.page_size)
+        changed_pages = tuple(
+            page
+            for page in range(
+                address // self.page_size, (address + size) // self.page_size,
+            )
+            if page in pages
+        )
+        if not changed_pages:
+            return self
+        for page in changed_pages:
+            pages.pop(page)
+        return PagedByteMemory(
+            MappingProxyType(pages), self.page_size,
+            id(self.pages), changed_pages,
+        )
 
     def read(self, address: int, size: int) -> bytes:
         """Return one exact mapped byte range, including page crossings."""
@@ -228,7 +261,7 @@ def write_operand(state: MachineExecutionState, instruction, operand_index: int,
         vectors = list(state.vector_registers)
         old = vectors[int(operand.register)]
         vectors[int(operand.register)] = (
-            value if target_width == 128
+            value if target_width == 256
             else (old & ~_mask(target_width)) | value
         )
         return replace(state, vector_registers=tuple(vectors))
@@ -293,6 +326,54 @@ def _binary_handler(kind: str, *, write: bool = True):
         result = replace(state, flags=flags)
         return write_operand(result, instruction, 0, raw, width=width) if write else result
     return handler
+
+
+def _multiply_signed(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    """Execute two/three-operand IMUL and define its architectural flags.
+
+    CF and OF are clear exactly when the full signed product is the sign
+    extension of the retained low-width result.  AMD64 leaves the remaining
+    arithmetic flags undefined; the deterministic VM preserves their incoming
+    values instead of inventing meanings for them.
+    """
+
+    accumulator_form = len(instruction.operands) == 1
+    if accumulator_form:
+        width = _data_width(instruction, 0)
+        left = state.registers[0] & _mask(width)
+        right = read_operand(state, instruction, 0, width=width)
+    elif len(instruction.operands) == 2:
+        width = _data_width(instruction, 0)
+        left = read_operand(state, instruction, 0, width=width)
+        right = read_operand(state, instruction, 1, width=width)
+    elif len(instruction.operands) == 3:
+        width = _data_width(instruction, 0)
+        left = read_operand(state, instruction, 1, width=width)
+        right_width = _data_width(instruction, 2)
+        right = read_operand(state, instruction, 2, width=right_width)
+        right = _sign_extend(right, right_width, width)
+    else:
+        raise ValueError("IMUL requires one, two, or three operands")
+
+    sign = 1 << (width - 1)
+    mask = _mask(width)
+    signed_left = (left & mask) - (1 << width) if left & sign else left & mask
+    signed_right = (right & mask) - (1 << width) if right & sign else right & mask
+    full_product = signed_left * signed_right
+    retained = full_product & mask
+    signed_retained = retained - (1 << width) if retained & sign else retained
+    overflow = full_product != signed_retained
+    flags = _set_flag(state.flags, CF, overflow)
+    flags = _set_flag(flags, OF, overflow)
+    result = replace(state, flags=flags)
+    if accumulator_form:
+        registers = list(result.registers)
+        registers[0] = retained
+        registers[2] = (full_product >> width) & mask
+        return replace(result, registers=tuple(registers))
+    return write_operand(result, instruction, 0, retained, width=width)
 
 
 def _subtract_with_borrow(state: MachineExecutionState, instruction) -> MachineExecutionState:
@@ -481,6 +562,16 @@ def _vector_xor(state: MachineExecutionState, instruction) -> MachineExecutionSt
     )
 
 
+def _vector_and(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    width = _data_width(instruction, 0)
+    return write_operand(
+        state, instruction, 0,
+        read_operand(state, instruction, 0, width=width)
+        & read_operand(state, instruction, 1, width=width),
+        width=width,
+    )
+
+
 def _vector_shift_right_logical(state: MachineExecutionState, instruction) -> MachineExecutionState:
     width = _data_width(instruction, 0)
     value = read_operand(state, instruction, 0, width=width)
@@ -510,10 +601,12 @@ def _multiply_unsigned(state: MachineExecutionState, instruction) -> MachineExec
 
 
 def _sign_extend_accumulator(state: MachineExecutionState, instruction) -> MachineExecutionState:
-    """Implement the implicit accumulator forms CDQE and CQO."""
+    """Implement the implicit accumulator forms CDQ, CDQE, and CQO."""
 
     registers = list(state.registers)
-    if instruction.token.name == "CDQE":
+    if instruction.token.name == "CDQ":
+        registers[2] = 0xFFFFFFFF if registers[0] & (1 << 31) else 0
+    elif instruction.token.name == "CDQE":
         registers[0] = _sign_extend(registers[0] & 0xFFFFFFFF, 32, 64)
     elif instruction.token.name == "CQO":
         registers[2] = MASK64 if registers[0] & (1 << 63) else 0
@@ -626,6 +719,32 @@ def _return_stack_effect(state: MachineExecutionState, instruction) -> MachineEx
 
 
 def _string_store(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    if instruction.token.name == "STOSB":
+        destination = state.registers[7]
+        memory = _as_memory(state.memory).write_unsigned(
+            destination, 8, state.registers[0],
+        )
+        registers = list(state.registers)
+        registers[7] = (
+            destination + (-1 if state.flags & (1 << 10) else 1)
+        ) & MASK64
+        return replace(state, registers=tuple(registers), memory=memory)
+    if instruction.token.name == "REP_STOSB":
+        count = state.registers[1]
+        destination = state.registers[7]
+        value = state.registers[0] & 0xFF
+        direction = -1 if state.flags & (1 << 10) else 1
+        memory = _as_memory(state.memory)
+        if count > len(memory):
+            raise ValueError("REP STOSB count exceeds mapped guest memory")
+        for index in range(count):
+            memory = memory.write_unsigned(
+                (destination + index * direction) & MASK64, 8, value,
+            )
+        registers = list(state.registers)
+        registers[1] = 0
+        registers[7] = (destination + count * direction) & MASK64
+        return replace(state, registers=tuple(registers), memory=memory)
     count = state.registers[1]
     destination = state.registers[7]
     value = state.registers[0] & 0xFFFF
@@ -716,8 +835,576 @@ def _bit_test(state: MachineExecutionState, instruction) -> MachineExecutionStat
     )
 
 
+def _bit_scan_reverse(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    width = _data_width(instruction, 0)
+    source = read_operand(state, instruction, 1, width=width)
+    flags = _set_flag(state.flags, ZF, source == 0)
+    if source == 0:
+        # AMD64 leaves the destination undefined. Preserving it gives the
+        # reversible VM a deterministic representative without asserting an
+        # architectural value that downstream SSA could depend upon.
+        return replace(state, flags=flags)
+    return write_operand(
+        replace(state, flags=flags), instruction, 0,
+        source.bit_length() - 1, width=width,
+    )
+
+
+def _signed_int64_to_float64_bits(value: int, mxcsr: int) -> tuple[int, bool]:
+    """Encode signed int64 as binary64 using MXCSR rounding, without host FP."""
+
+    source = int(value) & MASK64
+    signed = source - (1 << 64) if source & (1 << 63) else source
+    if signed == 0:
+        return 0, False
+    sign = signed < 0
+    magnitude = -signed if sign else signed
+    exponent = magnitude.bit_length() - 1
+    if exponent <= 52:
+        significand = magnitude << (52 - exponent)
+        remainder = 0
+        shift = 0
+    else:
+        shift = exponent - 52
+        significand = magnitude >> shift
+        remainder = magnitude & ((1 << shift) - 1)
+    inexact = remainder != 0
+    rounding = (int(mxcsr) >> 13) & 0x3
+    increment = False
+    if remainder:
+        if rounding == 0:
+            half = 1 << (shift - 1)
+            increment = remainder > half or (
+                remainder == half and bool(significand & 1)
+            )
+        elif rounding == 1:  # toward -infinity
+            increment = sign
+        elif rounding == 2:  # toward +infinity
+            increment = not sign
+        # rounding == 3 truncates toward zero.
+    if increment:
+        significand += 1
+        if significand == 1 << 53:
+            significand >>= 1
+            exponent += 1
+    encoded = (
+        (int(sign) << 63)
+        | ((exponent + 1023) << 52)
+        | (significand & ((1 << 52) - 1))
+    )
+    return encoded, inexact
+
+
+def _signed_int64_to_float32_bits(value: int, mxcsr: int) -> tuple[int, bool]:
+    """Encode signed int64 as binary32 using MXCSR, without host FP."""
+
+    source = int(value) & MASK64
+    signed = source - (1 << 64) if source & (1 << 63) else source
+    if signed == 0:
+        return 0, False
+    sign = signed < 0
+    magnitude = -signed if sign else signed
+    exponent = magnitude.bit_length() - 1
+    if exponent <= 23:
+        significand = magnitude << (23 - exponent)
+        remainder = 0
+        shift = 0
+    else:
+        shift = exponent - 23
+        significand = magnitude >> shift
+        remainder = magnitude & ((1 << shift) - 1)
+    inexact = remainder != 0
+    rounding = (int(mxcsr) >> 13) & 0x3
+    increment = False
+    if remainder:
+        if rounding == 0:
+            half = 1 << (shift - 1)
+            increment = remainder > half or (
+                remainder == half and bool(significand & 1)
+            )
+        elif rounding == 1:
+            increment = sign
+        elif rounding == 2:
+            increment = not sign
+    if increment:
+        significand += 1
+        if significand == 1 << 24:
+            significand >>= 1
+            exponent += 1
+    return (
+        (int(sign) << 31)
+        | ((exponent + 127) << 23)
+        | (significand & ((1 << 23) - 1)),
+        inexact,
+    )
+
+
+def _signed_integer_to_scalar_float64(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    source = read_operand(state, instruction, 1, width=64)
+    mxcsr = int(state.system_state.get("amd64.mxcsr", 0x1F80))
+    encoded, inexact = _signed_int64_to_float64_bits(source, mxcsr)
+    if inexact:
+        if not (mxcsr & (1 << 12)):
+            raise FloatingPointError("AMD64 SIMD precision exception")
+        mxcsr |= 1 << 5
+        system_state = dict(state.system_state)
+        system_state["amd64.mxcsr"] = mxcsr
+        state = replace(state, system_state=MappingProxyType(system_state))
+    # Legacy CVTSI2SD replaces only the low scalar lane.
+    return write_operand(state, instruction, 0, encoded, width=64)
+
+
+def _signed_integer_to_scalar_float32(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    source = read_operand(state, instruction, 1, width=64)
+    mxcsr = int(state.system_state.get("amd64.mxcsr", 0x1F80))
+    encoded, inexact = _signed_int64_to_float32_bits(source, mxcsr)
+    if inexact:
+        if not (mxcsr & (1 << 12)):
+            raise FloatingPointError("AMD64 SIMD precision exception")
+        mxcsr |= 1 << 5
+        system_state = dict(state.system_state)
+        system_state["amd64.mxcsr"] = mxcsr
+        state = replace(state, system_state=MappingProxyType(system_state))
+    return write_operand(state, instruction, 0, encoded, width=32)
+
+
+def _vector_move_low_zero_upper(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    width = 32 if instruction.token.name == "MOVD_XMM_RM32" else 64
+    value = read_operand(state, instruction, 1, width=width)
+    destination = instruction.operands[0]
+    if not isinstance(destination, VectorRegisterOperand):
+        raise ValueError("MOVQ zero-upper form requires an XMM destination")
+    vectors = list(state.vector_registers)
+    vectors[int(destination.register)] = value & _mask(width)
+    return replace(state, vector_registers=tuple(vectors))
+
+
+def _vector_insert_128_lane(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    if len(instruction.operands) != 4:
+        raise ValueError("VINSERTF128 requires four explicit operands")
+    destination, first_source, _second_source, selector = instruction.operands
+    if not isinstance(destination, VectorRegisterOperand) or destination.width != 256:
+        raise ValueError("VINSERTF128 destination must be a YMM register")
+    if not isinstance(first_source, VectorRegisterOperand) or first_source.width != 256:
+        raise ValueError("VINSERTF128 first source must be a YMM register")
+    if not isinstance(selector, ImmediateOperand):
+        raise ValueError("VINSERTF128 lane selector must be immediate")
+    base = read_operand(state, instruction, 1, width=256)
+    inserted = read_operand(state, instruction, 2, width=128)
+    shift = 128 if selector.value & 1 else 0
+    lane_mask = _mask(128) << shift
+    result = (base & ~lane_mask) | ((inserted & _mask(128)) << shift)
+    return write_operand(state, instruction, 0, result, width=256)
+
+
+def _float64_nan_bits(value: int) -> bool:
+    return (value & 0x7FF0000000000000) == 0x7FF0000000000000 \
+        and (value & 0x000FFFFFFFFFFFFF) != 0
+
+
+def _float64_signaling_nan_bits(value: int) -> bool:
+    return _float64_nan_bits(value) and not bool(value & (1 << 51))
+
+
+def _float32_nan_bits(value: int) -> bool:
+    return (value & 0x7F800000) == 0x7F800000 and (value & 0x007FFFFF) != 0
+
+
+def _float32_signaling_nan_bits(value: int) -> bool:
+    return _float32_nan_bits(value) and not bool(value & (1 << 22))
+
+
+def _mxcsr_invalid(state: MachineExecutionState) -> MachineExecutionState:
+    system_state = dict(state.system_state)
+    mxcsr = int(system_state.get("amd64.mxcsr", 0x1F80))
+    if not (mxcsr & (1 << 7)):
+        raise FloatingPointError("AMD64 SIMD invalid-operation exception")
+    system_state["amd64.mxcsr"] = mxcsr | 1
+    return replace(state, system_state=MappingProxyType(system_state))
+
+
+def _scalar_float64_compare(
+    state: MachineExecutionState, instruction, *, ordered: bool,
+) -> MachineExecutionState:
+    left_bits = read_operand(state, instruction, 0, width=64)
+    right_bits = read_operand(state, instruction, 1, width=64)
+    left = struct.unpack("<d", int(left_bits).to_bytes(8, "little"))[0]
+    right = struct.unpack("<d", int(right_bits).to_bytes(8, "little"))[0]
+    unordered = _float64_nan_bits(left_bits) or _float64_nan_bits(right_bits)
+    invalid = (
+        unordered if ordered else (
+            _float64_signaling_nan_bits(left_bits)
+            or _float64_signaling_nan_bits(right_bits)
+        )
+    )
+    if invalid:
+        state = _mxcsr_invalid(state)
+    flags = state.flags
+    for bit in (OF, SF, AF):
+        flags = _set_flag(flags, bit, False)
+    if unordered:
+        cf = pf = zf = True
+    elif left > right:
+        cf = pf = zf = False
+    elif left < right:
+        cf, pf, zf = True, False, False
+    else:
+        cf, pf, zf = False, False, True
+    flags = _set_flag(flags, CF, cf)
+    flags = _set_flag(flags, PF, pf)
+    flags = _set_flag(flags, ZF, zf)
+    return replace(state, flags=flags)
+
+
+def _scalar_float64_compare_unordered(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    return _scalar_float64_compare(state, instruction, ordered=False)
+
+
+def _scalar_float64_compare_ordered(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    return _scalar_float64_compare(state, instruction, ordered=True)
+
+
+def _scalar_float32_compare_ordered(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    left_bits = read_operand(state, instruction, 0, width=32)
+    right_bits = read_operand(state, instruction, 1, width=32)
+    left = struct.unpack("<f", int(left_bits).to_bytes(4, "little"))[0]
+    right = struct.unpack("<f", int(right_bits).to_bytes(4, "little"))[0]
+    unordered = _float32_nan_bits(left_bits) or _float32_nan_bits(right_bits)
+    if unordered:
+        state = _mxcsr_invalid(state)
+    flags = state.flags
+    for bit in (OF, SF, AF):
+        flags = _set_flag(flags, bit, False)
+    if unordered:
+        cf = pf = zf = True
+    elif left > right:
+        cf = pf = zf = False
+    elif left < right:
+        cf, pf, zf = True, False, False
+    else:
+        cf, pf, zf = False, False, True
+    flags = _set_flag(flags, CF, cf)
+    flags = _set_flag(flags, PF, pf)
+    flags = _set_flag(flags, ZF, zf)
+    return replace(state, flags=flags)
+
+
+def _scalar_float64_add(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    mxcsr = int(state.system_state.get("amd64.mxcsr", 0x1F80))
+    rounding = (mxcsr >> 13) & 0x3
+    if rounding != 0:
+        raise ValueError(
+            "ADDSD directed rounding awaits exact MXCSR rounding semantics"
+        )
+    left_bits = read_operand(state, instruction, 0, width=64)
+    right_bits = read_operand(state, instruction, 1, width=64)
+    left = struct.unpack("<d", int(left_bits).to_bytes(8, "little"))[0]
+    right = struct.unpack("<d", int(right_bits).to_bytes(8, "little"))[0]
+    encoded = int.from_bytes(struct.pack("<d", left + right), "little")
+    # Legacy ADDSD replaces the low lane and preserves the destination high lane.
+    return write_operand(state, instruction, 0, encoded, width=64)
+
+
+def _scalar_float32_add(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    mxcsr = int(state.system_state.get("amd64.mxcsr", 0x1F80))
+    if ((mxcsr >> 13) & 0x3) != 0:
+        raise ValueError(
+            "ADDSS directed rounding awaits exact MXCSR rounding semantics"
+        )
+    left_bits = read_operand(state, instruction, 0, width=32)
+    right_bits = read_operand(state, instruction, 1, width=32)
+    left = struct.unpack("<f", int(left_bits).to_bytes(4, "little"))[0]
+    right = struct.unpack("<f", int(right_bits).to_bytes(4, "little"))[0]
+    encoded = int.from_bytes(struct.pack("<f", left + right), "little")
+    # Legacy ADDSS replaces only the low lane and preserves upper 96 bits.
+    return write_operand(state, instruction, 0, encoded, width=32)
+
+
+def _scalar_float32_divide(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    mxcsr = int(state.system_state.get("amd64.mxcsr", 0x1F80))
+    if ((mxcsr >> 13) & 0x3) != 0:
+        raise ValueError(
+            "DIVSS directed rounding awaits exact MXCSR rounding semantics"
+        )
+    left_bits = read_operand(state, instruction, 0, width=32)
+    right_bits = read_operand(state, instruction, 1, width=32)
+    left = struct.unpack("<f", int(left_bits).to_bytes(4, "little"))[0]
+    right = struct.unpack("<f", int(right_bits).to_bytes(4, "little"))[0]
+    # The concrete VM is a diagnostic oracle for the default masked state;
+    # repository SSA above retains the complete encoded/MXCSR operation.
+    if right == 0.0:
+        if left == 0.0:
+            state = _mxcsr_invalid(state)
+            encoded = 0x7FC00000
+        else:
+            system_state = dict(state.system_state)
+            current = int(system_state.get("amd64.mxcsr", 0x1F80))
+            if not (current & (1 << 9)):
+                raise FloatingPointError("AMD64 SIMD divide-by-zero exception")
+            system_state["amd64.mxcsr"] = current | (1 << 2)
+            state = replace(state, system_state=MappingProxyType(system_state))
+            sign = ((left_bits ^ right_bits) >> 31) & 1
+            encoded = (sign << 31) | 0x7F800000
+    else:
+        encoded = int.from_bytes(struct.pack("<f", left / right), "little")
+    return write_operand(state, instruction, 0, encoded, width=32)
+
+
+def _scalar_float64_divide(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    mxcsr = int(state.system_state.get("amd64.mxcsr", 0x1F80))
+    if ((mxcsr >> 13) & 0x3) != 0:
+        raise ValueError(
+            "DIVSD directed rounding awaits exact MXCSR rounding semantics"
+        )
+    left_bits = read_operand(state, instruction, 0, width=64)
+    right_bits = read_operand(state, instruction, 1, width=64)
+    left = struct.unpack("<d", int(left_bits).to_bytes(8, "little"))[0]
+    right = struct.unpack("<d", int(right_bits).to_bytes(8, "little"))[0]
+    if right == 0.0:
+        if left == 0.0:
+            state = _mxcsr_invalid(state)
+            encoded = 0x7FF8000000000000
+        else:
+            system_state = dict(state.system_state)
+            current = int(system_state.get("amd64.mxcsr", 0x1F80))
+            if not (current & (1 << 9)):
+                raise FloatingPointError("AMD64 SIMD divide-by-zero exception")
+            system_state["amd64.mxcsr"] = current | (1 << 2)
+            state = replace(state, system_state=MappingProxyType(system_state))
+            sign = ((left_bits ^ right_bits) >> 63) & 1
+            encoded = (sign << 63) | 0x7FF0000000000000
+    else:
+        encoded = int.from_bytes(struct.pack("<d", left / right), "little")
+    return write_operand(state, instruction, 0, encoded, width=64)
+
+
+def _scalar_float64_subtract(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    mxcsr = int(state.system_state.get("amd64.mxcsr", 0x1F80))
+    if ((mxcsr >> 13) & 0x3) != 0:
+        raise ValueError(
+            "SUBSD directed rounding awaits exact MXCSR rounding semantics"
+        )
+    left_bits = read_operand(state, instruction, 0, width=64)
+    right_bits = read_operand(state, instruction, 1, width=64)
+    left = struct.unpack("<d", int(left_bits).to_bytes(8, "little"))[0]
+    right = struct.unpack("<d", int(right_bits).to_bytes(8, "little"))[0]
+    encoded = int.from_bytes(struct.pack("<d", left - right), "little")
+    return write_operand(state, instruction, 0, encoded, width=64)
+
+
+def _scalar_float64_to_signed_int64_truncate(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    bits = read_operand(state, instruction, 1, width=64)
+    sign = (bits >> 63) & 1
+    exponent = (bits >> 52) & 0x7FF
+    fraction = bits & ((1 << 52) - 1)
+    invalid = exponent == 0x7FF
+    if not invalid:
+        if exponent == 0:
+            magnitude = 0
+        else:
+            unbiased = exponent - 1023
+            significand = (1 << 52) | fraction
+            if unbiased < 0:
+                magnitude = 0
+            elif unbiased >= 52:
+                magnitude = significand << (unbiased - 52)
+            else:
+                magnitude = significand >> (52 - unbiased)
+        invalid = magnitude > ((1 << 63) if sign else (1 << 63) - 1)
+    if invalid:
+        state = _mxcsr_invalid(state)
+        result = 1 << 63
+    else:
+        result = (-magnitude if sign else magnitude) & MASK64
+    return write_operand(state, instruction, 0, result, width=64)
+
+
+def _scalar_float64_to_signed_int32_truncate(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    bits = read_operand(state, instruction, 1, width=64)
+    sign = (bits >> 63) & 1
+    exponent = (bits >> 52) & 0x7FF
+    fraction = bits & ((1 << 52) - 1)
+    invalid = exponent == 0x7FF
+    if not invalid:
+        if exponent == 0:
+            magnitude = 0
+        else:
+            unbiased = exponent - 1023
+            significand = (1 << 52) | fraction
+            if unbiased < 0:
+                magnitude = 0
+            elif unbiased >= 52:
+                magnitude = significand << (unbiased - 52)
+            else:
+                magnitude = significand >> (52 - unbiased)
+        invalid = magnitude > ((1 << 31) if sign else (1 << 31) - 1)
+    if invalid:
+        state = _mxcsr_invalid(state)
+        result = 1 << 31
+    else:
+        result = (-magnitude if sign else magnitude) & 0xFFFFFFFF
+    return write_operand(state, instruction, 0, result, width=32)
+
+
+def _byte_swap(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    width = _data_width(instruction, 0)
+    value = read_operand(state, instruction, 0, width=width)
+    swapped = int.from_bytes(
+        int(value).to_bytes(width // 8, "little"), "big",
+    )
+    return write_operand(state, instruction, 0, swapped, width=width)
+
+
+def _vector_unpack_low_qwords(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    left = read_operand(state, instruction, 0, width=128)
+    right = read_operand(state, instruction, 1, width=128)
+    result = (left & MASK64) | ((right & MASK64) << 64)
+    return write_operand(state, instruction, 0, result, width=128)
+
+
+def _vector_unpack_low_bytes(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    left = read_operand(state, instruction, 0, width=128)
+    right = read_operand(state, instruction, 1, width=128)
+    result = 0
+    for index in range(8):
+        result |= ((left >> (index * 8)) & 0xFF) << (index * 16)
+        result |= ((right >> (index * 8)) & 0xFF) << (index * 16 + 8)
+    return write_operand(state, instruction, 0, result, width=128)
+
+
+def _vector_unpack_low_words(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    left = read_operand(state, instruction, 0, width=128)
+    right = read_operand(state, instruction, 1, width=128)
+    result = 0
+    for index in range(4):
+        result |= ((left >> (index * 16)) & 0xFFFF) << (index * 32)
+        result |= ((right >> (index * 16)) & 0xFFFF) << (index * 32 + 16)
+    return write_operand(state, instruction, 0, result, width=128)
+
+
+def _scalar_float64_multiply(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    mxcsr = int(state.system_state.get("amd64.mxcsr", 0x1F80))
+    if ((mxcsr >> 13) & 0x3) != 0:
+        raise ValueError(
+            "MULSD directed rounding awaits exact MXCSR rounding semantics"
+        )
+    left_bits = read_operand(state, instruction, 0, width=64)
+    right_bits = read_operand(state, instruction, 1, width=64)
+    left = struct.unpack("<d", int(left_bits).to_bytes(8, "little"))[0]
+    right = struct.unpack("<d", int(right_bits).to_bytes(8, "little"))[0]
+    encoded = int.from_bytes(struct.pack("<d", left * right), "little")
+    return write_operand(state, instruction, 0, encoded, width=64)
+
+
+def _vector_add_qwords(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    left = read_operand(state, instruction, 0, width=128)
+    right = read_operand(state, instruction, 1, width=128)
+    result = (
+        ((left & MASK64) + (right & MASK64)) & MASK64
+        | (
+            ((((left >> 64) & MASK64) + ((right >> 64) & MASK64)) & MASK64)
+            << 64
+        )
+    )
+    return write_operand(state, instruction, 0, result, width=128)
+
+
+def _vector_compare_equal_qwords(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    left = read_operand(state, instruction, 0, width=128)
+    right = read_operand(state, instruction, 1, width=128)
+    low = MASK64 if (left & MASK64) == (right & MASK64) else 0
+    high = MASK64 if ((left >> 64) & MASK64) == ((right >> 64) & MASK64) else 0
+    return write_operand(state, instruction, 0, low | (high << 64), width=128)
+
+
+def _vector_subtract_qwords(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    left = read_operand(state, instruction, 0, width=128)
+    right = read_operand(state, instruction, 1, width=128)
+    result = (
+        ((left & MASK64) - (right & MASK64)) & MASK64
+        | (
+            ((((left >> 64) & MASK64) - ((right >> 64) & MASK64)) & MASK64)
+            << 64
+        )
+    )
+    return write_operand(state, instruction, 0, result, width=128)
+
+
+def _vector_shuffle_dwords(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    source = read_operand(state, instruction, 1, width=128)
+    control = read_operand(state, instruction, 2, width=8)
+    result = 0
+    for destination_lane in range(4):
+        source_lane = (control >> (2 * destination_lane)) & 0x3
+        lane = (source >> (32 * source_lane)) & 0xFFFFFFFF
+        result |= lane << (32 * destination_lane)
+    return write_operand(state, instruction, 0, result, width=128)
+
+
+def _vector_signed_int32_to_float64(
+    state: MachineExecutionState, instruction,
+) -> MachineExecutionState:
+    packed = read_operand(state, instruction, 1, width=64)
+    result = 0
+    mxcsr = int(state.system_state.get("amd64.mxcsr", 0x1F80))
+    for lane in range(2):
+        raw = (packed >> (32 * lane)) & 0xFFFFFFFF
+        signed = raw - (1 << 32) if raw & (1 << 31) else raw
+        encoded, inexact = _signed_int64_to_float64_bits(signed, mxcsr)
+        assert not inexact
+        result |= encoded << (64 * lane)
+    return write_operand(state, instruction, 0, result, width=128)
+
+
 def default_effect_handlers() -> Mapping[int, object]:
     handlers = {
+        MachineSemanticToken.INTEGER_MULTIPLY: _multiply_signed,
         MachineSemanticToken.EFFECTIVE_ADDRESS: _lea,
         MachineSemanticToken.INTEGER_SUBTRACT: _binary_handler("sub"),
         MachineSemanticToken.INTEGER_ADD: _binary_handler("add"),
@@ -746,6 +1433,7 @@ def default_effect_handlers() -> Mapping[int, object]:
         MachineSemanticToken.ATOMIC_ADD: _binary_handler("add"),
         MachineSemanticToken.EXCHANGE: _exchange,
         MachineSemanticToken.VECTOR_XOR: _vector_xor,
+        MachineSemanticToken.VECTOR_AND: _vector_and,
         MachineSemanticToken.VECTOR_MOVE: _move,
         MachineSemanticToken.VECTOR_SHIFT_RIGHT_LOGICAL: _vector_shift_right_logical,
         MachineSemanticToken.INTEGER_MULTIPLY_UNSIGNED: _multiply_unsigned,
@@ -766,6 +1454,31 @@ def default_effect_handlers() -> Mapping[int, object]:
         MachineSemanticToken.BIT_TEST: _bit_test,
         MachineSemanticToken.BIT_TEST_RESET: _bit_test,
         MachineSemanticToken.BIT_TEST_COMPLEMENT: _bit_test,
+        MachineSemanticToken.BIT_SCAN_REVERSE: _bit_scan_reverse,
+        MachineSemanticToken.SIGNED_INTEGER_TO_SCALAR_FLOAT64: _signed_integer_to_scalar_float64,
+        MachineSemanticToken.SIGNED_INTEGER_TO_SCALAR_FLOAT32: _signed_integer_to_scalar_float32,
+        MachineSemanticToken.VECTOR_MOVE_LOW_ZERO_UPPER: _vector_move_low_zero_upper,
+        MachineSemanticToken.SCALAR_FLOAT64_COMPARE_UNORDERED: _scalar_float64_compare_unordered,
+        MachineSemanticToken.SCALAR_FLOAT64_ADD: _scalar_float64_add,
+        MachineSemanticToken.SCALAR_FLOAT32_ADD: _scalar_float32_add,
+        MachineSemanticToken.SCALAR_FLOAT32_DIVIDE: _scalar_float32_divide,
+        MachineSemanticToken.SCALAR_FLOAT64_DIVIDE: _scalar_float64_divide,
+        MachineSemanticToken.SCALAR_FLOAT64_SUBTRACT: _scalar_float64_subtract,
+        MachineSemanticToken.SCALAR_FLOAT64_TO_SIGNED_INT64_TRUNCATE: _scalar_float64_to_signed_int64_truncate,
+        MachineSemanticToken.SCALAR_FLOAT64_TO_SIGNED_INT32_TRUNCATE: _scalar_float64_to_signed_int32_truncate,
+        MachineSemanticToken.BYTE_SWAP: _byte_swap,
+        MachineSemanticToken.VECTOR_UNPACK_LOW_QWORDS: _vector_unpack_low_qwords,
+        MachineSemanticToken.VECTOR_UNPACK_LOW_BYTES: _vector_unpack_low_bytes,
+        MachineSemanticToken.SCALAR_FLOAT64_MULTIPLY: _scalar_float64_multiply,
+        MachineSemanticToken.VECTOR_ADD_QWORDS: _vector_add_qwords,
+        MachineSemanticToken.VECTOR_COMPARE_EQUAL_QWORDS: _vector_compare_equal_qwords,
+        MachineSemanticToken.VECTOR_SUBTRACT_QWORDS: _vector_subtract_qwords,
+        MachineSemanticToken.VECTOR_SHUFFLE_DWORDS: _vector_shuffle_dwords,
+        MachineSemanticToken.VECTOR_SIGNED_INT32_TO_FLOAT64: _vector_signed_int32_to_float64,
+        MachineSemanticToken.SCALAR_FLOAT64_COMPARE_ORDERED: _scalar_float64_compare_ordered,
+        MachineSemanticToken.SCALAR_FLOAT32_COMPARE_ORDERED: _scalar_float32_compare_ordered,
+        MachineSemanticToken.VECTOR_UNPACK_LOW_WORDS: _vector_unpack_low_words,
+        MachineSemanticToken.VECTOR_INSERT_128_LANE: _vector_insert_128_lane,
     }
     return MappingProxyType({int(token): handler for token, handler in handlers.items()})
 

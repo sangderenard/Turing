@@ -19,6 +19,7 @@ env
 # media produced while debugging.  These are session output, not sources.
 .codex-*
 .probe_*
+.native_re_compile*/
 .conv_batch*.py
 .convert.py
 .a[0-9]*.log

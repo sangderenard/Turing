@@ -60,6 +60,8 @@ class DecodeReport:
     decoded_bytes: int
     stopped_at_return: bool
     stopped_at_control_transfer: bool = False
+    unreachable_spans: tuple[tuple[int, int], ...] = ()
+    external_fallthrough_addresses: tuple[int, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -311,6 +313,99 @@ class X86InstructionToken(IntEnum):
     XOR_RM32_R32 = 217
     SHL_RM64_CL = 218
     NOT_RM8 = 219
+    SAR_RM64_IMM8 = 220
+    JNS_REL32 = 221
+    MOVSX_R64_RM8 = 222
+    IMUL_R64_RM64 = 223
+    OR_RM8_IMM8 = 224
+    SUB_RM32_IMM32 = 225
+    XOR_RM64_IMM8 = 226
+    CMOVG_R32_RM32 = 227
+    CMOVG_R64_RM64 = 228
+    CMOVNS_R32_RM32 = 229
+    ADD_EAX_IMM32 = 230
+    SUB_EAX_IMM32 = 231
+    OR_AL_IMM8 = 232
+    SUB_RM8_IMM8 = 233
+    OR_R16_RM16 = 234
+    SUB_RM64_R64 = 235
+    CMOVLE_R64_RM64 = 236
+    SETAE_RM8 = 237
+    XCHG_RM32_R32 = 238
+    CDQ = 239
+    IDIV_RM32 = 240
+    BSR_R32_RM32 = 241
+    CVTSI2SD_XMM_RM64 = 242
+    MOVQ_XMM_RM64 = 243
+    MOVSX_R32_RM8 = 244
+    SHR_RM64_CL = 245
+    SETL_RM8 = 246
+    SETS_RM8 = 247
+    CMOVNS_R64_RM64 = 248
+    CMOVA_R64_RM64 = 249
+    SHR_RM32_CL = 250
+    SAR_RM32_IMM8 = 251
+    AND_AX_IMM16 = 252
+    MOV_RM16_IMM16 = 253
+    XOR_RM64_IMM32 = 254
+    BSR_R64_RM64 = 255
+    DEC_RM8 = 256
+    INC_RM8 = 257
+    SUB_R8_RM8 = 258
+    UCOMISD_XMM_XMMM64 = 259
+    MOVQ_XMM_XMMM64 = 260
+    ADDSD_XMM_XMMM64 = 261
+    PUNPCKLQDQ_XMM_XMMM128 = 262
+    SHL_RM8_IMM8 = 263
+    ADD_RM8_IMM8 = 264
+    JP_REL8 = 265
+    PUNPCKLBW_XMM_XMMM128 = 266
+    MULSD_XMM_XMMM64 = 267
+    PADDQ_XMM_XMMM128 = 268
+    IMUL_R64_RM64_IMM32 = 269
+    COMISD_XMM_XMMM64 = 270
+    PUNPCKLWD_XMM_XMMM128 = 271
+    MOVD_XMM_RM32 = 272
+    CMOVGE_R64_RM64 = 273
+    SUB_AL_IMM8 = 274
+    ADD_R8_RM8 = 275
+    IMUL_RM64 = 276
+    CMOVBE_R64_RM64 = 277
+    ADD_RM16_R16 = 278
+    CVTSI2SS_XMM_RM64 = 279
+    ADDSS_XMM_XMMM32 = 280
+    DIVSS_XMM_XMMM32 = 281
+    COMISS_XMM_XMMM32 = 282
+    CMOVS_R64_RM64 = 283
+    DIVSD_XMM_XMMM64 = 284
+    CMPXCHG_RM32_R32 = 285
+    AND_RM64_IMM32 = 286
+    BSWAP_R32 = 287
+    ROR_RM16_IMM8 = 288
+    SUBSD_XMM_XMMM64 = 289
+    CMOVS_R32_RM32 = 290
+    CVTTSD2SI_R64_XMMM64 = 291
+    SUB_RM32_R32 = 292
+    PCMPEQQ_XMM_XMMM128 = 293
+    SAR_RM32_1 = 294
+    PSUBQ_XMM_XMMM128 = 295
+    SBB_R8_RM8 = 296
+    ADD_AL_IMM8 = 297
+    IMUL_R32_RM32_IMM32 = 298
+    ANDPS_XMM_XMMM128 = 299
+    CMOVGE_R32_RM32 = 300
+    IMUL_RM32 = 301
+    PSHUFD_XMM_XMMM128_IMM8 = 302
+    CVTTSD2SI_R32_XMMM64 = 303
+    CVTDQ2PD_XMM_XMMM64 = 304
+    MOVD_RM32_XMM = 305
+    ROR_RM64_CL = 306
+    LOCK_INC_RM32 = 307
+    VINSERTF128_YMM_YMM_XMMM128_IMM8 = 308
+    VMOVDQA_YMMM256_YMM = 309
+    STOSB = 310
+    VMOVNTDQ_M256_YMM = 311
+    REP_STOSB = 312
 
 
 class MachineSemanticToken(IntEnum):
@@ -370,6 +465,33 @@ class MachineSemanticToken(IntEnum):
     BIT_TEST_COMPLEMENT = 51
     SOFTWARE_INTERRUPT = 52
     INTEGER_DIVIDE_SIGNED = 53
+    BIT_SCAN_REVERSE = 54
+    SIGNED_INTEGER_TO_SCALAR_FLOAT64 = 55
+    VECTOR_MOVE_LOW_ZERO_UPPER = 56
+    SCALAR_FLOAT64_COMPARE_UNORDERED = 57
+    SCALAR_FLOAT64_ADD = 58
+    VECTOR_UNPACK_LOW_QWORDS = 59
+    VECTOR_UNPACK_LOW_BYTES = 60
+    SCALAR_FLOAT64_MULTIPLY = 61
+    VECTOR_ADD_QWORDS = 62
+    SCALAR_FLOAT64_COMPARE_ORDERED = 63
+    VECTOR_UNPACK_LOW_WORDS = 64
+    SIGNED_INTEGER_TO_SCALAR_FLOAT32 = 65
+    SCALAR_FLOAT32_ADD = 66
+    SCALAR_FLOAT32_DIVIDE = 67
+    SCALAR_FLOAT32_COMPARE_ORDERED = 68
+    SCALAR_FLOAT64_DIVIDE = 69
+    BYTE_SWAP = 70
+    SCALAR_FLOAT64_SUBTRACT = 71
+    SCALAR_FLOAT64_TO_SIGNED_INT64_TRUNCATE = 72
+    VECTOR_COMPARE_EQUAL_QWORDS = 73
+    VECTOR_SUBTRACT_QWORDS = 74
+    VECTOR_AND = 75
+    VECTOR_SHUFFLE_DWORDS = 76
+    SCALAR_FLOAT64_TO_SIGNED_INT32_TRUNCATE = 77
+    VECTOR_SIGNED_INT32_TO_FLOAT64 = 78
+    ATOMIC_INCREMENT = 79
+    VECTOR_INSERT_128_LANE = 80
 
 
 class X86Register(IntEnum):
@@ -508,6 +630,16 @@ class InstructionSpec:
     require_rex_w: bool = False
     allowed_legacy_prefixes: frozenset[int] = frozenset()
     required_legacy_prefixes: frozenset[int] = frozenset()
+    # Optional reversible layout metadata.  The reference decoder remains
+    # authoritative even when this is absent; present metadata is compiled
+    # into the tensor accelerator and the incremental write head.
+    reversible_operand_form: str | None = None
+    reversible_immediate_bytes: int = 0
+    reversible_immediate_signed: bool = False
+    reversible_immediate_relative: bool = False
+    reversible_terminal: bool = False
+    reversible_allowed_rex_mask: int = 0x0F
+    reversible_modrm_memory_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -632,11 +764,16 @@ def _decode_imul_operands(
     rex: int | None,
 ) -> tuple[tuple[MachineOperand, ...], int]:
     decoded = _decode_modrm(region, offset, address, rex)
-    if not isinstance(decoded.rm, RegisterOperand):
-        raise VocabularyDecodeError(
-            f"{address:#x}: IMUL memory-source decoding exists, but memory-state "
-            "semantics are not in the current lifting vocabulary"
-        )
+    return (decoded.reg, decoded.rm), decoded.next_offset
+
+
+def _decode_imul_r64_rm64_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    decoded = _decode_modrm(region, offset, address, rex, register_width=64)
     return (decoded.reg, decoded.rm), decoded.next_offset
 
 
@@ -762,6 +899,78 @@ def _decode_vector_rm_reg_operands(region, offset, address, rex):
     )
 
 
+def _decode_vinsertf128_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    """Decode VEX.256.66.0F3A.W0 18 /r ib without hiding VEX fields.
+
+    ``offset`` follows the four-byte VEX/opcode path.  The inverted VEX R/X/B
+    and vvvv fields are recovered from the authored bytes and translated into
+    the same register/address objects used by the rest of the repository.
+    """
+
+    if rex is not None:
+        raise VocabularyDecodeError(
+            f"{address:#x}: VINSERTF128 cannot carry a legacy REX prefix"
+        )
+    _need(region, offset - 3, 3, address)
+    vex1 = int(region[offset - 3])
+    vex2 = int(region[offset - 2])
+    # The InstructionSpec mask proves map=0F3A, W=0, L=1 and pp=66.
+    vex_rex = (
+        (0x4 if not vex1 & 0x80 else 0)
+        | (0x2 if not vex1 & 0x40 else 0)
+        | (0x1 if not vex1 & 0x20 else 0)
+    )
+    decoded = _decode_modrm(
+        region, offset, address, vex_rex, register_width=128,
+    )
+    destination = VectorRegisterOperand(
+        _xmm(int(decoded.reg.register)), width=256,
+    )
+    first_source = VectorRegisterOperand(
+        _xmm((~(vex2 >> 3)) & 0xF), width=256,
+    )
+    if isinstance(decoded.rm, RegisterOperand):
+        second_source: MachineOperand = VectorRegisterOperand(
+            _xmm(int(decoded.rm.register)), width=128,
+        )
+    else:
+        second_source = decoded.rm
+    _need(region, decoded.next_offset, 1, address)
+    immediate = ImmediateOperand(
+        int(region[decoded.next_offset]), 8, False,
+    )
+    return (
+        destination, first_source, second_source, immediate,
+    ), decoded.next_offset + 1
+
+
+def _decode_vmovdqa_store_operands(region, offset, address, rex):
+    if rex is not None:
+        raise VocabularyDecodeError(
+            f"{address:#x}: VMOVDQA cannot carry a legacy REX prefix"
+        )
+    _need(region, offset - 2, 2, address)
+    vex2 = int(region[offset - 2])
+    vex_rex = 0x4 if not vex2 & 0x80 else 0
+    decoded = _decode_modrm(
+        region, offset, address, vex_rex, register_width=256,
+    )
+    source = VectorRegisterOperand(
+        _xmm(int(decoded.reg.register)), width=256,
+    )
+    destination: MachineOperand = decoded.rm
+    if isinstance(destination, RegisterOperand):
+        destination = VectorRegisterOperand(
+            _xmm(int(destination.register)), width=256,
+        )
+    return (destination, source), decoded.next_offset
+
+
 def _decode_binary_rm32_r32_operands(
     region: memoryview,
     offset: int,
@@ -812,6 +1021,22 @@ def _decode_binary_rm8_r8_operands(
     return (decoded.rm, decoded.reg), decoded.next_offset
 
 
+def _decode_lock_add_rm8_r8_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    operands, next_offset = _decode_binary_rm8_r8_operands(
+        region, offset, address, rex,
+    )
+    if isinstance(operands[0], RegisterOperand):
+        raise VocabularyDecodeError(
+            f"{address:#x}: LOCK ADD requires a memory destination"
+        )
+    return operands, next_offset
+
+
 def _decode_binary_r8_rm8_operands(
     region: memoryview,
     offset: int,
@@ -821,6 +1046,20 @@ def _decode_binary_r8_rm8_operands(
     _decode_binary_rm8_r8_operands(region, offset, address, rex)
     decoded = _decode_modrm(region, offset, address, rex, register_width=8)
     return (decoded.reg, decoded.rm), decoded.next_offset
+
+
+def _decode_vector_xmm_rm64_data_operands(region, offset, address, rex):
+    return _decode_vector_binary_operands(
+        region, offset, address, rex, destination_in_reg=True,
+    )
+
+
+def _decode_vector_xmm_rm32_data_operands(region, offset, address, rex):
+    # The ModR/M register namespace is XMM for both operands.  The semantic
+    # width of a memory source is supplied by ADDSS rather than by ModR/M.
+    return _decode_vector_binary_operands(
+        region, offset, address, rex, destination_in_reg=True,
+    )
 
 
 def _decode_nop_rm_operands(
@@ -884,10 +1123,6 @@ def _decode_sub_r64_imm8_operands(
             f"{address:#x}: REX.R is not part of the group-1 /5 opcode extension"
         )
     decoded = _decode_modrm(region, offset, address, rex, register_width=64)
-    if not isinstance(decoded.rm, RegisterOperand):
-        raise VocabularyDecodeError(
-            f"{address:#x}: SUB memory-destination state is outside this token"
-        )
     immediate = _signed(region, decoded.next_offset, 1, address)
     return (
         decoded.rm,
@@ -961,10 +1196,6 @@ def _decode_sub_r64_imm32_operands(
             f"{address:#x}: REX.R is not part of the group-1 /5 opcode extension"
         )
     decoded = _decode_modrm(region, offset, address, rex, register_width=64)
-    if not isinstance(decoded.rm, RegisterOperand):
-        raise VocabularyDecodeError(
-            f"{address:#x}: SUB imm32 memory destination is outside this token"
-        )
     immediate = _signed(region, decoded.next_offset, 4, address)
     return (
         decoded.rm,
@@ -1061,10 +1292,52 @@ def _decode_or_rm64_imm8_operands(region, offset, address, rex):
     )
 
 
+def _decode_or_rm8_imm8_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=1, operand_width=8, immediate_width=1, signed=False,
+    )
+
+
+def _decode_sub_rm32_imm32_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=5, operand_width=32, immediate_width=4, signed=False,
+    )
+
+
+def _decode_xor_rm64_imm8_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=6, operand_width=64, immediate_width=1, signed=True,
+    )
+
+
+def _decode_xor_rm64_imm32_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=6, operand_width=64, immediate_width=4, signed=True,
+    )
+
+
+def _decode_and_rm64_imm32_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=4, operand_width=64, immediate_width=4, signed=True,
+    )
+
+
 def _decode_mov_rm32_imm32_operands(region, offset, address, rex):
     return _decode_group_rm_imm(
         region, offset, address, rex,
         extension=0, operand_width=32, immediate_width=4, signed=False,
+    )
+
+
+def _decode_mov_rm16_imm16_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=0, operand_width=16, immediate_width=2, signed=False,
     )
 
 
@@ -1150,15 +1423,64 @@ def _decode_and_al_imm8_operands(region, offset, address, rex):
     return _decode_test_al_imm8_operands(region, offset, address, rex)
 
 
+def _decode_or_al_imm8_operands(region, offset, address, rex):
+    return _decode_test_al_imm8_operands(region, offset, address, rex)
+
+
+def _decode_sub_al_imm8_operands(region, offset, address, rex):
+    return _decode_test_al_imm8_operands(region, offset, address, rex)
+
+
+def _decode_add_al_imm8_operands(region, offset, address, rex):
+    return _decode_test_al_imm8_operands(region, offset, address, rex)
+
+
 def _decode_and_eax_imm32_operands(region, offset, address, rex):
     return _decode_accumulator_imm32_operands(
         region, offset, address, rex, width=32,
     )
 
 
+def _decode_and_ax_imm16_operands(region, offset, address, rex):
+    _need(region, offset, 2, address)
+    return (
+        RegisterOperand(X86Register.RAX, width=16),
+        ImmediateOperand(
+            int.from_bytes(region[offset:offset + 2], "little"),
+            width=16, signed=False,
+        ),
+    ), offset + 2
+
+
 def _decode_or_eax_imm32_operands(region, offset, address, rex):
     return _decode_accumulator_imm32_operands(
         region, offset, address, rex, width=32,
+    )
+
+
+def _decode_add_eax_imm32_operands(region, offset, address, rex):
+    return _decode_accumulator_imm32_operands(
+        region, offset, address, rex, width=32,
+    )
+
+
+def _decode_sub_eax_imm32_operands(region, offset, address, rex):
+    return _decode_accumulator_imm32_operands(
+        region, offset, address, rex, width=32,
+    )
+
+
+def _decode_sub_rm8_imm8_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=5, operand_width=8, immediate_width=1, signed=False,
+    )
+
+
+def _decode_add_rm8_imm8_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=0, operand_width=8, immediate_width=1, signed=False,
     )
 
 
@@ -1217,6 +1539,40 @@ def _decode_movsx_r64_rm16_operands(
     source: MachineOperand = decoded.rm
     if isinstance(source, RegisterOperand):
         source = RegisterOperand(source.register, width=16)
+    return (decoded.reg, source), decoded.next_offset
+
+
+def _decode_movsx_r64_rm8_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    # REX.W is required by the instruction specification below, so the four
+    # legacy high-byte register spellings cannot occur here.
+    decoded = _decode_modrm(region, offset, address, rex, register_width=64)
+    source: MachineOperand = decoded.rm
+    if isinstance(source, RegisterOperand):
+        source = RegisterOperand(source.register, width=8)
+    return (decoded.reg, source), decoded.next_offset
+
+
+def _decode_movsx_r32_rm8_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    _need(region, offset, 1, address)
+    modrm = int(region[offset])
+    decoded = _decode_modrm(region, offset, address, rex, register_width=32)
+    source: MachineOperand = decoded.rm
+    if isinstance(source, RegisterOperand):
+        if rex is None and (modrm & 0x7) >= 4:
+            raise VocabularyDecodeError(
+                f"{address:#x}: legacy high-byte source needs a distinct register token"
+            )
+        source = RegisterOperand(source.register, width=8)
     return (decoded.reg, source), decoded.next_offset
 
 
@@ -1486,6 +1842,27 @@ def _decode_sar_rm64_1_operands(region, offset, address, rex):
     )
 
 
+def _decode_sar_rm32_1_operands(region, offset, address, rex):
+    return _decode_shift_group(
+        region, offset, address, rex,
+        extension=7, operand_width=32, immediate=False,
+    )
+
+
+def _decode_sar_rm64_imm8_operands(region, offset, address, rex):
+    return _decode_shift_group(
+        region, offset, address, rex,
+        extension=7, operand_width=64, immediate=True,
+    )
+
+
+def _decode_sar_rm32_imm8_operands(region, offset, address, rex):
+    return _decode_shift_group(
+        region, offset, address, rex,
+        extension=7, operand_width=32, immediate=True,
+    )
+
+
 def _decode_shr_rm32_imm8_operands(region, offset, address, rex):
     return _decode_shift_group(
         region, offset, address, rex,
@@ -1515,6 +1892,39 @@ def _decode_shl_rm64_cl_operands(region, offset, address, rex):
     operands, end = _decode_shift_group(
         region, offset, address, rex,
         extension=4, operand_width=64, immediate=False,
+    )
+    return (
+        operands[0],
+        RegisterOperand(X86Register.RCX, width=8),
+    ), end
+
+
+def _decode_shr_rm64_cl_operands(region, offset, address, rex):
+    operands, end = _decode_shift_group(
+        region, offset, address, rex,
+        extension=5, operand_width=64, immediate=False,
+    )
+    return (
+        operands[0],
+        RegisterOperand(X86Register.RCX, width=8),
+    ), end
+
+
+def _decode_ror_rm64_cl_operands(region, offset, address, rex):
+    operands, end = _decode_shift_group(
+        region, offset, address, rex,
+        extension=1, operand_width=64, immediate=False,
+    )
+    return (
+        operands[0],
+        RegisterOperand(X86Register.RCX, width=8),
+    ), end
+
+
+def _decode_shr_rm32_cl_operands(region, offset, address, rex):
+    operands, end = _decode_shift_group(
+        region, offset, address, rex,
+        extension=5, operand_width=32, immediate=False,
     )
     return (
         operands[0],
@@ -1561,11 +1971,41 @@ def _decode_shr_rm8_imm8_operands(region, offset, address, rex):
     return operands, end
 
 
+def _decode_shl_rm8_imm8_operands(region, offset, address, rex):
+    operands, end = _decode_shift_group(
+        region, offset, address, rex,
+        extension=4, operand_width=8, immediate=True,
+    )
+    if (
+        rex is None
+        and isinstance(operands[0], RegisterOperand)
+        and (int(region[offset]) & 0x7) >= 4
+    ):
+        raise VocabularyDecodeError(
+            f"{address:#x}: legacy high-byte destination needs a distinct register token"
+        )
+    return operands, end
+
+
 def _decode_ror_rm64_imm8_operands(region, offset, address, rex):
     return _decode_shift_group(
         region, offset, address, rex,
         extension=1, operand_width=64, immediate=True,
     )
+
+
+def _decode_ror_rm16_imm8_operands(region, offset, address, rex):
+    return _decode_shift_group(
+        region, offset, address, rex,
+        extension=1, operand_width=16, immediate=True,
+    )
+
+
+def _decode_bswap_r32_operands(region, offset, address, rex):
+    _need(region, offset - 1, 1, address)
+    opcode = int(region[offset - 1])
+    register_code = (opcode & 0x7) | (0x8 if rex and rex & 0x1 else 0)
+    return (RegisterOperand(_gpr(register_code), width=32),), offset
 
 
 def _decode_shl_rm16_imm8_operands(region, offset, address, rex):
@@ -1612,6 +2052,18 @@ def _decode_unary_group_rm(
     return (decoded.rm,), decoded.next_offset
 
 
+def _decode_inc_rm8_operands(region, offset, address, rex):
+    return _decode_unary_group_rm(
+        region, offset, address, rex, extension=0, operand_width=8,
+    )
+
+
+def _decode_dec_rm8_operands(region, offset, address, rex):
+    return _decode_unary_group_rm(
+        region, offset, address, rex, extension=1, operand_width=8,
+    )
+
+
 def _decode_div_rm32_operands(region, offset, address, rex):
     return _decode_unary_group_rm(
         region, offset, address, rex, extension=6, operand_width=32,
@@ -1642,6 +2094,18 @@ def _decode_mul_rm32_operands(region, offset, address, rex):
     )
 
 
+def _decode_imul_rm64_operands(region, offset, address, rex):
+    return _decode_unary_group_rm(
+        region, offset, address, rex, extension=5, operand_width=64,
+    )
+
+
+def _decode_imul_rm32_operands(region, offset, address, rex):
+    return _decode_unary_group_rm(
+        region, offset, address, rex, extension=5, operand_width=32,
+    )
+
+
 def _decode_div_rm64_operands(region, offset, address, rex):
     return _decode_unary_group_rm(
         region, offset, address, rex, extension=6, operand_width=64,
@@ -1651,6 +2115,12 @@ def _decode_div_rm64_operands(region, offset, address, rex):
 def _decode_idiv_rm64_operands(region, offset, address, rex):
     return _decode_unary_group_rm(
         region, offset, address, rex, extension=7, operand_width=64,
+    )
+
+
+def _decode_idiv_rm32_operands(region, offset, address, rex):
+    return _decode_unary_group_rm(
+        region, offset, address, rex, extension=7, operand_width=32,
     )
 
 
@@ -1686,6 +2156,13 @@ def _decode_cqo_operands(region, offset, address, rex):
     ), offset
 
 
+def _decode_cdq_operands(region, offset, address, rex):
+    return (
+        RegisterOperand(X86Register.RDX, width=32),
+        RegisterOperand(X86Register.RAX, width=32),
+    ), offset
+
+
 def _decode_int_imm8_operands(region, offset, address, rex):
     _need(region, offset, 1, address)
     return (ImmediateOperand(int(region[offset]), width=8, signed=False),), offset + 1
@@ -1695,6 +2172,21 @@ def _decode_rep_stosw_operands(region, offset, address, rex):
     return (
         RegisterOperand(X86Register.RDI, width=64),
         RegisterOperand(X86Register.RAX, width=16),
+        RegisterOperand(X86Register.RCX, width=64),
+    ), offset
+
+
+def _decode_stosb_operands(region, offset, address, rex):
+    return (
+        RegisterOperand(X86Register.RDI, width=64),
+        RegisterOperand(X86Register.RAX, width=8),
+    ), offset
+
+
+def _decode_rep_stosb_operands(region, offset, address, rex):
+    return (
+        RegisterOperand(X86Register.RDI, width=64),
+        RegisterOperand(X86Register.RAX, width=8),
         RegisterOperand(X86Register.RCX, width=64),
     ), offset
 
@@ -1729,6 +2221,21 @@ def _decode_imul_r64_rm64_imm8_operands(
     ), decoded.next_offset + 1
 
 
+def _decode_imul_r64_rm64_imm32_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    decoded = _decode_modrm(region, offset, address, rex, register_width=64)
+    immediate = _signed(region, decoded.next_offset, 4, address)
+    return (
+        decoded.reg,
+        decoded.rm,
+        ImmediateOperand(immediate, width=32, signed=True),
+    ), decoded.next_offset + 4
+
+
 def _decode_imul_r32_rm32_imm8_operands(
     region: memoryview,
     offset: int,
@@ -1742,6 +2249,21 @@ def _decode_imul_r32_rm32_imm8_operands(
         decoded.rm,
         ImmediateOperand(immediate, width=8, signed=True),
     ), decoded.next_offset + 1
+
+
+def _decode_imul_r32_rm32_imm32_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    decoded = _decode_modrm(region, offset, address, rex, register_width=32)
+    immediate = _signed(region, decoded.next_offset, 4, address)
+    return (
+        decoded.reg,
+        decoded.rm,
+        ImmediateOperand(immediate, width=32, signed=True),
+    ), decoded.next_offset + 4
 
 
 def _decode_psrldq_xmm_imm8_operands(
@@ -1760,6 +2282,19 @@ def _decode_psrldq_xmm_imm8_operands(
     ), decoded.next_offset + 1
 
 
+def _decode_pshufd_xmm_xmmm128_imm8_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    operands, end = _decode_vector_binary_operands(
+        region, offset, address, rex, destination_in_reg=True,
+    )
+    _need(region, end, 1, address)
+    return (*operands, ImmediateOperand(int(region[end]), width=8, signed=False)), end + 1
+
+
 def _decode_movq_rm64_xmm_operands(
     region: memoryview,
     offset: int,
@@ -1769,6 +2304,60 @@ def _decode_movq_rm64_xmm_operands(
     decoded = _decode_modrm(region, offset, address, rex, register_width=64)
     source = VectorRegisterOperand(_xmm(int(decoded.reg.register)))
     return (decoded.rm, source), decoded.next_offset
+
+
+def _decode_movd_rm32_xmm_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    decoded = _decode_modrm(region, offset, address, rex, register_width=32)
+    source = VectorRegisterOperand(_xmm(int(decoded.reg.register)))
+    return (decoded.rm, source), decoded.next_offset
+
+
+def _decode_vector_xmm_rm64_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    decoded = _decode_modrm(region, offset, address, rex, register_width=64)
+    destination = VectorRegisterOperand(_xmm(int(decoded.reg.register)))
+    return (destination, decoded.rm), decoded.next_offset
+
+
+def _decode_r64_xmm_rm64_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    decoded = _decode_modrm(region, offset, address, rex, register_width=64)
+    destination = decoded.reg
+    source: MachineOperand
+    if isinstance(decoded.rm, RegisterOperand):
+        source = VectorRegisterOperand(_xmm(int(decoded.rm.register)))
+    else:
+        source = decoded.rm
+    return (destination, source), decoded.next_offset
+
+
+def _decode_r32_xmm_rm64_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    decoded = _decode_modrm(region, offset, address, rex, register_width=32)
+    destination = decoded.reg
+    source: MachineOperand
+    if isinstance(decoded.rm, RegisterOperand):
+        source = VectorRegisterOperand(_xmm(int(decoded.rm.register)))
+    else:
+        source = decoded.rm
+    return (destination, source), decoded.next_offset
 
 
 def _decode_dec_rm32_operands(region, offset, address, rex):
@@ -1991,6 +2580,17 @@ def _decode_inc_rm32_operands(
     return (decoded.rm,), decoded.next_offset
 
 
+def _decode_lock_inc_rm32_operands(region, offset, address, rex):
+    operands, end = _decode_inc_rm32_operands(
+        region, offset, address, rex,
+    )
+    if not isinstance(operands[0], EffectiveAddressOperand):
+        raise VocabularyDecodeError(
+            f"{address:#x}: LOCK INC requires a memory destination"
+        )
+    return operands, end
+
+
 def _decode_neg_rm32_operands(
     region: memoryview,
     offset: int,
@@ -2042,7 +2642,7 @@ def _decode_cmp_r64_rm64_operands(
     return (decoded.reg, decoded.rm), decoded.next_offset
 
 
-X86_64_REFERENCE_VOCABULARY: tuple[InstructionSpec, ...] = (
+_X86_64_REFERENCE_VOCABULARY: tuple[InstructionSpec, ...] = (
     InstructionSpec(
         X86InstructionToken.IMUL_R32_RM32,
         MachineSemanticToken.INTEGER_MULTIPLY,
@@ -2902,6 +3502,10 @@ X86_64_REFERENCE_VOCABULARY: tuple[InstructionSpec, ...] = (
         b"\x79", _decode_jcc_rel8_operands, allow_rex=False,
     ),
     InstructionSpec(
+        X86InstructionToken.JNS_REL32, MachineSemanticToken.CONDITIONAL_RELATIVE_JUMP,
+        b"\x0f\x89", _decode_jcc_rel32_operands, allow_rex=False,
+    ),
+    InstructionSpec(
         X86InstructionToken.BTS_RM32_R32, MachineSemanticToken.BIT_TEST,
         b"\x0f\xab", _decode_bt_rm32_r32_operands, allow_rex=True,
     ),
@@ -3003,11 +3607,96 @@ X86_64_REFERENCE_VOCABULARY: tuple[InstructionSpec, ...] = (
     InstructionSpec(X86InstructionToken.AND_RM32_R32, MachineSemanticToken.BITWISE_AND, b"\x21", _decode_binary_rm32_r32_operands, allow_rex=True),
     InstructionSpec(X86InstructionToken.IMUL_R32_RM32_IMM8, MachineSemanticToken.INTEGER_MULTIPLY, b"\x6b", _decode_imul_r32_rm32_imm8_operands, allow_rex=True),
     InstructionSpec(X86InstructionToken.SHR_RM64_IMM8, MachineSemanticToken.SHIFT_RIGHT_LOGICAL, b"\xc1", _decode_shr_rm64_imm8_operands, modrm_extension=5, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.SAR_RM64_IMM8, MachineSemanticToken.SHIFT_RIGHT_ARITHMETIC, b"\xc1", _decode_sar_rm64_imm8_operands, modrm_extension=7, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.MOVSX_R64_RM8, MachineSemanticToken.SIGN_EXTEND, b"\x0f\xbe", _decode_movsx_r64_rm8_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.IMUL_R64_RM64, MachineSemanticToken.INTEGER_MULTIPLY, b"\x0f\xaf", _decode_imul_r64_rm64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.OR_RM8_IMM8, MachineSemanticToken.BITWISE_OR, b"\x80", _decode_or_rm8_imm8_operands, modrm_extension=1, allow_rex=True),
+    InstructionSpec(X86InstructionToken.SUB_RM32_IMM32, MachineSemanticToken.INTEGER_SUBTRACT, b"\x81", _decode_sub_rm32_imm32_operands, modrm_extension=5, allow_rex=True),
+    InstructionSpec(X86InstructionToken.XOR_RM64_IMM8, MachineSemanticToken.BITWISE_XOR, b"\x83", _decode_xor_rm64_imm8_operands, modrm_extension=6, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.CMOVG_R32_RM32, MachineSemanticToken.CONDITIONAL_MOVE, b"\x0f\x4f", _decode_binary_r32_rm32_operands, allow_rex=True),
+    InstructionSpec(X86InstructionToken.CMOVG_R64_RM64, MachineSemanticToken.CONDITIONAL_MOVE, b"\x0f\x4f", _decode_binary_r64_rm64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.CMOVNS_R32_RM32, MachineSemanticToken.CONDITIONAL_MOVE, b"\x0f\x49", _decode_binary_r32_rm32_operands, allow_rex=True),
+    InstructionSpec(X86InstructionToken.ADD_EAX_IMM32, MachineSemanticToken.INTEGER_ADD, b"\x05", _decode_add_eax_imm32_operands, allow_rex=False),
+    InstructionSpec(X86InstructionToken.SUB_EAX_IMM32, MachineSemanticToken.INTEGER_SUBTRACT, b"\x2d", _decode_sub_eax_imm32_operands, allow_rex=False),
+    InstructionSpec(X86InstructionToken.OR_AL_IMM8, MachineSemanticToken.BITWISE_OR, b"\x0c", _decode_or_al_imm8_operands, allow_rex=False),
+    InstructionSpec(X86InstructionToken.SUB_RM8_IMM8, MachineSemanticToken.INTEGER_SUBTRACT, b"\x80", _decode_sub_rm8_imm8_operands, modrm_extension=5, allow_rex=True),
+    InstructionSpec(X86InstructionToken.OR_R16_RM16, MachineSemanticToken.BITWISE_OR, b"\x0b", _decode_binary_r16_rm16_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.SUB_RM64_R64, MachineSemanticToken.INTEGER_SUBTRACT, b"\x29", _decode_binary_rm64_r64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.CMOVLE_R64_RM64, MachineSemanticToken.CONDITIONAL_MOVE, b"\x0f\x4e", _decode_binary_r64_rm64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.SETAE_RM8, MachineSemanticToken.CONDITIONAL_SET, b"\x0f\x93", _decode_sete_rm8_operands, modrm_extension=0, allow_rex=True),
+    InstructionSpec(X86InstructionToken.XCHG_RM32_R32, MachineSemanticToken.EXCHANGE, b"\x87", _decode_binary_rm32_r32_operands, allow_rex=True),
+    InstructionSpec(X86InstructionToken.CDQ, MachineSemanticToken.SIGN_EXTEND_ACCUMULATOR, b"\x99", _decode_cdq_operands, allow_rex=False),
+    InstructionSpec(X86InstructionToken.IDIV_RM32, MachineSemanticToken.INTEGER_DIVIDE_SIGNED, b"\xf7", _decode_idiv_rm32_operands, modrm_extension=7, allow_rex=True),
+    InstructionSpec(X86InstructionToken.BSR_R32_RM32, MachineSemanticToken.BIT_SCAN_REVERSE, b"\x0f\xbd", _decode_binary_r32_rm32_operands, allow_rex=True),
+    InstructionSpec(X86InstructionToken.CVTSI2SD_XMM_RM64, MachineSemanticToken.SIGNED_INTEGER_TO_SCALAR_FLOAT64, b"\x0f\x2a", _decode_vector_xmm_rm64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True, allowed_legacy_prefixes=frozenset({0xf2}), required_legacy_prefixes=frozenset({0xf2})),
+    InstructionSpec(X86InstructionToken.MOVQ_XMM_RM64, MachineSemanticToken.VECTOR_MOVE_LOW_ZERO_UPPER, b"\x0f\x6e", _decode_vector_xmm_rm64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.MOVSX_R32_RM8, MachineSemanticToken.SIGN_EXTEND, b"\x0f\xbe", _decode_movsx_r32_rm8_operands, allow_rex=True),
+    InstructionSpec(X86InstructionToken.SHR_RM64_CL, MachineSemanticToken.SHIFT_RIGHT_LOGICAL, b"\xd3", _decode_shr_rm64_cl_operands, modrm_extension=5, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.SETL_RM8, MachineSemanticToken.CONDITIONAL_SET, b"\x0f\x9c", _decode_sete_rm8_operands, modrm_extension=0, allow_rex=True),
+    InstructionSpec(X86InstructionToken.SETS_RM8, MachineSemanticToken.CONDITIONAL_SET, b"\x0f\x98", _decode_sete_rm8_operands, modrm_extension=0, allow_rex=True),
+    InstructionSpec(X86InstructionToken.CMOVNS_R64_RM64, MachineSemanticToken.CONDITIONAL_MOVE, b"\x0f\x49", _decode_binary_r64_rm64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.CMOVA_R64_RM64, MachineSemanticToken.CONDITIONAL_MOVE, b"\x0f\x47", _decode_binary_r64_rm64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.SHR_RM32_CL, MachineSemanticToken.SHIFT_RIGHT_LOGICAL, b"\xd3", _decode_shr_rm32_cl_operands, modrm_extension=5, allow_rex=True),
+    InstructionSpec(X86InstructionToken.SAR_RM32_IMM8, MachineSemanticToken.SHIFT_RIGHT_ARITHMETIC, b"\xc1", _decode_sar_rm32_imm8_operands, modrm_extension=7, allow_rex=True),
+    InstructionSpec(X86InstructionToken.AND_AX_IMM16, MachineSemanticToken.BITWISE_AND, b"\x25", _decode_and_ax_imm16_operands, allow_rex=False, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.MOV_RM16_IMM16, MachineSemanticToken.REGISTER_WRITE_IMMEDIATE, b"\xc7", _decode_mov_rm16_imm16_operands, modrm_extension=0, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.XOR_RM64_IMM32, MachineSemanticToken.BITWISE_XOR, b"\x81", _decode_xor_rm64_imm32_operands, modrm_extension=6, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.BSR_R64_RM64, MachineSemanticToken.BIT_SCAN_REVERSE, b"\x0f\xbd", _decode_binary_r64_rm64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.DEC_RM8, MachineSemanticToken.INTEGER_DECREMENT, b"\xfe", _decode_dec_rm8_operands, modrm_extension=1, allow_rex=True),
+    InstructionSpec(X86InstructionToken.INC_RM8, MachineSemanticToken.INTEGER_INCREMENT, b"\xfe", _decode_inc_rm8_operands, modrm_extension=0, allow_rex=True),
+    InstructionSpec(X86InstructionToken.SUB_R8_RM8, MachineSemanticToken.INTEGER_SUBTRACT, b"\x2a", _decode_binary_r8_rm8_operands, allow_rex=True),
+    InstructionSpec(X86InstructionToken.UCOMISD_XMM_XMMM64, MachineSemanticToken.SCALAR_FLOAT64_COMPARE_UNORDERED, b"\x0f\x2e", _decode_vector_xmm_rm64_data_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.MOVQ_XMM_XMMM64, MachineSemanticToken.VECTOR_MOVE_LOW_ZERO_UPPER, b"\x0f\x7e", _decode_vector_xmm_rm64_data_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0xf3}), required_legacy_prefixes=frozenset({0xf3})),
+    InstructionSpec(X86InstructionToken.ADDSD_XMM_XMMM64, MachineSemanticToken.SCALAR_FLOAT64_ADD, b"\x0f\x58", _decode_vector_xmm_rm64_data_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0xf2}), required_legacy_prefixes=frozenset({0xf2})),
+    InstructionSpec(X86InstructionToken.PUNPCKLQDQ_XMM_XMMM128, MachineSemanticToken.VECTOR_UNPACK_LOW_QWORDS, b"\x0f\x6c", _decode_vector_reg_rm_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.SHL_RM8_IMM8, MachineSemanticToken.SHIFT_LEFT, b"\xc0", _decode_shl_rm8_imm8_operands, modrm_extension=4, allow_rex=True),
+    InstructionSpec(X86InstructionToken.ADD_RM8_IMM8, MachineSemanticToken.INTEGER_ADD, b"\x80", _decode_add_rm8_imm8_operands, modrm_extension=0, allow_rex=True),
+    InstructionSpec(X86InstructionToken.JP_REL8, MachineSemanticToken.CONDITIONAL_RELATIVE_JUMP, b"\x7a", _decode_jcc_rel8_operands, allow_rex=False),
+    InstructionSpec(X86InstructionToken.PUNPCKLBW_XMM_XMMM128, MachineSemanticToken.VECTOR_UNPACK_LOW_BYTES, b"\x0f\x60", _decode_vector_reg_rm_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.MULSD_XMM_XMMM64, MachineSemanticToken.SCALAR_FLOAT64_MULTIPLY, b"\x0f\x59", _decode_vector_xmm_rm64_data_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0xf2}), required_legacy_prefixes=frozenset({0xf2})),
+    InstructionSpec(X86InstructionToken.PADDQ_XMM_XMMM128, MachineSemanticToken.VECTOR_ADD_QWORDS, b"\x0f\xd4", _decode_vector_reg_rm_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.IMUL_R64_RM64_IMM32, MachineSemanticToken.INTEGER_MULTIPLY, b"\x69", _decode_imul_r64_rm64_imm32_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.COMISD_XMM_XMMM64, MachineSemanticToken.SCALAR_FLOAT64_COMPARE_ORDERED, b"\x0f\x2f", _decode_vector_xmm_rm64_data_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.PUNPCKLWD_XMM_XMMM128, MachineSemanticToken.VECTOR_UNPACK_LOW_WORDS, b"\x0f\x61", _decode_vector_reg_rm_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.MOVD_XMM_RM32, MachineSemanticToken.VECTOR_MOVE_LOW_ZERO_UPPER, b"\x0f\x6e", _decode_vector_xmm_rm64_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.CMOVGE_R64_RM64, MachineSemanticToken.CONDITIONAL_MOVE, b"\x0f\x4d", _decode_binary_r64_rm64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.SUB_AL_IMM8, MachineSemanticToken.INTEGER_SUBTRACT, b"\x2c", _decode_sub_al_imm8_operands, allow_rex=False),
+    InstructionSpec(X86InstructionToken.ADD_R8_RM8, MachineSemanticToken.INTEGER_ADD, b"\x02", _decode_binary_r8_rm8_operands, allow_rex=True),
+    InstructionSpec(X86InstructionToken.IMUL_RM64, MachineSemanticToken.INTEGER_MULTIPLY, b"\xf7", _decode_imul_rm64_operands, modrm_extension=5, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.CMOVBE_R64_RM64, MachineSemanticToken.CONDITIONAL_MOVE, b"\x0f\x46", _decode_binary_r64_rm64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.ADD_RM16_R16, MachineSemanticToken.INTEGER_ADD, b"\x01", _decode_binary_rm16_r16_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.CVTSI2SS_XMM_RM64, MachineSemanticToken.SIGNED_INTEGER_TO_SCALAR_FLOAT32, b"\x0f\x2a", _decode_vector_xmm_rm64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True, allowed_legacy_prefixes=frozenset({0xf3}), required_legacy_prefixes=frozenset({0xf3})),
+    InstructionSpec(X86InstructionToken.ADDSS_XMM_XMMM32, MachineSemanticToken.SCALAR_FLOAT32_ADD, b"\x0f\x58", _decode_vector_xmm_rm32_data_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0xf3}), required_legacy_prefixes=frozenset({0xf3})),
+    InstructionSpec(X86InstructionToken.DIVSS_XMM_XMMM32, MachineSemanticToken.SCALAR_FLOAT32_DIVIDE, b"\x0f\x5e", _decode_vector_xmm_rm32_data_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0xf3}), required_legacy_prefixes=frozenset({0xf3})),
+    InstructionSpec(X86InstructionToken.COMISS_XMM_XMMM32, MachineSemanticToken.SCALAR_FLOAT32_COMPARE_ORDERED, b"\x0f\x2f", _decode_vector_xmm_rm32_data_operands, allow_rex=True),
+    InstructionSpec(X86InstructionToken.CMOVS_R64_RM64, MachineSemanticToken.CONDITIONAL_MOVE, b"\x0f\x48", _decode_binary_r64_rm64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.DIVSD_XMM_XMMM64, MachineSemanticToken.SCALAR_FLOAT64_DIVIDE, b"\x0f\x5e", _decode_vector_xmm_rm64_data_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0xf2}), required_legacy_prefixes=frozenset({0xf2})),
+    InstructionSpec(X86InstructionToken.CMPXCHG_RM32_R32, MachineSemanticToken.ATOMIC_COMPARE_EXCHANGE, b"\x0f\xb1", _decode_binary_rm32_r32_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0xf0}), required_legacy_prefixes=frozenset({0xf0})),
+    InstructionSpec(X86InstructionToken.AND_RM64_IMM32, MachineSemanticToken.BITWISE_AND, b"\x81", _decode_and_rm64_imm32_operands, modrm_extension=4, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.BSWAP_R32, MachineSemanticToken.BYTE_SWAP, b"\x0f\xc8", _decode_bswap_r32_operands, opcode_mask=b"\xff\xf8", allow_rex=True),
+    InstructionSpec(X86InstructionToken.ROR_RM16_IMM8, MachineSemanticToken.ROTATE_RIGHT, b"\xc1", _decode_ror_rm16_imm8_operands, modrm_extension=1, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.SUBSD_XMM_XMMM64, MachineSemanticToken.SCALAR_FLOAT64_SUBTRACT, b"\x0f\x5c", _decode_vector_xmm_rm64_data_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0xf2}), required_legacy_prefixes=frozenset({0xf2})),
+    InstructionSpec(X86InstructionToken.CMOVS_R32_RM32, MachineSemanticToken.CONDITIONAL_MOVE, b"\x0f\x48", _decode_binary_r32_rm32_operands, allow_rex=True),
+    InstructionSpec(X86InstructionToken.CVTTSD2SI_R64_XMMM64, MachineSemanticToken.SCALAR_FLOAT64_TO_SIGNED_INT64_TRUNCATE, b"\x0f\x2c", _decode_r64_xmm_rm64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True, allowed_legacy_prefixes=frozenset({0xf2}), required_legacy_prefixes=frozenset({0xf2})),
+    InstructionSpec(X86InstructionToken.SUB_RM32_R32, MachineSemanticToken.INTEGER_SUBTRACT, b"\x29", _decode_binary_rm32_r32_operands, allow_rex=True),
+    InstructionSpec(X86InstructionToken.PCMPEQQ_XMM_XMMM128, MachineSemanticToken.VECTOR_COMPARE_EQUAL_QWORDS, b"\x0f\x38\x29", _decode_vector_reg_rm_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.SAR_RM32_1, MachineSemanticToken.SHIFT_RIGHT_ARITHMETIC, b"\xd1", _decode_sar_rm32_1_operands, modrm_extension=7, allow_rex=True),
+    InstructionSpec(X86InstructionToken.PSUBQ_XMM_XMMM128, MachineSemanticToken.VECTOR_SUBTRACT_QWORDS, b"\x0f\xfb", _decode_vector_reg_rm_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.SBB_R8_RM8, MachineSemanticToken.INTEGER_SUBTRACT_WITH_BORROW, b"\x1a", _decode_binary_r8_rm8_operands, allow_rex=True),
+    InstructionSpec(X86InstructionToken.ADD_AL_IMM8, MachineSemanticToken.INTEGER_ADD, b"\x04", _decode_add_al_imm8_operands, allow_rex=False),
+    InstructionSpec(X86InstructionToken.IMUL_R32_RM32_IMM32, MachineSemanticToken.INTEGER_MULTIPLY, b"\x69", _decode_imul_r32_rm32_imm32_operands, allow_rex=True),
+    InstructionSpec(X86InstructionToken.ANDPS_XMM_XMMM128, MachineSemanticToken.VECTOR_AND, b"\x0f\x54", _decode_vector_reg_rm_operands, allow_rex=True),
+    InstructionSpec(X86InstructionToken.CMOVGE_R32_RM32, MachineSemanticToken.CONDITIONAL_MOVE, b"\x0f\x4d", _decode_binary_r32_rm32_operands, allow_rex=True),
+    InstructionSpec(X86InstructionToken.IMUL_RM32, MachineSemanticToken.INTEGER_MULTIPLY, b"\xf7", _decode_imul_rm32_operands, modrm_extension=5, allow_rex=True),
+    InstructionSpec(X86InstructionToken.PSHUFD_XMM_XMMM128_IMM8, MachineSemanticToken.VECTOR_SHUFFLE_DWORDS, b"\x0f\x70", _decode_pshufd_xmm_xmmm128_imm8_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
+    InstructionSpec(X86InstructionToken.CVTTSD2SI_R32_XMMM64, MachineSemanticToken.SCALAR_FLOAT64_TO_SIGNED_INT32_TRUNCATE, b"\x0f\x2c", _decode_r32_xmm_rm64_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0xf2}), required_legacy_prefixes=frozenset({0xf2})),
+    InstructionSpec(X86InstructionToken.CVTDQ2PD_XMM_XMMM64, MachineSemanticToken.VECTOR_SIGNED_INT32_TO_FLOAT64, b"\x0f\xe6", _decode_vector_xmm_rm64_data_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0xf3}), required_legacy_prefixes=frozenset({0xf3})),
+    InstructionSpec(X86InstructionToken.MOVD_RM32_XMM, MachineSemanticToken.VECTOR_MOVE, b"\x0f\x7e", _decode_movd_rm32_xmm_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
     InstructionSpec(X86InstructionToken.OR_R8_RM8, MachineSemanticToken.BITWISE_OR, b"\x0a", _decode_binary_r8_rm8_operands, allow_rex=True),
     InstructionSpec(X86InstructionToken.XADD_RM32_R32, MachineSemanticToken.ATOMIC_EXCHANGE_ADD, b"\x0f\xc1", _decode_binary_rm32_r32_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0xf0}), required_legacy_prefixes=frozenset({0xf0})),
     InstructionSpec(X86InstructionToken.OR_EAX_IMM32, MachineSemanticToken.BITWISE_OR, b"\x0d", _decode_or_eax_imm32_operands, allow_rex=False),
     InstructionSpec(X86InstructionToken.AND_R8_RM8, MachineSemanticToken.BITWISE_AND, b"\x22", _decode_binary_r8_rm8_operands, allow_rex=True),
-    InstructionSpec(X86InstructionToken.LOCK_ADD_RM8_R8, MachineSemanticToken.ATOMIC_ADD, b"\x00", _decode_binary_rm8_r8_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0xf0}), required_legacy_prefixes=frozenset({0xf0})),
+    InstructionSpec(X86InstructionToken.LOCK_ADD_RM8_R8, MachineSemanticToken.ATOMIC_ADD, b"\x00", _decode_lock_add_rm8_r8_operands, allow_rex=True, allowed_legacy_prefixes=frozenset({0xf0}), required_legacy_prefixes=frozenset({0xf0}), reversible_operand_form="RM_REG", reversible_modrm_memory_only=True),
     InstructionSpec(X86InstructionToken.MOVQ_RM64_XMM, MachineSemanticToken.VECTOR_MOVE, b"\x0f\x7e", _decode_movq_rm64_xmm_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
     InstructionSpec(X86InstructionToken.XCHG_RM64_R64, MachineSemanticToken.EXCHANGE, b"\x87", _decode_binary_rm64_r64_operands, allow_rex=True, allow_rex_w=True, require_rex_w=True),
     InstructionSpec(X86InstructionToken.AND_RM16_IMM16, MachineSemanticToken.BITWISE_AND, b"\x81", _decode_and_rm16_imm16_operands, modrm_extension=4, allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}), required_legacy_prefixes=frozenset({0x66})),
@@ -3028,6 +3717,283 @@ X86_64_REFERENCE_VOCABULARY: tuple[InstructionSpec, ...] = (
     InstructionSpec(X86InstructionToken.CMOVL_R32_RM32, MachineSemanticToken.CONDITIONAL_MOVE, b"\x0f\x4c", _decode_binary_r32_rm32_operands, allow_rex=True),
     InstructionSpec(X86InstructionToken.XOR_RM32_R32, MachineSemanticToken.BITWISE_XOR, b"\x31", _decode_binary_rm32_r32_operands, allow_rex=True),
     InstructionSpec(X86InstructionToken.SHL_RM64_CL, MachineSemanticToken.SHIFT_LEFT, b"\xd3", _decode_shl_rm64_cl_operands, modrm_extension=4, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.ROR_RM64_CL, MachineSemanticToken.ROTATE_RIGHT, b"\xd3", _decode_ror_rm64_cl_operands, modrm_extension=1, allow_rex=True, allow_rex_w=True, require_rex_w=True),
+    InstructionSpec(X86InstructionToken.LOCK_INC_RM32, MachineSemanticToken.ATOMIC_INCREMENT, b"\xff", _decode_lock_inc_rm32_operands, modrm_extension=0, allow_rex=True, allowed_legacy_prefixes=frozenset({0xf0}), required_legacy_prefixes=frozenset({0xf0}), reversible_operand_form="RM", reversible_modrm_memory_only=True),
+    InstructionSpec(
+        X86InstructionToken.VINSERTF128_YMM_YMM_XMMM128_IMM8,
+        MachineSemanticToken.VECTOR_INSERT_128_LANE,
+        b"\xc4\xe3\x7d\x18",
+        _decode_vinsertf128_operands,
+        opcode_mask=b"\xff\x1f\x87\xff",
+        allow_rex=False,
+    ),
+    InstructionSpec(
+        X86InstructionToken.VMOVDQA_YMMM256_YMM,
+        MachineSemanticToken.VECTOR_MOVE,
+        b"\xc5\x7d\x7f",
+        _decode_vmovdqa_store_operands,
+        opcode_mask=b"\xff\x7f\xff",
+        allow_rex=False,
+    ),
+    InstructionSpec(
+        X86InstructionToken.STOSB, MachineSemanticToken.STRING_STORE,
+        b"\xaa", _decode_stosb_operands, allow_rex=False,
+    ),
+    InstructionSpec(
+        X86InstructionToken.VMOVNTDQ_M256_YMM,
+        MachineSemanticToken.VECTOR_MOVE,
+        b"\xc5\x7d\xe7",
+        _decode_vmovdqa_store_operands,
+        opcode_mask=b"\xff\x7f\xff",
+        allow_rex=False,
+    ),
+    InstructionSpec(
+        X86InstructionToken.REP_STOSB, MachineSemanticToken.STRING_STORE,
+        b"\xaa", _decode_rep_stosb_operands, allow_rex=False,
+        allowed_legacy_prefixes=frozenset({0xf3}),
+        required_legacy_prefixes=frozenset({0xf3}),
+    ),
+)
+
+
+# Reversible layout is attached to the authoritative decoder specification,
+# rather than maintained as a second tensor-only instruction catalogue.  The
+# compact tuples are: operand form, immediate bytes, signed, relative,
+# terminal, allowed REX bits.  Tokens absent here are still fully decoded by
+# the reference vocabulary; they merely lack compiled accelerator/write-head
+# layout until their exact inverse grammar is described.
+_REVERSIBLE_LAYOUTS: dict[
+    X86InstructionToken, tuple[str, int, bool, bool, bool, int]
+] = {
+    X86InstructionToken.IMUL_R32_RM32: ("REG_RM", 0, False, False, False, 0x07),
+    X86InstructionToken.LEA_R32_M: ("REG_RM", 0, False, False, False, 0x07),
+    X86InstructionToken.RET_NEAR: ("NONE", 0, False, False, True, 0x00),
+    X86InstructionToken.SUB_R64_IMM8: ("RM_IMMEDIATE", 1, True, False, False, 0x0B),
+    X86InstructionToken.CALL_REL32: ("RELATIVE", 4, True, True, False, 0x00),
+    X86InstructionToken.ADD_R64_IMM8: ("RM_IMMEDIATE", 1, True, False, False, 0x0B),
+    X86InstructionToken.JMP_REL32: ("RELATIVE", 4, True, True, True, 0x00),
+    X86InstructionToken.MOV_RM64_R64: ("RM_REG", 0, False, False, False, 0x0F),
+    X86InstructionToken.PUSH_R64: ("OPCODE_REGISTER", 0, False, False, False, 0x0F),
+    X86InstructionToken.MOV_R64_RM64: ("REG_RM", 0, False, False, False, 0x0F),
+    X86InstructionToken.AND_RM64_IMM8: ("RM_IMMEDIATE", 1, True, False, False, 0x0B),
+    X86InstructionToken.MOV_R32_IMM32: ("OPCODE_REGISTER_IMMEDIATE", 4, False, False, False, 0x01),
+    X86InstructionToken.MOV_R64_IMM64: ("OPCODE_REGISTER_IMMEDIATE", 8, False, False, False, 0x09),
+    X86InstructionToken.CMP_R64_RM64: ("REG_RM", 0, False, False, False, 0x0F),
+    X86InstructionToken.JNE_REL32: ("RELATIVE", 4, True, True, True, 0x00),
+    X86InstructionToken.PADDQ_XMM_XMMM128: ("REG_RM", 0, False, False, False, 0x0F),
+    X86InstructionToken.PSUBQ_XMM_XMMM128: ("REG_RM", 0, False, False, False, 0x0F),
+    X86InstructionToken.REP_MOVSQ: ("NONE", 0, False, False, False, 0x08),
+    X86InstructionToken.XADD_RM32_R32: ("RM_REG", 0, False, False, False, 0x0F),
+    X86InstructionToken.BTC_RM32_IMM8: ("RM_IMMEDIATE", 1, False, False, False, 0x0F),
+}
+
+
+def _attach_reversible_layout(spec: InstructionSpec) -> InstructionSpec:
+    layout = _REVERSIBLE_LAYOUTS.get(spec.token)
+    decoder_family = spec.decode_operands.__name__
+    if layout is None:
+        reg_rm_families = {
+            "_decode_binary_r8_rm8_operands",
+            "_decode_binary_r16_rm16_operands",
+            "_decode_binary_r32_rm32_operands",
+            "_decode_binary_r64_rm64_operands",
+            "_decode_mov_r32_rm32_operands",
+            "_decode_imul_r64_rm64_operands",
+            "_decode_vector_reg_rm_operands",
+            "_decode_vector_xmm_rm64_data_operands",
+            "_decode_vector_xmm_rm32_data_operands",
+        }
+        rm_reg_families = {
+            "_decode_binary_rm8_r8_operands",
+            "_decode_binary_rm16_r16_operands",
+            "_decode_binary_rm32_r32_operands",
+            "_decode_binary_rm64_r64_operands",
+            "_decode_vector_rm_reg_operands",
+        }
+        rm_families = {
+            "_decode_sete_rm8_operands",
+            "_decode_call_rm64_operands",
+            "_decode_jmp_rm64_operands",
+            "_decode_not_rm64_operands",
+            "_decode_not_rm32_operands",
+            "_decode_not_rm8_operands",
+            "_decode_neg_rm64_operands",
+            "_decode_neg_rm32_operands",
+            "_decode_neg_rm16_operands",
+            "_decode_neg_rm8_operands",
+            "_decode_inc_rm64_operands",
+            "_decode_inc_rm32_operands",
+            "_decode_inc_rm16_operands",
+            "_decode_inc_rm8_operands",
+            "_decode_dec_rm64_operands",
+            "_decode_dec_rm32_operands",
+            "_decode_dec_rm8_operands",
+            "_decode_div_rm64_operands",
+            "_decode_div_rm32_operands",
+            "_decode_idiv_rm64_operands",
+            "_decode_idiv_rm32_operands",
+            "_decode_mul_rm64_operands",
+            "_decode_mul_rm32_operands",
+            "_decode_imul_rm64_operands",
+            "_decode_imul_rm32_operands",
+        }
+        if decoder_family in reg_rm_families:
+            layout = ("REG_RM", 0, False, False, False, 0)
+        elif decoder_family in rm_reg_families:
+            layout = ("RM_REG", 0, False, False, False, 0)
+        elif decoder_family in rm_families:
+            layout = ("RM", 0, False, False, False, 0)
+        elif decoder_family == "_decode_jcc_rel8_operands":
+            layout = ("RELATIVE", 1, True, True, True, 0)
+        elif decoder_family == "_decode_jcc_rel32_operands":
+            layout = ("RELATIVE", 4, True, True, True, 0)
+        elif decoder_family in {
+            "_decode_imul_r64_rm64_imm8_operands",
+            "_decode_imul_r32_rm32_imm8_operands",
+            "_decode_imul_r64_rm64_imm32_operands",
+            "_decode_imul_r32_rm32_imm32_operands",
+            "_decode_pshufd_xmm_xmmm128_imm8_operands",
+        }:
+            width = 1 if "imm8" in decoder_family else 4
+            layout = (
+                "REG_RM_IMMEDIATE", width,
+                decoder_family.startswith("_decode_imul_"), False, False, 0,
+            )
+        elif "_rm" in decoder_family and "_imm" in decoder_family:
+            # Ask the authoritative operand decoder for its exact immediate
+            # contract.  A canonical register-direct ModRM avoids address
+            # framing while retaining the opcode-group extension.
+            extension = 0 if spec.modrm_extension is None else spec.modrm_extension
+            modrm = 0xC0 | (int(extension) << 3)
+            rex = 0x48 if spec.require_rex_w else None
+            try:
+                operands, _end = spec.decode_operands(
+                    memoryview(bytes((modrm,)) + b"\0" * 16), 0, 0, rex,
+                )
+            except VocabularyDecodeError:
+                operands = ()
+            immediates = tuple(
+                operand for operand in operands
+                if isinstance(operand, ImmediateOperand)
+            )
+            if len(immediates) == 1 and len(operands) == 2:
+                immediate = immediates[0]
+                layout = (
+                    "RM_IMMEDIATE", int(immediate.width) // 8,
+                    bool(immediate.signed), False, False, 0,
+                )
+        elif decoder_family in {
+            "_decode_cmp_rax_imm32_operands",
+            "_decode_cmp_eax_imm32_operands",
+            "_decode_test_eax_imm32_operands",
+            "_decode_test_al_imm8_operands",
+            "_decode_cmp_al_imm8_operands",
+            "_decode_and_eax_imm32_operands",
+            "_decode_and_al_imm8_operands",
+            "_decode_and_ax_imm16_operands",
+            "_decode_add_eax_imm32_operands",
+            "_decode_sub_eax_imm32_operands",
+            "_decode_or_al_imm8_operands",
+            "_decode_sub_al_imm8_operands",
+            "_decode_add_al_imm8_operands",
+            "_decode_or_eax_imm32_operands",
+            "_decode_add_rax_imm32_operands",
+            "_decode_int_imm8_operands",
+        }:
+            width = (
+                1 if "imm8" in decoder_family
+                else 2 if "imm16" in decoder_family
+                else 4
+            )
+            signed = width == 4 and not decoder_family.startswith("_decode_test_")
+            layout = ("IMMEDIATE", width, signed, False, False, 0)
+        elif decoder_family in {
+            "_decode_lea_r64_operands",
+            "_decode_movsxd_r64_rm32_operands",
+            "_decode_movzx_r32_rm16_operands",
+            "_decode_movsx_r32_rm16_operands",
+            "_decode_movzx_r32_rm8_operands",
+            "_decode_movsx_r64_rm16_operands",
+            "_decode_movsx_r64_rm8_operands",
+            "_decode_movsx_r32_rm8_operands",
+            "_decode_vector_xmm_rm64_operands",
+            "_decode_r64_xmm_rm64_operands",
+            "_decode_r32_xmm_rm64_operands",
+        }:
+            layout = ("REG_RM", 0, False, False, False, 0)
+        elif decoder_family in {
+            "_decode_bt_rm64_r64_operands",
+            "_decode_bt_rm32_r32_operands",
+            "_decode_movd_rm32_xmm_operands",
+            "_decode_movq_rm64_xmm_operands",
+        }:
+            layout = ("RM_REG", 0, False, False, False, 0)
+        elif decoder_family in {
+            "_decode_no_operands",
+            "_decode_cdqe_operands", "_decode_cdq_operands",
+            "_decode_rep_stosw_operands", "_decode_scasb_operands",
+            "_decode_cqo_operands",
+        }:
+            layout = ("NONE", 0, False, False, False, 0)
+        elif decoder_family == "_decode_nop_rm_operands":
+            layout = ("RM", 0, False, False, False, 0)
+        elif decoder_family in {
+            "_decode_sub_r64_imm32_operands",
+            "_decode_add_r64_imm32_operands",
+        }:
+            layout = ("RM_IMMEDIATE", 4, True, False, False, 0)
+        elif decoder_family == "_decode_mov_r64_rm64_operands":
+            layout = ("REG_RM", 0, False, False, False, 0)
+        elif decoder_family == "_decode_psrldq_xmm_imm8_operands":
+            layout = ("RM_IMMEDIATE", 1, False, False, False, 0)
+        elif decoder_family == "_decode_btr_rm32_r32_operands":
+            layout = ("RM_REG", 0, False, False, False, 0)
+        elif decoder_family in {
+            "_decode_pop_r64_operands", "_decode_bswap_r32_operands",
+        }:
+            layout = ("OPCODE_REGISTER", 0, False, False, False, 0)
+        elif decoder_family == "_decode_mov_r8_imm8_operands":
+            layout = ("OPCODE_REGISTER_IMMEDIATE", 1, False, False, False, 0)
+        elif decoder_family in {
+            "_decode_shr_rm32_1_operands",
+            "_decode_sar_rm64_1_operands",
+            "_decode_shr_rm64_1_operands",
+            "_decode_sar_rm32_1_operands",
+        }:
+            # Count=1 is opcode-selected and therefore not emitted as a byte.
+            layout = ("RM", 0, False, False, False, 0)
+        elif decoder_family in {
+            "_decode_shl_rm32_cl_operands",
+            "_decode_shr_rm64_cl_operands",
+            "_decode_shr_rm32_cl_operands",
+            "_decode_shl_rm64_cl_operands",
+            "_decode_ror_rm64_cl_operands",
+        }:
+            # CL is an architectural implicit, not an encoded register field.
+            layout = ("RM", 0, False, False, False, 0)
+    if layout is None:
+        return spec
+    from dataclasses import replace
+    form, width, signed, relative, terminal, rex_mask = layout
+    if not rex_mask:
+        rex_mask = (
+            0 if not spec.allow_rex
+            else 0x0F if spec.allow_rex_w
+            else 0x07
+        )
+    return replace(
+        spec,
+        reversible_operand_form=form,
+        reversible_immediate_bytes=width,
+        reversible_immediate_signed=signed,
+        reversible_immediate_relative=relative,
+        reversible_terminal=terminal,
+        reversible_allowed_rex_mask=rex_mask,
+    )
+
+
+X86_64_REFERENCE_VOCABULARY: tuple[InstructionSpec, ...] = tuple(
+    _attach_reversible_layout(spec) for spec in _X86_64_REFERENCE_VOCABULARY
 )
 
 
@@ -3451,6 +4417,163 @@ class X86ReferenceDecoder:
             decoded_bytes=offset,
             stopped_at_return=stopped_at_return,
             stopped_at_control_transfer=stopped_at_control_transfer,
+        )
+
+    def decode_cfg_report(
+        self,
+        binary_region: bytes | bytearray | memoryview | Iterable[int],
+        *,
+        size: int | None = None,
+        base_address: int = 0,
+        entry_addresses: Iterable[int] = (),
+    ) -> DecodeReport:
+        """Decode only instructions reachable from the bounded region entry.
+
+        Boundaries are proved by sequential fallthrough or an explicit direct
+        branch target. Returns and unconditional transfers terminate a path;
+        conditional transfers enqueue both target and fallthrough. Bytes not
+        reached by this control worklist are retained as explicit spans rather
+        than decoded as instructions or rejected as disposable trailing data.
+        """
+
+        raw, capacity = _strict_region_bytes(binary_region)
+        if isinstance(size, bool):
+            raise VocabularyDecodeError("binary size must be an integer, not boolean")
+        try:
+            accepted = capacity if size is None else operator.index(size)
+        except TypeError as error:
+            raise VocabularyDecodeError("binary size must be an integer") from error
+        if accepted < 0 or accepted > capacity:
+            raise VocabularyDecodeError(
+                f"binary size {accepted} is outside region capacity {capacity}"
+            )
+        if accepted == 0:
+            return DecodeReport(
+                (), (VocabularyFailure(
+                    "empty_region", 0, int(base_address), b"",
+                    "binary region contains no instructions",
+                ),), capacity, accepted, 0, False, False, (),
+            )
+
+        region = raw[:accepted]
+        requested_entries = {0}
+        for address in entry_addresses:
+            try:
+                offset = operator.index(address) - int(base_address)
+            except TypeError as error:
+                raise VocabularyDecodeError(
+                    "CFG entry addresses must be integers"
+                ) from error
+            if not 0 <= offset < accepted:
+                raise VocabularyDecodeError(
+                    f"CFG entry address {int(address):#x} is outside the bounded region"
+                )
+            requested_entries.add(offset)
+        pending = sorted(requested_entries)
+        queued = set(requested_entries)
+        decoded_by_offset: dict[int, DecodedInstruction] = {}
+        byte_owner: dict[int, int] = {}
+        failures: list[VocabularyFailure] = []
+        saw_return = False
+        saw_control = False
+        external_fallthroughs: set[int] = set()
+
+        def enqueue_address(address: int) -> None:
+            offset = int(address) - int(base_address)
+            if 0 <= offset < accepted and offset not in queued:
+                queued.add(offset)
+                pending.append(offset)
+
+        while pending and not failures:
+            cursor = pending.pop(0)
+            while cursor < accepted:
+                if cursor in decoded_by_offset:
+                    break
+                if cursor in byte_owner:
+                    owner = byte_owner[cursor]
+                    failures.append(VocabularyFailure(
+                        "overlapping_control_target", cursor,
+                        int(base_address) + cursor,
+                        bytes(region[cursor:min(accepted, cursor + 8)]),
+                        f"{base_address + cursor:#x}: control target enters "
+                        f"instruction at {base_address + owner:#x}",
+                    ))
+                    break
+                start = cursor
+                try:
+                    instruction, cursor = self.decode_one(
+                        region, start, base_address=base_address,
+                    )
+                except VocabularyDecodeError as error:
+                    failures.append(VocabularyFailure(
+                        "decode", start, int(base_address) + start,
+                        bytes(region[start:min(accepted, start + 8)]), str(error),
+                    ))
+                    break
+                overlap = next((
+                    byte_owner[index]
+                    for index in range(start, cursor)
+                    if index in byte_owner and byte_owner[index] != start
+                ), None)
+                if overlap is not None:
+                    failures.append(VocabularyFailure(
+                        "overlapping_instruction", start,
+                        int(base_address) + start, instruction.encoded,
+                        f"{instruction.address:#x}: instruction overlaps "
+                        f"instruction at {base_address + overlap:#x}",
+                    ))
+                    break
+                decoded_by_offset[start] = instruction
+                for index in range(start, cursor):
+                    byte_owner[index] = start
+
+                semantic = MachineSemanticToken(instruction.semantic)
+                if semantic is MachineSemanticToken.CONDITIONAL_RELATIVE_JUMP:
+                    saw_control = True
+                    target = instruction.operands[0]
+                    if cursor < accepted and cursor not in queued:
+                        queued.add(cursor)
+                        pending.append(cursor)
+                    if isinstance(target, RelativeAddressOperand):
+                        enqueue_address(target.target_address)
+                    break
+                if semantic is MachineSemanticToken.DIRECT_RELATIVE_JUMP:
+                    saw_control = True
+                    target = instruction.operands[0]
+                    if isinstance(target, RelativeAddressOperand):
+                        enqueue_address(target.target_address)
+                    break
+                if semantic in {
+                    MachineSemanticToken.RETURN,
+                    MachineSemanticToken.INDIRECT_JUMP,
+                }:
+                    saw_control = True
+                    saw_return = saw_return or semantic is MachineSemanticToken.RETURN
+                    break
+            else:
+                # A PE runtime-function record is unwind ownership, not a
+                # semantic fence. Reaching its end is an exact machine-state
+                # transfer to the following address and is linked like any
+                # other cross-record branch by the PE lifting layer.
+                saw_control = True
+                external_fallthroughs.add(int(base_address) + accepted)
+
+        unreachable: list[tuple[int, int]] = []
+        index = 0
+        while index < accepted:
+            if index in byte_owner:
+                index += 1
+                continue
+            start = index
+            while index < accepted and index not in byte_owner:
+                index += 1
+            unreachable.append((start, index))
+
+        decoded = tuple(decoded_by_offset[key] for key in sorted(decoded_by_offset))
+        return DecodeReport(
+            decoded, tuple(failures), capacity, accepted,
+            sum(len(item.encoded) for item in decoded), saw_return, saw_control,
+            tuple(unreachable), tuple(sorted(external_fallthroughs)),
         )
 
     def audit_region(

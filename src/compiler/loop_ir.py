@@ -42,6 +42,7 @@ class LoopStateEffectMode(str, Enum):
 
     OPAQUE = "opaque"
     INDEXED_PUBLICATION = "indexed_publication"
+    SEQUENCE_MUTATION = "sequence_mutation"
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,15 @@ class LoopStateEffect:
     loop_result_id: int | None = None
     argument_value_ids: tuple[int, ...] = ()
     mode: LoopStateEffectMode = LoopStateEffectMode.OPAQUE
+    # Compile-time row policy. ``unique`` means set/dict-style key dedup,
+    # ``duplicates`` means list-style insertion, and ``None`` remains an
+    # explicit lowering shortfall until source storage establishes the policy.
+    sequence_policy: str | None = None
+    argument_kind: str = "value"
+
+    def __post_init__(self) -> None:
+        if self.sequence_policy not in {None, "unique", "duplicates"}:
+            raise ValueError("unknown SSA sequence mutation policy")
 
 
 @dataclass(frozen=True)

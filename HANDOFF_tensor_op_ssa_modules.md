@@ -1,10 +1,264 @@
 # Handoff: whole-object DLL emission → modular tensor-op SSA definitions
 
-Branch: `nogodsnomasters`. Session date: 2026-08-11.
+Branch: `codex/recursive-reduction-bridge`. Session date: 2026-08-11.
+
+## 2026-08-12 static source-call linker continuation
+
+Binary/PE work is paused in `BINARY_HEAD_IR_CONTINUATION.md`; the active focus
+is again complete source pursuit and one statically linked repository-SSA
+ecosystem.  No long recursive compile was run in this continuation.
+
+Two call-linking defects are fixed and have direct source-ingestion regressions:
+
+1. Source calls are now materialized to a dependency fixed point.  A chain such
+   as `root -> middle -> leaf` no longer depends on function-table visitation
+   order; resolving the leaf makes its caller eligible in the next round until
+   the entire authored chain is ordinary repository-SSA `Call` instructions.
+2. Zero-result authored calls are executable calls rather than omitted records.
+   Outside retained loops, the process graph's exact source position identifies
+   the next produced SSA value and the call is inserted before that producer.
+   Calls inside retained loops remain unresolved until their control block owns
+   an explicit call marker; hoisting a side effect out of a loop is forbidden.
+
+Supporting invariants:
+
+- source-declared parameters remain in `Function.args` even when their only
+  consumer is a `PlanCall` materialized after control lowering;
+- call-only functions retain their source output identity, so `return callee()`
+  replaces the temporary empty `Ret` with a call and returned value;
+- hierarchy callable-shell duplicates are discarded only when a complete frame
+  for the same caller/callee exists and the duplicate has no argument/result
+  bindings;
+- unresolved-call emission diagnostics now report every missing callee storage
+  value and every established frame binding.
+
+Focused evidence: `tests/test_static_source_call_linking.py`,
+`tests/test_precompile_to_ssa.py`, and `tests/test_function_table.py` pass
+40 tests together.  The qualified-symbol whole-object emission test also
+passes independently.
+
+Constructor-owned record storage is now linked.  A class-construction node
+allocates a distinct caller-owned raw record/sequence arena, invokes the real
+source-linked constructor first, and binds later method frames to the same
+field storage by the record descriptor's exact storage identity.  The
+`Store().has(key)` regression now emits complete Fortran: the five dict-table
+ABI values are supplied rather than reported as `missing_frame`.  Repeated
+field reads/writes which have distinct local sequence descriptor ids are
+correlated to the same physical field arena without dropping either
+occurrence.  Two constructor occurrences are tested to receive disjoint
+arenas, and authored constructor parameters are passed from their exact caller
+operands.  No Python object, opaque handle, runtime dispatcher, scalar
+substitute, or numerical projection was introduced.
+
+Bounded evidence after this repair: the record/dict/sequence selections pass
+7 tests; the static-call, precompile, and FunctionTable selection passes 40
+tests.  The long recursive compile was not run.  Remaining boundaries are
+explicit: construction inside retained loops needs a caller-owned instance
+pool indexed by the loop, nested record-valued fields need recursive record
+descriptor remapping, and constructor defaults require the same authored
+default-literal binding already used by ordinary calls.
+
+Retained-loop construction now distinguishes lifetime correctly.  A
+non-escaping instance reuses one caller-owned arena, because its authored
+constructor resets that arena on every iteration; the constructor is an
+ordinary source-linked Call in the loop-body CFG and is never hoisted.  A
+one-sequence-field instance which escapes the iteration (for example
+`buckets.append(Bucket())`) uses the existing child-table pool ABI: the outer
+list stores the induction-row handle, ordinary Mul/GetElementPtr instructions
+derive the field row and per-instance length/status cells, and the constructor
+initializes that row before the append publishes its handle.  The resulting
+module emits complete Fortran.  Constructor calls are now first-class
+hierarchy PlanCalls, so call-only loops survive control projection before the
+ABI linker runs.  Multi-sequence-field escaping records now use a record-level
+instance-pool descriptor grouping one child-pool layout per exact field
+identity under the same outer handle. `Pair.left` and `Pair.right` therefore
+have independent row strides/data/length/status storage while sharing only the
+instance handle, and the complete module emits Fortran.
+
+The multi-field boundary was audited with `Pair.left` and `Pair.right`, two
+identically shaped list fields.  Repeated field views are now correlated only
+when their exact record storage identity matches; shape equality alone no
+longer collapses the fields.  Mixed scalar-plus-sequence records now join the
+same record pool: packed scalar record storage gets an instance stride and
+field offset, and ordinary Mul/Add/GetElementPtr derives the scalar field row.
+The conceptual record identity is removed from the ABI after every consumer is
+rewritten to physical field storage; a regression protects against local-id
+collision with unrelated capacity values. Nested record-valued fields remain
+the next explicit pool boundary.
+
+The bounded loop/control/precompile/static-call selection passes 76 tests.
+
+## 2026-08-11 bootstrap control-hole ledger
+
+The real `ProcessGraph.build_from_ast` compile now reaches whole-object Fortran
+emission in about 137--183 seconds instead of the earlier 26-minute / 73-GB
+thrash.  Do not collapse the remaining obligations: the compiler reports every
+specialized occurrence independently until it is actually lowered.
+
+Current numbered occurrences from the last real compile:
+
+1. `build_from_ast:159`, source line 2210: `existing_classes.add(identity)`.
+2. `build_graph:333`, line 2058: `args.extend(value)` and `args.append(value)`.
+3. `deduplicate_node:24`, line 1797: `G.remove_node(nid)`.
+4. `_expand_unresolved_ast_parents:463`, line 1101:
+   `unavailable_identities.add(...)` and `definitions.extend(...)`.
+5. `_expand_unresolved_ast_parents:602`, line 1302: generator iteration over
+   filtered `ast.walk(module)`; its append effects are already explicit.
+6. `_attach_external_methods:75`, line 335: `present.add(target.attr)`.
+7. Second specialized occurrence of item 2.
+8. Second specialized occurrence of item 3.
+9. Third specialized occurrence of item 3.
+10. Fourth specialized occurrence of item 3.
+11. Fifth specialized occurrence of item 3.
+12. Third specialized occurrence of item 2.
+13. Sixth specialized occurrence of item 3.
+14. Seventh specialized occurrence of item 3.
+15. Eighth specialized occurrence of item 3.
+16. Ninth specialized occurrence of item 3.
+17. Second specialized occurrence of item 4.
+18. Second specialized occurrence of item 5.
+19. Second specialized occurrence of item 6.
+
+The next non-loop blocker is tracked separately as item 20: an empty list
+aggregate reaches Fortran emission as scalar literal `[]` rather than through
+its SSA sequence descriptor/arena.
+
+Already fixed in this continuation: generator-backed `extend` now inserts each
+yield directly through destination sequence policy (including generator
+filters); `while pending` now reloads the sequence length and compares it with
+zero at both initial test and latch; parameter memory flags are compiler table
+metadata rather than runtime objects; callsite source identity propagates into
+formal receivers; and the planner's `object()` missing-value sentinel was
+replaced by separate integer status/value tables. No numerical projection or
+Python/runtime collection handler was added.
 
 This document summarizes a long working session and sets the forward architecture.
 Read the "Corrected direction" section first — several mid-session approaches were
 wrong and were reverted; do not resurrect them.
+
+## 2026-08-11 continuation — authoritative tensor-backend status
+
+The source-producing backend requested after the original handoff now exists.
+This supersedes the document's proposal to make `pure_backend` the only initial
+tensor definition module:
+
+- `SSATensorOperations(AbstractTensor)` records the fundamental tensor surface
+  into an `SSATensorProgram`; inherited compound methods therefore expand during
+  ingestion and bottom out in the same fundamental calls.
+- The C backend is represented by one complete LLVM/repository-SSA reference.
+  Tensor lowering copies the required function dependency closure into the
+  caller. It never calls an opaque tensor handler and never leaves a runtime
+  tensor dispatcher behind.
+- `SSATensorTable`/`SSATensorDescriptor` are first-class per-function SSA data:
+  logical tensor identity, data value, dtype, static/dynamic shape and strides,
+  storage, arena/allocation owner, byte span, view alias, and writability.
+  These adopt Nodus's useful record/lease separation without adopting Nodus's
+  opaque runtime handle/backend dispatch architecture.
+- Incoming `AbstractTensor` leaves can be replaced by SSA-owned input records or
+  detached SSA constants. The replacement retains no reference to the original
+  object, payload, or backend. Recursive replacement covers nested feed trees.
+- Complete ProcessGraph lowering now propagates a replacement feed's shape and
+  dtype through planned regions. Hierarchy ID assignment preserves
+  `PlanClosure.value_shapes`; it no longer erases them while canonicalizing IDs.
+- Proven compound catalog currently includes clamp/clip, derived trigonometric
+  reciprocals and ratios, degree/radian conversions, `nan_to_num`, stable
+  mean, one-dimensional stable softmax, and one-dimensional stable log-softmax.
+  They emit ordinary SSA with no remaining
+  `tensor`/`tensor_operation` placeholder. Stable softmax also compiles to a
+  Fortran DLL and executes correctly.
+- Fortran calls now distinguish a one-element metadata vector from a scalar
+  tensor arena. Shaped constants remain array designators for pointer arguments;
+  one-element tensor arenas are explicitly indexed for scalar arguments.
+
+Current honest boundary: structural singleton-axis broadcasting is complete
+through the source-level `broadcast_double` definition. Stack/cat definitions
+exist in the C reference but their pointer-table ABI remains source-only in the
+current Fortran emitter. This is an explicit substrate gap, not a runtime
+fallback.
+
+Focused verification: 73 tests pass across the SSA tensor reference, complete
+ProcessGraph lowering, hierarchy shape preservation, Fortran emission, and two
+real DLL execution routes. Numerical projection remains forbidden for this path.
+
+### Abstract-NN and broadcast correctness extension
+
+The smallest representative `abstract_nn` network now compiles correctly:
+`Linear(2→8) → tanh → Linear(8→1)`, including ordinary `(1, D)` biases and a
+four-row XOR-shaped input. Parameter creation through `from_list_like` preserves
+the owning `SSATensorProgram`, so weights and biases become detached SSA
+constants rather than NumPy payloads hidden inside an SSA wrapper.
+
+Both routes have native correctness proofs:
+
+- direct `abstract_nn.Model` construction through `SSATensorOperations`;
+- Python function ingestion through ProcessGraph, complete-region SSA lowering,
+  source-reference linking, generated control ABI, and Fortran DLL execution.
+
+The four native outputs agree with NumPy to a maximum absolute error of
+`5.6e-17`. ProcessGraph singleton axes are authoritative and survive hierarchy
+ID assignment. Shaped `MatMul` is routed to the row-major `matmul_double` source
+instead of Fortran's column-major intrinsic.
+
+The earlier general-broadcast boundary is closed. `broadcast_double` is now a
+handwritten repository-SSA reproduction of the C backend function; shaped SSA
+arithmetic materializes singleton-axis broadcasts through it before invoking
+the ordinary binary kernel. The direct SSA backend uses the same definition.
+
+Performance measurements (262,144 float64 elements, 7 warmups, medians) are
+diagnostic only; optimization remains the reducer/dispatcher's later job:
+
+| Program | Fortran | NumPy | Native compile |
+|---|---:|---:|---:|
+| `tanh(x)` | 6.871 ms | 6.726 ms | 1.33 s |
+| `x * 1.25 + 0.5` | 205.756 ms | 0.736 ms | 1.54 s |
+| 18-stage GELU/softplus/trig/clamp chain | 1564.530 ms | 40.136 ms | 2.54 s |
+| batch-one 2→8→1 MLP | 21.2 µs | 11.1 µs | 1.87 s |
+
+All comparisons matched NumPy (`0` error for the microbenchmarks/MLP and
+`6.7e-16` for the long chain). The large cost begins in opcode-dispatched
+binary kernels, not the ABI or unary libm loop; leave fusion/specialization to
+topological reduction and deployment scheduling.
+
+### First compiler-native bootstrap module
+
+The second half of the outer goal has now begun with a deliberately
+backend-neutral compiler module: lexicographical topological ordering. Its ABI
+is only two integer edge arrays plus integer order/status outputs. Python owns
+arbitrary graph node identities and lexical keys, normalizes them to dense
+indices, and reconstructs the returned identities. No AST object, tensor
+object, tensor operation, or backend handle crosses the DLL boundary.
+
+`native_compiler_accelerators.py` now provides:
+
+- a semantic-name registry which refuses native registration unless an exact
+  Python correctness fallback already exists;
+- explicit compile/load/registration (importing the compiler never invokes a
+  toolchain);
+- a complete `CompiledProgramAPI` record for the Fortran C ABI;
+- registration as both the active callable provider and an opportunistic
+  pipeline `Foundation`;
+- canonical ProcessGraph relabeling through that provider when installed,
+  otherwise the unchanged NetworkX implementation.
+
+The native implementation agrees with NetworkX for empty and nontrivial DAGs,
+custom lexical keys, equal-key insertion ordering, and cyclic-graph failure.
+The focused joint gate is 7 tests: native compile/registration, live canonical
+relabeler use, broadcast parity, shaped whole-object ABI, direct abstract-NN
+program ownership, and four-row ProcessGraph network DLL execution.
+The broader goal-focused gate is 77 tests and includes the complete repository
+SSA reference, precompile/control lowering, and hierarchy-shape suites.
+
+The next smallest clean modules, in order, are:
+
+1. dependency-wave/level assignment over the same dense edge-table ABI;
+2. dense parent/child offset-table construction used after canonical relabeling;
+3. row-major extent/stride table construction (metadata only, never tensor-op
+   semantics);
+4. batched FNV-1a token calculation over byte-offset tables.
+
+Do not put AST traversal, tensor dispatch, or backend operation policy in these
+DLLs. Those remain Python/SSA orchestration; native modules consume and return
+complete information tables.
 
 ---
 
@@ -49,8 +303,9 @@ The whole-object emission path (all backend-neutral at the SSA level unless note
 - **String/None as universal tokens** — `ir_string_interning.tokenize_ssa_string_constants`:
   a str/bytes `Const` → `string_token` (fnv1a-64), None → reserved `string_table.NONE_TOKEN`
   sentinel, `equal`/`not_equal` over a token tagged `string_compare`. Fortran realizes a
-  token as `transfer(<i64>, 0._c_double)` (64-bit identity in the f64 working type) and a
-  token compare as an i64 reinterpret. `_literal` is the universal backstop so no path
+  token as a typed signed `integer(c_int64_t)` and compares it directly. The earlier
+  float-bit reinterpretation was prohibited numerical projection. `_literal` is the
+  universal backstop so no path
   leaks a None/str/bytes. `fnv1a_64` accepts bytes. Verified content-addressed identity.
 - **Ingestion structural folds** (`transmogrifier/graph/node_special_cases.py`, applied in
   `graph_express2.build_graph`):

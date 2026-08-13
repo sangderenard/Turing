@@ -7,21 +7,82 @@ import builtins
 import copy
 from dataclasses import MISSING, dataclass, fields, is_dataclass
 import importlib
+import inspect
 import logging
+import textwrap
 import types
 from typing import Any, Callable
 
 import networkx as nx
 
+from ...compiler.native_compiler_accelerators import (
+    lexicographical_topological_order,
+)
+
 from ...compiler.shell_reference_tables import build_class_navigation_table
 from ...transmogrifier.function_table import (
     ExternalFunctionTable,
     FunctionTable,
+    ParameterAccess,
+    ParameterContract,
+    ParameterScope,
+    ParameterStorage,
+    ParameterTransfer,
 )
 from ...transmogrifier.ssa_registry import ast_ssa_name_map, c_ssa_name_map
 
 
 logger = logging.getLogger(__name__)
+
+
+def _known_parameter_memory_contracts(
+    definition: Any,
+    parameter_names: tuple[str, ...],
+    *,
+    method_owner: str | None,
+) -> tuple[ParameterContract, ...]:
+    """Describe parameter storage only when source pursuit proved its kind.
+
+    The records direct raw SSA data; they do not create wrapper objects or
+    runtime dispatch.  Once one parameter has a proven aggregate/record kind,
+    the complete ordered signature is recorded so argument positions remain
+    unambiguous.  Unproved parameters retain the scalar/value defaults.
+    """
+
+    bindings = dict(getattr(definition, "_python_bindings", {}) or {})
+    storage_by_name: dict[str, ParameterStorage] = {}
+    for index, name in enumerate(parameter_names):
+        value = bindings.get(name)
+        if any(value is kind for kind in (list, set, dict, tuple)):
+            storage_by_name[name] = ParameterStorage.TABLE
+        elif inspect.isclass(value):
+            storage_by_name[name] = ParameterStorage.RECORD
+        elif index == 0 and method_owner is not None:
+            storage_by_name[name] = ParameterStorage.RECORD
+    if not storage_by_name:
+        return ()
+    return tuple(
+        ParameterContract(
+            name,
+            transfer=(
+                ParameterTransfer.ALIAS
+                if name in storage_by_name
+                else ParameterTransfer.VALUE
+            ),
+            access=(
+                ParameterAccess.INOUT
+                if name in storage_by_name
+                else ParameterAccess.IN
+            ),
+            storage=storage_by_name.get(name, ParameterStorage.SCALAR),
+            scope=(
+                ParameterScope.CALLER
+                if name in storage_by_name
+                else ParameterScope.LOCAL
+            ),
+        )
+        for name in parameter_names
+    )
 
 
 @dataclass(frozen=True)
@@ -805,6 +866,9 @@ def _normalize_lexical_values(
     static_bindings: dict[str, Any],
     function_table: FunctionTable,
     lexical_function_bindings: dict[str, Any] | None = None,
+    closure_aggregate_kinds: dict[str, str] | None = None,
+    method_owner: str | None = None,
+    class_field_aggregate_kinds: Mapping[tuple[str, str], str] | None = None,
 ) -> None:
     """Resolve unique lexical occurrences into a monotonic value DAG.
 
@@ -849,6 +913,7 @@ def _normalize_lexical_values(
         navigation_table = build_class_navigation_table(graph)
         graph.G.graph["_class_navigation_table"] = navigation_table
     parameter_class_names: dict[str, str] = {}
+    parameter_aggregate_kinds: dict[str, str] = {}
     known_class_identities = {
         record.identity for record in navigation_table.classes
     }
@@ -863,6 +928,24 @@ def _normalize_lexical_values(
             and annotation.id in known_class_identities
         ):
             parameter_class_names[argument.arg] = annotation.id
+        if (
+            isinstance(annotation, ast.Name)
+            and annotation.id in {
+                "list", "set", "dict", "tuple", "bytes", "bytearray"
+            }
+        ):
+            parameter_aggregate_kinds[argument.arg] = annotation.id
+    # Source pursuit records an explicitly constructed local aggregate by
+    # its class (``opt_subs = {}`` -> ``opt_subs: dict``).  For a nested
+    # function that name is captured runtime storage, not a compile-time
+    # reference to the ``dict`` constructor.  Preserve that distinction at
+    # the function boundary so indexed mutation receives a real SSA input.
+    parameter_aggregate_kinds.update(closure_aggregate_kinds or {})
+    parameter_aggregate_kinds.update(
+        dict(
+            getattr(statement, "_python_aggregate_binding_kinds", {}) or {}
+        )
+    )
 
     def _resolve_instance_attribute_slot(
         class_identity: str, attribute_name: str
@@ -994,13 +1077,27 @@ def _normalize_lexical_values(
         value = environment.get(name)
         if value is not None:
             return value
+        aggregate_kind = parameter_aggregate_kinds.get(name)
+        attributes = {
+            "binding_name": name,
+            "binding_kind": binding_kind,
+        }
+        if aggregate_kind is not None:
+            attributes.update({
+                "producer_kind": "aggregate_parameter",
+                "aggregate_kind": aggregate_kind,
+                "sequence_key_columns": (
+                    (0,) if aggregate_kind in {"set", "dict"} else ()
+                ),
+                "sequence_column_count": (
+                    2 if aggregate_kind == "dict" else 1
+                ),
+                "sequence_writable": aggregate_kind not in {"tuple", "bytes"},
+            })
         value = new_node(
             "Input",
             name,
-            attributes={
-                "binding_name": name,
-                "binding_kind": binding_kind,
-            },
+            attributes=attributes,
         )
         environment[name] = value
         identity_bindings.setdefault(name, []).append(value)
@@ -1198,6 +1295,31 @@ def _normalize_lexical_values(
             else:
                 resolve_expression(expression.elt)
             node_id = id(expression)
+            if (
+                not isinstance(expression, ast.GeneratorExp)
+                and node_id in graph.G
+            ):
+                aggregate_kind = {
+                    ast.ListComp: "list",
+                    ast.SetComp: "set",
+                    ast.DictComp: "dict",
+                }[type(expression)]
+                graph.G.nodes[node_id].setdefault(
+                    "attributes", {}
+                ).update({
+                    # A comprehension is a dynamic resident sequence built
+                    # by its producer loop, not a closure aggregate whose
+                    # complete member identities are statically available.
+                    "producer_kind": "sequence_materialization",
+                    "aggregate_kind": aggregate_kind,
+                    "sequence_key_columns": (
+                        (0,) if aggregate_kind in {"set", "dict"} else ()
+                    ),
+                    "sequence_column_count": (
+                        2 if aggregate_kind == "dict" else 1
+                    ),
+                    "sequence_writable": True,
+                })
             if isinstance(expression, (ast.ListComp, ast.SetComp)):
                 value_id = resolve_expression(expression.elt)
                 for generator in expression.generators:
@@ -1226,6 +1348,49 @@ def _normalize_lexical_values(
                 else:
                     environment.pop(name, None)
             return node_id if node_id in graph.G else None
+        if isinstance(expression, ast.IfExp):
+            test_value = resolve_expression(expression.test)
+            body_value = resolve_expression(expression.body)
+            else_value = resolve_expression(expression.orelse)
+            node_id = id(expression)
+            if node_id in graph.G:
+                parents = tuple(
+                    (value, role)
+                    for value, role in (
+                        (test_value, "test"),
+                        (body_value, "body"),
+                        (else_value, "orelse"),
+                    )
+                    if isinstance(value, int)
+                )
+                _replace_inputs(graph, node_id, parents)
+                contracts = []
+                for value in (body_value, else_value):
+                    if not isinstance(value, int) or value not in graph.G:
+                        contracts.append(None)
+                        continue
+                    attributes = graph.G.nodes[value].get("attributes") or {}
+                    kind = attributes.get("aggregate_kind")
+                    contracts.append(
+                        None if kind is None else (
+                            str(kind),
+                            tuple(attributes.get("sequence_key_columns", ())),
+                            int(attributes.get("sequence_column_count", 1)),
+                            bool(attributes.get("sequence_writable", True)),
+                        )
+                    )
+                if contracts[0] is not None and contracts[0] == contracts[1]:
+                    kind, key_columns, column_count, writable = contracts[0]
+                    graph.G.nodes[node_id].setdefault(
+                        "attributes", {}
+                    ).update({
+                        "producer_kind": "aggregate_merge",
+                        "aggregate_kind": kind,
+                        "sequence_key_columns": key_columns,
+                        "sequence_column_count": column_count,
+                        "sequence_writable": writable,
+                    })
+            return node_id if node_id in graph.G else None
         if isinstance(expression, ast.comprehension):
             resolve_expression(expression.iter)
             bind_loop_target(expression.target)
@@ -1248,6 +1413,14 @@ def _normalize_lexical_values(
                     _remove_node(graph, node_id)
                     return static_reference
                 producer_id = environment.get(expression.id)
+                if (
+                    producer_id is None
+                    and expression.id in (closure_aggregate_kinds or {})
+                ):
+                    producer_id = input_value(
+                        expression.id,
+                        binding_kind="closure",
+                    )
                 static_value = static_bindings.get(expression.id)
                 function_reference = (
                     (lexical_function_bindings or {}).get(expression.id)
@@ -1369,6 +1542,34 @@ def _normalize_lexical_values(
                             graph.G.nodes[id(expression)].setdefault(
                                 "attributes", {}
                             )["attribute_slot"] = (class_identity, slot)
+                field_kind = (
+                    (class_field_aggregate_kinds or {}).get((
+                        str(method_owner), str(expression.attr)
+                    ))
+                    if (
+                        method_owner is not None
+                        and isinstance(expression.value, ast.Name)
+                        and expression.value.id in {"self", "cls"}
+                    )
+                    else None
+                )
+                if field_kind is not None:
+                    graph.G.nodes[id(expression)].setdefault(
+                        "attributes", {}
+                    ).update({
+                        "producer_kind": "record_field",
+                        "aggregate_kind": field_kind,
+                        "sequence_key_columns": (
+                            (0,) if field_kind in {"set", "dict"} else ()
+                        ),
+                        "sequence_column_count": (
+                            2 if field_kind == "dict" else 1
+                        ),
+                        "sequence_writable": field_kind != "tuple",
+                        "record_field": (
+                            str(method_owner), str(expression.attr)
+                        ),
+                    })
                 # An ordinary attribute access on a resolved receiver is a
                 # real reference-operator node -- ``_replace_inputs`` above
                 # already gave it the receiver as a dependency, and
@@ -1437,15 +1638,72 @@ def _normalize_lexical_values(
                         (*receiver_inputs, *argument_inputs, *keyword_inputs),
                     )
             callee = resolve_expression(expression.func)
+            if (
+                isinstance(callee, _StaticPythonReference)
+                and any(
+                    callee.value is kind
+                    for kind in (tuple, list, set, dict, bytes, bytearray)
+                )
+                and node_id in graph.G
+            ):
+                constructor = graph.G.nodes[node_id]
+                constructor_attributes = constructor.setdefault(
+                    "attributes", {}
+                )
+                aggregate_kind = callee.value.__name__
+                constructor_attributes.setdefault(
+                    "producer_kind",
+                    "aggregate" if not expression.args else (
+                        "aggregate_materialization"
+                    ),
+                )
+                constructor_attributes.update({
+                    "aggregate_kind": aggregate_kind,
+                    "sequence_key_columns": (
+                        (0,) if aggregate_kind in {"set", "dict"} else ()
+                    ),
+                    "sequence_column_count": (
+                        2 if aggregate_kind == "dict" else 1
+                    ),
+                    "sequence_writable": aggregate_kind not in {
+                        "tuple", "bytes"
+                    },
+                })
+                constructor_attributes.setdefault(
+                    "aggregate_leaf_value_ids",
+                    tuple(
+                        int(parent)
+                        for parent, role in constructor.get("parents") or ()
+                        if str(role).startswith(("arg", "kw:"))
+                    ),
+                )
             if isinstance(callee, int) and callee in graph.G:
-                callee_reference = (
+                callee_attributes = (
                     graph.G.nodes[callee].get("attributes") or {}
-                ).get("function_ref")
+                )
+                callee_reference = callee_attributes.get("function_ref")
                 if callee_reference is not None and node_id in graph.G:
                     graph.G.nodes[node_id].setdefault(
                         "attributes",
                         {},
                     )["callee_ref"] = callee_reference
+                method_reference = callee_attributes.get("method_ref")
+                if method_reference is not None and node_id in graph.G:
+                    graph.G.nodes[node_id].setdefault(
+                        "attributes", {}
+                    )["method_ref"] = int(method_reference)
+                    call_inputs = tuple(
+                        graph.G.nodes[node_id].get("parents") or ()
+                    )
+                    if not any(
+                        parent == callee and str(role) == "callee"
+                        for parent, role in call_inputs
+                    ):
+                        _replace_inputs(
+                            graph,
+                            node_id,
+                            (*call_inputs, (callee, "callee")),
+                        )
             if isinstance(callee, _StaticPythonReference) and node_id in graph.G:
                 reference_node_id = static_reference_node(callee)
                 attributes = graph.G.nodes[node_id].setdefault(
@@ -1694,6 +1952,22 @@ def _normalize_lexical_values(
             aggregate = graph.G.nodes[node_id]
             aggregate_attributes = aggregate.setdefault("attributes", {})
             aggregate_attributes["producer_kind"] = "aggregate"
+            aggregate_kind = {
+                ast.Tuple: "tuple",
+                ast.List: "list",
+                ast.Set: "set",
+                ast.Dict: "dict",
+            }[type(expression)]
+            aggregate_attributes.update({
+                "aggregate_kind": aggregate_kind,
+                "sequence_key_columns": (
+                    (0,) if aggregate_kind in {"set", "dict"} else ()
+                ),
+                "sequence_column_count": (
+                    2 if aggregate_kind == "dict" else 1
+                ),
+                "sequence_writable": aggregate_kind != "tuple",
+            })
             aggregate_attributes["aggregate_leaf_value_ids"] = tuple(
                 int(parent)
                 for parent, role in aggregate.get("parents") or ()
@@ -1906,9 +2180,14 @@ def _normalize_lexical_values(
             return
         if isinstance(target, ast.Subscript):
             if isinstance(value, _StaticPythonReference):
+                try:
+                    target_source = ast.unparse(target)
+                except Exception:  # noqa: BLE001 -- diagnostic only
+                    target_source = repr(target)
                 raise TypeError(
                     "a static Python reference cannot be assigned through "
-                    "a runtime tensor index"
+                    "a runtime tensor index; "
+                    f"target={target_source!r}; reference={value.path!r}"
                 )
             base = resolve_expression(target.value)
             index_expressions = (
@@ -1922,9 +2201,38 @@ def _normalize_lexical_values(
             if not isinstance(base, int) or not isinstance(value, int) or not all(
                 isinstance(index, int) for index in indices
             ):
+                try:
+                    assignment_source = ast.unparse(
+                        ast.Assign(targets=[target], value=ast.Constant(None))
+                    ).removesuffix(" = None")
+                except Exception:  # noqa: BLE001 -- diagnostic only
+                    assignment_source = ast.dump(
+                        target, include_attributes=False
+                    )
+                def component_identity(component: Any) -> str:
+                    if isinstance(component, _StaticPythonReference):
+                        return f"static:{component.path}"
+                    if not isinstance(component, int):
+                        return repr(component)
+                    if component not in graph.G:
+                        return f"node:{component}:absent"
+                    data = graph.G.nodes[component]
+                    attributes = data.get("attributes") or {}
+                    binding = attributes.get("binding_name")
+                    suffix = f":binding={binding}" if binding else ""
+                    return (
+                        f"node:{component}:{data.get('type')}:"
+                        f"{data.get('label')}{suffix}"
+                    )
                 raise TypeError(
                     "indexed assignment requires resolved tensor, index, "
-                    f"and value nodes in {statement.name}"
+                    f"and value nodes in {statement.name}: "
+                    f"target={assignment_source!r}; "
+                    f"base={component_identity(base)}; "
+                    "indices=("
+                    + ", ".join(component_identity(index) for index in indices)
+                    + "); "
+                    f"value={component_identity(value)}"
                 )
             node_id = id(target)
             if (
@@ -2404,15 +2712,25 @@ def _normalize_lexical_values(
                 reduce_statement(nested)
             return id(body_statement)
         if isinstance(body_statement, (ast.For, ast.While)):
-            before_loop = dict(environment)
             # A discarded bound-method result is an effectful body statement
             # unless a later lowering proves otherwise.  Record the actual
             # statement calls here; loop composition must not rediscover
             # state transitions from method-name lists or output reachability.
+            def current_loop_walk(node: ast.AST):
+                """Walk one loop body without stealing descendant-loop effects."""
+
+                yield node
+                if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+                    return
+                for child in source_child_nodes(node):
+                    yield from current_loop_walk(child)
+
             state_effect_calls = tuple(
                 expression_statement.value
                 for nested_statement in body_statement.body
-                for expression_statement in source_walk(nested_statement)
+                for expression_statement in current_loop_walk(
+                    nested_statement
+                )
                 if (
                     isinstance(expression_statement, ast.Expr)
                     and isinstance(expression_statement.value, ast.Call)
@@ -2422,15 +2740,27 @@ def _normalize_lexical_values(
                     )
                     and isinstance(
                         expression_statement.value.func.value,
-                        ast.Name,
+                        (ast.Name, ast.Attribute),
                     )
                 )
             )
             if isinstance(body_statement, ast.For):
                 resolve_expression(body_statement.iter)
+                # Parameter/external bindings are materialized lazily at
+                # their first lexical read.  Resolve the loop domain before
+                # taking the initial-state snapshot so a value first read by
+                # the iterator can still become explicit loop-carried state
+                # when the body writes it.
+                before_loop = dict(environment)
                 bind_loop_target(body_statement.target)
             else:
                 resolve_expression(body_statement.test)
+                # The same ordering is essential for while loops: a parameter
+                # first read by the predicate is the initial version consumed
+                # by the header, not a name that appeared only after entry.
+                # Snapshotting before this resolution silently lost genuine
+                # body updates such as ``data = data[0] if data else []``.
+                before_loop = dict(environment)
             for nested in body_statement.body:
                 reduce_statement(nested)
             for nested in body_statement.orelse:
@@ -2447,18 +2777,21 @@ def _normalize_lexical_values(
                     if isinstance(body_statement, ast.For)
                     else set()
                 )
+                # Read iteration inputs from the target AST identities that
+                # ``bind_loop_target`` recorded, not from the post-body lexical
+                # environment.  A body may legally reassign one tuple member
+                # (``for op, av in rows: ...; op = replacement``); by this
+                # point ``environment['op']`` denotes that later body value,
+                # but the loop's row contract still has both ``op`` and ``av``.
                 current_loop_bindings = {
-                    name: value_id
-                    for name, value_id in environment.items()
+                    target_name.id: loop_target_bindings_by_ast[id(target_name)]
+                    for target_name in target_name_nodes(body_statement.target)
                     if (
-                        name in direct_loop_target_names
-                        and
-                        (
-                            graph.G.nodes[value_id].get("attributes") or {}
-                        ).get("binding_kind") == "loop"
-                        and before_loop.get(name) != value_id
+                        id(target_name) in loop_target_bindings_by_ast
+                        and before_loop.get(target_name.id)
+                        != loop_target_bindings_by_ast[id(target_name)]
                     )
-                }
+                } if isinstance(body_statement, ast.For) else {}
                 # AST ingestion initially wires name occurrences before
                 # lexical rebinding is known.  A reused spelling (for example
                 # a comprehension's ``width`` followed by a ``for width``)
@@ -2491,12 +2824,63 @@ def _normalize_lexical_values(
                     {},
                 )
                 loop_target_bindings = current_loop_bindings
+                # A local assigned unconditionally from the current iteration
+                # before its first read is not recurrence.  For example
+                # ``for p in rows: op, av = p[0]`` gives ``op`` a new value on
+                # every iteration; exporting it as a Phi asks the latch for a
+                # producer even though the next iteration overwrites it before
+                # use.  Preserve genuine state (including conditional writes)
+                # by accepting only a direct body assignment reached before
+                # any lexical load of the same name.
+                overwritten_before_read: set[str] = set()
+                candidate_names = before_loop.keys() & environment.keys()
+                for name in candidate_names:
+                    for nested in body_statement.body:
+                        loaded = any(
+                            isinstance(member, ast.Name)
+                            and isinstance(member.ctx, ast.Load)
+                            and member.id == name
+                            for member in source_walk(nested)
+                        )
+                        direct_targets: tuple[ast.AST, ...] = ()
+                        if isinstance(nested, ast.Assign):
+                            direct_targets = tuple(nested.targets)
+                        elif isinstance(nested, (ast.AnnAssign, ast.AugAssign)):
+                            direct_targets = (nested.target,)
+                        assigned = any(
+                            target_name.id == name
+                            for target in direct_targets
+                            for target_name in target_name_nodes(target)
+                        )
+                        if assigned and not loaded:
+                            overwritten_before_read.add(name)
+                            break
+                        if loaded:
+                            break
                 loop_carried_bindings = {
                     name: (before_loop[name], environment[name])
                     for name in before_loop.keys() & environment.keys()
                     if (
                         before_loop[name] != environment[name]
                         and name not in loop_target_bindings
+                        and name not in overwritten_before_read
+                        # A descendant loop's induction binding remains in
+                        # Python's lexical environment after that loop, but it
+                        # is not recurrent state of this enclosing loop.  Its
+                        # value is produced by the descendant loop domain, not
+                        # by an enclosing-loop latch.  Treating it as carried
+                        # creates a Phi whose backedge can never have a body
+                        # producer (for example pad_cat_'s inner ``i, size``
+                        # enumerate target leaking into the outer ``arr``
+                        # loop).
+                        and not (
+                            environment[name] in graph.G
+                            and (
+                                graph.G.nodes[environment[name]].get(
+                                    "attributes"
+                                ) or {}
+                            ).get("binding_kind") == "loop"
+                        )
                     )
                 }
                 loop_attributes["loop_carried_bindings"] = (
@@ -2527,9 +2911,28 @@ def _normalize_lexical_values(
                 # the critical value graph before loop realization is known.
                 state_effects = []
                 for call in state_effect_calls:
-                    name = call.func.value.id
-                    initial = before_loop.get(name)
+                    receiver_expression = call.func.value
+                    name = ast.unparse(receiver_expression)
+                    # A parameter first referenced inside this loop is resolved
+                    # while reducing the body, after ``before_loop`` was
+                    # snapped.  Keep that real input as an opaque effect unless
+                    # its storage provenance proves a sequence policy; never
+                    # let the mutation disappear merely because its first use
+                    # is nested here.
                     call_id = id(call)
+                    call_parents = tuple(
+                        graph.G.nodes[call_id].get("parents") or ()
+                    ) if call_id in graph.G else ()
+                    operand = next((
+                        int(parent)
+                        for parent, role in call_parents
+                        if str(role) == "operand"
+                    ), None)
+                    initial = (
+                        before_loop.get(name, environment.get(name))
+                        if isinstance(receiver_expression, ast.Name)
+                        else operand
+                    )
                     if (
                         initial is None
                         or initial not in graph.G
@@ -2537,37 +2940,75 @@ def _normalize_lexical_values(
                         or name in loop_carried_bindings
                     ):
                         continue
-                    call_parents = tuple(
-                        graph.G.nodes[call_id].get("parents") or ()
+                    call_attributes = (
+                        graph.G.nodes[call_id].get("attributes") or {}
                     )
+                    # A source-linked method is already an ordinary SSA call:
+                    # its method_ref selects the complete function-table body,
+                    # and its receiver is the explicit ``operand`` input.  It
+                    # is not a second, opaque mutation of that receiver.  The
+                    # callee's own GetAttr/SetAttr and calls carry its effects.
+                    if call_attributes.get("method_ref") is not None:
+                        continue
                     argument_ids = tuple(
                         int(parent)
                         for parent, role in call_parents
                         if str(role).startswith("arg")
                     )
-                    environment[name] = initial
+                    if isinstance(receiver_expression, ast.Name):
+                        environment[name] = initial
                     argument_expression = (
                         call.args[0] if len(call.args) == 1 else None
+                    )
+                    state_attributes = (
+                        graph.G.nodes[initial].get("attributes") or {}
+                    )
+                    aggregate_kind = state_attributes.get("aggregate_kind")
+                    sequence_policy = (
+                        "unique"
+                        if aggregate_kind in {"set", "dict"}
+                        else (
+                            "duplicates"
+                            if aggregate_kind in {
+                                "list", "tuple", "bytes", "bytearray"
+                            }
+                            else None
+                        )
+                    )
+                    sequence_mutation = (
+                        sequence_policy is not None
+                        and call.func.attr in {"add", "append", "extend"}
+                        and not (
+                            aggregate_kind in {"tuple", "bytes"}
+                            or not state_attributes.get(
+                                "sequence_writable", True
+                            )
+                        )
                     )
                     state_effects.append({
                         "state_name": name,
                         "operator": call.func.attr,
                         "effect_mode": (
-                            "indexed_publication"
-                            if (
-                                len(argument_ids) == 1
-                                and (
-                                    call.func.attr == "append"
-                                    or (
-                                        call.func.attr == "extend"
-                                        and isinstance(
-                                            argument_expression,
-                                            (ast.GeneratorExp, ast.ListComp),
-                                        )
-                                    )
-                                )
-                            )
+                            "sequence_mutation"
+                            if sequence_mutation
                             else "opaque"
+                        ),
+                        "sequence_policy": sequence_policy,
+                        "argument_kind": (
+                            "generator"
+                            if isinstance(argument_expression, ast.GeneratorExp)
+                            else (
+                                (
+                                    "filtered_sequence"
+                                    if any(
+                                        generator.ifs
+                                        for generator in argument_expression.generators
+                                    )
+                                    else "sequence"
+                                )
+                                if isinstance(argument_expression, ast.ListComp)
+                                else "value"
+                            )
                         ),
                         "state_input_id": int(initial),
                         "effect_node_id": int(call_id),
@@ -2663,6 +3104,23 @@ def _normalize_lexical_values(
             # value has no consumers and must not leak into the public input
             # contract.
             _remove_node(graph, node_id)
+            continue
+        if (
+            data.get("type") == "StaticReference"
+            and graph.G.out_degree(node_id) == 0
+            and node_id not in graph.roots
+            and (data.get("attributes") or {}).get("reference_kind")
+            == "function_subgraph"
+        ):
+            # Resolving a direct named call first encounters the callee as a
+            # possible first-class value.  Once the Call has recorded its
+            # exact ``callee_ref``, that temporary token has no runtime role:
+            # the referenced source body lives in FunctionTable and the Call
+            # invokes its compiled slot.  Keep a function reference whenever
+            # it is returned or consumed as data; remove only this genuinely
+            # disconnected compiler token so it cannot be scheduled as an
+            # operator of its own.
+            _remove_node(graph, node_id)
 
     # A compile-time reference left as a root is one nothing consumes at
     # runtime. Whether that is correct depends entirely on whether it is
@@ -2728,9 +3186,8 @@ def _normalize_lexical_values(
         for node_id, data in graph.G.nodes(data=True)
     }
     ordered = list(
-        nx.lexicographical_topological_sort(
-            graph.G,
-            key=lambda node_id: source_position[node_id],
+        lexicographical_topological_order(
+            graph.G, key=lambda node_id: source_position[node_id]
         )
     )
     mapping = {
@@ -2906,6 +3363,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     call_owners: dict[int, Any] = {}
     method_owners: dict[int, str] = {}
     class_definitions: dict[str, ast.ClassDef] = {}
+    external_owner_classes: dict[str, type] = {}
     lexical_parent_by_function: dict[int, int] = {}
     function_definitions = {
         int(node_id): node_data.get("expr_obj")
@@ -2936,6 +3394,73 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         visitor = _DirectNestedFunctionVisitor(owner_id)
         for body_member in definition.body:
             visitor.visit(body_member)
+
+    def local_aggregate_kinds(definition: Any) -> dict[str, str]:
+        """Return aggregate storage explicitly constructed in one scope."""
+
+        if not isinstance(
+            definition, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            return {}
+        kinds: dict[str, str] = {}
+        pending = list(reversed(definition.body))
+        while pending:
+            member = pending.pop()
+            if isinstance(
+                member,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+            ):
+                continue
+            if isinstance(member, (ast.Assign, ast.AnnAssign)):
+                value = member.value
+                kind = None
+                if isinstance(value, (ast.List, ast.ListComp)):
+                    kind = "list"
+                elif isinstance(value, (ast.Set, ast.SetComp)):
+                    kind = "set"
+                elif isinstance(value, (ast.Dict, ast.DictComp)):
+                    kind = "dict"
+                elif isinstance(value, ast.Tuple):
+                    kind = "tuple"
+                elif (
+                    isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Name)
+                    and value.func.id in {
+                        "list", "set", "dict", "tuple", "bytes", "bytearray"
+                    }
+                ):
+                    kind = value.func.id
+                targets = (
+                    tuple(member.targets)
+                    if isinstance(member, ast.Assign)
+                    else (member.target,)
+                )
+                if kind is not None:
+                    for target in targets:
+                        if isinstance(target, ast.Name):
+                            kinds[target.id] = kind
+            pending.extend(reversed(tuple(source_child_nodes(member))))
+        return kinds
+
+    local_aggregate_kinds_by_function = {
+        definition_id: local_aggregate_kinds(definition)
+        for definition_id, definition in function_definitions.items()
+    }
+
+    def closure_aggregate_kinds(definition_id: int) -> dict[str, str]:
+        """Aggregate identities inherited from lexical parent scopes."""
+
+        inherited: dict[str, str] = {}
+        parent_id = lexical_parent_by_function.get(definition_id)
+        ancestry = []
+        while parent_id is not None:
+            ancestry.append(parent_id)
+            parent_id = lexical_parent_by_function.get(parent_id)
+        for ancestor_id in reversed(ancestry):
+            inherited.update(
+                local_aggregate_kinds_by_function.get(ancestor_id, {})
+            )
+        return inherited
     for _node_id, node_data in graph.G.nodes(data=True):
         class_definition = node_data.get("expr_obj")
         if isinstance(
@@ -2960,12 +3485,380 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             )
             if "<locals>" not in qualified and len(parts) >= 2:
                 method_owners[id(class_definition)] = parts[-2]
+                module_name = str(source_identity[0])
+                try:
+                    module = importlib.import_module(module_name)
+                    owner_class = getattr(module, parts[-2])
+                except (ImportError, AttributeError, TypeError):
+                    owner_class = None
+                if inspect.isclass(owner_class):
+                    external_owner_classes[parts[-2]] = owner_class
         if not isinstance(class_definition, ast.ClassDef):
             continue
         class_definitions[class_definition.name] = class_definition
+        class_source_identity = getattr(
+            class_definition, "_python_source_identity", None
+        )
+        if (
+            isinstance(class_source_identity, tuple)
+            and len(class_source_identity) == 2
+        ):
+            module_name, qualified_name = map(str, class_source_identity)
+            target: Any = None
+            try:
+                target = importlib.import_module(module_name)
+                for part in qualified_name.split("."):
+                    if part == "<locals>":
+                        target = None
+                        break
+                    target = getattr(target, part)
+            except (ImportError, AttributeError, TypeError):
+                target = None
+            if inspect.isclass(target):
+                external_owner_classes[class_definition.name] = target
         for member in class_definition.body:
             if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 method_owners[id(member)] = class_definition.name
+    class_field_aggregate_kinds: dict[tuple[str, str], str] = {}
+
+    def aggregate_expression_kind(expression: ast.AST | None) -> str | None:
+        if isinstance(expression, (ast.List, ast.ListComp)):
+            return "list"
+        if isinstance(expression, (ast.Set, ast.SetComp)):
+            return "set"
+        if isinstance(expression, (ast.Dict, ast.DictComp)):
+            return "dict"
+        if isinstance(expression, ast.Tuple):
+            return "tuple"
+        if (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Name)
+            and expression.func.id in {"list", "set", "dict", "tuple"}
+        ):
+            return expression.func.id
+        return None
+
+    class_factory_aggregate_kinds: dict[tuple[str, str], str] = {}
+    class_declared_field_aliases: set[tuple[str, str, str]] = set()
+    class_field_value_aggregate_kinds: dict[tuple[str, str], str] = {}
+    field_value_kind_conflicts: set[tuple[str, str]] = set()
+    class_bases: dict[str, tuple[str, ...]] = {}
+    for class_name, definition in class_definitions.items():
+        class_bases[str(class_name)] = tuple(
+            base.id for base in definition.bases if isinstance(base, ast.Name)
+        )
+        for member in definition.body:
+            if not isinstance(member, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = (
+                tuple(member.targets)
+                if isinstance(member, ast.Assign)
+                else (member.target,)
+            )
+            value = member.value
+            if isinstance(value, ast.Name):
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id != value.id:
+                        class_declared_field_aliases.add((
+                            str(class_name), str(target.id), str(value.id)
+                        ))
+            kind = (
+                value.id
+                if isinstance(value, ast.Name)
+                and value.id in {"list", "set", "dict", "tuple"}
+                else None
+            )
+            if kind is None:
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    class_factory_aggregate_kinds[(
+                        str(class_name), str(target.id)
+                    )] = kind
+    for owner_name, owner_class in external_owner_classes.items():
+        # Pursued external methods may arrive without their containing
+        # ClassDef. Read the exact class and base-class source declarations so
+        # class-level factories remain compiler facts. No class is
+        # instantiated and no factory is called.
+        for source_class in reversed(owner_class.__mro__):
+            try:
+                source = textwrap.dedent(inspect.getsource(source_class))
+                parsed = ast.parse(source)
+            except (OSError, TypeError, SyntaxError, IndentationError):
+                continue
+            definition = next(
+                (
+                    member for member in parsed.body
+                    if isinstance(member, ast.ClassDef)
+                ),
+                None,
+            )
+            if definition is None:
+                continue
+            for member in definition.body:
+                if not isinstance(member, (ast.Assign, ast.AnnAssign)):
+                    continue
+                targets = (
+                    tuple(member.targets)
+                    if isinstance(member, ast.Assign)
+                    else (member.target,)
+                )
+                value = member.value
+                if isinstance(value, ast.Name):
+                    for target in targets:
+                        if isinstance(target, ast.Name) and target.id != value.id:
+                            class_declared_field_aliases.add((
+                                str(owner_name), str(target.id), str(value.id)
+                            ))
+                kind = (
+                    value.id
+                    if isinstance(value, ast.Name)
+                    and value.id in {"list", "set", "dict", "tuple"}
+                    else None
+                )
+                if kind is None:
+                    continue
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        class_factory_aggregate_kinds[(
+                            str(owner_name), str(target.id)
+                        )] = kind
+            for source_member in ast.walk(definition):
+                if isinstance(source_member, ast.Assign):
+                    targets = tuple(source_member.targets)
+                    value = source_member.value
+                elif isinstance(source_member, ast.AnnAssign):
+                    targets = (source_member.target,)
+                    value = source_member.value
+                else:
+                    continue
+                outer_kind = aggregate_expression_kind(value)
+                if (
+                    outer_kind is None
+                    and isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Attribute)
+                    and isinstance(value.func.value, ast.Name)
+                    and value.func.value.id in {"self", "cls"}
+                ):
+                    outer_kind = class_factory_aggregate_kinds.get((
+                        str(owner_name), str(value.func.attr)
+                    ))
+                alias_source = (
+                    str(value.attr)
+                    if (
+                        isinstance(value, ast.Attribute)
+                        and isinstance(value.value, ast.Name)
+                        and value.value.id in {"self", "cls"}
+                    )
+                    else None
+                )
+                for target in targets:
+                    if not (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id in {"self", "cls"}
+                    ):
+                        continue
+                    if alias_source is not None:
+                        pending = (
+                            str(owner_name), str(target.attr), alias_source
+                        )
+                        if pending not in class_declared_field_aliases:
+                            class_declared_field_aliases.add(pending)
+                    if outer_kind is not None:
+                        class_field_aggregate_kinds.setdefault(
+                            (str(owner_name), str(target.attr)), outer_kind
+                        )
+                if not (
+                    isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Attribute)
+                    and isinstance(value.func.value, ast.Name)
+                    and value.func.value.id in {"self", "cls"}
+                ):
+                    continue
+                value_kind = class_factory_aggregate_kinds.get((
+                    str(owner_name), str(value.func.attr)
+                ))
+                if value_kind is None:
+                    continue
+                for target in targets:
+                    if not (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Attribute)
+                        and isinstance(target.value.value, ast.Name)
+                        and target.value.value.id in {"self", "cls"}
+                    ):
+                        continue
+                    value_key = (
+                        str(owner_name), str(target.value.attr)
+                    )
+                    previous = class_field_value_aggregate_kinds.setdefault(
+                        value_key, value_kind
+                    )
+                    if previous != value_kind:
+                        class_field_value_aggregate_kinds.pop(value_key, None)
+                        field_value_kind_conflicts.add(value_key)
+    changed = True
+    while changed:
+        changed = False
+        for class_name, bases in class_bases.items():
+            for base in bases:
+                for (owner, factory), kind in tuple(
+                    class_factory_aggregate_kinds.items()
+                ):
+                    if owner != base:
+                        continue
+                    key = (class_name, factory)
+                    if key not in class_factory_aggregate_kinds:
+                        class_factory_aggregate_kinds[key] = kind
+                        changed = True
+
+    field_kind_conflicts: set[tuple[str, str]] = set()
+    class_field_aliases: dict[tuple[str, str], str] = {}
+    pending_field_aliases: list[tuple[str, str, str]] = list(
+        sorted(class_declared_field_aliases)
+    )
+    for class_name, definition in class_definitions.items():
+        for member in definition.body:
+            if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for statement_member in source_walk(member):
+                if isinstance(statement_member, ast.Assign):
+                    targets = tuple(statement_member.targets)
+                    value = statement_member.value
+                elif isinstance(statement_member, ast.AnnAssign):
+                    targets = (statement_member.target,)
+                    value = statement_member.value
+                else:
+                    continue
+                kind = aggregate_expression_kind(value)
+                if (
+                    kind is None
+                    and isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Attribute)
+                    and isinstance(value.func.value, ast.Name)
+                    and value.func.value.id in {"self", "cls"}
+                ):
+                    kind = class_factory_aggregate_kinds.get((
+                        str(class_name), str(value.func.attr)
+                    ))
+                alias_source = (
+                    str(value.attr)
+                    if (
+                        isinstance(value, ast.Attribute)
+                        and isinstance(value.value, ast.Name)
+                        and value.value.id in {"self", "cls"}
+                    )
+                    else None
+                )
+                if alias_source is not None:
+                    for target in targets:
+                        if (
+                            isinstance(target, ast.Attribute)
+                            and isinstance(target.value, ast.Name)
+                            and target.value.id in {"self", "cls"}
+                        ):
+                            pending_field_aliases.append((
+                                str(class_name),
+                                str(target.attr),
+                                alias_source,
+                            ))
+                if kind is None and alias_source is not None:
+                    kind = class_field_aggregate_kinds.get((
+                        str(class_name), alias_source
+                    ))
+                for target in targets:
+                    if not (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Attribute)
+                        and isinstance(target.value.value, ast.Name)
+                        and target.value.value.id in {"self", "cls"}
+                    ):
+                        continue
+                    value_kind = aggregate_expression_kind(value)
+                    if (
+                        value_kind is None
+                        and isinstance(value, ast.Call)
+                        and isinstance(value.func, ast.Attribute)
+                        and isinstance(value.func.value, ast.Name)
+                        and value.func.value.id in {"self", "cls"}
+                    ):
+                        value_kind = class_factory_aggregate_kinds.get((
+                            str(class_name), str(value.func.attr)
+                        ))
+                    if value_kind is None:
+                        continue
+                    value_key = (
+                        str(class_name), str(target.value.attr)
+                    )
+                    previous_value_kind = (
+                        class_field_value_aggregate_kinds.setdefault(
+                            value_key, value_kind
+                        )
+                    )
+                    if previous_value_kind != value_kind:
+                        class_field_value_aggregate_kinds.pop(value_key, None)
+                        field_value_kind_conflicts.add(value_key)
+                if kind is None:
+                    continue
+                for target in targets:
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id in {"self", "cls"}
+                    ):
+                        key = (str(class_name), str(target.attr))
+                        if key in field_kind_conflicts:
+                            continue
+                        previous = class_field_aggregate_kinds.setdefault(
+                            key, kind
+                        )
+                        if previous != kind:
+                            # Conflicting assignments deliberately erase the
+                            # storage proof; no method spelling may restore it.
+                            class_field_aggregate_kinds.pop(key, None)
+                            field_kind_conflicts.add(key)
+                        elif alias_source is not None:
+                            class_field_aliases[key] = alias_source
+    changed = True
+    while changed:
+        changed = False
+        for class_name, alias, target in pending_field_aliases:
+            alias_key = (class_name, alias)
+            target_kind = class_field_aggregate_kinds.get((
+                class_name, target
+            ))
+            if target_kind is None or alias_key in field_kind_conflicts:
+                continue
+            previous = class_field_aggregate_kinds.setdefault(
+                alias_key, target_kind
+            )
+            if previous != target_kind:
+                class_field_aggregate_kinds.pop(alias_key, None)
+                class_field_aliases.pop(alias_key, None)
+                field_kind_conflicts.add(alias_key)
+                changed = True
+            elif class_field_aliases.get(alias_key) != target:
+                class_field_aliases[alias_key] = target
+                changed = True
+            target_value_kind = class_field_value_aggregate_kinds.get((
+                class_name, target
+            ))
+            if (
+                target_value_kind is not None
+                and alias_key not in field_value_kind_conflicts
+            ):
+                value_kind_was_present = (
+                    alias_key in class_field_value_aggregate_kinds
+                )
+                previous_value_kind = class_field_value_aggregate_kinds.setdefault(
+                    alias_key, target_value_kind
+                )
+                if previous_value_kind != target_value_kind:
+                    class_field_value_aggregate_kinds.pop(alias_key, None)
+                    field_value_kind_conflicts.add(alias_key)
+                elif not value_kind_was_present:
+                    changed = True
     for node_id, data in graph.G.nodes(data=True):
         statement = data.get("expr_obj")
         if not is_runnable_definition(statement):
@@ -3037,6 +3930,119 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 graph, reference, node_id, call_owners, function_return_values,
             )
 
+    # Source-less host callables are not external runtime handlers.  Source
+    # pursuit may attach a decompiled repository-SSA module to the exact Call;
+    # give its root an ordinary FunctionTable reference so all later call and
+    # module machinery sees the implementation as compiled interior code.
+    for node_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        if not isinstance(expression, ast.Call):
+            continue
+        host_module = getattr(expression, "_host_ssa_module", None)
+        host_root = getattr(expression, "_host_ssa_root", None)
+        if host_module is None or host_root is None:
+            continue
+        if isinstance(expression.func, ast.Name):
+            local_name = expression.func.id
+        elif isinstance(expression.func, ast.Attribute):
+            local_name = expression.func.attr
+        else:
+            local_name = str(host_root)
+        reference = function_table.declare(
+            local_name,
+            qualified_name=f"host-ssa.{host_root}",
+            metadata={
+                "host_ssa_module": host_module,
+                "host_ssa_root": str(host_root),
+                "host_ssa_blockers": tuple(getattr(
+                    expression, "_host_ssa_blockers", ()
+                )),
+                "host_ssa_raw_blockers": tuple(getattr(
+                    expression, "_host_ssa_raw_blockers", ()
+                )),
+                "host_ssa_hard_blockers": tuple(getattr(
+                    expression, "_host_ssa_hard_blockers", ()
+                )),
+                "host_ssa_legalization_shortfalls": tuple(getattr(
+                    expression, "_host_ssa_legalization_shortfalls", ()
+                )),
+                "host_machine_state_complete": bool(getattr(
+                    expression, "_host_machine_state_complete", False
+                )),
+                "host_machine_bodies_complete": bool(getattr(
+                    expression, "_host_machine_bodies_complete", False
+                )),
+                "host_dependency_context_complete": bool(getattr(
+                    expression, "_host_dependency_context_complete", False
+                )),
+                "host_repository_ssa_complete": bool(getattr(
+                    expression, "_host_repository_ssa_complete", False
+                )),
+                "host_uses_machine_state_dialect": bool(getattr(
+                    expression, "_host_uses_machine_state_dialect", False
+                )),
+                "host_native_module": getattr(
+                    expression, "_host_native_module", None
+                ),
+                "host_ssa_cache_key": getattr(
+                    expression, "_host_ssa_cache_key", None
+                ),
+                "host_ssa_cache_path": getattr(
+                    expression, "_host_ssa_cache_path", None
+                ),
+                "host_ssa_cache_hit": bool(getattr(
+                    expression, "_host_ssa_cache_hit", False
+                )),
+                "host_ssa_library_cache_keys": tuple(getattr(
+                    expression, "_host_ssa_library_cache_keys", ()
+                )),
+                "host_ssa_library_cache_paths": tuple(getattr(
+                    expression, "_host_ssa_library_cache_paths", ()
+                )),
+                "host_ssa_dependency_edges": tuple(getattr(
+                    expression, "_host_ssa_dependency_edges", ()
+                )),
+                "host_ssa_unresolved_dependencies": tuple(getattr(
+                    expression, "_host_ssa_unresolved_dependencies", ()
+                )),
+                "implementation_kind": "decompiled-host-ssa",
+                "implementation_variants": tuple(
+                    variant for variant, available in (
+                        ("repository-ssa", bool(getattr(
+                            expression, "_host_repository_ssa_complete", False
+                        ))),
+                        ("machine-state-ssa", bool(getattr(
+                            expression, "_host_machine_state_complete", False
+                        )) and bool(getattr(
+                            expression, "_host_uses_machine_state_dialect", False
+                        ))),
+                        ("retained-native-module", getattr(
+                            expression, "_host_native_module", None
+                        ) is not None),
+                    ) if available
+                ),
+            },
+        )
+        data.setdefault("attributes", {}).update({
+            "callee_ref": int(reference.address),
+            "host_ssa_root": str(host_root),
+            "host_ssa_cache_key": getattr(
+                expression, "_host_ssa_cache_key", None
+            ),
+            "host_ssa_blocker_count": len(tuple(getattr(
+                expression, "_host_ssa_blockers", ()
+            ))),
+            "host_repository_ssa_complete": bool(getattr(
+                expression, "_host_repository_ssa_complete", False
+            )),
+            "host_ssa_dependency_count": len(tuple(getattr(
+                expression, "_host_ssa_dependency_edges", ()
+            ))),
+            "host_ssa_unresolved_dependency_count": len(tuple(getattr(
+                expression, "_host_ssa_unresolved_dependencies", ()
+            ))),
+        })
+
     def class_field_defaults(definition: ast.ClassDef) -> dict[str, Any]:
         """Retain literal class-field defaults as structural compiler facts."""
 
@@ -3100,6 +4106,12 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         and isinstance(target.value, ast.Name)
                         and target.value.id in {"self", "cls"}
                     ),
+                    *(
+                        field_name
+                        for (owner, field_name), _kind
+                        in class_field_aggregate_kinds.items()
+                        if owner == class_name
+                    ),
                 ))
             ),
             # An omitted dataclass/class field is not an unknown shell input.
@@ -3119,6 +4131,15 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             owner_name,
             {"methods": {}, "fields": (), "field_defaults": {}},
         )
+        descriptor["fields"] = tuple(dict.fromkeys((
+            *tuple(descriptor.get("fields") or ()),
+            *(
+                field_name
+                for (owner, field_name), _kind
+                in class_field_aggregate_kinds.items()
+                if owner == owner_name
+            ),
+        )))
         function_definition = graph.G.nodes[function_node_id].get(
             "expr_obj"
         )
@@ -3134,6 +4155,33 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         for function_node_id, reference in function_nodes.items()
         if method_owners.get(function_node_id) is not None
     }
+    # Source pursuit has already made an exact definition->call dependency
+    # edge. Preserve that identity directly in SSA call metadata instead of
+    # attempting receiver-name inference again. This is especially important
+    # for a method reached through an argument (``G.remove_node``): its owner
+    # is proven by actual-argument provenance, not by the local spelling ``G``.
+    for call_id, call_data in graph.G.nodes(data=True):
+        expression = call_data.get("expr_obj")
+        if not isinstance(expression, ast.Call):
+            continue
+        resolved_parent = (call_data.get("attributes") or {}).get(
+            "resolved_ast_parent"
+        )
+        reference = function_nodes.get(int(resolved_parent)) if (
+            resolved_parent is not None
+        ) else None
+        if reference is None:
+            continue
+        attributes = call_data.setdefault("attributes", {})
+        attributes["callee_ref"] = int(reference.address)
+        if isinstance(expression.func, ast.Attribute):
+            attributes["method_ref"] = int(reference.address)
+            accessor_id = id(expression.func)
+            if accessor_id in graph.G:
+                graph.G.nodes[accessor_id].setdefault("attributes", {}).update({
+                    "accessor_kind": "method",
+                    "method_ref": int(reference.address),
+                })
 
     contextual_requirements = list(
         graph.G.graph.get("contextual_requirements", ())
@@ -3461,7 +4509,29 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             operation = _qualified_handler("binop", expression.op)
             data["type"] = operation
             data["op"] = operation
-            data.setdefault("attributes", {})["source_type"] = "BinOp"
+            attributes = data.setdefault("attributes", {})
+            attributes["source_type"] = "BinOp"
+            sequence_operand = (
+                expression.left
+                if isinstance(expression.left, (ast.List, ast.Tuple))
+                else expression.right
+                if isinstance(expression.right, (ast.List, ast.Tuple))
+                else None
+            )
+            if isinstance(expression.op, ast.Mult) and sequence_operand is not None:
+                attributes.update({
+                    "producer_kind": "sequence_replication",
+                    "aggregate_kind": (
+                        "list" if isinstance(sequence_operand, ast.List)
+                        else "tuple"
+                    ),
+                    "sequence_key_columns": (),
+                    "sequence_column_count": 1,
+                    "sequence_writable": isinstance(sequence_operand, ast.List),
+                    "sequence_fill_value_ids": tuple(
+                        id(element) for element in sequence_operand.elts
+                    ),
+                })
             _replace_inputs(
                 graph,
                 node_id,
@@ -3601,9 +4671,17 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     .get(expression.func.attr)
                 )
                 if method_reference is not None:
-                    data.setdefault("attributes", {})["method_ref"] = int(
+                    method_reference = int(method_reference)
+                    data.setdefault("attributes", {})["method_ref"] = (
                         method_reference
                     )
+                    accessor_id = id(expression.func)
+                    if accessor_id in graph.G:
+                        accessor = graph.G.nodes[accessor_id]
+                        accessor.setdefault("attributes", {}).update({
+                            "accessor_kind": "method",
+                            "method_ref": method_reference,
+                        })
             # Wiring the receiver/arguments as this node's own ``parents``
             # used to happen right here, keyed by ``id(expression.func.
             # value)`` -- the raw Python id() of the AST node, not a real
@@ -4178,7 +5256,33 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 )
                 else ()
             ),
+            class_field_aggregate_kinds={
+                field: kind
+                for (owner, field), kind in class_field_aggregate_kinds.items()
+                if owner == method_owners.get(node_id)
+            },
+            class_field_aliases={
+                field: target
+                for (owner, field), target in class_field_aliases.items()
+                if owner == method_owners.get(node_id)
+            },
+            class_field_value_aggregate_kinds={
+                field: kind
+                for (owner, field), kind
+                in class_field_value_aggregate_kinds.items()
+                if owner == method_owners.get(node_id)
+            },
         )
+        parameter_contracts = _known_parameter_memory_contracts(
+            statement,
+            parameter_names,
+            method_owner=method_owners.get(node_id),
+        )
+        if parameter_contracts:
+            function_table.set_parameter_contracts(
+                reference,
+                parameter_contracts,
+            )
         for member in function_graph.G:
             member_data = function_graph.G.nodes[member]
             expression = member_data.get("expr_obj")
@@ -4234,6 +5338,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             definition_static_bindings,
             function_table,
             lexical_functions_by_owner.get(int(reference.address), {}),
+            closure_aggregate_kinds(node_id),
+            method_owner=method_owners.get(node_id),
+            class_field_aggregate_kinds=class_field_aggregate_kinds,
         )
         generator_yields = tuple(
             node_id
@@ -4261,6 +5368,8 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 ] = "scalar"
         if hasattr(statement, "_python_bindings"):
             delattr(statement, "_python_bindings")
+        if hasattr(statement, "_python_aggregate_binding_kinds"):
+            delattr(statement, "_python_aggregate_binding_kinds")
         function_table.resolve_graph(reference, function_graph)
     # External call references and static Python bindings are two views of the
     # same compile-time environment.  Join them once after every call has been

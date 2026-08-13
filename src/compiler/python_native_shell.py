@@ -205,6 +205,10 @@ def compile_ast_fortran_io_shell(
 ) -> CompiledNativeShell:
     """Compile and generate one native shell using only declarative IO."""
 
+    from .compiler_entrypoints import warn_legacy_source_compiler
+
+    warn_legacy_source_compiler("compile_ast_fortran_io_shell")
+
     from ..common.tensors.accelerator_backends.aot_compile import compile_ast_aot
     from .backend_sources import collect_backend_sources
     from .shell_io import attach_shell_io

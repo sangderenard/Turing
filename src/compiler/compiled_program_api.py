@@ -158,6 +158,8 @@ def describe_fortran_function(
     kind: str = "numerical",
     note: str | None = None,
     source_names: Mapping[int, str] | None = None,
+    dynamic_array_extents: Mapping[int, str] | None = None,
+    array_argument_ids: Iterable[int] = (),
 ) -> EntryPoint:
     """Describe one emitted Fortran subroutine's calling contract.
 
@@ -168,6 +170,11 @@ def describe_fortran_function(
 
     parameters: list[Parameter] = []
     source_names = dict(source_names or {})
+    dynamic_array_extents = {
+        int(value_id): str(extent)
+        for value_id, extent in dict(dynamic_array_extents or {}).items()
+    }
+    array_argument_ids = {int(value_id) for value_id in array_argument_ids}
     for extent in extent_names:
         parameters.append(
             Parameter(
@@ -182,7 +189,12 @@ def describe_fortran_function(
     output_ids = {value.id for value in outputs}
     for value in function.args:
         c_type, ctypes_name = _c_type_for(value.dtype)
-        array = bool(value.shape)
+        dynamic_extent = dynamic_array_extents.get(int(value.id))
+        array = (
+            bool(value.shape)
+            or dynamic_extent is not None
+            or int(value.id) in array_argument_ids
+        )
         parameters.append(
             Parameter(
                 name=f"t{value.id}",
@@ -196,9 +208,16 @@ def describe_fortran_function(
                 ctypes_name=ctypes_name,
                 # A scalar dummy is declared `value` by the emitter; an array
                 # never is.
-                passing="reference" if array else "value",
+                passing=(
+                    "reference"
+                    if array or int(value.id) in output_ids
+                    else "value"
+                ),
                 shape=tuple(value.shape or ()),
-                extent=str(extent_names[-1]) if array and extent_names else None,
+                extent=(
+                    dynamic_extent
+                    or (str(extent_names[-1]) if array and extent_names else None)
+                ),
                 source_name=source_names.get(int(value.id)),
             )
         )

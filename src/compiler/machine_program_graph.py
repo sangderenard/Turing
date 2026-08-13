@@ -520,6 +520,18 @@ def raise_pe_to_token_multigraph(
         previous: EvolutionComponentRef | None = None
         local_instructions: dict[int, EvolutionComponentRef] = {}
         for instruction_index, instruction in enumerate(report.instructions):
+            from .semantic_translation import (
+                SemanticRepresentation, semantic_identity,
+            )
+            operation_identity = semantic_identity(
+                instruction.semantic.name,
+                SemanticRepresentation.MACHINE_GRAPH,
+                facets={
+                    "instruction_token": int(instruction.token),
+                    "encoded": instruction.encoded.hex(),
+                    "operand_count": len(instruction.operands),
+                },
+            )
             semantic_token = tokens.consume((
                 int(MachineGraphNamespace.SEMANTIC), int(instruction.semantic),
             ))
@@ -536,6 +548,7 @@ def raise_pe_to_token_multigraph(
                     "semantic_token_id": semantic_token,
                     "rex": instruction.rex,
                     "legacy_prefixes": tuple(instruction.legacy_prefixes),
+                    **operation_identity.attributes(),
                 },
                 consumes=(() if previous is None else (previous,)),
                 token_id=tokens.consume((

@@ -34,11 +34,13 @@ _REAL_TRANSLATED_SYMBOLS = {
     "unary_double",
     "matmul_double",
     "where_double",
+    "broadcast_double",
     "reduce_dim_double",
     "transpose_double",
     "cumsum_dim_double",
     "stack_double",
     "cat_double",
+    "pad_double_nd",
     "slice_copy_double",
     "index_select_double",
     "index_assign_double",
@@ -274,6 +276,41 @@ def test_handwritten_where_ssa_matches_real_c_kernel(llvm_engine):
         np.asarray(llvm_output),
         np.asarray([c_output[index] for index in range(4)]),
     )
+
+
+def test_handwritten_broadcast_ssa_matches_real_c_kernel(llvm_engine):
+    values = [1.0, 2.0, 3.0]
+    input_shape = [1, 3]
+    output_shape = [2, 3]
+    c_output = _c_array([0.0] * 6)
+    C.broadcast_double(
+        _c_array(values),
+        c_output,
+        ffi.new("int[]", input_shape),
+        len(input_shape),
+        ffi.new("int[]", output_shape),
+        len(output_shape),
+    )
+
+    llvm_output = (ctypes.c_double * 6)()
+    _llvm_function(
+        llvm_engine,
+        "broadcast_double",
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.c_int32,
+    )(
+        (ctypes.c_double * len(values))(*values),
+        llvm_output,
+        (ctypes.c_int32 * len(input_shape))(*input_shape),
+        len(input_shape),
+        (ctypes.c_int32 * len(output_shape))(*output_shape),
+        len(output_shape),
+    )
+    assert list(llvm_output) == [c_output[index] for index in range(6)]
 
 
 def test_handwritten_slice_ssa_matches_real_c_kernel(llvm_engine):

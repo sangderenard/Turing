@@ -83,6 +83,31 @@ def process_graph_to_ssa_instrs(pg: ProcessGraph, schedule: str = "alap") -> Lis
 
         args = [values.setdefault(p, SSAValue(p)) for p in parents]
         attributes = dict(data.get("attributes") or data.get("extra_args") or {})
+        from .semantic_translation import (
+            SemanticRepresentation, semantic_identity,
+        )
+        source_identity = semantic_identity(
+            str(op), SemanticRepresentation.PROCESS_GRAPH,
+            facets=dict(attributes.get("semantic_facets") or {}),
+        )
+        source_family = attributes.get("semantic_family")
+        if source_family is not None:
+            from .semantic_translation import SemanticOperationIdentity
+            source_identity = SemanticOperationIdentity(
+                str(source_family), SemanticRepresentation.PROCESS_GRAPH,
+                str(attributes.get("semantic_spelling") or op),
+                dict(attributes.get("semantic_facets") or {}),
+            )
+        from .semantic_translation import SemanticOperationIdentity
+        target_identity = SemanticOperationIdentity(
+            source_identity.family,
+            SemanticRepresentation.REPOSITORY_SSA,
+            str(op), dict(source_identity.facets),
+        )
+        attributes.update(target_identity.attributes())
+        attributes["semantic_source_representation"] = (
+            source_identity.representation.value
+        )
         if data.get("constant") is not None:
             attributes["value"] = data["constant"]
         source = data.get("source_span")

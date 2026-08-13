@@ -262,9 +262,13 @@ class AbstractTensor:
         if not isinstance(x, AbstractTensor):
             x = AbstractTensor.tensor(x)
 
-        x = AbstractTensor.where(AbstractTensor.isnan(x), nan, x)
-        x = AbstractTensor.where(x == AbstractTensor.inf, posinf, x)
-        x = AbstractTensor.where(x == AbstractTensor.ninf, neginf, x)
+        # Use the selected backend's structural ``where`` implementation.
+        # Calling ``AbstractTensor.where`` directly bypasses a source-producing
+        # backend override and falls into the Python valuewise/tolist path.
+        where = type(x).where
+        x = where(AbstractTensor.isnan(x), nan, x)
+        x = where(x == AbstractTensor.inf, posinf, x)
+        x = where(x == AbstractTensor.ninf, neginf, x)
         return x
 
     def __index__(self):
