@@ -1,24 +1,24 @@
-"""Single switch block for ingestion special cases.
+"""Shared structural compactions for ProcessGraph ingestion.
 
 The Python-AST and SymPy front ends converge on the *same* node interpreter:
 ``ProcessGraph.build_graph`` dispatches on ``type(node).__name__`` for both
 (which is why ``role_schemas`` carries SymPy spellings like ``IndexedBase`` /
 ``Sum`` right beside AST spellings like ``Module`` / ``Assign``).  This module
-is the one place that interpreter consults, and -- via :func:`dissolve_spans`
--- the one place the *ingestion seam* consults before any preprocessing pass
-walks the tree.
+consults this module for cross-frontend compactions. Language meaning is kept
+in sibling adapters; Python call and attribute semantics live in
+``python_special_cases.py``. :func:`dissolve_spans` still runs here before any
+preprocessing pass walks the tree.
 
 The deal it makes: the instant we can recognise a node as collapsible, we
 dissolve it to a single leaf and never descend.  A ``[0.0] * 153600`` span (or
 its already-expanded ``repr`` form baked into source text) becomes one ``fill``
-leaf -- so no pass ever counts, allocates, or mutates per element.  Every quirk
-we ever run across goes in the switch below as a new case; this is the
-community list.
+leaf -- so no pass ever counts, allocates, or mutates per element. Only cases
+safe across the shared structural walker belong in the switch below.
 
 Contract: :func:`interpret_special_case` returns a :class:`SpecialCase`
-describing the collapsed leaf, or ``None`` to defer to the normal schema path.
-Returning ``None`` must be behaviour-preserving -- a special case only ever
-*replaces* work the generic path would have done more expensively.
+describing the structural replacement, or ``None`` to defer to the normal
+schema path. Sibling language adapters may also use ``terminal=False`` to
+decorate a node while retaining its ordinary child-role traversal.
 """
 
 from __future__ import annotations
@@ -41,11 +41,6 @@ from ...common.tensors.operator_catalog import (
 # scale anyway, so anything below this element count is left untouched.
 _MIN_SPAN_ELEMENTS = 64
 
-# Builtin casts that are compiler vocabulary rather than foreign calls; the
-# spellings match what control lowering already handles.
-_CAST_BUILTINS = frozenset({"float", "int", "bool", "str", "len"})
-
-
 @dataclass(frozen=True)
 class SpecialCase:
     """A node the interpreter collapses to a single leaf.
@@ -53,11 +48,13 @@ class SpecialCase:
     ``type`` is the canonical node/op name written onto the graph node;
     ``attributes`` is copied to both ``attributes`` and ``extra_args``;
     ``constant`` is the folded constant payload (or ``None``).
+    ``terminal=False`` retains ordinary role-schema child traversal.
     """
 
     type: str
     attributes: dict
     constant: Any
+    terminal: bool = True
 
 
 def _as_numeric_constant(element: ast.AST) -> tuple[bool, Any]:
@@ -172,48 +169,6 @@ def interpret_special_case(node: Any) -> Optional[SpecialCase]:
     # becomes a literal aggregate in the first place.
     if kind == "BinOp":
         return _broadcast_literal(node)
-
-    # ── AST attribute access: ``obj.field`` ──────────────────────────────
-    # A read (``Load`` context) is normalized to the canonical ``GetAttr``
-    # operator here, at ingestion, instead of being left as a generic
-    # ``Attribute`` node for later passes to individually recognise (or
-    # fail to).  This does not collapse the node -- its receiver
-    # (``node.value``) still descends normally as this node's operand -- it
-    # only stamps the canonical operator name, the same way a tensor-op
-    # ``Call`` is flagged without collapsing just above.  Only ``Load`` is
-    # claimed: a ``Store``-context ``Attribute`` is an assignment target,
-    # already correctly built into a ``SetAttr`` node (with its own
-    # ``object``/``value`` wiring) by ``bind_target`` -- reinterpreting it
-    # here too would fight that already-correct, already-tested
-    # construction over the same AST node identity.
-    if kind == "Attribute" and isinstance(
-        getattr(node, "ctx", None), ast.Load
-    ):
-        return SpecialCase("GetAttr", {"attribute": node.attr}, None)
-
-    # ── AST builtin calls: publication and casts ─────────────────────────
-    # ``print`` is a publication, not a foreign call: it becomes a stream
-    # publish leaf whose payload is its arguments, which the planner lowers
-    # to a StreamPublishBlock (the backpressured text buffer) and every
-    # backend renders as its own publish.  Leaving it to fall through would
-    # make it a source-less external and drag the host runtime in.
-    #
-    # The casts are named here for the same reason: they are vocabulary, and
-    # control lowering already expects the canonical spellings.
-    if kind == "Call":
-        function = getattr(node, "func", None)
-        builtin = function.id if isinstance(function, ast.Name) else None
-        if builtin == "print":
-            return SpecialCase(
-                "stream_publish",
-                {
-                    "stream": "text",
-                    "argument_count": len(getattr(node, "args", ())),
-                },
-                None,
-            )
-        if builtin in _CAST_BUILTINS:
-            return SpecialCase(builtin, {"cast": builtin}, None)
 
     # ── (future cases go here) ───────────────────────────────────────────
     # e.g. SymPy ImmutableDenseMatrix of constants -> tensor_from_list,

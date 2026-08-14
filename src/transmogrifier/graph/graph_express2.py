@@ -28,6 +28,10 @@ from .node_special_cases import (
     dissolve_spans,
     tensor_operation_name,
 )
+from .python_special_cases import (
+    extraction_receipt,
+    interpret_python_special_case,
+)
 import colorsys
 import random
 import time
@@ -1810,6 +1814,7 @@ def _expand_unresolved_ast_parents(
                 "owner_source_identity": getattr(
                     call_owners.get(id(call)), "_python_source_identity", None
                 ),
+                "extraction_contract": extraction_receipt(call),
             }
         )
 
@@ -2186,6 +2191,15 @@ class ProcessGraph:
                 "source_language": self.source_language,
                 "boundary_rule": data.get("boundary_rule"),
                 "boundary_action": data.get("boundary_action"),
+                "extraction_action": (
+                    data.get("attributes") or {}
+                ).get("extraction_action"),
+                "extraction_rule": (
+                    data.get("attributes") or {}
+                ).get("extraction_rule"),
+                "extraction_identity": (
+                    data.get("attributes") or {}
+                ).get("extraction_identity"),
             },
         )
 
@@ -2288,7 +2302,9 @@ class ProcessGraph:
 
 
 
-    def ensure_node(self, node, store_id=None, deduplicate=True):
+    def ensure_node(
+        self, node, store_id=None, deduplicate=True, special_case=None,
+    ):
 
         nid = id(node)
 
@@ -2300,7 +2316,10 @@ class ProcessGraph:
             node_type = type(node).__name__
             #print(f"Building graph node: type={type(node).__name__}, repr={repr(node)}")
 
-            sig = operator_signatures.get(node_type, operator_signatures['Default'])
+            semantic_type = special_case.type if special_case is not None else node_type
+            sig = operator_signatures.get(
+                semantic_type, operator_signatures['Default']
+            )
             extra_args = {}
             for param in sig.get('parameters', []):
                 value = getattr(node, param, None)
@@ -2316,14 +2335,42 @@ class ProcessGraph:
                 }
             source_scope = tuple(getattr(node, "_turing_source_scope", ()))
             source_class = getattr(node, "_turing_source_class", None)
+            receipt = extraction_receipt(node)
+            semantic_attributes = (
+                dict(special_case.attributes) if special_case is not None else {}
+            )
+            if receipt is not None:
+                semantic_attributes.setdefault("extraction_contract", receipt)
+                semantic_attributes.setdefault("extraction_action", receipt["action"])
+                semantic_attributes.setdefault("extraction_rule", receipt.get("rule_id"))
+                semantic_attributes.setdefault(
+                    "extraction_identity", receipt.get("identity")
+                )
+                semantic_attributes.setdefault(
+                    "extraction_classification", receipt.get("classification")
+                )
+            label = str(node)
+            if receipt is not None and isinstance(node, ast.Call):
+                label = (
+                    f"{receipt['action']}: "
+                    f"{receipt.get('identity') or label}"
+                )
+            elif special_case is not None:
+                label = special_case.type
             self.G.add_node(nid,
-                label=str(node),
-                type=node_type,
+                label=label,
+                type=semantic_type,
+                op=semantic_type if special_case is not None else None,
                 expr_obj=node,
                 source_span=source_span,
                 source_scope=source_scope,
                 source_class=source_class,
-                extra_args=extra_args,
+                extra_args={**extra_args, **semantic_attributes},
+                attributes=semantic_attributes,
+                constant=(
+                    special_case.constant if special_case is not None else None
+                ),
+                extraction_contract=receipt,
                 domain_node=DomainNode(
                     shape=(1,1,1), #default will be function pointer
                     unit_size=1,  # default unit size for function pointers
@@ -2458,7 +2505,22 @@ class ProcessGraph:
                 frame_producer_role, frame_consumer_role, frame_store,
             ) = payload
             self._graph_build_counter += 1
-            nid, already_defined = self.ensure_node(current, frame_store)
+            boundary_resolution = None
+            if self.boundary_namespace is not None:
+                boundary_resolution = self.boundary_namespace.resolve(current, self)
+            special = (
+                None if boundary_resolution is None
+                else boundary_resolution.special_case
+            )
+            if special is None:
+                special = getattr(current, "_special_case", None)
+            if special is None and self.source_language.casefold() == "python":
+                special = interpret_python_special_case(current)
+            if special is None:
+                special = interpret_special_case(current)
+            nid, already_defined = self.ensure_node(
+                current, frame_store, special_case=special,
+            )
             if root_nid is None:
                 root_nid = nid
             node_type = type(current).__name__
@@ -2499,18 +2561,8 @@ class ProcessGraph:
                 nid, frame_producer, frame_consumer,
                 frame_producer_role, frame_consumer_role, frame_store,
             )
-            boundary_resolution = None
-            if self.boundary_namespace is not None:
-                boundary_resolution = self.boundary_namespace.resolve(current, self)
+            if boundary_resolution is not None:
                 self._apply_boundary_resolution(nid, boundary_resolution)
-            special = (
-                None if boundary_resolution is None
-                else boundary_resolution.special_case
-            )
-            if special is None:
-                special = getattr(current, "_special_case", None)
-            if special is None:
-                special = interpret_special_case(current)
             if special is not None:
                 data = self.G.nodes[nid]
                 data["type"] = special.type
@@ -2518,12 +2570,8 @@ class ProcessGraph:
                 data["attributes"] = special.attributes
                 data["extra_args"] = special.attributes
                 data["constant"] = special.constant
-                if (
-                    boundary_resolution is not None
-                    and boundary_resolution.receipt is not None
-                ):
-                    self.observe_evolution_node(nid, data)
-                pending.append(("finish", finish))
+                if special.terminal:
+                    pending.append(("finish", finish))
                 if special.type == "GetAttr" and isinstance(
                     current, ast.Attribute
                 ):
@@ -2531,7 +2579,9 @@ class ProcessGraph:
                         current.value, None, nid, "output", "value",
                         frame_store,
                     )))
-                continue
+                if special.terminal:
+                    continue
+                node_type = special.type
 
             tensor_op = tensor_operation_name(current)
             if tensor_op is not None:
@@ -2900,6 +2950,15 @@ class ProcessGraph:
         if resolve_unresolved_parents:
             self.G.graph["resolved_ast_parent_count"] = len(parent_links)
             self.G.graph["unresolved_ast_calls"] = unresolved_calls
+            self.G.graph["extraction_boundary_calls"] = tuple(
+                call for call in unresolved_calls
+                if call.get("extraction_contract") is not None
+            )
+            self.G.graph["rejected_extraction_calls"] = tuple(
+                call for call in unresolved_calls
+                if (call.get("extraction_contract") or {}).get("action")
+                == "reject"
+            )
             missing_parent_calls = tuple(
                 call
                 for call in unresolved_calls

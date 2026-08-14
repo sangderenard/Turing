@@ -27,6 +27,17 @@ is attached to its call and receipts are stored in
 `ProcessGraph.G.graph["extraction_contract_receipts"]` with identity,
 provenance, rule, action, and parameters.
 
+During Python ProcessGraph ingestion the same receipt is materialized on the
+individual call node before its first live evolution event. Known supported
+spellings become existing canonical operators (`print` becomes
+`stream_publish`; scalar casts retain their canonical names). Other choices
+remain call-shaped so their authored argument dataflow is preserved, with
+`extraction_action`, `extraction_identity`, `extraction_rule`, and the complete
+receipt in node attributes. This is terminal for recursive implementation
+pursuit, not terminal for evaluation of the call's arguments. Declared
+boundaries and rejected calls are also listed under
+`extraction_boundary_calls` and `rejected_extraction_calls` on the graph.
+
 Use another sheet with:
 
 ```powershell
