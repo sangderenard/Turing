@@ -213,6 +213,7 @@ class LLVMFunctionArtifact:
     name: str
     llvm_ir: str
     buffer_order: tuple[int, ...]
+    buffer_shapes: tuple[tuple[_Any, ...], ...]
     extent_order: tuple[tuple[int, str, int | None], ...]
     shortfalls: tuple[LLVMEmissionShortfall, ...]
     needs_text_sink: bool = False
@@ -252,6 +253,7 @@ def emit_ssa_function_to_llvm(
     """
 
     from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        extract_llvm_declaration,
         extract_llvm_function,
     )
 
@@ -266,6 +268,20 @@ def emit_ssa_function_to_llvm(
     scalars: dict[int, tuple[str, str]] = {}   # value id -> (rendering, type)
     kernels_used: set[str] = set()
     publishes_text = False
+    value_shapes: dict[int, tuple[_Any, ...]] = {
+        int(argument.id): tuple(argument.shape or ())
+        for argument in function.args
+    }
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            for argument in instruction.args:
+                value_shapes.setdefault(
+                    int(argument.id), tuple(argument.shape or ()),
+                )
+            if instruction.res is not None:
+                value_shapes[int(instruction.res.id)] = tuple(
+                    instruction.res.shape or ()
+                )
 
     def buffer(value_id: int) -> str:
         # The instruction stream is already scheduled by the compiler; a
@@ -350,6 +366,28 @@ def emit_ssa_function_to_llvm(
                 continue
 
             if operation in {"Ret", "ret", "Return", "return"}:
+                for position, argument in enumerate(instruction.args):
+                    value_id = int(argument.id)
+                    known = scalars.get(value_id)
+                    if known is None or known[1] == "ptr":
+                        # Tensor-producing kernels already write to this
+                        # buffer. Calling buffer() here also exposes an output
+                        # that otherwise had no downstream consumer.
+                        buffer(value_id)
+                        continue
+                    rendering = as_type(
+                        value_id, "double", f"return.{position}"
+                    )
+                    if rendering is None:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            function_name, "return",
+                            f"output %t{value_id} cannot render as double",
+                        ))
+                        continue
+                    destination = buffer(value_id)
+                    lines.append(
+                        f"  store double {rendering}, ptr {destination}, align 8"
+                    )
                 continue
 
             callee = instruction.attributes.get("callee")
@@ -484,28 +522,45 @@ def emit_ssa_function_to_llvm(
                 "operation has no likeness-table entry",
             ))
 
-    preamble: list[str] = []
-    for value_id in buffer_ids:
-        index = buffer_index[value_id]
-        preamble.append(
-            f"  %buffer.addr.{value_id} = getelementptr ptr, ptr %buffers, "
-            f"i64 {index}"
-        )
-        preamble.append(
-            f"  %buffer.{value_id} = load ptr, ptr %buffer.addr.{value_id}, "
-            "align 8"
-        )
+    # Authored kernels can call other authored helpers as well as external
+    # math/intrinsic symbols.  Carry their definition closure and exact
+    # canonical declarations into this otherwise standalone module.
+    definitions = {
+        symbol: extract_llvm_function(symbol) for symbol in kernels_used
+    }
+    external_declarations: dict[str, str] = {}
+    unresolved_symbols: set[str] = set()
+    while True:
+        dependency_text = "\n".join((*definitions.values(), *lines))
+        referenced = set(_re.findall(
+            r"@([A-Za-z_$.-][\w$.-]*)\s*\(", dependency_text,
+        ))
+        pending = referenced - set(definitions) - set(external_declarations)
+        pending.discard("turing_stream_publish_double")
+        pending -= unresolved_symbols
+        if not pending:
+            break
+        for symbol in sorted(pending):
+            try:
+                definitions[symbol] = extract_llvm_function(symbol)
+                continue
+            except KeyError:
+                pass
+            try:
+                external_declarations[symbol] = extract_llvm_declaration(symbol)
+            except KeyError:
+                unresolved_symbols.add(symbol)
+                shortfalls.append(LLVMEmissionShortfall(
+                    function_name, symbol,
+                    "referenced LLVM symbol has no authored definition or declaration",
+                ))
 
     kernel_texts = "\n\n".join(
-        extract_llvm_function(symbol) for symbol in sorted(kernels_used)
+        definitions[symbol] for symbol in sorted(definitions)
     )
-    intrinsics = sorted({
-        match for match in _re.findall(r"@llvm\.[\w.]+", "\n".join(lines))
-    })
     declarations = [
-        f"declare double {intrinsic}(double)" if intrinsic.count(".") == 2
-        else f"declare double {intrinsic}(double, double)"
-        for intrinsic in intrinsics
+        external_declarations[symbol]
+        for symbol in sorted(external_declarations)
     ]
     if publishes_text:
         # Resolved by linking turing_stream_buffer.c -- the shell-class sink.
@@ -521,7 +576,6 @@ def emit_ssa_function_to_llvm(
         "",
         f"define void @{name}(ptr %buffers, ptr %extents) {{",
         "entry:",
-        *preamble,
         *lines,
         "  ret void",
         "}",
@@ -531,6 +585,7 @@ def emit_ssa_function_to_llvm(
         name=name,
         llvm_ir=llvm_ir,
         buffer_order=tuple(buffer_ids),
+        buffer_shapes=tuple(value_shapes.get(value_id, ()) for value_id in buffer_ids),
         extent_order=tuple(extent_order),
         shortfalls=tuple(shortfalls),
         needs_text_sink=publishes_text,

@@ -2859,6 +2859,9 @@ class ProcessGraph:
                 self.G.graph["extraction_contract_fingerprint"] = getattr(
                     parent_include, "fingerprint", None
                 )
+                execution = getattr(parent_include, "execution", None)
+                if execution is not None and hasattr(execution, "receipt"):
+                    self.G.graph["execution_contract"] = execution.receipt()
 
         # Preserve class declarations as schema metadata beside the exact AST
         # nodes ProcessGraph is about to ingest; do not create a second AST

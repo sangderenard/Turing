@@ -14,6 +14,7 @@ from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
     TRANSLATIONS,
     covered_operations,
     extract_c_function,
+    extract_llvm_declaration,
     extract_llvm_function,
     lower_abstract_tensor_tape_to_llvm_ssa,
     translations_for_operation,
@@ -93,6 +94,13 @@ def test_translation_table_uses_only_real_c_function_definitions():
     for symbol in _REAL_TRANSLATED_SYMBOLS:
         assert re.search(rf"\b{symbol}\s*\(", extract_c_function(symbol))
         assert re.search(rf"@{symbol}\s*\(", extract_llvm_function(symbol))
+
+
+def test_external_llvm_declarations_are_extracted_from_canonical_module():
+    assert extract_llvm_declaration("acos") == "declare double @acos(double)"
+    assert extract_llvm_declaration("llvm.memset.p0.i64").startswith(
+        "declare void @llvm.memset.p0.i64("
+    )
 
 
 def test_translation_operations_are_real_abstract_tensor_names():

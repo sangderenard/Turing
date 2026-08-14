@@ -40,6 +40,94 @@ EXTRACTION_CLASSES = (
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionContract:
+    """Whole-program execution semantics surrounding extraction choices."""
+
+    host_runtime: str
+    dependency_search: str
+    native_lowering: str
+    dispatch_unit: str
+    unlowered_behavior: str
+    require_full_native: bool
+    backward_source: str
+    python_callbacks: str
+    numeric_semantics: str
+    scalar_promotion: str
+
+    @classmethod
+    def from_mapping(cls, raw: Any) -> "ExecutionContract":
+        if not isinstance(raw, Mapping):
+            raise ExtractionContractError("execution must be a mapping")
+        required = {
+            "host_runtime", "dependency_search", "native_lowering",
+            "dispatch_unit", "unlowered_behavior", "require_full_native",
+            "backward_source", "python_callbacks",
+            "numeric_semantics", "scalar_promotion",
+        }
+        missing = sorted(required - set(raw))
+        extra = sorted(set(raw) - required)
+        if missing or extra:
+            raise ExtractionContractError(
+                "execution must define exactly the execution-mode fields; "
+                f"missing={missing}, extra={extra}"
+            )
+        choices = {
+            "host_runtime": {"python", "native"},
+            "dependency_search": {"reachable", "none"},
+            "native_lowering": {"opportunistic", "required"},
+            "dispatch_unit": {"isolated_numeric_subgraph", "whole_program"},
+            "unlowered_behavior": {"execute_in_python", "reject"},
+            "backward_source": {"process_graph", "authored_python"},
+            "python_callbacks": {"contract_only", "reject"},
+            "numeric_semantics": {"abstract_tensor", "python_scalar"},
+            "scalar_promotion": {"all_numeric", "tensor_context_only", "none"},
+        }
+        values = {name: str(raw[name]) for name in choices}
+        for name, allowed in choices.items():
+            if values[name] not in allowed:
+                raise ExtractionContractError(
+                    f"execution.{name} must be one of {sorted(allowed)}"
+                )
+        require_full_native = raw["require_full_native"]
+        if not isinstance(require_full_native, bool):
+            raise ExtractionContractError(
+                "execution.require_full_native must be boolean"
+            )
+        if (
+            values["native_lowering"] == "opportunistic"
+            and require_full_native
+        ):
+            raise ExtractionContractError(
+                "opportunistic native lowering cannot require full native coverage"
+            )
+        if (
+            values["unlowered_behavior"] == "execute_in_python"
+            and values["host_runtime"] != "python"
+        ):
+            raise ExtractionContractError(
+                "execute_in_python fallback requires host_runtime: python"
+            )
+        return cls(
+            **values,
+            require_full_native=require_full_native,
+        )
+
+    def receipt(self) -> dict[str, Any]:
+        return {
+            "host_runtime": self.host_runtime,
+            "dependency_search": self.dependency_search,
+            "native_lowering": self.native_lowering,
+            "dispatch_unit": self.dispatch_unit,
+            "unlowered_behavior": self.unlowered_behavior,
+            "require_full_native": self.require_full_native,
+            "backward_source": self.backward_source,
+            "python_callbacks": self.python_callbacks,
+            "numeric_semantics": self.numeric_semantics,
+            "scalar_promotion": self.scalar_promotion,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ExtractionSubject:
     module: str
     qualname: str
@@ -112,6 +200,11 @@ class ExtractionContract:
             name: self._normalize_choice(f"default:{name}", choice)
             for name, choice in defaults.items()
         }
+        # Preserve the extraction-choice validation order: an unsafe or
+        # incomplete disposition table remains the first reported defect.
+        # The execution model surrounds those choices; it does not obscure
+        # them.
+        self.execution = ExecutionContract.from_mapping(raw.get("execution"))
         rules = raw.get("rules", ())
         if not isinstance(rules, list):
             raise ExtractionContractError("rules must be a list")
@@ -322,4 +415,5 @@ __all__ = [
     "ExtractionContractError",
     "ExtractionDecision",
     "ExtractionSubject",
+    "ExecutionContract",
 ]

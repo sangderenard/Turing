@@ -2853,6 +2853,18 @@ def extract_llvm_function(symbol: str) -> str:
     return _extract_braced_definition(LLVM_SSA_MODULE, match)
 
 
+def extract_llvm_declaration(symbol: str) -> str:
+    """Return the canonical external declaration for ``symbol``."""
+
+    pattern = re.compile(
+        rf"(?m)^declare[^\n@]*@{re.escape(symbol)}\([^\n]*$"
+    )
+    match = pattern.search(LLVM_SSA_MODULE)
+    if match is None:
+        raise KeyError(f"LLVM SSA symbol {symbol!r} has no declaration")
+    return match.group(0)
+
+
 def _header_opcode_order() -> tuple[str, ...]:
     text = _C_HEADER_PATH.read_text(encoding="utf-8")
     match = re.search(
@@ -3037,6 +3049,7 @@ __all__ = [
     "c_backend_repository_ssa_reference",
     "discover_c_backend_functions",
     "extract_c_function",
+    "extract_llvm_declaration",
     "extract_llvm_function",
     "lower_abstract_tensor_tape_to_llvm_ssa",
     "translations_for_operation",

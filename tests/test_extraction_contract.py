@@ -36,6 +36,16 @@ def _contract_outer():
 def test_default_contract_draws_python_native_and_decompile_lines():
     contract = ExtractionContract(CONTRACT)
 
+    assert contract.execution.host_runtime == "python"
+    assert contract.execution.dependency_search == "reachable"
+    assert contract.execution.native_lowering == "opportunistic"
+    assert contract.execution.dispatch_unit == "isolated_numeric_subgraph"
+    assert contract.execution.unlowered_behavior == "execute_in_python"
+    assert contract.execution.require_full_native is False
+    assert contract.execution.backward_source == "process_graph"
+    assert contract.execution.numeric_semantics == "abstract_tensor"
+    assert contract.execution.scalar_promotion == "all_numeric"
+
     assert contract.decide(Adam).action is ExtractionAction.INGEST_PYTHON
     assert contract.decide(range).action is ExtractionAction.INTRINSIC
     assert contract.decide(print).action is ExtractionAction.PYTHON_HOST_CALL
@@ -98,6 +108,7 @@ def test_parent_expansion_records_intrinsic_without_host_decompilation():
     assert float_receipt["action"] == "intrinsic"
     assert float_receipt["rule_id"] == "control-and-scalar-builtins"
     assert graph.G.graph["extraction_contract_fingerprint"] == contract.fingerprint
+    assert graph.G.graph["execution_contract"] == contract.execution.receipt()
     assert json.loads(contract.receipt_json())[0]["identity"] == "builtins.float"
 
 

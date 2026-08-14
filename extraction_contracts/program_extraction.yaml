@@ -1,6 +1,23 @@
 version: 1
 mode: exhaustive
 
+# Python is the complete execution context. Dependency pursuit discovers the
+# semantic program, while proven numerical compartments may be replaced by
+# modular native dispatches. Failure to lower one compartment leaves an
+# explicit Python-resident boundary; it is not a failed Python program and it
+# is never reported as full-native coverage.
+execution:
+  host_runtime: python
+  dependency_search: reachable
+  native_lowering: opportunistic
+  dispatch_unit: isolated_numeric_subgraph
+  unlowered_behavior: execute_in_python
+  require_full_native: false
+  backward_source: process_graph
+  python_callbacks: contract_only
+  numeric_semantics: abstract_tensor
+  scalar_promotion: all_numeric
+
 # Paths are relative to this sheet. First matching root/rule wins.
 roots:
   authored:

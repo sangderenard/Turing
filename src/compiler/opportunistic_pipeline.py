@@ -92,6 +92,7 @@ class BuildContext:
     directory: Optional[Path] = None
     name: Optional[str] = None
     checkpoint: Any = False           # threaded into the AOT checkpoint system
+    execution_contract: Mapping[str, Any] = field(default_factory=dict)
     progress: Optional[Callable[[str], None]] = None
 
     def report(self, message: str) -> None:
@@ -203,6 +204,7 @@ def _digest_input(artifact: Artifact, context: BuildContext) -> str:
         context.entrypoint,
         ",".join(sorted(context.mutable_parameters)),
         ",".join(sorted(context.feeds)),
+        repr(sorted(context.execution_contract.items())),
     ):
         hasher.update(b"\x00")
         hasher.update(part.encode("utf-8"))
