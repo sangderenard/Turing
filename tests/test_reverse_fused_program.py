@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.common.tensors.abstraction import AbstractTensor as AT
+from src.common.tensors.abstraction import AbstractTensor as AT, tensor_identity
 from src.common.tensors.abstract_nn import (
     build_fused_program,
     capture_reverse_fused_program,
@@ -18,12 +18,12 @@ def _unpruned_program():
     uncaptured = source + 3.0
     program = build_fused_program(
         autograd.tape.graph.copy(),
-        outputs={"visible": id(visible)},
+        outputs={"visible": tensor_identity(visible)},
     )
     values = {
-        id(source): source,
-        id(visible): visible,
-        id(uncaptured): uncaptured,
+        tensor_identity(source): source,
+        tensor_identity(visible): visible,
+        tensor_identity(uncaptured): uncaptured,
     }
     return source, visible, uncaptured, program, values
 
@@ -33,10 +33,10 @@ def test_retention_promotes_terminal_results_before_pruning():
 
     retained = retain_uncaptured_outputs(program)
 
-    assert retained.outputs["visible"] == id(visible)
+    assert retained.outputs["visible"] == tensor_identity(visible)
     added = {name: value_id for name, value_id in retained.outputs.items() if name != "visible"}
-    assert added == {"uncaptured_1_add": id(uncaptured)}
-    assert program.outputs == {"visible": id(visible)}
+    assert added == {"uncaptured_1_add": tensor_identity(uncaptured)}
+    assert program.outputs == {"visible": tensor_identity(visible)}
 
 
 def test_reverse_capture_parameterizes_all_outputs_and_returns_incidentals():
@@ -58,7 +58,8 @@ def test_reverse_capture_parameterizes_all_outputs_and_returns_incidentals():
     assert set(captured.output_parameters) == set(retained.outputs)
     assert set(captured.output_parameters.values()).issubset(captured.program.feeds)
     assert set(captured.output_parameters.values()).isdisjoint(captured.incidental_feed_ids)
-    assert id(source) in captured.incidental_feed_ids
+    assert tensor_identity(source) in captured.incidental_feed_ids
+    assert id(source) not in captured.incidental_feed_ids
     assert set(program.feeds).issubset(captured.incidental_feed_ids)
     assert captured.missing_backward == ()
     proposal = next(iter(result.proposed_inputs.values()))

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Dict, List, Tuple
-from ..abstraction import AbstractTensor as AT
+from ..abstraction import AbstractTensor as AT, tensor_identity
 from .utils import zeros_like
 from ..bpid import BPID
 
@@ -12,8 +12,7 @@ class Adam:
     calling code, however, generates a fresh parameter list each step and may
     reorder entries.  Index-based bookkeeping would then associate the wrong
     momentum/variance tensors with a parameter, causing shape mismatches.  We
-    now map state by the ``id`` of each parameter while retaining a strong
-    reference to avoid ID reuse once a tensor is garbage collected.
+    now map state by each parameter's monotonic tensor identity.
     """
 
     def __init__(
@@ -28,10 +27,9 @@ class Adam:
         self.beta1 = beta1
         self.beta2 = beta2
         self.eps = eps
-        # Track optimizer state per parameter ID to remain robust even if the
-        # caller reorders the parameter list between steps.  We keep a strong
-        # reference to each parameter to avoid ``id`` reuse once an object is
-        # garbage‑collected.
+        # Track optimizer state by monotonic tensor identity so a reordered
+        # parameter list cannot misassociate moments and a reclaimed Python
+        # address can never alias a later tensor.
         self.m: Dict[int, AT] = {}
         self.v: Dict[int, AT] = {}
         self._param_refs: Dict[int, AT] = {}
@@ -40,7 +38,7 @@ class Adam:
 
     def _init_params(self, params: List[AT]):
         for p in params:
-            key = id(p)
+            key = tensor_identity(p)
             if key not in self.m or self.m[key].shape != p.shape:
                 self.m[key] = zeros_like(p)
                 self.v[key] = zeros_like(p)
@@ -52,7 +50,7 @@ class Adam:
         lr, b1, b2, eps = self.lr, self.beta1, self.beta2, self.eps
         out_params: List[AT] = []
         for p, g in zip(params, grads):
-            key = id(p)
+            key = tensor_identity(p)
             if g is None:
                 # allow_unused contract: a parameter the graph never reached
                 # gets no update and its moments do not advance.

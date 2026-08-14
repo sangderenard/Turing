@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, Iterable, Mapping, Protocol
 
 import numpy as np
 
-from ..abstraction import AbstractTensor as AT
+from ..abstraction import AbstractTensor as AT, tensor_identity
 from ..autograd import GradTape, autograd
 from ..fused_ir import FusedProgram, ordered_feed_ids
 from .fused_program import ProgramRunner, build_fused_program
@@ -48,10 +48,10 @@ def _live_tensors(tape: GradTape) -> Dict[int, AT]:
     for node in getattr(tape, "_nodes", {}).values():
         for value in node.ctx.get("inputs", ()):
             if isinstance(value, AT):
-                values[id(value)] = value
+                values[tensor_identity(value)] = value
         value = node.ctx.get("result")
         if isinstance(value, AT):
-            values[id(value)] = value
+            values[tensor_identity(value)] = value
     return values
 
 
@@ -386,12 +386,12 @@ def capture_forward_reverse_cycle(
             raise TypeError("forward must return an AbstractTensor or a non-empty mapping of them")
         program = build_fused_program(
             tape.graph.copy(),
-            outputs={name: id(value) for name, value in declared.items()},
+            outputs={name: tensor_identity(value) for name, value in declared.items()},
         )
         extras = dict(program.extras or {})
         origins = dict(extras.get("capture_feed_origins", {}) or {})
         for name, value in bound.items():
-            origins[id(value)] = {"binding_name": name}
+            origins[tensor_identity(value)] = {"binding_name": name}
         extras["capture_feed_origins"] = origins
         program.extras = extras
         retained = retain_uncaptured_outputs(program)
@@ -406,7 +406,7 @@ def capture_forward_reverse_cycle(
             live_values,
             desired,
             step_size=correction.step_size(iteration),
-            wrt_feed_ids=(id(bound[name]) for name in solve_names),
+            wrt_feed_ids=(tensor_identity(bound[name]) for name in solve_names),
         )
         reverse_origins = dict((reverse.program.extras or {}).get("capture_feed_origins", {}) or {})
         reverse_origins.update(origins)
@@ -424,7 +424,7 @@ def capture_forward_reverse_cycle(
             reverse_capture=reverse,
             fused_program=fused,
             feed_values=fused_values,
-            parameter_ids={name: id(bound[name]) for name in solve_names},
+            parameter_ids={name: tensor_identity(bound[name]) for name in solve_names},
             target_ids=dict(reverse.output_parameters),
             correction=correction,
             tape=tape,

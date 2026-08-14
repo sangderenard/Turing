@@ -1,6 +1,7 @@
 import pytest
 import networkx as nx
 
+from src.common.tensors.abstraction import tensor_identity
 from src.common.tensors.autograd import autograd, GradTape
 
 try:  # NumPy backend is optional
@@ -38,11 +39,14 @@ def test_export_training_state():
     assert isinstance(bwd, nx.DiGraph)
     assert params_tensor is not None
     assert params_tensor.get_shape()[0] == 2
-    assert id_map[id(w)] != id_map[id(b)]
-    assert fwd.nodes[id(w)]["param_id"] == id_map[id(w)]
-    assert fwd.nodes[id(w)]["stateful"] is True
-    assert bwd.nodes[id(w)]["param_id"] == id_map[id(w)]
-    assert bwd.nodes[id(loss)]["loss"] is True
+    w_id = tensor_identity(w)
+    b_id = tensor_identity(b)
+    loss_id = tensor_identity(loss)
+    assert id_map[w_id] != id_map[b_id]
+    assert fwd.nodes[w_id]["param_id"] == id_map[w_id]
+    assert fwd.nodes[w_id]["stateful"] is True
+    assert bwd.nodes[w_id]["param_id"] == id_map[w_id]
+    assert bwd.nodes[loss_id]["loss"] is True
 
 
 @pytest.mark.skipif(Tensor is None, reason="NumPy backend not available")

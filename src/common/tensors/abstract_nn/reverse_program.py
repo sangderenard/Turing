@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, Iterable, Mapping
 
-from ..abstraction import AbstractTensor as AT
+from ..abstraction import AbstractTensor as AT, tensor_identity
 from ..autograd import autograd
 from ..fused_ir import FusedProgram, Meta, OpStep
 from .fused_program import ProgramRunner, build_fused_program, capture_backward_program
@@ -155,11 +155,14 @@ def capture_reverse_fused_program(
         name: forward_values[value_id]
         for name, value_id in retained.outputs.items()
     }
-    tapes = {id(getattr(value, "_tape", None)): getattr(value, "_tape", None) for value in output_tensors.values()}
-    tapes.pop(id(None), None)
+    tapes = {
+        tape
+        for value in output_tensors.values()
+        if (tape := getattr(value, "_tape", None)) is not None
+    }
     if len(tapes) != 1:
         raise ValueError("retained outputs must belong to one forward GradTape")
-    forward_tape = next(iter(tapes.values()))
+    forward_tape = next(iter(tapes))
 
     # Scalars and other saved operands may not be retained by the weak tensor
     # reference table, so recover them from operation contexts as well.
@@ -168,10 +171,10 @@ def capture_reverse_fused_program(
     for node in getattr(forward_tape, "_nodes", {}).values():
         for value in node.ctx.get("inputs", ()):
             if isinstance(value, AT):
-                live_values[id(value)] = value
+                live_values[tensor_identity(value)] = value
         value = node.ctx.get("result")
         if isinstance(value, AT):
-            live_values[id(value)] = value
+            live_values[tensor_identity(value)] = value
     absent_values = sorted(set(retained.feeds) - set(live_values))
     if absent_values:
         raise KeyError(f"forward values are unavailable for feed ids: {absent_values}")
@@ -205,8 +208,9 @@ def capture_reverse_fused_program(
                     f"target output {name!r} has shape {tuple(target.shape)}, "
                     f"expected {tuple(actual.shape)}"
                 )
-            parameter_values[id(target)] = target
-            output_parameters[name] = id(target)
+            target_id = tensor_identity(target)
+            parameter_values[target_id] = target
+            output_parameters[name] = target_id
             residual = actual - target
             term = (residual * residual).sum() * 0.5
             objective = term if objective is None else objective + term
@@ -227,7 +231,7 @@ def capture_reverse_fused_program(
             objective_boundary.update(forward_tape.graph.predecessors(node_id))
         objective_program = build_fused_program(
             forward_tape.graph.subgraph(objective_boundary).copy(),
-            outputs={"reverse_objective": id(objective)},
+            outputs={"reverse_objective": tensor_identity(objective)},
         )
     finally:
         autograd.tape = previous_tape
@@ -253,7 +257,7 @@ def capture_reverse_fused_program(
     feed_values = dict(backward.feed_values)
     feed_values.update(parameter_values)
     feed_values.update({feed_id: live_values[feed_id] for feed_id in retained.feeds})
-    feed_values.update({id(value): value for value in output_tensors.values()})
+    feed_values.update({tensor_identity(value): value for value in output_tensors.values()})
     steps = list(program.steps)
     outputs: Dict[str, int] = {}
     meta = {} if program.meta is None else dict(program.meta)

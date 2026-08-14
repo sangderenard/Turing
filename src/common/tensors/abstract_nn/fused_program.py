@@ -16,7 +16,7 @@ import difflib
 
 import networkx as nx
 
-from ..abstraction import AbstractTensor as AT
+from ..abstraction import AbstractTensor as AT, tensor_identity
 from ..graph_translator import GraphTranslator
 from ....transmogrifier.ilpscheduler import ILPScheduler
 from ..autograd import autograd
@@ -104,7 +104,7 @@ def build_fused_program(
         ctx_inputs = ctx.get("inputs")
         if ctx_inputs is not None:
             try:
-                input_ids = [int(id(x)) for x in ctx_inputs]
+                input_ids = [int(tensor_identity(x)) for x in ctx_inputs]
             except Exception:
                 # Fallback to graph predecessors if ctx is not materialized
                 input_ids = [
@@ -123,7 +123,7 @@ def build_fused_program(
         ctx_res = ctx.get("result")
         if ctx_res is not None:
             try:
-                result_id = int(id(ctx_res))
+                result_id = int(tensor_identity(ctx_res))
             except Exception:
                 result_id = nid
         else:
@@ -177,13 +177,14 @@ def capture_forward_program(model, inputs: AT, *, output_name: str = "prediction
     inputs._tape = tape
     tape.create_tensor_node(inputs)
     prediction = model.forward(inputs)
-    output_id = id(prediction)
+    output_id = tensor_identity(prediction)
     reachable = nx.ancestors(tape.graph, output_id) | {output_id}
     graph = tape.graph.subgraph(reachable).copy()
     program = build_fused_program(graph, outputs={output_name: output_id})
-    if id(inputs) not in program.feeds:
+    input_id = tensor_identity(inputs)
+    if input_id not in program.feeds:
         raise RuntimeError("captured forward program lost its input feed")
-    return program, id(inputs)
+    return program, input_id
 
 
 @dataclass(frozen=True)
@@ -213,7 +214,7 @@ def capture_backward_program(
     """
     wrt = tuple(wrt)
     forward_tape = getattr(loss, "_tape", None) or autograd.tape
-    if id(loss) not in forward_tape.graph:
+    if tensor_identity(loss) not in forward_tape.graph:
         raise ValueError("loss is not present on the active forward GradTape")
     override_names = set(backward_overrides or {})
     missing = tuple(sorted({
@@ -256,7 +257,7 @@ def capture_backward_program(
         selected.update(graph.predecessors(node_id))
     backward_graph = graph.subgraph(selected).copy()
     outputs = {
-        f"{output_prefix}_{index}": id(gradient)
+        f"{output_prefix}_{index}": tensor_identity(gradient)
         for index, gradient in enumerate(gradients)
         if gradient is not None
     }
@@ -271,20 +272,21 @@ def capture_backward_program(
     for node in getattr(forward_tape, "_nodes", {}).values():
         for value in node.ctx.get("inputs", ()):
             if isinstance(value, AT):
-                live_values[id(value)] = value
+                live_values[tensor_identity(value)] = value
         value = node.ctx.get("result")
         if isinstance(value, AT):
-            live_values[id(value)] = value
+            live_values[tensor_identity(value)] = value
     for value in (*wrt, loss, grad_output, *gradients):
         if isinstance(value, AT):
-            live_values[id(value)] = value
+            live_values[tensor_identity(value)] = value
     feed_values = {
         feed_id: live_values[feed_id]
         for feed_id in program.feeds
         if feed_id in live_values
     }
-    if id(grad_output) in program.feeds:
-        feed_values[id(grad_output)] = grad_output
+    grad_output_id = tensor_identity(grad_output)
+    if grad_output_id in program.feeds:
+        feed_values[grad_output_id] = grad_output
     return BackwardProgramCapture(program, feed_values, missing)
 
 
@@ -991,11 +993,11 @@ class IRGraphedModel:
                 new_m.append(m_new)
                 new_v.append(v_new)
                 t_new_any = t_new
-                extras[f"param{ i }_new"] = id(p_new)
-                extras[f"opt_m{ i }_new"] = id(m_new)
-                extras[f"opt_v{ i }_new"] = id(v_new)
+                extras[f"param{ i }_new"] = tensor_identity(p_new)
+                extras[f"opt_m{ i }_new"] = tensor_identity(m_new)
+                extras[f"opt_v{ i }_new"] = tensor_identity(v_new)
             if t_new_any is not None:
-                extras["opt_t_new"] = id(t_new_any)
+                extras["opt_t_new"] = tensor_identity(t_new_any)
 
         # Build program from the full autograd tape graph (includes backward/optimizer ops if any)
         try:
@@ -1006,15 +1008,15 @@ class IRGraphedModel:
         # Determine default outputs if not provided
         out_map: Dict[str, int] = {}
         try:
-            pred_id = id(pred)
+            pred_id = tensor_identity(pred)
             out_map["pred"] = pred_id
         except Exception:
-            raise RuntimeError("Failed to get id() of pred tensor")
+            raise RuntimeError("Failed to obtain prediction tensor identity")
         if loss is not None:
             try:
-                out_map["loss"] = id(loss)
+                out_map["loss"] = tensor_identity(loss)
             except Exception:
-                raise RuntimeError("Failed to get id() of loss tensor")
+                raise RuntimeError("Failed to obtain loss tensor identity")
         # Updated parameters from optimizer (if any)
         if extras:
             out_map.update(extras)
@@ -1041,16 +1043,16 @@ class IRGraphedModel:
             val = refs.get(fid)
             if val is None:
                 # best effort: try to reconstruct from model/inputs/targets ids
-                if id(inputs) == fid:
+                if tensor_identity(inputs) == fid:
                     val = inputs
-                elif targets is not None and id(targets) == fid:
+                elif targets is not None and tensor_identity(targets) == fid:
                     val = targets
-                elif self.opt_t is not None and id(self.opt_t) == fid:
+                elif self.opt_t is not None and tensor_identity(self.opt_t) == fid:
                     val = self.opt_t
                 else:
                     # search in opt state arrays
                     for s in (self.opt_m + self.opt_v):
-                        if id(s) == fid:
+                        if tensor_identity(s) == fid:
                             val = s
                             break
             if val is None:
