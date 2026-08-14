@@ -206,6 +206,720 @@ def _double_literal(value: _Any) -> str:
     return f"0x{bits:016X}"
 
 
+def _value_llvm_type(value: _Any) -> str:
+    if tuple(
+        (getattr(value, "accounting", {}) or {}).get(
+            "ssa_aggregate_outputs", ()
+        )
+    ):
+        return "ptr"
+    dtype = str(getattr(value, "dtype", None) or "float64").lower()
+    if dtype in {"bool", "i1"}:
+        return "i1"
+    if dtype in {"int", "int32", "i32"}:
+        return "i32"
+    if dtype in {"int64", "i64", "long"}:
+        return "i64"
+    if dtype == "opaque_ref":
+        return "i64"
+    return "double"
+
+
+def _value_element_count(value: _Any) -> int:
+    from math import prod
+
+    aggregate = tuple(
+        (getattr(value, "accounting", {}) or {}).get(
+            "ssa_aggregate_outputs", ()
+        )
+    )
+    if aggregate:
+        return len(aggregate)
+    shape = tuple(getattr(value, "shape", ()) or ())
+    return max(1, int(prod(map(int, shape)))) if shape else 1
+
+
+def _internal_call_closure(
+    module: _IRModule, root: str,
+) -> tuple[set[str], set[str]]:
+    """Return repository functions and authored leaves reachable from root."""
+
+    repository: set[str] = set()
+    kernels: set[str] = set()
+    pending = [str(root)]
+    while pending:
+        name = pending.pop()
+        if name in repository or name not in module.functions:
+            continue
+        repository.add(name)
+        for block in module.functions[name].blocks.values():
+            for instruction in block.instrs:
+                callee = instruction.attributes.get("callee")
+                if callee is None:
+                    continue
+                symbol = str(callee)
+                try:
+                    _kernel_signature(symbol)
+                except (KeyError, ValueError):
+                    if symbol in module.functions:
+                        pending.append(symbol)
+                else:
+                    kernels.add(symbol)
+    return repository, kernels
+
+
+def _emit_repository_call_module(
+    module: _IRModule,
+    function_name: str,
+    *,
+    entry_name: str,
+    text_sink: bool,
+) -> "LLVMFunctionArtifact":
+    """Emit a repository-SSA call closure with a pointer-only internal ABI.
+
+    Every internal function receives one pointer per SSA argument followed by
+    one pointer per result.  Aggregate call results remain explicit arrays of
+    pointers, so the repository's GetElementPtr/Load projections retain their
+    meaning without flattening or call-site substitution.
+    """
+
+    from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        extract_llvm_declaration,
+        extract_llvm_function,
+    )
+
+    reachable, kernels_used = _internal_call_closure(module, function_name)
+    shortfalls: list[LLVMEmissionShortfall] = []
+
+    values_by_function: dict[str, dict[int, _Any]] = {}
+    for name in reachable:
+        function = module.functions[name]
+        values: dict[int, _Any] = {int(value.id): value for value in function.args}
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                for value in instruction.args:
+                    current = values.get(int(value.id))
+                    if current is None or (
+                        not tuple(getattr(current, "shape", ()) or ())
+                        and tuple(getattr(value, "shape", ()) or ())
+                    ):
+                        values[int(value.id)] = value
+                if instruction.res is not None:
+                    value = instruction.res
+                    current = values.get(int(value.id))
+                    if current is None or (
+                        not tuple(getattr(current, "shape", ()) or ())
+                        and tuple(getattr(value, "shape", ()) or ())
+                    ):
+                        values[int(value.id)] = value
+        values_by_function[name] = values
+
+    # Determine which aggregate projections are actually consumed.  This
+    # shrinks planned-region ABIs and removes descriptor getters made dead by
+    # structural specialization before target emission.
+    aggregate_outputs: dict[str, list[int]] = {}
+    aggregate_output_values: dict[str, dict[int, _Any]] = {}
+    aggregate_positions: dict[tuple[str, int], tuple[int, ...]] = {}
+    for caller_name in reachable:
+        function = module.functions[caller_name]
+        uses: dict[int, int] = {}
+        instructions = [
+            instruction
+            for block in function.blocks.values()
+            for instruction in block.instrs
+        ]
+        for instruction in instructions:
+            for argument in instruction.args:
+                uses[int(argument.id)] = uses.get(int(argument.id), 0) + 1
+        for instruction in instructions:
+            if (
+                instruction.op not in {"Call", "call"}
+                or instruction.res is None
+                or instruction.attributes.get("result_convention")
+                != "ssa.aggregate"
+            ):
+                continue
+            callee = str(instruction.attributes.get("callee") or "")
+            declared = tuple(map(int, instruction.attributes.get("output_ids", ())))
+            live_positions: list[int] = []
+            address_position: dict[int, int] = {}
+            projected_values: dict[int, _Any] = {}
+            for follower in instructions:
+                if (
+                    follower.op in {"GetElementPtr", "getelementptr"}
+                    and follower.res is not None
+                    and follower.args
+                    and int(follower.args[0].id) == int(instruction.res.id)
+                ):
+                    position = follower.attributes.get("aggregate_index")
+                    if position is not None:
+                        address_position[int(follower.res.id)] = int(position)
+                elif (
+                    follower.op in {"Load", "load"}
+                    and follower.res is not None
+                    and follower.args
+                    and int(follower.args[0].id) in address_position
+                    and uses.get(int(follower.res.id), 0) > 0
+                ):
+                    projected_position = address_position[int(follower.args[0].id)]
+                    live_positions.append(projected_position)
+                    projected_values[projected_position] = follower.res
+            selected = tuple(dict.fromkeys(live_positions))
+            if not selected:
+                selected = tuple(range(len(declared)))
+            aggregate_positions[(caller_name, int(instruction.res.id))] = selected
+            if callee in reachable and declared:
+                output_ids = [declared[index] for index in selected]
+                existing = aggregate_outputs.setdefault(callee, [])
+                for value_id in output_ids:
+                    if value_id not in existing:
+                        existing.append(value_id)
+                typed = aggregate_output_values.setdefault(callee, {})
+                for position in selected:
+                    if position in projected_values:
+                        typed[declared[position]] = projected_values[position]
+
+    function_outputs: dict[str, tuple[_Any, ...]] = {}
+    for name in reachable:
+        function = module.functions[name]
+        returned = next((
+            tuple(instruction.args)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in {"Ret", "ret", "Return", "return"}
+        ), ())
+        ids = aggregate_outputs.get(name)
+        function_outputs[name] = tuple(
+            (
+                values_by_function[name][value_id]
+                if value_id in values_by_function[name]
+                else aggregate_output_values[name][value_id]
+            )
+            for value_id in ids
+            if (
+                value_id in values_by_function[name]
+                or value_id in aggregate_output_values.get(name, {})
+            )
+        ) if ids is not None else returned
+
+    # A source wrapper may return a callee's aggregate unchanged (the
+    # canonical backward ``bw_matmul -> matmul_vjp`` shape).  Returning an
+    # array of pointers to callee temporaries is not a valid native ABI: those
+    # pointees die with the wrapper's stack frame.  Spell the wrapper as the
+    # same multiple-output ABI as its callee, so its caller owns every output
+    # buffer and no ephemeral pointer escapes.
+    forwarded_aggregate_calls: dict[str, tuple[int, str]] = {}
+    changed = True
+    while changed:
+        changed = False
+        for name in reachable:
+            function = module.functions[name]
+            returned = next((
+                tuple(instruction.args)
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"Ret", "ret", "Return", "return"}
+            ), ())
+            if len(returned) != 1 or not tuple(
+                (returned[0].accounting or {}).get(
+                    "ssa_aggregate_outputs", ()
+                )
+            ):
+                continue
+            producer = next((
+                instruction
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"Call", "call"}
+                and instruction.res is not None
+                and int(instruction.res.id) == int(returned[0].id)
+                and str(instruction.attributes.get("callee") or "")
+                in reachable
+            ), None)
+            if producer is None:
+                continue
+            callee = str(producer.attributes["callee"])
+            callee_outputs = function_outputs.get(callee, ())
+            if len(callee_outputs) <= 1:
+                continue
+            forwarded_aggregate_calls[name] = (
+                int(producer.res.id), callee,
+            )
+            if function_outputs.get(name) != callee_outputs:
+                function_outputs[name] = callee_outputs
+                changed = True
+
+    internal_symbols = {
+        name: "__ssa_" + _re.sub(r"[^A-Za-z0-9_$.-]", "_", name)
+        for name in reachable
+    }
+
+    def literal(payload: _Any, llvm_type: str) -> str:
+        if llvm_type == "double":
+            return _double_literal(0.0 if payload is None else payload)
+        if llvm_type == "i1":
+            return "true" if bool(payload) else "false"
+        return str(int(0 if payload is None else payload))
+
+    emitted_functions: list[str] = []
+    for name in sorted(reachable, key=lambda item: item != function_name):
+        function = module.functions[name]
+        if len(function.blocks) != 1:
+            shortfalls.append(LLVMEmissionShortfall(
+                name, "control", "internal SSA emitter requires a straight-line function",
+            ))
+            continue
+        outputs = function_outputs[name]
+        parameters = [
+            *(f"ptr %arg.{index}" for index in range(len(function.args))),
+            *(f"ptr %out.{index}" for index in range(len(outputs))),
+        ]
+        body: list[str] = ["entry:"]
+        pointers: dict[int, str] = {
+            int(value.id): f"%arg.{index}"
+            for index, value in enumerate(function.args)
+        }
+        aggregate_members: dict[int, dict[int, str]] = {}
+        address_members: dict[int, str] = {}
+        address_slots: dict[int, str] = {}
+        allocated: set[int] = set()
+        output_pointer = {
+            int(value.id): f"%out.{index}"
+            for index, value in enumerate(outputs)
+        }
+
+        def pointer(value: _Any) -> str:
+            value_id = int(value.id)
+            known = pointers.get(value_id)
+            if known is not None:
+                return known
+            known = output_pointer.get(value_id)
+            if known is not None:
+                pointers[value_id] = known
+                return known
+            llvm_type = _value_llvm_type(value)
+            count = _value_element_count(value)
+            register = f"%value.{value_id}"
+            if value_id not in allocated:
+                body.append(
+                    f"  {register} = alloca {llvm_type}, i64 {count}, align 8"
+                )
+                allocated.add(value_id)
+            pointers[value_id] = register
+            return register
+
+        def load_as(value: _Any, wanted: str, tag: str) -> str:
+            source_type = _value_llvm_type(value)
+            loaded = f"%load.{tag}"
+            body.append(
+                f"  {loaded} = load {source_type}, ptr {pointer(value)}, align 8"
+            )
+            if source_type == wanted:
+                return loaded
+            converted = f"%convert.{tag}"
+            if wanted == "double" and source_type in {"i1", "i32", "i64"}:
+                opcode = "uitofp" if source_type == "i1" else "sitofp"
+                body.append(
+                    f"  {converted} = {opcode} {source_type} {loaded} to double"
+                )
+                return converted
+            if wanted in {"i32", "i64"} and source_type == "double":
+                body.append(
+                    f"  {converted} = fptosi double {loaded} to {wanted}"
+                )
+                return converted
+            return loaded
+
+        block = next(iter(function.blocks.values()))
+        projection_values: dict[int, dict[int, _Any]] = {}
+        projection_addresses: dict[int, tuple[int, int]] = {}
+        constant_values = {
+            int(projected.res.id): (
+                projected.attributes.get("constant")
+                if projected.attributes.get("constant") is not None
+                else projected.attributes.get("value")
+            )
+            for projected in block.instrs
+            if projected.op == "Const" and projected.res is not None
+        }
+        for projected in block.instrs:
+            if (
+                projected.op in {"GetElementPtr", "getelementptr"}
+                and projected.res is not None
+                and projected.args
+                and projected.attributes.get("aggregate_index") is not None
+            ):
+                projection_addresses[int(projected.res.id)] = (
+                    int(projected.args[0].id),
+                    int(projected.attributes["aggregate_index"]),
+                )
+            elif (
+                projected.op in {"Load", "load"}
+                and projected.res is not None
+                and projected.args
+                and int(projected.args[0].id) in projection_addresses
+            ):
+                aggregate_id, position = projection_addresses[
+                    int(projected.args[0].id)
+                ]
+                projection_values.setdefault(aggregate_id, {})[position] = (
+                    projected.res
+                )
+        for instruction_index, instruction in enumerate(block.instrs):
+            operation = str(instruction.op)
+            result = instruction.res
+            result_id = int(result.id) if result is not None else None
+            tag = f"{instruction_index}.{result_id if result_id is not None else 'v'}"
+
+            if operation in {"Const", "StaticRef"} and result is not None:
+                if operation == "StaticRef":
+                    payload = int(instruction.attributes["reference_handle"])
+                else:
+                    payload = instruction.attributes.get("constant")
+                if payload is None and "values" in instruction.attributes:
+                    payload = instruction.attributes.get("values")
+                if payload is None and "value" in instruction.attributes:
+                    payload = instruction.attributes.get("value")
+                target = pointer(result)
+                if isinstance(payload, (tuple, list)):
+                    for index, item in enumerate(payload):
+                        slot = f"%const.slot.{tag}.{index}"
+                        body.append(
+                            f"  {slot} = getelementptr i32, ptr {target}, i64 {index}"
+                        )
+                        body.append(f"  store i32 {int(item)}, ptr {slot}, align 4")
+                else:
+                    llvm_type = _value_llvm_type(result)
+                    body.append(
+                        f"  store {llvm_type} {literal(payload, llvm_type)}, ptr {target}, align 8"
+                    )
+                continue
+
+            if operation in {"Ret", "ret", "Return", "return"}:
+                continue
+
+            if operation in _SHAPE_ONLY and result is not None and instruction.args:
+                source_pointer = pointer(instruction.args[0])
+                destination = output_pointer.get(result_id)
+                if destination is not None and destination != source_pointer:
+                    body.append(
+                        "  call void @llvm.memcpy.p0.p0.i64("
+                        f"ptr {destination}, ptr {source_pointer}, "
+                        f"i64 {_value_element_count(result) * 8}, i1 false)"
+                    )
+                    pointers[result_id] = destination
+                else:
+                    pointers[result_id] = source_pointer
+                continue
+
+            if operation in {"GetElementPtr", "getelementptr"} and result is not None:
+                base_id = int(instruction.args[0].id) if instruction.args else -1
+                members = aggregate_members.get(base_id)
+                position = instruction.attributes.get("aggregate_index")
+                if position is None and len(instruction.args) > 1:
+                    position = constant_values.get(int(instruction.args[1].id))
+                if members is not None and position is not None and int(position) in members:
+                    address_members[result_id] = members[int(position)]
+                    continue
+                if (
+                    position is not None
+                    and instruction.args
+                ):
+                    slot = f"%aggregate.slot.{tag}"
+                    body.append(
+                        f"  {slot} = getelementptr ptr, ptr {pointer(instruction.args[0])}, i64 {int(position)}"
+                    )
+                    address_slots[result_id] = slot
+                    continue
+
+            if operation in {"Load", "load"} and result is not None and instruction.args:
+                member = address_members.get(int(instruction.args[0].id))
+                if member is not None:
+                    pointers[result_id] = member
+                    continue
+                slot = address_slots.get(int(instruction.args[0].id))
+                if slot is not None:
+                    if _value_llvm_type(result) == "i64":
+                        loaded_value = f"%reference.load.{tag}"
+                        body.append(
+                            f"  {loaded_value} = load i64, ptr {slot}, align 8"
+                        )
+                        body.append(
+                            f"  store i64 {loaded_value}, ptr {pointer(result)}, align 8"
+                        )
+                        continue
+                    loaded_pointer = f"%aggregate.load.{tag}"
+                    body.append(
+                        f"  {loaded_pointer} = load ptr, ptr {slot}, align 8"
+                    )
+                    pointers[result_id] = loaded_pointer
+                    continue
+
+            if operation in {"Store", "store"} and len(instruction.args) == 2:
+                source, address = instruction.args
+                destination = address_slots.get(int(address.id), pointer(address))
+                source_type = _value_llvm_type(source)
+                loaded_value = f"%store.load.{tag}"
+                body.append(
+                    f"  {loaded_value} = load {source_type}, ptr {pointer(source)}, align 8"
+                )
+                body.append(
+                    f"  store {source_type} {loaded_value}, ptr {destination}, align 8"
+                )
+                continue
+
+            callee = instruction.attributes.get("callee")
+            if callee is not None:
+                symbol = str(callee)
+                try:
+                    returns, argument_types = _kernel_signature(symbol)
+                except (KeyError, ValueError):
+                    returns = ""
+                    argument_types = ()
+                if argument_types or returns:
+                    kernels_used.add(symbol)
+                    arguments = list(instruction.args)
+                    output_argument = instruction.attributes.get("ssa_output_argument")
+                    if output_argument is not None and len(arguments) < len(argument_types):
+                        arguments.insert(int(output_argument), result)
+                    rendered: list[str] = []
+                    for position, (argument_type, argument) in enumerate(zip(argument_types, arguments)):
+                        rendered.append(
+                            f"ptr {pointer(argument)}"
+                            if argument_type == "ptr"
+                            else f"{argument_type} {load_as(argument, argument_type, f'{tag}.{position}')}"
+                        )
+                    if len(rendered) != len(argument_types):
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, symbol, "authored call arity does not match its definition",
+                        ))
+                        continue
+                    joined = ", ".join(rendered)
+                    if returns == "void":
+                        body.append(f"  call void @{symbol}({joined})")
+                    elif result is not None:
+                        call_result = f"%call.{tag}"
+                        body.append(f"  {call_result} = call {returns} @{symbol}({joined})")
+                        body.append(
+                            f"  store {returns} {call_result}, ptr {pointer(result)}, align 8"
+                        )
+                    continue
+
+                if symbol in reachable:
+                    callee_outputs = function_outputs[symbol]
+                    declared_ids = tuple(map(
+                        int, instruction.attributes.get("output_ids", ())
+                    ))
+                    selected = aggregate_positions.get(
+                        (name, result_id), tuple(range(len(callee_outputs)))
+                    )
+                    projections = projection_values.get(result_id, {})
+                    forwarded = forwarded_aggregate_calls.get(name)
+                    if (
+                        forwarded is not None
+                        and int(forwarded[0]) == result_id
+                        and str(forwarded[1]) == symbol
+                    ):
+                        result_ptrs = [
+                            f"%out.{index}"
+                            for index in range(len(callee_outputs))
+                        ]
+                    elif declared_ids:
+                        result_ptrs = [
+                            pointer(projections[position])
+                            for position in selected
+                            if position in projections
+                        ]
+                    else:
+                        if len(callee_outputs) == 1 and result is not None:
+                            result_ptrs = [pointer(result)]
+                        else:
+                            result_ptrs = []
+                            for output_index, value in enumerate(callee_outputs):
+                                llvm_type = _value_llvm_type(value)
+                                count = _value_element_count(value)
+                                temporary = f"%call.output.{tag}.{output_index}"
+                                body.append(
+                                    f"  {temporary} = alloca {llvm_type}, i64 {count}, align 8"
+                                )
+                                result_ptrs.append(temporary)
+                    call_args = [pointer(argument) for argument in instruction.args]
+                    if len(result_ptrs) != len(callee_outputs):
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, symbol,
+                            "live aggregate projections do not match callee outputs",
+                        ))
+                        continue
+                    body.append(
+                        f"  call void @{internal_symbols[symbol]}("
+                        + ", ".join(f"ptr {value}" for value in (*call_args, *result_ptrs))
+                        + ")"
+                    )
+                    if result is not None:
+                        if forwarded is not None and int(forwarded[0]) == result_id:
+                            # The call already wrote the wrapper's public
+                            # outputs.  Its aggregate result has no independent
+                            # storage and must not be reconstructed from local
+                            # pointers.
+                            pass
+                        elif len(callee_outputs) == 1 and not declared_ids:
+                            pointers[result_id] = result_ptrs[0]
+                        else:
+                            aggregate_members[result_id] = {
+                                original_position: result_ptrs[index]
+                                for index, original_position in enumerate(selected)
+                                if index < len(result_ptrs)
+                            }
+                            if not declared_ids:
+                                aggregate = f"%aggregate.{tag}"
+                                body.append(
+                                    f"  {aggregate} = alloca ptr, i64 {len(result_ptrs)}, align 8"
+                                )
+                                for output_index, result_pointer in enumerate(result_ptrs):
+                                    slot = f"%aggregate.output.slot.{tag}.{output_index}"
+                                    body.append(
+                                        f"  {slot} = getelementptr ptr, ptr {aggregate}, i64 {output_index}"
+                                    )
+                                    body.append(
+                                        f"  store ptr {result_pointer}, ptr {slot}, align 8"
+                                    )
+                                pointers[result_id] = aggregate
+                    continue
+
+            template = scalar_likeness(operation)
+            if template is not None and result is not None:
+                operands = [
+                    load_as(argument, "double", f"{tag}.{position}")
+                    for position, argument in enumerate(instruction.args)
+                ]
+                register = f"%scalar.{tag}"
+                for rendered_line in template.format(*operands, out=register).splitlines():
+                    body.append(f"  {rendered_line}")
+                result_type = "i1" if operation in {"Eq", "Ne", "Lt", "Le", "Gt", "Ge"} else "double"
+                body.append(
+                    f"  store {result_type} {register}, ptr {pointer(result)}, align 8"
+                )
+                continue
+
+            # Descriptor getters can be present as dead planned outputs after
+            # call specialization. They are omitted only when no selected ABI
+            # result or live instruction consumes them.
+            if operation == "getattr" and result is not None and result_id not in output_pointer:
+                continue
+            shortfalls.append(LLVMEmissionShortfall(
+                name, operation, "operation has no repository LLVM emission",
+            ))
+
+        for output_index, output in enumerate(outputs):
+            source = pointers.get(int(output.id))
+            if source is None:
+                tensor_table = getattr(module, "tensor_tables", {}).get(name)
+                descriptor = (
+                    tensor_table.by_id(int(output.id))
+                    if tensor_table is not None else None
+                )
+                if descriptor is not None:
+                    source = pointers.get(int(descriptor.data_value_id))
+            destination = f"%out.{output_index}"
+            if source is None or source == destination:
+                continue
+            llvm_type = _value_llvm_type(output)
+            count = _value_element_count(output)
+            if count == 1:
+                loaded = f"%return.load.{output_index}"
+                body.append(f"  {loaded} = load {llvm_type}, ptr {source}, align 8")
+                body.append(f"  store {llvm_type} {loaded}, ptr {destination}, align 8")
+            else:
+                body.append(
+                    f"  call void @llvm.memcpy.p0.p0.i64(ptr {destination}, ptr {source}, i64 {count * 8}, i1 false)"
+                )
+        body.append("  ret void")
+        emitted_functions.append("\n".join((
+            f"define void @{internal_symbols[name]}({', '.join(parameters)}) {{",
+            *body,
+            "}",
+        )))
+
+    root = module.functions[function_name]
+    root_outputs = function_outputs[function_name]
+    public_values = [*root.args, *root_outputs]
+    buffer_order: list[int] = []
+    buffer_shapes: list[tuple[_Any, ...]] = []
+    public_pointer: dict[int, str] = {}
+    wrapper: list[str] = ["entry:"]
+    for value in public_values:
+        value_id = int(value.id)
+        if value_id in public_pointer:
+            continue
+        slot = len(buffer_order)
+        buffer_order.append(value_id)
+        buffer_shapes.append(tuple(value.shape or ()))
+        address = f"%public.addr.{slot}"
+        loaded = f"%public.{slot}"
+        wrapper.append(f"  {address} = getelementptr ptr, ptr %buffers, i64 {slot}")
+        wrapper.append(f"  {loaded} = load ptr, ptr {address}, align 8")
+        public_pointer[value_id] = loaded
+    wrapper.append(
+        f"  call void @{internal_symbols[function_name]}("
+        + ", ".join(
+            f"ptr {public_pointer[int(value.id)]}"
+            for value in (*root.args, *root_outputs)
+        )
+        + ")"
+    )
+    wrapper.append("  ret void")
+
+    definitions: dict[str, str] = {}
+    declarations: dict[str, str] = {
+        "llvm.memcpy.p0.p0.i64": (
+            "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)"
+        )
+    }
+    unresolved: set[str] = set()
+    pending_kernels = set(kernels_used)
+    while pending_kernels:
+        symbol = pending_kernels.pop()
+        if symbol in definitions or symbol in declarations:
+            continue
+        try:
+            definition = extract_llvm_function(symbol)
+        except KeyError:
+            try:
+                declarations[symbol] = extract_llvm_declaration(symbol)
+            except KeyError:
+                unresolved.add(symbol)
+                shortfalls.append(LLVMEmissionShortfall(
+                    function_name, symbol,
+                    "referenced LLVM symbol has no authored definition or declaration",
+                ))
+            continue
+        definitions[symbol] = definition
+        for dependency in _re.findall(r"@([A-Za-z_$.-][\w$.-]*)\s*\(", definition):
+            if dependency != symbol:
+                pending_kernels.add(dependency)
+
+    llvm_ir = "\n\n".join(part for part in (
+        f'source_filename = "turing.ssa-llvm.{entry_name}"',
+        "\n".join(declarations[symbol] for symbol in sorted(declarations)),
+        "\n\n".join(definitions[symbol] for symbol in sorted(definitions)),
+        "\n\n".join(emitted_functions),
+        "\n".join((
+            f"define void @{entry_name}(ptr %buffers, ptr %extents) {{",
+            *wrapper,
+            "}",
+        )),
+    ) if part)
+    return LLVMFunctionArtifact(
+        name=entry_name,
+        llvm_ir=llvm_ir + "\n",
+        buffer_order=tuple(buffer_order),
+        buffer_shapes=tuple(buffer_shapes),
+        extent_order=(),
+        shortfalls=tuple(shortfalls),
+        needs_text_sink=bool(text_sink),
+    )
+
+
 @_dataclass
 class LLVMFunctionArtifact:
     """One SSA function emitted through the likeness table."""
@@ -256,6 +970,17 @@ def emit_ssa_function_to_llvm(
         extract_llvm_declaration,
         extract_llvm_function,
     )
+
+    repository_closure, _authored_leaves = _internal_call_closure(
+        module, function_name
+    )
+    if len(repository_closure) > 1:
+        return _emit_repository_call_module(
+            module,
+            function_name,
+            entry_name=entry_name or function_name,
+            text_sink=text_sink,
+        )
 
     function = module.functions[function_name]
     name = entry_name or function_name
@@ -348,6 +1073,8 @@ def emit_ssa_function_to_llvm(
                 payload = instruction.attributes.get("constant")
                 if payload is None:
                     payload = instruction.attributes.get("values")
+                if payload is None and "value" in instruction.attributes:
+                    payload = instruction.attributes.get("value")
                 if isinstance(payload, (tuple, list)):
                     symbol = f"@const.vec.{result_id}"
                     elements = ", ".join(f"i32 {int(item)}" for item in payload)
@@ -363,6 +1090,72 @@ def emit_ssa_function_to_llvm(
                     shortfalls.append(LLVMEmissionShortfall(
                         function_name, "Const", "constant without payload",
                     ))
+                continue
+
+            if operation == "StaticRef":
+                scalars[result_id] = (
+                    str(int(instruction.attributes["reference_handle"])),
+                    "i64",
+                )
+                continue
+
+            if operation in {"GetElementPtr", "getelementptr"} and (
+                instruction.res is not None and len(instruction.args) >= 2
+            ):
+                base = instruction.args[0]
+                base_value = scalars.get(int(base.id))
+                base_pointer = (
+                    base_value[0]
+                    if base_value is not None and base_value[1] == "ptr"
+                    else buffer(int(base.id))
+                )
+                index = as_type(
+                    int(instruction.args[1].id), "i32", f"gep.{result_id}"
+                )
+                if index is None:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        function_name, operation,
+                        "address index is not an emitted integer scalar",
+                    ))
+                    continue
+                address = f"%address.{result_id}"
+                lines.append(
+                    f"  {address} = getelementptr i64, ptr {base_pointer}, i32 {index}"
+                )
+                scalars[result_id] = (address, "ptr")
+                continue
+
+            if operation in {"Store", "store"} and len(instruction.args) == 2:
+                source, address = instruction.args
+                stored = scalars.get(int(source.id))
+                destination = scalars.get(int(address.id))
+                if stored is None or destination is None or destination[1] != "ptr":
+                    shortfalls.append(LLVMEmissionShortfall(
+                        function_name, operation,
+                        "store source or destination address has no emitted producer",
+                    ))
+                    continue
+                lines.append(
+                    f"  store {stored[1]} {stored[0]}, ptr {destination[0]}, align 8"
+                )
+                continue
+
+            if operation in {"Load", "load"} and (
+                instruction.res is not None and len(instruction.args) == 1
+            ):
+                address = scalars.get(int(instruction.args[0].id))
+                if address is None or address[1] != "ptr":
+                    shortfalls.append(LLVMEmissionShortfall(
+                        function_name, operation,
+                        "load address has no emitted pointer producer",
+                    ))
+                    continue
+                llvm_type = _value_llvm_type(instruction.res)
+                register = f"%load.{result_id}"
+                lines.append(
+                    f"  {register} = load {llvm_type}, ptr {address[0]}, align 8"
+                )
+                scalars[result_id] = (register, llvm_type)
                 continue
 
             if operation in {"Ret", "ret", "Return", "return"}:

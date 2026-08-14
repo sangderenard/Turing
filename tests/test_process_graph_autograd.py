@@ -3,12 +3,19 @@ from __future__ import annotations
 import ctypes
 import re
 
+import networkx as nx
 import numpy as np
 import pytest
 
 from src.compiler.process_graph_autograd import (
+    abstract_tensor_program_to_process_graph,
+    ConditionalAdjointContract,
+    compile_process_graph_backward,
     ProcessGraphAutogradError,
+    LoopAdjointContract,
+    differentiate_control_program,
     differentiate_process_graph,
+    differentiate_process_program,
     fuse_forward_loss_backward,
     lower_training_motion_to_repository_ssa,
 )
@@ -54,9 +61,16 @@ def test_process_graph_adjoint_is_parametric_and_accumulates_shared_uses():
     assert backward.G.graph["python_backward_callbacks"] is False
     assert backward.G.graph["backward_rule_registry"].endswith("BACKWARD_RULES")
     assert set(adjoint.seed_value_ids) == {5}
-    # Only the multiplication operands require saved numeric values. Equal
-    # static shapes let the registry's unbroadcast helper reduce to identity.
-    assert set(adjoint.saved_value_ids) == {1, 2}
+    # Multiplication retains its numeric operands; addition also retains the
+    # two result descriptors required by the authored unbroadcast identity.
+    assert {
+        value_id for value_id, contract in adjoint.saved_value_contracts.items()
+        if contract.storage == "resident"
+    } == {1, 2}
+    assert {
+        value_id for value_id, contract in adjoint.saved_value_contracts.items()
+        if contract.storage == "descriptor"
+    } == {3, 4}
     assert set(adjoint.gradient_value_ids) == {1, 2}
     # Both requested gradients are explicit graph outputs, and each shared
     # input's contributions meet at an ordinary add node.
@@ -86,6 +100,29 @@ def test_saved_values_are_named_runtime_inputs_not_embedded_python_objects():
             "source_forward_id": forward_id,
         }
         assert not any(callable(value) for value in data.values())
+
+
+@pytest.mark.parametrize("packaging", ("independent", "combined"))
+def test_every_backward_request_returns_the_adjoint_binding_graph(packaging):
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "input", label="left", shape=(2, 2))
+    _add(graph, 2, "input", label="right", shape=(2, 2))
+    _add(graph, 3, "mul", (1, 2), shape=(2, 2))
+    graph.roots = [3]
+
+    product = compile_process_graph_backward(
+        graph, wrt=(1, 2), packaging=packaging,
+    )
+
+    assert product.binding_graph is product.adjoint.binding_graph
+    assert set(product.binding_graph.graph) == {1, 2}
+    if packaging == "independent":
+        assert product.motion is None
+        assert product.graph is product.adjoint.backward
+    else:
+        assert product.motion is not None
+        assert product.binding_graph is product.motion.binding_graph
+        assert product.graph is product.motion.graph
 
 
 def test_backward_graph_inherits_python_host_opportunistic_dispatch_contract():
@@ -140,45 +177,7 @@ def test_cyclic_control_refuses_observed_traversal_differentiation():
         differentiate_process_graph(graph)
 
 
-def _run_backward(adjoint, feeds):
-    values = dict(feeds)
-    graph = adjoint.backward.G
-    for node_id in list(__import__("networkx").topological_sort(graph)):
-        if node_id in values:
-            continue
-        data = graph.nodes[node_id]
-        op = data["op"]
-        parents = [values[parent] for parent, _role in data["parents"]]
-        attrs = data.get("attributes") or {}
-        if op == "const":
-            values[node_id] = np.asarray(data["constant"])
-        elif op == "add":
-            values[node_id] = parents[0] + parents[1]
-        elif op == "sub":
-            values[node_id] = parents[0] - parents[1]
-        elif op == "mul":
-            values[node_id] = parents[0] * parents[1]
-        elif op == "truediv":
-            values[node_id] = parents[0] / parents[1]
-        elif op == "neg":
-            values[node_id] = -parents[0]
-        elif op == "matmul":
-            values[node_id] = parents[0] @ parents[1]
-        elif op == "transpose":
-            values[node_id] = np.swapaxes(parents[0], -1, -2)
-        elif op == "sum":
-            values[node_id] = parents[0].sum(
-                axis=attrs.get("dim", attrs.get("axis")),
-                keepdims=bool(attrs.get("keepdim", False)),
-            )
-        elif op == "reshape":
-            values[node_id] = parents[0].reshape(tuple(attrs["shape"]))
-        else:  # pragma: no cover - test evaluator stays deliberately narrow
-            raise AssertionError(op)
-    return [values[root] for root in adjoint.backward.roots]
-
-
-def test_mse_numeric_subgraph_derives_parametric_gradients_without_tape():
+def test_mse_numeric_subgraph_derives_graph_backed_adjoint_without_tape():
     # This is the exact numeric return cone of abstract_nn.MSELoss.forward:
     # mean((pred - target) * (pred - target)).
     graph = ProcessGraph(materialize_memory=False)
@@ -190,23 +189,13 @@ def test_mse_numeric_subgraph_derives_parametric_gradients_without_tape():
     graph.roots = [5]
 
     adjoint = differentiate_process_graph(graph, wrt=(1, 2))
-    pred = np.asarray([[0.2, 0.7], [1.1, -0.4]])
-    target = np.asarray([[0.0, 1.0], [0.3, -0.2]])
-    diff = pred - target
-    saved_forward = {1: pred, 2: target, 3: diff, 4: diff * diff}
-    feeds = {
-        adjoint.seed_value_ids[5]: np.asarray(1.0),
-        **{
-            adjoint.saved_value_ids[source]: value
-            for source, value in saved_forward.items()
-            if source in adjoint.saved_value_ids
-        },
-    }
-
-    grad_pred, grad_target = _run_backward(adjoint, feeds)
-    expected = 2.0 * diff / diff.size
-    np.testing.assert_allclose(grad_pred, expected)
-    np.testing.assert_allclose(grad_target, -expected)
+    assert len(adjoint.backward.roots) == 2
+    assert set(adjoint.gradient_value_ids) == {1, 2}
+    assert adjoint.backward.G.graph["python_backward_callbacks"] is False
+    assert any(
+        data["op"] == "Call"
+        for _node, data in adjoint.backward.G.nodes(data=True)
+    )
     assert not {
         "adjoint_reduce_to_shape",
         "adjoint_expand_reduction",
@@ -231,30 +220,27 @@ def test_linear_forward_loss_backward_is_one_parametric_graph_motion(tmp_path):
     graph.roots = [9]
 
     adjoint = differentiate_process_graph(graph, wrt=(1, 2, 3))
+    assert all(
+        contract.storage in {"resident", "descriptor"}
+        and contract.lifetime == "forward_through_backward"
+        for contract in adjoint.saved_value_contracts.values()
+    )
+    assert {
+        value_id for value_id, contract
+        in adjoint.saved_value_contracts.items()
+        if contract.storage == "resident"
+    } == {1, 2, 7}
+    assert adjoint.binding_graph.graph.nodes[7]["kind"] == "product"
+    assert adjoint.binding_graph.graph.nodes[3]["kind"] == "parameter"
+    assert adjoint.gradient_contracts[2].binding_name == "W"
+    assert adjoint.gradient_contracts[2].accumulation == "sum"
     x = np.asarray([[0.2, -0.3, 0.7], [1.1, 0.4, -0.2]])
     weight = np.asarray([[0.5, -0.1], [0.2, 0.8], [-0.4, 0.3]])
     bias = np.asarray([0.05, -0.15])
     target = np.asarray([[0.1, 0.9], [-0.2, 0.3]])
     prediction = x @ weight + bias
     diff = prediction - target
-    saved_forward = {
-        1: x, 2: weight, 3: bias, 4: target,
-        5: x @ weight, 6: prediction, 7: diff, 8: diff * diff,
-    }
-    feeds = {
-        adjoint.seed_value_ids[9]: np.asarray(1.0),
-        **{
-            adjoint.saved_value_ids[source]: value
-            for source, value in saved_forward.items()
-            if source in adjoint.saved_value_ids
-        },
-    }
-
-    grad_x, grad_weight, grad_bias = _run_backward(adjoint, feeds)
     grad_prediction = 2.0 * diff / diff.size
-    np.testing.assert_allclose(grad_x, grad_prediction @ weight.T)
-    np.testing.assert_allclose(grad_weight, x.T @ grad_prediction)
-    np.testing.assert_allclose(grad_bias, grad_prediction.sum(axis=0))
     assert set(adjoint.backward.G.graph["backward_rule_nodes"].values()) == {
         "matmul", "add", "sub", "mul", "mean"
     }
@@ -328,3 +314,332 @@ def test_linear_forward_loss_backward_is_one_parametric_graph_motion(tmp_path):
     buffers[3][...] -= 0.1 * buffers[lowering.outputs["grad_3"]]
     entry(pointers, extents)
     assert float(buffers[lowering.outputs["loss_0"]]) < first_loss
+
+
+def test_real_abstract_nn_linear_loss_runs_process_graph_adjoint_natively(tmp_path):
+    from src.common.tensors.abstract_nn import Linear, MSELoss
+    from src.common.tensors.accelerator_backends.ssa_backend import (
+        SSATensorOperations,
+        SSATensorProgram,
+    )
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact,
+        emit_ssa_function_to_llvm,
+    )
+
+    program = SSATensorProgram("abstract_nn_linear_mse")
+    inputs = SSATensorOperations.input(program, (2, 3))
+    weight = SSATensorOperations.input(program, (3, 2))
+    bias = SSATensorOperations.input(program, (1, 2))
+    targets = SSATensorOperations.input(program, (2, 2))
+    layer = Linear(3, 2, like=inputs, init="xavier")
+    layer.W = weight
+    layer.b = bias
+    loss = MSELoss()(layer.forward(inputs), targets)
+
+    forward = abstract_tensor_program_to_process_graph(
+        loss,
+        bindings={
+            "x": inputs, "W": weight, "b": bias, "target": targets,
+        },
+    )
+    assert [forward.G.nodes[node]["op"] for node in nx.topological_sort(
+        forward.G
+    )] == ["input", "input", "input", "input", "matmul", "add", "sub", "mul", "mean"]
+    product = compile_process_graph_backward(
+        forward, wrt=(0, 1, 2), packaging="combined",
+    )
+    assert product.motion is not None
+    assert product.binding_graph is product.adjoint.binding_graph
+    assert product.graph.G.graph["optimizer_included"] is False
+
+    lowering = lower_training_motion_to_repository_ssa(
+        product.motion, function_name="abstract_nn_linear_mse",
+    )
+    llvm = emit_ssa_function_to_llvm(
+        lowering.module, lowering.function_name,
+        entry_name=lowering.function_name,
+    )
+    assert llvm.shortfalls == ()
+    native = compile_artifact(llvm, directory=tmp_path / "abstract_nn_native")
+
+    x_value = np.asarray([[0.2, -0.3, 0.7], [1.1, 0.4, -0.2]])
+    weight_value = np.asarray([[0.5, -0.1], [0.2, 0.8], [-0.4, 0.3]])
+    bias_value = np.asarray([[0.05, -0.15]])
+    target_value = np.asarray([[0.1, 0.9], [-0.2, 0.3]])
+    inputs_by_id = {
+        0: x_value, 1: weight_value, 2: bias_value, 3: target_value,
+    }
+    buffers = {
+        value_id: np.ascontiguousarray(inputs_by_id[value_id], dtype=np.float64)
+        if value_id in inputs_by_id else np.zeros(shape or (), dtype=np.float64)
+        for value_id, shape in zip(native.buffer_order, native.buffer_shapes)
+    }
+    pointers = (ctypes.c_void_p * len(native.buffer_order))(*(
+        ctypes.c_void_p(buffers[value_id].ctypes.data)
+        for value_id in native.buffer_order
+    ))
+    extents = (ctypes.c_int32 * len(native.extent_order))()
+    entry = native.entry()
+    entry(pointers, extents)
+
+    prediction = x_value @ weight_value + bias_value
+    upstream = 2.0 * (prediction - target_value) / prediction.size
+    np.testing.assert_allclose(
+        buffers[lowering.outputs["loss_0"]],
+        np.mean((prediction - target_value) ** 2),
+    )
+    np.testing.assert_allclose(
+        buffers[lowering.outputs["grad_0"]], upstream @ weight_value.T,
+    )
+    np.testing.assert_allclose(
+        buffers[lowering.outputs["grad_1"]], x_value.T @ upstream,
+    )
+    np.testing.assert_allclose(
+        buffers[lowering.outputs["grad_2"]], upstream.sum(axis=0, keepdims=True),
+    )
+
+    first_loss = float(buffers[lowering.outputs["loss_0"]])
+    buffers[1][...] -= 0.1 * buffers[lowering.outputs["grad_1"]]
+    buffers[2][...] -= 0.1 * buffers[lowering.outputs["grad_2"]]
+    entry(pointers, extents)
+    assert float(buffers[lowering.outputs["loss_0"]]) < first_loss
+
+
+def test_control_adjoint_preserves_branch_and_reverses_each_selected_arm():
+    from src.compiler.control_source import (
+        ConditionalBlock,
+        ControlProgram,
+        SequenceBlock,
+        StatementBlock,
+    )
+    from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
+    from src.transmogrifier.ssa_registry import Handler
+
+    forward = ControlProgram(
+        root=SequenceBlock((
+            StatementBlock(("__scheduled_region_0__",)),
+            ConditionalBlock(
+                predicate_value_id=50,
+                body=StatementBlock((
+                    "__scheduled_region_1__",
+                    "__scheduled_region_2__",
+                )),
+                orelse=StatementBlock(("__scheduled_region_3__",)),
+            ),
+            StatementBlock(("__scheduled_region_4__",)),
+        )),
+        region_indices=(0, 1, 2, 3, 4),
+    )
+    result = differentiate_control_program(
+        forward,
+        forward_to_backward_regions={
+            0: 10, 1: 11, 2: 12, 3: 13, 4: 14,
+        },
+    )
+    root = result.backward.root
+    assert isinstance(root, SequenceBlock)
+    assert root.blocks[0].lines == ("__scheduled_region_14__",)
+    branch = root.blocks[1]
+    assert isinstance(branch, ConditionalBlock)
+    assert branch.predicate_value_id == 50
+    assert branch.body.lines == (
+        "__scheduled_region_12__",
+        "__scheduled_region_11__",
+    )
+    assert branch.orelse.lines == ("__scheduled_region_13__",)
+    assert root.blocks[2].lines == ("__scheduled_region_10__",)
+
+    region_callees = {index: f"backward_region_{index}" for index in range(10, 15)}
+    function, shortfalls = lower_control_program_to_ssa(
+        result.backward,
+        region_callees=region_callees,
+        region_signatures={index: ((), ()) for index in region_callees},
+    )
+    assert shortfalls == ()
+    instructions = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+    assert sum(instruction.op == Handler.CondBr.value for instruction in instructions) == 1
+    assert {"if_true", "if_false", "if_merge"} <= set(function.blocks)
+
+
+def test_process_program_adjoint_partitions_backward_by_forward_region():
+    from src.compiler.control_source import ControlProgram, SequenceBlock, StatementBlock
+
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "input", label="x", shape=(2,))
+    _add(graph, 2, "input", label="weight", shape=(2,))
+    _add(graph, 3, "mul", (1, 2), shape=(2,))
+    _add(graph, 4, "mean", (3,), shape=())
+    graph.roots = [4]
+    control = ControlProgram(
+        SequenceBlock((
+            StatementBlock(("__scheduled_region_0__",)),
+            StatementBlock(("__scheduled_region_1__",)),
+        )),
+        region_indices=(0, 1),
+    )
+
+    result = differentiate_process_program(
+        graph,
+        control,
+        region_nodes={0: (1, 2, 3), 1: (4,)},
+        wrt=(1, 2),
+    )
+    assert result.control.forward_to_backward_regions == {0: 2, 1: 3}
+    assert result.control.backward.root.blocks[0].lines == (
+        "__scheduled_region_3__",
+    )
+    assert result.control.backward.root.blocks[1].lines == (
+        "__scheduled_region_2__",
+    )
+    for region, node_ids in result.backward_region_nodes.items():
+        source_regions = {
+            0 if int((result.numeric.backward.G.nodes[node]["attributes"])["source_forward_id"]) in {1, 2, 3}
+            else 1
+            for node in node_ids
+        }
+        assert source_regions == ({0} if region == 2 else {1})
+
+
+def test_program_adjoint_ledger_includes_predicate_and_loop_history_by_default():
+    from src.compiler.control_source import (
+        ConditionalBlock,
+        ControlProgram,
+        LoopBlock,
+        SequenceBlock,
+        StatementBlock,
+    )
+
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "input", label="x", shape=(2,))
+    _add(graph, 2, "input", label="weight", shape=(2,))
+    _add(graph, 3, "mul", (1, 2), shape=(2,))
+    _add(graph, 4, "mean", (3,), shape=())
+    _add(graph, 5, "const", label="take_branch", shape=())
+    _add(graph, 6, "const", label="trip_count", shape=())
+    graph.roots = [4]
+    control = ControlProgram(
+        SequenceBlock((
+            ConditionalBlock(
+                predicate_value_id=5,
+                body=StatementBlock(("__scheduled_region_0__",)),
+                orelse=StatementBlock(("__scheduled_region_1__",)),
+            ),
+            LoopBlock(
+                induction="i",
+                start="0",
+                stop="8",
+                step="1",
+                body=StatementBlock(("__scheduled_region_1__",)),
+                recursion_region_id=9,
+            ),
+        )),
+        region_indices=(0, 1),
+    )
+
+    result = differentiate_process_program(
+        graph,
+        control,
+        region_nodes={0: (1, 2, 3, 5), 1: (4, 6)},
+        outputs=(4,),
+        wrt=(1, 2),
+        loop_adjoint_contracts={9: LoopAdjointContract(6)},
+    )
+
+    ledger = result.binding_graph.graph
+    assert result.binding_graph is not result.numeric.binding_graph
+    assert ledger.nodes[5]["kind"] == "predicate"
+    assert ledger.nodes[5]["storage"] == "resident"
+    assert ledger.nodes[5]["control_consumers"] == (
+        ("root.sequence[0]", "branch_selection"),
+    )
+    assert ledger.nodes[6]["kind"] == "loop_history"
+    assert ledger.nodes[6]["backward_input_id"] is None
+    assert ledger.nodes[6]["control_consumers"] == (
+        ("root.sequence[1]", "reverse_trip_count"),
+    )
+    assert ledger.graph["semantic_authority"] == "ProcessGraph+ControlProgram"
+
+
+def test_control_adjoint_rejects_branch_carried_state_without_merge_contract():
+    from src.compiler.control_source import ConditionalBlock, ControlProgram, StatementBlock
+
+    control = ControlProgram(ConditionalBlock(
+        predicate_value_id=7,
+        body=StatementBlock(("__scheduled_region_0__",)),
+        carried_aliases=((10, 11, 9, 12),),
+    ))
+    with pytest.raises(ProcessGraphAutogradError, match="branch-carried"):
+        differentiate_control_program(
+            control,
+            forward_to_backward_regions={0: 1},
+        )
+
+
+def test_conditional_carried_gradient_merge_requires_exact_contract():
+    from src.compiler.control_source import ConditionalBlock, ControlProgram, StatementBlock
+
+    forward_aliases = ((10, 11, 9, 12),)
+    backward_aliases = ((110, 111, 112, 109),)
+    control = ControlProgram(ConditionalBlock(
+        predicate_value_id=7,
+        body=StatementBlock(("__scheduled_region_0__",)),
+        orelse=StatementBlock(("__scheduled_region_1__",)),
+        carried_aliases=forward_aliases,
+        source_node_id=42,
+    ))
+    result = differentiate_control_program(
+        control,
+        forward_to_backward_regions={0: 2, 1: 3},
+        conditional_adjoint_contracts={
+            42: ConditionalAdjointContract(
+                forward_carried_aliases=forward_aliases,
+                backward_carried_aliases=backward_aliases,
+            ),
+        },
+    )
+    assert result.backward.root.carried_aliases == backward_aliases
+
+
+def test_counted_loop_adjoint_uses_saved_trip_count_and_descending_cfg():
+    from src.compiler.control_source import ControlProgram, LoopBlock, StatementBlock
+    from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
+    from src.transmogrifier.ssa_registry import Handler
+
+    forward = ControlProgram(
+        LoopBlock(
+            induction="i",
+            start="2",
+            stop="11",
+            step="3",
+            body=StatementBlock(("__scheduled_region_0__",)),
+            recursion_region_id=7,
+        ),
+        region_indices=(0,),
+    )
+    result = differentiate_control_program(
+        forward,
+        forward_to_backward_regions={0: 1},
+        loop_adjoint_contracts={7: LoopAdjointContract(90)},
+    )
+    loop = result.backward.root
+    assert isinstance(loop, LoopBlock)
+    assert loop.start == "(2) + ((value_90 - 1) * (3))"
+    assert loop.stop == "(2) - 1"
+    assert loop.step == "-(3)"
+    assert loop.comparison == "gt"
+    assert result.backward.uniforms[0].value_id == 90
+
+    function, shortfalls = lower_control_program_to_ssa(
+        result.backward,
+        region_callees={1: "backward_region_1"},
+        region_signatures={1: ((), ())},
+    )
+    assert shortfalls == ()
+    header_ops = [item.op for item in function.blocks["loop_header"].instrs]
+    assert Handler.Gt.value in header_ops
+    assert Handler.CondBr.value in header_ops

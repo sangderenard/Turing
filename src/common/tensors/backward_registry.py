@@ -149,13 +149,9 @@ def unbroadcast(G, target_shape):
     return G.reshape(tuple(t_shape))
 
 def expand_to(G, shape):
-    # Prefer a native broadcast_to if available
-    try:
-        return AbstractTensor.broadcast_to(G, shape)
-    except Exception:
-        # Fallback: multiply by ones of target shape to force broadcast
-        ones = AbstractTensor.ones(shape, dtype=getattr(G, "dtype", None), device=getattr(G, "device", None))
-        return ones * G
+    """Broadcast through the guaranteed AbstractTensor operator surface."""
+
+    return AbstractTensor.broadcast_to(G, shape)
 
 
 def expand_reduction(G, shape, axis=None, keepdim=False):

@@ -53,6 +53,10 @@ _SHAPED_SSA_OPERATIONS = {
     "Mul": "mul", "Mult": "mul", "mul": "mul",
     "Div": "truediv", "truediv": "truediv",
     "Pow": "pow", "pow": "pow",
+    "sum": "sum", "mean": "mean", "prod": "prod",
+    "min": "min", "max": "max", "any": "any", "all": "all",
+    "matmul": "matmul", "transpose": "transpose",
+    "broadcast_to": "broadcast_to", "expand": "expand",
 }
 
 
@@ -109,6 +113,210 @@ def _attribute(attributes: dict[str, Any], *names: str) -> Any:
     return None
 
 
+def propagate_repository_ssa_call_metadata(module: IRModule) -> bool:
+    """Settle tensor dtype/shape facts across repository-SSA call edges.
+
+    Planned regions return through explicit aggregate projections while source
+    functions use ordinary ``Ret`` values.  This pass correlates both forms,
+    including an aggregate forwarded into a projection-only adapter.  It only
+    copies already-proven SSA metadata; it executes no source code and invents
+    no extents.
+    """
+
+    changed_any = False
+
+    def values(function) -> list[SSAValue]:
+        return [
+            *function.args,
+            *(
+                value
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                for value in (*instruction.args, instruction.res)
+                if value is not None
+            ),
+        ]
+
+    def enrich(function, value_id: int, source: SSAValue) -> bool:
+        changed = False
+        source_shape = tuple(source.shape or ())
+        source_dtype = source.dtype
+        source_aggregate = tuple(
+            (source.accounting or {}).get("ssa_aggregate_outputs", ())
+        )
+        for value in values(function):
+            if int(value.id) != int(value_id):
+                continue
+            if source_shape and not tuple(value.shape or ()):
+                value.shape = source_shape
+                changed = True
+            if source_dtype is not None and value.dtype is None:
+                value.dtype = source_dtype
+                changed = True
+            if (
+                source_aggregate
+                and not tuple(
+                    (value.accounting or {}).get(
+                        "ssa_aggregate_outputs", ()
+                    )
+                )
+            ):
+                value.accounting = {
+                    **dict(value.accounting or {}),
+                    "ssa_aggregate_outputs": source_aggregate,
+                }
+                changed = True
+        return changed
+
+    def returned(function) -> tuple[SSAValue, ...]:
+        return next((
+            tuple(instruction.args)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in {"Ret", "ret", "Return", "return"}
+        ), ())
+
+    def constant_indices(function) -> dict[int, int]:
+        result = {}
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.op != "Const" or instruction.res is None:
+                    continue
+                payload = _constant_payload(instruction)
+                if isinstance(payload, (int, float)):
+                    result[int(instruction.res.id)] = int(payload)
+        return result
+
+    def projections(function, aggregate_id: int) -> dict[int, SSAValue]:
+        constants = constant_indices(function)
+        addresses: dict[int, int] = {}
+        result: dict[int, SSAValue] = {}
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    instruction.op in {"GetElementPtr", "getelementptr"}
+                    and instruction.res is not None
+                    and instruction.args
+                    and int(instruction.args[0].id) == int(aggregate_id)
+                ):
+                    position = instruction.attributes.get("aggregate_index")
+                    if position is None and len(instruction.args) > 1:
+                        position = constants.get(int(instruction.args[1].id))
+                    if position is not None:
+                        addresses[int(instruction.res.id)] = int(position)
+                elif (
+                    instruction.op in {"Load", "load"}
+                    and instruction.res is not None
+                    and instruction.args
+                    and int(instruction.args[0].id) in addresses
+                ):
+                    result[addresses[int(instruction.args[0].id)]] = instruction.res
+        return result
+
+    changed = True
+    while changed:
+        changed = False
+        for function_name, function in module.functions.items():
+            # Elementwise/reduction results inherit a shaped numerical input;
+            # exact result extents already present elsewhere always win.
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.res is None:
+                        continue
+                    operation = str(
+                        instruction.attributes.get("tensor_candidate")
+                        or instruction.attributes.get("tensor_operation")
+                        or instruction.op
+                    )
+                    if operation not in {
+                        "Div", "Sub", "Add", "Mul",
+                        "div", "truediv", "sub", "add", "mul",
+                        "broadcast_to", "expand",
+                    }:
+                        continue
+                    shaped = next(
+                        (value for value in instruction.args if tuple(value.shape or ())),
+                        None,
+                    )
+                    if shaped is not None:
+                        changed |= enrich(function, int(instruction.res.id), shaped)
+
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.op not in {"Call", "call"}:
+                        continue
+                    callee_name = str(instruction.attributes.get("callee") or "")
+                    callee = module.functions.get(callee_name)
+                    if callee is None:
+                        continue
+                    for actual, formal in zip(instruction.args, callee.args):
+                        changed |= enrich(callee, int(formal.id), actual)
+                        changed |= enrich(function, int(actual.id), formal)
+
+                    callee_returns = returned(callee)
+                    declared = tuple(map(
+                        int, instruction.attributes.get("output_ids", ())
+                    ))
+                    if declared and instruction.res is not None:
+                        caller_outputs = projections(function, int(instruction.res.id))
+                        callee_values = {int(value.id): value for value in values(callee)}
+                        for position, output_id in enumerate(declared):
+                            caller_value = caller_outputs.get(position)
+                            callee_value = callee_values.get(output_id)
+                            if callee_value is None:
+                                tensor_table = getattr(
+                                    module, "tensor_tables", {}
+                                ).get(callee_name)
+                                descriptor = (
+                                    tensor_table.by_id(output_id)
+                                    if tensor_table is not None else None
+                                )
+                                if descriptor is not None:
+                                    callee_value = callee_values.get(
+                                        int(descriptor.data_value_id)
+                                    )
+                            if caller_value is None or callee_value is None:
+                                continue
+                            changed |= enrich(
+                                function, int(caller_value.id), callee_value
+                            )
+                            changed |= enrich(
+                                callee, int(callee_value.id), caller_value
+                            )
+                    elif len(callee_returns) == 1 and instruction.res is not None:
+                        changed |= enrich(
+                            function, int(instruction.res.id), callee_returns[0]
+                        )
+                        changed |= enrich(
+                            callee, int(callee_returns[0].id), instruction.res
+                        )
+                    elif len(callee_returns) > 1 and instruction.res is not None:
+                        # An aggregate may be forwarded into a small adapter
+                        # whose sole job is to project its members.
+                        for consumer_block in function.blocks.values():
+                            for consumer in consumer_block.instrs:
+                                if consumer.op not in {"Call", "call"}:
+                                    continue
+                                adapter = module.functions.get(str(
+                                    consumer.attributes.get("callee") or ""
+                                ))
+                                if adapter is None:
+                                    continue
+                                for position, actual in enumerate(consumer.args):
+                                    if int(actual.id) != int(instruction.res.id):
+                                        continue
+                                    formal = adapter.args[position]
+                                    adapter_outputs = projections(adapter, int(formal.id))
+                                    for output_index, source in enumerate(callee_returns):
+                                        projected = adapter_outputs.get(output_index)
+                                        if projected is not None:
+                                            changed |= enrich(
+                                                adapter, int(projected.id), source
+                                            )
+        changed_any |= changed
+    return changed_any
+
+
 def lower_tensor_calls_to_repository_ssa(
     module: IRModule,
     reference: SSATensorCodeReference,
@@ -155,7 +363,8 @@ def lower_tensor_calls_to_repository_ssa(
         attributes = {
             key: value for key, value in source.attributes.items()
             if key not in {
-                "tensor_operation", "tensor", "callee", "lowered_from"
+                "tensor_operation", "tensor", "tensor_candidate",
+                "callee", "lowered_from"
             }
         }
         attributes["callee"] = callee
@@ -347,9 +556,21 @@ def lower_tensor_calls_to_repository_ssa(
                 instruction = dataclasses.replace(
                     original, args=[resolve(argument) for argument in original.args]
                 )
+                if (
+                    instruction.op in {"Call", "call"}
+                    and instruction.attributes.get("callee") is not None
+                ):
+                    rewritten.append(instruction)
+                    continue
+                candidate_only = bool(
+                    instruction.attributes.get("tensor_candidate") is not None
+                    and instruction.attributes.get("tensor_operation") is None
+                    and instruction.attributes.get("tensor") is None
+                )
                 operation_value = (
                     instruction.attributes.get("tensor_operation")
                     or instruction.attributes.get("tensor")
+                    or instruction.attributes.get("tensor_candidate")
                 )
                 # ProcessGraph spells Python arithmetic as ordinary SSA
                 # opcodes rather than attaching tensor metadata. Once shape
@@ -357,7 +578,10 @@ def lower_tensor_calls_to_repository_ssa(
                 # opcodes through the authored row-major tensor source.
                 if (
                     operation_value is None
-                    and instruction.op in _SHAPED_SSA_OPERATIONS
+                    and (
+                        instruction.op in _SHAPED_SSA_OPERATIONS
+                        or c_tensor_opcode(str(instruction.op)) is not None
+                    )
                     and instruction.res is not None
                     and (
                         tuple(instruction.res.shape)
@@ -371,7 +595,9 @@ def lower_tensor_calls_to_repository_ssa(
                         )
                     )
                 ):
-                    operation_value = _SHAPED_SSA_OPERATIONS[instruction.op]
+                    operation_value = _SHAPED_SSA_OPERATIONS.get(
+                        instruction.op, str(instruction.op)
+                    )
                 if operation_value is None or instruction.res is None:
                     rewritten.append(instruction)
                     continue
@@ -411,8 +637,20 @@ def lower_tensor_calls_to_repository_ssa(
 
                 # Constants after the first data operand are structural call
                 # operands (axis, shape, dtype token, keepdim, ...).
-                data_args = [argument for argument in args if int(argument.id) not in constants]
-                metadata = [constants[int(argument.id)] for argument in args if int(argument.id) in constants]
+                # Operand zero is the tensor value even when constant folding
+                # proved its payload.  Only later constant operands are call
+                # structure (shape, axis, dtype, keepdim, ...).  Dropping a
+                # constant first operand made calls such as
+                # ``broadcast_to(1.0, (m, n))`` appear to have no source.
+                data_args = [
+                    argument for position, argument in enumerate(args)
+                    if position == 0 or int(argument.id) not in constants
+                ]
+                metadata = [
+                    constants[int(argument.id)]
+                    for position, argument in enumerate(args)
+                    if position != 0 and int(argument.id) in constants
+                ]
                 source = data_args[0] if data_args else (args[0] if args else None)
                 source_descriptor = None
                 if source is not None:
@@ -555,7 +793,20 @@ def lower_tensor_calls_to_repository_ssa(
                 ) and source is not None:
                     axis = _attribute(instruction.attributes, "axis", "dim")
                     if axis is None:
-                        axis = next((item for item in metadata if isinstance(item, (int, float))), None)
+                        axis = next((
+                            item for item in metadata
+                            if isinstance(item, (int, float))
+                            or (
+                                _as_sequence(item) is not None
+                                and all(
+                                    isinstance(member, (int, float))
+                                    for member in _as_sequence(item) or ()
+                                )
+                            )
+                        ), None)
+                    axis_sequence = _as_sequence(axis)
+                    if axis_sequence is not None and len(axis_sequence) == 1:
+                        axis = axis_sequence[0]
                     if axis is None and operation in {"sum", "mean"}:
                         count = need_count(source, source_count)
                         if count is not None and operation == "sum":
@@ -616,6 +867,68 @@ def lower_tensor_calls_to_repository_ssa(
                         "where_double", [*data_args, result, count], result,
                         instruction, output_argument=3,
                     ))
+
+                elif operation in {"broadcast_to", "expand"} and source is not None:
+                    requested_shape = _attribute(
+                        instruction.attributes, "shape", "size", "sizes"
+                    )
+                    if requested_shape is None:
+                        requested_shape = next(
+                            (
+                                item for item in metadata
+                                if _as_sequence(item) is not None
+                            ),
+                            None,
+                        )
+                    output_shape = _as_sequence(requested_shape)
+                    if output_shape is None and result.shape:
+                        output_shape = tuple(result.shape)
+                    if output_shape is not None and (
+                        source.shape or source.dtype is not None
+                    ):
+                        output_shape = tuple(map(int, output_shape))
+                        result.shape = output_shape
+                        input_shape, input_shape_def = int_vector(source.shape)
+                        input_rank, input_rank_def = constant(
+                            len(source.shape), "int32"
+                        )
+                        result_shape, result_shape_def = int_vector(output_shape)
+                        result_rank, result_rank_def = constant(
+                            len(output_shape), "int32"
+                        )
+                        prefix.extend((
+                            input_shape_def,
+                            input_rank_def,
+                            result_shape_def,
+                            result_rank_def,
+                        ))
+                        emitted.append(call(
+                            "broadcast_double",
+                            [
+                                source, result, input_shape, input_rank,
+                                result_shape, result_rank,
+                            ],
+                            result, instruction, output_argument=1,
+                        ))
+                    elif output_shape is not None and not source.shape:
+                        output_shape = tuple(map(int, output_shape))
+                        result.shape = output_shape
+                        source_extents = ensure_dynamic(prefix, source)
+                        result_shape, result_shape_def = int_vector(output_shape)
+                        result_rank, result_rank_def = constant(
+                            len(output_shape), "int32"
+                        )
+                        prefix.extend((result_shape_def, result_rank_def))
+                        emitted.append(call(
+                            "broadcast_double",
+                            [
+                                source, result,
+                                source_extents["shape"],
+                                source_extents["rank"],
+                                result_shape, result_rank,
+                            ],
+                            result, instruction, output_argument=1,
+                        ))
 
                 elif operation == "sign" and source is not None:
                     count = need_count(source, source_count)
@@ -769,7 +1082,7 @@ def lower_tensor_calls_to_repository_ssa(
                     or operation == "cbrt"
                     or reference.operation(operation) is not None
                 )
-                if recognized:
+                if recognized and not candidate_only:
                     reason = (
                         "tensor extent/shape or structural operands are not available in SSA"
                         if source is not None and _known_count(source) is None
@@ -816,4 +1129,8 @@ def lower_tensor_calls_to_repository_ssa(
     return tuple(shortfalls)
 
 
-__all__ = ["TensorSSALoweringShortfall", "lower_tensor_calls_to_repository_ssa"]
+__all__ = [
+    "TensorSSALoweringShortfall",
+    "lower_tensor_calls_to_repository_ssa",
+    "propagate_repository_ssa_call_metadata",
+]

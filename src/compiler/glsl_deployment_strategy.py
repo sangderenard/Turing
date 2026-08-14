@@ -1600,12 +1600,20 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     known = False
                 elif opcode in {"neg", "USub"} and len(parents) == 1:
                     values = tuple(_constant_values[parent] for parent in parents)
-                    value = -values[0]
-                    known = True
+                    try:
+                        value = -values[0]
+                    except (ArithmeticError, TypeError, ValueError):
+                        known = False
+                    else:
+                        known = True
                 elif opcode in {"pos", "UAdd"} and len(parents) == 1:
                     values = tuple(_constant_values[parent] for parent in parents)
-                    value = +values[0]
-                    known = True
+                    try:
+                        value = +values[0]
+                    except (ArithmeticError, TypeError, ValueError):
+                        known = False
+                    else:
+                        known = True
                 elif opcode in {"Tuple", "tuple"}:
                     values = tuple(_constant_values[parent] for parent in parents)
                     value = tuple(values)
@@ -1616,16 +1624,28 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     known = True
                 elif opcode in {"add", "Add"} and len(parents) == 2:
                     values = tuple(_constant_values[parent] for parent in parents)
-                    value = values[0] + values[1]
-                    known = True
+                    try:
+                        value = values[0] + values[1]
+                    except (ArithmeticError, TypeError, ValueError):
+                        known = False
+                    else:
+                        known = True
                 elif opcode in {"sub", "Sub"} and len(parents) == 2:
                     values = tuple(_constant_values[parent] for parent in parents)
-                    value = values[0] - values[1]
-                    known = True
+                    try:
+                        value = values[0] - values[1]
+                    except (ArithmeticError, TypeError, ValueError):
+                        known = False
+                    else:
+                        known = True
                 elif opcode in {"mul", "Mul"} and len(parents) == 2:
                     values = tuple(_constant_values[parent] for parent in parents)
-                    value = values[0] * values[1]
-                    known = True
+                    try:
+                        value = values[0] * values[1]
+                    except (ArithmeticError, TypeError, ValueError):
+                        known = False
+                    else:
+                        known = True
                 else:
                     known = False
                 if known:
@@ -2996,7 +3016,9 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     and body_value == else_value
                 ):
                     return body_value
-        if isinstance(expression, ast.Attribute) and expression.attr == "shape":
+        if isinstance(expression, ast.Attribute) and expression.attr in {
+            "shape", "ndim", "ndims", "dtype", "device",
+        }:
             base = next((
                 parent
                 for role, parent in parents.items()
@@ -3008,9 +3030,19 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     projected = leaves(endpoint[0], base)
                     if len(projected) == 1 and () in projected:
                         meta = value_meta(projected[()])
-                shape = None if meta is None else meta.shape
-                if shape is not None:
-                    return tuple(int(size) for size in shape)
+                if meta is not None:
+                    if expression.attr == "shape" and meta.shape is not None:
+                        return tuple(int(size) for size in meta.shape)
+                    if expression.attr in {"ndim", "ndims"} and (
+                        meta.shape is not None
+                    ):
+                        return len(meta.shape)
+                    if expression.attr == "dtype" and meta.dtype is not None:
+                        return str(meta.dtype)
+                    if expression.attr == "device":
+                        device = getattr(meta, "device", None)
+                        if device is not None:
+                            return device
         if (
             isinstance(expression, ast.Subscript)
             or data.get("type") in {"Indexed", "indexed"}
@@ -3149,7 +3181,7 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         if (
             isinstance(expression, ast.Call)
             and isinstance(expression.func, ast.Attribute)
-            and expression.func.attr == "ndims"
+            and expression.func.attr in {"numel", "ndim", "ndims"}
         ):
             base = next((
                 parent
@@ -3164,31 +3196,129 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                         meta = value_meta(projected[()])
                 shape = None if meta is None else meta.shape
                 if shape is not None:
-                    return len(shape)
+                    if expression.func.attr in {"ndim", "ndims"}:
+                        return len(shape)
+                    count = 1
+                    for extent in shape:
+                        count *= int(extent)
+                    return count
         if (
             isinstance(expression, ast.Call)
             and isinstance(expression.func, ast.Name)
-            and expression.func.id in {"bool", "int", "float"}
         ):
-            argument = next((
+            builtin_name = expression.func.id
+            positional = tuple(
                 parent
-                for role, parent in parents.items()
-                if _positional_argument_index(role) == 0
-            ), None)
-            fixed = (
-                unresolved_static
-                if argument is None
-                else static_endpoint_value(
-                    (endpoint[0], argument), visiting
+                for role, parent in sorted(
+                    parents.items(),
+                    key=lambda item: (
+                        _positional_argument_index(item[0])
+                        if _positional_argument_index(item[0]) is not None
+                        else 1 << 30
+                    ),
                 )
+                if _positional_argument_index(role) is not None
             )
-            if fixed is not unresolved_static:
+            fixed_arguments = tuple(
+                static_endpoint_value((endpoint[0], argument), visiting)
+                for argument in positional
+            )
+            if builtin_name == "getattr" and len(fixed_arguments) >= 2:
+                attribute_name = fixed_arguments[1]
+                base_id = positional[0]
+                if (
+                    isinstance(attribute_name, str)
+                    and not attribute_name.startswith("_")
+                ):
+                    meta = value_meta((endpoint[0], base_id))
+                    if meta is not None:
+                        if attribute_name == "shape" and meta.shape is not None:
+                            return tuple(int(size) for size in meta.shape)
+                        if attribute_name in {"ndim", "ndims"} and (
+                            meta.shape is not None
+                        ):
+                            return len(meta.shape)
+                        if attribute_name == "dtype" and meta.dtype is not None:
+                            return str(meta.dtype)
+                        if attribute_name == "device":
+                            device = getattr(meta, "device", None)
+                            if device is not None:
+                                return device
+                    owner_value = fixed_arguments[0]
+                    if owner_value is not unresolved_static and isinstance(
+                        owner_value,
+                        (tuple, list, dict, range, str, bytes),
+                    ):
+                        try:
+                            return getattr(owner_value, attribute_name)
+                        except AttributeError:
+                            pass
+                if (
+                    len(fixed_arguments) >= 3
+                    and fixed_arguments[2] is not unresolved_static
+                ):
+                    return fixed_arguments[2]
+            if builtin_name == "isinstance" and positional:
+                candidate = fixed_arguments[0]
+                type_expression = (
+                    expression.args[1] if len(expression.args) > 1 else None
+                )
+
+                def safe_types(node: ast.AST | None):
+                    if isinstance(node, ast.Name):
+                        return {
+                            "bool": (bool,), "int": (int,),
+                            "float": (float,), "str": (str,),
+                            "bytes": (bytes,), "tuple": (tuple,),
+                            "list": (list,), "dict": (dict,),
+                            "set": (set,), "range": (range,),
+                        }.get(node.id)
+                    if isinstance(node, ast.Tuple):
+                        collected = tuple(
+                            item
+                            for element in node.elts
+                            for item in (safe_types(element) or ())
+                        )
+                        return collected or None
+                    return None
+
+                accepted = safe_types(type_expression)
+                if candidate is not unresolved_static and accepted is not None:
+                    return isinstance(candidate, accepted)
+            if all(
+                argument is not unresolved_static
+                for argument in fixed_arguments
+            ):
                 try:
-                    return {
-                        "bool": bool,
-                        "int": int,
-                        "float": float,
-                    }[expression.func.id](fixed)
+                    if builtin_name in {"bool", "int", "float"}:
+                        return {"bool": bool, "int": int, "float": float}[
+                            builtin_name
+                        ](*fixed_arguments)
+                    if builtin_name in {"tuple", "list", "set"}:
+                        constructor = {
+                            "tuple": tuple, "list": list, "set": set,
+                        }[builtin_name]
+                        return constructor(*fixed_arguments)
+                    if builtin_name == "len":
+                        return len(*fixed_arguments)
+                    if builtin_name == "range":
+                        return range(*fixed_arguments)
+                    if builtin_name == "enumerate":
+                        return tuple(enumerate(*fixed_arguments))
+                    if builtin_name == "zip":
+                        return tuple(zip(*fixed_arguments))
+                    if builtin_name == "sorted":
+                        return sorted(*fixed_arguments)
+                    if builtin_name == "max":
+                        return max(*fixed_arguments)
+                    if builtin_name == "min":
+                        return min(*fixed_arguments)
+                    if builtin_name == "all":
+                        return all(*fixed_arguments)
+                    if builtin_name == "any":
+                        return any(*fixed_arguments)
+                    if builtin_name == "slice":
+                        return slice(*fixed_arguments)
                 except (TypeError, ValueError, OverflowError):
                     pass
         if isinstance(data.get("expr_obj"), ast.Attribute):
@@ -12550,6 +12680,87 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
             )[parameter] = first
 
 
+def _propagate_callsite_tensor_specializations(graph: Any) -> None:
+    """Carry consistent tensor descriptors through the function table.
+
+    This is the descriptor analogue of literal planner specialization.  It
+    settles to a fixed point so a root call can shape ``bw_matmul`` and that
+    shaped wrapper can in turn shape ``matmul_vjp`` before either function's
+    logical control is partitioned. Conflicting callsite shapes remain
+    parametric and are left for per-callsite specialization.
+    """
+
+    function_table = getattr(graph, "function_table", None)
+    if function_table is None:
+        return
+    graphs = [graph]
+    graphs.extend(
+        entry.graph for entry in function_table if entry.graph is not None
+    )
+    changed = True
+    while changed:
+        changed = False
+        candidates: dict[tuple[int, str], list[dict[str, Any]]] = {}
+        for caller in graphs:
+            for _node_id, data in caller.G.nodes(data=True):
+                attributes = data.get("attributes") or {}
+                reference = attributes.get("callee_ref")
+                if reference is None:
+                    continue
+                try:
+                    callee = function_table.entry(int(reference)).graph
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if callee is None:
+                    continue
+                _receiver, positional, _all = _method_parameter_layout(callee.G)
+                for parent, role_value in data.get("parents") or ():
+                    role = str(role_value)
+                    position = _positional_argument_index(role)
+                    parameter = (
+                        positional[position]
+                        if position is not None and position < len(positional)
+                        else role[3:] if role.startswith("kw:") else None
+                    )
+                    descriptor = _tensor_descriptor(caller, int(parent))
+                    if parameter is not None and descriptor is not None:
+                        candidates.setdefault(
+                            (int(reference), str(parameter)), []
+                        ).append(copy.deepcopy(dict(descriptor)))
+        by_reference: dict[int, dict[str, dict[str, Any]]] = {}
+        for (reference, parameter), descriptors in candidates.items():
+            if not descriptors or any(
+                descriptor != descriptors[0] for descriptor in descriptors[1:]
+            ):
+                continue
+            by_reference.setdefault(reference, {})[parameter] = descriptors[0]
+        for reference, descriptors in by_reference.items():
+            callee = function_table.entry(reference).graph
+            if callee is None:
+                continue
+            existing = callee.G.graph.setdefault(
+                "planner_tensor_descriptors", {}
+            )
+            additions = {
+                name: descriptor
+                for name, descriptor in descriptors.items()
+                if existing.get(name) != descriptor
+            }
+            if not additions:
+                continue
+            existing.update(copy.deepcopy(additions))
+            _apply_callsite_tensor_descriptors(callee, additions)
+            # The catalogue graph is shared by every callsite.  A tensor
+            # descriptor alone is not a complete structural specialization:
+            # helpers such as ``unbroadcast(G, target_shape)`` also require a
+            # callsite-local shape value before their source control can be
+            # selected.  Folding the shared graph here permanently discarded
+            # branches before that value was known.  The copied graph is
+            # folded below by ``_callsite_specialized_shell_type`` after both
+            # descriptor and literal arguments have been collected.
+            changed = True
+
+
 def _resolve_bound_function_references(graph: Any) -> None:
     """Turn a specialized callable parameter into an ordinary call edge.
 
@@ -12712,6 +12923,781 @@ def propagate_bound_planner_specializations(
 
 
 _CALLSITE_SHELL_TYPE_CACHE: dict[tuple[object, ...], type] = {}
+_UNRESOLVED_STRUCTURAL_VALUE = object()
+
+
+@dataclass(frozen=True)
+class _StructuralValueAlias:
+    source_id: int
+
+
+def _tensor_descriptor(graph: Any, node_id: int) -> dict[str, Any] | None:
+    """Return compiler-owned tensor facts without inspecting a runtime value."""
+
+    if int(node_id) not in graph.G:
+        return None
+    tensor = dict(graph.G.nodes[int(node_id)].get("tensor") or {})
+    if "shape" not in tensor:
+        return None
+    return {
+        "shape": tuple(tensor.get("shape") or ()),
+        "dtype": str(tensor.get("dtype") or "float64"),
+        **(
+            {"device": tensor["device"]}
+            if tensor.get("device") is not None else {}
+        ),
+    }
+
+
+def _fold_callsite_structural_values(graph: Any) -> None:
+    """Fold only whitelisted structural Python identities from graph facts.
+
+    This pass is deliberately smaller than Python evaluation.  It consumes
+    constants and compiler-owned tensor descriptors, and recognizes the
+    structural builtins used to express shapes and source control.  It never
+    invokes a retained Python callable or reads a runtime tensor payload.
+    """
+
+    unresolved = _UNRESOLVED_STRUCTURAL_VALUE
+    known: dict[int, Any] = {}
+
+    def constant(data: Mapping[str, Any]) -> Any:
+        try:
+            return _constant_value(data)
+        except KeyError:
+            return unresolved
+
+    def positional(data: Mapping[str, Any]) -> tuple[int, ...]:
+        indexed = []
+        for parent, role_value in data.get("parents") or ():
+            position = _positional_argument_index(str(role_value))
+            if position is not None:
+                indexed.append((position, int(parent)))
+        return tuple(parent for _position, parent in sorted(indexed))
+
+    def descriptor_attribute(parent: int, attribute: str) -> Any:
+        descriptor = _tensor_descriptor(graph, parent)
+        if descriptor is None:
+            return unresolved
+        if attribute == "shape":
+            return descriptor["shape"]
+        if attribute in {"ndim", "ndims"}:
+            return len(descriptor["shape"])
+        if attribute == "dtype":
+            return descriptor["dtype"]
+        if attribute == "device" and "device" in descriptor:
+            return descriptor["device"]
+        return unresolved
+
+    def safe_types(expression: ast.AST | None):
+        if isinstance(expression, ast.Name):
+            return {
+                "bool": (bool,), "int": (int,), "float": (float,),
+                "str": (str,), "bytes": (bytes,), "tuple": (tuple,),
+                "list": (list,), "dict": (dict,), "set": (set,),
+                "range": (range,),
+            }.get(expression.id)
+        if isinstance(expression, ast.Tuple):
+            result = tuple(
+                item
+                for element in expression.elts
+                for item in (safe_types(element) or ())
+            )
+            return result or None
+        return None
+
+    def evaluate(node_id: int, data: Mapping[str, Any]) -> Any:
+        node_type = str(data.get("type") or "")
+        operation = str(data.get("op") or node_type).casefold()
+        expression = data.get("expr_obj")
+        if node_type in {"Constant", "Const", "const"}:
+            return constant(data)
+        if node_type in {"Input", "input"}:
+            binding_name = (data.get("attributes") or {}).get(
+                "binding_name"
+            )
+            specializations = graph.G.graph.get(
+                "planner_specializations"
+            ) or {}
+            return specializations.get(str(binding_name), unresolved)
+        if node_type in {"Tuple", "List", "Set"} or isinstance(
+            expression, (ast.Tuple, ast.List, ast.Set),
+        ):
+            values = tuple(
+                known.get(int(parent), unresolved)
+                for parent, _role in (data.get("parents") or ())
+            )
+            if any(value is unresolved for value in values):
+                return unresolved
+            if node_type == "List" or isinstance(expression, ast.List):
+                return list(values)
+            if node_type == "Set" or isinstance(expression, ast.Set):
+                return set(values)
+            return tuple(values)
+        if node_type in {"GetAttr", "Attribute"} or isinstance(
+            expression, ast.Attribute,
+        ):
+            parent = next((
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role) in {"value", "base", "operand", "object"}
+            ), None)
+            attribute = str(
+                (data.get("attributes") or {}).get("attribute")
+                or getattr(expression, "attr", "")
+            )
+            if parent is not None:
+                fixed = descriptor_attribute(parent, attribute)
+                if fixed is not unresolved:
+                    return fixed
+        if operation in {"numel", "ndim", "ndims"}:
+            parent = next((
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role) in {"operand", "value", "base", "object"}
+            ), None)
+            descriptor = None if parent is None else _tensor_descriptor(
+                graph, parent
+            )
+            if descriptor is not None:
+                if operation in {"ndim", "ndims"}:
+                    return len(descriptor["shape"])
+                count = 1
+                for extent in descriptor["shape"]:
+                    count *= int(extent)
+                return count
+        if node_type == "Phi" or isinstance(expression, ast.IfExp):
+            parents = {
+                str(role): int(parent)
+                for parent, role in (data.get("parents") or ())
+            }
+            predicate = known.get(parents.get("test"), unresolved)
+            if predicate is unresolved:
+                return unresolved
+            selected = parents.get("body" if bool(predicate) else "orelse")
+            if selected is None:
+                return unresolved
+            fixed = known.get(selected, unresolved)
+            return _StructuralValueAlias(selected) if fixed is unresolved else fixed
+        if isinstance(expression, ast.UnaryOp):
+            parent = next((
+                int(parent) for parent, role in (data.get("parents") or ())
+                if str(role) in {"operand", "value"}
+            ), None)
+            value = known.get(parent, unresolved)
+            if value is unresolved:
+                return unresolved
+            if isinstance(expression.op, ast.USub):
+                return -value
+            if isinstance(expression.op, ast.UAdd):
+                return +value
+            if isinstance(expression.op, ast.Not):
+                return not value
+        if isinstance(expression, ast.BinOp):
+            parents = {
+                str(role): int(parent)
+                for parent, role in (data.get("parents") or ())
+            }
+            left = known.get(parents.get("lhs", parents.get("left")), unresolved)
+            right = known.get(parents.get("rhs", parents.get("right")), unresolved)
+            if left is unresolved or right is unresolved:
+                return unresolved
+            try:
+                return {
+                    ast.Add: operator.add, ast.Sub: operator.sub,
+                    ast.Mult: operator.mul, ast.Div: operator.truediv,
+                    ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+                    ast.Pow: operator.pow,
+                }[type(expression.op)](left, right)
+            except (KeyError, ArithmeticError, TypeError, ValueError):
+                return unresolved
+        if isinstance(expression, ast.Compare) and len(expression.ops) == 1:
+            parents = {
+                str(role): int(parent)
+                for parent, role in (data.get("parents") or ())
+            }
+            left = known.get(parents.get("lhs", parents.get("left")), unresolved)
+            right = known.get(parents.get("rhs", parents.get("right")), unresolved)
+            if left is unresolved or right is unresolved:
+                return unresolved
+            comparison = {
+                ast.Eq: operator.eq, ast.NotEq: operator.ne,
+                ast.Lt: operator.lt, ast.LtE: operator.le,
+                ast.Gt: operator.gt, ast.GtE: operator.ge,
+                ast.Is: operator.is_, ast.IsNot: operator.is_not,
+            }.get(type(expression.ops[0]))
+            if comparison is None:
+                return unresolved
+            try:
+                return comparison(left, right)
+            except (TypeError, ValueError):
+                return unresolved
+        if isinstance(expression, ast.BoolOp):
+            values = [
+                known.get(int(parent), unresolved)
+                for parent, role in (data.get("parents") or ())
+                if str(role).startswith("value")
+            ]
+            if not values or any(value is unresolved for value in values):
+                return unresolved
+            return all(values) if isinstance(expression.op, ast.And) else any(values)
+        if not isinstance(expression, ast.Call):
+            return unresolved
+        name = (
+            expression.func.id
+            if isinstance(expression.func, ast.Name)
+            else expression.func.attr
+            if isinstance(expression.func, ast.Attribute)
+            else ""
+        )
+        arguments = positional(data)
+        values = tuple(known.get(argument, unresolved) for argument in arguments)
+        if name == "getattr" and len(arguments) >= 2:
+            attribute = values[1]
+            if isinstance(attribute, str) and not attribute.startswith("_"):
+                fixed = descriptor_attribute(arguments[0], attribute)
+                if fixed is not unresolved:
+                    return fixed
+            if len(values) >= 3 and values[2] is not unresolved:
+                return values[2]
+        if name == "isinstance" and values:
+            accepted = safe_types(
+                expression.args[1] if len(expression.args) > 1 else None
+            )
+            if values[0] is not unresolved and accepted is not None:
+                return isinstance(values[0], accepted)
+        if any(value is unresolved for value in values):
+            return unresolved
+        try:
+            if name in {"bool", "int", "float"}:
+                return {"bool": bool, "int": int, "float": float}[name](*values)
+            if name in {"tuple", "list", "set"}:
+                return {"tuple": tuple, "list": list, "set": set}[name](*values)
+            if name == "len":
+                return len(*values)
+            if name == "range":
+                return range(*values)
+            if name == "enumerate":
+                return tuple(enumerate(*values))
+            if name == "zip":
+                return tuple(zip(*values))
+            if name == "sorted":
+                return sorted(*values)
+            if name == "max":
+                return max(*values)
+            if name == "min":
+                return min(*values)
+            if name == "all":
+                return all(*values)
+            if name == "any":
+                return any(*values)
+            if name == "slice":
+                return slice(*values)
+        except (TypeError, ValueError, OverflowError):
+            return unresolved
+        return unresolved
+
+    def replace(node_id: int, value: Any) -> None:
+        data = graph.G.nodes[int(node_id)]
+        for parent, _role in tuple(data.get("parents") or ()):
+            if graph.G.has_edge(int(parent), int(node_id)):
+                graph.G.remove_edge(int(parent), int(node_id))
+            if int(parent) in graph.G:
+                graph.G.nodes[int(parent)]["children"] = [
+                    (child, role)
+                    for child, role in graph.G.nodes[int(parent)].get(
+                        "children", ()
+                    )
+                    if int(child) != int(node_id)
+                ]
+        attributes = {
+            "value": copy.deepcopy(value),
+            "structural_specialization": True,
+        }
+        data.update({
+            "type": "Constant", "op": "const", "label": repr(value),
+            "parents": [], "attributes": attributes,
+            "constant": copy.deepcopy(value), "expr_obj": None,
+        })
+
+    def remove_node(node_id: int) -> None:
+        node_id = int(node_id)
+        if node_id not in graph.G:
+            return
+        for successor in tuple(graph.G.successors(node_id)):
+            successor_data = graph.G.nodes[int(successor)]
+            successor_data["parents"] = [
+                (int(parent), str(role))
+                for parent, role in successor_data.get("parents") or ()
+                if int(parent) != node_id
+            ]
+        for predecessor in tuple(graph.G.predecessors(node_id)):
+            graph.G.nodes[int(predecessor)]["children"] = [
+                (child, role)
+                for child, role in graph.G.nodes[int(predecessor)].get(
+                    "children", ()
+                )
+                if int(child) != node_id
+            ]
+        graph.G.remove_node(node_id)
+
+    def replace_alias(node_id: int, source_id: int) -> None:
+        node_id = int(node_id)
+        source_id = int(source_id)
+        if node_id == source_id or source_id not in graph.G:
+            return
+        for successor in tuple(graph.G.successors(node_id)):
+            successor_data = graph.G.nodes[int(successor)]
+            replacement = tuple(
+                (
+                    source_id if int(parent) == node_id else int(parent),
+                    str(role),
+                )
+                for parent, role in successor_data.get("parents") or ()
+            )
+            if graph.G.has_edge(node_id, int(successor)):
+                graph.G.remove_edge(node_id, int(successor))
+            successor_data["parents"] = list(replacement)
+            for parent, role in replacement:
+                if not graph.G.has_edge(int(parent), int(successor)):
+                    graph.G.add_edge(int(parent), int(successor), role=str(role))
+                children = graph.G.nodes[int(parent)].setdefault("children", [])
+                if (int(successor), str(role)) not in children:
+                    children.append((int(successor), str(role)))
+        identities = graph.G.graph.get("identity_table") or {}
+        graph.G.graph["identity_table"] = {
+            str(name): tuple(dict.fromkeys(
+                source_id if int(value_id) == node_id else int(value_id)
+                for value_id in history
+            ))
+            for name, history in identities.items()
+        }
+        graph.roots = [
+            source_id if int(root) == node_id else int(root)
+            for root in graph.roots
+        ]
+        remove_node(node_id)
+
+    changed = True
+    while changed:
+        changed = False
+        for node_id in _dependency_order(graph):
+            node_id = int(node_id)
+            data = graph.G.nodes[node_id]
+            operation = str(data.get("op") or data.get("type") or "").casefold()
+            if _tensor_descriptor(graph, node_id) is None and operation in {
+                "add", "sub", "mult", "mul", "div", "truediv",
+                "floordiv", "mod", "pow", "maximum", "minimum",
+            }:
+                parent_descriptors = tuple(
+                    descriptor
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) not in {"callee", "func", "definition"}
+                    and (
+                        descriptor := _tensor_descriptor(graph, int(parent))
+                    ) is not None
+                )
+                if parent_descriptors:
+                    try:
+                        shape = tuple(np.broadcast_shapes(*(
+                            descriptor["shape"]
+                            for descriptor in parent_descriptors
+                        )))
+                    except ValueError:
+                        shape = None
+                    if shape is not None:
+                        data["tensor"] = {
+                            "shape": shape,
+                            "dtype": parent_descriptors[0]["dtype"],
+                        }
+            attributes = data.get("attributes") or {}
+            tensor_candidate = str(
+                attributes.get("tensor_candidate") or operation
+            ).casefold()
+            if (
+                _tensor_descriptor(graph, node_id) is None
+                and tensor_candidate in {
+                    "transpose", "swapaxes", "transpose_last2", "t"
+                }
+            ):
+                source_descriptor = next((
+                    _tensor_descriptor(graph, int(parent))
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"operand", "arg:0", "value"}
+                    and _tensor_descriptor(graph, int(parent)) is not None
+                ), None)
+                if source_descriptor is not None:
+                    source_shape = tuple(source_descriptor["shape"])
+                    result_shape = (
+                        (*source_shape[:-2], source_shape[-1], source_shape[-2])
+                        if len(source_shape) >= 2 else source_shape
+                    )
+                    data["tensor"] = {
+                        "shape": result_shape,
+                        "dtype": source_descriptor["dtype"],
+                    }
+            if (
+                _tensor_descriptor(graph, node_id) is None
+                and tensor_candidate in {"matmul", "mm"}
+            ):
+                operand_descriptors = tuple(
+                    descriptor
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) not in {"callee", "func", "definition"}
+                    and (
+                        descriptor := _tensor_descriptor(graph, int(parent))
+                    ) is not None
+                )
+                if len(operand_descriptors) >= 2:
+                    left_shape = tuple(operand_descriptors[0]["shape"])
+                    right_shape = tuple(operand_descriptors[1]["shape"])
+                    result_shape = None
+                    if len(left_shape) == 1 and len(right_shape) == 1:
+                        result_shape = ()
+                    elif len(left_shape) == 1 and len(right_shape) >= 2:
+                        result_shape = (*right_shape[:-2], right_shape[-1])
+                    elif len(left_shape) >= 2 and len(right_shape) == 1:
+                        result_shape = (*left_shape[:-2], left_shape[-2])
+                    elif len(left_shape) >= 2 and len(right_shape) >= 2:
+                        try:
+                            batch_shape = tuple(np.broadcast_shapes(
+                                left_shape[:-2], right_shape[:-2],
+                            ))
+                        except ValueError:
+                            batch_shape = None
+                        if batch_shape is not None:
+                            result_shape = (
+                                *batch_shape, left_shape[-2], right_shape[-1],
+                            )
+                    if result_shape is not None:
+                        data["tensor"] = {
+                            "shape": tuple(result_shape),
+                            "dtype": operand_descriptors[0]["dtype"],
+                        }
+            if (
+                _tensor_descriptor(graph, node_id) is None
+                and tensor_candidate in {"reshape", "view"}
+            ):
+                source_descriptor = next((
+                    _tensor_descriptor(graph, int(parent))
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"operand", "arg:0", "value"}
+                    and _tensor_descriptor(graph, int(parent)) is not None
+                ), None)
+                shape_parent = next((
+                    int(parent)
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"shape", "new_shape", "arg:1", "arg:0"}
+                    and str(role) not in {"operand", "value"}
+                    and known.get(int(parent), unresolved) is not unresolved
+                ), None)
+                if source_descriptor is not None and shape_parent is not None:
+                    result_shape = known[int(shape_parent)]
+                    if isinstance(result_shape, (tuple, list)):
+                        data["tensor"] = {
+                            "shape": tuple(int(extent) for extent in result_shape),
+                            "dtype": source_descriptor["dtype"],
+                        }
+            if (
+                _tensor_descriptor(graph, node_id) is None
+                and tensor_candidate in {
+                    "sum", "mean", "prod", "min", "max", "any", "all"
+                }
+            ):
+                source_descriptor = next((
+                    _tensor_descriptor(graph, int(parent))
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"operand", "arg:0", "value"}
+                    and _tensor_descriptor(graph, int(parent)) is not None
+                ), None)
+                structural_arguments = {
+                    str(role): known.get(int(parent), unresolved)
+                    for parent, role in (data.get("parents") or ())
+                }
+                axis = next((
+                    value for role, value in structural_arguments.items()
+                    if role in {"dim", "axis", "kw:dim", "kw:axis", "arg:1"}
+                    and value is not unresolved
+                ), unresolved)
+                keepdim = next((
+                    value for role, value in structural_arguments.items()
+                    if role in {"keepdim", "kw:keepdim", "arg:2"}
+                    and value is not unresolved
+                ), False)
+                if source_descriptor is not None and axis is not unresolved:
+                    source_shape = tuple(source_descriptor["shape"])
+                    raw_axes = (
+                        tuple(axis) if isinstance(axis, (tuple, list))
+                        else (int(axis),)
+                    )
+                    axes = tuple(sorted({
+                        int(item) % len(source_shape) for item in raw_axes
+                    })) if source_shape else ()
+                    if bool(keepdim):
+                        result_shape = tuple(
+                            1 if index in axes else extent
+                            for index, extent in enumerate(source_shape)
+                        )
+                    else:
+                        result_shape = tuple(
+                            extent for index, extent in enumerate(source_shape)
+                            if index not in axes
+                        )
+                    data["tensor"] = {
+                        "shape": result_shape,
+                        "dtype": source_descriptor["dtype"],
+                    }
+            if str(data.get("type")) in {"Constant", "Const", "const"}:
+                value = constant(data)
+            else:
+                value = evaluate(node_id, data)
+            if value is unresolved:
+                continue
+            if isinstance(value, _StructuralValueAlias):
+                replace_alias(node_id, value.source_id)
+                known.pop(node_id, None)
+                changed = True
+                break
+            if node_id not in known or known[node_id] != value:
+                known[node_id] = value
+                changed = True
+            if str(data.get("type")) not in {"Constant", "Const", "const"}:
+                replace(node_id, value)
+
+    # A callsite specialization may make source control decidable even when
+    # the selected value remains runtime numerical data.  Remove only the
+    # unselected lexical compartment and replace its merge Phi with an alias
+    # to the selected producer.  The proof is the graph constant above; no
+    # runtime tensor value or Python callable participates.
+    pruned = True
+    while pruned:
+        pruned = False
+        for control_id, control_data in tuple(graph.G.nodes(data=True)):
+            expression = control_data.get("expr_obj")
+            if not isinstance(expression, ast.If):
+                continue
+            predicate_id = next((
+                int(parent)
+                for parent, role in control_data.get("parents") or ()
+                if str(role) == "test"
+            ), None)
+            if predicate_id is None or predicate_id not in graph.G:
+                continue
+            predicate = constant(graph.G.nodes[predicate_id])
+            if predicate is unresolved:
+                continue
+            selected_role = "body" if bool(predicate) else "orelse"
+            rejected_role = "orelse" if bool(predicate) else "body"
+            for phi_id, phi_data in tuple(graph.G.nodes(data=True)):
+                if str(phi_data.get("type")) != "Phi":
+                    continue
+                phi_parents = {
+                    str(role): int(parent)
+                    for parent, role in phi_data.get("parents") or ()
+                }
+                if phi_parents.get("test") != predicate_id:
+                    continue
+                selected = phi_parents.get(selected_role)
+                if selected is not None:
+                    replace_alias(int(phi_id), int(selected))
+            rejected_statements = (
+                expression.orelse if rejected_role == "orelse"
+                else expression.body
+            )
+            rejected_ast_ids = {
+                id(member)
+                for statement in rejected_statements
+                for member in ast.walk(statement)
+            }
+            rejected_nodes = {
+                int(node_id)
+                for node_id, data in graph.G.nodes(data=True)
+                if id(data.get("expr_obj")) in rejected_ast_ids
+            }
+            for node_id in sorted(rejected_nodes, reverse=True):
+                remove_node(node_id)
+            remove_node(int(control_id))
+            identities = graph.G.graph.get("identity_table") or {}
+            graph.G.graph["identity_table"] = {
+                str(name): tuple(
+                    int(value_id) for value_id in history
+                    if int(value_id) in graph.G
+                )
+                for name, history in identities.items()
+            }
+            pruned = True
+            break
+
+    identities = graph.G.graph.get("identity_table") or {}
+    protected_values = {
+        int(value_id)
+        for name in graph.G.graph.get("function_outputs") or ()
+        for value_id in identities.get(str(name), ())
+        if int(value_id) in graph.G
+    } | {
+        int(root) for root in graph.roots if int(root) in graph.G
+    }
+    dead_metadata = True
+    while dead_metadata:
+        dead_metadata = False
+        for node_id, data in tuple(graph.G.nodes(data=True)):
+            attributes = data.get("attributes") or {}
+            dead_pure_tensor_call = bool(
+                attributes.get("tensor_candidate") is not None
+                or str(attributes.get("static_python_reference") or "").startswith(
+                    "AbstractTensor."
+                )
+            )
+            if (
+                int(node_id) not in protected_values
+                and graph.G.out_degree(int(node_id)) == 0
+                and (
+                    str(data.get("type")) in {
+                        "GetAttr", "Attribute", "StaticReference",
+                        "Constant", "Const", "const",
+                        "Tuple", "List", "Set",
+                    }
+                    or dead_pure_tensor_call
+                )
+            ):
+                remove_node(int(node_id))
+                dead_metadata = True
+                break
+
+    unused_parameters = {
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_kind") == "parameter"
+        and graph.G.out_degree(int(node_id)) == 0
+        and int(node_id) not in set(map(int, graph.roots))
+    }
+    for node_id in sorted(unused_parameters, reverse=True):
+        remove_node(node_id)
+    if unused_parameters:
+        identities = graph.G.graph.get("identity_table") or {}
+        graph.G.graph["identity_table"] = {
+            str(name): tuple(
+                int(value_id) for value_id in history
+                if int(value_id) in graph.G
+            )
+            for name, history in identities.items()
+        }
+
+
+def _apply_callsite_tensor_descriptors(
+    graph: Any,
+    descriptors: Mapping[str, Mapping[str, Any]],
+) -> None:
+    identities = graph.G.graph.get("identity_table") or {}
+    for name, descriptor in descriptors.items():
+        candidates = tuple(dict.fromkeys((
+            *tuple(identities.get(str(name), ())),
+            *(
+                int(node_id)
+                for node_id, data in graph.G.nodes(data=True)
+                if data.get("type") == "Input"
+                and (data.get("attributes") or {}).get("binding_name") == name
+            ),
+        )))
+        for node_id in candidates:
+            if int(node_id) not in graph.G:
+                continue
+            data = graph.G.nodes[int(node_id)]
+            if data.get("type") != "Input":
+                continue
+            data["tensor"] = copy.deepcopy(dict(descriptor))
+
+
+def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
+    """Lower the authored ``unbroadcast`` helper to canonical tensor nodes.
+
+    The helper's Python loop is only structural shape logic.  Once a callsite
+    supplies both shapes, retain its exact BACKWARD_RULES meaning as a finite
+    sequence of existing ``sum`` and ``reshape`` operators instead of asking
+    the control planner to carry a tensor through a Python ``for`` loop.
+    """
+
+    if str(graph.G.graph.get("function_name") or "") != "unbroadcast":
+        return False
+    descriptors = graph.G.graph.get("planner_tensor_descriptors") or {}
+    specializations = graph.G.graph.get("planner_specializations") or {}
+    source_descriptor = descriptors.get("G")
+    target_shape = specializations.get("target_shape")
+    if source_descriptor is None or not isinstance(target_shape, (tuple, list)):
+        return False
+    source_shape = tuple(map(int, source_descriptor.get("shape") or ()))
+    target_shape = tuple(map(int, target_shape))
+    input_id = next((
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "G"
+    ), None)
+    if input_id is None:
+        return False
+    metadata = copy.deepcopy(dict(graph.G.graph))
+    input_data = copy.deepcopy(dict(graph.G.nodes[input_id]))
+    graph.G.clear()
+    graph.G.graph.update(metadata)
+    input_data["parents"] = []
+    input_data["children"] = []
+    input_data["tensor"] = copy.deepcopy(dict(source_descriptor))
+    graph.G.add_node(input_id, **input_data)
+    next_id = input_id + 1
+    current = input_id
+    current_shape = list(source_shape)
+
+    def append(op: str, attributes: Mapping[str, Any], shape: tuple[int, ...]):
+        nonlocal next_id, current
+        node_id = next_id
+        next_id += 1
+        role = "operand"
+        graph.G.add_node(
+            node_id, op=op, type=op, label=op,
+            parents=[(current, role)], children=[],
+            attributes={
+                **dict(attributes),
+                "tensor_candidate": op,
+                "authored_identity": "backward_registry.unbroadcast",
+            },
+            extra_args=dict(attributes),
+            tensor={
+                "shape": tuple(shape),
+                "dtype": str(source_descriptor.get("dtype") or "float64"),
+            },
+            control={}, constant=None, expr_obj=None, store_id=None,
+        )
+        graph.G.add_edge(current, node_id, role=role)
+        graph.G.nodes[current]["children"].append((node_id, role))
+        current = node_id
+
+    while len(current_shape) > len(target_shape):
+        current_shape.pop(0)
+        append(
+            "sum", {"dim": 0, "keepdim": False}, tuple(current_shape),
+        )
+    for axis, (actual, target) in enumerate(zip(current_shape, target_shape)):
+        if target == 1 and actual != 1:
+            current_shape[axis] = 1
+            append(
+                "sum", {"dim": axis, "keepdim": True},
+                tuple(current_shape),
+            )
+    append("reshape", {"shape": target_shape}, target_shape)
+    graph.roots = [current]
+    identities = copy.deepcopy(metadata.get("identity_table") or {})
+    identities["G"] = (input_id,)
+    identities["result_0"] = (current,)
+    graph.G.graph.update({
+        "identity_table": identities,
+        "function_outputs": ("result_0",),
+        "function_parameters": ("G",),
+        "positional_parameters": ("G",),
+        "keyword_only_parameters": (),
+        "authored_identity_expansion": "backward_registry.unbroadcast",
+    })
+    return True
 
 
 def _callsite_specialized_shell_type(
@@ -12737,6 +13723,7 @@ def _callsite_specialized_shell_type(
         return fallback
     _receiver, positional, _all = _method_parameter_layout(original.G)
     specializations = {}
+    tensor_descriptors: dict[str, dict[str, Any]] = {}
     data = caller.G.nodes[int(node_id)]
     for parent, role_value in data.get("parents") or ():
         role = str(role_value)
@@ -12748,17 +13735,19 @@ def _callsite_specialized_shell_type(
             if role.startswith("kw:")
             else None
         )
-        if parameter is None or not _source_static_value(
-            caller, int(parent)
-        ):
+        if parameter is None:
             continue
-        try:
-            specializations[str(parameter)] = _source_static_literal(
-                caller, int(parent)
-            )
-        except ValueError:
-            continue
-    if not specializations:
+        descriptor = _tensor_descriptor(caller, int(parent))
+        if descriptor is not None:
+            tensor_descriptors[str(parameter)] = descriptor
+        if _source_static_value(caller, int(parent)):
+            try:
+                specializations[str(parameter)] = _source_static_literal(
+                    caller, int(parent)
+                )
+            except ValueError:
+                pass
+    if not specializations and not tensor_descriptors:
         return fallback
 
     def stable(value: Any) -> object:
@@ -12782,6 +13771,10 @@ def _callsite_specialized_shell_type(
             (name, stable(value))
             for name, value in specializations.items()
         )),
+        tuple(sorted(
+            (name, stable(value))
+            for name, value in tensor_descriptors.items()
+        )),
         int(max_nodes_per_dispatch),
     )
     cached = _CALLSITE_SHELL_TYPE_CACHE.get(key)
@@ -12794,6 +13787,12 @@ def _callsite_specialized_shell_type(
     specialized.G.graph.setdefault(
         "planner_specializations", {}
     ).update(specializations)
+    specialized.G.graph.setdefault(
+        "planner_tensor_descriptors", {}
+    ).update(copy.deepcopy(tensor_descriptors))
+    _apply_callsite_tensor_descriptors(specialized, tensor_descriptors)
+    if not _expand_specialized_unbroadcast_identity(specialized):
+        _fold_callsite_structural_values(specialized)
     planned = strategize_shell_deployment(
         specialized,
         max_nodes_per_dispatch=int(max_nodes_per_dispatch),
@@ -16132,6 +17131,7 @@ def strategize_shell_deployment(
 
     _resolve_bound_function_references(graph)
     _propagate_callsite_planner_specializations(graph)
+    _propagate_callsite_tensor_specializations(graph)
     canonical_value_ids = bool(
         graph.G.graph.get("canonical_value_ids")
     )
@@ -16155,6 +17155,15 @@ def strategize_shell_deployment(
         if discovered_loop_plans
         else ()
     )
+    if evaporated_loop_plans and (
+        graph.G.graph.get("planner_specializations")
+        or graph.G.graph.get("planner_tensor_descriptors")
+    ):
+        # Unrolling turns each induction/tuple component into a literal node.
+        # Re-run the same structural fixed point so predicates inside the
+        # cloned body select aliases to their real carried producer instead of
+        # escaping as invented function arguments.
+        _fold_callsite_structural_values(graph)
     evaporated_loop_ids = {
         int(plan.loop.node_id) for plan in evaporated_loop_plans
     }
