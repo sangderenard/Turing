@@ -13,6 +13,7 @@ for the program.
 
 from __future__ import annotations
 
+import ctypes
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,106 @@ from src.compiler.ssa_llvm_backend import (
     compile_artifact,
     emit_ssa_function_to_llvm,
 )
+from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
+
+
+def _native_scalar_buffers(artifact, values):
+    buffers = {}
+    for value_id, shape in zip(artifact.buffer_order, artifact.buffer_shapes):
+        value = values.get(value_id, 0)
+        if value_id in values and isinstance(value, bool):
+            buffers[value_id] = ctypes.c_bool(value)
+        else:
+            buffers[value_id] = ctypes.c_int32(int(value))
+    pointers = (ctypes.c_void_p * len(artifact.buffer_order))(*(
+        ctypes.cast(ctypes.pointer(buffers[value_id]), ctypes.c_void_p)
+        for value_id in artifact.buffer_order
+    ))
+    extents = (ctypes.c_int32 * len(artifact.extent_order))()
+    return buffers, pointers, extents
+
+
+def test_multiblock_conditional_phi_executes_natively(tmp_path):
+    predicate = SSAValue(0, "bool")
+    true_value = SSAValue(1, "int")
+    false_value = SSAValue(2, "int")
+    selected = SSAValue(3, "int")
+    function = Function("select_value", [predicate, true_value, false_value], {
+        "entry": BasicBlock("entry", [Instr(
+            "CondBr", [predicate], None,
+            attributes={"true_target": "if_true", "false_target": "if_false"},
+        )], ["if_true", "if_false"]),
+        "if_true": BasicBlock("if_true", [
+            Instr("Br", [], None, attributes={"target": "merge"}),
+        ], ["merge"]),
+        "if_false": BasicBlock("if_false", [
+            Instr("Br", [], None, attributes={"target": "merge"}),
+        ], ["merge"]),
+        "merge": BasicBlock("merge", [
+            Instr(
+                "Phi", [true_value, false_value], selected,
+                attributes={"incoming_blocks": ("if_true", "if_false")},
+            ),
+            Instr("Ret", [selected], None),
+        ]),
+    })
+    artifact = emit_ssa_function_to_llvm(
+        IRModule({function.name: function}), function.name,
+    )
+    assert artifact.shortfalls == ()
+    native = compile_artifact(artifact, directory=tmp_path / "native_branch")
+    buffers, pointers, extents = _native_scalar_buffers(
+        native, {0: True, 1: 17, 2: -4},
+    )
+    entry = native.entry()
+    entry(pointers, extents)
+    assert buffers[3].value == 17
+    buffers[0].value = False
+    entry(pointers, extents)
+    assert buffers[3].value == -4
+
+
+def test_descending_loop_phi_executes_natively(tmp_path):
+    trip_count = SSAValue(0, "int")
+    zero = SSAValue(1, "int")
+    negative_one = SSAValue(2, "int")
+    current = SSAValue(3, "int")
+    updated = SSAValue(4, "int")
+    active = SSAValue(5, "bool")
+    function = Function("descending_loop", [trip_count], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], zero, attributes={"value": 0}),
+            Instr("Const", [], negative_one, attributes={"value": -1}),
+            Instr("Br", [], None, attributes={"target": "loop_header"}),
+        ], ["loop_header"]),
+        "loop_header": BasicBlock("loop_header", [
+            Instr(
+                "Phi", [trip_count, updated], current,
+                attributes={"incoming_blocks": ("entry", "loop_latch")},
+            ),
+            Instr("Gt", [current, zero], active),
+            Instr(
+                "CondBr", [active], None,
+                attributes={"true_target": "loop_body", "false_target": "loop_exit"},
+            ),
+        ], ["loop_body", "loop_exit"]),
+        "loop_body": BasicBlock("loop_body", [
+            Instr("Br", [], None, attributes={"target": "loop_latch"}),
+        ], ["loop_latch"]),
+        "loop_latch": BasicBlock("loop_latch", [
+            Instr("Add", [current, negative_one], updated),
+            Instr("Br", [], None, attributes={"target": "loop_header"}),
+        ], ["loop_header"]),
+        "loop_exit": BasicBlock("loop_exit", [Instr("Ret", [current], None)]),
+    })
+    artifact = emit_ssa_function_to_llvm(
+        IRModule({function.name: function}), function.name,
+    )
+    assert artifact.shortfalls == ()
+    native = compile_artifact(artifact, directory=tmp_path / "native_loop")
+    buffers, pointers, extents = _native_scalar_buffers(native, {0: 7})
+    native.entry()(pointers, extents)
+    assert buffers[3].value == 0
 
 EXAMPLE = (
     Path(__file__).resolve().parents[1]

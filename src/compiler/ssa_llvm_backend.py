@@ -464,17 +464,13 @@ def _emit_repository_call_module(
     emitted_functions: list[str] = []
     for name in sorted(reachable, key=lambda item: item != function_name):
         function = module.functions[name]
-        if len(function.blocks) != 1:
-            shortfalls.append(LLVMEmissionShortfall(
-                name, "control", "internal SSA emitter requires a straight-line function",
-            ))
-            continue
         outputs = function_outputs[name]
         parameters = [
             *(f"ptr %arg.{index}" for index in range(len(function.args))),
             *(f"ptr %out.{index}" for index in range(len(outputs))),
         ]
-        body: list[str] = ["entry:"]
+        body: list[str] = []
+        entry_allocas: list[str] = []
         pointers: dict[int, str] = {
             int(value.id): f"%arg.{index}"
             for index, value in enumerate(function.args)
@@ -501,7 +497,7 @@ def _emit_repository_call_module(
             count = _value_element_count(value)
             register = f"%value.{value_id}"
             if value_id not in allocated:
-                body.append(
+                entry_allocas.append(
                     f"  {register} = alloca {llvm_type}, i64 {count}, align 8"
                 )
                 allocated.add(value_id)
@@ -530,7 +526,11 @@ def _emit_repository_call_module(
                 return converted
             return loaded
 
-        block = next(iter(function.blocks.values()))
+        scheduled_instructions = [
+            (block_name, instruction)
+            for block_name, block in function.blocks.items()
+            for instruction in block.instrs
+        ]
         projection_values: dict[int, dict[int, _Any]] = {}
         projection_addresses: dict[int, tuple[int, int]] = {}
         constant_values = {
@@ -539,10 +539,10 @@ def _emit_repository_call_module(
                 if projected.attributes.get("constant") is not None
                 else projected.attributes.get("value")
             )
-            for projected in block.instrs
+            for _block_name, projected in scheduled_instructions
             if projected.op == "Const" and projected.res is not None
         }
-        for projected in block.instrs:
+        for _block_name, projected in scheduled_instructions:
             if (
                 projected.op in {"GetElementPtr", "getelementptr"}
                 and projected.res is not None
@@ -565,7 +565,44 @@ def _emit_repository_call_module(
                 projection_values.setdefault(aggregate_id, {})[position] = (
                     projected.res
                 )
-        for instruction_index, instruction in enumerate(block.instrs):
+
+        def emit_return_values() -> None:
+            for output_index, output in enumerate(outputs):
+                source = pointers.get(int(output.id))
+                if source is None:
+                    tensor_table = getattr(module, "tensor_tables", {}).get(name)
+                    descriptor = (
+                        tensor_table.by_id(int(output.id))
+                        if tensor_table is not None else None
+                    )
+                    if descriptor is not None:
+                        source = pointers.get(int(descriptor.data_value_id))
+                destination = f"%out.{output_index}"
+                if source is None or source == destination:
+                    continue
+                llvm_type = _value_llvm_type(output)
+                count = _value_element_count(output)
+                if count == 1:
+                    loaded = f"%return.load.{output_index}.{len(body)}"
+                    body.append(
+                        f"  {loaded} = load {llvm_type}, ptr {source}, align 8"
+                    )
+                    body.append(
+                        f"  store {llvm_type} {loaded}, ptr {destination}, align 8"
+                    )
+                else:
+                    body.append(
+                        "  call void @llvm.memcpy.p0.p0.i64("
+                        f"ptr {destination}, ptr {source}, i64 {count * 8}, i1 false)"
+                    )
+        active_block: str | None = None
+        emitted_return = False
+        for instruction_index, (block_name, instruction) in enumerate(
+            scheduled_instructions
+        ):
+            if block_name != active_block:
+                body.append(f"{block_name}:")
+                active_block = block_name
             operation = str(instruction.op)
             result = instruction.res
             result_id = int(result.id) if result is not None else None
@@ -595,7 +632,71 @@ def _emit_repository_call_module(
                     )
                 continue
 
+            if operation in {"Phi", "phi"} and result is not None:
+                incoming_blocks = tuple(
+                    instruction.attributes.get("incoming_blocks") or ()
+                )
+                incoming = tuple(instruction.attributes.get("incoming") or ())
+                if incoming:
+                    incoming_blocks = tuple(str(item[0]) for item in incoming)
+                    incoming_values = tuple(item[1] for item in incoming)
+                else:
+                    incoming_values = tuple(instruction.args)
+                if len(incoming_blocks) != len(incoming_values):
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        "phi incoming blocks do not match incoming values",
+                    ))
+                    continue
+                register = f"%phi.{result_id}"
+                body.append(
+                    f"  {register} = phi ptr "
+                    + ", ".join(
+                        f"[ {pointer(value)}, %{predecessor} ]"
+                        for predecessor, value in zip(
+                            incoming_blocks, incoming_values
+                        )
+                    )
+                )
+                pointers[result_id] = register
+                continue
+
+            if operation in {"Br", "br"}:
+                target = str(instruction.attributes.get("target") or "")
+                if target not in function.blocks:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation, f"unknown branch target {target!r}",
+                    ))
+                    continue
+                body.append(f"  br label %{target}")
+                continue
+
+            if operation in {"CondBr", "condbr"} and instruction.args:
+                true_target = str(
+                    instruction.attributes.get("true")
+                    or instruction.attributes.get("true_target")
+                    or ""
+                )
+                false_target = str(
+                    instruction.attributes.get("false")
+                    or instruction.attributes.get("false_target")
+                    or ""
+                )
+                if true_target not in function.blocks or false_target not in function.blocks:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation, "conditional branch has an unknown target",
+                    ))
+                    continue
+                condition = load_as(instruction.args[0], "i1", f"{tag}.condition")
+                body.append(
+                    f"  br i1 {condition}, label %{true_target}, label %{false_target}"
+                )
+                continue
+
             if operation in {"Ret", "ret", "Return", "return"}:
+                emit_return_values()
+                body.append("  ret void")
+                emitted_return = True
                 continue
 
             if operation in _SHAPE_ONLY and result is not None and instruction.args:
@@ -788,14 +889,61 @@ def _emit_repository_call_module(
 
             template = scalar_likeness(operation)
             if template is not None and result is not None:
+                result_type = _value_llvm_type(result)
+                operand_type = (
+                    _value_llvm_type(instruction.args[0])
+                    if instruction.args else result_type
+                )
                 operands = [
-                    load_as(argument, "double", f"{tag}.{position}")
+                    load_as(argument, operand_type, f"{tag}.{position}")
                     for position, argument in enumerate(instruction.args)
                 ]
                 register = f"%scalar.{tag}"
-                for rendered_line in template.format(*operands, out=register).splitlines():
-                    body.append(f"  {rendered_line}")
-                result_type = "i1" if operation in {"Eq", "Ne", "Lt", "Le", "Gt", "Ge"} else "double"
+                if operand_type in {"i1", "i32", "i64"}:
+                    integer_binary = {
+                        "Add": "add", "Sub": "sub", "Mul": "mul",
+                        "Div": "sdiv", "Mod": "srem",
+                        "And": "and", "Or": "or", "Xor": "xor",
+                        "BitAnd": "and", "BitOr": "or", "BitXor": "xor",
+                        "Shl": "shl", "Shr": "lshr",
+                    }
+                    integer_comparison = {
+                        "Eq": "eq", "Ne": "ne", "Lt": "slt",
+                        "Le": "sle", "Gt": "sgt", "Ge": "sge",
+                        "ULt": "ult", "ULe": "ule",
+                    }
+                    if operation in integer_binary and len(operands) == 2:
+                        body.append(
+                            f"  {register} = {integer_binary[operation]} "
+                            f"{operand_type} {operands[0]}, {operands[1]}"
+                        )
+                    elif operation in integer_comparison and len(operands) == 2:
+                        body.append(
+                            f"  {register} = icmp {integer_comparison[operation]} "
+                            f"{operand_type} {operands[0]}, {operands[1]}"
+                        )
+                        result_type = "i1"
+                    elif operation == "Neg" and len(operands) == 1:
+                        body.append(
+                            f"  {register} = sub {operand_type} 0, {operands[0]}"
+                        )
+                    elif operation == "Not" and len(operands) == 1:
+                        body.append(
+                            f"  {register} = xor {operand_type} {operands[0]}, 1"
+                        )
+                    else:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, operation,
+                            f"integer scalar operation has no LLVM emission for {operand_type}",
+                        ))
+                        continue
+                else:
+                    for rendered_line in template.format(
+                        *operands, out=register
+                    ).splitlines():
+                        body.append(f"  {rendered_line}")
+                    if operation in {"Eq", "Ne", "Lt", "Le", "Gt", "Ge"}:
+                        result_type = "i1"
                 body.append(
                     f"  store {result_type} {register}, ptr {pointer(result)}, align 8"
                 )
@@ -810,30 +958,16 @@ def _emit_repository_call_module(
                 name, operation, "operation has no repository LLVM emission",
             ))
 
-        for output_index, output in enumerate(outputs):
-            source = pointers.get(int(output.id))
-            if source is None:
-                tensor_table = getattr(module, "tensor_tables", {}).get(name)
-                descriptor = (
-                    tensor_table.by_id(int(output.id))
-                    if tensor_table is not None else None
-                )
-                if descriptor is not None:
-                    source = pointers.get(int(descriptor.data_value_id))
-            destination = f"%out.{output_index}"
-            if source is None or source == destination:
-                continue
-            llvm_type = _value_llvm_type(output)
-            count = _value_element_count(output)
-            if count == 1:
-                loaded = f"%return.load.{output_index}"
-                body.append(f"  {loaded} = load {llvm_type}, ptr {source}, align 8")
-                body.append(f"  store {llvm_type} {loaded}, ptr {destination}, align 8")
-            else:
-                body.append(
-                    f"  call void @llvm.memcpy.p0.p0.i64(ptr {destination}, ptr {source}, i64 {count * 8}, i1 false)"
-                )
-        body.append("  ret void")
+        if not emitted_return:
+            emit_return_values()
+            body.append("  ret void")
+        if not any(line.endswith(":") for line in body):
+            body.insert(0, "entry:")
+        entry_label_index = next(
+            (index for index, line in enumerate(body) if line.endswith(":")),
+            0,
+        )
+        body[entry_label_index + 1:entry_label_index + 1] = entry_allocas
         emitted_functions.append("\n".join((
             f"define void @{internal_symbols[name]}({', '.join(parameters)}) {{",
             *body,
@@ -974,7 +1108,10 @@ def emit_ssa_function_to_llvm(
     repository_closure, _authored_leaves = _internal_call_closure(
         module, function_name
     )
-    if len(repository_closure) > 1:
+    if (
+        len(repository_closure) > 1
+        or len(module.functions[function_name].blocks) > 1
+    ):
         return _emit_repository_call_module(
             module,
             function_name,

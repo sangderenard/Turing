@@ -643,3 +643,76 @@ def test_counted_loop_adjoint_uses_saved_trip_count_and_descending_cfg():
     header_ops = [item.op for item in function.blocks["loop_header"].instrs]
     assert Handler.Gt.value in header_ops
     assert Handler.CondBr.value in header_ops
+
+
+def test_real_control_adjoint_cfg_compiles_and_runs_natively(tmp_path):
+    from src.compiler.control_source import (
+        ConditionalBlock,
+        ControlProgram,
+        LoopBlock,
+        SequenceBlock,
+        StatementBlock,
+    )
+    from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact,
+        emit_ssa_function_to_llvm,
+    )
+    from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr
+
+    forward = ControlProgram(
+        SequenceBlock((
+            ConditionalBlock(
+                predicate_value_id=50,
+                body=StatementBlock(("__scheduled_region_0__",)),
+                orelse=StatementBlock(("__scheduled_region_1__",)),
+            ),
+            LoopBlock(
+                induction="i",
+                start="0",
+                stop="6",
+                step="1",
+                body=StatementBlock(("__scheduled_region_2__",)),
+                recursion_region_id=7,
+            ),
+        )),
+        region_indices=(0, 1, 2),
+    )
+    adjoint = differentiate_control_program(
+        forward,
+        forward_to_backward_regions={0: 10, 1: 11, 2: 12},
+        loop_adjoint_contracts={7: LoopAdjointContract(90)},
+    )
+    region_names = {index: f"backward_region_{index}" for index in (10, 11, 12)}
+    control_function, shortfalls = lower_control_program_to_ssa(
+        adjoint.backward,
+        region_callees=region_names,
+        region_signatures={index: ((), ()) for index in region_names},
+    )
+    assert shortfalls == ()
+    region_functions = {
+        name: Function(
+            name, [], {"entry": BasicBlock("entry", [Instr("Ret", [], None)])},
+        )
+        for name in region_names.values()
+    }
+    module = IRModule({control_function.name: control_function, **region_functions})
+    artifact = emit_ssa_function_to_llvm(
+        module, control_function.name, entry_name="native_control_adjoint",
+    )
+    assert artifact.shortfalls == ()
+    native = compile_artifact(artifact, directory=tmp_path / "native_control")
+    values = {
+        50: ctypes.c_bool(True),
+        90: ctypes.c_int32(6),
+    }
+    buffers = (ctypes.c_void_p * len(native.buffer_order))(*(
+        ctypes.cast(ctypes.pointer(values[value_id]), ctypes.c_void_p)
+        for value_id in native.buffer_order
+    ))
+    extents = (ctypes.c_int32 * len(native.extent_order))()
+    entry = native.entry()
+    entry(buffers, extents)
+    values[50].value = False
+    values[90].value = 3
+    entry(buffers, extents)
