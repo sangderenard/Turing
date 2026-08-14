@@ -28,10 +28,22 @@ is attached to its call and receipts are stored in
 provenance, rule, action, and parameters.
 
 During Python ProcessGraph ingestion the same receipt is materialized on the
-individual call node before its first live evolution event. Known supported
-spellings become existing canonical operators (`print` becomes
-`stream_publish`; scalar casts retain their canonical names). Other choices
-remain call-shaped so their authored argument dataflow is preserved, with
+individual call node before its first live evolution event. Resolved identities
+are then interpreted by `python_identity_programs.py`. Each replacement is
+explicitly one of four kinds:
+
+- `operator`: one canonical operator, such as `math.sqrt` -> `sqrt`,
+  `random.gauss` -> stateful `random_source`, or `print` -> `stream_publish`;
+- `program`: a short graph sequence, such as `len(x)` -> `shape(x)[0]`;
+- `object`: compiler-owned state or schema meaning, such as a range domain,
+  stable object identity, OOP `super` dispatch, or PRNG state;
+- `compile_time`: provenance/logging metadata with no runtime operation.
+
+Direct operators are materialized immediately and retain their authored
+argument edges. Programs and objects remain call-shaped with their complete
+declarative replacement attached for the sequence/OOP lowering passes. Other
+choices also remain call-shaped so their authored argument dataflow is
+preserved, with
 `extraction_action`, `extraction_identity`, `extraction_rule`, and the complete
 receipt in node attributes. This is terminal for recursive implementation
 pursuit, not terminal for evaluation of the call's arguments. Declared

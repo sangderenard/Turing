@@ -56,7 +56,30 @@ rules:
   - id: control-and-scalar-builtins
     match:
       module: builtins
-      qualname: [range, len, enumerate, zip, int, float, bool, min, max, abs]
+      qualname:
+        - range
+        - len
+        - enumerate
+        - zip
+        - int
+        - float
+        - bool
+        - min
+        - max
+        - abs
+        - sum
+        - all
+        - any
+        - id
+        - getattr
+        - setattr
+        - hasattr
+        - isinstance
+        - type
+        - callable
+        - super
+        - list
+        - tuple
     action: intrinsic
     parameters:
       lowering_namespace: python_language

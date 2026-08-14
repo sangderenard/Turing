@@ -222,10 +222,37 @@ def test_print_host_boundary_uses_existing_stream_operator():
         parent_include=contract,
     )
 
-    _, call = _call_nodes(graph)[0]
+    call_id, call = _call_nodes(graph)[0]
     assert call["type"] == "stream_publish"
     assert call["attributes"]["extraction_action"] == "python_host_call"
     assert call["attributes"]["extraction_identity"] == "builtins.print"
+    assert graph.G.in_degree(call_id) == 1
+
+
+def test_nested_identity_replacements_retain_authored_dataflow():
+    contract = ExtractionContract(CONTRACT)
+    graph = ProcessGraph(materialize_memory=False)
+    graph.build_from_ast(
+        "def kernel(loss):\n    print(float(loss))\n",
+        resolve_unresolved_parents=True,
+        pursuit_roots=("kernel",),
+        parent_include=contract,
+    )
+
+    calls = {
+        data["attributes"]["extraction_identity"]: (node_id, data)
+        for node_id, data in _call_nodes(graph)
+    }
+    publish_id, publish = calls["builtins.print"]
+    cast_id, cast = calls["builtins.float"]
+
+    assert publish["type"] == "stream_publish"
+    assert cast["type"] == "float"
+    assert graph.G.has_edge(cast_id, publish_id)
+    assert graph.G.in_degree(publish_id) == 1
+    assert graph.G.in_degree(cast_id) == 1
+    assert publish["attributes"]["python_replacement_kind"] == "operator"
+    assert cast["attributes"]["python_replacement_kind"] == "operator"
 
 
 @pytest.mark.parametrize("action", ["ingest_python", "decompile_machine"])

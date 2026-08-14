@@ -12,9 +12,9 @@ import ast
 from typing import Any, Mapping
 
 from .node_special_cases import SpecialCase
+from .python_identity_programs import resolve_python_identity
 
 
-_CAST_BUILTINS = frozenset({"float", "int", "bool", "str", "len"})
 _EXTRACTION_ACTIONS = frozenset({
     "ingest_python",
     "intrinsic",
@@ -76,26 +76,31 @@ def interpret_python_special_case(node: Any) -> SpecialCase | None:
     receipt = extraction_receipt(node)
     attributes = _receipt_attributes(receipt) if receipt is not None else {}
     spelling = _call_spelling(node)
+    identity = receipt.get("identity") if receipt is not None else None
+    program = resolve_python_identity(identity)
+    if program is not None:
+        attributes.update({
+            "python_identity_program": program.mapping(),
+            "python_replacement_kind": program.kind,
+        })
+        operator = program.direct_operator
+        if operator is not None:
+            attributes.update(program.direct_attributes)
+            attributes["argument_count"] = len(node.args)
+            return SpecialCase(operator, attributes, None, terminal=False)
 
-    if spelling == "print" and (
-        receipt is None or receipt["action"] == "python_host_call"
-    ):
+    # Preserve the pre-contract convenience behavior for isolated structural
+    # ingestion. Governed compilation always selects by resolved identity.
+    if receipt is None and spelling in {"float", "int", "bool"}:
+        return SpecialCase(
+            spelling, {"cast": spelling}, None, terminal=False,
+        )
+    if receipt is None and spelling == "print":
         return SpecialCase(
             "stream_publish",
-            {
-                **attributes,
-                "stream": "text",
-                "argument_count": len(node.args),
-            },
+            {"stream": "text", "argument_count": len(node.args)},
             None,
-        )
-    if spelling in _CAST_BUILTINS and (
-        receipt is None or receipt["action"] == "intrinsic"
-    ):
-        return SpecialCase(
-            spelling,
-            {**attributes, "cast": spelling},
-            None,
+            terminal=False,
         )
 
     if receipt is None:
