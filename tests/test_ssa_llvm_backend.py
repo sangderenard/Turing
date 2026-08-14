@@ -26,6 +26,7 @@ from src.compiler.precompile_to_ssa import lower_precompile_and_control_to_ssa
 from src.compiler.ssa_llvm_backend import (
     compile_artifact,
     emit_ssa_function_to_llvm,
+    with_native_sgd_loop,
 )
 from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
 
@@ -127,6 +128,54 @@ def test_descending_loop_phi_executes_natively(tmp_path):
     buffers, pointers, extents = _native_scalar_buffers(native, {0: 7})
     native.entry()(pointers, extents)
     assert buffers[3].value == 0
+
+
+def test_native_sgd_wrapper_repeats_motion_and_updates_parameter(tmp_path):
+    parameter = SSAValue(0, "float64")
+    target = SSAValue(1, "float64")
+    gradient = SSAValue(2, "float64")
+    loss = SSAValue(3, "float64")
+    function = Function("scalar_training_motion", [parameter, target], {
+        "entry": BasicBlock("entry", [
+            Instr("Sub", [parameter, target], gradient),
+            Instr("Mul", [gradient, gradient], loss),
+            Instr("Ret", [loss, gradient], None),
+        ]),
+    })
+    motion = emit_ssa_function_to_llvm(
+        IRModule({function.name: function}), function.name,
+    )
+    assert motion.shortfalls == ()
+    loop = with_native_sgd_loop(
+        motion,
+        parameter_gradient_pairs=((parameter.id, gradient.id),),
+    )
+    native = compile_artifact(loop, directory=tmp_path / "native_sgd_loop")
+    values = {
+        parameter.id: ctypes.c_double(4.0),
+        target.id: ctypes.c_double(1.0),
+        gradient.id: ctypes.c_double(0.0),
+        loss.id: ctypes.c_double(0.0),
+        native.training_steps_value_id: ctypes.c_int32(6),
+        native.learning_rate_value_id: ctypes.c_double(0.25),
+    }
+    pointers = (ctypes.c_void_p * len(native.buffer_order))(*(
+        ctypes.cast(ctypes.pointer(values[value_id]), ctypes.c_void_p)
+        for value_id in native.buffer_order
+    ))
+    extents = (ctypes.c_int32 * len(native.extent_order))()
+
+    native.entry()(pointers, extents)
+
+    assert values[parameter.id].value == pytest.approx(
+        1.0 + 3.0 * (0.75 ** 6)
+    )
+    assert values[gradient.id].value == pytest.approx(3.0 * (0.75 ** 5))
+    assert values[loss.id].value == pytest.approx((3.0 * (0.75 ** 5)) ** 2)
+    settled = values[parameter.id].value
+    values[native.training_steps_value_id].value = 0
+    native.entry()(pointers, extents)
+    assert values[parameter.id].value == settled
 
 EXAMPLE = (
     Path(__file__).resolve().parents[1]

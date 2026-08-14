@@ -1066,6 +1066,8 @@ class LLVMFunctionArtifact:
     shortfalls: tuple[LLVMEmissionShortfall, ...]
     needs_text_sink: bool = False
     library_path: _Path | None = None
+    training_steps_value_id: int | None = None
+    learning_rate_value_id: int | None = None
     _entry: _Any = _field(default=None, repr=False)
 
     @property
@@ -1085,6 +1087,160 @@ class LLVMFunctionArtifact:
             ]
             self._entry = function
         return self._entry
+
+
+def with_native_sgd_loop(
+    artifact: LLVMFunctionArtifact,
+    *,
+    parameter_gradient_pairs: _Any,
+    entry_name: str | None = None,
+) -> LLVMFunctionArtifact:
+    """Wrap one native motion in a repeated in-process SGD update loop.
+
+    The wrapped motion remains the compiled forward/loss/backward authority.
+    This adds only the outer iteration and parameter update. Step count and
+    learning rate are ordinary caller-owned ABI buffers, so the loop performs
+    no Python callback and can be invoked repeatedly with new controls.
+    """
+
+    if artifact.shortfalls:
+        raise ValueError("cannot wrap an incomplete LLVM artifact")
+    if artifact.library_path is not None:
+        raise ValueError("wrap the LLVM artifact before native compilation")
+    pairs = tuple((int(parameter), int(gradient)) for parameter, gradient in (
+        parameter_gradient_pairs or ()
+    ))
+    if not pairs:
+        raise ValueError("native SGD loop requires parameter/gradient pairs")
+    positions = {
+        int(value_id): index
+        for index, value_id in enumerate(artifact.buffer_order)
+    }
+    shapes = {
+        int(value_id): tuple(shape or ())
+        for value_id, shape in zip(artifact.buffer_order, artifact.buffer_shapes)
+    }
+    parameter_counts: dict[int, int] = {}
+    for parameter, gradient in pairs:
+        if parameter not in positions or gradient not in positions:
+            raise ValueError(
+                f"parameter/gradient pair ({parameter}, {gradient}) is not public"
+            )
+        if shapes[parameter] != shapes[gradient]:
+            raise ValueError(
+                f"parameter {parameter} shape {shapes[parameter]!r} does not "
+                f"match gradient {gradient} shape {shapes[gradient]!r}"
+            )
+        count_value = 1
+        try:
+            for extent in shapes[parameter]:
+                count_value *= int(extent)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "native SGD loop requires static parameter shapes"
+            ) from error
+        parameter_counts[parameter] = max(1, count_value)
+
+    occupied = set(positions)
+    steps_id = min((*occupied, 0)) - 1
+    while steps_id in occupied:
+        steps_id -= 1
+    learning_rate_id = steps_id - 1
+    while learning_rate_id in occupied:
+        learning_rate_id -= 1
+    steps_slot = len(artifact.buffer_order)
+    learning_rate_slot = steps_slot + 1
+    original_name = str(artifact.name)
+    selected_name = str(entry_name or original_name)
+    once_name = "__" + _re.sub(r"[^A-Za-z0-9_$.-]", "_", selected_name) + "_motion_once"
+    definition = _re.compile(
+        r"define\s+void\s+@" + _re.escape(original_name)
+        + r"\(ptr %buffers, ptr %extents\)\s*\{"
+    )
+    renamed, count = definition.subn(
+        f"define internal void @{once_name}(ptr %buffers, ptr %extents) {{",
+        artifact.llvm_ir,
+        count=1,
+    )
+    if count != 1:
+        raise ValueError(
+            f"LLVM artifact has no unique public entry @{original_name}"
+        )
+
+    lines = [
+        f"define void @{selected_name}(ptr %buffers, ptr %extents) {{",
+        "entry:",
+        f"  %steps.addr = getelementptr ptr, ptr %buffers, i64 {steps_slot}",
+        "  %steps.ptr = load ptr, ptr %steps.addr, align 8",
+        "  %steps = load i32, ptr %steps.ptr, align 4",
+        f"  %lr.addr = getelementptr ptr, ptr %buffers, i64 {learning_rate_slot}",
+        "  %lr.ptr = load ptr, ptr %lr.addr, align 8",
+        "  %lr = load double, ptr %lr.ptr, align 8",
+    ]
+    for pair_index, (parameter, gradient) in enumerate(pairs):
+        lines.extend((
+            f"  %parameter.addr.{pair_index} = getelementptr ptr, ptr %buffers, i64 {positions[parameter]}",
+            f"  %parameter.ptr.{pair_index} = load ptr, ptr %parameter.addr.{pair_index}, align 8",
+            f"  %gradient.addr.{pair_index} = getelementptr ptr, ptr %buffers, i64 {positions[gradient]}",
+            f"  %gradient.ptr.{pair_index} = load ptr, ptr %gradient.addr.{pair_index}, align 8",
+        ))
+    lines.extend((
+        "  br label %training.header",
+        "training.header:",
+        "  %training.iteration = phi i32 [ 0, %entry ], [ %training.next, %training.latch ]",
+        "  %training.active = icmp slt i32 %training.iteration, %steps",
+        "  br i1 %training.active, label %training.motion, label %training.exit",
+        "training.motion:",
+        f"  call void @{once_name}(ptr %buffers, ptr %extents)",
+        "  br label %update.0.header",
+    ))
+    for pair_index, (parameter, _gradient) in enumerate(pairs):
+        count_value = parameter_counts[parameter]
+        next_header = (
+            f"update.{pair_index + 1}.header"
+            if pair_index + 1 < len(pairs) else "training.latch"
+        )
+        lines.extend((
+            f"update.{pair_index}.header:",
+            f"  %update.index.{pair_index} = phi i64 [ 0, %training.motion ], "
+            f"[ %update.next.{pair_index}, %update.{pair_index}.body ]"
+            if pair_index == 0 else
+            f"  %update.index.{pair_index} = phi i64 [ 0, %update.{pair_index - 1}.exit ], "
+            f"[ %update.next.{pair_index}, %update.{pair_index}.body ]",
+            f"  %update.active.{pair_index} = icmp ult i64 %update.index.{pair_index}, {count_value}",
+            f"  br i1 %update.active.{pair_index}, label %update.{pair_index}.body, label %update.{pair_index}.exit",
+            f"update.{pair_index}.body:",
+            f"  %parameter.element.{pair_index} = getelementptr double, ptr %parameter.ptr.{pair_index}, i64 %update.index.{pair_index}",
+            f"  %gradient.element.{pair_index} = getelementptr double, ptr %gradient.ptr.{pair_index}, i64 %update.index.{pair_index}",
+            f"  %parameter.value.{pair_index} = load double, ptr %parameter.element.{pair_index}, align 8",
+            f"  %gradient.value.{pair_index} = load double, ptr %gradient.element.{pair_index}, align 8",
+            f"  %scaled.gradient.{pair_index} = fmul double %lr, %gradient.value.{pair_index}",
+            f"  %updated.parameter.{pair_index} = fsub double %parameter.value.{pair_index}, %scaled.gradient.{pair_index}",
+            f"  store double %updated.parameter.{pair_index}, ptr %parameter.element.{pair_index}, align 8",
+            f"  %update.next.{pair_index} = add i64 %update.index.{pair_index}, 1",
+            f"  br label %update.{pair_index}.header",
+            f"update.{pair_index}.exit:",
+            f"  br label %{next_header}",
+        ))
+    lines.extend((
+        "training.latch:",
+        "  %training.next = add i32 %training.iteration, 1",
+        "  br label %training.header",
+        "training.exit:",
+        "  ret void",
+        "}",
+    ))
+    return LLVMFunctionArtifact(
+        name=selected_name,
+        llvm_ir=renamed.rstrip() + "\n\n" + "\n".join(lines) + "\n",
+        buffer_order=(*artifact.buffer_order, steps_id, learning_rate_id),
+        buffer_shapes=(*artifact.buffer_shapes, (), ()),
+        extent_order=artifact.extent_order,
+        shortfalls=(),
+        needs_text_sink=artifact.needs_text_sink,
+        training_steps_value_id=steps_id,
+        learning_rate_value_id=learning_rate_id,
+    )
 
 
 def emit_ssa_function_to_llvm(
@@ -1180,6 +1336,20 @@ def emit_ssa_function_to_llvm(
         if wanted == "i32" and kind == "double" and not rendering.startswith("%"):
             return str(int(float.fromhex(rendering)))
         return None
+
+    # Scalar public arguments are ordinary resident buffers just like tensor
+    # arguments. Load them once at entry so scalar SSA can use the same
+    # likeness table instead of requiring a Python-side scalar evaluator.
+    for argument in function.args:
+        if tuple(argument.shape or ()):
+            continue
+        llvm_type = _value_llvm_type(argument)
+        argument_pointer = buffer(int(argument.id))
+        register = f"%argument.{int(argument.id)}"
+        lines.append(
+            f"  {register} = load {llvm_type}, ptr {argument_pointer}, align 8"
+        )
+        scalars[int(argument.id)] = (register, llvm_type)
 
     for block in function.blocks.values():
         for instruction in block.instrs:
