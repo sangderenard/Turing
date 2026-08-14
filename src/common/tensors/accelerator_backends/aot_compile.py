@@ -95,8 +95,10 @@ two forms are the same computation.
 
 import ast
 import contextlib
+import hashlib
 import inspect
 import io
+import os
 import traceback
 import types
 from pathlib import Path
@@ -519,6 +521,8 @@ def prepare_aot_checkpoint_store(
     python_bindings: Mapping[str, Any] | None = None,
     tensor_code_references: Mapping[str, Callable[..., Any]] | None = None,
     runtime_closure_only: bool = False,
+    boundary_namespace_fingerprint: str = "",
+    source_language: str = "python",
     checkpoint: bool | str | Path = False,
 ) -> tuple[Any, str, str, str, str, Mapping[str, Any]]:
     """Build the checkpoint store and phase digests ``compile_ast_aot`` resumes
@@ -542,9 +546,12 @@ def prepare_aot_checkpoint_store(
     )
     constant_map = dict(constant_map or {})
     mutable_parameters = tuple(dict.fromkeys(map(str, mutable_parameters)))
+    from ....transmogrifier.graph.boundary_namespace import BoundaryNamespace
 
     frontend_implementation = callable_digest(
         ProcessGraph.build_from_ast,
+        BoundaryNamespace.resolve,
+        BoundaryNamespace.rules_for_scope,
         reduce_abstract_tensor_topology,
         _normalize_lexical_values,
         propagate_bound_planner_specializations,
@@ -553,6 +560,7 @@ def prepare_aot_checkpoint_store(
     )
     source_graph_implementation = callable_digest(
         ProcessGraph.build_from_ast,
+        BoundaryNamespace.resolve,
         _apply_parameter_constant_map,
     )
     checkpoint_feeds = {
@@ -601,6 +609,8 @@ def prepare_aot_checkpoint_store(
             "mutable_parameters": mutable_parameters,
             "retain": retain,
             "runtime_closure_only": bool(runtime_closure_only),
+            "boundary_namespace_fingerprint": str(boundary_namespace_fingerprint),
+            "source_language": str(source_language),
             "python_binding_sources": callable_digest(*binding_values),
             "tensor_code_reference_sources": callable_digest(
                 *tensor_reference_values
@@ -643,6 +653,9 @@ def compile_ast_aot(
     require_planned_shells: bool = False,
     runtime_closure_only: bool = False,
     project_captured_hierarchy: bool = True,
+    boundary_namespace: Any = None,
+    source_language: str = "python",
+    extraction_contract: Any = None,
 ) -> AOTCompilation:
     """Compile ``entrypoint`` in ``source`` ahead-of-time and execute it once.
 
@@ -705,6 +718,36 @@ def compile_ast_aot(
     expanded_python_bindings = _expand_python_static_bindings(
         python_bindings
     )
+    boundary_resolver = boundary_namespace
+    if boundary_resolver is not None:
+        from ....transmogrifier.graph.boundary_namespace import BoundaryNamespace
+        if isinstance(boundary_resolver, (str, os.PathLike)):
+            boundary_resolver = BoundaryNamespace(
+                boundary_resolver, language=source_language,
+            )
+        elif not hasattr(boundary_resolver, "fingerprint"):
+            raise TypeError(
+                "boundary_namespace must be a path or BoundaryNamespace"
+            )
+    boundary_fingerprint = (
+        "" if boundary_resolver is None else boundary_resolver.fingerprint()
+    )
+    extraction_policy = extraction_contract
+    if extraction_policy is not None:
+        from ....compiler.extraction_contract import ExtractionContract
+        if isinstance(extraction_policy, (str, os.PathLike)):
+            extraction_policy = ExtractionContract(extraction_policy)
+        elif not hasattr(extraction_policy, "decide"):
+            raise TypeError(
+                "extraction_contract must be a path or ExtractionContract"
+            )
+        boundary_fingerprint = hashlib.sha256(
+            (
+                boundary_fingerprint
+                + "\0extraction-contract\0"
+                + str(extraction_policy.fingerprint)
+            ).encode("utf-8")
+        ).hexdigest()
 
     (
         checkpoint_store,
@@ -728,6 +771,8 @@ def compile_ast_aot(
         python_bindings=python_bindings,
         tensor_code_references=tensor_code_references,
         runtime_closure_only=runtime_closure_only,
+        boundary_namespace_fingerprint=boundary_fingerprint,
+        source_language=source_language,
         checkpoint=checkpoint,
     )
     # A compiled plan contains the frontend's resolved call identities and
@@ -930,7 +975,11 @@ def compile_ast_aot(
     # its own moments ago for telemetry/summarize_process_graph. They are
     # not the same object and this does not reuse that work; real, currently
     # unavoidable duplicate compute, not just an unlogged phase.
-        graph = ProcessGraph(materialize_memory=False)
+        graph = ProcessGraph(
+            materialize_memory=False,
+            boundary_namespace=boundary_resolver,
+            source_language=source_language,
+        )
     # AOT compilation may target a function from a live module.  Its resolved
     # globals are static closure values, not runtime tensor feeds.  Capturing
     # them here lets the reducer retain computed constants and imported
@@ -951,7 +1000,11 @@ def compile_ast_aot(
             graph.build_from_ast(
                 module,
                 resolve_unresolved_parents=True,
-                parent_include=_source_dependency_is_not_tensor_primitive,
+                parent_include=(
+                    extraction_policy
+                    if extraction_policy is not None
+                    else _source_dependency_is_not_tensor_primitive
+                ),
                 pursuit_roots=(
                     tuple(dict.fromkeys((*targets, *dependency_seeds)))
                     if runtime_closure_only else None

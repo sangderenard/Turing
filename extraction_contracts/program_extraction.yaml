@@ -1,0 +1,105 @@
+version: 1
+mode: exhaustive
+
+# Paths are relative to this sheet. First matching root/rule wins.
+roots:
+  authored:
+    - ../examples
+  repository:
+    - ..
+
+# Every callable must land in exactly one class, and every class has a choice.
+# No implicit "inspect it and see" fallback exists.
+defaults:
+  authored_python:
+    action: ingest_python
+    parameters: {follow_reachable_calls: true}
+  repository_python:
+    action: ingest_python
+    parameters: {follow_reachable_calls: true}
+  third_party_python:
+    action: python_host_call
+    parameters: {execution: existing_interpreter, callbacks: reject}
+  stdlib_python:
+    action: python_host_call
+    parameters: {execution: existing_interpreter, callbacks: reject}
+  builtin:
+    action: intrinsic
+    parameters: {lowering_namespace: cpython_semantics}
+  native_extension:
+    action: use_native
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject}
+  dynamic_library:
+    action: use_native
+    parameters: {loader: operating_system, symbol_resolution: in_place, callbacks: reject}
+  unknown:
+    action: reject
+    parameters: {reason: provenance_not_declared}
+
+rules:
+  - id: authored-abstract-nn-is-real-program
+    match:
+      module: src.common.tensors.abstract_nn*
+    action: ingest_python
+    parameters:
+      follow_reachable_calls: true
+      include_classes: true
+      include_nested_methods: reachable
+
+  - id: abstract-tensor-vocabulary-is-intrinsic
+    match:
+      identity: src.common.tensors.abstraction.AbstractTensor.*
+    action: intrinsic
+    parameters:
+      lowering_namespace: abstract_tensor
+
+  - id: control-and-scalar-builtins
+    match:
+      module: builtins
+      qualname: [range, len, enumerate, zip, int, float, bool, min, max, abs]
+    action: intrinsic
+    parameters:
+      lowering_namespace: python_language
+
+  - id: print-is-an-output-port
+    match: {module: builtins, qualname: print}
+    action: python_host_call
+    parameters:
+      execution: system_port
+      port: stdout
+      callbacks: reject
+
+  - id: never-extract-cpython-bootstrap
+    match:
+      module: [importlib*, _frozen_importlib*, inspect, ast, dis, types]
+    action: reject
+    parameters: {reason: interpreter_implementation}
+
+  # Machine decompilation is forbidden unless an exact rule opts in. Example:
+  # - id: exact-vendor-kernel-decompile
+  #   match: {identity: vendor.kernel.entry, origin: "C:/vendor/kernel.dll"}
+  #   action: decompile_machine
+  #   parameters:
+  #     explicit_opt_in: true
+  #     architecture: amd64
+  #     dependency_policy: use_native
+  #     max_functions: 32
+
+limits:
+  python_source:
+    max_files: 4096
+    max_total_bytes: 67108864
+    max_definitions: 100000
+    max_work_items: 200000
+    max_dependency_depth: 512
+  machine_decompilation:
+    enabled_by_default: false
+    max_functions: 0
+    max_total_bytes: 0
+    max_dependency_depth: 0
+  native_use_in_place:
+    allow_callbacks: false
+    require_declared_abi: true
+  receipts:
+    record_every_identity: true
+    record_rule_parameters: true

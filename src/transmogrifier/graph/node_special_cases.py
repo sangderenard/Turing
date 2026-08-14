@@ -41,6 +41,10 @@ from ...common.tensors.operator_catalog import (
 # scale anyway, so anything below this element count is left untouched.
 _MIN_SPAN_ELEMENTS = 64
 
+# Builtin casts that are compiler vocabulary rather than foreign calls; the
+# spellings match what control lowering already handles.
+_CAST_BUILTINS = frozenset({"float", "int", "bool", "str", "len"})
+
 
 @dataclass(frozen=True)
 class SpecialCase:
@@ -186,6 +190,30 @@ def interpret_special_case(node: Any) -> Optional[SpecialCase]:
         getattr(node, "ctx", None), ast.Load
     ):
         return SpecialCase("GetAttr", {"attribute": node.attr}, None)
+
+    # ── AST builtin calls: publication and casts ─────────────────────────
+    # ``print`` is a publication, not a foreign call: it becomes a stream
+    # publish leaf whose payload is its arguments, which the planner lowers
+    # to a StreamPublishBlock (the backpressured text buffer) and every
+    # backend renders as its own publish.  Leaving it to fall through would
+    # make it a source-less external and drag the host runtime in.
+    #
+    # The casts are named here for the same reason: they are vocabulary, and
+    # control lowering already expects the canonical spellings.
+    if kind == "Call":
+        function = getattr(node, "func", None)
+        builtin = function.id if isinstance(function, ast.Name) else None
+        if builtin == "print":
+            return SpecialCase(
+                "stream_publish",
+                {
+                    "stream": "text",
+                    "argument_count": len(getattr(node, "args", ())),
+                },
+                None,
+            )
+        if builtin in _CAST_BUILTINS:
+            return SpecialCase(builtin, {"cast": builtin}, None)
 
     # ── (future cases go here) ───────────────────────────────────────────
     # e.g. SymPy ImmutableDenseMatrix of constants -> tensor_from_list,

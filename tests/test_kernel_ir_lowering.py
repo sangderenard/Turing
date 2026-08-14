@@ -142,3 +142,50 @@ def test_zero_element_count_is_refused():
     assert not program.complete
     assert any("element_count must be positive" in s.reason
                for s in program.shortfalls)
+
+
+def _sum_function(dtype="float32", extent=256):
+    """total = sum(values) -- a composite, not a Tier-0 instruction."""
+
+    source = SSAValue(0, dtype, (extent,))
+    total = SSAValue(1, dtype, ())
+    block = BasicBlock(
+        "entry",
+        [
+            Instr("sum", [source], total),
+            Instr("Ret", [], None),
+        ],
+    )
+    return Function("sum_kernel", [source], {"entry": block}), total
+
+
+def test_composites_are_named_tier1_shortfalls_not_invented_opcodes():
+    """A reduction is not one Tier-0 instruction and this lowering says so.
+
+    Tier-0 stays small (docs/TIERS.md): composites are DEFINED by Tier-1
+    recipes over Tier-0 on the nodus side, so the honest answer here is a
+    shortfall that names the composition family -- never a fabricated opcode
+    every emitter would then have to implement.
+    """
+
+    function, total = _sum_function()
+    program = lower_function_to_kernel_ir(function, [total], element_count=1)
+    assert not program.complete
+    assert any(
+        "not one Tier-0 KernelIR instruction" in s.reason
+        and "'reduce'" in s.reason
+        for s in program.shortfalls
+    )
+
+
+def test_contraction_names_its_own_family():
+    a = SSAValue(0, "float32", (16,))
+    b = SSAValue(1, "float32", (16,))
+    out = SSAValue(2, "float32", (16,))
+    block = BasicBlock(
+        "entry", [Instr("matmul", [a, b], out), Instr("Ret", [], None)],
+    )
+    function = Function("mm", [a, b], {"entry": block})
+    program = lower_function_to_kernel_ir(function, [out], element_count=1)
+    assert not program.complete
+    assert any("'contract'" in s.reason for s in program.shortfalls)

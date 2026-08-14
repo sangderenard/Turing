@@ -806,6 +806,9 @@ def extract_host_code_library(
     *,
     cache_directory: str | Path | None = None,
     dependency_provider: Callable[[str, Path], str | Path | None] | None = None,
+    max_functions: int | None = None,
+    max_total_bytes: int | None = None,
+    max_dependency_depth: int | None = None,
 ) -> CachedHostCodeLibrary | None:
     """Pursue the complete statically named PE dependency surface.
 
@@ -815,16 +818,28 @@ def extract_host_code_library(
     traversal or invoking the host loader.
     """
 
+    for name, limit in (
+        ("max_functions", max_functions),
+        ("max_total_bytes", max_total_bytes),
+        ("max_dependency_depth", max_dependency_depth),
+    ):
+        if limit is not None and int(limit) <= 0:
+            raise ValueError(f"{name} must be positive when supplied")
     root = extract_host_code_module(value, cache_directory=cache_directory)
     if root is None:
         return None
     provider = dependency_provider or _default_pe_dependency_path
     units: dict[str, CachedHostCodeModule] = {root.cache_key: root}
-    pending = [root]
+    pending = [(root, 0)]
     processed: set[str] = set()
     edges: list[HostCodeDependencyEdge] = []
+    counted_paths = {root.identity.module_path.resolve()}
+    try:
+        total_bytes = root.identity.module_path.stat().st_size
+    except OSError:
+        total_bytes = 0
     while pending:
-        source = pending.pop(0)
+        source, source_depth = pending.pop(0)
         if source.cache_key in processed:
             continue
         processed.add(source.cache_key)
@@ -891,6 +906,38 @@ def extract_host_code_library(
                 continue
             assert path is not None and exported is not None
             assert exported.rva is not None
+            next_depth = source_depth + 1
+            if (
+                max_dependency_depth is not None
+                and next_depth > int(max_dependency_depth)
+            ):
+                edges.append(HostCodeDependencyEdge(
+                    source.cache_key, external_identity, None,
+                    f"policy-depth-limit:{max_dependency_depth}", source_address,
+                ))
+                continue
+            if max_functions is not None and len(units) >= int(max_functions):
+                edges.append(HostCodeDependencyEdge(
+                    source.cache_key, external_identity, None,
+                    f"policy-function-limit:{max_functions}", source_address,
+                ))
+                continue
+            resolved_path = path.resolve()
+            added_bytes = 0
+            if resolved_path not in counted_paths:
+                try:
+                    added_bytes = resolved_path.stat().st_size
+                except OSError:
+                    added_bytes = 0
+            if (
+                max_total_bytes is not None
+                and total_bytes + added_bytes > int(max_total_bytes)
+            ):
+                edges.append(HostCodeDependencyEdge(
+                    source.cache_key, external_identity, None,
+                    f"policy-byte-limit:{max_total_bytes}", source_address,
+                ))
+                continue
             identity = HostCodeIdentity(
                 "pe-dependency", path, active_identity,
                 int(exported.rva), "windows-x64-pe-import",
@@ -899,6 +946,9 @@ def extract_host_code_library(
                 identity, cache_directory=cache_directory,
             )
             units.setdefault(target.cache_key, target)
+            if resolved_path not in counted_paths:
+                counted_paths.add(resolved_path)
+                total_bytes += added_bytes
             edges.append(HostCodeDependencyEdge(
                 source.cache_key, external_identity, target.cache_key,
                 (
@@ -910,7 +960,7 @@ def extract_host_code_library(
                 source_address,
             ))
             if target.cache_key not in processed:
-                pending.append(target)
+                pending.append((target, next_depth))
     return CachedHostCodeLibrary(
         root.cache_key, tuple(units.values()), tuple(edges),
     )

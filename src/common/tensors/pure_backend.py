@@ -509,20 +509,23 @@ class PurePythonTensorOperations(AbstractTensor):
             return [self.long_cast_(item) for item in tensor]
         return int(tensor)
 
-    def float_(self, tensor: Any) -> Any:
-        return self.to_dtype_(tensor, "float")
+    # The dtype casts are called receiver-style by abstraction_methods
+    # (``self.long_()``), so the tensor argument defaults to this instance's
+    # own data; an explicit tensor argument still casts that instead.
+    def float_(self, tensor: Any = None) -> Any:
+        return self.to_dtype_(self.data if tensor is None else tensor, "float")
 
-    def double_(self, tensor: Any) -> Any:
-        return self.to_dtype_(tensor, "double")
+    def double_(self, tensor: Any = None) -> Any:
+        return self.to_dtype_(self.data if tensor is None else tensor, "double")
 
-    def int_(self, tensor: Any) -> Any:
-        return self.to_dtype_(tensor, "int")
+    def int_(self, tensor: Any = None) -> Any:
+        return self.to_dtype_(self.data if tensor is None else tensor, "int")
 
-    def long_(self, tensor: Any) -> Any:
-        return self.to_dtype_(tensor, "long")
+    def long_(self, tensor: Any = None) -> Any:
+        return self.to_dtype_(self.data if tensor is None else tensor, "long")
 
-    def bool_(self, tensor: Any) -> Any:
-        return self.to_dtype_(tensor, "bool")
+    def bool_(self, tensor: Any = None) -> Any:
+        return self.to_dtype_(self.data if tensor is None else tensor, "bool")
 
     def not_equal_(self, value: Any) -> Any:
         value = value.data if isinstance(value, AbstractTensor) else value
@@ -1646,12 +1649,27 @@ class PurePythonTensorOperations(AbstractTensor):
     def logical_not_(self):
         return self._map_unary(lambda x: not x, self.data)
 
-    def to_dtype_(self, tensor, dtype: str = "float"):
+    _DTYPE_SPELLINGS = frozenset({
+        "float", "float32", "f32", "float64", "double", "f64",
+        "int", "int32", "i32", "int64", "long", "i64",
+        "uint8", "byte", "bool",
+    })
+
+    def to_dtype_(self, tensor=None, dtype: str = "float"):
+        # Two calling conventions exist in the wild: abstraction_methods call
+        # receiver-style (``self.to_dtype_("float")``), this backend's own
+        # cast methods pass explicit data (``self.to_dtype_(data, "long")``).
+        # A dtype spelling in the tensor slot is the receiver-style call.
+        if isinstance(tensor, str) and tensor in self._DTYPE_SPELLINGS:
+            tensor, dtype = self.data, tensor
+        elif tensor is None:
+            tensor = self.data
         # For pure Python, just convert all elements recursively
         def convert(val):
-            if dtype in ("float", "float32", "f32"):
+            if dtype in ("float", "float32", "f32", "float64", "double", "f64"):
                 return float(val)
-            elif dtype in ("int", "int32", "i32"):
+            elif dtype in ("int", "int32", "i32", "int64", "long", "i64",
+                           "uint8", "byte"):
                 return int(val)
             elif dtype in ("bool",):
                 return bool(val)

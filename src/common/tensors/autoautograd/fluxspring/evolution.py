@@ -86,6 +86,7 @@ class MultiNetworkFluxSpring:
         self.age = np.zeros(0, dtype=np.float32)
         self.psi = np.zeros(0, dtype=np.float32)
         self.edge_activation = np.zeros(0, dtype=np.float32)
+        self.visual_haze: dict[int, float] = {}
         self._network_order: dict[str, int] = {}
         self._known_handoffs: set[tuple[str, str]] = set()
         self._spec: FluxSpringSpec | None = None
@@ -170,6 +171,17 @@ class MultiNetworkFluxSpring:
         ).reshape(-1, 2)
         self.edge_activation = np.zeros(len(edges), dtype=np.float32)
         self._rebuild_spec()
+
+    def set_visual_haze(self, scores: dict[int, float]) -> None:
+        """Set an observer-owned ring value; never feed it into physics."""
+
+        self.visual_haze = {
+            int(index): max(-1.0, min(1.0, float(value)))
+            for index, value in scores.items()
+            if 0 <= int(index) < len(self.nodes)
+        }
+        if self._system is not None:
+            self._system.visual_haze = dict(self.visual_haze)
 
     def _rebuild_spec(self) -> None:
         node_specs = [
@@ -265,6 +277,7 @@ class MultiNetworkFluxSpring:
             gamma=0.91,
             dt=1.0 / 60.0,
         )
+        self._system.visual_haze = dict(self.visual_haze)
         for i, node in enumerate(self.nodes):
             anchor = AT.get_tensor([
                 self._network_order[node.network] * self.network_spacing,

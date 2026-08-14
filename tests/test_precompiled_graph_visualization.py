@@ -1,3 +1,4 @@
+import ast
 import threading
 
 import numpy as np
@@ -11,6 +12,7 @@ from src.rendering.precompiled_graph import (
 )
 from src.rendering.opengl_render.fluxspring_shader import load_fluxspring_graph_shaders
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
+from src.transmogrifier.graph.graph_express2 import _annotate_visual_source_owners
 from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
 
 
@@ -131,3 +133,24 @@ def test_reusable_surface_loads_the_original_fluxspring_demo_shader():
     assert "layout (location = 2) in float in_size" in vertex
     assert "gl_PointSize = in_size" in vertex
     assert "dot(p, p) > 1.0" in fragment
+
+
+def test_source_class_ownership_reaches_observer_node_metadata():
+    tree = ast.parse("""
+class LeakyLayer:
+    def forward(self, value):
+        return value + 1
+""")
+    _annotate_visual_source_owners(tree)
+    class_node = tree.body[0]
+    add_node = class_node.body[0].body[0].value
+    graph = ProcessGraph(materialize_memory=False)
+    class_id, _ = graph.ensure_node(class_node)
+    add_id, _ = graph.ensure_node(add_node)
+
+    assert graph.G.nodes[class_id]["source_class"] == "LeakyLayer"
+    assert graph.G.nodes[class_id]["source_scope"] == ("LeakyLayer",)
+    assert graph.G.nodes[add_id]["source_class"] == "LeakyLayer"
+    assert graph.G.nodes[add_id]["source_scope"] == (
+        "LeakyLayer", "forward"
+    )

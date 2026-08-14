@@ -5493,8 +5493,18 @@ def lower_precompile_and_control_to_ssa(
         for instruction in block.instrs
         if instruction.res is not None
     }
-    algorithm_import = import_llvm_to_repository_ssa(LLVM_SSA_MODULE)
-    functions = dict(algorithm_import.module.functions)
+    # One authority for the authored kernel algorithms: when a tensor code
+    # reference is supplied, its (cached) module IS the import -- a second
+    # independent import would mint different Function identities and collide
+    # at the tensor lowering's linker.
+    if tensor_ssa_reference is not None:
+        algorithm_functions = dict(tensor_ssa_reference.module.functions)
+        algorithm_shortfalls: tuple[Any, ...] = ()
+    else:
+        algorithm_import = import_llvm_to_repository_ssa(LLVM_SSA_MODULE)
+        algorithm_functions = dict(algorithm_import.module.functions)
+        algorithm_shortfalls = tuple(algorithm_import.shortfalls)
+    functions = dict(algorithm_functions)
     functions[numerical.name] = numerical
     region_callees: dict[int, str] = {}
     region_signatures: dict[
@@ -5654,7 +5664,7 @@ def lower_precompile_and_control_to_ssa(
                     f"{item.function}:{item.block}",
                     item.reason,
                 )
-                for item in algorithm_import.shortfalls
+                for item in algorithm_shortfalls
             ),
         )),
         tuple(cycles),

@@ -132,6 +132,38 @@ class EvolutionMetaGraph:
             subscriber(event)
         return event
 
+    def ingest_event(self, event: EvolutionEvent) -> None:
+        """Replay one authoritative event received from an isolated compiler.
+
+        The event keeps its compiler-assigned sequence. This is intentionally
+        narrower than `_publish`: it reconstructs just enough ledger state for
+        snapshots and subscribers without inventing a second mutation.
+        """
+
+        with self._lock:
+            if self._events and event.sequence <= self._events[-1].sequence:
+                raise ValueError(
+                    "external evolution events must arrive in increasing order"
+                )
+            if event.graph is not None:
+                self._graphs[event.graph.id] = event.graph
+            if (
+                event.component is not None
+                and event.kind in {"component-spawn", "component-update"}
+            ):
+                self._components[event.component] = EvolutionComponent(
+                    event.component,
+                    str(event.detail.get("label") or event.component.local_id),
+                    str(event.detail.get("kind") or "component"),
+                    dict(event.detail.get("attributes") or {}),
+                    event.detail.get("token_id"),
+                )
+            self._events.append(event)
+            self._next_sequence = max(self._next_sequence, event.sequence + 1)
+            subscribers = tuple(self._subscribers)
+        for subscriber in subscribers:
+            subscriber(event)
+
     def open_graph(self, stage: str, label: str = "") -> EvolutionGraphRef:
         with self._lock:
             graph_id = f"{stage}:{self._next_graph}"
@@ -194,7 +226,11 @@ class EvolutionMetaGraph:
             graph=graph,
             component=ref,
             sources=consumes,
-            detail={"label": record.label, "kind": record.kind},
+            detail={
+                "label": record.label,
+                "kind": record.kind,
+                "attributes": dict(record.attributes),
+            },
         )
         return ref
 

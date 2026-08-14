@@ -60,7 +60,11 @@ def _record_planned_process_graph(
             node_id,
             label=str(data.get("label") or data.get("op") or node_id),
             kind=str(data.get("type") or data.get("op") or "operation"),
-            attributes={"source_span": span},
+            attributes={
+                "source_span": span,
+                "source_scope": tuple(data.get("source_scope") or ()),
+                "source_class": data.get("source_class"),
+            },
             consumes=sources,
         )
         if sources:
@@ -87,6 +91,9 @@ def compile_source_autogenesis(
     *,
     final_target: str | None = "webgl",
     metagraph: EvolutionMetaGraph | None = None,
+    boundary_namespace: Any = None,
+    source_language: str = "python",
+    extraction_contract: Any = None,
 ) -> AutogenesisCompilation:
     """Compile once while recording exact cross-IR component lineage."""
 
@@ -94,19 +101,66 @@ def compile_source_autogenesis(
 
     warn_legacy_source_compiler("compile_source_autogenesis")
 
-    from ..common.tensors.accelerator_backends.aot_compile import compile_ast_aot
-    from .glsl_deployment_strategy import _walk_planned_shells
-    from .precompile_to_ssa import lower_precompile_and_control_to_ssa
-
     metagraph = metagraph or EvolutionMetaGraph()
+    run_graph = metagraph.open_graph(
+        "compiler-run", f"{source_language}:{entrypoint} live compile"
+    )
+    progress_ordinal = 0
+    previous_progress = metagraph.component(
+        run_graph,
+        progress_ordinal,
+        label="compile requested",
+        kind="compiler-phase",
+        attributes={
+            "source_scope": (entrypoint,),
+            "source_language": source_language,
+        },
+    )
+
+    def record_progress(message: str) -> None:
+        nonlocal progress_ordinal, previous_progress
+        progress_ordinal += 1
+        current = metagraph.component(
+            run_graph,
+            progress_ordinal,
+            label=str(message),
+            kind="compiler-phase",
+            attributes={
+                "source_scope": (entrypoint,),
+                "source_language": source_language,
+            },
+        )
+        metagraph.relationship(
+            run_graph,
+            previous_progress,
+            current,
+            role="phase-order",
+        )
+        previous_progress = current
+
+    record_progress("loading AOT compiler")
+    from ..common.tensors.accelerator_backends.aot_compile import compile_ast_aot
+    record_progress("loading deployment planner")
+    from .glsl_deployment_strategy import _walk_planned_shells
+    record_progress("loading SSA lowering")
+    from .precompile_to_ssa import lower_precompile_and_control_to_ssa
+    record_progress("AOT compile starting")
+
     region_evolution: dict[int, Any] = {}
     with record_evolution(metagraph):
-        aot = compile_ast_aot(
-            source,
-            entrypoint,
-            dict(feeds),
-            precompile_only=True,
-        )
+        try:
+            aot = compile_ast_aot(
+                source,
+                entrypoint,
+                dict(feeds),
+                precompile_only=True,
+                boundary_namespace=boundary_namespace,
+                source_language=source_language,
+                extraction_contract=extraction_contract,
+                progress=record_progress,
+            )
+        finally:
+            metagraph.close_graph(run_graph)
 
         # Region programs have already been remapped to their owning semantic
         # ProcessGraph value IDs. Record that exact correspondence before SSA

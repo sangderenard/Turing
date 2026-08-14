@@ -58,6 +58,13 @@ _EMITTED_OPCODES = (
     "AND", "OR", "XOR", "NOT",
 )
 
+# Composite operations (catalog class "opaque") are NOT Tier-0 KernelIR
+# instructions -- a reduction cannot be one instruction, which is why the
+# catalog records kernel_op=null and names a tier1_class instead. They are
+# DEFINED on the nodus side by Tier-1 recipes over Tier-0 primitives
+# (include/tier1_lowering.h), so this lowering reports them as named
+# shortfalls rather than inventing an opcode for them.
+
 
 class KernelIRLoweringError(ValueError):
     """Raised when the canonical catalog itself is missing or malformed."""
@@ -293,6 +300,18 @@ class _Lowering:
                 "the element-wise map of the scalar chain over storage "
                 "buffers",
             )
+        # Report a composite plainly before the element-wise frame's own
+        # premise (one element per argument) trips on its shaped input -- the
+        # composite is the real reason, and the more specific message is the
+        # useful one.
+        for instr in block.instrs:
+            if instr.op == "Ret":
+                continue
+            entry = self._by_name.get(instr.op) or self._by_handler.get(instr.op)
+            if entry is not None and not entry[1].get("lowerable", False):
+                self._lower_instr(instr, block.name)
+                return self._finish()
+
         for value in function.args:
             if value.shape:
                 return self._bail(
@@ -328,15 +347,25 @@ class _Lowering:
                 continue
             self._lower_instr(instr, block.name)
 
+        return self._emit_output_store(block.name)
+
+    def _emit_output_store(self, block: str) -> KernelIRProgram:
+        """Declare the output buffer and store the result at the global index.
+
+        Shared by both frames: the element-wise kernel stores one element per
+        invocation, and a whole-buffer reduction stores its single total from
+        the one invocation its element_count=1 dispatch runs.
+        """
+
         output = self.outputs[0]
         result = self._ssa_to_kernel.get(output.id)
         if result is None:
             self._shortfall(
-                f"%t{output.id}", block.name,
+                f"%t{output.id}", block,
                 "declared output was never defined by a lowered instruction",
             )
             return self._finish()
-        scalar = self._scalar_of(output, block.name)
+        scalar = self._scalar_of(output, block)
         if scalar is None:
             return self._finish()
         out_buffer = self._new_value(
@@ -344,6 +373,7 @@ class _Lowering:
         )
         self.buffer_ids.append(out_buffer)
         out_pointer = self._new_value(scalar, debug_name=f"t{output.id}_optr")
+        gid = KernelOperand.ref(GLOBAL_INDEX_VALUE)
         self.instrs.append(KernelInstruction(
             "ADDR", -1, (KernelOperand.ref(out_buffer), gid), (out_pointer,),
         ))
@@ -372,10 +402,17 @@ class _Lowering:
             return
         canonical_id, operation = entry
         if not operation.get("lowerable", False):
+            family = operation.get("tier1_class")
+            detail = (
+                f"it is a Tier-1 '{family}' composite, defined by a recipe over "
+                "Tier-0 primitives on the nodus side"
+                if family
+                else "it has no Tier-0 expression"
+            )
             self._shortfall(
                 instr.op, block,
-                f"canonical operation '{operation.get('name')}' is marked "
-                "non-lowerable in the catalog (must stay native)",
+                f"canonical operation '{operation.get('name')}' is not one "
+                f"Tier-0 KernelIR instruction: {detail}",
             )
             return
         kernel_op = operation.get("kernel_op")

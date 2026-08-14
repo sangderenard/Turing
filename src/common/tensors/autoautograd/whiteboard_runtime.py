@@ -459,7 +459,6 @@ def run_batched_vjp(
     with scope, _tape():
         view = NodeAttrView(sys.nodes, union_schema, indices=union_ids).build()
         x_all = view.tensor
-        print("x_all:", x_all)
         print("node_attrs:", node_attrs)
         print("indices:", union_ids)
 

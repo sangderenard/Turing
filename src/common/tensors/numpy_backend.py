@@ -484,23 +484,31 @@ class NumPyTensorOperations(AbstractTensor):
     def long_cast_(self, tensor):
         return self._AbstractTensor__unwrap(tensor).astype(np.int64)
 
+    # The dtype casts are called receiver-style by abstraction_methods
+    # (``self.long_()``); ``to_dtype_`` here already reads ``self.data``, so
+    # an explicit tensor argument casts that array with the same dtype map.
+    def _cast_(self, tensor, dtype: str):
+        if tensor is None:
+            return self.to_dtype_(dtype)
+        return np.asarray(self._AbstractTensor__unwrap(tensor)).astype(
+            {"float": np.float32, "double": np.float64, "int": np.int32,
+             "long": np.int64, "bool": np.bool_}[dtype]
+        )
+
     def float_(self, tensor=None):
-        if tensor is not None:
-            tensor.float()
-        else:
-            return self.to_dtype_("float")
+        return self._cast_(tensor, "float")
 
-    def double_(self, tensor):
-        return self.to_dtype_(tensor, "double")
+    def double_(self, tensor=None):
+        return self._cast_(tensor, "double")
 
-    def int_(self, tensor):
-        return self.to_dtype_(tensor, "int")
+    def int_(self, tensor=None):
+        return self._cast_(tensor, "int")
 
-    def long_(self, tensor):
-        return self.to_dtype_(tensor, "long")
+    def long_(self, tensor=None):
+        return self._cast_(tensor, "long")
 
-    def bool_(self, tensor):
-        return self.to_dtype_(tensor, "bool")
+    def bool_(self, tensor=None):
+        return self._cast_(tensor, "bool")
 
     def not_equal_(self, value):
         value = value.data if isinstance(value, AbstractTensor) else value

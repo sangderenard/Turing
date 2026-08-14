@@ -53,6 +53,11 @@ class Adam:
         out_params: List[AT] = []
         for p, g in zip(params, grads):
             key = id(p)
+            if g is None:
+                # allow_unused contract: a parameter the graph never reached
+                # gets no update and its moments do not advance.
+                out_params.append(p)
+                continue
             m = self.m[key]
             v = self.v[key]
             m = b1 * m + (1.0 - b1) * g

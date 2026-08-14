@@ -834,7 +834,32 @@ def compile_fortran_module_c_shell(
         ),
         encoding="utf-8",
     )
-    module.api.write(api_path)
+    # Pack runtime dependencies into the contract at compile time. The
+    # producer knows them here -- the compiler's own bin directory is where a
+    # gfortran-built library's support DLLs live -- and a consumer must never
+    # rediscover them by loader archaeology (nodus boundary error register,
+    # E15: a missing libgfortran presented as a silent LoadLibrary failure
+    # that mimicked an ABI bug).
+    api = module.api
+    runtime_dependencies = []
+    if os.name == "nt":
+        toolchain_bin = Path(compiler).parent
+        for dll_name in (
+            "libgfortran-5.dll",
+            "libquadmath-0.dll",
+            "libgcc_s_seh-1.dll",
+            "libwinpthread-1.dll",
+        ):
+            candidate = toolchain_bin / dll_name
+            if candidate.exists():
+                runtime_dependencies.append(
+                    {"name": dll_name, "path": candidate.as_posix()}
+                )
+    if runtime_dependencies:
+        metadata = dict(api.metadata)
+        metadata["runtime_dependencies"] = runtime_dependencies
+        api = replace(api, metadata=metadata)
+    api.write(api_path)
     state_path.write_bytes(bytes(state_bytes))
 
     if library:

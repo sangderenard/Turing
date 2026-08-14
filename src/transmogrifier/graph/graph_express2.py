@@ -110,6 +110,52 @@ SIMD_DEFAULT_CONCURRENCY = 4  # default concurrency for SIMD operations
 from collections.abc import Callable
 
 
+def _annotate_visual_source_owners(tree: ast.AST) -> None:
+    """Attach lexical provenance used only by observers and diagnostics.
+
+    The AST remains the compiler authority.  These annotations let optional
+    evolution observers attribute a later graph expansion to the source class
+    or function that owned the node without reconstructing lexical scope from
+    lossy graph edges.
+    """
+
+    class OwnerVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.scope: list[str] = []
+            self.classes: list[str] = []
+
+        def visit(self, node):
+            if isinstance(node, ast.AST):
+                node._turing_source_scope = tuple(self.scope)
+                node._turing_source_class = (
+                    self.classes[-1] if self.classes else None
+                )
+            return super().visit(node)
+
+        def visit_ClassDef(self, node: ast.ClassDef):
+            node._turing_source_scope = tuple((*self.scope, node.name))
+            node._turing_source_class = node.name
+            self.scope.append(node.name)
+            self.classes.append(node.name)
+            self.generic_visit(node)
+            self.classes.pop()
+            self.scope.pop()
+
+        def _visit_function(self, node):
+            node._turing_source_scope = tuple((*self.scope, node.name))
+            node._turing_source_class = (
+                self.classes[-1] if self.classes else None
+            )
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+
+        visit_FunctionDef = _visit_function
+        visit_AsyncFunctionDef = _visit_function
+
+    OwnerVisitor().visit(tree)
+
+
 @dataclass(frozen=True)
 class _ASTReferenceAlternatives:
     """Compile-time-only alternatives for conservative source lookup."""
@@ -582,6 +628,9 @@ def _class_schema_from_ast(definition):
             "name": method.name,
             "graph_identity": f"{definition.name}.{method.name}",
             "ast_node_id": id(method),
+            "parameters": tuple(
+                argument.arg for argument in method.args.args
+            ),
             "permissions": (),
         } for method in methods),
     }
@@ -1295,6 +1344,16 @@ def _expand_unresolved_ast_parents(
     binding_revisions = {}
     processed_revisions = {}
     work_items = 0
+    contract_source_limits = (
+        dict(getattr(include, "limits", {}).get("python_source") or {})
+        if include is not None else {}
+    )
+    max_work_items = int(contract_source_limits.get("max_work_items", 0))
+    max_dependency_depth = int(
+        contract_source_limits.get("max_dependency_depth", 0)
+    )
+    call_depths = {id(call): 0 for call in pending_calls}
+    definition_depths = {id(definition): 0 for definition in definitions}
 
     def definition_calls(definition):
         return lexical_calls(definition)
@@ -1319,14 +1378,22 @@ def _expand_unresolved_ast_parents(
             binding_revisions.get(definition_id, 0) + 1
         )
         calls = definition_calls(definition)
+        definition_depth = definition_depths.get(id(definition), 0)
         for call in calls:
             call_owners[id(call)] = definition
+            call_depths[id(call)] = definition_depth
         all_calls.extend(calls)
         pending_calls.extend(calls)
 
     while pending_calls:
+        if max_work_items and work_items >= max_work_items:
+            raise RuntimeError(
+                "extraction contract python max_work_items exceeded: "
+                f"{max_work_items}"
+            )
         node = pending_calls.popleft()
         work_items += 1
+        call_depth = call_depths.get(id(node), 0)
         call_bindings = node_bindings.get(id(node), root_bindings)
         owner_definition = call_owners.get(id(node))
         revision = binding_revisions.get(
@@ -1342,7 +1409,23 @@ def _expand_unresolved_ast_parents(
         identity_target = target.__func__ if inspect.ismethod(target) else target
         if not callable(identity_target):
             continue
-        if include is not None and not include(identity_target):
+        extraction_decision = (
+            include.decide(identity_target)
+            if include is not None and hasattr(include, "decide")
+            else None
+        )
+        if extraction_decision is not None:
+            node._extraction_contract = extraction_decision.receipt()
+        if include is not None and not (
+            extraction_decision.ingest_parent
+            if extraction_decision is not None
+            else include(identity_target)
+        ):
+            # A rich extraction contract is authoritative. In particular,
+            # intrinsic/use-native/host-call choices must never fall through
+            # to the historical "perhaps decompile it" host-code resolver.
+            if extraction_decision is not None:
+                continue
             from ...compiler.host_code_modules import (
                 resolve_host_code_identity,
             )
@@ -1415,7 +1498,20 @@ def _expand_unresolved_ast_parents(
                 materialize_host_code_library,
             )
 
-            host_library = extract_host_code_library(source_target)
+            decompile_parameters = (
+                dict(extraction_decision.parameters)
+                if extraction_decision is not None else {}
+            )
+            host_library = extract_host_code_library(
+                source_target,
+                **({
+                    "max_functions": int(decompile_parameters["max_functions"]),
+                    "max_total_bytes": int(decompile_parameters["max_total_bytes"]),
+                    "max_dependency_depth": int(
+                        decompile_parameters["max_dependency_depth"]
+                    ),
+                } if extraction_decision is not None else {}),
+            )
             if host_library is not None:
                 host_root = host_library.root
                 node._host_ssa_module = materialize_host_code_library(
@@ -1498,6 +1594,12 @@ def _expand_unresolved_ast_parents(
                     source_target
                 )
         source_definition = _filter_discovered_definition(source_definition, module)
+        source_depth = call_depth + 1
+        if max_dependency_depth and source_depth > max_dependency_depth:
+            raise RuntimeError(
+                "extraction contract python max_dependency_depth exceeded: "
+                f"{source_depth}/{max_dependency_depth} at {identity[0]}.{identity[1]}"
+            )
             # The AST node's short ``name`` is insufficient once an unbounded
             # closure contains same-named definitions from different modules.
             # Preserve the exact live Python identity used to discover it;
@@ -1516,7 +1618,12 @@ def _expand_unresolved_ast_parents(
                 progress(
                     f"{_heat_escape(work_items)}[upward search W{work_items}]{bang} "
                     f"found {getattr(source_definition, 'name', identity)!r} "
-                    f"(unbounded -- no constant depth limit){bang}{_HEAT_RESET}"
+                    + (
+                        f"(contract depth {source_depth}/{max_dependency_depth})"
+                        if max_dependency_depth else
+                        "(unbounded -- no constant depth limit)"
+                    )
+                    + f"{bang}{_HEAT_RESET}"
                 )
             # ``source_definition`` itself is included first, matching what
             # ``ast.walk(source_definition)`` used to yield before this loop
@@ -1538,6 +1645,8 @@ def _expand_unresolved_ast_parents(
                         f"{getattr(source_definition, 'name', identity)!r}{arrows}{_HEAT_RESET}"
                     )
         definitions.extend(new_definitions)
+        for new_definition in new_definitions:
+            definition_depths[id(new_definition)] = source_depth
         for new_definition in new_definitions:
                 definitions_by_name.setdefault(
                     new_definition.name,
@@ -1858,6 +1967,8 @@ class ProcessGraph:
         materialize_memory=True,
         function_table=None,
         external_function_table=None,
+        boundary_namespace=None,
+        source_language="python",
     ):
         # Translation and scheduling do not require a physical memory graph.
         # Keep materialization opt-in at the call site so compiler front-ends
@@ -1891,6 +2002,17 @@ class ProcessGraph:
         self.domain_shape = ()
         self.roots = []
         self.role_schemas = role_schemas
+        if isinstance(boundary_namespace, (str, os.PathLike)):
+            from .boundary_namespace import BoundaryNamespace
+            boundary_namespace = BoundaryNamespace(
+                boundary_namespace, language=source_language,
+            )
+        elif boundary_namespace is not None and not hasattr(
+            boundary_namespace, "rules_for_scope"
+        ):
+            raise TypeError("boundary_namespace must be a path or BoundaryNamespace")
+        self.boundary_namespace = boundary_namespace
+        self.source_language = str(source_language)
         
         self.scheduler = ILPScheduler(self)
         self.consumer_queues = {}
@@ -1970,6 +2092,8 @@ class ProcessGraph:
                 continue
             restored_bindings[name] = value
         self.python_bindings = restored_bindings
+        self.boundary_namespace = getattr(self, "boundary_namespace", None)
+        self.source_language = getattr(self, "source_language", "python")
         self._graph_lock = threading.RLock()
         self._graph_condition = threading.Condition(self._graph_lock)
         self._graph_subscribers = []
@@ -2057,8 +2181,31 @@ class ProcessGraph:
             attributes={
                 "source_span": source_span,
                 "schema_version": data.get("schema_version"),
+                "source_scope": tuple(data.get("source_scope") or ()),
+                "source_class": data.get("source_class"),
+                "source_language": self.source_language,
+                "boundary_rule": data.get("boundary_rule"),
+                "boundary_action": data.get("boundary_action"),
             },
         )
+
+    def _apply_boundary_resolution(self, node_id, resolution) -> None:
+        receipt = getattr(resolution, "receipt", None)
+        excluded = tuple(getattr(resolution, "excluded_rule_ids", ()) or ())
+        if receipt is None and not excluded:
+            return
+        data = self.G.nodes[node_id]
+        if receipt is not None:
+            mapping = receipt.mapping()
+            data["boundary_rule"] = mapping["rule_id"]
+            data["boundary_action"] = mapping["action"]
+            data["boundary_receipt"] = mapping
+            receipts = tuple(self.G.graph.get("boundary_namespace_receipts") or ())
+            if mapping not in receipts:
+                self.G.graph["boundary_namespace_receipts"] = (*receipts, mapping)
+        if excluded:
+            data["boundary_excluded_rule_ids"] = excluded
+        self.observe_evolution_node(node_id, data)
 
     def observe_evolution_edge(self, source, target, role="data") -> None:
         if self._evolution_graph is None:
@@ -2159,10 +2306,23 @@ class ProcessGraph:
                 value = getattr(node, param, None)
                 if value is not None:
                     extra_args[param] = value
+            source_span = None
+            if isinstance(node, ast.AST) and getattr(node, "lineno", None) is not None:
+                source_span = {
+                    "line": getattr(node, "lineno", None),
+                    "column": getattr(node, "col_offset", None),
+                    "end_line": getattr(node, "end_lineno", None),
+                    "end_column": getattr(node, "end_col_offset", None),
+                }
+            source_scope = tuple(getattr(node, "_turing_source_scope", ()))
+            source_class = getattr(node, "_turing_source_class", None)
             self.G.add_node(nid,
                 label=str(node),
                 type=node_type,
                 expr_obj=node,
+                source_span=source_span,
+                source_scope=source_scope,
+                source_class=source_class,
                 extra_args=extra_args,
                 domain_node=DomainNode(
                     shape=(1,1,1), #default will be function pointer
@@ -2339,7 +2499,16 @@ class ProcessGraph:
                 nid, frame_producer, frame_consumer,
                 frame_producer_role, frame_consumer_role, frame_store,
             )
-            special = getattr(current, "_special_case", None)
+            boundary_resolution = None
+            if self.boundary_namespace is not None:
+                boundary_resolution = self.boundary_namespace.resolve(current, self)
+                self._apply_boundary_resolution(nid, boundary_resolution)
+            special = (
+                None if boundary_resolution is None
+                else boundary_resolution.special_case
+            )
+            if special is None:
+                special = getattr(current, "_special_case", None)
             if special is None:
                 special = interpret_special_case(current)
             if special is not None:
@@ -2349,6 +2518,11 @@ class ProcessGraph:
                 data["attributes"] = special.attributes
                 data["extra_args"] = special.attributes
                 data["constant"] = special.constant
+                if (
+                    boundary_resolution is not None
+                    and boundary_resolution.receipt is not None
+                ):
+                    self.observe_evolution_node(nid, data)
                 pending.append(("finish", finish))
                 if special.type == "GetAttr" and isinstance(
                     current, ast.Attribute
@@ -2378,7 +2552,12 @@ class ProcessGraph:
                     # tensor-valued after lexical reduction/specialization.
                     attributes["tensor"] = tensor_op
 
-            schema = self.role_schemas.get(node_type)
+            schema = (
+                None if boundary_resolution is None
+                else boundary_resolution.role_schema
+            )
+            if schema is None:
+                schema = self.role_schemas.get(node_type)
             args = getattr(current, "args", [])
             args = list(args) if isinstance(args, list) else [args]
             if graph_build_verbose:
@@ -2495,6 +2674,8 @@ class ProcessGraph:
         retain=(),
         profile_verbose=False,
         progress=None,
+        boundary_namespace=None,
+        source_language=None,
         **kwargs,
     ):
         """Import Python source as a structural AST ProcessGraph.
@@ -2520,6 +2701,21 @@ class ProcessGraph:
         runtime.
         """
         import os
+
+        if boundary_namespace is not None:
+            if isinstance(boundary_namespace, (str, os.PathLike)):
+                from .boundary_namespace import BoundaryNamespace
+                boundary_namespace = BoundaryNamespace(
+                    boundary_namespace,
+                    language=source_language or self.source_language,
+                )
+            elif not hasattr(boundary_namespace, "rules_for_scope"):
+                raise TypeError(
+                    "boundary_namespace must be a path or BoundaryNamespace"
+                )
+            self.boundary_namespace = boundary_namespace
+        if source_language is not None:
+            self.source_language = str(source_language)
 
         supplied_ast = isinstance(node_or_path, ast.AST)
         if supplied_ast:
@@ -2606,6 +2802,13 @@ class ProcessGraph:
             # MachinePathHeadStatus``) was real and resolved, just
             # discarded before reduction could ever see it.
             self.python_bindings = root_bindings
+            if parent_include is not None and hasattr(parent_include, "receipts"):
+                self.G.graph["extraction_contract_receipts"] = (
+                    parent_include.receipts()
+                )
+                self.G.graph["extraction_contract_fingerprint"] = getattr(
+                    parent_include, "fingerprint", None
+                )
 
         # Preserve class declarations as schema metadata beside the exact AST
         # nodes ProcessGraph is about to ingest; do not create a second AST
@@ -2661,6 +2864,7 @@ class ProcessGraph:
             **annotate_types(tree),
         }
         tree = ast.fix_missing_locations(tree)
+        _annotate_visual_source_owners(tree)
 
         if profile_verbose:
             print(

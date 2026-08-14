@@ -1249,16 +1249,18 @@ class LiveVizGLPoints:
         self._vbo_pos = None
         self._vbo_col = None
         self._vbo_size = None
+        self._vbo_haze = None
         self._num_points = 0
         self._edge_vao = None
         self._edge_vbo_pos = None
         self._edge_vbo_col = None
         self._edge_vbo_size = None
         self._num_edge_vertices = 0
-        self._cap_pos = self._cap_col = self._cap_size = 0
+        self._cap_pos = self._cap_col = self._cap_size = self._cap_haze = 0
         self._edge_cap_pos = self._edge_cap_col = self._edge_cap_size = 0
 
         self._u_mvp = None  # uniform location
+        self._u_haze_pass = None
         tensor = AbstractTensor.get_tensor(0)
         dtype = tensor.get_dtype()
         self._mvp = AbstractTensor.eye(4, dtype=dtype)  # updated each frame
@@ -1328,6 +1330,8 @@ class LiveVizGLPoints:
         glDepthFunc(GL_LEQUAL)
         glDisable(GL_CULL_FACE)
         glEnable(GL_PROGRAM_POINT_SIZE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         r, g, b = self.bg_color
         glClearColor(r, g, b, 1.0)
         glViewport(0, 0, self._w, self._h)
@@ -1339,29 +1343,45 @@ class LiveVizGLPoints:
         layout (location = 0) in vec3 in_pos;
         layout (location = 1) in vec3 in_col;
         layout (location = 2) in float in_size;
+        layout (location = 3) in float in_haze;
 
         uniform mat4 u_mvp;
+        uniform int u_haze_pass;
 
         out vec3 v_col;
+        out float v_haze;
 
         void main() {
             v_col = in_col;
+            v_haze = in_haze;
             gl_Position = u_mvp * vec4(in_pos, 1.0);
-            gl_PointSize = in_size;  // requires GL_PROGRAM_POINT_SIZE
+            gl_PointSize = in_size * (u_haze_pass == 1
+                ? (1.8 + 1.4 * abs(in_haze)) : 1.0);
         }
         """
 
         fsrc = """
         #version 330 core
         in vec3 v_col;
+        in float v_haze;
         out vec4 FragColor;
+        uniform int u_haze_pass;
 
         void main() {
             // Circular point sprite mask (optional). Comment out for square points.
             vec2 p = gl_PointCoord * 2.0 - 1.0;
+            float r2 = dot(p, p);
             if (dot(p, p) > 1.0) discard;
-
-            FragColor = vec4(v_col, 1.0);
+            if (u_haze_pass == 1) {
+                if (abs(v_haze) < 0.01 || r2 < 0.48) discard;
+                vec3 minus_colour = vec3(0.10, 0.78, 0.96);
+                vec3 plus_colour = vec3(0.52, 0.30, 0.96);
+                vec3 haze_colour = v_haze < 0.0 ? minus_colour : plus_colour;
+                float rim = smoothstep(0.48, 0.72, r2) * (1.0 - smoothstep(0.82, 1.0, r2));
+                FragColor = vec4(haze_colour, rim * (0.18 + 0.72 * abs(v_haze)));
+            } else {
+                FragColor = vec4(v_col, 1.0);
+            }
         }
         """
 
@@ -1372,6 +1392,7 @@ class LiveVizGLPoints:
             compileShader(fsrc, GL_FRAGMENT_SHADER)
         )
         self._u_mvp = glGetUniformLocation(self._program, "u_mvp")
+        self._u_haze_pass = glGetUniformLocation(self._program, "u_haze_pass")
 
     def _create_buffers(self):
         self._vao = glGenVertexArrays(1)
@@ -1394,6 +1415,12 @@ class LiveVizGLPoints:
         glBufferData(GL_ARRAY_BUFFER, 1, None, GL_DYNAMIC_DRAW)
         glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 0, None)
         glEnableVertexAttribArray(2)
+
+        self._vbo_haze = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self._vbo_haze)
+        glBufferData(GL_ARRAY_BUFFER, 1, None, GL_DYNAMIC_DRAW)
+        glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(3)
 
         glBindVertexArray(0)
 
@@ -1428,6 +1455,7 @@ class LiveVizGLPoints:
         if ids.shape == (0,):
             return (AbstractTensor.zeros((0, 3), ids.float_dtype),
                     AbstractTensor.zeros((0, 3), ids.float_dtype),
+                    AbstractTensor.zeros((0,), ids.float_dtype),
                     AbstractTensor.zeros((0,), ids.float_dtype),
                     AbstractTensor.zeros((0, 3), ids.float_dtype))
 
@@ -1499,7 +1527,12 @@ class LiveVizGLPoints:
                 float(getattr(self.sys.nodes[int(nid)], "visual_growth", 1.0)),
             )
 
-        return P, C, sizes, P  # return P twice; last is for autoscale
+        haze_map = getattr(self.sys, "visual_haze", {})
+        haze = AbstractTensor.get_tensor(
+            [float(haze_map.get(int(i), 0.0)) for i in ids],
+            dtype="float32",
+        )
+        return P, C, sizes, haze, P  # return P twice; last is for autoscale
 
     def _compute_edge_energy(self, e, nodes):
         pi = nodes[e.i][0]
@@ -1542,12 +1575,13 @@ class LiveVizGLPoints:
         return P, C, S
 
     def _update_buffers(self):
-        P, C, S, P_for_bounds = self._pack_points()
+        P, C, S, H, P_for_bounds = self._pack_points()
         self._num_points = P.shape[0]
         # points
         self._upload(self._vbo_pos,  P, "_cap_pos")
         self._upload(self._vbo_col,  C, "_cap_col")
         self._upload(self._vbo_size, S, "_cap_size")
+        self._upload(self._vbo_haze, H, "_cap_haze")
 
 
 
@@ -1670,6 +1704,7 @@ class LiveVizGLPoints:
             if self._vbo_pos:  glDeleteBuffers(1, [self._vbo_pos])
             if self._vbo_col:  glDeleteBuffers(1, [self._vbo_col])
             if self._vbo_size: glDeleteBuffers(1, [self._vbo_size])
+            if self._vbo_haze: glDeleteBuffers(1, [self._vbo_haze])
             if self._vao:      glDeleteVertexArrays(1, [self._vao])
             if self._edge_vbo_pos: glDeleteBuffers(1, [self._edge_vbo_pos])
             if self._edge_vbo_col: glDeleteBuffers(1, [self._edge_vbo_col])
@@ -1679,7 +1714,7 @@ class LiveVizGLPoints:
         except Exception:
             pass
         self._program = None
-        self._vao = self._vbo_pos = self._vbo_col = self._vbo_size = None
+        self._vao = self._vbo_pos = self._vbo_col = self._vbo_size = self._vbo_haze = None
         self._edge_vao = self._edge_vbo_pos = self._edge_vbo_col = self._edge_vbo_size = None
         self._num_edge_vertices = 0
 
@@ -1712,6 +1747,10 @@ class LiveVizGLPoints:
         glUniformMatrix4fv(self._u_mvp, 1, GL_FALSE, getattr(mvp, "data", mvp))
 
         glBindVertexArray(self._vao)
+        if self._u_haze_pass is not None and self._u_haze_pass >= 0:
+            glUniform1i(self._u_haze_pass, 1)
+            glDrawArrays(GL_POINTS, 0, self._num_points)
+            glUniform1i(self._u_haze_pass, 0)
         glDrawArrays(GL_POINTS, 0, self._num_points)
         glBindVertexArray(0)
 
@@ -1759,6 +1798,8 @@ class LiveVizGLPoints:
                 glDeleteBuffers(1, [self._vbo_col])
             if self._vbo_size:
                 glDeleteBuffers(1, [self._vbo_size])
+            if self._vbo_haze:
+                glDeleteBuffers(1, [self._vbo_haze])
             if self._vao:
                 glDeleteVertexArrays(1, [self._vao])
             if self._edge_vbo_pos:

@@ -66,8 +66,20 @@ def _call_spelling(node: ast.AST) -> str | None:
     return None
 
 
-def build_semantic_ast(graph, tree: ast.AST, *, filename: str | None = None):
-    """Lower one Python function/module into ``graph`` using existing ops."""
+def build_semantic_ast(
+    graph, tree: ast.AST, *, filename: str | None = None,
+    helpers: dict | None = None, self_constants: dict | None = None,
+):
+    """Lower one Python function/module into ``graph`` using existing ops.
+
+    ``helpers`` maps names to ``ast.FunctionDef`` bodies that calls may be
+    lowered INTO (module-local helper functions): the call site's arguments
+    bind to the helper's parameters and the helper's dataflow continues in
+    place, so composition pursues down to the canonical vocabulary instead of
+    stopping at an unimplementable ``call`` node. ``self_constants`` maps
+    attribute names to literal values for ``self.NAME`` reads (class-level
+    constants), which otherwise have no dataflow meaning inside one function.
+    """
 
     env: dict[str, int] = {}
     next_id = 0
@@ -129,6 +141,32 @@ def build_semantic_ast(graph, tree: ast.AST, *, filename: str | None = None):
             source=span(node),
         )
 
+    def inline_helper(function, call_node):
+        """Continue lowering inside a helper: arguments bind to parameters.
+
+        Returns the node id of the helper's returned value, or None when the
+        call shape is not bindable (defaults, keywords, arity mismatch) --
+        the caller then falls back to an explicit ``call`` node.
+        """
+
+        parameters = [parameter.arg for parameter in function.args.args]
+        if call_node.keywords or len(call_node.args) != len(parameters):
+            return None
+        values = [expression(argument) for argument in call_node.args]
+        saved = dict(env)
+        env.clear()
+        env.update(dict(zip(parameters, values)))
+        result = None
+        for child in function.body:
+            if isinstance(child, ast.Return):
+                result = (expression(child.value)
+                          if child.value is not None else None)
+                break
+            statement(child)
+        env.clear()
+        env.update(saved)
+        return result
+
     def expression(node):
         if isinstance(node, ast.Name):
             if node.id not in env:
@@ -137,6 +175,18 @@ def build_semantic_ast(graph, tree: ast.AST, *, filename: str | None = None):
                     tensor={}, source=span(node), output_roles=("value",),
                 )
             return env[node.id]
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+            and self_constants is not None
+            and node.attr in self_constants
+        ):
+            value = self_constants[node.attr]
+            return add_node(
+                "const", label=repr(value), constant=value,
+                source=span(node), output_roles=("value",),
+            )
         if isinstance(node, ast.Constant):
             return add_node(
                 "const", label=repr(node.value), constant=node.value,
@@ -192,6 +242,15 @@ def build_semantic_ast(graph, tree: ast.AST, *, filename: str | None = None):
                     source=span(node),
                 )
             canonical = _CALLS.get(spelling)
+            if (
+                canonical is None
+                and helpers
+                and isinstance(node.func, ast.Name)
+                and node.func.id in helpers
+            ):
+                inlined = inline_helper(helpers[node.func.id], node)
+                if inlined is not None:
+                    return inlined
             arguments = []
             if canonical is not None and isinstance(node.func, ast.Attribute):
                 arguments.append(expression(node.func.value))
@@ -270,6 +329,14 @@ def build_semantic_ast(graph, tree: ast.AST, *, filename: str | None = None):
                 )
             env.clear(); env.update(merged)
             return condition
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            # A context manager guards execution; it carries no dataflow. The
+            # body lowers in the enclosing environment, and the context
+            # expression (autograd.no_grad, device scopes) is machinery the
+            # destination does not re-run.
+            for child in node.body:
+                statement(child)
+            return None
         return opaque(node)
 
     if isinstance(tree, ast.Module):
@@ -288,7 +355,10 @@ def build_semantic_ast(graph, tree: ast.AST, *, filename: str | None = None):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if graph.G.number_of_nodes():
                 raise ValueError("semantic AST import accepts one top-level function")
-            return build_semantic_ast(graph, child, filename=filename)
+            return build_semantic_ast(
+                graph, child, filename=filename,
+                helpers=helpers, self_constants=self_constants,
+            )
         statement(child)
     if not graph.roots:
         graph.roots = [nid for nid in graph.G if graph.G.out_degree(nid) == 0]

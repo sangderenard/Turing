@@ -85,7 +85,54 @@ def _v1_valuewise(self, op: str, *, annotate: Dict[str, Any] | None = None):
         tape.annotate(out, **({"eval_mode":"valuewise","v":"v1","length":len(flat)} | annotate))
     return out
 
-# --------------- v2: binary (NO implicit broadcast) ----------------
+def _broadcast_result_shape(op: str, shape_a, shape_b):
+    """The NumPy-rule broadcast shape of two operand shapes, or a named error."""
+
+    rank = max(len(shape_a), len(shape_b))
+    padded_a = (1,) * (rank - len(shape_a)) + tuple(shape_a)
+    padded_b = (1,) * (rank - len(shape_b)) + tuple(shape_b)
+    result = []
+    for extent_a, extent_b in zip(padded_a, padded_b):
+        if extent_a == extent_b or extent_a == 1 or extent_b == 1:
+            result.append(max(extent_a, extent_b))
+        else:
+            raise ValueError(
+                f"{op}: incompatible shapes {tuple(shape_a)} vs {tuple(shape_b)}"
+            )
+    return tuple(result)
+
+
+def _broadcast_flat_index(src_shape, dst_shape):
+    """Map a flat index in ``dst_shape`` to the flat index of the source
+    element that broadcasts into it (singleton source dimensions contribute
+    stride zero)."""
+
+    rank = len(dst_shape)
+    padded = (1,) * (rank - len(src_shape)) + tuple(src_shape)
+    src_strides = []
+    acc = 1
+    for extent in reversed(padded):
+        src_strides.append(acc)
+        acc *= extent
+    src_strides.reverse()
+    effective = [0 if extent == 1 else stride
+                 for extent, stride in zip(padded, src_strides)]
+    dst_strides = []
+    acc = 1
+    for extent in reversed(dst_shape):
+        dst_strides.append(acc)
+        acc *= extent
+    dst_strides.reverse()
+
+    def map_index(flat):
+        offset = 0
+        for stride, extent, source in zip(dst_strides, dst_shape, effective):
+            offset += ((flat // stride) % extent) * source
+        return offset
+    return map_index
+
+
+# --------------- v2: binary (broadcasting, value-wise) ----------------
 def _v2_valuewise(
     self,
     op: str,
@@ -140,28 +187,45 @@ def _v2_valuewise(
             tape.annotate(out, **({"eval_mode":"valuewise","v":"v2","length":0,"scalar_lift":{"left":False,"right":False}} | annotate))
         return out
 
-    target = max(na, nb)
-
-    def lift(lst, name):
-        if len(lst) == target:
-            return lst, False
-        if allow_scalar and len(lst) == 1:
-            return [lst[0]] * target, True
-        if target % len(lst) == 0:
-            k = target // len(lst)
-            return [lst[i // k] for i in range(target)], True
-        raise ValueError(f"{op}: incompatible lengths {na} vs {nb}")
-
-    a, left_lift = lift(a, "left")
-    b, right_lift = lift(b, "right")
-    lifted = {"left": left_lift, "right": right_lift}
+    shape_a = tuple(self.get_shape())
+    shape_b = tuple(other_t.get_shape())
 
     K = self._scalar_kernel(op)
     # Same reasoning as _v1_valuewise: a/b came from tolist(), so they are
     # already plain scalars -- the per-element _as_scalar try/except was
     # pure waste, not part of the comparison's actual cost.
-    out = [K(x, y) for x, y in zip(a, b)]
-    shape = self.get_shape() if na == target else other_t.get_shape()
+    if shape_a == shape_b:
+        target = na
+        shape = shape_a
+        lifted = {"left": False, "right": False}
+        out = [K(x, y) for x, y in zip(a, b)]
+    elif allow_scalar and na == 1:
+        target = nb
+        shape = shape_b
+        lifted = {"left": True, "right": False}
+        scalar = a[0]
+        out = [K(scalar, y) for y in b]
+    elif allow_scalar and nb == 1:
+        target = na
+        shape = shape_a
+        lifted = {"left": False, "right": True}
+        scalar = b[0]
+        out = [K(x, scalar) for x in a]
+    else:
+        # General elementwise broadcasting (NumPy rules). The previous
+        # divisibility lift repeated elements in flat order, which is only
+        # correct when the shorter operand aligns with the TRAILING
+        # dimensions; interior singleton dimensions (a (1,1,K,1) index grid
+        # against an (N,C,1,L) field, the pooling-backward mask shape)
+        # silently produced wrong values under the wrong shape.
+        shape = _broadcast_result_shape(op, shape_a, shape_b)
+        map_a = _broadcast_flat_index(shape_a, shape)
+        map_b = _broadcast_flat_index(shape_b, shape)
+        target = 1
+        for extent in shape:
+            target *= extent
+        lifted = {"left": shape_a != shape, "right": shape_b != shape}
+        out = [K(a[map_a(i)], b[map_b(i)]) for i in range(target)]
     out = self.ensure_tensor(out).reshape(shape)
     out = finalize(out)
     tape = getattr(out, "_tape", None)
@@ -205,40 +269,29 @@ def _v3_valuewise(
     A = a_t.reshape(-1).tolist()
     B = b_t.reshape(-1).tolist()
 
-    orig_len_c = len(c)
-    orig_len_a = len(A)
-    orig_len_b = len(B)
-
-    target = max(orig_len_c, orig_len_a, orig_len_b)
-
-    def lift(lst, name, *, allow_div: bool = False):
-        if len(lst) == target:
-            return lst, False
-        if allow_div and len(lst) > 0 and target % len(lst) == 0:
-            k = target // len(lst)
-            return [lst[i // k] for i in range(target)], True
-        if allow_scalar and len(lst) == 1:
-            return [lst[0]] * target, True
-        raise ValueError(f"{op}: {name} length {len(lst)} != {target}")
-
-    A, liftA = lift(A, "a")
-    B, liftB = lift(B, "b")
-    c, liftC = lift(c, "cond", allow_div=True)
+    # Broadcast all three operands with the same NumPy rule as _v2_valuewise.
+    # The previous divisibility lift on the condition repeated elements in
+    # flat order, which silently misaligns interior singleton dimensions.
+    shape_c = tuple(self.get_shape())
+    shape_a = tuple(a_t.get_shape())
+    shape_b = tuple(b_t.get_shape())
+    shape = _broadcast_result_shape(op, shape_c, shape_a)
+    shape = _broadcast_result_shape(op, shape, shape_b)
+    target = 1
+    for extent in shape:
+        target *= extent
+    liftC, liftA, liftB = (shape_c != shape, shape_a != shape, shape_b != shape)
 
     K = self._scalar_kernel("where")
     # Same reasoning as _v2_valuewise: c/A/B came from tolist(), already
     # plain scalars -- skip the no-op try/except unwrap per element.
-    out = [K(*triple) for triple in zip(c, A, B)]
-
-    # Determine result shape using the operand that originally carried the target length
-    if orig_len_a == target and orig_len_a != 1:
-        shape = a_t.get_shape()
-    elif orig_len_b == target and orig_len_b != 1:
-        shape = b_t.get_shape()
-    elif orig_len_c == target:
-        shape = self.get_shape()
+    if not (liftC or liftA or liftB):
+        out = [K(*triple) for triple in zip(c, A, B)]
     else:
-        shape = (target,)
+        map_c = _broadcast_flat_index(shape_c, shape)
+        map_a = _broadcast_flat_index(shape_a, shape)
+        map_b = _broadcast_flat_index(shape_b, shape)
+        out = [K(c[map_c(i)], A[map_a(i)], B[map_b(i)]) for i in range(target)]
 
     out = self.ensure_tensor(out).reshape(*shape)
     out = finalize(out)

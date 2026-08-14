@@ -76,7 +76,11 @@ def _constant_payload(instruction: Instr) -> Any:
         return None
     attributes = instruction.attributes
     if attributes.get("values") is not None:
-        return tuple(attributes["values"])
+        # The whole-object compiler spells a scalar constant with the same
+        # "values" key a vector constant uses; a scalar payload stays scalar.
+        payload = attributes["values"]
+        sequence = _as_sequence(payload)
+        return sequence if sequence is not None else payload
     for key in ("constant", "value", "data"):
         if key in attributes and attributes[key] is not None:
             return attributes[key]
@@ -190,6 +194,7 @@ def lower_tensor_calls_to_repository_ssa(
             metadata_state: str | None = None,
             alias_of: int | None = None,
             data_value_id: int | None = None,
+            extent_ids_from: SSATensorDescriptor | None = None,
         ) -> SSATensorDescriptor:
             tensor_id = int(value.id)
             existing = tensor_table.by_id(tensor_id)
@@ -209,6 +214,23 @@ def lower_tensor_calls_to_repository_ssa(
                 "float64": 8, "double": 8, "int64": 8, "i64": 8,
             }.get(str(value.dtype or "float64").lower(), 8)
             element_count = prod(shape) if shape else 1
+            # A dynamic descriptor requires all three extent values; a result
+            # inheriting a dynamic source's state inherits its extents too
+            # (elementwise results share the source's runtime metadata).
+            extent_ids: dict[str, int | None] = {
+                "shape_value_id": None,
+                "rank_value_id": None,
+                "element_count_value_id": None,
+            }
+            if state == "dynamic":
+                if extent_ids_from is None or extent_ids_from.shape_value_id is None:
+                    state = "unresolved"
+                else:
+                    extent_ids = {
+                        "shape_value_id": extent_ids_from.shape_value_id,
+                        "rank_value_id": extent_ids_from.rank_value_id,
+                        "element_count_value_id": extent_ids_from.element_count_value_id,
+                    }
             return tensor_table.register(SSATensorDescriptor(
                 tensor_id=tensor_id,
                 data_value_id=int(
@@ -219,6 +241,7 @@ def lower_tensor_calls_to_repository_ssa(
                 strides=strides(shape),
                 storage=storage,
                 metadata_state=state,
+                **extent_ids,
                 arena_id=owner.arena_id if owner is not None else tensor_id,
                 allocation_owner=(
                     owner.allocation_owner if owner is not None else tensor_id
@@ -240,6 +263,74 @@ def lower_tensor_calls_to_repository_ssa(
                     payload = _constant_payload(instruction)
                     if payload is not None:
                         constants[int(instruction.res.id)] = payload
+
+        # Runtime extents: when a static shape is absent (the whole-program
+        # capture keeps parameters symbolic), extent metadata becomes ordinary
+        # SSA via the ``extent`` tensor operation -- the same contract the
+        # descriptor was designed for ("shape/stride information is either
+        # static (the tuples) or itself ordinary SSA (the optional value
+        # ids)") and the Fortran emitter already recognises. Each backend
+        # lowers ``extent`` its own way; nothing here is float- or
+        # backend-specific.
+        dynamic_extents: dict[int, dict[str, SSAValue]] = {}
+
+        def ensure_dynamic(
+            prefix: list[Instr], tensor: SSAValue
+        ) -> dict[str, SSAValue]:
+            """Cross ``tensor`` to dynamic metadata, whole.
+
+            The descriptor's own validation states the contract: a dynamic
+            tensor carries shape, rank, AND element-count as ordinary SSA,
+            never a subset. All three ``extent`` instructions are minted on
+            the first request and reused after.
+            """
+
+            tensor_id = int(tensor.id)
+            cached = dynamic_extents.get(tensor_id)
+            if cached is not None:
+                return cached
+            minted: dict[str, SSAValue] = {}
+            for kind in ("shape", "rank", "element_count"):
+                value = fresh(dtype="int32")
+                prefix.append(Instr(
+                    "extent", [tensor], value,
+                    attributes={
+                        "tensor_operation": "extent", "extent_kind": kind,
+                    },
+                ))
+                minted[kind] = value
+            dynamic_extents[tensor_id] = minted
+            existing = tensor_table.by_id(tensor_id)
+            if existing is not None:
+                tensor_table.tensors[tensor_id] = dataclasses.replace(
+                    existing,
+                    metadata_state="dynamic",
+                    byte_size=None,
+                    shape_value_id=int(minted["shape"].id),
+                    rank_value_id=int(minted["rank"].id),
+                    element_count_value_id=int(minted["element_count"].id),
+                )
+            return minted
+
+        per_dim_extents: dict[tuple[int, int], SSAValue] = {}
+
+        def dim_extent(
+            prefix: list[Instr], tensor: SSAValue, axis: int
+        ) -> SSAValue:
+            key = (int(tensor.id), int(axis))
+            cached = per_dim_extents.get(key)
+            if cached is not None:
+                return cached
+            value = fresh(dtype="int32")
+            prefix.append(Instr(
+                "extent", [tensor], value,
+                attributes={
+                    "tensor_operation": "extent", "extent_kind": "dim",
+                    "axis": int(axis),
+                },
+            ))
+            per_dim_extents[key] = value
+            return value
 
         aliases: dict[int, SSAValue] = {}
 
@@ -271,6 +362,13 @@ def lower_tensor_calls_to_repository_ssa(
                     and (
                         tuple(instruction.res.shape)
                         or any(tuple(argument.shape) for argument in instruction.args)
+                        # Symbolic shapes prove nothing either way; an operand
+                        # already registered as a tensor descriptor (a kernel
+                        # call's result) is proof enough of tensorhood.
+                        or any(
+                            tensor_table.by_id(int(argument.id)) is not None
+                            for argument in instruction.args
+                        )
                     )
                 ):
                     operation_value = _SHAPED_SSA_OPERATIONS[instruction.op]
@@ -344,22 +442,28 @@ def lower_tensor_calls_to_repository_ssa(
                         and not tuple(result.shape)
                         else None
                     ),
+                    extent_ids_from=source_descriptor,
                 )
                 source_count = _known_count(source) if source is not None else None
                 result_count = _known_count(result)
 
-                def need_count(which: str, count: int | None) -> SSAValue | None:
-                    if count is None:
+                def need_count(
+                    of: SSAValue | None, count: int | None
+                ) -> SSAValue | None:
+                    if count is not None:
+                        value, definition = constant(count, "int32")
+                        prefix.append(definition)
+                        return value
+                    if of is None:
                         return None
-                    value, definition = constant(count, "int32")
-                    prefix.append(definition)
-                    return value
+                    # Extent unknown statically: mint it as ordinary SSA.
+                    return ensure_dynamic(prefix, of)["element_count"]
 
                 # Derived source definition: cbrt(x) = sign(x)*pow(abs(x),1/3).
                 # It is deliberately expressed through the finite primitive
                 # basis instead of becoming a new runtime intrinsic.
-                if operation == "cbrt" and source is not None and source_count is not None:
-                    count = need_count("source", source_count)
+                if operation == "cbrt" and source is not None:
+                    count = need_count(source, source_count)
                     abs_result = fresh(shape=source.shape, dtype=source.dtype or "float64")
                     sign_result = fresh(shape=source.shape, dtype=source.dtype or "float64")
                     power_result = fresh(shape=source.shape, dtype=source.dtype or "float64")
@@ -388,9 +492,36 @@ def lower_tensor_calls_to_repository_ssa(
                             if any(token in dtype_hint for token in ("int", "long", "bool"))
                             else "cast_double_to_float_values"
                         )
-                    count = need_count("source", source_count)
+                    count = need_count(source, source_count)
                     if count is not None:
                         emitted.append(call(callee, [source, result, count], result, instruction, output_argument=1))
+
+                elif (
+                    operation in {"transpose", "swapaxes", "permute"}
+                    and source is not None
+                    and not source.shape
+                ):
+                    # Symbolic source: a swap of axes 0 and 1 states rank two
+                    # (the same contract matmul_double already carries), so
+                    # the axes vector is static while shape and rank ride as
+                    # runtime extents. Any other permutation of a symbolic
+                    # tensor stays a refusal until ranks are inferred.
+                    dims = [int(item) for item in metadata if isinstance(item, (int, float))]
+                    dim0 = _attribute(instruction.attributes, "dim0", "axis1")
+                    dim1 = _attribute(instruction.attributes, "dim1", "axis2")
+                    if dim0 is not None and dim1 is not None:
+                        dims = [int(dim0), int(dim1)]
+                    if set(dims) == {0, 1}:
+                        extents = ensure_dynamic(prefix, source)
+                        ensure_dynamic(prefix, result)
+                        axes_value, axes_def = int_vector((1, 0))
+                        ndim, ndim_def = constant(2, "int32")
+                        prefix.extend((axes_def, ndim_def))
+                        emitted.append(call(
+                            "transpose_double",
+                            [source, result, extents["shape"], axes_value, ndim],
+                            result, instruction, output_argument=1,
+                        ))
 
                 elif operation in {"transpose", "swapaxes", "permute"} and source is not None and source.shape:
                     rank = len(source.shape)
@@ -419,15 +550,40 @@ def lower_tensor_calls_to_repository_ssa(
                             result, instruction, output_argument=1,
                         ))
 
-                elif operation in _REDUCTION_CODES and source is not None:
+                elif (
+                    operation in _REDUCTION_CODES or operation == "mean"
+                ) and source is not None:
                     axis = _attribute(instruction.attributes, "axis", "dim")
                     if axis is None:
                         axis = next((item for item in metadata if isinstance(item, (int, float))), None)
-                    if axis is None and operation == "sum":
-                        count = need_count("source", source_count)
-                        if count is not None:
+                    if axis is None and operation in {"sum", "mean"}:
+                        count = need_count(source, source_count)
+                        if count is not None and operation == "sum":
                             emitted.append(call("sum_double", [source, count], result, instruction))
-                    elif axis is not None and source.shape:
+                        elif count is not None:
+                            # mean = flat sum scaled by the element count; the
+                            # division is ordinary scalar SSA, not a kernel.
+                            total = fresh(dtype=result.dtype or "float64")
+                            emitted.append(call("sum_double", [source, count], total, instruction))
+                            emitted.append(Instr(
+                                "Div", [total, count], result,
+                                attributes={"lowered_from": "mean"},
+                                source_span=instruction.source_span,
+                            ))
+                    elif axis is not None and not source.shape and operation in _REDUCTION_CODES:
+                        # Symbolic source: shape and rank ride as runtime
+                        # extents; the kernel already takes them as operands.
+                        extents = ensure_dynamic(prefix, source)
+                        ensure_dynamic(prefix, result)
+                        dim, dim_def = constant(int(axis), "int32")
+                        code, code_def = constant(_REDUCTION_CODES[operation], "int32")
+                        prefix.extend((dim_def, code_def))
+                        emitted.append(call(
+                            "reduce_dim_double",
+                            [source, result, extents["shape"], extents["rank"], dim, code],
+                            result, instruction, output_argument=1,
+                        ))
+                    elif axis is not None and source.shape and operation in _REDUCTION_CODES:
                         rank = len(source.shape)
                         axis_value = int(axis) % rank
                         shape_value, shape_def = int_vector(source.shape)
@@ -454,15 +610,15 @@ def lower_tensor_calls_to_repository_ssa(
                         result, instruction, output_argument=1,
                     ))
 
-                elif operation == "where" and len(data_args) == 3 and result_count is not None:
-                    count = need_count("result", result_count)
+                elif operation == "where" and len(data_args) == 3:
+                    count = need_count(result, result_count)
                     emitted.append(call(
                         "where_double", [*data_args, result, count], result,
                         instruction, output_argument=3,
                     ))
 
-                elif operation == "sign" and source is not None and source_count is not None:
-                    count = need_count("source", source_count)
+                elif operation == "sign" and source is not None:
+                    count = need_count(source, source_count)
                     emitted.append(call("sign_double", [source, result, count], result, instruction, output_argument=1))
 
                 elif operation == "matmul" and len(data_args) == 2:
@@ -477,13 +633,28 @@ def lower_tensor_calls_to_repository_ssa(
                             "matmul_double", [left, right, result, *dimensions], result,
                             instruction, output_argument=2,
                         ))
+                    elif not left.shape and not right.shape:
+                        # Symbolic operands: matmul_double's contract is rank
+                        # two, so the three dims become runtime extents.
+                        ensure_dynamic(prefix, left)
+                        ensure_dynamic(prefix, right)
+                        ensure_dynamic(prefix, result)
+                        dimensions = [
+                            dim_extent(prefix, left, 0),
+                            dim_extent(prefix, left, 1),
+                            dim_extent(prefix, right, 1),
+                        ]
+                        emitted.append(call(
+                            "matmul_double", [left, right, result, *dimensions], result,
+                            instruction, output_argument=2,
+                        ))
 
                 else:
                     opcode = c_tensor_opcode(operation)
                     if opcode is not None and source is not None:
                         kind, opcode_value = opcode
                         count_value = source_count if kind == "unary" else result_count
-                        count = need_count("tensor", count_value)
+                        count = need_count(source if kind == "unary" else result, count_value)
                         opcode_ssa, opcode_instruction = constant(opcode_value, "int32")
                         if count is not None:
                             prefix.append(opcode_instruction)
@@ -499,7 +670,37 @@ def lower_tensor_calls_to_repository_ssa(
                                         conformed_args.append(operand)
                                         continue
                                     if not operand.shape or not result.shape:
-                                        conformed_args.append(operand)
+                                        # Shapes unknown statically: conforming
+                                        # is a runtime decision, so route the
+                                        # operand through broadcast_double with
+                                        # extent metadata -- never a silent
+                                        # mismatched elementwise call.
+                                        operand_extents = ensure_dynamic(prefix, operand)
+                                        result_extents = ensure_dynamic(prefix, result)
+                                        broadcasted = fresh(
+                                            shape=result.shape,
+                                            dtype=operand.dtype or "float64",
+                                        )
+                                        emitted.append(call(
+                                            "broadcast_double",
+                                            [
+                                                operand,
+                                                broadcasted,
+                                                operand_extents["shape"],
+                                                operand_extents["rank"],
+                                                result_extents["shape"],
+                                                result_extents["rank"],
+                                            ],
+                                            broadcasted,
+                                            instruction,
+                                            output_argument=1,
+                                        ))
+                                        register_tensor(
+                                            broadcasted, storage="temporary",
+                                            metadata_state="dynamic",
+                                            extent_ids_from=tensor_table.by_id(int(result.id)),
+                                        )
+                                        conformed_args.append(broadcasted)
                                         continue
                                     broadcasted = fresh(
                                         shape=result.shape,
