@@ -403,6 +403,18 @@ class ProcessGraphProgramAdjoint:
     binding_graph: AdjointBindingGraph
 
 
+@dataclass(frozen=True)
+class ProcessGraphAdjointRegion:
+    """One semantics-preserving numerical compartment of a program adjoint."""
+
+    phase: str
+    region_id: int
+    graph: ProcessGraph
+    node_ids: tuple[int, ...]
+    input_value_ids: tuple[int, ...]
+    output_value_ids: tuple[int, ...]
+
+
 _SCHEDULED_REGION = re.compile(r"__scheduled_region_(\d+)__")
 
 
@@ -890,6 +902,170 @@ def differentiate_process_program(
         },
         binding_graph=binding_graph,
     )
+
+
+def _isolate_process_graph_region(
+    graph: ProcessGraph,
+    *,
+    phase: str,
+    region_id: int,
+    node_ids: Iterable[int],
+    required_outputs: Iterable[int] = (),
+) -> ProcessGraphAdjointRegion:
+    """Copy a numerical region with explicit, identity-preserving boundaries."""
+
+    selected = {int(node_id) for node_id in node_ids}
+    unknown = selected - set(graph.G)
+    if unknown:
+        raise ProcessGraphAutogradError(
+            f"{phase} region {region_id} contains unknown nodes "
+            + ", ".join(map(str, sorted(unknown)))
+        )
+    if not selected:
+        isolated = copy.copy(graph)
+        isolated.G = nx.DiGraph()
+        isolated.G.graph.update({
+            "graph_kind": "process_graph_adjoint_region",
+            "semantic_authority": "ProcessGraph",
+            "region_phase": str(phase),
+            "region_id": int(region_id),
+            "region_nodes": (),
+            "region_inputs": (),
+            "region_outputs": (),
+            "source_graph_preserved": True,
+            "fused_program_semantic_authority": False,
+        })
+        isolated.roots = []
+        isolated.levels = {}
+        isolated.scheduler = copy.copy(graph.scheduler)
+        isolated.scheduler.G = isolated.G
+        return ProcessGraphAdjointRegion(
+            phase=str(phase), region_id=int(region_id), graph=isolated,
+            node_ids=(), input_value_ids=(), output_value_ids=(),
+        )
+
+    def semantic_parents(node_id: int) -> set[int]:
+        return {
+            *map(int, graph.G.predecessors(node_id)),
+            *map(int, _parents(graph, node_id)),
+        }
+
+    def semantic_children(node_id: int) -> set[int]:
+        return {
+            *map(int, graph.G.successors(node_id)),
+            *(
+                int(child)
+                for child, _role in graph.G.nodes[node_id].get("children", ())
+                if int(child) in graph.G
+            ),
+        }
+
+    boundary = {
+        parent
+        for node_id in selected
+        for parent in semantic_parents(node_id)
+        if parent not in selected
+    }
+    included = selected | boundary
+    isolated = copy.copy(graph)
+    isolated.G = copy.deepcopy(graph.G.subgraph(included).copy())
+    isolated.G.graph = copy.deepcopy(dict(graph.G.graph))
+    isolated.scheduler = copy.copy(graph.scheduler)
+    isolated.scheduler.G = isolated.G
+
+    inputs: list[int] = sorted(
+        node_id for node_id in selected
+        if _operation(isolated.G.nodes[node_id]) == "input"
+    )
+    for node_id in sorted(boundary):
+        data = isolated.G.nodes[node_id]
+        if _operation(data) == "const":
+            continue
+        attributes = dict(data.get("attributes") or {})
+        attributes.update({
+            "binding_kind": "region_input",
+            "source_value_id": int(node_id),
+            "region_phase": str(phase),
+            "region_id": int(region_id),
+        })
+        data.update({
+            "type": "input",
+            "op": "input",
+            "label": str(data.get("label") or f"value_{node_id}"),
+            "parents": [],
+            "attributes": attributes,
+            "extra_args": copy.deepcopy(attributes),
+        })
+        for parent in tuple(isolated.G.predecessors(node_id)):
+            isolated.G.remove_edge(parent, node_id)
+        inputs.append(int(node_id))
+    inputs = sorted(set(inputs))
+
+    required = set(map(int, required_outputs))
+    outputs = tuple(sorted(
+        node_id
+        for node_id in selected
+        if node_id in required
+        or not semantic_children(node_id)
+        or any(child not in selected for child in semantic_children(node_id))
+    ))
+    isolated.roots = list(outputs)
+    isolated.levels = {
+        int(node_id): int(level)
+        for level, generation in enumerate(nx.topological_generations(isolated.G))
+        for node_id in generation
+    }
+    isolated.G.graph.update({
+        "graph_kind": "process_graph_adjoint_region",
+        "semantic_authority": "ProcessGraph",
+        "region_phase": str(phase),
+        "region_id": int(region_id),
+        "region_nodes": tuple(sorted(selected)),
+        "region_inputs": tuple(inputs),
+        "region_outputs": outputs,
+        "source_graph_preserved": True,
+        "fused_program_semantic_authority": False,
+    })
+    return ProcessGraphAdjointRegion(
+        phase=str(phase),
+        region_id=int(region_id),
+        graph=isolated,
+        node_ids=tuple(sorted(selected)),
+        input_value_ids=tuple(inputs),
+        output_value_ids=outputs,
+    )
+
+
+def isolate_process_program_adjoint_regions(
+    program: ProcessGraphProgramAdjoint,
+) -> tuple[ProcessGraphAdjointRegion, ...]:
+    """Materialize both directions as explicit ProcessGraph compartments.
+
+    Boundary nodes retain the source value id and become ordinary region
+    inputs only in the copied compartment. The authoritative forward and
+    backward graphs are never rewritten by isolation.
+    """
+
+    regions: list[ProcessGraphAdjointRegion] = []
+    forward_outputs = set(map(int, program.numeric.output_value_ids))
+    backward_outputs = set(map(int, program.numeric.backward.roots))
+    for region_id, node_ids in sorted(program.forward_region_nodes.items()):
+        regions.append(_isolate_process_graph_region(
+            program.numeric.forward,
+            phase="forward",
+            region_id=int(region_id),
+            node_ids=node_ids,
+            required_outputs=forward_outputs,
+        ))
+    for region_id, node_ids in sorted(program.backward_region_nodes.items()):
+        regions.append(_isolate_process_graph_region(
+            program.numeric.backward,
+            phase="backward",
+            region_id=int(region_id),
+            node_ids=node_ids,
+            required_outputs=backward_outputs,
+        ))
+    return tuple(regions)
 
 
 def _operation(data: Mapping[str, Any]) -> str:
@@ -2266,6 +2442,7 @@ __all__ = [
     "LoopAdjointContract",
     "GradientValueContract",
     "ProcessGraphProgramAdjoint",
+    "ProcessGraphAdjointRegion",
     "ProcessGraphBackwardProduct",
     "TrainingMotionSSALowering",
     "ProcessGraphAdjoint",
@@ -2277,5 +2454,6 @@ __all__ = [
     "differentiate_control_program",
     "differentiate_process_program",
     "fuse_forward_loss_backward",
+    "isolate_process_program_adjoint_regions",
     "lower_training_motion_to_repository_ssa",
 ]

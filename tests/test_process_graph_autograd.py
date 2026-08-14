@@ -17,6 +17,7 @@ from src.compiler.process_graph_autograd import (
     differentiate_process_graph,
     differentiate_process_program,
     fuse_forward_loss_backward,
+    isolate_process_program_adjoint_regions,
     lower_training_motion_to_repository_ssa,
 )
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
@@ -503,6 +504,68 @@ def test_process_program_adjoint_partitions_backward_by_forward_region():
             for node in node_ids
         }
         assert source_regions == ({0} if region == 2 else {1})
+
+
+def test_program_adjoint_regions_preserve_source_graph_and_publish_boundaries():
+    from src.compiler.control_source import ControlProgram, SequenceBlock, StatementBlock
+
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "input", label="x", shape=(2,))
+    _add(graph, 2, "input", label="weight", shape=(2,))
+    _add(graph, 3, "mul", (1, 2), shape=(2,))
+    _add(graph, 4, "mean", (3,), shape=())
+    graph.roots = [4]
+    control = ControlProgram(
+        SequenceBlock((
+            StatementBlock(("__scheduled_region_0__",)),
+            StatementBlock(("__scheduled_region_1__",)),
+        )),
+        region_indices=(0, 1),
+    )
+    program = differentiate_process_program(
+        graph,
+        control,
+        region_nodes={0: (1, 2, 3), 1: (4,)},
+        wrt=(1, 2),
+    )
+    source_snapshot = {
+        node_id: (
+            graph.G.nodes[node_id]["op"],
+            tuple(graph.G.nodes[node_id]["parents"]),
+        )
+        for node_id in graph.G
+    }
+
+    regions = isolate_process_program_adjoint_regions(program)
+
+    assert {(region.phase, region.region_id) for region in regions} == {
+        ("forward", 0), ("forward", 1), ("backward", 2), ("backward", 3),
+    }
+    forward_zero = next(
+        region for region in regions
+        if region.phase == "forward" and region.region_id == 0
+    )
+    forward_one = next(
+        region for region in regions
+        if region.phase == "forward" and region.region_id == 1
+    )
+    assert forward_zero.input_value_ids == (1, 2)
+    assert forward_zero.output_value_ids == (3,)
+    assert forward_one.input_value_ids == (3,)
+    assert forward_one.output_value_ids == (4,)
+    assert forward_one.graph.G.nodes[3]["op"] == "input"
+    assert forward_one.graph.G.nodes[3]["attributes"]["source_value_id"] == 3
+    assert all(
+        region.graph.G.graph["fused_program_semantic_authority"] is False
+        for region in regions
+    )
+    assert source_snapshot == {
+        node_id: (
+            graph.G.nodes[node_id]["op"],
+            tuple(graph.G.nodes[node_id]["parents"]),
+        )
+        for node_id in graph.G
+    }
 
 
 def test_program_adjoint_ledger_includes_predicate_and_loop_history_by_default():
