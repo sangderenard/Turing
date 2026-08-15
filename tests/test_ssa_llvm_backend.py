@@ -16,6 +16,7 @@ from __future__ import annotations
 import ctypes
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from src.common.tensors.accelerator_backends.aot_compile import compile_ast_aot
@@ -26,6 +27,7 @@ from src.compiler.precompile_to_ssa import lower_precompile_and_control_to_ssa
 from src.compiler.ssa_llvm_backend import (
     compile_artifact,
     emit_ssa_function_to_llvm,
+    prepare_artifact_execution,
     with_native_sgd_loop,
 )
 from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
@@ -151,31 +153,57 @@ def test_native_sgd_wrapper_repeats_motion_and_updates_parameter(tmp_path):
         parameter_gradient_pairs=((parameter.id, gradient.id),),
     )
     native = compile_artifact(loop, directory=tmp_path / "native_sgd_loop")
-    values = {
-        parameter.id: ctypes.c_double(4.0),
-        target.id: ctypes.c_double(1.0),
-        gradient.id: ctypes.c_double(0.0),
-        loss.id: ctypes.c_double(0.0),
-        native.training_steps_value_id: ctypes.c_int32(6),
-        native.learning_rate_value_id: ctypes.c_double(0.25),
-    }
-    pointers = (ctypes.c_void_p * len(native.buffer_order))(*(
-        ctypes.cast(ctypes.pointer(values[value_id]), ctypes.c_void_p)
-        for value_id in native.buffer_order
-    ))
-    extents = (ctypes.c_int32 * len(native.extent_order))()
+    execution = prepare_artifact_execution(native, {
+        parameter.id: 4.0,
+        target.id: 1.0,
+        native.training_steps_value_id: 6,
+        native.learning_rate_value_id: 0.25,
+    })
+    execution.run()
 
-    native.entry()(pointers, extents)
-
-    assert values[parameter.id].value == pytest.approx(
+    assert float(execution.buffers[parameter.id]) == pytest.approx(
         1.0 + 3.0 * (0.75 ** 6)
     )
-    assert values[gradient.id].value == pytest.approx(3.0 * (0.75 ** 5))
-    assert values[loss.id].value == pytest.approx((3.0 * (0.75 ** 5)) ** 2)
-    settled = values[parameter.id].value
-    values[native.training_steps_value_id].value = 0
-    native.entry()(pointers, extents)
-    assert values[parameter.id].value == settled
+    assert float(execution.buffers[gradient.id]) == pytest.approx(
+        3.0 * (0.75 ** 5)
+    )
+    assert float(execution.buffers[loss.id]) == pytest.approx(
+        (3.0 * (0.75 ** 5)) ** 2
+    )
+    settled = float(execution.buffers[parameter.id])
+    execution.buffers[native.training_steps_value_id][...] = 0
+    execution.run()
+    assert float(execution.buffers[parameter.id]) == settled
+
+
+def test_executor_measures_dynamic_shape_vector_from_feed():
+    tensor = SSAValue(10, "float64", ("rows", "cols"))
+    shape = SSAValue(11, "int32", (2,))
+    function = Function("dynamic_shape", [tensor], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "extent", [tensor], shape,
+                attributes={"extent_kind": "shape"},
+            ),
+            Instr("Ret", [], None),
+        ]),
+    })
+    artifact = emit_ssa_function_to_llvm(
+        IRModule({function.name: function}), function.name,
+    )
+    assert artifact.shortfalls == ()
+    assert artifact.extent_order == (
+        (tensor.id, "shape", 0),
+        (tensor.id, "shape", 1),
+    )
+
+    execution = prepare_artifact_execution(
+        artifact,
+        {tensor.id: np.arange(6, dtype=np.float64).reshape(2, 3)},
+    )
+
+    assert list(execution.extents) == [2, 3]
+    assert execution.buffers[tensor.id].shape == (2, 3)
 
 EXAMPLE = (
     Path(__file__).resolve().parents[1]

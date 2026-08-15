@@ -979,6 +979,7 @@ def _emit_repository_call_module(
     public_values = [*root.args, *root_outputs]
     buffer_order: list[int] = []
     buffer_shapes: list[tuple[_Any, ...]] = []
+    buffer_dtypes: list[str] = []
     public_pointer: dict[int, str] = {}
     wrapper: list[str] = ["entry:"]
     for value in public_values:
@@ -988,6 +989,7 @@ def _emit_repository_call_module(
         slot = len(buffer_order)
         buffer_order.append(value_id)
         buffer_shapes.append(tuple(value.shape or ()))
+        buffer_dtypes.append(_value_llvm_type(value))
         address = f"%public.addr.{slot}"
         loaded = f"%public.{slot}"
         wrapper.append(f"  {address} = getelementptr ptr, ptr %buffers, i64 {slot}")
@@ -1050,6 +1052,7 @@ def _emit_repository_call_module(
         buffer_shapes=tuple(buffer_shapes),
         extent_order=(),
         shortfalls=tuple(shortfalls),
+        buffer_dtypes=tuple(buffer_dtypes),
         needs_text_sink=bool(text_sink),
     )
 
@@ -1064,6 +1067,7 @@ class LLVMFunctionArtifact:
     buffer_shapes: tuple[tuple[_Any, ...], ...]
     extent_order: tuple[tuple[int, str, int | None], ...]
     shortfalls: tuple[LLVMEmissionShortfall, ...]
+    buffer_dtypes: tuple[str, ...] = ()
     needs_text_sink: bool = False
     library_path: _Path | None = None
     training_steps_value_id: int | None = None
@@ -1087,6 +1091,104 @@ class LLVMFunctionArtifact:
             ]
             self._entry = function
         return self._entry
+
+
+@_dataclass
+class LLVMExecution:
+    """Allocated runtime state for one compiled LLVM artifact."""
+
+    artifact: LLVMFunctionArtifact
+    buffers: dict[int, _Any]
+    pointers: _Any
+    extents: _Any
+
+    def run(self) -> "LLVMExecution":
+        self.artifact.entry()(self.pointers, self.extents)
+        return self
+
+
+def prepare_artifact_execution(
+    artifact: LLVMFunctionArtifact,
+    feeds: _Any,
+    *,
+    shapes: _Any = None,
+) -> LLVMExecution:
+    """Allocate the public ABI and derive runtime extents from real buffers."""
+
+    import numpy as np
+
+    feed_values = {int(key): value for key, value in dict(feeds or {}).items()}
+    shape_overrides = {
+        int(key): tuple(value) for key, value in dict(shapes or {}).items()
+    }
+    llvm_dtypes = artifact.buffer_dtypes or tuple(
+        "double" for _value_id in artifact.buffer_order
+    )
+    if len(llvm_dtypes) != len(artifact.buffer_order):
+        raise ValueError("artifact buffer dtype metadata does not match its ABI")
+    numpy_dtypes = {
+        "double": np.float64,
+        "i32": np.int32,
+        "i64": np.int64,
+        "i1": np.bool_,
+        "ptr": np.uintp,
+    }
+    buffers: dict[int, _Any] = {}
+    for value_id, authored_shape, llvm_dtype in zip(
+        artifact.buffer_order, artifact.buffer_shapes, llvm_dtypes
+    ):
+        value_id = int(value_id)
+        dtype = numpy_dtypes.get(str(llvm_dtype))
+        if dtype is None:
+            raise ValueError(f"unsupported LLVM ABI dtype {llvm_dtype!r}")
+        if value_id in feed_values:
+            value = np.asarray(feed_values[value_id], dtype=dtype)
+            if value.ndim and not value.flags.c_contiguous:
+                value = np.ascontiguousarray(value)
+            expected = shape_overrides.get(value_id)
+            if expected is not None and tuple(value.shape) != expected:
+                raise ValueError(
+                    f"feed {value_id} shape {value.shape!r} != {expected!r}"
+                )
+            buffers[value_id] = value
+            continue
+        runtime_shape = shape_overrides.get(value_id)
+        if runtime_shape is None:
+            try:
+                runtime_shape = tuple(int(extent) for extent in authored_shape)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"buffer {value_id} has dynamic shape {authored_shape!r}; "
+                    "provide a runtime shape"
+                ) from error
+        buffers[value_id] = np.zeros(runtime_shape or (), dtype=dtype)
+
+    pointers = (_ctypes.c_void_p * len(artifact.buffer_order))(*(
+        _ctypes.c_void_p(int(buffers[int(value_id)].ctypes.data))
+        for value_id in artifact.buffer_order
+    ))
+    extent_values: list[int] = []
+    for value_id, kind, axis in artifact.extent_order:
+        shape = tuple(buffers[int(value_id)].shape)
+        if kind in {"numel", "element_count"}:
+            extent_values.append(int(buffers[int(value_id)].size))
+        elif kind == "rank":
+            extent_values.append(len(shape))
+        elif kind in {"dim", "shape"} and axis is not None:
+            extent_values.append(int(shape[int(axis)]))
+        elif kind == "shape" and not shape:
+            extent_values.append(0)
+        else:
+            raise ValueError(
+                f"extent ({value_id}, {kind!r}, {axis!r}) cannot be measured"
+            )
+    extents = (_ctypes.c_int32 * len(extent_values))(*extent_values)
+    return LLVMExecution(
+        artifact=artifact,
+        buffers=buffers,
+        pointers=pointers,
+        extents=extents,
+    )
 
 
 def with_native_sgd_loop(
@@ -1152,6 +1254,9 @@ def with_native_sgd_loop(
     learning_rate_slot = steps_slot + 1
     original_name = str(artifact.name)
     selected_name = str(entry_name or original_name)
+    base_dtypes = artifact.buffer_dtypes or tuple(
+        "double" for _value_id in artifact.buffer_order
+    )
     once_name = "__" + _re.sub(r"[^A-Za-z0-9_$.-]", "_", selected_name) + "_motion_once"
     definition = _re.compile(
         r"define\s+void\s+@" + _re.escape(original_name)
@@ -1237,6 +1342,7 @@ def with_native_sgd_loop(
         buffer_shapes=(*artifact.buffer_shapes, (), ()),
         extent_order=artifact.extent_order,
         shortfalls=(),
+        buffer_dtypes=(*base_dtypes, "i32", "double"),
         needs_text_sink=artifact.needs_text_sink,
         training_steps_value_id=steps_id,
         learning_rate_value_id=learning_rate_id,
@@ -1290,6 +1396,10 @@ def emit_ssa_function_to_llvm(
         int(argument.id): tuple(argument.shape or ())
         for argument in function.args
     }
+    value_llvm_types: dict[int, str] = {
+        int(argument.id): _value_llvm_type(argument)
+        for argument in function.args
+    }
     for block in function.blocks.values():
         for instruction in block.instrs:
             for argument in instruction.args:
@@ -1299,6 +1409,9 @@ def emit_ssa_function_to_llvm(
             if instruction.res is not None:
                 value_shapes[int(instruction.res.id)] = tuple(
                     instruction.res.shape or ()
+                )
+                value_llvm_types[int(instruction.res.id)] = _value_llvm_type(
+                    instruction.res
                 )
 
     def buffer(value_id: int) -> str:
@@ -1341,10 +1454,10 @@ def emit_ssa_function_to_llvm(
     # arguments. Load them once at entry so scalar SSA can use the same
     # likeness table instead of requiring a Python-side scalar evaluator.
     for argument in function.args:
+        argument_pointer = buffer(int(argument.id))
         if tuple(argument.shape or ()):
             continue
         llvm_type = _value_llvm_type(argument)
-        argument_pointer = buffer(int(argument.id))
         register = f"%argument.{int(argument.id)}"
         lines.append(
             f"  {register} = load {llvm_type}, ptr {argument_pointer}, align 8"
@@ -1360,10 +1473,20 @@ def emit_ssa_function_to_llvm(
                 kind = str(instruction.attributes.get("extent_kind"))
                 axis = instruction.attributes.get("axis")
                 slot = len(extent_order)
-                extent_order.append((
-                    int(instruction.args[0].id), kind,
-                    int(axis) if axis is not None else None,
-                ))
+                source_id = int(instruction.args[0].id)
+                if kind == "shape":
+                    rank = len(value_shapes.get(source_id, ()))
+                    extent_order.extend(
+                        (source_id, "shape", shape_axis)
+                        for shape_axis in range(rank)
+                    )
+                    if rank == 0:
+                        extent_order.append((source_id, "shape", None))
+                else:
+                    extent_order.append((
+                        source_id, kind,
+                        int(axis) if axis is not None else None,
+                    ))
                 address = f"%extent.addr.{slot}"
                 lines.append(
                     f"  {address} = getelementptr i32, ptr %extents, i64 {slot}"
@@ -1688,6 +1811,9 @@ def emit_ssa_function_to_llvm(
         buffer_shapes=tuple(value_shapes.get(value_id, ()) for value_id in buffer_ids),
         extent_order=tuple(extent_order),
         shortfalls=tuple(shortfalls),
+        buffer_dtypes=tuple(
+            value_llvm_types.get(value_id, "double") for value_id in buffer_ids
+        ),
         needs_text_sink=publishes_text,
     )
 
