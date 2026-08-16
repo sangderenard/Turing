@@ -439,6 +439,74 @@ def test_keyed_mapping_lowers_to_token_and_value_vectors():
     ].id
 
 
+def test_mapping_iteration_walks_its_own_key_and_value_vectors():
+    """``for k, v in d.items()`` indexes the mapping's declared slots.
+
+    The loop lowering already walks an iterable as parallel columns, and a
+    keyed mapping already *is* parallel key/value vectors, so the two only had
+    to be recognised as the same thing. Before that the iterable and its second
+    column were anonymous storage: the loop bound came from an opaque ``extent``
+    call with nothing to measure, and neither projection named a slot, so every
+    backend refused the whole comprehension.
+    """
+
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def root(metrics):\n"
+        "    total = 0.0\n"
+        "    for name, limit in metrics.error_channels.items():\n"
+        "        total = total + limit\n"
+        "    return total\n",
+        "root",
+        name="mapping_iteration",
+        extraction_contract=CONTRACT,
+    )
+
+    root = module.functions["mapping_iteration__root"]
+    slot = {
+        (value.accounting or {}).get("program_abi_field"): int(value.id)
+        for value in root.args
+        if (value.accounting or {}).get("program_abi_keyed_owner")
+        == "error_channels"
+    }
+    instructions = [
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+    ]
+
+    # The opaque iterable extent is gone; the loop is bounded by the declared
+    # length itself.
+    assert not any(
+        instruction.attributes.get("tensor_operation") == "extent"
+        for instruction in instructions
+    )
+    condition = next(
+        instruction for instruction in instructions
+        if instruction.attributes.get("binding") == "loop_condition"
+    )
+    assert slot["error_channels.length"] in {
+        int(argument.id) for argument in condition.args
+    }
+
+    # Each destructured column indexes its own vector: names from the token
+    # vector, values from the value vector.
+    projected = {
+        int(instruction.args[0].id)
+        for instruction in instructions
+        if instruction.attributes.get("binding") == "projected_iterable"
+        and instruction.op == "GetElementPtr"
+    }
+    assert projected == {
+        slot["error_channels.keys"], slot["error_channels.values"],
+    }
+
+    # The anonymous iterable and its appended column are no longer arguments.
+    assert not any(
+        (value.accounting or {}).get("projected_row_source_id") is not None
+        for value in root.args
+    )
+
+
 def test_declared_mapping_or_default_keeps_the_mapping():
     """``x or {}`` over a declared container selects, it does not combine.
 

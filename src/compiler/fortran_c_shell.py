@@ -4247,8 +4247,124 @@ def _class_surface_ssa_program(
         if not table.records:
             all_record_tables.pop(symbol, None)
 
+    def resolve_keyed_mapping_iterables(symbol: str, graph: Any) -> None:
+        """Bind ``d.items()``/``.keys()``/``.values()`` to the mapping's slots.
+
+        A keyed mapping is already a length and two parallel vectors, and the
+        loop lowering already walks an iterable as parallel columns: column 0
+        is the iterable itself and each further column is an appended source
+        carrying ``projected_row_source_id``/``projected_row_column``. Those
+        columns *are* the mapping's key and value vectors, so nothing new is
+        built here -- only recognised. Left unrecognised they stay anonymous
+        storage with no length to iterate and no slot to read, which is what
+        made every consumer of a mapping unresolvable at every backend.
+
+        Both ends of the association are exact. The reducer states the method
+        as the node's own operation with the mapping as its operand, and the
+        column index is carried on the appended source, so neither the mapping
+        nor the column is inferred from a name or a position.
+        """
+
+        function = all_functions.get(symbol)
+        if function is None:
+            return
+        slots_by_mapping: dict[int, dict[str, int]] = {}
+        for value in function.args:
+            accounting = value.accounting or {}
+            if accounting.get("program_abi_storage") != "keyed":
+                continue
+            parts = {
+                part: accounting.get(f"program_abi_keyed_{part}")
+                for part in ("length", "keys", "values")
+            }
+            if any(slot is None for slot in parts.values()):
+                continue        # unresolved in this frame; leave it alone
+            slots_by_mapping[int(value.id)] = {
+                part: int(slot) for part, slot in parts.items()
+            }
+        if not slots_by_mapping:
+            return
+
+        # method -> the slot each successive destructured column selects
+        columns_by_method = {
+            "items": ("keys", "values"),
+            "keys": ("keys",),
+            "values": ("values",),
+        }
+        replacements: dict[int, int] = {}
+        for node_id, data in graph.nodes(data=True):
+            method = str(
+                data.get("type") or data.get("op") or ""
+            ).casefold()
+            columns = columns_by_method.get(method)
+            if columns is None:
+                continue
+            owner = next((
+                int(graph.nodes[parent].get("value_id", parent))
+                for parent, role in data.get("parents") or ()
+                if str(role) in {"operand", "value", "object", "base"}
+                and parent in graph
+            ), None)
+            slots = (
+                None if owner is None else slots_by_mapping.get(int(owner))
+            )
+            if slots is None:
+                continue
+            iterable_id = int(data.get("value_id", node_id))
+            replacements[iterable_id] = slots[columns[0]]
+            for value in function.args:
+                accounting = value.accounting or {}
+                source = accounting.get("projected_row_source_id")
+                if source is None or int(source) != iterable_id:
+                    continue
+                column = int(accounting.get("projected_row_column") or 0)
+                if column < len(columns):
+                    replacements[int(value.id)] = slots[columns[column]]
+            # The iterable's extent is the mapping's own declared length.
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if (
+                        instruction.op == "Call"
+                        and instruction.attributes.get("tensor_operation")
+                        == "extent"
+                        and instruction.args
+                        and int(instruction.args[0].id) == iterable_id
+                        and instruction.res is not None
+                    ):
+                        replacements[int(instruction.res.id)] = slots["length"]
+        if not replacements:
+            return
+
+        values = function_values(function)
+        resolved = {
+            source: values[target]
+            for source, target in replacements.items()
+            if target in values
+        }
+        for block in function.blocks.values():
+            kept = []
+            for instruction in block.instrs:
+                if (
+                    instruction.res is not None
+                    and int(instruction.res.id) in resolved
+                ):
+                    continue        # its value is the slot now
+                instruction.args = [
+                    resolved.get(int(argument.id), argument)
+                    for argument in instruction.args
+                ]
+                kept.append(instruction)
+            block.instrs = kept
+        function.args = [
+            value for value in function.args
+            if int(value.id) not in resolved
+        ]
+
     for source_symbol, source_graph in source_graphs_by_symbol.items():
         materialize_parameter_record_abi(source_symbol, source_graph)
+
+    for source_symbol, source_graph in source_graphs_by_symbol.items():
+        resolve_keyed_mapping_iterables(source_symbol, source_graph)
 
     for source_symbol, source_graph in source_graphs_by_symbol.items():
         materialize_program_abi_record_literals(source_symbol, source_graph)
