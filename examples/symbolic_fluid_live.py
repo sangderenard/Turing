@@ -93,8 +93,9 @@ def main() -> int:
         # runs at the frame rate as before.
         args.audio_rate = False
 
-    native = compile_native_symbolic_fluid_step(args.build_directory)
-    advance = load_symbolic_fluid_managed_functions(native)[
+    # The whole traversal is one native artifact now; the per-cell stencil
+    # adapter and the exec'd Python loop over it are gone.
+    advance = load_symbolic_fluid_managed_functions(args.build_directory)[
         "symbolic_fluid_advance"
     ]
     state = SymbolicFluidGridState.initial(args.grid, args.grid)
