@@ -3960,6 +3960,22 @@ def _class_surface_ssa_program(
                     candidate_ids = (next_physical_id,)
                     next_physical_id += 1
                 if storage == "keyed":
+                    # Materialize once per function. A second pass over the
+                    # same symbol sees different attribute occurrences, so
+                    # re-running would append a second set of slots and leave
+                    # the mapping naming the first -- ids that no longer
+                    # correspond to anything in this frame.
+                    already = next((
+                        int(existing)
+                        for value_id in candidate_ids
+                        if (existing := (
+                            (values.get(int(value_id)) or SSAValue(-1)
+                             ).accounting or {}
+                        ).get("program_abi_keyed_length")) is not None
+                        and int(existing) in values
+                    ), None)
+                    if already is not None:
+                        continue
                     # A mapping keyed by words is not one opaque handle. It is
                     # a length plus two parallel vectors: the keys as the
                     # repository's universal string tokens, and the values.
@@ -8511,6 +8527,16 @@ def _class_surface_ssa_program(
                         continue
                     if (formal.accounting or {}).get("program_abi_storage"):
                         continue
+                    # A keyed mapping's slot ids name values in the caller's
+                    # own frame. The callee materializes its own slots from the
+                    # same contract, so carrying these across would point at
+                    # whatever happens to hold those ids there.
+                    for frame_local in (
+                        "program_abi_keyed_length",
+                        "program_abi_keyed_keys",
+                        "program_abi_keyed_values",
+                    ):
+                        accounting.pop(frame_local, None)
                     formal.accounting = {
                         **dict(formal.accounting or {}), **accounting,
                     }
@@ -8522,6 +8548,42 @@ def _class_surface_ssa_program(
                     # is the repository's *static* element-count contract, so
                     # naming symbolic axes there would corrupt every buffer
                     # size and block copy derived from it.
+
+    # A keyed mapping's slot ids name values in one frame. Several passes copy
+    # field accounting between frames, so verify the correlation still resolves
+    # where it is stated and drop it where it does not. A mapping that names no
+    # slots is simply unresolved here -- honest, and refusable by a backend --
+    # whereas one naming ids this frame never defined would silently address
+    # whatever else happens to hold them.
+    for function in all_functions.values():
+        frame_values = {int(value.id) for value in function.args}
+        frame_values.update(
+            int(instruction.res.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        )
+        for value in function.args:
+            accounting = dict(value.accounting or {})
+            if accounting.get("program_abi_storage") != "keyed":
+                continue
+            slots = [
+                accounting.get("program_abi_keyed_length"),
+                accounting.get("program_abi_keyed_keys"),
+                accounting.get("program_abi_keyed_values"),
+            ]
+            if all(
+                slot is not None and int(slot) in frame_values
+                for slot in slots
+            ):
+                continue
+            for frame_local in (
+                "program_abi_keyed_length",
+                "program_abi_keyed_keys",
+                "program_abi_keyed_values",
+            ):
+                accounting.pop(frame_local, None)
+            value.accounting = accounting
 
     # Literal construction is pure. Source ingestion intentionally retains
     # strings, empty tuples, debug labels, and optional markers long enough
