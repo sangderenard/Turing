@@ -1626,6 +1626,46 @@ def _emit_repository_call_module(
                         body.append(f"  {rendered_line}")
                     if operation in {"Eq", "Ne", "Lt", "Le", "Gt", "Ge"}:
                         result_type = "i1"
+                # The cell was alloca'd with the value's DECLARED type; a
+                # narrower computed result stored raw left garbage bytes that
+                # a later declared-type load reinterpreted (an i32 mul result
+                # read back as double turned row*4 into a denormal ~0).
+                declared_type = _value_llvm_type(result)
+                if declared_type != result_type:
+                    converted = f"%declared.{tag}"
+                    if declared_type == "double" and result_type in {
+                        "i32", "i64",
+                    }:
+                        body.append(
+                            f"  {converted} = sitofp {result_type} "
+                            f"{register} to double"
+                        )
+                        register, result_type = converted, "double"
+                    elif declared_type == "double" and result_type == "i1":
+                        body.append(
+                            f"  {converted} = uitofp i1 {register} to double"
+                        )
+                        register, result_type = converted, "double"
+                    elif declared_type in {"i32", "i64"} and result_type == (
+                        "double"
+                    ):
+                        body.append(
+                            f"  {converted} = fptosi double {register} "
+                            f"to {declared_type}"
+                        )
+                        register, result_type = converted, declared_type
+                    elif (
+                        declared_type in {"i32", "i64"}
+                        and result_type in {"i32", "i64"}
+                    ):
+                        opcode_word = (
+                            "sext" if declared_type == "i64" else "trunc"
+                        )
+                        body.append(
+                            f"  {converted} = {opcode_word} {result_type} "
+                            f"{register} to {declared_type}"
+                        )
+                        register, result_type = converted, declared_type
                 body.append(
                     f"  store {result_type} {register}, ptr {pointer(result)}, align 8"
                 )

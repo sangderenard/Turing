@@ -1681,9 +1681,23 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                 _constant_values.get(root),
             )
 
+        # A loop target's value is per-iteration even though its INITIALIZER
+        # is a literal; folding it froze ``row`` at 0 inside every region a
+        # nested body formed, so value = row*4+col compiled as value = col.
+        loop_target_value_ids = {
+            int(bound_target)
+            for _loop_id, loop_data in graph.G.nodes(data=True)
+            for bound_target in (
+                (loop_data.get("attributes") or {}).get(
+                    "loop_target_bindings", {}
+                ) or {}
+            ).values()
+        }
         capture_constants = {}
         for value_id in region_captures:
             if value_id in carried_initial_boundaries:
+                continue
+            if int(value_id) in loop_target_value_ids:
                 continue
             known, value = _constant_expression(value_id)
             if known:
