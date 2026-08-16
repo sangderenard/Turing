@@ -848,6 +848,15 @@ class _ControlSSABuilder:
         for result_id, query_id, sequence_id in table_lookups:
             if ("lookup", (result_id, query_id, sequence_id)) in scheduled_table_operations:
                 continue
+            # A whole-program shell graph shows every linked frame's nodes,
+            # so a lookup can be recorded here whose result this function
+            # never consumes -- it is a callee's operation.  Emitting it
+            # anyway materialized its operands as id()-carrying arguments
+            # (dead code by definition: real value ids are monotonic), which
+            # displaced the frame's positional public-span correlation.  The
+            # owner is the function whose regions consume the result.
+            if int(result_id) not in self.region_value_meta:
+                continue
             self._emit_table_lookup(result_id, query_id, sequence_id)
         for effect_id, key_id, value_id, sequence_id in table_stores:
             if ("store", (effect_id, key_id, value_id, sequence_id)) in scheduled_table_operations:

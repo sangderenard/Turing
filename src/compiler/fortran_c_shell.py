@@ -1045,6 +1045,7 @@ def _field_slot_ops(
     graph_obj: Any,
     *,
     retained_storage_identities: frozenset[str] = frozenset(),
+    keyed_table_fields: frozenset[str] = frozenset(),
 ):
     """Recover a method's instance-field accesses as slot loads and stores.
 
@@ -1149,6 +1150,25 @@ def _field_slot_ops(
             field_sequence_ids[canonical] = result_id
     for _attribute, canonical, result_id in aggregate_reads:
         field_sequence_ids.setdefault(canonical, result_id)
+    # A contract-declared keyed field is a lookup table too, but it is a
+    # program-ABI record field, not a class-field aggregate, so it must not
+    # enter ``field_sequence_ids`` (that registry engages the object-field
+    # arena machinery).  Same identity convention: the GetAttr's own value id
+    # names the table, one canonical id per field.
+    keyed_field_sequence_ids: dict[str, int] = {}
+    if keyed_table_fields:
+        for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
+            data = graph_obj.nodes[node_id]
+            if node_operation(data) != "getattr":
+                continue
+            attribute = str(
+                (data.get("attributes") or {}).get("attribute") or ""
+            )
+            if attribute not in keyed_table_fields:
+                continue
+            keyed_field_sequence_ids.setdefault(
+                attribute, int(data.get("value_id", node_id))
+            )
     # Runtime aggregates captured from a lexical/module binding are resident
     # storage exactly like aggregate fields, but they have no record slot.
     # Correlate all normalized occurrences by their authored binding identity;
@@ -1251,7 +1271,6 @@ def _field_slot_ops(
             2 if aggregate_kind == "dict" else 1,
             aggregate_kind != "bytes",
         ))
-
     def table_sequence(base_id: int) -> tuple[int | None, str | None]:
         if base_id not in graph_obj:
             return None, None
@@ -1268,6 +1287,11 @@ def _field_slot_ops(
             return (
                 field_sequence_ids[canonical],
                 f"{owner}.{canonical}",
+            )
+        if str(field_name) in keyed_field_sequence_ids:
+            return (
+                keyed_field_sequence_ids[str(field_name)],
+                f"keyed.{field_name}",
             )
         if attributes.get("aggregate_kind") != "dict":
             return None, None
@@ -1467,6 +1491,31 @@ def _field_slot_ops(
             key_id,
             int(sequence_id),
         ))
+    # ``d.get(key, default)`` is the same lookup ``d[key]`` is -- the key's
+    # token walked against the table -- differing only in what the absent
+    # branch yields.  Recognising only ``indexed`` left ``get`` unclaimed, so
+    # its result crossed every backend as a producerless argument.
+    for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
+        data = graph_obj.nodes[node_id]
+        if node_operation(data) != "get":
+            continue
+        by_role = {
+            str(role): int(parent)
+            for parent, role in (data.get("parents") or ())
+        }
+        base_id = by_role.get("operand") or by_role.get("value")
+        key_id = by_role.get("arg:0")
+        if base_id is None or key_id is None or base_id not in graph_obj:
+            continue
+        sequence_id, _storage_identity = table_sequence(base_id)
+        if sequence_id is None:
+            continue
+        key_id = int(graph_obj.nodes[key_id].get("value_id", key_id))
+        table_lookups.append((
+            int(data.get("value_id", node_id)),
+            key_id,
+            int(sequence_id),
+        ))
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         if node_operation(data) != "indexedstore":
@@ -1580,6 +1629,33 @@ def _field_slot_ops(
         for sequence_id, policy, column_count, writable
         in sequence_declarations
     ]
+    # A record-field dict is a table exactly as a local one is, but declare it
+    # only where a table operation actually addresses it: a declaration
+    # materializes anonymous descriptor storage into the frame, and doing that
+    # in functions that merely ITERATE the mapping displaced their public-span
+    # correlation for every unrelated rank-2 field.
+    field_table_ids = {
+        int(sequence_id)
+        for sequence_id in (
+            *field_sequence_ids.values(),
+            *keyed_field_sequence_ids.values(),
+        )
+    }
+    referenced_table_ids = {
+        int(sequence_id)
+        for _result, _query, sequence_id in table_lookups
+    } | {
+        int(sequence_id)
+        for _effect, _key, _value, sequence_id in table_stores
+    }
+    declared_ids = {
+        int(sequence_id) for sequence_id, *_rest in sequence_declarations
+    }
+    sequence_declarations.extend(
+        (int(sequence_id), "unique", 2, False)
+        for sequence_id in sorted(field_table_ids & referenced_table_ids)
+        if int(sequence_id) not in declared_ids
+    )
     return (
         self_value_id,
         tuple(field_ops),
@@ -2669,6 +2745,20 @@ def _class_surface_ssa_program(
         self_id, field_ops, const_sources, field_count, field_names, record_identity, sequence_initializations, field_aliases, sequence_declarations, sequence_memberships, table_lookups, table_stores, table_deletions, retained_sequence_ids, nested_sequence_ids, nested_record_fields = _field_slot_ops(
             graph_obj,
             retained_storage_identities=frozenset(retained_storage_identities),
+            # A contract-declared keyed field is a lookup table, but it is a
+            # program-ABI record field, NOT a class-field aggregate: seeding
+            # it into class_field_aggregate_kinds engaged the object-field
+            # arena machinery in every frame and displaced public-span
+            # correlation for unrelated fields.  This channel reaches only
+            # table recognition.
+            keyed_table_fields=frozenset(
+                str(_field_name)
+                for _record in dict(program_abi.get("records") or {}).values()
+                for _field_name, _field in dict(
+                    _record.get("fields") or {}
+                ).items()
+                if str(_field.get("storage") or "") == "keyed"
+            ),
         )
         from .hierarchical_plan import PlanCall
 
@@ -4282,7 +4372,16 @@ def _class_surface_ssa_program(
             slots_by_mapping[int(value.id)] = {
                 part: int(slot) for part, slot in parts.items()
             }
-        if not slots_by_mapping:
+        # The mapping identity's slot correlation is frame-local and may have
+        # been dropped, while the parts themselves still name their owner.
+        # Lookups rebind through the parts, so their presence alone keeps
+        # this pass alive.
+        has_keyed_parts = any(
+            (value.accounting or {}).get("program_abi_keyed_owner")
+            is not None
+            for value in function.args
+        )
+        if not slots_by_mapping and not has_keyed_parts:
             return
 
         # method -> the slot each successive destructured column selects
@@ -4332,6 +4431,57 @@ def _class_surface_ssa_program(
                         and instruction.res is not None
                     ):
                         replacements[int(instruction.res.id)] = slots["length"]
+        # A table lookup on a keyed mapping walks the same declared vectors.
+        # The descriptor was built during lowering from anonymous storage --
+        # (keys, values, length, capacity) fresh arguments -- because the
+        # slots only exist after record materialization.  Bind them here.
+        # The mapping identity's own accounting may be frame-local-dropped,
+        # so the parts are found by their owner/part markers and the lookup's
+        # field by its GetAttr node in the source graph.  A caller-supplied
+        # mapping is always exactly full, so capacity IS the length; the
+        # status cell stays an ordinary frame-allocated scalar.
+        parts_by_owner: dict[str, dict[str, int]] = {}
+        for value in function.args:
+            accounting = value.accounting or {}
+            owner = accounting.get("program_abi_keyed_owner")
+            part = accounting.get("program_abi_keyed_part")
+            if owner is None or part is None:
+                continue
+            parts_by_owner.setdefault(str(owner), {})[str(part)] = int(
+                value.id
+            )
+        field_of_sequence: dict[int, str] = {}
+        for node_id, data in graph.nodes(data=True):
+            attribute = (data.get("attributes") or {}).get("attribute")
+            if attribute is None:
+                continue
+            field_of_sequence[int(data.get("value_id", node_id))] = str(
+                attribute
+            )
+        helper_argument_dtypes = (
+            ("int64", None), ("float64", None), ("int", (1,)),
+            ("int", None), ("int", (1,)), ("int64", None),
+        )
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    instruction.op != "Call"
+                    or instruction.attributes.get("ssa_sequence_operation")
+                    != "lookup"
+                    or len(instruction.args) < 6
+                ):
+                    continue
+                sequence_id = int(
+                    instruction.attributes.get("sequence_id", -1)
+                )
+                owner = field_of_sequence.get(sequence_id)
+                if owner is None:
+                    continue
+                # The slots this lookup must walk may not exist in this frame
+                # yet -- for a mapping produced by a call, the linker imports
+                # them later.  Stamp the owner now, while the source graph is
+                # at hand; the storage is bound after call-frame linking.
+                instruction.attributes["keyed_lookup_owner"] = str(owner)
         if not replacements:
             return
 
@@ -8618,6 +8768,165 @@ def _class_surface_ssa_program(
             if constants:
                 block.instrs[index:index] = constants
             instruction.args = refreshed
+
+    # A table lookup on a keyed mapping walks the mapping's own declared
+    # vectors.  Its descriptor was built during lowering from anonymous
+    # storage -- (keys, values, length, capacity) fresh arguments -- because
+    # the slots exist only after record materialization and call-frame
+    # linking.  Every frame is linked now, so bind them: keys/values/length
+    # are the owner's parts, and a caller-supplied mapping is always exactly
+    # full, so capacity IS the length.  The status cell stays an ordinary
+    # frame-allocated scalar.
+    _keyed_helper_dtypes = (
+        ("int64", None), ("float64", None), ("int", (1,)),
+        ("int", None), ("int", (1,)), ("int64", None),
+    )
+    for function in all_functions.values():
+        parts_by_owner: dict[str, dict[str, Any]] = {}
+        for value in function.args:
+            accounting = value.accounting or {}
+            owner_name = accounting.get("program_abi_keyed_owner")
+            part_name = accounting.get("program_abi_keyed_part")
+            if owner_name is None or part_name is None:
+                continue
+            parts_by_owner.setdefault(str(owner_name), {})[
+                str(part_name)
+            ] = value
+        if not parts_by_owner:
+            continue
+        replaced_storage_ids: set[int] = set()
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                owner_name = instruction.attributes.get("keyed_lookup_owner")
+                if owner_name is None or len(instruction.args) < 6:
+                    continue
+                parts = parts_by_owner.get(str(owner_name))
+                if parts is None or any(
+                    name not in parts
+                    for name in ("length", "keys", "values")
+                ):
+                    continue
+                replaced_storage_ids.update(
+                    int(argument.id) for argument in instruction.args[:4]
+                )
+                instruction.args[0] = parts["keys"]
+                instruction.args[1] = parts["values"]
+                instruction.args[2] = parts["length"]
+                instruction.args[3] = parts["length"]
+                helper = all_functions.get(
+                    str(instruction.attributes.get("callee") or "")
+                )
+                if helper is not None:
+                    typed: dict[int, str] = {}
+                    for argument, (dtype, shape) in zip(
+                        helper.args, _keyed_helper_dtypes
+                    ):
+                        if argument.dtype in {None, "unknown", "None"}:
+                            argument.dtype = dtype
+                        if shape is not None and not tuple(
+                            argument.shape or ()
+                        ):
+                            argument.shape = shape
+                        typed[int(argument.id)] = str(argument.dtype)
+                    # The body holds its own SSAValue instances for the same
+                    # ids; retype them too, and give each Load the element
+                    # type of the span it reads.
+                    span_element = {
+                        int(helper.args[0].id): "int64",
+                        int(helper.args[1].id): "float64",
+                    }
+                    address_element: dict[int, str] = {}
+                    for helper_block in helper.blocks.values():
+                        for helper_instruction in helper_block.instrs:
+                            for value in (
+                                *helper_instruction.args,
+                                *((helper_instruction.res,)
+                                  if helper_instruction.res is not None
+                                  else ()),
+                            ):
+                                refined = typed.get(int(value.id))
+                                if refined is not None and value.dtype in {
+                                    None, "unknown", "None",
+                                }:
+                                    value.dtype = refined
+                            if (
+                                helper_instruction.op == "GetElementPtr"
+                                and helper_instruction.res is not None
+                                and helper_instruction.args
+                            ):
+                                element = span_element.get(
+                                    int(helper_instruction.args[0].id)
+                                )
+                                if element is not None:
+                                    address_element[
+                                        int(helper_instruction.res.id)
+                                    ] = element
+                            if (
+                                helper_instruction.op == "Load"
+                                and helper_instruction.res is not None
+                                and helper_instruction.args
+                                and helper_instruction.res.dtype in {
+                                    None, "unknown", "None",
+                                }
+                            ):
+                                element = address_element.get(
+                                    int(helper_instruction.args[0].id)
+                                )
+                                if element is not None:
+                                    helper_instruction.res.dtype = element
+        if not replaced_storage_ids:
+            continue
+        still_consumed = {
+            int(argument.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            for argument in instruction.args
+        }
+        dropped_positions = [
+            position
+            for position, value in enumerate(function.args)
+            if int(value.id) in replaced_storage_ids
+            and int(value.id) not in still_consumed
+        ]
+        if not dropped_positions:
+            continue
+        original_arity = len(function.args)
+        function.args = [
+            value
+            for position, value in enumerate(function.args)
+            if position not in set(dropped_positions)
+        ]
+        # A formal exists only together with the operand every caller feeds
+        # it.  Dropping the formal alone leaves each call site one operand
+        # too long, and the public-span origin walk skips calls whose arity
+        # disagrees -- silently severing every span reached through this
+        # function for every caller above it.
+        function_symbol = next(
+            (
+                candidate_symbol
+                for candidate_symbol, candidate in all_functions.items()
+                if candidate is function
+            ),
+            None,
+        )
+        if function_symbol is None:
+            continue
+        for caller in all_functions.values():
+            for block in caller.blocks.values():
+                for instruction in block.instrs:
+                    if (
+                        instruction.op != "Call"
+                        or str(
+                            instruction.attributes.get("callee") or ""
+                        ) != function_symbol
+                        or len(instruction.args) != original_arity
+                    ):
+                        continue
+                    instruction.args = [
+                        argument
+                        for position, argument in enumerate(instruction.args)
+                        if position not in set(dropped_positions)
+                    ]
 
     # A declared record field keeps its storage identity across the call frame.
     # The contract states `height` as a rank-2 span, but a callee's formal

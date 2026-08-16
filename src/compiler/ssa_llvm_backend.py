@@ -1080,7 +1080,13 @@ def _emit_repository_call_module(
                     )
                     address_slots[result_id] = slot
                     continue
-                if len(instruction.args) > 1 and name in extent_users:
+                # A single index is already the offset and touches no extent
+                # slot, so it must not require membership in extent_users --
+                # that set names functions with MULTI-axis addresses.  A
+                # rank-1 span walk (a keyed lookup helper) is single-index.
+                if len(instruction.args) > 1 and (
+                    name in extent_users or len(instruction.args) == 2
+                ):
                     base = instruction.args[0]
                     indices = [
                         load_as(argument, "i32", f"{tag}.{position}")
@@ -1102,7 +1108,15 @@ def _emit_repository_call_module(
                         rank == len(indices)
                         and (
                             public_id is not None
-                            or all(isinstance(item, int) for item in static)
+                            # Vacuously-true all() over an empty static shape
+                            # walked a declared-rank span into extent slots
+                            # for a public origin that does not exist.
+                            or (
+                                len(static) >= len(indices)
+                                and all(
+                                    isinstance(item, int) for item in static
+                                )
+                            )
                         )
                     ):
                         offset = indices[0]
