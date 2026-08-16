@@ -121,3 +121,19 @@ is_scalar_value, or admit intrinsic extractions unconditionally when the
 consumer is a carried continuation (the port set names them exactly).
 Both build-failure modes are honest now -- the loop_carried shortfall
 names the value the moment membership drops it.
+
+
+## Minimal executable repro decodes the last wrongness (session 3)
+
+8-line nested sum+max (tools: lower nested2__root, count=4) compiles with
+zero shortfalls and returns total=24, peak=3 (expect 120, 15).  Decode:
+24 = sum(row*4) with col==0; 3 = max(col) with row==0.  The two carried
+chains live in different regions, each holding its own copy of
+float(row*4+col); each copy binds ONE loop's induction correctly and reads
+the OTHER loop's induction from its seed cell.  Cross-loop induction feeds
+into inner-body regions are the remaining defect -- everything else in the
+carried chain (phis, ports, order, linked calls, phi forward refs) is now
+verified correct by this same program.  Fix where induction values bind to
+region feeds (precompile loop lowering, external_values[target]=induction
+around the projected-binding block); the outer induction consumed by an
+inner-body region must resolve to the OUTER phi value, not the start cell.
