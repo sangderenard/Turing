@@ -3222,12 +3222,29 @@ class _ControlSSABuilder:
         # port as the carried Phi's exit value; left undefined it
         # materialized as a producerless argument and every reduction after
         # the loop read its own seed.
-        for port_id, _initial_id, updated_id in getattr(
+        #
+        # Nesting: continuation consumers hold the INNERMOST loop's port ids
+        # (materialization rewires inner-first), but only the OUTERMOST phi
+        # dominates the outer exit.  Each loop therefore rebinds every port
+        # already seen for the same (initial, updated) carried identity, so
+        # after the outermost lowering all aliases of one reduction name the
+        # phi that is actually in scope where they are read.
+        carried_ports = getattr(self, "_carried_port_groups", None)
+        if carried_ports is None:
+            carried_ports = {}
+            self._carried_port_groups = carried_ports
+        for port_id, initial_id, updated_id in getattr(
             loop, "result_ports", ()
         ):
             phi = carried_phis.get(int(updated_id))
-            if phi is not None and phi.res is not None:
-                self.external_values[int(port_id)] = phi.res
+            if phi is None or phi.res is None:
+                continue
+            group = carried_ports.setdefault(
+                (int(initial_id), int(updated_id)), set()
+            )
+            group.add(int(port_id))
+            for grouped_port in group:
+                self.external_values[int(grouped_port)] = phi.res
         for source_id, collection_id, induction_name, start in (
             self.program.collection_bindings
         ):

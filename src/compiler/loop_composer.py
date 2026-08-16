@@ -3193,12 +3193,36 @@ def analyze_shader_loop_reductions(
             for node_id in regions[index]:
                 if int(node_id) not in graph.G:
                     continue
-                for parent, _role in (
-                    graph.G.nodes[int(node_id)].get("parents") or ()
-                ):
-                    producer = body_region_owner.get(int(parent))
-                    if producer is not None and producer != index:
-                        region_dependencies.add_edge(producer, index)
+                # A dependency may pass THROUGH nodes no region owns -- a
+                # source-linked call mediating region_1 -> stencil ->
+                # region_3 is invisible to a direct parent check, which left
+                # the accumulator free to schedule before the stencil whose
+                # outputs it consumes.  Project each path onto its nearest
+                # region-owned ancestors, exactly as the fusion reducer
+                # projects execution edges through structural nodes.
+                pending = [
+                    int(parent)
+                    for parent, _role in (
+                        graph.G.nodes[int(node_id)].get("parents") or ()
+                    )
+                ]
+                seen: set[int] = set()
+                while pending:
+                    parent = pending.pop()
+                    if parent in seen or parent not in graph.G:
+                        continue
+                    seen.add(parent)
+                    producer = body_region_owner.get(parent)
+                    if producer is not None:
+                        if producer != index:
+                            region_dependencies.add_edge(producer, index)
+                        continue
+                    pending.extend(
+                        int(grandparent)
+                        for grandparent, _role in (
+                            graph.G.nodes[parent].get("parents") or ()
+                        )
+                    )
         try:
             body_region_indices = tuple(nx.lexicographical_topological_sort(
                 region_dependencies, key=earliest_member,

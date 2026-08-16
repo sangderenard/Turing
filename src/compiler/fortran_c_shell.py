@@ -6714,6 +6714,19 @@ def _class_surface_ssa_program(
                 ))
                 if anchor_value_id is None:
                     return False
+                produced_ids = {
+                    int(instruction.res.id)
+                    for instruction in sequence
+                    if instruction.res is not None
+                }
+                for instruction in sequence:
+                    produced_ids.update(
+                        int(output_id) for output_id in (
+                            (instruction.attributes or {}).get(
+                                "output_ids"
+                            ) or ()
+                        )
+                    )
                 for block_name, block in caller.blocks.items():
                     if block_name not in owned:
                         continue
@@ -6723,6 +6736,22 @@ def _class_surface_ssa_program(
                             and int(instruction.res.id)
                             == int(anchor_value_id)
                         ):
+                            # The anchor names WHERE the authored program
+                            # placed this call; region reordering may have
+                            # legally moved a consumer of the call's outputs
+                            # ahead of that anchor.  A call may never follow
+                            # a consumer of its own results, so clamp to the
+                            # earliest such consumer.
+                            index = min(index, next((
+                                consumer_index
+                                for consumer_index, candidate in enumerate(
+                                    block.instrs[:index]
+                                )
+                                if any(
+                                    int(argument.id) in produced_ids
+                                    for argument in candidate.args
+                                )
+                            ), index))
                             block.instrs[index:index] = sequence
                             return True
                 return False

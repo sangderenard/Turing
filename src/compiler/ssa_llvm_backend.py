@@ -837,6 +837,21 @@ def _emit_repository_call_module(
             for block_name, block in function.blocks.items()
             for instruction in block.instrs
         ]
+        # Phi registers must be visible to every block regardless of render
+        # order: a loop exit may render before a nested header (dict order),
+        # and an outer phi's latch operand references the inner phi.  Left
+        # unregistered, pointer() fabricated a dead alloca for the
+        # not-yet-rendered phi and cached it -- the outer phi then read a
+        # cell nothing ever wrote, which zeroed every nested carried
+        # reduction.  LLVM accepts forward references; pre-register them all.
+        for _block_name, instruction in scheduled_instructions:
+            if (
+                str(instruction.op) in {"Phi", "phi"}
+                and instruction.res is not None
+            ):
+                pointers[int(instruction.res.id)] = (
+                    f"%phi.{int(instruction.res.id)}"
+                )
         projection_values: dict[int, dict[int, _Any]] = {}
         projection_addresses: dict[int, tuple[int, int]] = {}
         constant_values = {
