@@ -198,8 +198,15 @@ _VIEW_OPERATIONS = frozenset({
     "detach",
 })
 _CAST_OPERATIONS = {
+    # Value-precision casts under the double-typed working representation.
+    # The reference semantics is the numpy backend's ``_cast_`` map:
+    # float -> float32 values, double -> float64 values (a copying identity
+    # here), int/long -> truncated integer values, bool -> nonzero.  ``double``
+    # previously shared the narrowing kernel and silently truncated every
+    # mantissa to single precision.
     "float": "cast_double_to_float_values",
-    "double": "cast_double_to_float_values",
+    "double": "cast_double_to_double_values",
+    "bool": "cast_double_to_bool_values",
     "to_dtype": None,
     "astype": None,
     "to": None,
@@ -1165,11 +1172,28 @@ def lower_tensor_calls_to_repository_ssa(
                         or (metadata[-1] if metadata else result.dtype or "")
                     ).lower()
                     if callee is None:
-                        callee = (
-                            "cast_double_to_int_values"
-                            if any(token in dtype_hint for token in ("int", "long", "bool"))
-                            else "cast_double_to_float_values"
-                        )
+                        # Dispatch on the requested dtype exactly.  The old
+                        # two-way split sent every non-integer request --
+                        # including an explicit ``to_dtype("float64")`` --
+                        # through the single-precision narrowing kernel, and
+                        # sent ``bool`` through integer truncation (2.7 -> 2
+                        # where the reference says nonzero -> 1).
+                        if any(
+                            token in dtype_hint
+                            for token in ("bool", "logical")
+                        ):
+                            callee = "cast_double_to_bool_values"
+                        elif any(
+                            token in dtype_hint for token in ("int", "long")
+                        ):
+                            callee = "cast_double_to_int_values"
+                        elif any(
+                            token in dtype_hint
+                            for token in ("float64", "double")
+                        ):
+                            callee = "cast_double_to_double_values"
+                        else:
+                            callee = "cast_double_to_float_values"
                     count = need_count(source, source_count)
                     if count is not None:
                         emitted.append(call(callee, [source, result, count], result, instruction, output_argument=1))

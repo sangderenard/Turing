@@ -38,6 +38,7 @@ _OP_NAMES = {
     "exp": "CT_OP_EXP",
     "log": "CT_OP_LOG",
     "tanh": "CT_OP_TANH",
+    "sigmoid": "CT_OP_SIGMOID",
     "sin": "CT_OP_SIN",
     "cos": "CT_OP_COS",
     "tan": "CT_OP_TAN",

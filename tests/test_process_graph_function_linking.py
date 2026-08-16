@@ -507,6 +507,122 @@ def test_mapping_iteration_walks_its_own_key_and_value_vectors():
     )
 
 
+def test_comprehension_element_is_evaluated_inside_its_own_loop():
+    """A generator's element expression is loop-owned work, not a prologue.
+
+    A ``for`` statement claims its whole body subtree; a comprehension claimed
+    only the element's root node, so every operand below it -- here the
+    ``float`` cast -- was planned into a region scheduled before the loop and
+    fed the target's pre-loop value.  The loop then loaded the real element
+    into a value nothing read.  Both halves are silent: the program compiles
+    and computes the wrong thing.
+    """
+
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def root(metrics):\n"
+        "    return any(\n"
+        "        float(limit) > 1.0\n"
+        "        for name, limit in metrics.error_channels.items()\n"
+        "    )\n",
+        "root",
+        name="comprehension_element",
+        extraction_contract=CONTRACT,
+    )
+
+    root = module.functions["comprehension_element__root"]
+    body = next(
+        block for name, block in root.blocks.items()
+        if name.startswith("loop_body")
+    )
+    values_load = next(
+        instruction for instruction in body.instrs
+        if instruction.op == "Load"
+        and instruction.attributes.get("binding") == "projected_iterable"
+        and int(instruction.attributes.get("projection", -1)) == 1
+    )
+    element = int(values_load.res.id)
+
+    # The projected value column is read by work in the same iteration ...
+    consumers = [
+        instruction for instruction in body.instrs
+        if any(int(argument.id) == element for argument in instruction.args)
+    ]
+    assert consumers, "the loaded element has no consumer in the loop body"
+
+    # ... and that work is the element expression's own region.
+    region_call = next(
+        instruction for instruction in consumers
+        if instruction.op == "Call"
+        and "planned_region" in str(instruction.attributes.get("callee", ""))
+    )
+    region = module.functions[str(region_call.attributes["callee"])]
+    region_ops = [
+        instruction.op
+        for block in region.blocks.values()
+        for instruction in block.instrs
+    ]
+    assert "Cast" in region_ops and "Gt" in region_ops
+
+    # Nothing in the element expression is left as a pre-loop argument.
+    entry = root.blocks["entry"]
+    assert not any(
+        instruction.op == "Call"
+        and "planned_region" in str(instruction.attributes.get("callee", ""))
+        for instruction in entry.instrs
+    )
+
+
+def test_comprehension_reduction_reads_the_collection_the_loop_publishes():
+    """``any(...)`` consumes the loop's collection port, not the generator.
+
+    A carried binding rewires its continuation onto its ``LoopResult``; a
+    collection output did not.  The reduction kept naming the comprehension
+    node, which the retained loop no longer produces, so it arrived as an
+    anonymous frame slot while every published element went somewhere else.
+    """
+
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def root(metrics):\n"
+        "    return any(\n"
+        "        float(limit) > 1.0\n"
+        "        for name, limit in metrics.error_channels.items()\n"
+        "    )\n",
+        "root",
+        name="comprehension_reduction",
+        extraction_contract=CONTRACT,
+    )
+
+    root = module.functions["comprehension_reduction__root"]
+    instructions = [
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+    ]
+    publication = next(
+        instruction for instruction in instructions
+        if instruction.attributes.get("binding") == "collection_publication"
+        and instruction.op == "GetElementPtr"
+    )
+    collection_id = int(publication.attributes["collection_value_id"])
+
+    def reduces(callee_name: str) -> bool:
+        callee = module.functions.get(callee_name)
+        return callee is not None and any(
+            item.op == "any"
+            for block in callee.blocks.values()
+            for item in block.instrs
+        )
+
+    reduction_call = next(
+        instruction for instruction in instructions
+        if instruction.op == "Call"
+        and reduces(str(instruction.attributes.get("callee", "")))
+    )
+    assert collection_id in {
+        int(argument.id) for argument in reduction_call.args
+    }
+
+
 def test_declared_mapping_or_default_keeps_the_mapping():
     """``x or {}`` over a declared container selects, it does not combine.
 

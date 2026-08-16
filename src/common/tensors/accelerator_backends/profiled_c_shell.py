@@ -22,6 +22,45 @@ from functools import lru_cache
 from typing import Any, Callable
 
 
+_C_TRACE_DECLARATIONS = r"""
+typedef struct TuringTraceRecord {
+    unsigned long long sequence;
+    unsigned long long shell_ns;
+    unsigned long long device_ns;
+    int region;
+    int status;
+} TuringTraceRecord;
+
+typedef struct TuringTraceRing {
+    TuringTraceRecord *records;
+    unsigned long long capacity;
+    unsigned long long written;
+    unsigned long long drained;
+} TuringTraceRing;
+
+typedef struct TuringTraceSite {
+    TuringTraceRing *ring;
+    int region;
+    int reserved;
+} TuringTraceSite;
+
+void turing_trace_ring_reset(
+    TuringTraceRing *ring,
+    TuringTraceRecord *storage,
+    unsigned long long capacity
+);
+void turing_trace_logger(void *user, const TuringLaunchProfile *profile);
+turing_launch_logger turing_trace_logger_address(void);
+unsigned long long turing_trace_available(const TuringTraceRing *ring);
+unsigned long long turing_trace_lost(const TuringTraceRing *ring);
+unsigned long long turing_trace_drain(
+    TuringTraceRing *ring,
+    TuringTraceRecord *out,
+    unsigned long long limit
+);
+"""
+
+
 _C_DECLARATIONS = r"""
 typedef int (*turing_compute_closure)(
     void *context,
@@ -71,6 +110,27 @@ int turing_profiled_launch_ex(
     int language
 );
 
+"""
+
+
+_C_TRACE_SOURCE = r"""
+/* Trace digest.
+
+   The logger hook fires once per launch, which is the right granularity to
+   watch a program run -- but calling into Python there would cost more than
+   the launch being measured, which is the same reason TuringLaunchStats
+   accumulates in C rather than round-tripping. So the default logger writes a
+   fixed-size record into a ring the artifact owns, and a reader drains it
+   whenever it likes. The launch pays four stores; nothing crosses a language
+   boundary until someone asks.
+
+   ``written`` and ``drained`` are monotonic totals rather than wrapped
+   indices, so a reader can tell the difference between an empty ring and one
+   that lapped it: if more than ``capacity`` records accumulated since the last
+   drain, the oldest are simply gone and the reader is told how many. Losing
+   the tail of a burst is the correct failure -- the alternative is stalling
+   the program to keep its own telemetry. */
+
 typedef struct TuringTraceRecord {
     unsigned long long sequence;
     unsigned long long shell_ns;
@@ -96,16 +156,80 @@ void turing_trace_ring_reset(
     TuringTraceRing *ring,
     TuringTraceRecord *storage,
     unsigned long long capacity
-);
-void turing_trace_logger(void *user, const TuringLaunchProfile *profile);
-turing_launch_logger turing_trace_logger_address(void);
-unsigned long long turing_trace_available(const TuringTraceRing *ring);
-unsigned long long turing_trace_lost(const TuringTraceRing *ring);
+) {
+    if (ring == 0) {
+        return;
+    }
+    ring->records = storage;
+    ring->capacity = storage == 0 ? 0 : capacity;
+    ring->written = 0;
+    ring->drained = 0;
+}
+
+void turing_trace_logger(void *user, const TuringLaunchProfile *profile) {
+    TuringTraceSite *site = (TuringTraceSite *)user;
+    if (site == 0 || profile == 0) {
+        return;
+    }
+    TuringTraceRing *ring = site->ring;
+    if (ring == 0 || ring->capacity == 0 || ring->records == 0) {
+        return;
+    }
+    TuringTraceRecord *record =
+        &ring->records[ring->written % ring->capacity];
+    record->sequence = ring->written;
+    record->shell_ns = profile->shell_ns;
+    record->device_ns = profile->device_ns;
+    record->region = site->region;
+    record->status = profile->status;
+    ring->written += 1;
+}
+
+/* The launch wants a function pointer. Handing back C's own address avoids
+   depending on how the binding happens to expose library symbols. */
+turing_launch_logger turing_trace_logger_address(void) {
+    return turing_trace_logger;
+}
+
+unsigned long long turing_trace_available(const TuringTraceRing *ring) {
+    if (ring == 0 || ring->capacity == 0) {
+        return 0;
+    }
+    unsigned long long pending = ring->written - ring->drained;
+    return pending > ring->capacity ? ring->capacity : pending;
+}
+
+unsigned long long turing_trace_lost(const TuringTraceRing *ring) {
+    if (ring == 0 || ring->capacity == 0) {
+        return 0;
+    }
+    unsigned long long pending = ring->written - ring->drained;
+    return pending > ring->capacity ? pending - ring->capacity : 0;
+}
+
 unsigned long long turing_trace_drain(
     TuringTraceRing *ring,
     TuringTraceRecord *out,
     unsigned long long limit
-);
+) {
+    if (ring == 0 || out == 0 || ring->capacity == 0 || ring->records == 0) {
+        return 0;
+    }
+    unsigned long long written = ring->written;
+    unsigned long long drained = ring->drained;
+    unsigned long long pending = written - drained;
+    if (pending > ring->capacity) {
+        /* The writer lapped the reader; resume at the oldest survivor. */
+        drained = written - ring->capacity;
+        pending = ring->capacity;
+    }
+    unsigned long long count = pending < limit ? pending : limit;
+    for (unsigned long long index = 0; index < count; ++index) {
+        out[index] = ring->records[(drained + index) % ring->capacity];
+    }
+    ring->drained = drained + count;
+    return count;
+}
 """
 
 
@@ -235,9 +359,17 @@ int turing_profiled_launch_ex(
             stats->shell_ns_max = shell_ns;
         }
     }
+#if TURING_TRACE
     if (logger != 0) {
         logger(logger_user, profile);
     }
+#else
+    /* Diagnostics were not requested, so the hook is not compiled in at all
+       -- not merely skipped. A launch pays nothing for a facility it was not
+       built with, which is the only honest meaning of opt-in here. */
+    (void)logger;
+    (void)logger_user;
+#endif
     return status;
 }
 
@@ -249,123 +381,6 @@ int turing_profiled_launch(
     return turing_profiled_launch_ex(
         compute, context, profile, 0, 0, 0, 0
     );
-}
-
-/* Trace digest.
-
-   The logger hook fires once per launch, which is the right granularity to
-   watch a program run -- but calling into Python there would cost more than
-   the launch being measured, which is the same reason TuringLaunchStats
-   accumulates in C rather than round-tripping. So the default logger writes a
-   fixed-size record into a ring the artifact owns, and a reader drains it
-   whenever it likes. The launch pays four stores; nothing crosses a language
-   boundary until someone asks.
-
-   ``written`` and ``drained`` are monotonic totals rather than wrapped
-   indices, so a reader can tell the difference between an empty ring and one
-   that lapped it: if more than ``capacity`` records accumulated since the last
-   drain, the oldest are simply gone and the reader is told how many. Losing
-   the tail of a burst is the correct failure -- the alternative is stalling
-   the program to keep its own telemetry. */
-
-typedef struct TuringTraceRecord {
-    unsigned long long sequence;
-    unsigned long long shell_ns;
-    unsigned long long device_ns;
-    int region;
-    int status;
-} TuringTraceRecord;
-
-typedef struct TuringTraceRing {
-    TuringTraceRecord *records;
-    unsigned long long capacity;
-    unsigned long long written;
-    unsigned long long drained;
-} TuringTraceRing;
-
-typedef struct TuringTraceSite {
-    TuringTraceRing *ring;
-    int region;
-    int reserved;
-} TuringTraceSite;
-
-void turing_trace_ring_reset(
-    TuringTraceRing *ring,
-    TuringTraceRecord *storage,
-    unsigned long long capacity
-) {
-    if (ring == 0) {
-        return;
-    }
-    ring->records = storage;
-    ring->capacity = storage == 0 ? 0 : capacity;
-    ring->written = 0;
-    ring->drained = 0;
-}
-
-void turing_trace_logger(void *user, const TuringLaunchProfile *profile) {
-    TuringTraceSite *site = (TuringTraceSite *)user;
-    if (site == 0 || profile == 0) {
-        return;
-    }
-    TuringTraceRing *ring = site->ring;
-    if (ring == 0 || ring->capacity == 0 || ring->records == 0) {
-        return;
-    }
-    TuringTraceRecord *record =
-        &ring->records[ring->written % ring->capacity];
-    record->sequence = ring->written;
-    record->shell_ns = profile->shell_ns;
-    record->device_ns = profile->device_ns;
-    record->region = site->region;
-    record->status = profile->status;
-    ring->written += 1;
-}
-
-/* The launch wants a function pointer. Handing back C's own address avoids
-   depending on how the binding happens to expose library symbols. */
-turing_launch_logger turing_trace_logger_address(void) {
-    return turing_trace_logger;
-}
-
-unsigned long long turing_trace_available(const TuringTraceRing *ring) {
-    if (ring == 0 || ring->capacity == 0) {
-        return 0;
-    }
-    unsigned long long pending = ring->written - ring->drained;
-    return pending > ring->capacity ? ring->capacity : pending;
-}
-
-unsigned long long turing_trace_lost(const TuringTraceRing *ring) {
-    if (ring == 0 || ring->capacity == 0) {
-        return 0;
-    }
-    unsigned long long pending = ring->written - ring->drained;
-    return pending > ring->capacity ? pending - ring->capacity : 0;
-}
-
-unsigned long long turing_trace_drain(
-    TuringTraceRing *ring,
-    TuringTraceRecord *out,
-    unsigned long long limit
-) {
-    if (ring == 0 || out == 0 || ring->capacity == 0 || ring->records == 0) {
-        return 0;
-    }
-    unsigned long long written = ring->written;
-    unsigned long long drained = ring->drained;
-    unsigned long long pending = written - drained;
-    if (pending > ring->capacity) {
-        /* The writer lapped the reader; resume at the oldest survivor. */
-        drained = written - ring->capacity;
-        pending = ring->capacity;
-    }
-    unsigned long long count = pending < limit ? pending : limit;
-    for (unsigned long long index = 0; index < count; ++index) {
-        out[index] = ring->records[(drained + index) % ring->capacity];
-    }
-    ring->drained = drained + count;
-    return count;
 }
 
 /* Cost of the launch boundary itself, in picoseconds.
@@ -487,6 +502,9 @@ class LaunchStatistics:
 class ProfiledCShell:
     ffi: Any
     library: Any
+    # Whether the digest was compiled in. Reading it beats calling a symbol
+    # that does not exist in this build.
+    trace: bool = False
 
     def callback(
         self,
@@ -668,14 +686,29 @@ class ProfiledCShell:
         )
 
 
-@lru_cache(maxsize=1)
-def profiled_c_shell() -> ProfiledCShell:
+@lru_cache(maxsize=2)
+def profiled_c_shell(*, trace: bool = False) -> ProfiledCShell:
+    """Build the launch boundary, with diagnostics only if asked for.
+
+    ``trace=False`` is not a runtime flag that skips the digest -- the digest
+    is not in the binary. The ring, its logger, and the hook that would call
+    it are all behind ``TURING_TRACE``, so an artifact built without
+    diagnostics has no trace code to execute, no branch to predict, and no
+    symbol to resolve. Turning it on is a compile-time decision, cached
+    separately so both shells can coexist in one process.
+    """
+
     from cffi import FFI
 
     ffi = FFI()
-    ffi.cdef(_C_DECLARATIONS)
-    library = ffi.verify(_C_SOURCE)
-    return ProfiledCShell(ffi=ffi, library=library)
+    declarations = _C_DECLARATIONS
+    source = "#define TURING_TRACE {}\n".format(1 if trace else 0) + _C_SOURCE
+    if trace:
+        declarations = declarations + _C_TRACE_DECLARATIONS
+        source = source + _C_TRACE_SOURCE
+    ffi.cdef(declarations)
+    library = ffi.verify(source)
+    return ProfiledCShell(ffi=ffi, library=library, trace=bool(trace))
 
 
 __all__ = [

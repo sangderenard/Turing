@@ -162,11 +162,49 @@ _UNARY: dict[str, str] = {
     "SiToFp": "real({0}, c_double)",
     "UiToFp": "real({0}, c_double)",
     "FpExt": "real({0}, c_double)",
-    "FpTrunc": "real({0}, c_double)",
+    # Narrowing keeps the double working type but passes the VALUE through
+    # single precision; spelling it as a plain c_double conversion was an
+    # identity that never narrowed anything.
+    "FpTrunc": "real(real({0}, c_float), c_double)",
     "neg": "(-{0})",
     "abs": "abs({0})",
     "sqrt": "sqrt({0})",
     "Sqrt": "sqrt({0})",
+    # The transcendentals. ``sqrt`` above is algebraic and was already here;
+    # these are not producible by finitely many algebraic operations, which is
+    # the only reason they were a separate omission rather than an oversight
+    # of the same kind. Every one is a Fortran intrinsic -- the inverse
+    # hyperbolics since Fortran 2008 -- so nothing here is a new capability,
+    # only a registration that was missing.
+    #
+    # CONCERN, worth auditing rather than assuming: Fortran intrinsics are
+    # ELEMENTAL, so ``exp(a)`` over a whole array is a single whole-array
+    # operation the compiler is free to vectorise -- exactly the property
+    # ``_REDUCTION`` below is written to exploit ("emitted as whole-array
+    # intrinsics rather than explicit loops so the compiler picks the
+    # schedule"). That only holds if the operand still *is* an array by the
+    # time it reaches here. If the SSA arriving at this table has already been
+    # scalarised into a per-element loop, these templates faithfully emit a
+    # scalar call per element and the batch opportunity is gone -- not because
+    # the registration is wrong, but because it was lost upstream. The
+    # batch-capable library functions (``unary_double`` and friends) are the
+    # ones that would preserve it. So: check whether these callees arrive with
+    # array operands before concluding the emitted Fortran is as fast as it
+    # can be.
+    "exp": "exp({0})",
+    "log": "log({0})",
+    "sin": "sin({0})",
+    "cos": "cos({0})",
+    "tan": "tan({0})",
+    "asin": "asin({0})",
+    "acos": "acos({0})",
+    "atan": "atan({0})",
+    "sinh": "sinh({0})",
+    "cosh": "cosh({0})",
+    "tanh": "tanh({0})",
+    "asinh": "asinh({0})",
+    "acosh": "acosh({0})",
+    "atanh": "atanh({0})",
     # FLOOR/CEILING/NINT return INTEGER in Fortran, where the numpy
     # equivalents return a float. Keeping the recorded program's type means
     # converting back, which also stops these from poisoning every intrinsic
@@ -2007,6 +2045,43 @@ class _FunctionEmitter:
         native_callee = self.callee_native_symbols.get(str(callee), str(callee))
         return [f"    call {native_callee}({', '.join(arguments)})"]
 
+    #: Value-precision cast kernels arrive as ``Call`` instructions whose
+    #: callee is the C kernel symbol (attached by the shared tensor SSA
+    #: lowering) with operands ``(source, out, count)``.  They are not SSA
+    #: functions in the module, so ``_ssa_call`` cannot serve them -- but each
+    #: is one ELEMENTAL Fortran expression, so the whole call is a single
+    #: whole-array assignment and the count operand never needs to exist.
+    #: The reference semantics is the numpy backend's ``_cast_`` map.
+    _CAST_KERNEL_SPELLINGS = {
+        "cast_double_to_float_values": "real(real({0}, c_float), c_double)",
+        "cast_double_to_double_values": "({0})",
+        "cast_double_to_int_values": "real(int({0}, c_int64_t), c_double)",
+        "cast_double_to_bool_values": (
+            "merge(1.0_c_double, 0.0_c_double, ({0}) /= 0.0_c_double)"
+        ),
+    }
+
+    def _cast_kernel_call(self, instr: Instr) -> list[str] | None:
+        if instr.op not in ("Call", "call"):
+            return None
+        spelling = self._CAST_KERNEL_SPELLINGS.get(
+            str(instr.attributes.get("callee") or "")
+        )
+        if spelling is None or instr.res is None:
+            return None
+        output_argument = instr.attributes.get("ssa_output_argument")
+        if (
+            output_argument is None
+            or len(instr.args) < 2
+            or int(output_argument) < 0
+            or int(output_argument) >= len(instr.args)
+            or int(instr.args[int(output_argument)].id) != int(instr.res.id)
+        ):
+            return None
+        source = self._operand(instr.args[0])
+        self._locals[instr.res.id] = self._typed(instr.res)
+        return [f"    {_name(instr.res)} = {spelling.format(source)}"]
+
     def _indexed_store(self, instr: Instr) -> list[str] | None:
         """``collection[i] = value``, without materialising an address.
 
@@ -2347,13 +2422,23 @@ class _FunctionEmitter:
                 callee = str(instr.attributes.get("callee") or "")
                 intrinsic = {
                     "pow": "{0} ** {1}",
-                                                                                                                                                                                                                                                    "llvm.sqrt.f64": "sqrt({0})",
+                    "llvm.sqrt.f64": "sqrt({0})",
                     "llvm.fabs.f64": "abs({0})",
                     "llvm.round.f64": "anint({0})",
                     "llvm.trunc.f64": "aint({0})",
                     "llvm.floor.f64": "floor({0}, kind=c_int64_t)",
                     "llvm.ceil.f64": "ceiling({0}, kind=c_int64_t)",
                 }.get(callee)
+                if intrinsic is None and len(instr.args) == 1:
+                    # A call whose callee is simply the operation's own name,
+                    # carrying no ``tensor_operation`` to recognise it by.
+                    # These are the primitive-library functions the SSA
+                    # lowering emits -- ``exp`` calling ``exp`` -- and the
+                    # name is the whole identity. Consulting ``_UNARY`` here
+                    # means one registration serves both spellings instead of
+                    # this dict having to restate every intrinsic it already
+                    # holds.
+                    intrinsic = _UNARY.get(callee)
                 if intrinsic is not None:
                     return intrinsic.format(*(self._operand(a) for a in instr.args))
                 if callee in {"llvm.fcmp.ord", "llvm.fcmp.uno"} and len(instr.args) == 2:
@@ -2723,6 +2808,15 @@ class _FunctionEmitter:
             group = self._region_call(block, index)
             if group is not None:
                 body.extend(group)
+                continue
+
+            # Before _ssa_call deliberately: even when the kernel body was
+            # imported into the module, the ELEMENTAL spelling is one
+            # whole-array assignment the compiler can vectorise, where the
+            # imported body is an explicit per-element loop.
+            cast = self._cast_kernel_call(instr)
+            if cast is not None:
+                body.extend(cast)
                 continue
 
             call = self._ssa_call(instr)

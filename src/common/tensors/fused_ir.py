@@ -314,6 +314,7 @@ ELEMENTWISE_UNARY = frozenset(
         "exp",
         "log",
         "tanh",
+        "sigmoid",
         "sin",
         "cos",
         "tan",

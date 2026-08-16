@@ -59,7 +59,8 @@ ffi.cdef("""
         CT_OP_EQ, CT_OP_NE, CT_OP_MAXIMUM, CT_OP_MINIMUM, CT_OP_TANH,
         CT_OP_SIN, CT_OP_COS, CT_OP_TAN, CT_OP_ASIN, CT_OP_ACOS,
         CT_OP_ATAN, CT_OP_SINH, CT_OP_COSH, CT_OP_ASINH, CT_OP_ACOSH,
-        CT_OP_ATANH, CT_OP_SIGN, CT_OP_INVERT, CT_OP_BITAND, CT_OP_BITOR,
+        CT_OP_ATANH, CT_OP_SIGN, CT_OP_INVERT, CT_OP_SIGMOID,
+        CT_OP_BITAND, CT_OP_BITOR,
         CT_OP_BITXOR, CT_OP_SHL, CT_OP_SHR, CT_OP_LOGICAL_AND,
         CT_OP_LOGICAL_OR, ...
     } CTensorOp;
@@ -174,6 +175,8 @@ ffi.cdef("""
 
     void cast_double_to_int_values(const double* a, double* out, int n);
     void cast_double_to_float_values(const double* a, double* out, int n);
+    void cast_double_to_double_values(const double* a, double* out, int n);
+    void cast_double_to_bool_values(const double* a, double* out, int n);
     void stack_double(const double** tensors, int num_tensors, const int* shape, int ndim, int dim, double* out);
     void cat_double(const double** tensors, const int* dim_sizes, int num_tensors, const int* shape, int ndim, int dim, double* out);
 """)
@@ -435,6 +438,7 @@ class CTensorOperations(AbstractTensor):
             "exp": C.CT_OP_EXP,
             "log": C.CT_OP_LOG,
             "tanh": C.CT_OP_TANH,
+            "sigmoid": C.CT_OP_SIGMOID,
             "sin": C.CT_OP_SIN,
             "cos": C.CT_OP_COS,
             "tan": C.CT_OP_TAN,
@@ -1587,8 +1591,13 @@ class CTensorOperations(AbstractTensor):
             C.cast_double_to_float_values(
                 tensor.as_c_ptr(), buf, tensor.size
             )
+        elif dtype in {"bool", "bool_"}:
+            buf = ffi.new("double[]", tensor.size)
+            C.cast_double_to_bool_values(
+                tensor.as_c_ptr(), buf, tensor.size
+            )
         else:
-            raise ValueError("C backend supports numeric float/int casts only")
+            raise ValueError("C backend supports numeric float/int/bool casts only")
 
         return CTensor(tensor.shape, buf)
 

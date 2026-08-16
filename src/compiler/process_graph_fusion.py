@@ -791,8 +791,30 @@ def reduce_scheduled_shader_regions(
                 candidates[:len(group)] = [merged]
                 changed = True
 
+    # Regions execute in the order they are listed, so that order must respect
+    # the quotient graph, not the position of each region's earliest member.
+    # Fusing a node with a consumer that depends on a later region moved the
+    # whole region ahead of its own producer: the consumer then read the
+    # producer's pre-loop value while the real result was versioned into a
+    # value nothing read -- a use before definition that emitted cleanly.
+    # Every accepted merge keeps the quotient acyclic, so a topological order
+    # always exists; the earliest-member index remains the tie-break, which
+    # leaves every already-legal listing exactly as it was.
+    region_order = {
+        region_id: position
+        for position, region_id in enumerate(
+            nx.lexicographical_topological_sort(
+                quotient(),
+                key=lambda region_id: min(
+                    order_index[node_id] for node_id in regions[region_id]
+                ),
+            )
+        )
+    }
     dispatches = []
-    for region_id, members in regions.items():
+    for region_id, members in sorted(
+        regions.items(), key=lambda item: region_order[item[0]]
+    ):
         ordered = tuple(sorted(members, key=order_index.__getitem__))
         dispatches.append(FlatComputeDispatch(
             kind="shader_region",
@@ -801,11 +823,6 @@ def reduce_scheduled_shader_regions(
             operator_pattern=tuple(_operation(graph, node) for node in ordered),
             rewrite_history=tuple(histories[region_id]),
         ))
-    dispatches.sort(
-        key=lambda dispatch: min(
-            order_index[node_id] for node_id in dispatch.node_ids
-        )
-    )
     node_locations = {
         node_id: (dispatch_index, lane_index)
         for dispatch_index, dispatch in enumerate(dispatches)

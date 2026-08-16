@@ -47,7 +47,13 @@ _DIRECT_HANDLERS = {
     "alloca": Handler.Alloca,
     "getelementptr": Handler.GetElementPtr,
     "trunc": Handler.Trunc,
-    "fptrunc": Handler.Trunc,
+    # ``fptrunc`` narrows a FLOAT's precision; ``Trunc`` is INTEGER
+    # truncation.  Conflating them turned the float-narrowing kernels into
+    # integer truncation wherever an imported body was re-spelled (Fortran
+    # emitted ``int(x)`` for ``float(x)`` with no shortfall).  ``Cast`` with
+    # the result's own declared type carries the correct meaning, exactly as
+    # ``fpext`` below already does.
+    "fptrunc": Handler.Cast,
     "zext": Handler.ZExt,
     "sext": Handler.SExt,
     "fptosi": Handler.FpToSi,

@@ -236,15 +236,29 @@ def tensor_identity(value: Any) -> int:
     values fall back to ``id()`` since there is nowhere to cache a token.
     """
     if isinstance(value, AbstractTensor):
-        token = value.__dict__.get("_identity_token")
+        # Ordinary attribute access, not ``__dict__`` indexing. Reaching into
+        # the instance dictionary bypasses nothing here -- ``AbstractTensor``
+        # overrides neither ``__getattr__`` nor ``__setattr__`` -- but it does
+        # ingest as a literal dictionary read and write, so a graph built from
+        # this function carried a Python mapping into the IR and left a
+        # ``GetAttr('__dict__')`` chain that the planner could not place. The
+        # class-level default below means the read always resolves, so this is
+        # the same two operations expressed on the path every other attribute
+        # already takes.
+        token = value._identity_token
         if token is None:
             token = next(_IDENTITY_COUNTER)
-            value.__dict__["_identity_token"] = token
+            value._identity_token = token
         return token
     return id(value)
 
 
 class AbstractTensor:
+    # Declared so ``tensor_identity`` reads a slot that always exists rather
+    # than a lookup that misses on first use. Instances overwrite it with
+    # their own token; the class value is only ever the "not yet assigned"
+    # sentinel.
+    _identity_token: int | None = None
     _preferred_backend: str | None = None
     _preferred_device: Any = None
     inf: float = float('inf')
@@ -3648,6 +3662,7 @@ from .abstraction_methods.elementwise import (
     __rshift__ as elementwise_rshift,
     where as elementwise_where,
     sign as elementwise_sign,
+    sigmoid as elementwise_sigmoid,
     maximum as elementwise_maximum,
     minimum as elementwise_minimum,
     _as_scalar, _scalar_kernel,
@@ -3655,6 +3670,7 @@ from .abstraction_methods.elementwise import (
 )
 
 # --- Elementwise operator assignments (from abstraction_methods/elementwise.py) ---
+AbstractTensor.sigmoid   = elementwise_sigmoid
 AbstractTensor.__eq__    = elementwise_eq
 AbstractTensor.__ne__    = elementwise_ne
 AbstractTensor.__lt__    = elementwise_lt

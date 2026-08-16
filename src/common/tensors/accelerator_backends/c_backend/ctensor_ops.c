@@ -200,6 +200,17 @@
                 case CT_OP_LOGICAL_NOT:
                     out[i] = value == 0.0 ? 1.0 : 0.0; break;
                 case CT_OP_TANH: out[i] = tanh(value); break;
+                /* Branch-free stable form: exp() of a large positive argument
+                   overflows, so the sign of the input decides which way the
+                   quotient is written. Both branches are the same function. */
+                case CT_OP_SIGMOID:
+                    if (value >= 0.0) {
+                        out[i] = 1.0 / (1.0 + exp(-value));
+                    } else {
+                        double activation = exp(value);
+                        out[i] = activation / (1.0 + activation);
+                    }
+                    break;
                 case CT_OP_SIN: out[i] = sin(value); break;
                 case CT_OP_COS: out[i] = cos(value); break;
                 case CT_OP_TAN: out[i] = tan(value); break;
@@ -246,6 +257,7 @@
         return (
             (op >= CT_OP_SQRT && op <= CT_OP_LOGICAL_NOT)
             || (op >= CT_OP_TANH && op <= CT_OP_INVERT)
+            || op == CT_OP_SIGMOID
         );
     }
 
@@ -687,6 +699,17 @@
 
     void cast_double_to_float_values(const double* a, double* out, int n) {
         for (int i = 0; i < n; ++i) out[i] = (double)((float)a[i]);
+    }
+
+    /* double -> double is the identity over values, but it is still a cast:
+     * the reference semantics (numpy astype) always copies, so aliasing the
+     * source buffer would change behaviour under later in-place mutation. */
+    void cast_double_to_double_values(const double* a, double* out, int n) {
+        for (int i = 0; i < n; ++i) out[i] = a[i];
+    }
+
+    void cast_double_to_bool_values(const double* a, double* out, int n) {
+        for (int i = 0; i < n; ++i) out[i] = (a[i] != 0.0) ? 1.0 : 0.0;
     }
 
     void log_softmax_1d(const double* a, double* out, int n) {

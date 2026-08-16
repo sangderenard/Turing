@@ -1287,6 +1287,18 @@ def materialize_retained_loop_ports(
                 "collection_owner_id": collection_id,
             })
             materializer["attributes"] = materializer_attributes
+            # A carried binding rewires its continuation onto the LoopResult
+            # port; a collection output did not, so a reduction such as
+            # ``any(... for ...)`` kept consuming the comprehension node --
+            # which the loop no longer produces.  The loop published every
+            # element into the collection and the reduction read an unrelated
+            # anonymous slot.  The collection port is the value that leaves
+            # this loop, so the continuation must name it.
+            rewire_continuation(
+                int(output.materializer_node_id),
+                collection_id,
+                owned_nodes,
+            )
             planned_iteration_outputs.append(LoopIterationOutput(
                 value_id=int(output.value_id),
                 result_value_id=collection_id,
@@ -1951,18 +1963,82 @@ class LoopComposer:
                 if is_lexical_body_node(candidate)
             )
         elif not body_nodes and isinstance(expression, ast.comprehension):
-            body_nodes = tuple(
-                parent
+            comprehension_owners = tuple(
+                successor
                 for successor in graph.G.successors(node_id)
                 if isinstance(
                     graph.G.nodes[successor].get("expr_obj"),
                     (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
                 )
+            )
+            element_roots = tuple(
+                parent
+                for successor in comprehension_owners
                 for parent, role in (
                     graph.G.nodes[successor].get("parents") or ()
                 )
                 if str(role) in {"elt", "key", "value"}
             )
+            # The element expression *is* the comprehension's body, and a
+            # ``for`` statement claims its whole body subtree.  Claiming only
+            # the element's root node left every operand below it -- a cast, a
+            # mapping lookup, an arithmetic step -- outside the loop, where it
+            # bound the target's pre-loop value and the loop's own projected
+            # load was left with no consumer.  Walk the authored element and
+            # filter conditions the same way ``ast.For`` walks its statements.
+            authored_members = [
+                member
+                for successor in comprehension_owners
+                for field in ("elt", "key", "value")
+                if (
+                    owner_expression := getattr(
+                        graph.G.nodes[successor].get("expr_obj"), field, None
+                    )
+                ) is not None
+                for member in ast.walk(owner_expression)
+            ]
+            authored_members.extend(
+                member
+                for condition in expression.ifs
+                for member in ast.walk(condition)
+            )
+            element_nodes = tuple(dict.fromkeys(
+                member_node
+                for member in authored_members
+                if (member_node := graph_node_for_ast(member)) is not None
+            ))
+            # A load resolved inside the element may name a value defined
+            # before the comprehension -- the mapping being looked up, a bound
+            # constant.  Those are captured dependencies the planner is right
+            # to evaluate once.  Only work that reaches the loop's own target
+            # is loop-owned, so keep exactly what descends from a target
+            # binding, plus the element roots themselves.
+            target_value_ids = frozenset(map(
+                int,
+                (attributes.get("loop_target_bindings") or {}).values(),
+            ))
+            target_dependents: set[int] = set()
+            pending = [
+                target_id
+                for target_id in target_value_ids
+                if target_id in graph.G
+            ]
+            while pending:
+                current = pending.pop()
+                for successor in graph.G.successors(current):
+                    successor = int(successor)
+                    if successor in target_dependents:
+                        continue
+                    target_dependents.add(successor)
+                    pending.append(successor)
+            body_nodes = tuple(dict.fromkeys((
+                *element_roots,
+                *(
+                    member
+                    for member in element_nodes
+                    if int(member) in target_dependents
+                ),
+            )))
         if body_nodes:
             original_position = {
                 int(member): position
@@ -3079,18 +3155,65 @@ def analyze_shader_loop_reductions(
             validated_raise_signatures.update(
                 expression_signature(item) for item in statement.body
             )
+        def earliest_member(index: int) -> int:
+            return min(
+                lexical_position[node_id]
+                for node_id in regions[index]
+                if node_id in lexical_position
+            )
+
         body_region_indices = tuple(sorted(
             (
             index
             for index, nodes in enumerate(regions)
             if body.intersection(nodes)
             ),
-            key=lambda index: min(
-                lexical_position[node_id]
-                for node_id in regions[index]
-                if node_id in lexical_position
-            ),
+            key=earliest_member,
         ))
+        # A region's earliest member says when it *may* start, not when it may
+        # run: the same region also holds later members whose operands another
+        # region produces.  Ordering by the earliest member alone put a fused
+        # cast-and-compare ahead of the region computing the compare's other
+        # operand, so the compare read that operand's pre-loop value while the
+        # real one was versioned into a value nothing read -- a use before
+        # definition that every backend emitted without complaint.  Order the
+        # body over the regions' own dependency graph instead, and keep each
+        # region as early as its dependencies allow.
+        body_region_owner = {
+            int(node_id): index
+            for index in body_region_indices
+            for node_id in regions[index]
+        }
+        region_dependencies = nx.DiGraph()
+        region_dependencies.add_nodes_from(body_region_indices)
+        for index in body_region_indices:
+            for node_id in regions[index]:
+                if int(node_id) not in graph.G:
+                    continue
+                for parent, _role in (
+                    graph.G.nodes[int(node_id)].get("parents") or ()
+                ):
+                    producer = body_region_owner.get(int(parent))
+                    if producer is not None and producer != index:
+                        region_dependencies.add_edge(producer, index)
+        try:
+            body_region_indices = tuple(nx.lexicographical_topological_sort(
+                region_dependencies, key=earliest_member,
+            ))
+        except nx.NetworkXUnfeasible as error:
+            raise ValueError(
+                f"loop {loop.node_id} has mutually dependent body regions; "
+                "region formation must not fuse across a dependency cycle"
+            ) from error
+        body_region_positions = {}
+        for index in body_region_indices:
+            body_region_positions[index] = max((
+                earliest_member(index),
+                *(
+                    body_region_positions[producer]
+                    for producer in region_dependencies.predecessors(index)
+                ),
+            ))
         condition = set(map(int, loop.condition_nodes))
         condition_region_indices = tuple(
             index
@@ -3281,11 +3404,7 @@ def analyze_shader_loop_reductions(
         ))
         body_items: list[tuple[int, object]] = [
             (
-                min(
-                    lexical_position[node_id]
-                    for node_id in regions[region_index]
-                    if node_id in lexical_position
-                ),
+                body_region_positions[region_index],
                 StatementBlock((f"__scheduled_region_{region_index}__",)),
             )
             for region_index in body_region_indices

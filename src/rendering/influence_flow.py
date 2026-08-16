@@ -49,6 +49,7 @@ from ..compiler.influence_field import (
     MAX_DISPERSION,
     RECURRENT,
     InfluenceField,
+    Moments,
 )
 
 # Power-sum slots carried by every cell.
@@ -210,6 +211,41 @@ class InfluenceFlow:
 
         self._recurrent_index = self._category_index.get(RECURRENT)
 
+        # Dye injected from outside, waiting for the next step to carry it in.
+        # When something is actually observing the program, this is where its
+        # events land, and the periodic emitters are silenced: a source that
+        # opens on a clock and a source that opens because a region really ran
+        # must not both be running, or the picture mixes an observation with a
+        # rehearsal of one and nothing distinguishes them.
+        self._injected: dict[tuple[int, int], Moments] = {}
+        self.observed = False
+
+    def observe(self) -> None:
+        """Stop emitting on a clock; carry only what is injected."""
+
+        self.observed = True
+        self.emitters = []
+
+    def inject(self, key: Any, hue: float, weight: float,
+               category: str = DYNAMIC) -> bool:
+        """Release dye at one node because something happened there.
+
+        Returns whether the node is part of this network -- an event naming
+        something the field does not contain is dropped and reported, rather
+        than silently colouring nothing.
+        """
+
+        node = self._node_index.get(key)
+        if node is None:
+            return False
+        slot = self._category_index.get(category)
+        if slot is None:
+            return False
+        held = self._injected.get((node, slot))
+        deposit = (held or Moments()).deposited(float(hue), float(weight))
+        self._injected[(node, slot)] = deposit
+        return True
+
     def step(self, dt: float) -> None:
         """Advance emission, advection, and junction mixing by ``dt``."""
 
@@ -236,6 +272,16 @@ class InfluenceFlow:
             slot[S0] += amount
             slot[S1] += amount * hue
             slot[S2] += amount * hue * hue
+
+        # Injected dye enters exactly like emitted dye: as arrivals, before
+        # the junctions push. Nothing downstream can tell the difference,
+        # which is the point -- transport does not care why a drop exists.
+        if self._injected:
+            for (node, slot), moments in self._injected.items():
+                self.arrivals[node, slot, S0] += moments.s0
+                self.arrivals[node, slot, S1] += moments.s1
+                self.arrivals[node, slot, S2] += moments.s2
+            self._injected.clear()
 
         # Advection. Upwind transport at a uniform rate: the tail cell leaves
         # the pipe, everything else shifts toward it. First order, so the front

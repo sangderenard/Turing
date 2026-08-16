@@ -1,4 +1,5 @@
 # ---- Imports ----
+import math as _math
 from typing import Dict, Any
 try:
     from ..branch_oracle import BRANCH_ORACLE as _BRANCH_ORACLE
@@ -35,7 +36,15 @@ def _scalar_kernel(op: str):
         "invert":        lambda a,     **k: ~int(a),
         "logical_not":   lambda a,     **k: bool(not bool(a)),
         "where":         lambda c, a, b, **k: (a if bool(c) else b),
-        "sign":          lambda a,     **k: (a if (a != a) else (1 if a > 0 else (-1 if a < 0 else 0)))
+        "sign":          lambda a,     **k: (a if (a != a) else (1 if a > 0 else (-1 if a < 0 else 0))),
+        # Same branch the C kernel takes, and for the same reason: exp() of a
+        # large positive argument overflows, so the sign of the input decides
+        # which way the quotient is written. This is the reference the
+        # backends must agree with.
+        "sigmoid":       lambda a,     **k: (
+            1.0 / (1.0 + _math.exp(-a)) if a >= 0.0
+            else _math.exp(a) / (1.0 + _math.exp(a))
+        ),
     }
     if op not in tbl: raise NotImplementedError(op)
     return tbl[op]
@@ -410,3 +419,18 @@ def where(cond, a, b, *, allow_scalar: bool = True):
 
 def sign(self):
     return self._v1_valuewise("sign", annotate={"op":"sign"})
+
+
+def sigmoid(self):
+    """Logistic activation, as a primitive rather than a composition.
+
+    ``abstract_nn.Sigmoid`` built this from comparisons, ``exp``, and division
+    and then recorded the whole thing as one opaque ``sigmoid`` op. That made
+    it unlowerable: the tape saw an atom no backend had, even though every
+    piece of it already existed. Registering it as an ordinary elementwise
+    unary means the backends handle it exactly as they handle ``tanh``, and
+    the numerically stable branch lives once, in C, instead of being rebuilt
+    out of five ops each time.
+    """
+
+    return self._v1_valuewise("sigmoid", annotate={"op": "sigmoid"})

@@ -633,6 +633,7 @@ def compile_ast_aot(
     entrypoint: str,
     feeds: Mapping[str, Any],
     *,
+    trace: bool = False,
     backend: str = "c",
     remove_loops: bool = False,
     unroll_limit: int = 8,
@@ -1071,6 +1072,7 @@ def compile_ast_aot(
     # question -- do not fold it into this function.
     return _lower_process_graph_to_compilation(
         graph, entrypoint_node_id, entrypoint, feeds,
+        trace=trace,
         backend=backend,
         remove_loops=remove_loops,
         unroll_limit=unroll_limit,
@@ -1142,6 +1144,7 @@ def _lower_process_graph_to_compilation(
     runtime_closure_only: bool = False,
     project_captured_hierarchy: bool = True,
     linked_process_graphs: Mapping[str, Any] | None = None,
+    trace: bool = False,
 ) -> AOTCompilation:
     """Lower an already-built ``ProcessGraph`` into a real ``AOTCompilation``.
 
@@ -1962,6 +1965,20 @@ def _lower_process_graph_to_compilation(
             "exist, but no retained control/numerical SSA value consumes "
             "them"
         )
+    if trace:
+        # Companion data only, and only when asked for: nothing in the
+        # compiled program reads it, and its absence changes nothing that
+        # runs. It exists so a trace record carrying one cheap integer can be
+        # resolved to whichever representation a viewer wants to talk about.
+        from ....compiler.trace_manifest import build_trace_manifest
+
+        map_ir = dict(map_ir or {})
+        map_ir["trace"] = build_trace_manifest(
+            region_programs=region_programs,
+            control_program=shell_control_program,
+            identity_table=identity_table,
+            entrypoint=entrypoint,
+        )
     shell = DualIRShell(
         compiled_shell_program=compiled_shell_program,
         shell_control_program=shell_control_program,
@@ -2141,6 +2158,7 @@ def compile_cpp_shell_aot(
 
     return _lower_process_graph_to_compilation(
         graph, entrypoint_node_id, entrypoint, feeds,
+        trace=trace,
         backend=backend,
         remove_loops=remove_loops,
         unroll_limit=unroll_limit,

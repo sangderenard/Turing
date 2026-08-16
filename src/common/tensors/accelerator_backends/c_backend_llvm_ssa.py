@@ -70,6 +70,8 @@ C_SSA_OUTPUT_ARGUMENTS = {
     "increment_mask_double": 0,
     "cast_double_to_int_values": 1,
     "cast_double_to_float_values": 1,
+    "cast_double_to_double_values": 1,
+    "cast_double_to_bool_values": 1,
     "create_arange": 3,
 }
 
@@ -194,6 +196,8 @@ _C_FUNCTION_ROLES = {
     "increment_mask_double": "tensor_kernel",
     "cast_double_to_int_values": "tensor_kernel",
     "cast_double_to_float_values": "tensor_kernel",
+    "cast_double_to_double_values": "tensor_kernel",
+    "cast_double_to_bool_values": "tensor_kernel",
     "log_softmax_1d": "tensor_kernel",
     "log_softmax_callback": "private_callback",
     "pad_double_nd": "tensor_kernel",
@@ -1546,6 +1550,52 @@ exit:
   ret void
 }
 
+define void @cast_double_to_double_values(ptr %a, ptr %out, i32 %n) {
+entry:
+  br label %loop.header
+
+loop.header:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop.body ]
+  %continue = icmp slt i32 %i, %n
+  br i1 %continue, label %loop.body, label %exit
+
+loop.body:
+  %i64 = sext i32 %i to i64
+  %a.ptr = getelementptr inbounds double, ptr %a, i64 %i64
+  %out.ptr = getelementptr inbounds double, ptr %out, i64 %i64
+  %value = load double, ptr %a.ptr, align 8
+  store double %value, ptr %out.ptr, align 8
+  %i.next = add nsw i32 %i, 1
+  br label %loop.header
+
+exit:
+  ret void
+}
+
+define void @cast_double_to_bool_values(ptr %a, ptr %out, i32 %n) {
+entry:
+  br label %loop.header
+
+loop.header:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop.body ]
+  %continue = icmp slt i32 %i, %n
+  br i1 %continue, label %loop.body, label %exit
+
+loop.body:
+  %i64 = sext i32 %i to i64
+  %a.ptr = getelementptr inbounds double, ptr %a, i64 %i64
+  %out.ptr = getelementptr inbounds double, ptr %out, i64 %i64
+  %value = load double, ptr %a.ptr, align 8
+  %nonzero = fcmp une double %value, 0.0
+  %result = uitofp i1 %nonzero to double
+  store double %result, ptr %out.ptr, align 8
+  %i.next = add nsw i32 %i, 1
+  br label %loop.header
+
+exit:
+  ret void
+}
+
 define double @sum_double(ptr %a, i32 %n) {
 entry:
   br label %loop.header
@@ -2437,8 +2487,20 @@ TRANSLATIONS = (
     CBackendLLVMSSA(
         "cast_double_to_float_values",
         "cast_double_to_float_values",
-        ("float", "double", "to_dtype"),
-        "double-storage float-value cast",
+        ("float", "to_dtype"),
+        "double-storage single-precision-value cast",
+    ),
+    CBackendLLVMSSA(
+        "cast_double_to_double_values",
+        "cast_double_to_double_values",
+        ("double", "to_dtype"),
+        "double-storage double-value cast (copying identity)",
+    ),
+    CBackendLLVMSSA(
+        "cast_double_to_bool_values",
+        "cast_double_to_bool_values",
+        ("bool", "to_dtype"),
+        "double-storage boolean-value cast (nonzero -> 1)",
     ),
     CBackendLLVMSSA(
         "sum_double",

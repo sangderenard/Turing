@@ -195,8 +195,12 @@ _TENSOR: dict[str, str] = {
     "ones_like": "fill_double",
     "full": "fill_double",
     "full_like": "fill_double",
+    # Value-precision casts; reference is the numpy backend's ``_cast_`` map.
+    # ``double`` is float64 values -- a copying identity under the double
+    # working type, never the narrowing kernel.
     "float": "cast_double_to_float_values",
-    "double": "cast_double_to_float_values",
+    "double": "cast_double_to_double_values",
+    "bool": "cast_double_to_bool_values",
     "long": "cast_double_to_int_values",
     "int": "cast_double_to_int_values",
     "arange": "create_arange",

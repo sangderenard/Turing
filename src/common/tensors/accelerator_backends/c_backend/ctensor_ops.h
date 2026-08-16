@@ -56,6 +56,11 @@ typedef enum CTensorOp {
     CT_OP_SHR,
     CT_OP_LOGICAL_AND,
     CT_OP_LOGICAL_OR,
+    /* Appended rather than grouped with the other transcendentals on purpose:
+       is_unary_op classifies by enum *range*, so inserting mid-list would
+       renumber every op after it and silently reclassify anything holding a
+       raw opcode. New entries go here and are named explicitly below. */
+    CT_OP_SIGMOID,
     CT_OP_COUNT
 } CTensorOp;
 

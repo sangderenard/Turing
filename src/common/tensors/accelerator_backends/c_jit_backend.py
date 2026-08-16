@@ -470,6 +470,23 @@ class CJITProgram:
         self.output_specs = outputs
         self.source_artifact = source_artifact
         self._shell_address = shell_address
+        # Diagnostics, attached once if at all. ``_trace_site`` is a resident
+        # pointer stamped with the region this program belongs to, so a launch
+        # passes an argument it already holds rather than looking anything up.
+        self._trace_shell: Any | None = None
+        self._trace_site: Any | None = None
+
+    def attach_trace(self, shell: Any, ring: Any, region: int) -> None:
+        """Bind this program to a trace ring, for one region.
+
+        Called once when diagnostics are requested. A program that was never
+        attached launches exactly as before: the logger arguments stay ``None``
+        and, in a shell built without ``trace``, the hook they would feed is
+        not compiled in at all.
+        """
+
+        self._trace_shell = shell
+        self._trace_site = shell.trace_site(ring, region)
 
     def execute(
         self,
@@ -490,7 +507,7 @@ class CJITProgram:
             for spec in self.output_specs
         ]
         arrays = [*feed_arrays, *output_arrays]
-        shell = profiled_c_shell()
+        shell = self._trace_shell or profiled_c_shell()
         context = shell.ffi.new(
             "void *[]",
             [
@@ -503,7 +520,15 @@ class CJITProgram:
             if profiler is not None
             else None
         )
-        profile = shell.launch(self._shell_address, context)
+        if self._trace_site is not None:
+            profile = shell.launch(
+                self._shell_address,
+                context,
+                logger=shell.trace_logger,
+                logger_user=self._trace_site,
+            )
+        else:
+            profile = shell.launch(self._shell_address, context)
         if profiler is not None:
             shell.record(
                 profiler,
