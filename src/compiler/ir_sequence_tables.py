@@ -1307,8 +1307,14 @@ def lower_table_lookup(
     descriptor: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
+    default_parameter: bool = False,
 ) -> SSASequenceLowering:
-    """Build key lookup for a two-column table and publish found status."""
+    """Build key lookup for a two-column table and publish found status.
+
+    ``default_parameter`` appends one trailing argument of the value column's
+    dtype and returns it from the absent branch -- the ``d.get(key, default)``
+    contract -- instead of the absent branch's literal zero.
+    """
 
     value_columns = tuple(
         column for column in range(len(descriptor.column_value_ids))
@@ -1393,8 +1399,15 @@ def lower_table_lookup(
     builder.emit(found, "Load", [value_address], found_value)
     builder.emit(found, "Store", [one, status_slot])
     builder.branch(found, result_block)
-    missing_value = builder.fresh(value_dtype)
-    builder.emit(absent, "Const", [], missing_value, attributes={"value": 0})
+    if default_parameter:
+        missing_value = builder.fresh(value_dtype)
+        default_argument = missing_value
+    else:
+        missing_value = builder.fresh(value_dtype)
+        default_argument = None
+        builder.emit(
+            absent, "Const", [], missing_value, attributes={"value": 0},
+        )
     builder.emit(absent, "Store", [zero, status_slot])
     builder.branch(absent, result_block)
     result = builder.fresh(value_dtype)
@@ -1405,7 +1418,10 @@ def lower_table_lookup(
     name = function_name or f"ssa_sequence_{descriptor.sequence_id}_lookup"
     function = Function(
         name,
-        [*storage, status_arena, *queries],
+        [
+            *storage, status_arena, *queries,
+            *((default_argument,) if default_argument is not None else ()),
+        ],
         builder.blocks,
         metadata={
             "ssa_sequence_operation": "lookup",

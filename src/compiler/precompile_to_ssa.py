@@ -442,6 +442,7 @@ class _ControlSSABuilder:
         sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
         sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
         table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
+        table_lookup_defaults: dict[int, float] | None = None,
         table_stores: tuple[
             tuple[int, int | tuple[int, ...], int, int], ...
         ] = (),
@@ -500,6 +501,7 @@ class _ControlSSABuilder:
         self.arguments: list[SSAValue] = []
         self.external_values: dict[int, SSAValue] = {}
         self.declared_parameter_only_ids: set[int] = set()
+        self.table_lookup_defaults = dict(table_lookup_defaults or {})
         self.sequence_descriptors: dict[int, SSASequenceDescriptor] = {}
         self.sequence_storage_values: dict[int, tuple[SSAValue, ...]] = {}
         self.sequence_status_values: dict[int, SSAValue] = {}
@@ -889,8 +891,17 @@ class _ControlSSABuilder:
             return
         from .ir_sequence_tables import lower_table_lookup
 
-        helper_name = f"ssa_sequence_{int(sequence_id)}_lookup"
-        lowering = lower_table_lookup(descriptor, function_name=helper_name)
+        default_literal = self.table_lookup_defaults.get(int(result_id))
+        helper_name = (
+            f"ssa_sequence_{int(sequence_id)}_lookup_or_default"
+            if default_literal is not None
+            else f"ssa_sequence_{int(sequence_id)}_lookup"
+        )
+        lowering = lower_table_lookup(
+            descriptor,
+            function_name=helper_name,
+            default_parameter=default_literal is not None,
+        )
         self.sequence_helper_functions.update(
             (function.name, function) for function in lowering.functions
         )
@@ -907,12 +918,21 @@ class _ControlSSABuilder:
         )
         self.next_value_id = max(self.next_value_id, int(result_id) + 1)
         self.external_values[int(result_id)] = result
+        default_operands: tuple[SSAValue, ...] = ()
+        if default_literal is not None:
+            default_value = self.fresh_value(dtype="float64")
+            self.emit(
+                Handler.Const, [], default_value,
+                attributes={"value": float(default_literal)},
+            )
+            default_operands = (default_value,)
         self.emit(
             Handler.Call,
             [
                 *self.sequence_storage_values[int(sequence_id)],
                 self.sequence_status_values[int(sequence_id)],
                 *self._table_query_values(query_id),
+                *default_operands,
             ],
             result,
             attributes={
@@ -3667,6 +3687,7 @@ def lower_control_program_to_ssa(
     sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
     sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
     table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
+    table_lookup_defaults: dict[int, float] | None = None,
     table_stores: tuple[
         tuple[int, int | tuple[int, ...], int, int], ...
     ] = (),
@@ -3701,6 +3722,7 @@ def lower_control_program_to_ssa(
         sequence_declarations=sequence_declarations,
         sequence_memberships=sequence_memberships,
         table_lookups=table_lookups,
+        table_lookup_defaults=table_lookup_defaults,
         table_stores=table_stores,
         table_deletions=table_deletions,
         retained_sequence_ids=retained_sequence_ids,
@@ -4368,6 +4390,7 @@ def lower_control_sections_to_ssa(
     sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
     sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
     table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
+    table_lookup_defaults: dict[int, float] | None = None,
     table_stores: tuple[
         tuple[int, int | tuple[int, ...], int, int], ...
     ] = (),
@@ -5565,6 +5588,7 @@ def lower_control_sections_to_ssa(
         sequence_declarations=sequence_declarations,
         sequence_memberships=sequence_memberships,
         table_lookups=table_lookups,
+        table_lookup_defaults=table_lookup_defaults,
         table_stores=table_stores,
         table_deletions=table_deletions,
         retained_sequence_ids=retained_sequence_ids,

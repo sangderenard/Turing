@@ -1494,7 +1494,9 @@ def _field_slot_ops(
     # ``d.get(key, default)`` is the same lookup ``d[key]`` is -- the key's
     # token walked against the table -- differing only in what the absent
     # branch yields.  Recognising only ``indexed`` left ``get`` unclaimed, so
-    # its result crossed every backend as a producerless argument.
+    # its result crossed every backend as a producerless argument.  The
+    # authored default rides beside the lookup by result id.
+    table_lookup_defaults: dict[int, Any] = {}
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         if node_operation(data) != "get":
@@ -1510,12 +1512,21 @@ def _field_slot_ops(
         sequence_id, _storage_identity = table_sequence(base_id)
         if sequence_id is None:
             continue
+        result_id = int(data.get("value_id", node_id))
         key_id = int(graph_obj.nodes[key_id].get("value_id", key_id))
-        table_lookups.append((
-            int(data.get("value_id", node_id)),
-            key_id,
-            int(sequence_id),
-        ))
+        table_lookups.append((result_id, key_id, int(sequence_id)))
+        default_node = by_role.get("arg:1")
+        if default_node is not None and default_node in graph_obj:
+            default_data = graph_obj.nodes[default_node]
+            literal = default_data.get("constant")
+            if literal is None:
+                literal = (
+                    default_data.get("attributes") or {}
+                ).get("value")
+            if isinstance(literal, (int, float)) and not isinstance(
+                literal, bool
+            ):
+                table_lookup_defaults[result_id] = float(literal)
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         if node_operation(data) != "indexedstore":
@@ -1672,6 +1683,7 @@ def _field_slot_ops(
         tuple(dict.fromkeys(sequence_declarations)),
         tuple(dict.fromkeys(sequence_memberships)),
         tuple(dict.fromkeys(table_lookups)),
+        dict(table_lookup_defaults),
         tuple(dict.fromkeys(table_stores)),
         tuple(dict.fromkeys(table_deletions)),
         tuple(sorted(retained_sequence_ids)),
@@ -2742,7 +2754,7 @@ def _class_surface_ssa_program(
         # store. In whole-program precompile mode the field-op region is never
         # built (gated behind ``not precompile_only``), so recover the field ops
         # from the process graph and hand them to the lowerer as slot access.
-        self_id, field_ops, const_sources, field_count, field_names, record_identity, sequence_initializations, field_aliases, sequence_declarations, sequence_memberships, table_lookups, table_stores, table_deletions, retained_sequence_ids, nested_sequence_ids, nested_record_fields = _field_slot_ops(
+        self_id, field_ops, const_sources, field_count, field_names, record_identity, sequence_initializations, field_aliases, sequence_declarations, sequence_memberships, table_lookups, table_lookup_defaults, table_stores, table_deletions, retained_sequence_ids, nested_sequence_ids, nested_record_fields = _field_slot_ops(
             graph_obj,
             retained_storage_identities=frozenset(retained_storage_identities),
             # A contract-declared keyed field is a lookup table, but it is a
@@ -2878,6 +2890,7 @@ def _class_surface_ssa_program(
                 sequence_declarations=sequence_declarations,
                 sequence_memberships=sequence_memberships,
                 table_lookups=table_lookups,
+                table_lookup_defaults=table_lookup_defaults,
                 table_stores=table_stores,
                 table_deletions=table_deletions,
                 retained_sequence_ids=retained_sequence_ids,
