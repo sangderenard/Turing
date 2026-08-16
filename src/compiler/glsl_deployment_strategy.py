@@ -5324,30 +5324,27 @@ def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
         and isinstance(expression, ast.Call)
         and isinstance(expression.func, ast.Attribute)
     )
-    # A loop-carried UPDATE is body work by definition -- the loop itself
-    # names its updated ids at port materialization.  When such an update is
-    # an intrinsic extraction of a catalogued operator (``max``/``min``
-    # arrive as builtin Calls), it computes exactly as ``carried + x`` does;
-    # classifying it coordination severed every carried max reduction from
-    # its region while the adds flowed.
-    if node_type in {"Call", "call"} and str(
-        (data.get("attributes") or {}).get("tensor") or ""
-    ) in abstract_tensor_funcs:
-        carried_updated = graph.G.graph.get("_carried_updated_cache")
-        fingerprint = (graph.G.number_of_nodes(), graph.G.number_of_edges())
-        if carried_updated is None or carried_updated[0] != fingerprint:
-            carried_updated = (fingerprint, frozenset(
-                int(updated)
-                for _node, loop_data in graph.G.nodes(data=True)
-                for updated in (
-                    (loop_data.get("attributes") or {}).get(
-                        "loop_carried_updated_ids"
-                    ) or ()
-                )
-            ))
-            graph.G.graph["_carried_updated_cache"] = carried_updated
-        if int(data.get("value_id", node_id)) in carried_updated[1]:
-            return False
+    # A builtin Call naming a catalogued operator in ``tensor`` computes
+    # exactly as the operator it names: ``max(a, b)`` is numeric work as
+    # surely as ``a + b``.  Classifying these coordination severed every
+    # carried max reduction -- and every post-loop ``abs``/``max``
+    # temporary -- from its region while the adds flowed.  Method calls
+    # (an Attribute callee: ``d.get``) and linked references stay
+    # coordinator work; those have their own machinery.
+    if (
+        node_type in {"Call", "call"}
+        and str(
+            (data.get("attributes") or {}).get("tensor") or ""
+        ) in abstract_tensor_funcs
+        and not isinstance(
+            getattr(expression, "func", None), ast.Attribute
+        )
+        and not any(
+            (data.get("attributes") or {}).get(name) is not None
+            for name in ("callee_ref", "method_ref", "class_ref")
+        )
+    ):
+        return False
     return (
         bool(
             (data.get("attributes") or {}).get(
