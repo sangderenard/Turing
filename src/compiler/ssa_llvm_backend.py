@@ -814,6 +814,15 @@ def _emit_repository_call_module(
                     f"  {converted} = fptosi double {loaded} to {wanted}"
                 )
                 return converted
+            # Integer width coercion.  An i32 induction against an int64 ABI
+            # cell (a keyed mapping's length slot) previously emitted a mixed
+            # icmp the LLVM verifier rejects.
+            if wanted == "i64" and source_type == "i32":
+                body.append(f"  {converted} = sext i32 {loaded} to i64")
+                return converted
+            if wanted == "i32" and source_type == "i64":
+                body.append(f"  {converted} = trunc i64 {loaded} to i32")
+                return converted
             if wanted == "i1":
                 zero = "0.0" if source_type == "double" else "0"
                 comparison = "fcmp one" if source_type == "double" else "icmp ne"
