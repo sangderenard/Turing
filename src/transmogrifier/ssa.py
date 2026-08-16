@@ -892,6 +892,43 @@ class IRModule:
                 if function.metadata.get("deployment_regions")
             }
 
+    def reachable_functions(
+        self,
+        *roots: str,
+        follow_call: "Callable[[Instr], str | None] | None" = None,
+    ) -> tuple[str, ...]:
+        """Function names reachable from ``roots``, in this module's order.
+
+        Reachability is MEMBERSHIP; ORDER belongs to the module.  The walk
+        follows each instruction's ``callee`` attribute -- a backend narrows
+        which calls are edges by passing ``follow_call``, returning the
+        callee name to follow or ``None`` -- and the result is reported in
+        ``functions`` insertion order.  Handing consumers a set here made
+        every one of them invent an ordering, and one of them iterated the
+        set itself: a per-process-random function order in emitted code.
+        """
+
+        def default_follow(instruction: "Instr") -> str | None:
+            callee = instruction.attributes.get("callee")
+            if callee is not None and str(callee) in self.functions:
+                return str(callee)
+            return None
+
+        follow = follow_call or default_follow
+        members: set[str] = set()
+        pending = [str(root) for root in roots]
+        while pending:
+            name = pending.pop()
+            if name in members or name not in self.functions:
+                continue
+            members.add(name)
+            for block in self.functions[name].blocks.values():
+                for instruction in block.instrs:
+                    followed = follow(instruction)
+                    if followed is not None:
+                        pending.append(str(followed))
+        return tuple(name for name in self.functions if name in members)
+
 # -----------------------------------------------------------------------------
 # Correlator for Language <-> SSA Operation Mappings
 # -----------------------------------------------------------------------------

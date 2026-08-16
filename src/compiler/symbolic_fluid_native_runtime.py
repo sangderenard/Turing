@@ -274,6 +274,34 @@ class NativeSymbolicFluidAdvance:
             "height_positivity": names.get("max_height_violation"),
             "tracer_bounds": names.get("max_tracer_violation"),
         }
+        # A carried reduction's component id is its LoopResult port, but the
+        # value actually returned is the carried phi under its own id; the
+        # phi names its ports.  Follow that record, or the read lands on the
+        # port's unwritten field cell.
+        port_owner = {}
+        for block in self.function.blocks.values():
+            for instruction in block.instrs:
+                if str(instruction.op) not in {"Ret", "ret"}:
+                    continue
+                for argument in instruction.args:
+                    for port_id in (
+                        (argument.accounting or {}).get("carried_port_ids")
+                        or ()
+                    ):
+                        port_owner.setdefault(
+                            int(port_id), int(argument.id)
+                        )
+        by_kwarg = {
+            kwarg: port_owner.get(int(value_id), int(value_id))
+            for kwarg, value_id in by_kwarg.items()
+        }
+        channels = {
+            name: (
+                None if value_id is None
+                else port_owner.get(int(value_id), int(value_id))
+            )
+            for name, value_id in channels.items()
+        }
         self._metrics_parts = (by_kwarg, channels)
 
     def _named_stencil_operand(self, wanted: str) -> list[int]:

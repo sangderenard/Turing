@@ -274,6 +274,27 @@ def integer_scalar_lines(
     evaluation converted back to the declared integer type.
     """
 
+    if operation == "Mod" and len(operands) == 2:
+        # Python ``%`` is FLOORED: the result carries the divisor's sign.
+        # ``srem`` is C semantics -- ``-1 % 16`` gave -1 instead of 15, and a
+        # periodic wrap like ``(row - 1) % height`` addressed sixteen doubles
+        # BEFORE its span for the whole first row.
+        return ([
+            f"{register}.rem = srem {operand_type} "
+            f"{operands[0]}, {operands[1]}",
+            f"{register}.mix = xor {operand_type} "
+            f"{register}.rem, {operands[1]}",
+            f"{register}.opposed = icmp slt {operand_type} "
+            f"{register}.mix, 0",
+            f"{register}.nonzero = icmp ne {operand_type} "
+            f"{register}.rem, 0",
+            f"{register}.fix = and i1 {register}.opposed, "
+            f"{register}.nonzero",
+            f"{register}.adjust = select i1 {register}.fix, "
+            f"{operand_type} {operands[1]}, {operand_type} 0",
+            f"{register} = add {operand_type} {register}.rem, "
+            f"{register}.adjust",
+        ], operand_type)
     if operation in _INTEGER_BINARY and len(operands) == 2:
         return ([
             f"{register} = {_INTEGER_BINARY[operation]} "
@@ -415,31 +436,29 @@ def _value_element_count(value: _Any) -> int:
 
 def _internal_call_closure(
     module: _IRModule, root: str,
-) -> tuple[set[str], set[str]]:
-    """Return repository functions and authored leaves reachable from root."""
+) -> tuple[tuple[str, ...], set[str]]:
+    """Repository functions (module order) and authored kernel leaves.
 
-    repository: set[str] = set()
+    Which calls are edges is this backend's policy -- a callee with an
+    authored kernel signature is a leaf, not an edge -- but the ORDER of
+    the result is the module's own, via ``IRModule.reachable_functions``.
+    """
+
     kernels: set[str] = set()
-    pending = [str(root)]
-    while pending:
-        name = pending.pop()
-        if name in repository or name not in module.functions:
-            continue
-        repository.add(name)
-        for block in module.functions[name].blocks.values():
-            for instruction in block.instrs:
-                callee = instruction.attributes.get("callee")
-                if callee is None:
-                    continue
-                symbol = str(callee)
-                try:
-                    _kernel_signature(symbol)
-                except (KeyError, ValueError):
-                    if symbol in module.functions:
-                        pending.append(symbol)
-                else:
-                    kernels.add(symbol)
-    return repository, kernels
+
+    def follow(instruction: _Any) -> str | None:
+        callee = instruction.attributes.get("callee")
+        if callee is None:
+            return None
+        symbol = str(callee)
+        try:
+            _kernel_signature(symbol)
+        except (KeyError, ValueError):
+            return symbol if symbol in module.functions else None
+        kernels.add(symbol)
+        return None
+
+    return module.reachable_functions(str(root), follow_call=follow), kernels
 
 
 def _emit_repository_call_module(
@@ -494,6 +513,7 @@ def _emit_repository_call_module(
     aggregate_output_positions: dict[str, list[int]] = {}
     aggregate_output_ids: dict[str, list[int]] = {}
     aggregate_output_values: dict[str, dict[int, _Any]] = {}
+    aggregate_escapes_whole: set[tuple[str, int]] = set()
     aggregate_positions: dict[tuple[str, int], tuple[int, ...]] = {}
     for caller_name in reachable:
         function = module.functions[caller_name]
@@ -551,6 +571,10 @@ def _emit_repository_call_module(
             )
             if consumed_whole or not selected:
                 selected = tuple(range(len(declared)))
+            if consumed_whole:
+                aggregate_escapes_whole.add(
+                    (caller_name, int(instruction.res.id))
+                )
             aggregate_positions[(caller_name, int(instruction.res.id))] = selected
             if callee in reachable and declared:
                 existing = aggregate_output_positions.setdefault(callee, [])
@@ -750,7 +774,7 @@ def _emit_repository_call_module(
         return slot
 
     emitted_functions: list[str] = []
-    for name in sorted(reachable, key=lambda item: item != function_name):
+    for name in reachable:
         function = module.functions[name]
         outputs = function_outputs[name]
         parameters = [
@@ -790,6 +814,16 @@ def _emit_repository_call_module(
                 entry_allocas.append(
                     f"  {register} = alloca {llvm_type}, i64 {count}, align 8"
                 )
+                # Diagnostic sentinel: any consumed value derived from this
+                # constant identifies a read-before-write cell by value.
+                if count == 1 and llvm_type == "double":
+                    entry_allocas.append(
+                        f"  store double 1.0e250, ptr {register}, align 8"
+                    )
+                elif count == 1 and llvm_type in {"i32", "i64"}:
+                    entry_allocas.append(
+                        f"  store {llvm_type} 123456789, ptr {register}, align 8"
+                    )
                 allocated.add(value_id)
             pointers[value_id] = register
             return register
@@ -852,6 +886,49 @@ def _emit_repository_call_module(
                 pointers[int(instruction.res.id)] = (
                     f"%phi.{int(instruction.res.id)}"
                 )
+        # A dead unpack pair -- GEP(aggregate_index) plus the Load of its
+        # address whose result nothing consumes -- reads a slot the callee
+        # never publishes (only live positions have out cells).  Skip both;
+        # a CONSUMED projection without a member stays a named shortfall.
+        function_use_counts: dict[int, int] = {}
+        for _pre_block, pre_instruction in scheduled_instructions:
+            for argument in pre_instruction.args:
+                function_use_counts[int(argument.id)] = (
+                    function_use_counts.get(int(argument.id), 0) + 1
+                )
+        dead_unpack_results: set[int] = set()
+        address_consumers: dict[int, list[_Any]] = {}
+        for _pre_block, pre_instruction in scheduled_instructions:
+            if (
+                str(pre_instruction.op) in {"Load", "load"}
+                and pre_instruction.args
+                and pre_instruction.res is not None
+            ):
+                address_consumers.setdefault(
+                    int(pre_instruction.args[0].id), []
+                ).append(pre_instruction)
+        for _pre_block, pre_instruction in scheduled_instructions:
+            if (
+                str(pre_instruction.op) in {"GetElementPtr", "getelementptr"}
+                and pre_instruction.res is not None
+                and pre_instruction.attributes.get("aggregate_index")
+                is not None
+            ):
+                gep_result = int(pre_instruction.res.id)
+                paired_loads = address_consumers.get(gep_result, ())
+                if all(
+                    function_use_counts.get(int(load.res.id), 0) == 0
+                    for load in paired_loads
+                    if load.res is not None
+                ) and function_use_counts.get(gep_result, 0) == len(
+                    tuple(paired_loads)
+                ):
+                    dead_unpack_results.add(gep_result)
+                    dead_unpack_results.update(
+                        int(load.res.id)
+                        for load in paired_loads
+                        if load.res is not None
+                    )
         projection_values: dict[int, dict[int, _Any]] = {}
         projection_addresses: dict[int, tuple[int, int]] = {}
         constant_values = {
@@ -927,6 +1004,8 @@ def _emit_repository_call_module(
             operation = str(instruction.op)
             result = instruction.res
             result_id = int(result.id) if result is not None else None
+            if result_id is not None and result_id in dead_unpack_results:
+                continue
             tag = f"{instruction_index}.{result_id if result_id is not None else 'v'}"
 
             if operation in {"Const", "StaticRef"} and result is not None:
@@ -1093,10 +1172,24 @@ def _emit_repository_call_module(
                 if members is not None and position is not None and int(position) in members:
                     address_members[result_id] = members[int(position)]
                     continue
+                if members is not None and position is not None:
+                    # The projection map is the whole truth about this
+                    # aggregate.  A projection it does not answer is a
+                    # compile-time contradiction and must refuse by name --
+                    # the raw-slot fallback read past the table and returned
+                    # different garbage every run.
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"aggregate projection {int(position)} of "
+                        f"%t{base_id} has no compile-time member "
+                        f"(known: {sorted(members)})",
+                    ))
+                    continue
                 if (
                     position is not None
                     and instruction.args
                     and len(instruction.args) <= 2
+                    and int(instruction.args[0].id) in pointers
                 ):
                     slot = f"%aggregate.slot.{tag}"
                     body.append(
@@ -1532,27 +1625,35 @@ def _emit_repository_call_module(
                                     aggregate_members[result_id].setdefault(
                                         original_position, known,
                                     )
-                            aggregate = f"%aggregate.{tag}"
-                            body.append(
-                                f"  {aggregate} = alloca ptr, i64 "
-                                f"{len(result_ptrs)}, align 8"
-                            )
-                            for output_index, result_pointer in enumerate(
-                                result_ptrs
-                            ):
-                                slot = (
-                                    f"%aggregate.output.slot.{tag}."
-                                    f"{output_index}"
-                                )
+                            # The projection map above IS the aggregate: a
+                            # runtime pointer table restates compile-time
+                            # knowledge as memory indirection, and every
+                            # projection that missed the map read past the
+                            # table -- undefined behavior varying run to
+                            # run.  Materialize the table ONLY when the
+                            # aggregate value itself escapes whole.
+                            if (name, result_id) in aggregate_escapes_whole:
+                                aggregate = f"%aggregate.{tag}"
                                 body.append(
-                                    f"  {slot} = getelementptr ptr, ptr "
-                                    f"{aggregate}, i64 {output_index}"
+                                    f"  {aggregate} = alloca ptr, i64 "
+                                    f"{len(result_ptrs)}, align 8"
                                 )
-                                body.append(
-                                    f"  store ptr {result_pointer}, ptr "
-                                    f"{slot}, align 8"
-                                )
-                            pointers[result_id] = aggregate
+                                for output_index, result_pointer in enumerate(
+                                    result_ptrs
+                                ):
+                                    slot = (
+                                        f"%aggregate.output.slot.{tag}."
+                                        f"{output_index}"
+                                    )
+                                    body.append(
+                                        f"  {slot} = getelementptr ptr, ptr "
+                                        f"{aggregate}, i64 {output_index}"
+                                    )
+                                    body.append(
+                                        f"  store ptr {result_pointer}, ptr "
+                                        f"{slot}, align 8"
+                                    )
+                                pointers[result_id] = aggregate
                     continue
 
             if operation in {"Cast", "CastLike", "cast_like"} and result is not None and instruction.args:
@@ -3042,7 +3143,7 @@ def compile_artifact(
     # Same LLVM toolchain resolution the C backend uses: the ziglang package
     # bundles clang, invoked through the interpreter, no PATH assumptions.
     import sys as _sys
-    command = [_sys.executable, "-m", "ziglang", "cc", "-shared", "-O2",
+    command = [_sys.executable, "-m", "ziglang", "cc", "-shared", "-O0",
                "-o", str(library), str(source)]
     if artifact.needs_text_sink:
         command.append(str(

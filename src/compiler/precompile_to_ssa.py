@@ -3245,6 +3245,15 @@ class _ControlSSABuilder:
             group.add(int(port_id))
             for grouped_port in group:
                 self.external_values[int(grouped_port)] = phi.res
+            # The record-return expansion selects Ret components by RAW
+            # layout id.  A port-resolved phi carries its own result id, so
+            # the component silently dropped and the public return read the
+            # port's unwritten field cell.  Name every port this phi stands
+            # for on the value itself, so id-keyed selection can follow it.
+            phi.res.accounting["carried_port_ids"] = tuple(dict.fromkeys((
+                *(phi.res.accounting.get("carried_port_ids") or ()),
+                *sorted(int(item) for item in group),
+            )))
         for source_id, collection_id, induction_name, start in (
             self.program.collection_bindings
         ):

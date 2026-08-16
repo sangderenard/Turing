@@ -4549,6 +4549,18 @@ def _class_surface_ssa_program(
                     int(argument.id): argument
                     for argument in instruction.args
                 }
+                # A carried reduction returns through its LoopResult port,
+                # but the value in the Ret is the carried PHI, which has its
+                # own id.  The phi names every port it stands for; selection
+                # by raw layout id must follow that record or the component
+                # silently drops and the public return reads the port's
+                # unwritten field cell.
+                for argument in instruction.args:
+                    for port_id in (
+                        (argument.accounting or {}).get("carried_port_ids")
+                        or ()
+                    ):
+                        by_id.setdefault(int(port_id), argument)
                 record_layouts = dict(
                     function.metadata.get("record_return_layouts", ())
                 )
@@ -7650,9 +7662,43 @@ def _class_surface_ssa_program(
                         callee_outputs_by_id = {
                             int(value.id): value for value in callee_outputs
                         }
+                        # An authored tuple unpack names every result; a read
+                        # is generated ONLY for results something consumes.
+                        # Generating all of them asked the aggregate for
+                        # slots liveness never gave a cell, and each dead
+                        # read was undefined behavior at runtime (velocity_x
+                        # and friends in the fluid stencil call).
+                        consumed_caller_ids = {
+                            int(argument.id)
+                            for caller_block in caller.blocks.values()
+                            for caller_instruction in caller_block.instrs
+                            for argument in caller_instruction.args
+                        }
+                        consumed_caller_ids.update(map(int, (
+                            caller.metadata.get("source_output_value_ids")
+                            or ()
+                        )))
+                        consumed_caller_ids.update(
+                            int(component)
+                            for _record_id, components in (
+                                caller.metadata.get(
+                                    "record_return_layouts"
+                                ) or ()
+                            )
+                            for component in components
+                        )
+                        consumed_caller_ids.update(
+                            int(bound_caller_id)
+                            for sibling in records
+                            for bound_caller_id, _bound_callee_id in (
+                                sibling.argument_bindings or ()
+                            )
+                        )
                         for output_index, (callee_id, caller_id) in enumerate(
                             physical_result_bindings
                         ):
+                            if int(caller_id) not in consumed_caller_ids:
+                                continue
                             index_value = SSAValue(next_value_id, dtype="int")
                             next_value_id += 1
                             address = SSAValue(next_value_id, dtype="ptr")
