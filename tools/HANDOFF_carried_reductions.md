@@ -80,3 +80,29 @@ both lanes already exist.
 
 When those numbers land, the dt controller's rejection logic runs on real
 values and `examples/symbolic_fluid_live.py` runs compiled end to end.
+
+
+## Narrowed further (session 2026-08-16, commit after 9dea735)
+
+Probed with the relaxed filter live:
+
+- 47/116 (the mass Adds): `_is_dispatch_metadata_node` False, executable,
+  dispatched to regions 2/3.  Their whole chain now works end to end.
+- 117/118/119 (the max updates): they are builtin ``Call`` nodes
+  (type=Call, static_python_reference='max'), so the dispatch classifier
+  calls them coordinator metadata -- never executable, never in a dispatch
+  region.  In earlier builds the HIERARCHY planner still emitted their
+  PlanLines inside planned_region_3 (outputs 116,117,118,119); with the
+  aliases admitted, the seeds become carried boundaries and the hierarchy
+  planner drops the max lines too -- no region produces OR feeds 117-119,
+  and the honest loop_carried shortfall fails the build.
+
+THE FIX LIVES IN REGION MEMBERSHIP for intrinsic builtin calls whose
+consumers are carried continuations: ``max(carried, x)`` is numeric work
+exactly like ``carried + x`` (which classifies executable as an Add).  Two
+candidate shapes: teach the dispatch classifier that an intrinsic
+extraction (python_identity_program with a pure operator step, as float
+already is) over scalar operands is numeric work, not coordination; or
+keep the hierarchy planner's membership stable under carried boundaries.
+The first is the honest one -- it removes the asymmetry between ``+`` and
+``max`` instead of patching around it.
