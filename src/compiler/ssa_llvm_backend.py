@@ -322,7 +322,7 @@ from dataclasses import dataclass as _dataclass, field as _field
 from pathlib import Path as _Path
 from typing import Any as _Any, Mapping as _Mapping
 
-from ..transmogrifier.ssa import IRModule as _IRModule
+from ..transmogrifier.ssa import IRModule as _IRModule, SSAValue as _SSAValue
 from .output_publication import (
     function_output_publications,
     publication_surface_plan,
@@ -1512,6 +1512,26 @@ def _emit_repository_call_module(
                                 for index, original_position in enumerate(selected)
                                 if index < len(result_ptrs)
                             }
+                            # An in/out-aliased output has no distinct out
+                            # parameter -- the callee writes through the
+                            # argument's own storage.  Its aggregate position
+                            # must still resolve, or the unpack walks past
+                            # the alloca and reads garbage (the fluid wave
+                            # chain read exactly that).
+                            declared_output_ids = tuple(
+                                int(output_id) for output_id in (
+                                    instruction.attributes.get("output_ids")
+                                    or ()
+                                )
+                            )
+                            for original_position, output_id in enumerate(
+                                declared_output_ids
+                            ):
+                                known = pointers.get(int(output_id))
+                                if known is not None:
+                                    aggregate_members[result_id].setdefault(
+                                        original_position, known,
+                                    )
                             aggregate = f"%aggregate.{tag}"
                             body.append(
                                 f"  {aggregate} = alloca ptr, i64 "
