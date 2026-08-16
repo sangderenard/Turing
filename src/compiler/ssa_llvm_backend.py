@@ -45,6 +45,8 @@ _BINARY: dict[str, str] = {
     "And": "{out} = and i1 {0}, {1}",
     "Or": "{out} = or i1 {0}, {1}",
     "Xor": "{out} = xor i1 {0}, {1}",
+    "LAnd": "{out} = and i1 {0}, {1}",
+    "LOr": "{out} = or i1 {0}, {1}",
     "BitAnd": "{out} = and i64 {0}, {1}",
     "BitOr": "{out} = or i64 {0}, {1}",
     "BitXor": "{out} = xor i64 {0}, {1}",
@@ -67,10 +69,51 @@ _UNARY: dict[str, str] = {
     "Trunc": "{out} = call double @llvm.trunc.f64(double {0})",
     "Round": "{out} = call double @llvm.round.f64(double {0})",
     "Not": "{out} = xor i1 {0}, true",
+    "LNot": "{out} = xor i1 {0}, true",
     "Invert": "{out} = xor i64 {0}, -1",
     "SIToFP": "{out} = sitofp i32 {0} to double",
     "FPToSI": "{out} = fptosi double {0} to i32",
+    "SiToFp": "{out} = sitofp i32 {0} to double",
+    "UiToFp": "{out} = uitofp i32 {0} to double",
+    "FpToSi": "{out} = fptosi double {0} to i32",
+    "FpToUi": "{out} = fptoui double {0} to i32",
+    "SExt": "{out} = sext i32 {0} to i64",
+    "ZExt": "{out} = zext i32 {0} to i64",
 }
+
+def _intrinsic_declarations_from_templates(
+    *tables: dict[str, str],
+) -> dict[str, str]:
+    """Derive `declare` lines for the LLVM intrinsics the tables actually call.
+
+    A target intrinsic belongs to the LLVM language itself, not to the
+    repository's authored kernels, so it has no extractable definition. Its
+    signature is nevertheless already stated exactly by the authored call
+    template above, so the declaration is read back from that same text rather
+    than restated as a second, drift-prone signature table.
+    """
+
+    declarations: dict[str, str] = {}
+    call = _re.compile(
+        r"call\s+(?P<ret>[\w.]+)\s+@(?P<symbol>llvm\.[\w.]+)\((?P<args>[^)]*)\)"
+    )
+    for table in tables:
+        for template in table.values():
+            for match in call.finditer(template):
+                symbol = match.group("symbol")
+                operands = []
+                for operand in match.group("args").split(","):
+                    operand = operand.strip()
+                    if not operand:
+                        continue
+                    # "double {0}" / "double {out}.q" -> the declared type only.
+                    operands.append(operand.split()[0])
+                declarations[symbol] = (
+                    f"declare {match.group('ret')} @{symbol}"
+                    f"({', '.join(operands)})"
+                )
+    return declarations
+
 
 # --- tensor likeness: SSA tensor operation -> authored kernel symbol --------
 # The symbol is the deterministic likeness; body and signature live with the
@@ -97,11 +140,30 @@ _TENSOR: dict[str, str] = {
     "sqrt": "unary_double",
     "exp": "unary_double",
     "log": "unary_double",
+    "floor": "unary_double",
+    "ceil": "unary_double",
+    "round": "unary_double",
+    "trunc": "unary_double",
+    "isfinite": "unary_double",
+    "isnan": "unary_double",
+    "isinf": "unary_double",
+    "logical_not": "unary_double",
     "tanh": "unary_double",
     "sin": "unary_double",
     "cos": "unary_double",
+    "tan": "unary_double",
+    "asin": "unary_double",
+    "acos": "unary_double",
+    "atan": "unary_double",
+    "sinh": "unary_double",
+    "cosh": "unary_double",
+    "asinh": "unary_double",
+    "acosh": "unary_double",
+    "atanh": "unary_double",
     "sign": "sign_double",
     "matmul": "matmul_double",
+    "unfold2d": "unfold2d_double",
+    "fold2d": "fold2d_double",
     "transpose": "transpose_double",
     "swapaxes": "transpose_double",
     "permute": "transpose_double",
@@ -116,10 +178,23 @@ _TENSOR: dict[str, str] = {
     "cumsum": "cumsum_dim_double",
     "where": "where_double",
     "broadcast": "broadcast_double",
+    "broadcast_to": "broadcast_double",
+    "expand": "broadcast_double",
+    "gather": "index_select_double",
+    "scatter": "index_assign_double",
+    "pad": "pad_double_nd",
+    "stack": "stack_double",
+    "cat": "cat_double",
+    "concat": "cat_double",
+    "concatenate": "cat_double",
     "fill": "fill_double",
     "zeros": "fill_double",
+    "zeros_like": "fill_double",
+    "empty": "fill_double",
     "ones": "fill_double",
+    "ones_like": "fill_double",
     "full": "fill_double",
+    "full_like": "fill_double",
     "float": "cast_double_to_float_values",
     "double": "cast_double_to_float_values",
     "long": "cast_double_to_int_values",
@@ -139,11 +214,86 @@ def supported_scalar_operations() -> frozenset[str]:
 
 
 def supported_tensor_operations() -> frozenset[str]:
-    return frozenset(_TENSOR) | _SHAPE_ONLY
+    from .ssa_numeric_operators import TENSOR_SSA_OPERATORS
+
+    scalar = supported_scalar_operations()
+    direct = {
+        row.name
+        for row in TENSOR_SSA_OPERATORS
+        if row.is_direct and row.handler.value in scalar
+    }
+    # Const is a first-class repository instruction handled by the emitter,
+    # not a scalar likeness-table entry.  tensor_from_list is its canonical
+    # tensor spelling.
+    direct.add("tensor_from_list")
+    return frozenset(_TENSOR) | _SHAPE_ONLY | frozenset(direct)
 
 
 def scalar_likeness(operation: str) -> str | None:
     return _BINARY.get(operation) or _UNARY.get(operation)
+
+
+# Integer-domain scalar emission. The templates above are the double column of
+# the same table; an integer-typed value must not be quietly widened to double
+# and stored back into a narrower ABI slot, so the integer spelling lives here
+# as one shared rule both module emitters consult.
+_INTEGER_BINARY: dict[str, str] = {
+    "Add": "add", "Sub": "sub", "Mul": "mul",
+    "Div": "sdiv", "Mod": "srem",
+    "And": "and", "Or": "or", "Xor": "xor",
+    "LAnd": "and", "LOr": "or",
+    "BitAnd": "and", "BitOr": "or", "BitXor": "xor",
+    "Shl": "shl", "Shr": "lshr",
+}
+_INTEGER_COMPARISON: dict[str, str] = {
+    "Eq": "eq", "Ne": "ne", "Lt": "slt",
+    "Le": "sle", "Gt": "sgt", "Ge": "sge",
+    "ULt": "ult", "ULe": "ule",
+}
+# The double column reaches minnum/maxnum, which have no integer form.
+# Compare-and-select is the exact integer equivalent and needs no intrinsic.
+# Unsigned selection stays absent until an unsigned opcode names itself,
+# exactly as ULt/ULe already do for comparison.
+_INTEGER_SELECTION: dict[str, str] = {"Max": "sgt", "Min": "slt"}
+
+
+def integer_scalar_lines(
+    operation: str,
+    operand_type: str,
+    operands: list[str],
+    register: str,
+) -> tuple[list[str], str] | None:
+    """(lines, result type) for an integer-domain scalar op, else ``None``.
+
+    ``None`` means this opcode has no exact integer spelling; the caller
+    decides whether that is a shortfall or a documented double-domain
+    evaluation converted back to the declared integer type.
+    """
+
+    if operation in _INTEGER_BINARY and len(operands) == 2:
+        return ([
+            f"{register} = {_INTEGER_BINARY[operation]} "
+            f"{operand_type} {operands[0]}, {operands[1]}"
+        ], operand_type)
+    if operation in _INTEGER_SELECTION and len(operands) == 2:
+        return ([
+            f"{register}.cmp = icmp {_INTEGER_SELECTION[operation]} "
+            f"{operand_type} {operands[0]}, {operands[1]}",
+            f"{register} = select i1 {register}.cmp, "
+            f"{operand_type} {operands[0]}, {operand_type} {operands[1]}",
+        ], operand_type)
+    if operation in _INTEGER_COMPARISON and len(operands) == 2:
+        return ([
+            f"{register} = icmp {_INTEGER_COMPARISON[operation]} "
+            f"{operand_type} {operands[0]}, {operands[1]}"
+        ], "i1")
+    if operation == "Neg" and len(operands) == 1:
+        return ([f"{register} = sub {operand_type} 0, {operands[0]}"],
+                operand_type)
+    if operation in {"Not", "LNot"} and len(operands) == 1:
+        return ([f"{register} = xor {operand_type} {operands[0]}, 1"],
+                operand_type)
+    return None
 
 
 def tensor_likeness(operation: str) -> str | None:
@@ -166,9 +316,24 @@ import subprocess as _subprocess
 import tempfile as _tempfile
 from dataclasses import dataclass as _dataclass, field as _field
 from pathlib import Path as _Path
-from typing import Any as _Any
+from typing import Any as _Any, Mapping as _Mapping
 
 from ..transmogrifier.ssa import IRModule as _IRModule
+from .output_publication import (
+    function_output_publications,
+    publication_surface_plan,
+)
+
+
+# Target intrinsics reached by the scalar tables, plus the block-copy the
+# arena/aggregate paths emit directly. This is the one home for intrinsic
+# declarations; both module emitters seed from it.
+_LLVM_INTRINSIC_DECLARATIONS: dict[str, str] = {
+    **_intrinsic_declarations_from_templates(_BINARY, _UNARY),
+    "llvm.memcpy.p0.p0.i64": (
+        "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)"
+    ),
+}
 
 
 @_dataclass(frozen=True)
@@ -207,13 +372,18 @@ def _double_literal(value: _Any) -> str:
 
 
 def _value_llvm_type(value: _Any) -> str:
+    accounting = getattr(value, "accounting", {}) or {}
     if tuple(
-        (getattr(value, "accounting", {}) or {}).get(
+        accounting.get(
             "ssa_aggregate_outputs", ()
         )
     ):
         return "ptr"
-    dtype = str(getattr(value, "dtype", None) or "float64").lower()
+    dtype = str(
+        accounting.get("physical_dtype")
+        or getattr(value, "dtype", None)
+        or "float64"
+    ).lower()
     if dtype in {"bool", "i1"}:
         return "i1"
     if dtype in {"int", "int32", "i32"}:
@@ -317,7 +487,8 @@ def _emit_repository_call_module(
     # Determine which aggregate projections are actually consumed.  This
     # shrinks planned-region ABIs and removes descriptor getters made dead by
     # structural specialization before target emission.
-    aggregate_outputs: dict[str, list[int]] = {}
+    aggregate_output_positions: dict[str, list[int]] = {}
+    aggregate_output_ids: dict[str, list[int]] = {}
     aggregate_output_values: dict[str, dict[int, _Any]] = {}
     aggregate_positions: dict[tuple[str, int], tuple[int, ...]] = {}
     for caller_name in reachable:
@@ -365,19 +536,33 @@ def _emit_repository_call_module(
                     live_positions.append(projected_position)
                     projected_values[projected_position] = follower.res
             selected = tuple(dict.fromkeys(live_positions))
-            if not selected:
+            consumed_whole = any(
+                follower is not instruction
+                and follower.op not in {"GetElementPtr", "getelementptr"}
+                and any(
+                    int(argument.id) == int(instruction.res.id)
+                    for argument in follower.args
+                )
+                for follower in instructions
+            )
+            if consumed_whole or not selected:
                 selected = tuple(range(len(declared)))
             aggregate_positions[(caller_name, int(instruction.res.id))] = selected
             if callee in reachable and declared:
-                output_ids = [declared[index] for index in selected]
-                existing = aggregate_outputs.setdefault(callee, [])
-                for value_id in output_ids:
-                    if value_id not in existing:
-                        existing.append(value_id)
+                existing = aggregate_output_positions.setdefault(callee, [])
+                existing_ids = aggregate_output_ids.setdefault(callee, [])
                 typed = aggregate_output_values.setdefault(callee, {})
                 for position in selected:
-                    if position in projected_values:
-                        typed[declared[position]] = projected_values[position]
+                    if position not in existing:
+                        existing.append(position)
+                        existing_ids.append(declared[position])
+                    value = projected_values.get(position)
+                    if value is None:
+                        value = values_by_function[caller_name].get(
+                            declared[position]
+                        )
+                    if value is not None:
+                        typed[declared[position]] = value
 
     function_outputs: dict[str, tuple[_Any, ...]] = {}
     for name in reachable:
@@ -388,19 +573,47 @@ def _emit_repository_call_module(
             for instruction in block.instrs
             if instruction.op in {"Ret", "ret", "Return", "return"}
         ), ())
-        ids = aggregate_outputs.get(name)
-        function_outputs[name] = tuple(
-            (
-                values_by_function[name][value_id]
-                if value_id in values_by_function[name]
-                else aggregate_output_values[name][value_id]
-            )
-            for value_id in ids
-            if (
+        physical_returned = returned
+        if len(returned) == 1:
+            aggregate_ids = tuple(map(
+                int,
+                (returned[0].accounting or {}).get(
+                    "ssa_aggregate_outputs", ()
+                ),
+            ))
+            if aggregate_ids and all(
                 value_id in values_by_function[name]
-                or value_id in aggregate_output_values.get(name, {})
+                for value_id in aggregate_ids
+            ):
+                physical_returned = tuple(
+                    values_by_function[name][value_id]
+                    for value_id in aggregate_ids
+                )
+        positions = aggregate_output_positions.get(name)
+        if physical_returned:
+            function_outputs[name] = (
+                tuple(physical_returned[position] for position in positions)
+                if positions is not None
+                and all(
+                    position < len(physical_returned)
+                    for position in positions
+                )
+                else physical_returned
             )
-        ) if ids is not None else returned
+        else:
+            declared_ids = aggregate_output_ids.get(name, ())
+            function_outputs[name] = tuple(
+                (
+                    values_by_function[name][value_id]
+                    if value_id in values_by_function[name]
+                    else aggregate_output_values[name][value_id]
+                )
+                for value_id in declared_ids
+                if (
+                    value_id in values_by_function[name]
+                    or value_id in aggregate_output_values.get(name, {})
+                )
+            )
 
     # A source wrapper may return a callee's aggregate unchanged (the
     # canonical backward ``bw_matmul -> matmul_vjp`` shape).  Returning an
@@ -461,6 +674,77 @@ def _emit_repository_call_module(
             return "true" if bool(payload) else "false"
         return str(int(0 if payload is None else payload))
 
+    # --- runtime span extents across the internal call frames ---------------
+    # A rank-N span is addressed inside a region, but only the public boundary
+    # knows how large the real buffer is. Resolve each internal span parameter
+    # back to the public value it came from by walking the argument bindings
+    # the caller already computed -- the same binding the record-field identity
+    # travels on -- then measure that buffer's axis once through the artifact's
+    # existing extents vector. Nothing is inferred from names or positions.
+    span_origin: dict[tuple[str, int], tuple[str, int]] = {}
+    internal_callers: dict[str, set[str]] = {}
+    for caller_name in reachable:
+        for block in module.functions[caller_name].blocks.values():
+            for instruction in block.instrs:
+                if instruction.op != "Call":
+                    continue
+                callee_name = str(instruction.attributes.get("callee") or "")
+                callee_function = module.functions.get(callee_name)
+                if callee_function is None:
+                    continue
+                internal_callers.setdefault(callee_name, set()).add(caller_name)
+                if len(callee_function.args) != len(instruction.args):
+                    continue
+                for fed, formal in zip(instruction.args, callee_function.args):
+                    span_origin[(callee_name, int(formal.id))] = (
+                        caller_name, int(fed.id),
+                    )
+
+    def public_span_value(name: str, value_id: int) -> int | None:
+        """The root's own value id for a span reached through call frames."""
+
+        seen: set[tuple[str, int]] = set()
+        current = (str(name), int(value_id))
+        while current[0] != function_name:
+            if current in seen:
+                return None
+            seen.add(current)
+            origin = span_origin.get(current)
+            if origin is None:
+                return None
+            current = origin
+        return current[1]
+
+    # Functions that address a span across more than one axis need the extents
+    # vector, and so does every function that calls one.
+    extent_users: set[str] = {
+        name for name in reachable
+        for block in module.functions[name].blocks.values()
+        for instruction in block.instrs
+        if instruction.op in {"GetElementPtr", "getelementptr"}
+        and len(instruction.args) > 2
+    }
+    growing = True
+    while growing:
+        growing = False
+        for callee_name in tuple(extent_users):
+            for caller_name in internal_callers.get(callee_name, ()):  # noqa: B007
+                if caller_name in reachable and caller_name not in extent_users:
+                    extent_users.add(caller_name)
+                    growing = True
+
+    module_extent_order: list[tuple[int, str, int | None]] = []
+    module_extent_slots: dict[tuple[int, str, int | None], int] = {}
+
+    def module_extent_slot(public_id: int, axis: int) -> int:
+        key = (int(public_id), "dim", int(axis))
+        slot = module_extent_slots.get(key)
+        if slot is None:
+            slot = len(module_extent_order)
+            module_extent_order.append(key)
+            module_extent_slots[key] = slot
+        return slot
+
     emitted_functions: list[str] = []
     for name in sorted(reachable, key=lambda item: item != function_name):
         function = module.functions[name]
@@ -468,6 +752,7 @@ def _emit_repository_call_module(
         parameters = [
             *(f"ptr %arg.{index}" for index in range(len(function.args))),
             *(f"ptr %out.{index}" for index in range(len(outputs))),
+            *(("ptr %extents",) if name in extent_users else ()),
         ]
         body: list[str] = []
         entry_allocas: list[str] = []
@@ -478,6 +763,7 @@ def _emit_repository_call_module(
         aggregate_members: dict[int, dict[int, str]] = {}
         address_members: dict[int, str] = {}
         address_slots: dict[int, str] = {}
+        span_addresses: dict[int, str] = {}
         allocated: set[int] = set()
         output_pointer = {
             int(value.id): f"%out.{index}"
@@ -522,6 +808,13 @@ def _emit_repository_call_module(
             if wanted in {"i32", "i64"} and source_type == "double":
                 body.append(
                     f"  {converted} = fptosi double {loaded} to {wanted}"
+                )
+                return converted
+            if wanted == "i1":
+                zero = "0.0" if source_type == "double" else "0"
+                comparison = "fcmp one" if source_type == "double" else "icmp ne"
+                body.append(
+                    f"  {converted} = {comparison} {source_type} {loaded}, {zero}"
                 )
                 return converted
             return loaded
@@ -693,6 +986,56 @@ def _emit_repository_call_module(
                 )
                 continue
 
+            if operation == "extent" and result is not None and instruction.args:
+                source = instruction.args[0]
+                shape = tuple(getattr(source, "shape", ()) or ())
+                try:
+                    concrete_shape = tuple(int(extent) for extent in shape)
+                except (TypeError, ValueError):
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name,
+                        operation,
+                        "internal dynamic extent has no static repository "
+                        "shape contract",
+                    ))
+                    continue
+                kind = str(instruction.attributes.get("extent_kind") or "")
+                target = pointer(result)
+                if kind == "shape":
+                    for axis, extent in enumerate(concrete_shape):
+                        slot = f"%extent.shape.slot.{tag}.{axis}"
+                        body.append(
+                            f"  {slot} = getelementptr i32, ptr {target}, "
+                            f"i64 {axis}"
+                        )
+                        body.append(
+                            f"  store i32 {extent}, ptr {slot}, align 4"
+                        )
+                else:
+                    if kind in {"element_count", "numel"}:
+                        from math import prod as _shape_product
+
+                        extent_value = int(_shape_product(concrete_shape))
+                    elif kind == "rank":
+                        extent_value = len(concrete_shape)
+                    elif kind == "dim":
+                        axis = int(instruction.attributes.get(
+                            "axis", instruction.attributes.get("dim", 0)
+                        ))
+                        extent_value = concrete_shape[axis]
+                    else:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, operation, f"unknown extent kind {kind!r}",
+                        ))
+                        continue
+                    llvm_type = _value_llvm_type(result)
+                    body.append(
+                        f"  store {llvm_type} "
+                        f"{literal(extent_value, llvm_type)}, ptr {target}, "
+                        "align 8"
+                    )
+                continue
+
             if operation in {"Ret", "ret", "Return", "return"}:
                 emit_return_values()
                 body.append("  ret void")
@@ -725,6 +1068,7 @@ def _emit_repository_call_module(
                 if (
                     position is not None
                     and instruction.args
+                    and len(instruction.args) <= 2
                 ):
                     slot = f"%aggregate.slot.{tag}"
                     body.append(
@@ -732,8 +1076,85 @@ def _emit_repository_call_module(
                     )
                     address_slots[result_id] = slot
                     continue
+                if len(instruction.args) > 1 and name in extent_users:
+                    base = instruction.args[0]
+                    indices = [
+                        load_as(argument, "i32", f"{tag}.{position}")
+                        for position, argument in enumerate(
+                            instruction.args[1:]
+                        )
+                    ]
+                    declared_rank = int(
+                        (getattr(base, "accounting", None) or {}).get(
+                            "program_abi_rank"
+                        ) or 0
+                    )
+                    static = tuple(base.shape or ())
+                    rank = len(static) or declared_rank
+                    public_id = public_span_value(name, int(base.id))
+                    # A single index is already the offset; only a multi-axis
+                    # address has to know the axis it is striding over.
+                    if len(indices) == 1 or (
+                        rank == len(indices)
+                        and (
+                            public_id is not None
+                            or all(isinstance(item, int) for item in static)
+                        )
+                    ):
+                        offset = indices[0]
+                        for axis, index in enumerate(indices[1:], start=1):
+                            if axis < len(static) and isinstance(
+                                static[axis], int
+                            ):
+                                stride = str(int(static[axis]))
+                            else:
+                                measured = module_extent_slot(public_id, axis)
+                                address = f"%extent.addr.{tag}.{axis}"
+                                register = f"%extent.{tag}.{axis}"
+                                body.append(
+                                    f"  {address} = getelementptr i32, "
+                                    f"ptr %extents, i64 {measured}"
+                                )
+                                body.append(
+                                    f"  {register} = load i32, ptr {address}, "
+                                    "align 4"
+                                )
+                                stride = register
+                            scaled = f"%address.{tag}.scale.{axis}"
+                            body.append(
+                                f"  {scaled} = mul i32 {offset}, {stride}"
+                            )
+                            summed = f"%address.{tag}.sum.{axis}"
+                            body.append(
+                                f"  {summed} = add i32 {scaled}, {index}"
+                            )
+                            offset = summed
+                        element_type = _value_llvm_type(base)
+                        if element_type == "ptr":
+                            element_type = "i64"
+                        computed = f"%address.{tag}"
+                        body.append(
+                            f"  {computed} = getelementptr {element_type}, "
+                            f"ptr {pointer(base)}, i32 {offset}"
+                        )
+                        # The addressed element *is* the storage; a later Load
+                        # aliases it rather than copying, exactly as the
+                        # aggregate-member path already does.
+                        pointers[result_id] = computed
+                        span_addresses[result_id] = computed
+                        continue
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"{len(indices)}-axis address for %t{int(base.id)} "
+                        f"has rank {rank} and no public span origin",
+                    ))
+                    continue
 
             if operation in {"Load", "load"} and result is not None and instruction.args:
+                addressed = span_addresses.get(int(instruction.args[0].id))
+                if addressed is not None:
+                    pointers[result_id] = addressed
+                    continue
                 member = address_members.get(int(instruction.args[0].id))
                 if member is not None:
                     pointers[result_id] = member
@@ -772,6 +1193,115 @@ def _emit_repository_call_module(
             callee = instruction.attributes.get("callee")
             if callee is not None:
                 symbol = str(callee)
+                tensor_operation = instruction.attributes.get("tensor_operation")
+                if (
+                    instruction.res is not None
+                    and tensor_operation is not None
+                    and symbol in {
+                        "binary_double", "binary_scalar_double", "unary_double",
+                    }
+                ):
+                    # Repository SSA keeps tensor calls semantic: operands and
+                    # result are SSA values, while element count, C opcode and
+                    # scalar direction remain attributes/shape facts. Expand
+                    # that boundary here instead of requiring precompile SSA
+                    # to carry one backend's private C ABI as fake operands.
+                    from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+                        c_tensor_opcode,
+                    )
+
+                    opcode = c_tensor_opcode(str(tensor_operation))
+                    result_count = _value_element_count(instruction.res)
+                    if opcode is None:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name,
+                            symbol,
+                            f"no C tensor opcode for {tensor_operation!r}",
+                        ))
+                        continue
+                    opcode_kind, opcode_value = opcode
+                    destination = pointer(instruction.res)
+                    if symbol == "unary_double":
+                        if opcode_kind != "unary" or len(instruction.args) != 1:
+                            shortfalls.append(LLVMEmissionShortfall(
+                                name,
+                                symbol,
+                                "semantic unary call has an invalid operand layout",
+                            ))
+                            continue
+                        source = pointer(instruction.args[0])
+                        body.append(
+                            f"  call void @unary_double(ptr {source}, "
+                            f"ptr {destination}, i32 {result_count}, "
+                            f"i32 {opcode_value})"
+                        )
+                        kernels_used.add(symbol)
+                        continue
+                    if opcode_kind != "binary":
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name,
+                            symbol,
+                            "semantic binary call resolved to a non-binary opcode",
+                        ))
+                        continue
+                    if symbol == "binary_double":
+                        if len(instruction.args) != 2:
+                            shortfalls.append(LLVMEmissionShortfall(
+                                name,
+                                symbol,
+                                "semantic binary call requires two operands",
+                            ))
+                            continue
+                        left = pointer(instruction.args[0])
+                        right = pointer(instruction.args[1])
+                        body.append(
+                            f"  call void @binary_double(ptr {left}, ptr {right}, "
+                            f"ptr {destination}, i32 {result_count}, "
+                            f"i32 {opcode_value})"
+                        )
+                        kernels_used.add(symbol)
+                        continue
+
+                    reverse = bool(instruction.attributes.get("reverse", False))
+                    scalar_literal = instruction.attributes.get("right_scalar")
+                    array_argument = None
+                    scalar_rendering = None
+                    if scalar_literal is not None and len(instruction.args) == 1:
+                        array_argument = instruction.args[0]
+                        scalar_rendering = _double_literal(float(scalar_literal))
+                    elif len(instruction.args) == 2:
+                        left, right = instruction.args
+                        left_count = _value_element_count(left)
+                        right_count = _value_element_count(right)
+                        if left_count == result_count and right_count == 1:
+                            array_argument, scalar_argument = left, right
+                        elif left_count == 1 and right_count == result_count:
+                            array_argument, scalar_argument = right, left
+                            reverse = not reverse
+                        else:
+                            scalar_argument = None
+                        if array_argument is not None and scalar_argument is not None:
+                            scalar_rendering = load_as(
+                                scalar_argument,
+                                "double",
+                                f"semantic.scalar.{result_id}",
+                            )
+                    if array_argument is None or scalar_rendering is None:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name,
+                            symbol,
+                            "semantic scalar binary call has an invalid operand layout",
+                        ))
+                        continue
+                    source = pointer(array_argument)
+                    body.append(
+                        f"  call void @binary_scalar_double(ptr {source}, "
+                        f"double {scalar_rendering}, ptr {destination}, "
+                        f"i32 {result_count}, i32 {opcode_value}, "
+                        f"i32 {int(reverse)})"
+                    )
+                    kernels_used.add(symbol)
+                    continue
                 try:
                     returns, argument_types = _kernel_signature(symbol)
                 except (KeyError, ValueError):
@@ -826,11 +1356,33 @@ def _emit_repository_call_module(
                             for index in range(len(callee_outputs))
                         ]
                     elif declared_ids:
-                        result_ptrs = [
-                            pointer(projections[position])
-                            for position in selected
-                            if position in projections
-                        ]
+                        if len(selected) != len(callee_outputs):
+                            shortfalls.append(LLVMEmissionShortfall(
+                                name,
+                                symbol,
+                                "aggregate positions "
+                                f"{selected!r} do not match "
+                                f"{len(callee_outputs)} callee outputs; "
+                                f"declared={declared_ids!r}",
+                            ))
+                            continue
+                        result_ptrs = []
+                        for output_index, position in enumerate(selected):
+                            projected = projections.get(position)
+                            if projected is not None:
+                                result_ptrs.append(pointer(projected))
+                            else:
+                                value = callee_outputs[output_index]
+                                llvm_type = _value_llvm_type(value)
+                                count = _value_element_count(value)
+                                temporary = (
+                                    f"%call.output.{tag}.{output_index}"
+                                )
+                                body.append(
+                                    f"  {temporary} = alloca {llvm_type}, "
+                                    f"i64 {count}, align 8"
+                                )
+                                result_ptrs.append(temporary)
                     else:
                         if len(callee_outputs) == 1 and result is not None:
                             result_ptrs = [pointer(result)]
@@ -844,16 +1396,63 @@ def _emit_repository_call_module(
                                     f"  {temporary} = alloca {llvm_type}, i64 {count}, align 8"
                                 )
                                 result_ptrs.append(temporary)
-                    call_args = [pointer(argument) for argument in instruction.args]
+                    semantic_arguments = list(instruction.args)
+                    expected_argument_count = len(
+                        module.functions[symbol].args
+                    )
+                    if len(semantic_arguments) > expected_argument_count:
+                        surplus = semantic_arguments[expected_argument_count:]
+                        if all(
+                            (value.accounting or {}).get(
+                                "linked_call_frame_storage"
+                            )
+                            for value in surplus
+                        ):
+                            # Source linking can retain caller-owned storage
+                            # placeholders after the callee has internalized
+                            # those temporaries.  They are neither semantic
+                            # operands nor callee outputs.  Passing them
+                            # positionally shifts the real output pointers and
+                            # silently writes results into the caller frame.
+                            semantic_arguments = semantic_arguments[
+                                :expected_argument_count
+                            ]
+                        else:
+                            shortfalls.append(LLVMEmissionShortfall(
+                                name,
+                                symbol,
+                                "repository call has surplus non-frame "
+                                f"arguments: actual={len(semantic_arguments)}, "
+                                f"expected={expected_argument_count}",
+                            ))
+                            continue
+                    if len(semantic_arguments) != expected_argument_count:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name,
+                            symbol,
+                            "repository call argument count does not match "
+                            f"callee ABI: actual={len(semantic_arguments)}, "
+                            f"expected={expected_argument_count}",
+                        ))
+                        continue
+                    call_args = [
+                        pointer(argument) for argument in semantic_arguments
+                    ]
                     if len(result_ptrs) != len(callee_outputs):
                         shortfalls.append(LLVMEmissionShortfall(
                             name, symbol,
-                            "live aggregate projections do not match callee outputs",
+                            "live aggregate projections do not match callee "
+                            f"outputs: pointers={len(result_ptrs)}, "
+                            f"outputs={len(callee_outputs)}, "
+                            f"selected={selected!r}, declared={declared_ids!r}",
                         ))
                         continue
                     body.append(
                         f"  call void @{internal_symbols[symbol]}("
-                        + ", ".join(f"ptr {value}" for value in (*call_args, *result_ptrs))
+                        + ", ".join(f"ptr {value}" for value in (
+                            *call_args, *result_ptrs,
+                            *(("%extents",) if symbol in extent_users else ()),
+                        ))
                         + ")"
                     )
                     if result is not None:
@@ -871,21 +1470,65 @@ def _emit_repository_call_module(
                                 for index, original_position in enumerate(selected)
                                 if index < len(result_ptrs)
                             }
-                            if not declared_ids:
-                                aggregate = f"%aggregate.{tag}"
-                                body.append(
-                                    f"  {aggregate} = alloca ptr, i64 {len(result_ptrs)}, align 8"
+                            aggregate = f"%aggregate.{tag}"
+                            body.append(
+                                f"  {aggregate} = alloca ptr, i64 "
+                                f"{len(result_ptrs)}, align 8"
+                            )
+                            for output_index, result_pointer in enumerate(
+                                result_ptrs
+                            ):
+                                slot = (
+                                    f"%aggregate.output.slot.{tag}."
+                                    f"{output_index}"
                                 )
-                                for output_index, result_pointer in enumerate(result_ptrs):
-                                    slot = f"%aggregate.output.slot.{tag}.{output_index}"
-                                    body.append(
-                                        f"  {slot} = getelementptr ptr, ptr {aggregate}, i64 {output_index}"
-                                    )
-                                    body.append(
-                                        f"  store ptr {result_pointer}, ptr {slot}, align 8"
-                                    )
-                                pointers[result_id] = aggregate
+                                body.append(
+                                    f"  {slot} = getelementptr ptr, ptr "
+                                    f"{aggregate}, i64 {output_index}"
+                                )
+                                body.append(
+                                    f"  store ptr {result_pointer}, ptr "
+                                    f"{slot}, align 8"
+                                )
+                            pointers[result_id] = aggregate
                     continue
+
+            if operation in {"Cast", "CastLike", "cast_like"} and result is not None and instruction.args:
+                result_type = _value_llvm_type(result)
+                rendered = load_as(
+                    instruction.args[0], result_type, f"cast.{tag}"
+                )
+                body.append(
+                    f"  store {result_type} {rendered}, ptr {pointer(result)}, align 8"
+                )
+                continue
+
+            if (
+                operation in {"Select", "where"}
+                and result is not None
+                and len(instruction.args) == 3
+            ):
+                # Select(mask, when_true, when_false); the mask reaches i1
+                # through the same truthiness conversion every other target
+                # applies, so a numeric mask needs no separate opcode.
+                result_type = _value_llvm_type(result)
+                mask = load_as(instruction.args[0], "i1", f"select.{tag}")
+                when_true = load_as(
+                    instruction.args[1], result_type, f"select.{tag}.true",
+                )
+                when_false = load_as(
+                    instruction.args[2], result_type, f"select.{tag}.false",
+                )
+                register = f"%select.{tag}"
+                body.append(
+                    f"  {register} = select i1 {mask}, "
+                    f"{result_type} {when_true}, {result_type} {when_false}"
+                )
+                body.append(
+                    f"  store {result_type} {register}, "
+                    f"ptr {pointer(result)}, align 8"
+                )
+                continue
 
             template = scalar_likeness(operation)
             if template is not None and result is not None:
@@ -899,44 +1542,35 @@ def _emit_repository_call_module(
                     for position, argument in enumerate(instruction.args)
                 ]
                 register = f"%scalar.{tag}"
-                if operand_type in {"i1", "i32", "i64"}:
-                    integer_binary = {
-                        "Add": "add", "Sub": "sub", "Mul": "mul",
-                        "Div": "sdiv", "Mod": "srem",
-                        "And": "and", "Or": "or", "Xor": "xor",
-                        "BitAnd": "and", "BitOr": "or", "BitXor": "xor",
-                        "Shl": "shl", "Shr": "lshr",
-                    }
-                    integer_comparison = {
-                        "Eq": "eq", "Ne": "ne", "Lt": "slt",
-                        "Le": "sle", "Gt": "sgt", "Ge": "sge",
-                        "ULt": "ult", "ULe": "ule",
-                    }
-                    if operation in integer_binary and len(operands) == 2:
-                        body.append(
-                            f"  {register} = {integer_binary[operation]} "
-                            f"{operand_type} {operands[0]}, {operands[1]}"
-                        )
-                    elif operation in integer_comparison and len(operands) == 2:
-                        body.append(
-                            f"  {register} = icmp {integer_comparison[operation]} "
-                            f"{operand_type} {operands[0]}, {operands[1]}"
-                        )
-                        result_type = "i1"
-                    elif operation == "Neg" and len(operands) == 1:
-                        body.append(
-                            f"  {register} = sub {operand_type} 0, {operands[0]}"
-                        )
-                    elif operation == "Not" and len(operands) == 1:
-                        body.append(
-                            f"  {register} = xor {operand_type} {operands[0]}, 1"
-                        )
-                    else:
+                integer_cast = {
+                    "SiToFp": "sitofp",
+                    "UiToFp": "uitofp",
+                    "SExt": "sext",
+                    "ZExt": "zext",
+                }
+                float_cast = {"FpToSi": "fptosi", "FpToUi": "fptoui"}
+                if operation in integer_cast and len(operands) == 1:
+                    body.append(
+                        f"  {register} = {integer_cast[operation]} "
+                        f"{operand_type} {operands[0]} to {result_type}"
+                    )
+                elif operation in float_cast and len(operands) == 1:
+                    body.append(
+                        f"  {register} = {float_cast[operation]} "
+                        f"{operand_type} {operands[0]} to {result_type}"
+                    )
+                elif operand_type in {"i1", "i32", "i64"}:
+                    integer = integer_scalar_lines(
+                        operation, operand_type, operands, register,
+                    )
+                    if integer is None:
                         shortfalls.append(LLVMEmissionShortfall(
                             name, operation,
                             f"integer scalar operation has no LLVM emission for {operand_type}",
                         ))
                         continue
+                    integer_lines, result_type = integer
+                    body.extend(f"  {line}" for line in integer_lines)
                 else:
                     for rendered_line in template.format(
                         *operands, out=register
@@ -947,6 +1581,16 @@ def _emit_repository_call_module(
                 body.append(
                     f"  store {result_type} {register}, ptr {pointer(result)}, align 8"
                 )
+                continue
+
+            if operation in {"Deploy", "Join"}:
+                # A deployment boundary describes scheduling around the
+                # numerical program, not a computation inside it. One native
+                # module executes that program serially, so the marker has no
+                # instruction of its own; it stays as a comment so the
+                # structural boundary remains visible in the emitted IR. This
+                # matches the Fortran lane exactly.
+                body.append(f"  ; {operation} deployment boundary")
                 continue
 
             # Descriptor getters can be present as dead planned outputs after
@@ -976,7 +1620,20 @@ def _emit_repository_call_module(
 
     root = module.functions[function_name]
     root_outputs = function_outputs[function_name]
-    public_values = [*root.args, *root_outputs]
+    # Storage introduced while linking a nested repository call belongs to
+    # the root function's native frame, not to the authored program ABI.  It
+    # remains an ordinary pointer argument of the internal root function so
+    # call-frame linkage stays uniform, but the public wrapper owns and
+    # allocates it locally.
+    root_public_args = tuple(
+        value for value in root.args
+        if not (value.accounting or {}).get("linked_call_frame_storage")
+    )
+    root_internal_storage = tuple(
+        value for value in root.args
+        if (value.accounting or {}).get("linked_call_frame_storage")
+    )
+    public_values = [*root_public_args, *root_outputs]
     buffer_order: list[int] = []
     buffer_shapes: list[tuple[_Any, ...]] = []
     buffer_dtypes: list[str] = []
@@ -995,27 +1652,48 @@ def _emit_repository_call_module(
         wrapper.append(f"  {address} = getelementptr ptr, ptr %buffers, i64 {slot}")
         wrapper.append(f"  {loaded} = load ptr, ptr {address}, align 8")
         public_pointer[value_id] = loaded
+    for storage_index, value in enumerate(root_internal_storage):
+        llvm_type = _value_llvm_type(value)
+        count = _value_element_count(value)
+        local = f"%root.frame.{storage_index}"
+        wrapper.append(
+            f"  {local} = alloca {llvm_type}, i64 {count}, align 8"
+        )
+        public_pointer[int(value.id)] = local
     wrapper.append(
         f"  call void @{internal_symbols[function_name]}("
-        + ", ".join(
-            f"ptr {public_pointer[int(value.id)]}"
-            for value in (*root.args, *root_outputs)
-        )
+        + ", ".join((
+            *(
+                f"ptr {public_pointer[int(value.id)]}"
+                for value in (*root.args, *root_outputs)
+            ),
+            *(("ptr %extents",) if function_name in extent_users else ()),
+        ))
         + ")"
     )
     wrapper.append("  ret void")
 
     definitions: dict[str, str] = {}
-    declarations: dict[str, str] = {
-        "llvm.memcpy.p0.p0.i64": (
-            "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)"
-        )
-    }
+    declarations: dict[str, str] = {}
     unresolved: set[str] = set()
-    pending_kernels = set(kernels_used)
+    # The scalar tables reach target intrinsics from the emitted bodies and the
+    # wrapper, not only from authored kernels, so the closure starts at every
+    # symbol this module actually references.
+    module_text = "\n".join((*emitted_functions, *wrapper))
+    pending_kernels = set(kernels_used) | set(_re.findall(
+        r"@([A-Za-z_$.-][\w$.-]*)\s*\(", module_text,
+    ))
+    # Functions this module defines itself are not external references.
+    pending_kernels -= set(_re.findall(
+        r"define\s+[^@]*@([A-Za-z_$.-][\w$.-]*)\s*\(", module_text,
+    ))
+    pending_kernels.discard(entry_name)
     while pending_kernels:
         symbol = pending_kernels.pop()
         if symbol in definitions or symbol in declarations:
+            continue
+        if symbol in _LLVM_INTRINSIC_DECLARATIONS:
+            declarations[symbol] = _LLVM_INTRINSIC_DECLARATIONS[symbol]
             continue
         try:
             definition = extract_llvm_function(symbol)
@@ -1045,15 +1723,18 @@ def _emit_repository_call_module(
             "}",
         )),
     ) if part)
+    publications = function_output_publications(module.functions[function_name])
     return LLVMFunctionArtifact(
         name=entry_name,
         llvm_ir=llvm_ir + "\n",
         buffer_order=tuple(buffer_order),
         buffer_shapes=tuple(buffer_shapes),
-        extent_order=(),
+        extent_order=tuple(module_extent_order),
         shortfalls=tuple(shortfalls),
         buffer_dtypes=tuple(buffer_dtypes),
         needs_text_sink=bool(text_sink),
+        output_publications=publications,
+        output_surfaces=publication_surface_plan(publications, target="llvm"),
     )
 
 
@@ -1069,6 +1750,8 @@ class LLVMFunctionArtifact:
     shortfalls: tuple[LLVMEmissionShortfall, ...]
     buffer_dtypes: tuple[str, ...] = ()
     needs_text_sink: bool = False
+    output_publications: tuple[_Mapping[str, _Any], ...] = ()
+    output_surfaces: _Mapping[str, _Any] | None = None
     library_path: _Path | None = None
     training_steps_value_id: int | None = None
     learning_rate_value_id: int | None = None
@@ -1344,6 +2027,8 @@ def with_native_sgd_loop(
         shortfalls=(),
         buffer_dtypes=(*base_dtypes, "i32", "double"),
         needs_text_sink=artifact.needs_text_sink,
+        output_publications=artifact.output_publications,
+        output_surfaces=artifact.output_surfaces,
         training_steps_value_id=steps_id,
         learning_rate_value_id=learning_rate_id,
     )
@@ -1352,6 +2037,8 @@ def with_native_sgd_loop(
 def emit_ssa_function_to_llvm(
     module: _IRModule, function_name: str, *, entry_name: str | None = None,
     text_sink: bool = False,
+    pi_solver: str | None = None,
+    pi_epsilon: float | None = None,
 ) -> LLVMFunctionArtifact:
     """Render one SSA function of table-covered instructions as LLVM IR.
 
@@ -1389,8 +2076,10 @@ def emit_ssa_function_to_llvm(
     buffer_ids: list[int] = []
     buffer_index: dict[int, int] = {}
     extent_order: list[tuple[int, str, int | None]] = []
+    extent_slots: dict[tuple[int, str, int | None], int] = {}
     scalars: dict[int, tuple[str, str]] = {}   # value id -> (rendering, type)
     kernels_used: set[str] = set()
+    bounded_definitions: dict[str, str] = {}
     publishes_text = False
     value_shapes: dict[int, tuple[_Any, ...]] = {
         int(argument.id): tuple(argument.shape or ())
@@ -1433,6 +2122,29 @@ def emit_ssa_function_to_llvm(
             )
         return f"%buffer.{value_id}"
 
+    def runtime_extent(value_id: int, axis: int, tag: str) -> str:
+        """An i32 register holding one axis length, measured at call time.
+
+        The public ABI already carries an ``%extents`` vector that the executor
+        fills from the real buffers, so a runtime axis length needs a slot in
+        that vector rather than a compile-time constant. Slots are memoised so
+        one axis is measured once per function.
+        """
+
+        key = (int(value_id), "dim", int(axis))
+        slot = extent_slots.get(key)
+        if slot is None:
+            slot = len(extent_order)
+            extent_order.append(key)
+            extent_slots[key] = slot
+        address = f"%extent.addr.{tag}.{slot}"
+        register = f"%extent.{tag}.{slot}"
+        lines.append(
+            f"  {address} = getelementptr i32, ptr %extents, i64 {slot}"
+        )
+        lines.append(f"  {register} = load i32, ptr {address}, align 4")
+        return register
+
     def as_type(value_id: int, wanted: str, tag: str) -> str | None:
         known = scalars.get(int(value_id))
         if known is None:
@@ -1440,15 +2152,122 @@ def emit_ssa_function_to_llvm(
         rendering, kind = known
         if kind == wanted:
             return rendering
-        if wanted == "double" and kind == "i32":
+        if wanted == "double" and kind in {"i1", "i32", "i64"}:
             if not rendering.startswith("%"):
                 return _double_literal(float(int(rendering)))
             register = f"%conv.{tag}"
-            lines.append(f"  {register} = sitofp i32 {rendering} to double")
+            opcode = "uitofp" if kind == "i1" else "sitofp"
+            lines.append(f"  {register} = {opcode} {kind} {rendering} to double")
             return register
-        if wanted == "i32" and kind == "double" and not rendering.startswith("%"):
-            return str(int(float.fromhex(rendering)))
+        if wanted in {"i32", "i64"} and kind == "double":
+            if not rendering.startswith("%"):
+                return str(int(float.fromhex(rendering)))
+            register = f"%conv.{tag}"
+            lines.append(f"  {register} = fptosi double {rendering} to {wanted}")
+            return register
+        if wanted == "i1" and kind != "ptr":
+            zero = "0.0" if kind == "double" else "0"
+            comparison = "fcmp one" if kind == "double" else "icmp ne"
+            register = f"%conv.{tag}"
+            lines.append(
+                f"  {register} = {comparison} {kind} {rendering}, {zero}"
+            )
+            return register
         return None
+
+    def emit_semantic_tensor_call(instruction, symbol: str) -> str | None:
+        """Expand a semantic tensor Call into the private C-kernel ABI.
+
+        Returns ``None`` when this is not one of the elementwise kernels,
+        an empty string on success, or a diagnostic string on malformed
+        semantic operands.
+        """
+
+        tensor_operation = instruction.attributes.get("tensor_operation")
+        if (
+            instruction.res is None
+            or tensor_operation is None
+            or symbol not in {
+                "binary_double", "binary_scalar_double", "unary_double",
+            }
+        ):
+            return None
+        from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+            c_tensor_opcode,
+        )
+
+        opcode = c_tensor_opcode(str(tensor_operation))
+        if opcode is None:
+            return f"no C tensor opcode for {tensor_operation!r}"
+        opcode_kind, opcode_value = opcode
+        result_id = int(instruction.res.id)
+        result_count = _value_element_count(instruction.res)
+        destination = buffer(result_id)
+        if symbol == "unary_double":
+            if opcode_kind != "unary" or len(instruction.args) != 1:
+                return "semantic unary call has an invalid operand layout"
+            source = buffer(int(instruction.args[0].id))
+            lines.append(
+                f"  call void @unary_double(ptr {source}, ptr {destination}, "
+                f"i32 {result_count}, i32 {opcode_value})"
+            )
+            kernels_used.add(symbol)
+            return ""
+        if opcode_kind != "binary":
+            return "semantic binary call resolved to a non-binary opcode"
+        if symbol == "binary_double":
+            if len(instruction.args) != 2:
+                return "semantic binary call requires two operands"
+            left = buffer(int(instruction.args[0].id))
+            right = buffer(int(instruction.args[1].id))
+            lines.append(
+                f"  call void @binary_double(ptr {left}, ptr {right}, "
+                f"ptr {destination}, i32 {result_count}, i32 {opcode_value})"
+            )
+            kernels_used.add(symbol)
+            return ""
+
+        reverse = bool(instruction.attributes.get("reverse", False))
+        scalar_literal = instruction.attributes.get("right_scalar")
+        array_argument = None
+        scalar_rendering = None
+        if scalar_literal is not None and len(instruction.args) == 1:
+            array_argument = instruction.args[0]
+            scalar_rendering = _double_literal(float(scalar_literal))
+        elif len(instruction.args) == 2:
+            left, right = instruction.args
+            left_count = _value_element_count(left)
+            right_count = _value_element_count(right)
+            if left_count == result_count and right_count == 1:
+                array_argument, scalar_argument = left, right
+            elif left_count == 1 and right_count == result_count:
+                array_argument, scalar_argument = right, left
+                reverse = not reverse
+            else:
+                scalar_argument = None
+            if array_argument is not None and scalar_argument is not None:
+                scalar_rendering = as_type(
+                    int(scalar_argument.id),
+                    "double",
+                    f"semantic.scalar.{result_id}",
+                )
+                if scalar_rendering is None:
+                    scalar_pointer = buffer(int(scalar_argument.id))
+                    scalar_rendering = f"%semantic.scalar.{result_id}"
+                    lines.append(
+                        f"  {scalar_rendering} = load double, "
+                        f"ptr {scalar_pointer}, align 8"
+                    )
+        if array_argument is None or scalar_rendering is None:
+            return "semantic scalar binary call has an invalid operand layout"
+        source = buffer(int(array_argument.id))
+        lines.append(
+            f"  call void @binary_scalar_double(ptr {source}, "
+            f"double {scalar_rendering}, ptr {destination}, "
+            f"i32 {result_count}, i32 {opcode_value}, i32 {int(reverse)})"
+        )
+        kernels_used.add(symbol)
+        return ""
 
     # Scalar public arguments are ordinary resident buffers just like tensor
     # arguments. Load them once at entry so scalar SSA can use the same
@@ -1499,6 +2318,43 @@ def emit_ssa_function_to_llvm(
                     scalars[result_id] = (register, "i32")
                 continue
 
+            if operation == "Pi":
+                from .bounded_constants import materialize_pi
+
+                selected_solver = (
+                    pi_solver
+                    or instruction.attributes.get("constant_solver")
+                    or "literal"
+                )
+                selected_epsilon = (
+                    pi_epsilon
+                    if pi_epsilon is not None
+                    else instruction.attributes.get("requested_epsilon")
+                )
+                materialization = materialize_pi(
+                    selected_solver, selected_epsilon,
+                )
+                if materialization.value is None:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        function_name, "Pi",
+                        "pi materialization rejected by caller policy",
+                    ))
+                elif materialization.llvm_symbol is None:
+                    scalars[result_id] = (
+                        _double_literal(materialization.value), "double",
+                    )
+                else:
+                    register = f"%pi.{result_id}"
+                    lines.append(
+                        f"  {register} = call double "
+                        f"@{materialization.llvm_symbol}()"
+                    )
+                    scalars[result_id] = (register, "double")
+                    bounded_definitions[materialization.llvm_symbol] = (
+                        materialization.llvm_function
+                    )
+                continue
+
             if operation == "Const":
                 payload = instruction.attributes.get("constant")
                 if payload is None:
@@ -1539,18 +2395,80 @@ def emit_ssa_function_to_llvm(
                     if base_value is not None and base_value[1] == "ptr"
                     else buffer(int(base.id))
                 )
-                index = as_type(
-                    int(instruction.args[1].id), "i32", f"gep.{result_id}"
-                )
-                if index is None:
+                indices = []
+                trouble = None
+                for position, argument in enumerate(instruction.args[1:]):
+                    rendered = as_type(
+                        int(argument.id), "i32",
+                        f"gep.{result_id}.{position}",
+                    )
+                    if rendered is None:
+                        trouble = (
+                            "address index is not an emitted integer scalar"
+                        )
+                        break
+                    indices.append(rendered)
+                if trouble is not None:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        function_name, operation, trouble,
+                    ))
+                    continue
+                # The element type is the span's own dtype. A fixed i64 stride
+                # silently addresses the wrong element for any span that is
+                # not eight bytes wide.
+                element_type = _value_llvm_type(base)
+                if element_type == "ptr":
+                    element_type = "i64"
+                extents = value_shapes.get(int(base.id), ())
+                if not extents:
+                    # A span whose extents are only known at call time still
+                    # declares its rank through its record-field identity.
+                    declared_rank = int(
+                        (getattr(base, "accounting", None) or {}).get(
+                            "program_abi_rank"
+                        ) or 0
+                    )
+                    if declared_rank:
+                        extents = (None,) * declared_rank
+                if len(indices) == 1:
+                    offset = indices[0]
+                elif len(extents) == len(indices):
+                    # Row-major linearisation. A declared integer axis folds to
+                    # a constant; a symbolic one is measured from the real
+                    # buffer through the extents vector, so a runtime grid
+                    # size needs no compile-time specialisation.
+                    offset = indices[0]
+                    for axis, index in enumerate(indices[1:], start=1):
+                        extent = extents[axis]
+                        stride = (
+                            str(int(extent)) if isinstance(extent, int)
+                            else runtime_extent(
+                                int(base.id), axis, f"gep{result_id}",
+                            )
+                        )
+                        scaled = f"%address.{result_id}.scale.{axis}"
+                        lines.append(
+                            f"  {scaled} = mul i32 {offset}, {stride}"
+                        )
+                        summed = f"%address.{result_id}.sum.{axis}"
+                        lines.append(
+                            f"  {summed} = add i32 {scaled}, {index}"
+                        )
+                        offset = summed
+                else:
+                    # Multi-axis addressing needs this span's declared extents.
+                    # Folding the trailing indices away would silently read the
+                    # wrong element, so the storage identity is named instead.
                     shortfalls.append(LLVMEmissionShortfall(
                         function_name, operation,
-                        "address index is not an emitted integer scalar",
+                        f"{len(indices)}-axis address needs declared extents "
+                        f"for %t{int(base.id)}; its storage carries {extents!r}",
                     ))
                     continue
                 address = f"%address.{result_id}"
                 lines.append(
-                    f"  {address} = getelementptr i64, ptr {base_pointer}, i32 {index}"
+                    f"  {address} = getelementptr {element_type}, "
+                    f"ptr {base_pointer}, i32 {offset}"
                 )
                 scalars[result_id] = (address, "ptr")
                 continue
@@ -1598,18 +2516,24 @@ def emit_ssa_function_to_llvm(
                         # that otherwise had no downstream consumer.
                         buffer(value_id)
                         continue
+                    # The public buffer for this output is allocated with the
+                    # value's declared dtype, so the store must use that same
+                    # type. Widening to double here would write eight bytes
+                    # into a four-byte slot and read back as noise.
+                    declared = _value_llvm_type(argument)
                     rendering = as_type(
-                        value_id, "double", f"return.{position}"
+                        value_id, declared, f"return.{position}"
                     )
                     if rendering is None:
                         shortfalls.append(LLVMEmissionShortfall(
                             function_name, "return",
-                            f"output %t{value_id} cannot render as double",
+                            f"output %t{value_id} cannot render as {declared}",
                         ))
                         continue
                     destination = buffer(value_id)
                     lines.append(
-                        f"  store double {rendering}, ptr {destination}, align 8"
+                        f"  store {declared} {rendering}, ptr {destination}, "
+                        "align 8"
                     )
                 continue
 
@@ -1643,6 +2567,15 @@ def emit_ssa_function_to_llvm(
                 continue
             if callee is not None:
                 symbol = str(callee)
+                semantic_diagnostic = emit_semantic_tensor_call(
+                    instruction, symbol,
+                )
+                if semantic_diagnostic is not None:
+                    if semantic_diagnostic:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            function_name, symbol, semantic_diagnostic,
+                        ))
+                    continue
                 try:
                     returns, argument_types = _kernel_signature(symbol)
                 except ValueError as error:
@@ -1713,13 +2646,98 @@ def emit_ssa_function_to_llvm(
                     )
                 continue
 
+            if operation in {"Cast", "CastLike", "cast_like"} and instruction.res is not None and instruction.args:
+                target_type = _value_llvm_type(instruction.res)
+                rendering = as_type(
+                    int(instruction.args[0].id), target_type,
+                    f"cast.{result_id}",
+                )
+                if rendering is None:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        function_name, str(operation),
+                        f"operand %t{int(instruction.args[0].id)} cannot cast to {target_type}",
+                    ))
+                    continue
+                scalars[result_id] = (rendering, target_type)
+                continue
+
+            if operation in {"Deploy", "Join"}:
+                # See the whole-module emitter: a deployment boundary is
+                # scheduling around the program, not an instruction in it.
+                lines.append(f"  ; {operation} deployment boundary")
+                continue
+
+            if (
+                operation in {"Select", "where"}
+                and instruction.res is not None
+                and len(instruction.args) == 3
+            ):
+                # Select(mask, when_true, when_false). The mask carries its own
+                # type; `as_type(..., "i1", ...)` is the same truthiness rule
+                # the other targets apply, so a numeric or reference mask does
+                # not need a separate opcode.
+                target_type = _value_llvm_type(instruction.res)
+                mask = as_type(
+                    int(instruction.args[0].id), "i1", f"select.{result_id}",
+                )
+                when_true = as_type(
+                    int(instruction.args[1].id), target_type,
+                    f"select.{result_id}.true",
+                )
+                when_false = as_type(
+                    int(instruction.args[2].id), target_type,
+                    f"select.{result_id}.false",
+                )
+                if mask is None or when_true is None or when_false is None:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        function_name, str(operation),
+                        f"select operands cannot render as {target_type}",
+                    ))
+                    continue
+                register = f"%select.{result_id}"
+                lines.append(
+                    f"  {register} = select i1 {mask}, "
+                    f"{target_type} {when_true}, {target_type} {when_false}"
+                )
+                scalars[result_id] = (register, target_type)
+                continue
+
             template = scalar_likeness(str(operation))
             if template is not None:
+                # The declared result type is the authority on the evaluation
+                # domain. Widening an integer result to double and storing it
+                # back into the narrower declared slot is a real type/rank
+                # defect, not a harmless promotion, so the integer column is
+                # used whenever the result is an integer. Comparisons produce
+                # i1 and follow their operands instead.
+                declared = (
+                    _value_llvm_type(instruction.res)
+                    if instruction.res is not None else "double"
+                )
+                operand_types = [
+                    (scalars.get(int(argument.id)) or (None, "double"))[1]
+                    for argument in instruction.args
+                ]
+                if declared in {"i32", "i64"}:
+                    domain = declared
+                elif (
+                    declared == "i1"
+                    and operand_types
+                    and all(
+                        kind in {"i1", "i32", "i64"} for kind in operand_types
+                    )
+                ):
+                    domain = "i64" if "i64" in operand_types else (
+                        "i32" if "i32" in operand_types else "i1"
+                    )
+                else:
+                    domain = "double"
+
                 operands = []
                 trouble = None
                 for position, argument in enumerate(instruction.args):
                     rendering = as_type(
-                        int(argument.id), "double", f"{result_id}.{position}"
+                        int(argument.id), domain, f"{result_id}.{position}"
                     )
                     if rendering is None:
                         trouble = (
@@ -1733,6 +2751,46 @@ def emit_ssa_function_to_llvm(
                     ))
                     continue
                 register = f"%scalar.{result_id}"
+                integer = (
+                    None if domain == "double"
+                    else integer_scalar_lines(
+                        str(operation), domain, operands, register,
+                    )
+                )
+                if integer is not None:
+                    integer_lines, produced = integer
+                    lines.extend(f"  {line}" for line in integer_lines)
+                    scalars[result_id] = (register, produced)
+                    continue
+                if domain != "double":
+                    # No exact integer spelling. Evaluate in the double column
+                    # and convert back, so the value still reaches its declared
+                    # slot with the declared type rather than a wider one.
+                    operands = []
+                    for position, argument in enumerate(instruction.args):
+                        rendering = as_type(
+                            int(argument.id), "double",
+                            f"{result_id}.wide.{position}",
+                        )
+                        if rendering is None:
+                            trouble = (
+                                f"scalar operand %t{int(argument.id)} unavailable"
+                            )
+                            break
+                        operands.append(rendering)
+                    if trouble is not None:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            function_name, str(operation), trouble,
+                        ))
+                        continue
+                    wide = f"%scalar.wide.{result_id}"
+                    for line in template.format(*operands, out=wide).splitlines():
+                        lines.append(f"  {line}")
+                    lines.append(
+                        f"  {register} = fptosi double {wide} to {domain}"
+                    )
+                    scalars[result_id] = (register, domain)
+                    continue
                 for line in template.format(
                     *operands, out=register
                 ).splitlines():
@@ -1748,9 +2806,10 @@ def emit_ssa_function_to_llvm(
     # Authored kernels can call other authored helpers as well as external
     # math/intrinsic symbols.  Carry their definition closure and exact
     # canonical declarations into this otherwise standalone module.
-    definitions = {
+    definitions = dict(bounded_definitions)
+    definitions.update({
         symbol: extract_llvm_function(symbol) for symbol in kernels_used
-    }
+    })
     external_declarations: dict[str, str] = {}
     unresolved_symbols: set[str] = set()
     while True:
@@ -1764,6 +2823,11 @@ def emit_ssa_function_to_llvm(
         if not pending:
             break
         for symbol in sorted(pending):
+            if symbol in _LLVM_INTRINSIC_DECLARATIONS:
+                external_declarations[symbol] = _LLVM_INTRINSIC_DECLARATIONS[
+                    symbol
+                ]
+                continue
             try:
                 definitions[symbol] = extract_llvm_function(symbol)
                 continue
@@ -1804,6 +2868,7 @@ def emit_ssa_function_to_llvm(
         "}",
         "",
     ))
+    publications = function_output_publications(function)
     return LLVMFunctionArtifact(
         name=name,
         llvm_ir=llvm_ir,
@@ -1815,6 +2880,8 @@ def emit_ssa_function_to_llvm(
             value_llvm_types.get(value_id, "double") for value_id in buffer_ids
         ),
         needs_text_sink=publishes_text,
+        output_publications=publications,
+        output_surfaces=publication_surface_plan(publications, target="llvm"),
     )
 
 

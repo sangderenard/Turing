@@ -240,6 +240,7 @@ def materialize_host_code_library(library: CachedHostCodeLibrary) -> IRModule:
     tensor_tables = {}
     sequence_tables = {}
     record_tables = {}
+    reference_tables = {}
     call_table = {}
     control_links = []
     indirect_links = []
@@ -301,6 +302,11 @@ def materialize_host_code_library(library: CachedHostCodeLibrary) -> IRModule:
         qualify_table(tensor_tables, source_module.tensor_tables, mapping)
         qualify_table(sequence_tables, source_module.sequence_tables, mapping)
         qualify_table(record_tables, source_module.record_tables, mapping)
+        qualify_table(
+            reference_tables,
+            getattr(source_module, "reference_tables", {}),
+            mapping,
+        )
         qualify_table(call_table, source_module.call_table, mapping)
         for link in source_module.machine_control_table.links:
             control_links.append(SSAMachineControlLink(
@@ -347,6 +353,7 @@ def materialize_host_code_library(library: CachedHostCodeLibrary) -> IRModule:
         tensor_tables=tensor_tables,
         sequence_tables=sequence_tables,
         record_tables=record_tables,
+        reference_tables=reference_tables,
         call_table=call_table,
         machine_control_table=SSAMachineControlTable(tuple(control_links)),
         machine_indirect_table=SSAMachineIndirectTable(tuple(indirect_links)),

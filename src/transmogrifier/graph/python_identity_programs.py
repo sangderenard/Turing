@@ -113,6 +113,36 @@ def _operator(
 
 
 PYTHON_IDENTITY_PROGRAMS: tuple[PythonIdentityProgram, ...] = (
+    _operator(
+        "src.common.dt_system.dt_controller._restore_type",
+        operator="cast_like", inputs=("$arg0", "$arg1"),
+        attributes={"target_from_operand": 1},
+        description=(
+            "construct the reference operand's schema type from the value"
+        ),
+    ),
+    _operator(
+        "src.common.tensors.abstraction.AbstractTensor.tensor",
+        operator="tensor",
+        attributes={
+            "ensures_schema_type": (
+                "src.common.tensors.abstraction.AbstractTensor"
+            ),
+        },
+        description=(
+            "idempotent AbstractTensor normalization from any accepted input"
+        ),
+    ),
+    _operator(
+        "src.common.tensors.abstraction_methods.elementwise.maximum",
+        operator="maximum", inputs=("$receiver", "$arg0"),
+        description="AbstractTensor elementwise maximum",
+    ),
+    _operator(
+        "src.common.tensors.abstraction_methods.elementwise.minimum",
+        operator="minimum", inputs=("$receiver", "$arg0"),
+        description="AbstractTensor elementwise minimum",
+    ),
     _operator("builtins.float", operator="float", description="scalar extraction/cast"),
     _operator("builtins.int", operator="int", description="integer cast"),
     _operator("builtins.bool", operator="bool", description="truth-value cast"),
@@ -249,6 +279,7 @@ PYTHON_IDENTITY_PROGRAMS: tuple[PythonIdentityProgram, ...] = (
     PythonIdentityProgram(
         identities=(
             "logging.Logger.debug", "logging.Logger.info",
+            "src.common.dt_system.debug.dbg",
             "src.common.tensors.autoautograd.*.annotate",
             "src.common.tensors.autoautograd.*.create_tensor_node",
             "src.common.tensors.autoautograd.*.record",

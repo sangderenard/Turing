@@ -146,9 +146,11 @@ def normalized_program(program: Any) -> Any:
         normalized_meta = {}
         for value_id, entry in meta.items():
             dtype = getattr(entry, "dtype", None)
-            if isinstance(dtype, str) and "." in dtype:
+            dtype_name = None if dtype is None else str(dtype)
+            if dtype_name is not None and "." in dtype_name:
                 entry = type(entry)(
-                    shape=entry.shape, dtype=dtype.rsplit(".", 1)[-1],
+                    shape=entry.shape,
+                    dtype=dtype_name.rsplit(".", 1)[-1],
                     device=entry.device,
                 )
             normalized_meta[value_id] = entry

@@ -59,6 +59,8 @@ from .wasm_binary import (
     OP_F64_CONVERT_I64_S,
     OP_I32_TRUNC_F32_S,
     OP_I32_TRUNC_F64_S,
+    OP_I32_AND,
+    OP_I32_OR,
     OP_I64_AND,
     OP_I64_OR,
     OP_I64_SHL,
@@ -347,10 +349,7 @@ _COMPARISON_INSTRUCTION = {
 # float pass does not model yet. (sign, pow, and now mod/floordiv ARE lowered --
 # mod is ``a - trunc(a/b)*b`` and floordiv is ``floor(a/b)``, both exact from
 # instructions WebAssembly has; see the float binary path in _step_instructions.)
-_NO_WASM_INSTRUCTION = {
-    "tan",
-    "isfinite", "isnan", "isinf", "logical_not",
-}
+_NO_WASM_INSTRUCTION: set[str] = set()
 # Reachable through a baked table rather than an instruction. Taken from
 # the catalogue itself so the two cannot drift apart: adding a function to
 # wasm_math_tables makes it emittable here without a second edit. f64 only --
@@ -362,6 +361,55 @@ def _tabulated_ops() -> frozenset[str]:
 
 
 _LUT_OPS = _tabulated_ops()
+
+
+def supported_tensor_operations(dtype: str | None = None) -> frozenset[str]:
+    """Canonical operations with a real lowering in this WebAssembly lane.
+
+    With no dtype this returns the union of the floating and integral routes;
+    target selection has not fixed a working type yet.  Passing a dtype gives
+    the exact typed surface and prevents integer-only bit operations or
+    float-only table functions from being advertised for the wrong module.
+    """
+
+    from ..common.tensors.operator_catalog import (
+        CANONICAL_ABSTRACT_TENSOR_OPERATORS,
+    )
+
+    floating = (
+        frozenset(_BINARY_INSTRUCTION)
+        | frozenset(_COMPARISON_INSTRUCTION)
+        | frozenset(_UNARY_INSTRUCTION)
+        | frozenset(_LUT_OPS)
+        | frozenset({
+            "sign", "pow", "mod", "floordiv", "isfinite", "isnan",
+            "isinf", "logical_not", "logical_and", "logical_or", "tan",
+        })
+    )
+    integral = (
+        frozenset(_INTEGER_BINARY_INSTRUCTION)
+        | frozenset(_INTEGER_COMPARISON_INSTRUCTION)
+        | _INTEGER_COMPOSED_BINARY
+        | _INTEGER_LOGICAL_BINARY
+        | _INTEGER_LOGICAL_UNARY
+        | _INTEGER_IDENTITY_UNARY
+        | frozenset({"neg", "abs", "sign", "invert"})
+    )
+    structural = frozenset({
+        "tensor_from_list", "where", "gather", "reshape", "view", "clone",
+        "tobytes", "sum", "mean", "prod", "min", "max",
+    })
+    if dtype is None:
+        operations = floating | integral | structural | frozenset(
+            _I64_BITWISE_OPCODE
+        ) | frozenset({"invert"})
+    elif _is_integer_type(_TYPES.get(str(dtype).lower(), _TYPES["float64"])[0]):
+        operations = integral | structural
+    else:
+        operations = floating | structural
+        if _TYPES.get(str(dtype).lower(), _TYPES["float64"])[0] == "f64":
+            operations |= frozenset(_I64_BITWISE_OPCODE) | frozenset({"invert"})
+    return frozenset(operations & CANONICAL_ABSTRACT_TENSOR_OPERATORS)
 
 
 @dataclass(frozen=True)
@@ -1520,6 +1568,16 @@ def emit_wasm_module(
                 f"      i32.const {byte_offset}",
                 "      i32.add",
             ])
+        source_meta = program_meta.get(int(source_id))
+        if (
+            source_meta is not None
+            and _shape_product(source_meta.shape) == 1
+        ):
+            # A one-element feed is one resident scalar broadcast across the
+            # elementwise walk. Advancing it with $i reads the next ABI
+            # buffer, which can look correct for lane zero and corrupt every
+            # subsequent lane.
+            return instructions
         instructions.extend([
             "      local.get $i",
             f"      i32.const {stride * byte_width}",
@@ -1991,6 +2049,48 @@ def _step_instructions(
             f"      {value_type}.sub",
         ]
 
+    if not integral and op in {"isfinite", "isnan", "isinf"}:
+        if op == "isnan":
+            return [
+                f"      local.get {left}",
+                f"      local.get {left}",
+                f"      {value_type}.ne",
+                f"      {value_type}.convert_i32_u",
+            ]
+        infinity_test = [
+            f"      local.get {left}",
+            f"      {value_type}.abs",
+            f"      {value_type}.const inf",
+            f"      {value_type}.{'eq' if op == 'isinf' else 'ne'}",
+        ]
+        if op == "isinf":
+            return [*infinity_test, f"      {value_type}.convert_i32_u"]
+        return [
+            f"      local.get {left}",
+            f"      local.get {left}",
+            f"      {value_type}.eq",
+            *infinity_test,
+            "      i32.and",
+            f"      {value_type}.convert_i32_u",
+        ]
+
+    if not integral and op == "logical_not":
+        return [
+            f"      local.get {left}",
+            f"      {value_type}.const 0.0",
+            f"      {value_type}.eq",
+            f"      {value_type}.convert_i32_u",
+        ]
+
+    if not integral and op == "invert" and value_type == "f64":
+        return [
+            f"      local.get {left}",
+            "      i64.trunc_f64_s",
+            "      i64.const -1",
+            "      i64.xor",
+            "      f64.convert_i64_s",
+        ]
+
     if op == "pow":
         if step.attrs.get("reverse", False):
             shortfalls.append(WasmShortfall(
@@ -2001,6 +2101,12 @@ def _step_instructions(
         # tables. Text names the step rather than inlining it, like any LUT op.
         return [f"      ;; pow via exp(y*log(x)) baked tables (see the .wasm)",
                 f"      local.get {left}"]
+
+    if op == "tan":
+        return [
+            "      ;; tan via sin(x)/cos(x) baked tables (see the .wasm)",
+            f"      local.get {left}",
+        ]
 
     if op in _LUT_OPS:
         # The binary carries the table and the interpolation; the text form
@@ -2271,6 +2377,18 @@ def _step_instructions(
             f"      {value_type}.convert_i32_u",
         ]
 
+    if op in {"logical_and", "logical_or"}:
+        return [
+            operands[0],
+            f"      {value_type}.const 0.0",
+            f"      {value_type}.ne",
+            operands[1],
+            f"      {value_type}.const 0.0",
+            f"      {value_type}.ne",
+            f"      i32.{'and' if op == 'logical_and' else 'or'}",
+            f"      {value_type}.convert_i32_u",
+        ]
+
     if op in _I64_BITWISE_OPCODE and value_type == "f64":
         # Integer bitwise/shift on an integer-valued f64: round-trip through
         # i64 so the operation is on the integer's bits, not the float's.
@@ -2318,6 +2436,8 @@ def _assemble(
     lut_ops = {step.op_name for step in live} & _LUT_OPS
     if any(step.op_name == "pow" for step in live):
         lut_ops |= {"exp", "log"}
+    if any(step.op_name == "tan" for step in live):
+        lut_ops |= {"sin", "cos"}
     lut_ops = sorted(lut_ops)
     if lut_ops and value_type != "f64":
         raise WasmEmissionError(
@@ -2412,6 +2532,12 @@ def _assemble(
         if byte_offset:
             builder.i32_const(byte_offset)
             builder.raw(0x6A)  # i32.add
+        source_meta = program_meta.get(int(source_id))
+        if (
+            source_meta is not None
+            and _shape_product(source_meta.shape) == 1
+        ):
+            return
         builder.local_get(index_local)
         builder.i32_const(stride * byte_width)
         builder.raw(0x6C)  # i32.mul
@@ -2575,6 +2701,31 @@ def _assemble(
             builder.local_set(local)
             return
 
+        if not integral and step.op_name in {"isfinite", "isnan", "isinf"}:
+            if step.op_name == "isnan":
+                builder.local_get(left).local_get(left).op("ne")
+            else:
+                if step.op_name == "isfinite":
+                    builder.local_get(left).local_get(left).op("eq")
+                builder.local_get(left).op("abs").value_const(float("inf"))
+                builder.op("eq" if step.op_name == "isinf" else "ne")
+                if step.op_name == "isfinite":
+                    builder.raw(OP_I32_AND)
+            builder.op("convert_i32_u")
+            builder.local_set(local)
+            return
+
+        if not integral and step.op_name == "logical_not":
+            builder.local_get(left).value_const(0.0).op("eq")
+            builder.op("convert_i32_u").local_set(local)
+            return
+
+        if not integral and step.op_name == "invert" and value_type == "f64":
+            builder.local_get(left).raw(OP_I64_TRUNC_F64_S)
+            builder.i64_const(-1).raw(OP_I64_XOR, OP_F64_CONVERT_I64_S)
+            builder.local_set(local)
+            return
+
         if step.op_name == "pow":
             # pow(x, y) = exp(y * log(x)), composing the baked tables.
             log_entry = tables["entries"]["log"]
@@ -2593,6 +2744,29 @@ def _assemble(
                 exp_entry["intervals"], exp_entry["lower"],
                 exp_entry["upper"], exp_entry["periodic"],
             )
+            builder.local_set(local)
+            return
+
+        if step.op_name == "tan":
+            sine = builder.declare_local(value_type)
+            _emit_lut(
+                builder, left, "sin", tables["entries"]["sin"]["base"],
+                tables["entries"]["sin"]["intervals"],
+                tables["entries"]["sin"]["lower"],
+                tables["entries"]["sin"]["upper"],
+                tables["entries"]["sin"]["periodic"],
+            )
+            builder.local_set(sine)
+            cosine = builder.declare_local(value_type)
+            _emit_lut(
+                builder, left, "cos", tables["entries"]["cos"]["base"],
+                tables["entries"]["cos"]["intervals"],
+                tables["entries"]["cos"]["lower"],
+                tables["entries"]["cos"]["upper"],
+                tables["entries"]["cos"]["periodic"],
+            )
+            builder.local_set(cosine)
+            builder.local_get(sine).local_get(cosine).op("div")
             builder.local_set(local)
             return
 
@@ -2735,6 +2909,17 @@ def _assemble(
                 builder.raw(OP_I64_TRUNC_F64_S)
                 builder.raw(_I64_BITWISE_OPCODE[step.op_name])
                 builder.raw(OP_F64_CONVERT_I64_S)
+            elif step.op_name in {"logical_and", "logical_or"}:
+                second = builder.declare_local(value_type)
+                builder.local_set(second)
+                first = builder.declare_local(value_type)
+                builder.local_set(first)
+                builder.local_get(first).value_const(0.0).op("ne")
+                builder.local_get(second).value_const(0.0).op("ne")
+                builder.raw(
+                    OP_I32_AND if step.op_name == "logical_and" else OP_I32_OR
+                )
+                builder.op("convert_i32_u")
             else:
                 instruction = _BINARY_INSTRUCTION.get(step.op_name)
                 if instruction is not None:
@@ -3151,6 +3336,8 @@ def plan_static_data(
     if any(step.op_name == "pow" for step in steps):
         # pow composes exp and log tables even though it is not itself tabulated.
         lut_ops |= {"exp", "log"}
+    if any(step.op_name == "tan" for step in steps):
+        lut_ops |= {"sin", "cos"}
     tables = plan_tables(sorted(lut_ops))
     for entry in tables["entries"].values():
         entry["base"] += data_offset
@@ -3445,5 +3632,6 @@ __all__ = [
     "WasmShortfall",
     "compile_wat",
     "emit_wasm_module",
+    "supported_tensor_operations",
     "wat_assembler",
 ]

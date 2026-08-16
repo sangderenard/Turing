@@ -62,6 +62,9 @@ C_SSA_OUTPUT_ARGUMENTS = {
     "slice_copy_double": 1,
     "index_select_double": 1,
     "index_assign_double": 0,
+    "index_set_double": 1,
+    "unfold2d_double": 1,
+    "fold2d_double": 1,
     "sign_double": 1,
     "mask_select_double": 2,
     "increment_mask_double": 0,
@@ -78,6 +81,7 @@ C_SSA_I32_POINTER_ARGUMENTS = {
     "slice_copy_double": (2,),
     "index_select_double": (2, 5),
     "index_assign_double": (1, 3, 4),
+    "index_set_double": (2, 4, 5),
     "cumsum_dim_double": (2,),
     "reduce_dim_double": (2,),
     "transpose_double": (2, 3),
@@ -131,13 +135,24 @@ C_TENSOR_OPCODE_ORDER = (
     "ASINH",
     "ACOSH",
     "ATANH",
+    "SIGN",
+    "INVERT",
+    "BITAND",
+    "BITOR",
+    "BITXOR",
+    "SHL",
+    "SHR",
+    "LOGICAL_AND",
+    "LOGICAL_OR",
 )
 
 C_SSA_EXTERNAL_PRIMITIVES = frozenset({
     "acos", "acosh", "asin", "asinh", "atan", "atanh", "cos", "cosh",
     "exp", "llvm.ceil.f64", "llvm.fabs.f64", "llvm.fcmp.ord",
     "llvm.fcmp.uno", "llvm.floor.f64", "llvm.round.f64", "llvm.sqrt.f64",
-    "llvm.trunc.f64", "log", "pow", "sin", "sinh", "tan", "tanh",
+    "llvm.trunc.f64", "llvm.memcpy.p0.p0.i64", "llvm.memset.p0.i64",
+    "log", "pow", "sin", "sinh", "tan", "tanh",
+    "llvm.maxnum.f64", "llvm.minnum.f64", "llvm.pow.f64",
 })
 
 
@@ -170,6 +185,9 @@ _C_FUNCTION_ROLES = {
     "index_select_double": "tensor_kernel",
     "slice_copy_double": "tensor_kernel",
     "index_assign_double": "tensor_kernel",
+    "index_set_double": "tensor_kernel",
+    "unfold2d_double": "tensor_kernel",
+    "fold2d_double": "tensor_kernel",
     "sign_double": "tensor_kernel",
     "count_true_double": "tensor_kernel",
     "mask_select_double": "tensor_kernel",
@@ -204,6 +222,9 @@ declare double @llvm.round.f64(double)
 declare double @llvm.trunc.f64(double)
 declare double @llvm.floor.f64(double)
 declare double @llvm.ceil.f64(double)
+declare double @llvm.maxnum.f64(double, double)
+declare double @llvm.minnum.f64(double, double)
+declare double @llvm.pow.f64(double, double)
 declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
 declare double @pow(double, double)
@@ -354,6 +375,13 @@ entry:
     i32 25, label %ne
     i32 26, label %maximum
     i32 27, label %minimum
+    i32 42, label %bitand
+    i32 43, label %bitor
+    i32 44, label %bitxor
+    i32 45, label %shl
+    i32 46, label %shr
+    i32 47, label %logical_and
+    i32 48, label %logical_or
   ]
 
 add:
@@ -413,6 +441,50 @@ minimum:
   %minimum.bit = fcmp olt double %a, %b
   %minimum.value = select i1 %minimum.bit, double %a, double %b
   ret double %minimum.value
+bitand:
+  %bitand.a = fptosi double %a to i64
+  %bitand.b = fptosi double %b to i64
+  %bitand.int = and i64 %bitand.a, %bitand.b
+  %bitand.value = sitofp i64 %bitand.int to double
+  ret double %bitand.value
+bitor:
+  %bitor.a = fptosi double %a to i64
+  %bitor.b = fptosi double %b to i64
+  %bitor.int = or i64 %bitor.a, %bitor.b
+  %bitor.value = sitofp i64 %bitor.int to double
+  ret double %bitor.value
+bitxor:
+  %bitxor.a = fptosi double %a to i64
+  %bitxor.b = fptosi double %b to i64
+  %bitxor.int = xor i64 %bitxor.a, %bitxor.b
+  %bitxor.value = sitofp i64 %bitxor.int to double
+  ret double %bitxor.value
+shl:
+  %shl.a = fptosi double %a to i64
+  %shl.b.raw = fptosi double %b to i64
+  %shl.b = and i64 %shl.b.raw, 63
+  %shl.int = shl i64 %shl.a, %shl.b
+  %shl.value = sitofp i64 %shl.int to double
+  ret double %shl.value
+shr:
+  %shr.a = fptosi double %a to i64
+  %shr.b.raw = fptosi double %b to i64
+  %shr.b = and i64 %shr.b.raw, 63
+  %shr.int = ashr i64 %shr.a, %shr.b
+  %shr.value = sitofp i64 %shr.int to double
+  ret double %shr.value
+logical_and:
+  %logical.and.a = fcmp une double %a, 0.000000e+00
+  %logical.and.b = fcmp une double %b, 0.000000e+00
+  %logical.and.bit = and i1 %logical.and.a, %logical.and.b
+  %logical.and.value = uitofp i1 %logical.and.bit to double
+  ret double %logical.and.value
+logical_or:
+  %logical.or.a = fcmp une double %a, 0.000000e+00
+  %logical.or.b = fcmp une double %b, 0.000000e+00
+  %logical.or.bit = or i1 %logical.or.a, %logical.or.b
+  %logical.or.value = uitofp i1 %logical.or.bit to double
+  ret double %logical.or.value
 invalid:
   ret double 0x7FF8000000000000
 }
@@ -509,6 +581,8 @@ loop.body:
     i32 37, label %asinh
     i32 38, label %acosh
     i32 39, label %atanh
+    i32 40, label %sign
+    i32 41, label %invert
   ]
 
 sqrt:
@@ -594,6 +668,18 @@ acosh:
 atanh:
   %atanh.value = call double @atanh(double %value)
   br label %store
+sign:
+  %sign.positive = fcmp ogt double %value, 0.000000e+00
+  %sign.negative = fcmp olt double %value, 0.000000e+00
+  %sign.positive.value = uitofp i1 %sign.positive to double
+  %sign.negative.value = uitofp i1 %sign.negative to double
+  %sign.value = fsub double %sign.positive.value, %sign.negative.value
+  br label %store
+invert:
+  %invert.int = fptosi double %value to i64
+  %invert.flipped = xor i64 %invert.int, -1
+  %invert.value = sitofp i64 %invert.flipped to double
+  br label %store
 identity:
   br label %store
 
@@ -624,6 +710,8 @@ store:
     [ %asinh.value, %asinh ],
     [ %acosh.value, %acosh ],
     [ %atanh.value, %atanh ],
+    [ %sign.value, %sign ],
+    [ %invert.value, %invert ],
     [ %value, %identity ]
   store double %result, ptr %out.ptr, align 8
   %i.next = add nsw i32 %i, 1
@@ -1067,6 +1155,223 @@ flat.store:
 flat.latch:
   %flat.next = add nsw i32 %flat, 1
   br label %flat.header
+
+exit:
+  ret void
+}
+
+define void @index_set_double(
+    ptr %input, ptr %output, ptr %shape, i32 %ndim,
+    ptr %axis.offsets, ptr %axis.indices, ptr %values, i32 %value.count) {
+entry:
+  br label %count.header
+
+count.header:
+  %axis = phi i32 [ 0, %entry ], [ %axis.next, %count.body ]
+  %element.count = phi i32 [ 1, %entry ], [ %element.count.next, %count.body ]
+  %continue = icmp slt i32 %axis, %ndim
+  br i1 %continue, label %count.body, label %copy
+
+count.body:
+  %axis64 = sext i32 %axis to i64
+  %shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %axis64
+  %extent = load i32, ptr %shape.ptr, align 4
+  %element.count.next = mul nsw i32 %element.count, %extent
+  %axis.next = add nsw i32 %axis, 1
+  br label %count.header
+
+copy:
+  %byte.count32 = mul nsw i32 %element.count, 8
+  %byte.count = sext i32 %byte.count32 to i64
+  call void @llvm.memcpy.p0.p0.i64(
+      ptr %output, ptr %input, i64 %byte.count, i1 false)
+  call void @index_assign_double(
+      ptr %output, ptr %shape, i32 %ndim,
+      ptr %axis.offsets, ptr %axis.indices,
+      ptr %values, i32 %value.count)
+  ret void
+}
+
+define void @unfold2d_double(
+    ptr %input, ptr %output,
+    i32 %n, i32 %c, i32 %h, i32 %w,
+    i32 %kh.count, i32 %kw.count,
+    i32 %sh, i32 %sw, i32 %ph, i32 %pw, i32 %dh, i32 %dw) {
+entry:
+  %kh.minus = sub nsw i32 %kh.count, 1
+  %kw.minus = sub nsw i32 %kw.count, 1
+  %effective.h.raw = mul nsw i32 %kh.minus, %dh
+  %effective.w.raw = mul nsw i32 %kw.minus, %dw
+  %effective.h = add nsw i32 %effective.h.raw, 1
+  %effective.w = add nsw i32 %effective.w.raw, 1
+  %twoph = mul nsw i32 %ph, 2
+  %twopw = mul nsw i32 %pw, 2
+  %padded.h = add nsw i32 %h, %twoph
+  %padded.w = add nsw i32 %w, %twopw
+  %numerator.h = sub nsw i32 %padded.h, %effective.h
+  %numerator.w = sub nsw i32 %padded.w, %effective.w
+  %oh.raw = sdiv i32 %numerator.h, %sh
+  %ow.raw = sdiv i32 %numerator.w, %sw
+  %oh.count = add nsw i32 %oh.raw, 1
+  %ow.count = add nsw i32 %ow.raw, 1
+  %count.0 = mul nsw i32 %n, %c
+  %count.1 = mul nsw i32 %count.0, %kh.count
+  %count.2 = mul nsw i32 %count.1, %kw.count
+  %count.3 = mul nsw i32 %count.2, %oh.count
+  %count = mul nsw i32 %count.3, %ow.count
+  br label %loop.header
+
+loop.header:
+  %flat = phi i32 [ 0, %entry ], [ %flat.next, %loop.latch ]
+  %continue = icmp slt i32 %flat, %count
+  br i1 %continue, label %decode, label %exit
+
+decode:
+  %ow = srem i32 %flat, %ow.count
+  %q.ow = sdiv i32 %flat, %ow.count
+  %oh = srem i32 %q.ow, %oh.count
+  %q.oh = sdiv i32 %q.ow, %oh.count
+  %kw = srem i32 %q.oh, %kw.count
+  %q.kw = sdiv i32 %q.oh, %kw.count
+  %kh = srem i32 %q.kw, %kh.count
+  %q.kh = sdiv i32 %q.kw, %kh.count
+  %channel = srem i32 %q.kh, %c
+  %batch = sdiv i32 %q.kh, %c
+  %ih.base = mul nsw i32 %oh, %sh
+  %iw.base = mul nsw i32 %ow, %sw
+  %ih.unpadded = sub nsw i32 %ih.base, %ph
+  %iw.unpadded = sub nsw i32 %iw.base, %pw
+  %kh.offset = mul nsw i32 %kh, %dh
+  %kw.offset = mul nsw i32 %kw, %dw
+  %ih = add nsw i32 %ih.unpadded, %kh.offset
+  %iw = add nsw i32 %iw.unpadded, %kw.offset
+  %ih.low = icmp sge i32 %ih, 0
+  %ih.high = icmp slt i32 %ih, %h
+  %iw.low = icmp sge i32 %iw, 0
+  %iw.high = icmp slt i32 %iw, %w
+  %h.valid = and i1 %ih.low, %ih.high
+  %w.valid = and i1 %iw.low, %iw.high
+  %valid = and i1 %h.valid, %w.valid
+  br i1 %valid, label %load, label %zero
+
+load:
+  %input.bc = mul nsw i32 %batch, %c
+  %input.channel = add nsw i32 %input.bc, %channel
+  %input.row.base = mul nsw i32 %input.channel, %h
+  %input.row = add nsw i32 %input.row.base, %ih
+  %input.flat.base = mul nsw i32 %input.row, %w
+  %input.flat = add nsw i32 %input.flat.base, %iw
+  %input.flat64 = sext i32 %input.flat to i64
+  %input.ptr = getelementptr inbounds double, ptr %input, i64 %input.flat64
+  %loaded = load double, ptr %input.ptr, align 8
+  br label %store
+
+zero:
+  br label %store
+
+store:
+  %value = phi double [ %loaded, %load ], [ 0.000000e+00, %zero ]
+  %flat64 = sext i32 %flat to i64
+  %output.ptr = getelementptr inbounds double, ptr %output, i64 %flat64
+  store double %value, ptr %output.ptr, align 8
+  br label %loop.latch
+
+loop.latch:
+  %flat.next = add nsw i32 %flat, 1
+  br label %loop.header
+
+exit:
+  ret void
+}
+
+define void @fold2d_double(
+    ptr %columns, ptr %output,
+    i32 %n, i32 %c, i32 %h, i32 %w,
+    i32 %kh.count, i32 %kw.count,
+    i32 %sh, i32 %sw, i32 %ph, i32 %pw, i32 %dh, i32 %dw) {
+entry:
+  %output.count.0 = mul nsw i32 %n, %c
+  %output.count.1 = mul nsw i32 %output.count.0, %h
+  %output.count = mul nsw i32 %output.count.1, %w
+  %byte.count32 = mul nsw i32 %output.count, 8
+  %byte.count = sext i32 %byte.count32 to i64
+  call void @llvm.memset.p0.i64(ptr %output, i8 0, i64 %byte.count, i1 false)
+  %kh.minus = sub nsw i32 %kh.count, 1
+  %kw.minus = sub nsw i32 %kw.count, 1
+  %effective.h.raw = mul nsw i32 %kh.minus, %dh
+  %effective.w.raw = mul nsw i32 %kw.minus, %dw
+  %effective.h = add nsw i32 %effective.h.raw, 1
+  %effective.w = add nsw i32 %effective.w.raw, 1
+  %twoph = mul nsw i32 %ph, 2
+  %twopw = mul nsw i32 %pw, 2
+  %padded.h = add nsw i32 %h, %twoph
+  %padded.w = add nsw i32 %w, %twopw
+  %numerator.h = sub nsw i32 %padded.h, %effective.h
+  %numerator.w = sub nsw i32 %padded.w, %effective.w
+  %oh.raw = sdiv i32 %numerator.h, %sh
+  %ow.raw = sdiv i32 %numerator.w, %sw
+  %oh.count = add nsw i32 %oh.raw, 1
+  %ow.count = add nsw i32 %ow.raw, 1
+  %count.0 = mul nsw i32 %n, %c
+  %count.1 = mul nsw i32 %count.0, %kh.count
+  %count.2 = mul nsw i32 %count.1, %kw.count
+  %count.3 = mul nsw i32 %count.2, %oh.count
+  %count = mul nsw i32 %count.3, %ow.count
+  br label %loop.header
+
+loop.header:
+  %flat = phi i32 [ 0, %entry ], [ %flat.next, %loop.latch ]
+  %continue = icmp slt i32 %flat, %count
+  br i1 %continue, label %decode, label %exit
+
+decode:
+  %ow = srem i32 %flat, %ow.count
+  %q.ow = sdiv i32 %flat, %ow.count
+  %oh = srem i32 %q.ow, %oh.count
+  %q.oh = sdiv i32 %q.ow, %oh.count
+  %kw = srem i32 %q.oh, %kw.count
+  %q.kw = sdiv i32 %q.oh, %kw.count
+  %kh = srem i32 %q.kw, %kh.count
+  %q.kh = sdiv i32 %q.kw, %kh.count
+  %channel = srem i32 %q.kh, %c
+  %batch = sdiv i32 %q.kh, %c
+  %ih.base = mul nsw i32 %oh, %sh
+  %iw.base = mul nsw i32 %ow, %sw
+  %ih.unpadded = sub nsw i32 %ih.base, %ph
+  %iw.unpadded = sub nsw i32 %iw.base, %pw
+  %kh.offset = mul nsw i32 %kh, %dh
+  %kw.offset = mul nsw i32 %kw, %dw
+  %ih = add nsw i32 %ih.unpadded, %kh.offset
+  %iw = add nsw i32 %iw.unpadded, %kw.offset
+  %ih.low = icmp sge i32 %ih, 0
+  %ih.high = icmp slt i32 %ih, %h
+  %iw.low = icmp sge i32 %iw, 0
+  %iw.high = icmp slt i32 %iw, %w
+  %h.valid = and i1 %ih.low, %ih.high
+  %w.valid = and i1 %iw.low, %iw.high
+  %valid = and i1 %h.valid, %w.valid
+  br i1 %valid, label %accumulate, label %loop.latch
+
+accumulate:
+  %flat64 = sext i32 %flat to i64
+  %column.ptr = getelementptr inbounds double, ptr %columns, i64 %flat64
+  %column.value = load double, ptr %column.ptr, align 8
+  %output.bc = mul nsw i32 %batch, %c
+  %output.channel = add nsw i32 %output.bc, %channel
+  %output.row.base = mul nsw i32 %output.channel, %h
+  %output.row = add nsw i32 %output.row.base, %ih
+  %output.flat.base = mul nsw i32 %output.row, %w
+  %output.flat = add nsw i32 %output.flat.base, %iw
+  %output.flat64 = sext i32 %output.flat to i64
+  %output.ptr = getelementptr inbounds double, ptr %output, i64 %output.flat64
+  %previous = load double, ptr %output.ptr, align 8
+  %updated = fadd double %previous, %column.value
+  store double %updated, ptr %output.ptr, align 8
+  br label %loop.latch
+
+loop.latch:
+  %flat.next = add nsw i32 %flat, 1
+  br label %loop.header
 
 exit:
   ret void
@@ -1913,6 +2218,13 @@ TRANSLATIONS = (
             "not_equal",
             "maximum",
             "minimum",
+            "bitand",
+            "bitor",
+            "bitxor",
+            "shl",
+            "shr",
+            "logical_and",
+            "logical_or",
         ),
         "scalar binary semantics",
     ),
@@ -1935,6 +2247,13 @@ TRANSLATIONS = (
             "not_equal",
             "maximum",
             "minimum",
+            "bitand",
+            "bitor",
+            "bitxor",
+            "shl",
+            "shr",
+            "logical_and",
+            "logical_or",
         ),
         "elementwise binary loop",
     ),
@@ -1957,6 +2276,13 @@ TRANSLATIONS = (
             "not_equal",
             "maximum",
             "minimum",
+            "bitand",
+            "bitor",
+            "bitxor",
+            "shl",
+            "shr",
+            "logical_and",
+            "logical_or",
         ),
         "elementwise tensor-scalar loop",
     ),
@@ -1989,6 +2315,8 @@ TRANSLATIONS = (
             "asinh",
             "acosh",
             "atanh",
+            "sign",
+            "invert",
         ),
         "elementwise unary loop and signal-call frontier",
     ),
@@ -2055,8 +2383,26 @@ TRANSLATIONS = (
     CBackendLLVMSSA(
         "index_assign_double",
         "index_assign_double",
-        ("scatter", "index_set"),
+        ("scatter",),
         "arbitrary-rank indexed mutation",
+    ),
+    CBackendLLVMSSA(
+        "index_set_double",
+        "index_set_double",
+        ("index_set",),
+        "functional arbitrary-rank indexed assignment",
+    ),
+    CBackendLLVMSSA(
+        "unfold2d_double",
+        "unfold2d_double",
+        ("unfold2d",),
+        "two-dimensional image-to-column transform",
+    ),
+    CBackendLLVMSSA(
+        "fold2d_double",
+        "fold2d_double",
+        ("fold2d",),
+        "two-dimensional overlap-accumulating column-to-image transform",
     ),
     CBackendLLVMSSA(
         "sign_double",
@@ -2183,6 +2529,7 @@ def discover_c_backend_functions() -> tuple[CBackendFunction, ...]:
     return tuple(functions)
 
 
+@lru_cache(maxsize=1)
 def _c_backend_operator_codes() -> tuple[dict[str, str], dict[str, str]]:
     """Read the real ``_apply_operator__`` dispatch dictionaries."""
 

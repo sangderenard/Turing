@@ -940,6 +940,41 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "notes": "Right-inverse of broadcasting via summation.",
         "tags": ["shape"],
     },
+    "unfold2d": {
+        "arity": "unary",
+        "signature": "y = unfold2d(x, kernel_size, stride, padding, dilation)",
+        "latex": r"y = \operatorname{im2col}(x)",
+        "backward": {
+            "x": "gx = fold2d(g, x.shape, kernel_size, stride, padding, dilation)"
+        },
+        "python": {
+            "parameters": [
+                "g", "x", "kernel_size", "stride", "padding", "dilation"
+            ],
+            "body": "return AbstractTensor.fold2d(g, tuple(x.shape), kernel_size, stride=stride, padding=padding, dilation=dilation)",
+        },
+        "domain": "Rank-four NCHW tensors with valid convolution geometry.",
+        "notes": "The adjoint is overlap-accumulating column-to-image fold.",
+        "tags": ["shape", "convolution"],
+    },
+    "fold2d": {
+        "arity": "unary",
+        "signature": "y = fold2d(x, output_size, kernel_size, stride, padding, dilation)",
+        "latex": r"y = \operatorname{col2im}(x)",
+        "backward": {
+            "x": "gx = unfold2d(g, kernel_size, stride, padding, dilation)"
+        },
+        "python": {
+            "parameters": [
+                "g", "x", "output_size", "kernel_size", "stride",
+                "padding", "dilation"
+            ],
+            "body": "return AbstractTensor.unfold2d(g, kernel_size, stride=stride, padding=padding, dilation=dilation)",
+        },
+        "domain": "Column tensors paired with valid rank-four output geometry.",
+        "notes": "The adjoint is the matching image-to-column transform.",
+        "tags": ["shape", "convolution"],
+    },
     "slice": {
         "arity": "unary",
         "signature": "y = x[slices]",
@@ -960,15 +995,15 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = x; y[idx] = v",
         "latex": r"y = x; y[\\text{idx}] = v",
         "backward": {
-            "x": "gx = g.clone()",
+            "x": "gx = g.clone(); gx[idx] = 0",
             "v": "gv = g[idx]"
         },
         "python": {
             "parameters": ["g", "x", "v", "idx"],
-            "body": "gx=g.clone(); gv=g[idx]; return gx, gv"
+            "body": "gx=g.clone(); gx[idx]=0; gv=g[idx]; return gx, gv"
         },
         "domain": "Any real; idx valid.",
-        "notes": "Scatter assignment; gradient flows from selected region to the value.",
+        "notes": "Overwrite assignment; replaced source entries have zero adjoint and the selected gradient flows to the value.",
         "tags": ["indexing"],
     },
     "clone": {

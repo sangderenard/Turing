@@ -28,7 +28,7 @@ def build_dataset(like):
     return X, Y
 
 
-def build_model(like):
+def build_model(like) -> Model:
     return Model(
         layers=[
             Linear(2, 8, like=like, init="xavier"),
@@ -49,10 +49,14 @@ def train(steps=200, lr=1e-2):
     for step in range(1, steps + 1):
         prediction = model.forward(X)
         loss = loss_fn.forward(prediction, Y)
-        gradient = loss_fn.backward(prediction, Y)
-        gradients = model.backward(gradient)
-        parameters = optimizer.step(model.parameters(), gradients)
-        model.assign_parameters(parameters)
+        loss.backward()
+        parameters = model.parameters()
+        gradients = [parameter.grad for parameter in parameters]
+        updated = optimizer.step(parameters, gradients)
+        model.layers[0].W = updated[0]
+        model.layers[0].b = updated[1]
+        model.layers[1].W = updated[2]
+        model.layers[1].b = updated[3]
         if step == 1 or step % 50 == 0:
             print(f"step {step}: loss {float(loss):.6f}")
     return model, float(loss)

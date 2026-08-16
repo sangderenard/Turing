@@ -1,9 +1,12 @@
 import ast
+import contextlib
+import io
 import json
 import math
 from pathlib import Path
 
 import pytest
+import yaml
 
 from src.compiler.extraction_contract import (
     ExtractionAction,
@@ -11,6 +14,8 @@ from src.compiler.extraction_contract import (
     ExtractionContractError,
 )
 from src.common.tensors.abstract_nn import Adam
+from src.common.tensors.abstraction import AbstractTensor
+from src.common.tensors.autograd import autograd
 from src.compiler.evolution_metagraph import record_evolution
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 from src.transmogrifier.graph.python_special_cases import (
@@ -45,6 +50,19 @@ def test_default_contract_draws_python_native_and_decompile_lines():
     assert contract.execution.backward_source == "process_graph"
     assert contract.execution.numeric_semantics == "abstract_tensor"
     assert contract.execution.scalar_promotion == "all_numeric"
+    state_abi = contract.program_abi.records_for_function(
+        "symbolic_fluid_advance"
+    )["state"]
+    assert state_abi.fields["height"].storage == "span"
+    assert state_abi.fields["height"].rank == 2
+    assert state_abi.fields["dx"].dtype == "float64"
+    assert state_abi.fields["dx"].mutable is False
+    dt_abi = contract.program_abi.values_for_function(
+        "step_with_dt_control_used"
+    )["dt"]
+    assert dt_abi.field.storage == "scalar"
+    assert dt_abi.field.dtype == "float64"
+    assert dt_abi.python_type == "builtins.float"
 
     assert contract.decide(Adam).action is ExtractionAction.INGEST_PYTHON
     assert contract.decide(range).action is ExtractionAction.INTRINSIC
@@ -55,6 +73,18 @@ def test_default_contract_draws_python_native_and_decompile_lines():
         receipt["action"] != ExtractionAction.DECOMPILE_MACHINE.value
         for receipt in contract.receipts()
     )
+
+
+def test_program_abi_correlates_unannotated_method_receiver_by_class_identity():
+    contract = ExtractionContract(CONTRACT)
+
+    records = contract.program_abi.records_for_function(
+        "pi_update",
+        method_owner="STController",
+        parameters=("self", "dt_prev", "dt_pen"),
+    )
+
+    assert records["self"].identity.endswith(".STController")
 
 
 def test_contract_must_cover_every_class_and_explicitly_opt_into_decompile(tmp_path):
@@ -87,10 +117,24 @@ def test_contract_must_cover_every_class_and_explicitly_opt_into_decompile(tmp_p
         },
     }
     unsafe = tmp_path / "unsafe.yaml"
-    import yaml
     unsafe.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ExtractionContractError, match="explicit_opt_in"):
         ExtractionContract(unsafe)
+
+
+def test_program_abi_rejects_untyped_physical_spans(tmp_path):
+    raw = yaml.safe_load(CONTRACT.read_text(encoding="utf-8"))
+    raw["program_abi"]["records"]["Broken"] = {
+        "fields": {"values": {"storage": "span", "rank": 1}}
+    }
+    raw["program_abi"]["bindings"].append({
+        "function": "*", "parameter": "broken", "record": "Broken",
+    })
+    path = tmp_path / "broken-program-abi.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    with pytest.raises(ExtractionContractError, match="dtype is required"):
+        ExtractionContract(path)
 
 
 def test_parent_expansion_records_intrinsic_without_host_decompilation():
@@ -297,3 +341,58 @@ def test_python_dependency_depth_is_a_hard_contract_ceiling():
             parent_bindings={"outer": _contract_outer},
             parent_include=contract,
         )
+
+
+def test_autograd_instance_occurrences_pursue_the_real_tape_source():
+    contract = ExtractionContract(CONTRACT)
+    assert contract.decide(autograd).receipt()["occurrence"] == "instance"
+    assert contract.decide(autograd.tape).parameters["occurrence_pursuit"] == (
+        "referenced_attributes"
+    )
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"loss": AbstractTensor}
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            ast.parse(
+                "class Unrelated:\n"
+                "    def backward(self):\n"
+                "        return None\n\n"
+                "def kernel():\n"
+                "    loss.backward()\n"
+            ),
+            resolve_unresolved_parents=True,
+            pursuit_roots=("kernel",),
+            parent_include=contract,
+        )
+
+    identities = {
+        tuple(identity)
+        for _node_id, data in graph.G.nodes(data=True)
+        if (identity := getattr(
+            data.get("expr_obj"),
+            "_python_source_identity",
+            None,
+        ))
+    }
+    assert ("src.common.tensors.autograd", "backward") in identities
+    assert (
+        "src.common.tensors.autograd",
+        "GradTape.mark_loss",
+    ) in identities
+    assert (
+        "src.common.tensors.autograd",
+        "GradTape.parameter_tensors",
+    ) in identities
+    assert ("src.common.tensors.autograd", "Autograd.grad") in identities
+
+    occurrences = {
+        receipt["identity"]
+        for _node_id, data in graph.G.nodes(data=True)
+        for receipt in (data.get("attributes") or {}).get(
+            "extraction_occurrences",
+            (),
+        )
+    }
+    assert "src.common.tensors.autograd.Autograd" in occurrences
+    assert "src.common.tensors.autograd.GradTape" in occurrences

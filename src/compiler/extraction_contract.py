@@ -13,7 +13,7 @@ from pathlib import Path
 import sys
 import sysconfig
 import threading
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import yaml
 
@@ -132,6 +132,7 @@ class ExtractionSubject:
     module: str
     qualname: str
     kind: str
+    occurrence: str
     origin: str
     classification: str
     source_available: bool
@@ -161,6 +162,7 @@ class ExtractionDecision:
             "module": self.subject.module,
             "qualname": self.subject.qualname,
             "kind": self.subject.kind,
+            "occurrence": self.subject.occurrence,
             "origin": self.subject.origin,
             "classification": self.subject.classification,
             "source_available": self.subject.source_available,
@@ -172,6 +174,287 @@ class ExtractionDecision:
 
 class ExtractionContractError(ValueError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramABIField:
+    """Physical field promised by the source-program boundary."""
+
+    storage: str
+    dtype: str | None = None
+    rank: int = 0
+    mutable: bool = False
+    default: Any = None
+    has_default: bool = False
+
+    @classmethod
+    def from_mapping(cls, location: str, raw: Any) -> "ProgramABIField":
+        if not isinstance(raw, Mapping):
+            raise ExtractionContractError(f"{location} must be a mapping")
+        allowed = {"storage", "dtype", "rank", "mutable", "default"}
+        extra = sorted(set(raw) - allowed)
+        if extra:
+            raise ExtractionContractError(
+                f"{location} has unknown fields {extra}"
+            )
+        storage = str(raw.get("storage") or "")
+        if storage not in {"scalar", "span", "record", "reference", "keyed"}:
+            raise ExtractionContractError(
+                f"{location}.storage must be scalar, span, record, reference, "
+                "or keyed"
+            )
+        dtype = raw.get("dtype")
+        if storage in {"scalar", "span", "keyed"} and not dtype:
+            raise ExtractionContractError(
+                f"{location}.dtype is required for {storage} storage"
+            )
+        rank = raw.get("rank", 0)
+        if not isinstance(rank, int) or isinstance(rank, bool) or rank < 0:
+            raise ExtractionContractError(
+                f"{location}.rank must be a non-negative integer"
+            )
+        if storage == "scalar" and rank != 0:
+            raise ExtractionContractError(
+                f"{location}.rank must be zero for scalar storage"
+            )
+        if storage == "span" and rank == 0:
+            raise ExtractionContractError(
+                f"{location}.rank must be positive for span storage"
+            )
+        # A keyed field is a mapping whose keys are words. It lowers to the
+        # repository's universal string tokens: parallel key/value vectors plus
+        # a length, so a constant key and a name hashed at run time land on the
+        # same slot without a shared intern counter. Its rank is the vector's,
+        # which is always one -- the mapping is flat.
+        if storage == "keyed" and rank not in {0, 1}:
+            raise ExtractionContractError(
+                f"{location}.rank must be zero or one for keyed storage"
+            )
+        mutable = raw.get("mutable", False)
+        if not isinstance(mutable, bool):
+            raise ExtractionContractError(
+                f"{location}.mutable must be boolean"
+            )
+        return cls(
+            storage,
+            None if dtype is None else str(dtype),
+            rank,
+            mutable,
+            raw.get("default"),
+            "default" in raw,
+        )
+
+    def receipt(self) -> dict[str, Any]:
+        result = {
+            "storage": self.storage,
+            "dtype": self.dtype,
+            "rank": self.rank,
+            "mutable": self.mutable,
+        }
+        if self.has_default:
+            result["default"] = self.default
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramABIRecord:
+    identity: str
+    fields: Mapping[str, ProgramABIField]
+
+    def receipt(self) -> dict[str, Any]:
+        return {
+            "identity": self.identity,
+            "fields": {
+                name: field.receipt() for name, field in self.fields.items()
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramABIBinding:
+    function: str
+    parameter: str
+    record: str
+
+    def receipt(self) -> dict[str, str]:
+        return {
+            "function": self.function,
+            "parameter": self.parameter,
+            "record": self.record,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramABIValueBinding:
+    """Physical ABI and source-language type for one function parameter."""
+
+    function: str
+    parameter: str
+    field: ProgramABIField
+    python_type: str
+
+    def receipt(self) -> dict[str, Any]:
+        return {
+            "function": self.function,
+            "parameter": self.parameter,
+            **self.field.receipt(),
+            "python_type": self.python_type,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramABIContract:
+    """Typed host/native boundary independent of Python object identity."""
+
+    records: Mapping[str, ProgramABIRecord] = field(default_factory=dict)
+    bindings: tuple[ProgramABIBinding, ...] = ()
+    values: tuple[ProgramABIValueBinding, ...] = ()
+
+    @classmethod
+    def from_mapping(cls, raw: Any) -> "ProgramABIContract":
+        if raw is None:
+            return cls()
+        if not isinstance(raw, Mapping):
+            raise ExtractionContractError("program_abi must be a mapping")
+        extra = sorted(set(raw) - {"records", "bindings", "values"})
+        if extra:
+            raise ExtractionContractError(
+                f"program_abi has unknown fields {extra}"
+            )
+        raw_records = raw.get("records", {})
+        if not isinstance(raw_records, Mapping):
+            raise ExtractionContractError("program_abi.records must be a mapping")
+        records: dict[str, ProgramABIRecord] = {}
+        for name, record_raw in raw_records.items():
+            location = f"program_abi.records.{name}"
+            if not isinstance(record_raw, Mapping):
+                raise ExtractionContractError(f"{location} must be a mapping")
+            extra_record = sorted(set(record_raw) - {"identity", "fields"})
+            if extra_record:
+                raise ExtractionContractError(
+                    f"{location} has unknown fields {extra_record}"
+                )
+            raw_fields = record_raw.get("fields", {})
+            if not isinstance(raw_fields, Mapping) or not raw_fields:
+                raise ExtractionContractError(
+                    f"{location}.fields must be a non-empty mapping"
+                )
+            fields = {
+                str(field_name): ProgramABIField.from_mapping(
+                    f"{location}.fields.{field_name}", field_raw,
+                )
+                for field_name, field_raw in raw_fields.items()
+            }
+            identity = str(record_raw.get("identity") or name)
+            records[str(name)] = ProgramABIRecord(identity, fields)
+        raw_bindings = raw.get("bindings", ())
+        if not isinstance(raw_bindings, list):
+            raise ExtractionContractError("program_abi.bindings must be a list")
+        bindings = []
+        for index, binding_raw in enumerate(raw_bindings):
+            location = f"program_abi.bindings[{index}]"
+            if not isinstance(binding_raw, Mapping):
+                raise ExtractionContractError(f"{location} must be a mapping")
+            if set(binding_raw) != {"function", "parameter", "record"}:
+                raise ExtractionContractError(
+                    f"{location} must define exactly function, parameter, record"
+                )
+            binding = ProgramABIBinding(
+                str(binding_raw["function"]),
+                str(binding_raw["parameter"]),
+                str(binding_raw["record"]),
+            )
+            if binding.record not in records:
+                raise ExtractionContractError(
+                    f"{location}.record names unknown record {binding.record!r}"
+                )
+            bindings.append(binding)
+        raw_values = raw.get("values", ())
+        if not isinstance(raw_values, list):
+            raise ExtractionContractError("program_abi.values must be a list")
+        values = []
+        for index, value_raw in enumerate(raw_values):
+            location = f"program_abi.values[{index}]"
+            if not isinstance(value_raw, Mapping):
+                raise ExtractionContractError(f"{location} must be a mapping")
+            required = {"function", "parameter", "storage", "python_type"}
+            if not required.issubset(value_raw):
+                raise ExtractionContractError(
+                    f"{location} must define function, parameter, storage, "
+                    "and python_type"
+                )
+            field_raw = {
+                key: value
+                for key, value in value_raw.items()
+                if key not in {"function", "parameter", "python_type"}
+            }
+            field = ProgramABIField.from_mapping(location, field_raw)
+            python_type = str(value_raw.get("python_type") or "")
+            if not python_type:
+                raise ExtractionContractError(
+                    f"{location}.python_type must be a qualified identity"
+                )
+            values.append(ProgramABIValueBinding(
+                str(value_raw["function"]),
+                str(value_raw["parameter"]),
+                field,
+                python_type,
+            ))
+        return cls(records, tuple(bindings), tuple(values))
+
+    def records_for_function(
+        self,
+        function_name: str,
+        *,
+        method_owner: str | None = None,
+        parameters: Iterable[str] = (),
+    ) -> dict[str, ProgramABIRecord]:
+        result = {}
+        for binding in self.bindings:
+            if fnmatchcase(str(function_name), binding.function):
+                result[binding.parameter] = self.records[binding.record]
+        # An instance method's receiver already has an exact source-level
+        # class identity.  Let that identity select the matching record ABI
+        # instead of requiring every contract to repeat ``parameter: self``
+        # for every method.  This is schema correlation only: ambiguity is
+        # left unresolved and no Python class is constructed or inspected.
+        parameter_names = set(map(str, parameters))
+        if (
+            method_owner is not None
+            and "self" in parameter_names
+            and "self" not in result
+        ):
+            owner = str(method_owner)
+            candidates = tuple(
+                record
+                for name, record in self.records.items()
+                if (
+                    str(name) == owner
+                    or str(record.identity) == owner
+                    or str(record.identity).rsplit(".", 1)[-1] == owner
+                )
+            )
+            if len(candidates) == 1:
+                result["self"] = candidates[0]
+        return result
+
+    def values_for_function(
+        self, function_name: str,
+    ) -> dict[str, ProgramABIValueBinding]:
+        result = {}
+        for binding in self.values:
+            if fnmatchcase(str(function_name), binding.function):
+                result[binding.parameter] = binding
+        return result
+
+    def receipt(self) -> dict[str, Any]:
+        return {
+            "records": {
+                name: record.receipt() for name, record in self.records.items()
+            },
+            "bindings": [binding.receipt() for binding in self.bindings],
+            "values": [binding.receipt() for binding in self.values],
+        }
 
 
 class ExtractionContract:
@@ -205,6 +488,7 @@ class ExtractionContract:
         # The execution model surrounds those choices; it does not obscure
         # them.
         self.execution = ExecutionContract.from_mapping(raw.get("execution"))
+        self.program_abi = ProgramABIContract.from_mapping(raw.get("program_abi"))
         rules = raw.get("rules", ())
         if not isinstance(rules, list):
             raise ExtractionContractError("rules must be a list")
@@ -229,7 +513,9 @@ class ExtractionContract:
         self.limits = dict(raw.get("limits") or {})
         self.fingerprint = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
         self._lock = threading.Lock()
-        self._decisions: dict[tuple[str, str, str], ExtractionDecision] = {}
+        self._decisions: dict[
+            tuple[str, str, str, str], ExtractionDecision
+        ] = {}
         self._source_origins: set[Path] = set()
         self._source_bytes = 0
 
@@ -287,8 +573,24 @@ class ExtractionContract:
 
     def subject(self, value: Any) -> ExtractionSubject:
         target = value.__func__ if inspect.ismethod(value) else value
-        module = str(getattr(target, "__module__", ""))
-        qualname = str(getattr(target, "__qualname__", getattr(target, "__name__", "")))
+        occurrence = (
+            "definition"
+            if (
+                inspect.isclass(target)
+                or inspect.isfunction(target)
+                or inspect.ismethod(value)
+                or inspect.isbuiltin(target)
+                or inspect.ismodule(target)
+            )
+            else "instance"
+        )
+        definition_target = type(target) if occurrence == "instance" else target
+        module = str(getattr(definition_target, "__module__", ""))
+        qualname = str(getattr(
+            definition_target,
+            "__qualname__",
+            getattr(definition_target, "__name__", ""),
+        ))
         kind = (
             "class" if inspect.isclass(target)
             else "builtin" if inspect.isbuiltin(target)
@@ -297,13 +599,19 @@ class ExtractionContract:
             else type(target).__name__
         )
         try:
-            origin = str(inspect.getsourcefile(target) or inspect.getfile(target) or "")
+            origin = str(
+                inspect.getsourcefile(definition_target)
+                or inspect.getfile(definition_target)
+                or ""
+            )
         except (OSError, TypeError):
-            defining_module = inspect.getmodule(target) or sys.modules.get(module)
+            defining_module = (
+                inspect.getmodule(definition_target) or sys.modules.get(module)
+            )
             origin = str(getattr(defining_module, "__file__", "") or "")
         suffix = Path(origin).suffix.casefold()
         try:
-            inspect.getsource(target)
+            inspect.getsource(definition_target)
             source_available = True
         except (OSError, TypeError):
             source_available = False
@@ -329,7 +637,13 @@ class ExtractionContract:
         else:
             classification = "unknown"
         return ExtractionSubject(
-            module, qualname, kind, origin, classification, source_available
+            module,
+            qualname,
+            kind,
+            occurrence,
+            origin,
+            classification,
+            source_available,
         )
 
     @staticmethod
@@ -339,6 +653,7 @@ class ExtractionContract:
             "qualname": subject.qualname,
             "identity": subject.identity,
             "kind": subject.kind,
+            "occurrence": subject.occurrence,
             "origin": subject.origin.replace("\\", "/"),
             "classification": subject.classification,
         }
@@ -356,7 +671,12 @@ class ExtractionContract:
 
     def decide(self, value: Any) -> ExtractionDecision:
         subject = self.subject(value)
-        key = (subject.module, subject.qualname, subject.origin)
+        key = (
+            subject.module,
+            subject.qualname,
+            subject.occurrence,
+            subject.origin,
+        )
         with self._lock:
             cached = self._decisions.get(key)
         if cached is not None:
@@ -416,4 +736,8 @@ __all__ = [
     "ExtractionDecision",
     "ExtractionSubject",
     "ExecutionContract",
+    "ProgramABIBinding",
+    "ProgramABIContract",
+    "ProgramABIField",
+    "ProgramABIRecord",
 ]

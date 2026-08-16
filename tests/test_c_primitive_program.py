@@ -96,6 +96,26 @@ def test_prepared_primitive_program_reuses_native_slots():
     assert second.tolist() == [6.0, 0.0, 2.0]
 
 
+def test_prepared_primitive_program_exposes_every_named_output():
+    feed = CTensor.from_list([1.0, 2.0, 3.0], (3,))
+    program = FusedProgram(
+        1,
+        {0},
+        [
+            OpStep(0, "add", [0], {"right_scalar": 1.0}, 1),
+            OpStep(1, "mul", [1], {"right_scalar": 2.0}, 2),
+        ],
+        {"incremented": 1, "doubled": 2},
+    )
+
+    prepared = prepare_fused_program(program, [feed])
+    prepared.execute()
+
+    assert set(prepared.outputs) == {"incremented", "doubled"}
+    np.testing.assert_allclose(prepared.outputs["incremented"].tolist(), [2, 3, 4])
+    np.testing.assert_allclose(prepared.outputs["doubled"].tolist(), [4, 6, 8])
+
+
 def test_primitive_program_rejects_invalid_slot_program():
     program = _program(
         [0], [("add", 1, [8], {"right_scalar": 1.0})], 1

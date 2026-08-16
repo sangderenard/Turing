@@ -656,6 +656,7 @@ def compile_ast_aot(
     boundary_namespace: Any = None,
     source_language: str = "python",
     extraction_contract: Any = None,
+    linked_process_graphs: Mapping[str, Any] | None = None,
 ) -> AOTCompilation:
     """Compile ``entrypoint`` in ``source`` ahead-of-time and execute it once.
 
@@ -718,6 +719,10 @@ def compile_ast_aot(
     expanded_python_bindings = _expand_python_static_bindings(
         python_bindings
     )
+    linked_process_graphs = {
+        str(name): graph
+        for name, graph in dict(linked_process_graphs or {}).items()
+    }
     boundary_resolver = boundary_namespace
     if boundary_resolver is not None:
         from ....transmogrifier.graph.boundary_namespace import BoundaryNamespace
@@ -732,6 +737,21 @@ def compile_ast_aot(
     boundary_fingerprint = (
         "" if boundary_resolver is None else boundary_resolver.fingerprint()
     )
+    if linked_process_graphs:
+        linked_identity = repr(tuple(
+            (
+                name,
+                tuple(graph.G.graph.get("symbolic_equations") or ()),
+                tuple(graph.G.graph.get("function_parameters") or ()),
+                tuple(graph.G.graph.get("function_outputs") or ()),
+            )
+            for name, graph in sorted(linked_process_graphs.items())
+        ))
+        boundary_fingerprint = hashlib.sha256(
+            (boundary_fingerprint + "\0linked-process-graphs\0" + linked_identity).encode(
+                "utf-8"
+            )
+        ).hexdigest()
     extraction_policy = extraction_contract
     if extraction_policy is not None:
         from ....compiler.extraction_contract import ExtractionContract
@@ -748,6 +768,7 @@ def compile_ast_aot(
                 + str(extraction_policy.fingerprint)
             ).encode("utf-8")
         ).hexdigest()
+
 
     (
         checkpoint_store,
@@ -980,6 +1001,15 @@ def compile_ast_aot(
             boundary_namespace=boundary_resolver,
             source_language=source_language,
         )
+        if linked_process_graphs:
+            _report("aot: registering authored ProcessGraph functions")
+            from ....compiler.process_graph_function_linking import (
+                link_process_graph_functions,
+            )
+            # Register before AST dependency pursuit.  The AST ingester can
+            # then attach the existing FunctionReference directly instead of
+            # treating the cross-language name as an unresolved Python call.
+            link_process_graph_functions(graph, linked_process_graphs)
     # AOT compilation may target a function from a live module.  Its resolved
     # globals are static closure values, not runtime tensor feeds.  Capturing
     # them here lets the reducer retain computed constants and imported
@@ -1071,6 +1101,7 @@ def compile_ast_aot(
         require_planned_shells=require_planned_shells,
         runtime_closure_only=runtime_closure_only,
         project_captured_hierarchy=project_captured_hierarchy,
+        linked_process_graphs=linked_process_graphs,
     )
 
 
@@ -1110,6 +1141,7 @@ def _lower_process_graph_to_compilation(
     require_planned_shells: bool = False,
     runtime_closure_only: bool = False,
     project_captured_hierarchy: bool = True,
+    linked_process_graphs: Mapping[str, Any] | None = None,
 ) -> AOTCompilation:
     """Lower an already-built ``ProcessGraph`` into a real ``AOTCompilation``.
 
@@ -1136,6 +1168,12 @@ def _lower_process_graph_to_compilation(
             graph.G.graph["compile_targets"] = tuple(compile_targets)
         _report("aot: reducing abstract tensor topology")
         reduce_abstract_tensor_topology(graph)
+        if linked_process_graphs:
+            _report("aot: linking authored ProcessGraph functions")
+            from ....compiler.process_graph_function_linking import (
+                link_process_graph_functions,
+            )
+            link_process_graph_functions(graph, linked_process_graphs)
         _report("aot: propagating bound planner specializations")
         propagate_bound_planner_specializations(
             graph,
@@ -1791,10 +1829,34 @@ def _lower_process_graph_to_compilation(
         for name in function_parameters
         if (history := tuple(identity_table.get(name, ())))
     }
+
+    def close_region_feed_set(program: FusedProgram) -> set[int]:
+        """Return the complete external-value boundary of one region.
+
+        Capture/remapping is allowed to replace a primitive identity with a
+        ProcessGraph identity after projection.  Hierarchical assembly can do
+        the same while namespacing a child program.  In both cases the
+        instruction operands are authoritative: every consumed value not
+        produced in this region is an input, even when an earlier provisional
+        feed set still names the pre-remap identity.
+
+        Keeping the provisional feeds is intentional.  They may include a
+        pass-through output or state value with no instruction consumer.
+        """
+
+        produced = {int(step.result_id) for step in program.steps}
+        external_operands = {
+            int(value_id)
+            for step in program.steps
+            for value_id in step.input_ids
+            if int(value_id) not in produced
+        }
+        return {int(value_id) for value_id in program.feeds} | external_operands
+
     region_programs = {
         index: FusedProgram(
             version=program.version,
-            feeds=set(program.feeds),
+            feeds=close_region_feed_set(program),
             steps=list(program.steps),
             outputs=dict(program.outputs),
             state_in=None if program.state_in is None else set(program.state_in),
@@ -2105,6 +2167,7 @@ def compile_cpp_shell_aot(
         map_ir=None,
         resume=False,
         require_planned_shells=False,
+        linked_process_graphs=None,
     )
 
 

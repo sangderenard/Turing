@@ -179,6 +179,7 @@ TYPE_AND_DEVICE_OPERATORS = frozenset(
     {
         "astype",
         "bool",
+        "cast_like",
         "cpu",
         "cuda",
         "double",

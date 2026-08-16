@@ -1275,6 +1275,11 @@ def _declared_output_terminals(
     return terminals
 
 
+def _control_dependency_value_ids(control: Any) -> frozenset[int]:
+    from .control_source import control_dependency_value_ids
+
+    return control_dependency_value_ids(control)
+
 def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
     """Freeze call/region ownership before backend source composition."""
 
@@ -1474,6 +1479,23 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
             int(value)
             for value in subgraph.G.graph.get("deployment_nodes", ())
         )
+        original_region_node_set = set(region_nodes)
+        carried_initial_boundaries = {
+            int(initial)
+            for loop_plan in getattr(shell, "loop_plans", ())
+            for _name, initial, updated in loop_plan.loop.carried_bindings
+            if int(updated) in original_region_node_set
+            and int(initial) != int(updated)
+        }
+        # A carried initializer is the entry arm of the coordinator-owned Phi.
+        # If the numerical compartment also owns that initializer, its body
+        # recomputes from the iteration-zero value on every trip.  Cut it from
+        # this region so the ordinary capture calculation below binds the
+        # current Phi value into the update operation.
+        region_nodes = tuple(
+            value_id for value_id in region_nodes
+            if value_id not in carried_initial_boundaries
+        )
         region_node_set = set(region_nodes)
         # Loop-port materialization can rewrite a region's live parents after
         # its dispatch subgraph was first carved. Recompute region captures
@@ -1661,6 +1683,8 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
 
         capture_constants = {}
         for value_id in region_captures:
+            if value_id in carried_initial_boundaries:
+                continue
             known, value = _constant_expression(value_id)
             if known:
                 capture_constants[value_id] = value
@@ -1799,6 +1823,14 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     or node.get("type")
                     or ""
                 ).casefold()
+                if operation in {"const", "constant"}:
+                    literal = attributes.get("value", node.get("constant"))
+                    if isinstance(literal, bool):
+                        dtype = "bool"
+                    elif isinstance(literal, int):
+                        dtype = "int"
+                    elif isinstance(literal, float):
+                        dtype = "float64"
                 parents = tuple(
                     int(parent)
                     for parent, _role in (node.get("parents") or ())
@@ -1911,101 +1943,9 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
             items=(*const_lines, *compute_lines),
             value_shapes=value_shapes,
         ))
-    control_values = set()
-    control = getattr(shell, "shell_control_program", None)
-    if control is not None:
-        control_values.update(
-            int(uniform.value_id) for uniform in control.uniforms
-        )
-        control_values.update(
-            int(value_id)
-            for iterable, target, _induction, sources
-            in control.closure_iterable_bindings
-            for value_id in (iterable, target, *sources)
-        )
-        control_values.update(
-            int(value_id)
-            for pair in control.value_aliases
-            for value_id in pair
-        )
-        control_values.update(
-            int(value_id)
-            for iterable, target, _induction
-            in control.iterable_bindings
-            for value_id in (iterable, target)
-        )
-        control_values.update(
-            int(value_id)
-            for iterable, target, _induction, _projection
-            in control.projected_iterable_bindings
-            for value_id in (iterable, target)
-        )
-        control_values.update(
-            int(value_id)
-            for source, collection, _induction, _start
-            in control.collection_bindings
-            for value_id in (source, collection)
-        )
-        control_values.update(
-            int(value_id)
-            for iterable, target, _induction, _values
-            in control.static_iterable_bindings
-            for value_id in (iterable, target)
-        )
-
-        def validation_values(block) -> None:
-            from .control_source import (
-                CallBlock,
-                LoopControlBlock,
-                LoopBlock,
-                ParallelDeployment,
-                SequenceBlock,
-                StateMachineTick,
-                WhileBlock,
-            )
-
-            def expression_values(expression):
-                if expression is None:
-                    return
-                if expression.value_id is not None:
-                    control_values.add(int(expression.value_id))
-                for operand in expression.operands:
-                    expression_values(operand)
-
-            if isinstance(block, ValidationBlock):
-                control_values.add(int(block.predicate_value_id))
-            elif isinstance(block, StreamPublishBlock):
-                control_values.add(int(block.value_id))
-                if block.count_value_id is not None:
-                    control_values.add(int(block.count_value_id))
-                if block.predicate_value_id is not None:
-                    control_values.add(int(block.predicate_value_id))
-            elif isinstance(block, SequenceBlock):
-                for child in block.blocks:
-                    validation_values(child)
-            elif isinstance(block, LoopBlock):
-                validation_values(block.body)
-            elif isinstance(block, WhileBlock):
-                control_values.add(int(block.predicate_value_id))
-                expression_values(block.predicate_expression)
-                validation_values(block.condition)
-                validation_values(block.body)
-            elif isinstance(block, LoopControlBlock):
-                if block.predicate_value_id is not None:
-                    control_values.add(int(block.predicate_value_id))
-                expression_values(block.predicate_expression)
-            elif isinstance(block, StateMachineTick):
-                for _value, body in block.cases:
-                    validation_values(body)
-                if block.default is not None:
-                    validation_values(block.default)
-            elif isinstance(block, ParallelDeployment):
-                for lane in block.lanes:
-                    validation_values(lane)
-            elif isinstance(block, CallBlock):
-                validation_values(block.callee)
-
-        validation_values(control.root)
+    control_values = set(_control_dependency_value_ids(
+        getattr(shell, "shell_control_program", None)
+    ))
 
     return PlanClosure(
         name=str(
@@ -2275,87 +2215,7 @@ def _refresh_hierarchy_control_captures(
         WhileBlock,
     )
 
-    values: set[int] = set()
-    control = shell.shell_control_program
-    if control is not None:
-        values.update(int(uniform.value_id) for uniform in control.uniforms)
-        values.update(
-            int(value_id)
-            for pair in control.value_aliases
-            for value_id in pair
-        )
-        values.update(
-            int(value_id)
-            for iterable, target, _induction in control.iterable_bindings
-            for value_id in (iterable, target)
-        )
-        values.update(
-            int(value_id)
-            for iterable, target, _induction, _projection
-            in control.projected_iterable_bindings
-            for value_id in (iterable, target)
-        )
-        values.update(
-            int(value_id)
-            for iterable, target, _induction, _items
-            in control.static_iterable_bindings
-            for value_id in (iterable, target)
-        )
-        values.update(
-            int(value_id)
-            for source, collection, _induction, _start
-            in control.collection_bindings
-            for value_id in (source, collection)
-        )
-        values.update(
-            int(value_id)
-            for iterable, target, _induction, sources
-            in control.closure_iterable_bindings
-            for value_id in (iterable, target, *sources)
-        )
-
-        def visit(block) -> None:
-            def expression_values(expression):
-                if expression is None:
-                    return
-                if expression.value_id is not None:
-                    values.add(int(expression.value_id))
-                for operand in expression.operands:
-                    expression_values(operand)
-            if isinstance(block, ValidationBlock):
-                values.add(int(block.predicate_value_id))
-            elif isinstance(block, StreamPublishBlock):
-                values.add(int(block.value_id))
-                if block.count_value_id is not None:
-                    values.add(int(block.count_value_id))
-                if block.predicate_value_id is not None:
-                    values.add(int(block.predicate_value_id))
-            elif isinstance(block, SequenceBlock):
-                for child in block.blocks:
-                    visit(child)
-            elif isinstance(block, LoopBlock):
-                visit(block.body)
-            elif isinstance(block, WhileBlock):
-                values.add(int(block.predicate_value_id))
-                expression_values(block.predicate_expression)
-                visit(block.condition)
-                visit(block.body)
-            elif isinstance(block, LoopControlBlock):
-                if block.predicate_value_id is not None:
-                    values.add(int(block.predicate_value_id))
-                expression_values(block.predicate_expression)
-            elif isinstance(block, StateMachineTick):
-                for _case, body in block.cases:
-                    visit(body)
-                if block.default is not None:
-                    visit(block.default)
-            elif isinstance(block, ParallelDeployment):
-                for lane in block.lanes:
-                    visit(lane)
-            elif isinstance(block, CallBlock):
-                visit(block.callee)
-
-        visit(control.root)
+    values = set(_control_dependency_value_ids(shell.shell_control_program))
 
     refreshed_items = []
     for item in closure.items:
@@ -4322,6 +4182,8 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     block.carried_aliases,
                     block.recursion_region_id,
                     block.predicate_expression,
+                    block.sequence_mutations,
+                    block.source_loop_node_id,
                 )
             if isinstance(block, LoopControlBlock):
                 return block
@@ -5855,6 +5717,21 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
                         memberships.setdefault(guarded, set()).add(
                             (control_id, role)
                         )
+    # Reducer-authored Phi values do not own an AST expression, but they run
+    # at the continuation of their exact source conditional.  When that
+    # conditional is itself nested in another branch, its merge is therefore
+    # guarded by the enclosing branch and must be a candidate outgoing value
+    # for the enclosing Phi.  Inherit only the source conditional's outer
+    # memberships; never mark the merge as belonging to either of its own
+    # mutually exclusive arms.
+    for node_id, data in graph.G.nodes(data=True):
+        source_conditional_id = int((data.get("attributes") or {}).get(
+            "source_conditional_id", -1
+        ))
+        if source_conditional_id in memberships:
+            memberships.setdefault(int(node_id), set()).update(
+                memberships[source_conditional_id]
+            )
     return {
         node_id: frozenset(roles)
         for node_id, roles in memberships.items()
@@ -5955,10 +5832,18 @@ def _ordinary_conditional_control_programs(
                 if ordered[position] not in {*body_values, *else_values}
             ), ordered[0])
             merged = next((
-                ordered[position]
-                for position in range(last_branch + 1, len(ordered))
-                if ordered[position] not in {*body_values, *else_values}
+                value_id for value_id in ordered
+                if int((graph.G.nodes[node_by_value[value_id]].get(
+                    "attributes"
+                ) or {}).get("source_conditional_id", -1))
+                == int(control_id)
             ), None)
+            if merged is None:
+                merged = next((
+                    ordered[position]
+                    for position in range(last_branch + 1, len(ordered))
+                    if ordered[position] not in {*body_values, *else_values}
+                ), None)
             if merged is None:
                 continue
             carried.append((
@@ -12626,6 +12511,7 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
         entry.graph for entry in function_table if entry.graph is not None
     )
     candidates: dict[tuple[int, str], list[Any]] = {}
+    dynamic_argument = object()
     for caller in graphs:
         for _node_id, data in caller.G.nodes(data=True):
             attributes = data.get("attributes") or {}
@@ -12639,6 +12525,7 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
             if callee is None:
                 continue
             _receiver, positional, _all = _method_parameter_layout(callee.G)
+            bound_parameters: set[str] = set()
             for parent, role_value in data.get("parents") or ():
                 role = str(role_value)
                 position = _positional_argument_index(role)
@@ -12652,19 +12539,36 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                     if role.startswith("kw:")
                     else None
                 )
-                if parameter is None or not _source_static_value(
-                    caller, int(parent)
-                ):
+                if parameter is None:
                     continue
-                try:
-                    value = _source_static_literal(caller, int(parent))
-                except ValueError:
-                    continue
+                parameter = str(parameter)
+                bound_parameters.add(parameter)
+                if _source_static_value(caller, int(parent)):
+                    try:
+                        value = _source_static_literal(caller, int(parent))
+                    except ValueError:
+                        value = dynamic_argument
+                else:
+                    value = dynamic_argument
                 candidates.setdefault(
-                    (int(reference), str(parameter)), []
+                    (int(reference), parameter), []
                 ).append(value)
+            # Omitted arguments are just as exact as authored literal
+            # arguments: Python binds them to the signature default before
+            # the body starts. Include them in the same consistency proof so
+            # optional-selection idioms can be resolved without turning
+            # ``None`` into a runtime scalar. A dynamic argument at any other
+            # callsite vetoes shared specialization below.
+            for parameter, default in (
+                callee.G.graph.get("parameter_defaults") or {}
+            ).items():
+                parameter = str(parameter)
+                if parameter not in bound_parameters:
+                    candidates.setdefault(
+                        (int(reference), parameter), []
+                    ).append(copy.deepcopy(default))
     for (reference, parameter), values in candidates.items():
-        if not values:
+        if not values or any(value is dynamic_argument for value in values):
             continue
         first = values[0]
         try:
@@ -12931,6 +12835,15 @@ class _StructuralValueAlias:
     source_id: int
 
 
+@dataclass(frozen=True)
+class _ProgramABIValueFact:
+    """Declared source type attached to a physical native parameter."""
+
+    python_type: str
+    storage: str
+    dtype: str | None
+
+
 def _tensor_descriptor(graph: Any, node_id: int) -> dict[str, Any] | None:
     """Return compiler-owned tensor facts without inspecting a runtime value."""
 
@@ -12960,6 +12873,15 @@ def _fold_callsite_structural_values(graph: Any) -> None:
 
     unresolved = _UNRESOLVED_STRUCTURAL_VALUE
     known: dict[int, Any] = {}
+    loop_carried_initial_ids = {
+        int(initial)
+        for _loop_id, data in graph.G.nodes(data=True)
+        for initial, _updated in (
+            (data.get("attributes") or {}).get(
+                "loop_carried_bindings", {}
+            ).values()
+        )
+    }
 
     def constant(data: Mapping[str, Any]) -> Any:
         try:
@@ -13006,6 +12928,27 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             return result or None
         return None
 
+    def type_identities(expression: ast.AST | None) -> tuple[str, ...]:
+        if isinstance(expression, ast.Name):
+            return (str(expression.id),)
+        if isinstance(expression, ast.Attribute):
+            parts = [str(expression.attr)]
+            owner = expression.value
+            while isinstance(owner, ast.Attribute):
+                parts.append(str(owner.attr))
+                owner = owner.value
+            if isinstance(owner, ast.Name):
+                parts.append(str(owner.id))
+                return (".".join(reversed(parts)),)
+            return (str(expression.attr),)
+        if isinstance(expression, ast.Tuple):
+            return tuple(
+                identity
+                for item in expression.elts
+                for identity in type_identities(item)
+            )
+        return ()
+
     def evaluate(node_id: int, data: Mapping[str, Any]) -> Any:
         node_type = str(data.get("type") or "")
         operation = str(data.get("op") or node_type).casefold()
@@ -13016,10 +12959,55 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             binding_name = (data.get("attributes") or {}).get(
                 "binding_name"
             )
+            if binding_name is None:
+                identities = graph.G.graph.get("identity_table") or {}
+                parameters = set(map(
+                    str, graph.G.graph.get("function_parameters") or ()
+                ))
+                binding_name = next((
+                    str(name)
+                    for name, history in identities.items()
+                    if str(name) in parameters
+                    and int(node_id) in set(map(int, history or ()))
+                ), None)
             specializations = graph.G.graph.get(
                 "planner_specializations"
             ) or {}
-            return specializations.get(str(binding_name), unresolved)
+            specialized = specializations.get(str(binding_name), unresolved)
+            if specialized is not unresolved:
+                return specialized
+            defaults = graph.G.graph.get("parameter_defaults") or {}
+            if str(binding_name) in defaults:
+                default = defaults[str(binding_name)]
+
+                def structural_default(value: Any) -> bool:
+                    if value is None or isinstance(
+                        value, (bool, int, float, str, bytes)
+                    ):
+                        return True
+                    return isinstance(value, tuple) and all(
+                        structural_default(item) for item in value
+                    )
+
+                if structural_default(default):
+                    return copy.deepcopy(default)
+            value_abi = (
+                graph.G.graph.get("parameter_value_abi") or {}
+            ).get(str(binding_name))
+            if value_abi is not None:
+                return _ProgramABIValueFact(
+                    str(value_abi["python_type"]),
+                    str(value_abi["storage"]),
+                    value_abi.get("dtype"),
+                )
+            record_abi = (
+                graph.G.graph.get("parameter_record_abi") or {}
+            ).get(str(binding_name))
+            if record_abi is not None:
+                return _ProgramABIValueFact(
+                    str(record_abi["identity"]), "record", None
+                )
+            return unresolved
         if node_type in {"Tuple", "List", "Set"} or isinstance(
             expression, (ast.Tuple, ast.List, ast.Set),
         ):
@@ -13050,6 +13038,39 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 fixed = descriptor_attribute(parent, attribute)
                 if fixed is not unresolved:
                     return fixed
+                owner_fact = known.get(parent, unresolved)
+                if (
+                    isinstance(owner_fact, _ProgramABIValueFact)
+                    and owner_fact.storage == "record"
+                ):
+                    matching_records = tuple(
+                        record
+                        for record in (
+                            graph.G.graph.get("parameter_record_abi") or {}
+                        ).values()
+                        if str(record.get("identity") or "")
+                        == owner_fact.python_type
+                    )
+                    if len(matching_records) == 1:
+                        field = dict(
+                            matching_records[0].get("fields") or {}
+                        ).get(attribute)
+                        if field is not None:
+                            dtype = field.get("dtype")
+                            python_type = {
+                                "bool": "builtins.bool",
+                                "int": "builtins.int",
+                                "int32": "builtins.int",
+                                "int64": "builtins.int",
+                                "float": "builtins.float",
+                                "float32": "builtins.float",
+                                "float64": "builtins.float",
+                            }.get(str(dtype), str(dtype or "unknown"))
+                            return _ProgramABIValueFact(
+                                python_type,
+                                str(field.get("storage") or "unknown"),
+                                None if dtype is None else str(dtype),
+                            )
         if operation in {"numel", "ndim", "ndims"}:
             parent = next((
                 int(parent)
@@ -13072,20 +13093,29 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 for parent, role in (data.get("parents") or ())
             }
             predicate = known.get(parents.get("test"), unresolved)
-            if predicate is unresolved:
+            if predicate is unresolved or isinstance(
+                predicate, _ProgramABIValueFact
+            ):
                 return unresolved
             selected = parents.get("body" if bool(predicate) else "orelse")
             if selected is None:
                 return unresolved
             fixed = known.get(selected, unresolved)
-            return _StructuralValueAlias(selected) if fixed is unresolved else fixed
+            return (
+                _StructuralValueAlias(selected)
+                if fixed is unresolved
+                or isinstance(fixed, _ProgramABIValueFact)
+                else fixed
+            )
         if isinstance(expression, ast.UnaryOp):
             parent = next((
                 int(parent) for parent, role in (data.get("parents") or ())
                 if str(role) in {"operand", "value"}
             ), None)
             value = known.get(parent, unresolved)
-            if value is unresolved:
+            if value is unresolved or isinstance(
+                value, _ProgramABIValueFact
+            ):
                 return unresolved
             if isinstance(expression.op, ast.USub):
                 return -value
@@ -13138,7 +13168,11 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 for parent, role in (data.get("parents") or ())
                 if str(role).startswith("value")
             ]
-            if not values or any(value is unresolved for value in values):
+            if not values or any(
+                value is unresolved
+                or isinstance(value, _ProgramABIValueFact)
+                for value in values
+            ):
                 return unresolved
             return all(values) if isinstance(expression.op, ast.And) else any(values)
         if not isinstance(expression, ast.Call):
@@ -13161,6 +13195,16 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             if len(values) >= 3 and values[2] is not unresolved:
                 return values[2]
         if name == "isinstance" and values:
+            if isinstance(values[0], _ProgramABIValueFact):
+                declared = values[0].python_type
+                accepted_identities = type_identities(
+                    expression.args[1] if len(expression.args) > 1 else None
+                )
+                return any(
+                    declared == identity
+                    or declared.endswith("." + identity)
+                    for identity in accepted_identities
+                )
             accepted = safe_types(
                 expression.args[1] if len(expression.args) > 1 else None
             )
@@ -13277,6 +13321,19 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             for root in graph.roots
         ]
         remove_node(node_id)
+
+    def same_structural_value(left: Any, right: Any) -> bool:
+        if left is right:
+            return True
+        if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+            try:
+                return bool(np.array_equal(left, right))
+            except (TypeError, ValueError):
+                return False
+        try:
+            return bool(left == right)
+        except (TypeError, ValueError):
+            return False
 
     changed = True
     while changed:
@@ -13453,14 +13510,30 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 value = evaluate(node_id, data)
             if value is unresolved:
                 continue
+            if node_id in loop_carried_initial_ids:
+                # This literal is the entry arm of a Phi, not an invariant
+                # fact for the loop's condition/body.  Keeping it out of the
+                # structural-known table prevents the fixed point from
+                # replacing expressions such as ``iters < max_iters`` with
+                # their iteration-zero value.
+                continue
             if isinstance(value, _StructuralValueAlias):
                 replace_alias(node_id, value.source_id)
                 known.pop(node_id, None)
                 changed = True
                 break
-            if node_id not in known or known[node_id] != value:
+            if (
+                node_id not in known
+                or not same_structural_value(known[node_id], value)
+            ):
                 known[node_id] = value
                 changed = True
+            # ABI facts prove source type and physical presence; they are not
+            # runtime literals.  Keep the authored SSA producer intact so a
+            # record field remains a normal dataflow value while comparisons
+            # such as ``field is not None`` can still be decided here.
+            if isinstance(value, _ProgramABIValueFact):
+                continue
             if str(data.get("type")) not in {"Constant", "Const", "const"}:
                 replace(node_id, value)
 
@@ -13724,6 +13797,7 @@ def _callsite_specialized_shell_type(
     _receiver, positional, _all = _method_parameter_layout(original.G)
     specializations = {}
     tensor_descriptors: dict[str, dict[str, Any]] = {}
+    bound_parameters: set[str] = set()
     data = caller.G.nodes[int(node_id)]
     for parent, role_value in data.get("parents") or ():
         role = str(role_value)
@@ -13737,16 +13811,36 @@ def _callsite_specialized_shell_type(
         )
         if parameter is None:
             continue
+        parameter = str(parameter)
+        bound_parameters.add(parameter)
         descriptor = _tensor_descriptor(caller, int(parent))
         if descriptor is not None:
-            tensor_descriptors[str(parameter)] = descriptor
+            tensor_descriptors[parameter] = descriptor
         if _source_static_value(caller, int(parent)):
             try:
-                specializations[str(parameter)] = _source_static_literal(
+                specializations[parameter] = _source_static_literal(
                     caller, int(parent)
                 )
             except ValueError:
                 pass
+    for parameter, default in (
+        original.G.graph.get("parameter_defaults") or {}
+    ).items():
+        parameter = str(parameter)
+        if parameter in bound_parameters:
+            continue
+        if default is None or isinstance(
+            default, (bool, int, float, str, bytes)
+        ) or (
+            isinstance(default, tuple)
+            and all(
+                item is None or isinstance(
+                    item, (bool, int, float, str, bytes)
+                )
+                for item in default
+            )
+        ):
+            specializations[parameter] = copy.deepcopy(default)
     if not specializations and not tensor_descriptors:
         return fallback
 
@@ -13784,12 +13878,16 @@ def _callsite_specialized_shell_type(
         original,
         original.G,
     )
-    specialized.G.graph.setdefault(
-        "planner_specializations", {}
-    ).update(specializations)
-    specialized.G.graph.setdefault(
-        "planner_tensor_descriptors", {}
-    ).update(copy.deepcopy(tensor_descriptors))
+    # These are callsite facts, not accumulators.  A shared function-table
+    # graph may already carry metadata from an earlier specialization; using
+    # ``setdefault().update()`` allowed a scalar literal from one occurrence
+    # to survive into a later tensor-valued occurrence of the same parameter.
+    specialized.G.graph["planner_specializations"] = copy.deepcopy(
+        specializations
+    )
+    specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
+        tensor_descriptors
+    )
     _apply_callsite_tensor_descriptors(specialized, tensor_descriptors)
     if not _expand_specialized_unbroadcast_identity(specialized):
         _fold_callsite_structural_values(specialized)
@@ -14465,7 +14563,19 @@ class ProcessGraphGLSLDeployment:
         self.refresh_hierarchy_plan()
         if not self.whole_program_compiled:
             self.compile_process_graph(device=device)
-        for target in _walk_planned_shells(self):
+        # A selected-entrypoint compile prepares only its proven activation
+        # tree.  The canonical whole-source caller explicitly requests the
+        # complete definition catalogue: class identity is retained by
+        # ClassNavigationTable, while every constructor/method shell supplies
+        # the executable contents of that one class record.  Do not infer this
+        # from ``runtime_closure_only``: older selected-entrypoint adapters also
+        # use broad planning but still have one executable activation tree.
+        for target in _walk_planned_shells(
+            self,
+            include_function_registry=bool(getattr(
+                self, "prepare_complete_catalogue", False
+            )),
+        ):
             target.refresh_hierarchy_plan()
             complete_regions = tuple(range(len(target.dispatch_subgraphs)))
             retained_value_ids = {
@@ -17132,6 +17242,8 @@ def strategize_shell_deployment(
     _resolve_bound_function_references(graph)
     _propagate_callsite_planner_specializations(graph)
     _propagate_callsite_tensor_specializations(graph)
+    if graph.G.graph.get("planner_specializations"):
+        _fold_callsite_structural_values(graph)
     canonical_value_ids = bool(
         graph.G.graph.get("canonical_value_ids")
     )

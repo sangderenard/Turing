@@ -147,6 +147,63 @@ class SSAClassTable:
         return None
 
 
+class SSAReferenceKind(str, Enum):
+    """Identity domain carried by an opaque SSA reference handle.
+
+    A reference is deliberately distinct from ``ptr``.  ``ptr`` addresses
+    repository-owned memory and is valid for Load/Store; an opaque reference
+    identifies a program object whose storage or implementation may remain on
+    the Python host.  Backends may copy and compare its fixed-width handle but
+    must not pretend that the handle is a dereferenceable target pointer.
+    """
+
+    STATIC_PYTHON = "static-python"
+    FUNCTION = "function"
+    OBJECT = "object"
+
+
+@dataclass(frozen=True)
+class SSAReferenceDescriptor:
+    """One stable, backend-neutral opaque reference identity."""
+
+    handle: int
+    identity: str
+    kind: SSAReferenceKind = SSAReferenceKind.OBJECT
+    host_resident: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "handle", int(self.handle))
+        object.__setattr__(self, "identity", str(self.identity))
+        object.__setattr__(self, "kind", SSAReferenceKind(self.kind))
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "handle": self.handle,
+            "identity": self.identity,
+            "kind": self.kind.value,
+            "host_resident": bool(self.host_resident),
+        }
+
+
+@dataclass
+class SSAReferenceTable:
+    """Opaque handles retained by one SSA function/module surface."""
+
+    references: Dict[int, SSAReferenceDescriptor] = field(default_factory=dict)
+
+    def register(
+        self, descriptor: SSAReferenceDescriptor
+    ) -> SSAReferenceDescriptor:
+        existing = self.references.get(descriptor.handle)
+        if existing is not None and existing != descriptor:
+            raise ValueError(
+                f"conflicting SSA reference handle {descriptor.handle}: "
+                f"{existing.identity!r} != {descriptor.identity!r}"
+            )
+        self.references[descriptor.handle] = descriptor
+        return descriptor
+
+
 class SSARecordFieldStorage(str, Enum):
     """Physical SSA storage named by one record field."""
 
@@ -154,6 +211,7 @@ class SSARecordFieldStorage(str, Enum):
     SPAN = "span"
     SEQUENCE = "sequence"
     RECORD = "record"
+    REFERENCE = "reference"
     FUNCTION_TABLE = "function_table"
     CLASS_TABLE = "class_table"
 
@@ -809,6 +867,10 @@ class IRModule:
     # Function-scoped typed record correlations. Record fields point only to
     # ordinary SSA values or other published descriptor tables.
     record_tables: Dict[str, SSARecordTable] = field(default_factory=dict)
+    # Opaque program-object identities. Their signed i64 handles can be
+    # copied, compared, and stored by native backends; ``host_resident``
+    # records the explicit boundary at which dereference remains Python-owned.
+    reference_tables: Dict[str, SSAReferenceTable] = field(default_factory=dict)
     # Every pursued source call occurrence, including those not yet supplied
     # with a complete call-frame storage ABI.  Targets must not silently omit
     # records whose resolution remains ``unresolved``.

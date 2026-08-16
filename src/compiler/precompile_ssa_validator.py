@@ -100,6 +100,13 @@ class PrecompileSSAValidationError(ValueError):
 # already-recorded precompile operation corresponds to.  Absence is reported;
 # the validator never invents a Handler or decomposes an operation.
 PRECOMPILE_TO_SSA: dict[str, Handler] = {
+    "getattr": Handler.GetAttr,
+    "Indexed": Handler.Indexed,
+    "IndexedStore": Handler.IndexedStore,
+    # These are representation/view boundaries, not numerical kernels. They
+    # remain explicit Calls carrying tensor_operation for backend policy.
+    "get_tensor": Handler.Call,
+    "tolist": Handler.Call,
     "add": Handler.Add,
     "sub": Handler.Sub,
     "mul": Handler.Mul,

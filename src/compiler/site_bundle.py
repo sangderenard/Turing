@@ -2328,10 +2328,10 @@ def build_program_bundle(
             if contract.state_feedback and module is not None:
                 entry = module.api.entry_points[0]
                 input_names = {
-                    item.name for item in entry.parameters if item.role == "input"
+                    item.name for item in entry.parameters if item.role in {"input", "inout"}
                 }
                 output_names = {
-                    item.name for item in entry.parameters if item.role == "output"
+                    item.name for item in entry.parameters if item.role in {"output", "inout"}
                 }
                 missing_inputs = set(contract.state_feedback) - input_names
                 missing_outputs = set(contract.state_feedback.values()) - output_names
@@ -2577,7 +2577,7 @@ def build_program_bundle(
             output_names = {
                 item.name
                 for item in module.api.entry_points[0].parameters
-                if item.role == "output"
+                if item.role in {"output", "inout"}
             }
             if {"red", "green", "blue"} <= output_names:
                 channel.log(
@@ -2649,6 +2649,35 @@ def build_program_bundle(
                     )
                 else:
                     channel.log("threaded partition unavailable, staying single-region", path="regions")
+        # Deployment planning stage: classify every captured region and
+        # choose a strategy per backend, refined by any machine-local
+        # calibration verdicts (read-only at build time).  Runs on every
+        # build; with no verdicts recorded the choices reduce to the static
+        # class preferences and nothing downstream changes.
+        from .deployment_calibration import CalibrationStore
+        from .deployment_stage import (
+            browser_threading_veto, plan_region_deployments,
+        )
+
+        _stage_channels = (
+            effective_shader_configuration or {}
+        ).get("channels")
+        deployment_plan = plan_region_deployments(
+            effective_region_programs,
+            deployment_regions=(
+                real_control.deployment_regions
+                if real_control is not None else ()
+            ),
+            presentation_channels=(
+                frozenset(map(str, _stage_channels))
+                if _stage_channels else None
+            ),
+            calibration_store=CalibrationStore(),
+        )
+        channel.log(
+            "deployment plan computed", path="regions",
+            regions=len(deployment_plan.decisions),
+        )
         if real_control is not None:
             # Pre-flight consistency scan: a captured region whose op reads a
             # value produced by no region and declared no feed is malformed
@@ -2850,6 +2879,14 @@ def build_program_bundle(
                 },
             )
             channel.log("browser thread plan built", path="regions")
+            if thread_plan is not None:
+                threading_veto = browser_threading_veto(deployment_plan)
+                if threading_veto:
+                    channel.log(
+                        "browser thread plan withheld", path="regions",
+                        reason=threading_veto,
+                    )
+                    thread_plan = None
         else:
             assert program is not None
             channel.log("partitioning reduced program (no parallel regions)", path="regions")
@@ -2902,8 +2939,8 @@ def build_program_bundle(
                 "name": module.name,
                 "url": wasm_relative.as_posix(),
                 "entry": module.api.entry,
-                "inputs": [item.name for item in entry.parameters if item.role == "input"],
-                "outputs": [item.name for item in entry.parameters if item.role == "output"],
+                "inputs": [item.name for item in entry.parameters if item.role in {"input", "inout"}],
+                "outputs": [item.name for item in entry.parameters if item.role in {"output", "inout"}],
                 "value_type": module.api.metadata.get("value_type", "f64"),
                 "element_bytes": module.api.metadata.get("element_bytes", 8),
                 "memory_export": module.api.metadata.get("memory_export", "memory"),
@@ -3339,6 +3376,11 @@ def build_program_bundle(
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(log_text + "\n", encoding="utf-8")
 
+        region_execution_classes = {
+            str(index): classification.as_record()
+            for index, classification in
+            deployment_plan.classifications().items()
+        }
         manifest = {
             "schema": BUNDLE_SCHEMA,
             "layout_version": BUNDLE_LAYOUT_VERSION,
@@ -3400,12 +3442,23 @@ def build_program_bundle(
                 # registered machine_targets entries could serve each region
                 # as-is, keyed by region index. This is the raw material a
                 # distributed-dispatch planner needs (which client capability
-                # profiles could even accept a given region's binary) -- it
-                # is not that planner. Nothing here picks one target per
-                # region; that decision doesn't exist yet.
+                # profiles could even accept a given region's binary) -- the
+                # chosen assignment lives in region_execution_classes below.
                 "region_target_capabilities": _region_target_capabilities(
                     effective_region_programs
                 ),
+                # The chosen per-region execution class -- graphics-output /
+                # shader-compute / thread-workers / host-linear -- with the
+                # full eligibility set and reasons, so a client with fewer
+                # capabilities can fall back without re-deriving anything.
+                # See deployment_classification.py.
+                "region_execution_classes": region_execution_classes,
+                # The per-backend strategy each region should lower with
+                # (serial / pool / dispatch), calibration-refined where a
+                # machine-local verdict exists.  See deployment_stage.py;
+                # this is the decision the capability table above is raw
+                # material for.
+                "region_deployment_strategies": deployment_plan.as_manifest(),
             },
             "artifacts": _artifact_inventory(temporary),
         }

@@ -59,7 +59,9 @@ ffi.cdef("""
         CT_OP_EQ, CT_OP_NE, CT_OP_MAXIMUM, CT_OP_MINIMUM, CT_OP_TANH,
         CT_OP_SIN, CT_OP_COS, CT_OP_TAN, CT_OP_ASIN, CT_OP_ACOS,
         CT_OP_ATAN, CT_OP_SINH, CT_OP_COSH, CT_OP_ASINH, CT_OP_ACOSH,
-        CT_OP_ATANH, ...
+        CT_OP_ATANH, CT_OP_SIGN, CT_OP_INVERT, CT_OP_BITAND, CT_OP_BITOR,
+        CT_OP_BITXOR, CT_OP_SHL, CT_OP_SHR, CT_OP_LOGICAL_AND,
+        CT_OP_LOGICAL_OR, ...
     } CTensorOp;
     typedef enum CTensorOperandKind {
         CT_OPERAND_NONE, CT_OPERAND_SLOT, CT_OPERAND_SCALAR
@@ -420,6 +422,13 @@ class CTensorOperations(AbstractTensor):
             "not_equal": C.CT_OP_NE,
             "maximum": C.CT_OP_MAXIMUM,
             "minimum": C.CT_OP_MINIMUM,
+            "bitand": C.CT_OP_BITAND,
+            "bitor": C.CT_OP_BITOR,
+            "bitxor": C.CT_OP_BITXOR,
+            "shl": C.CT_OP_SHL,
+            "shr": C.CT_OP_SHR,
+            "logical_and": C.CT_OP_LOGICAL_AND,
+            "logical_or": C.CT_OP_LOGICAL_OR,
         }
         unary_codes = {
             "sqrt": C.CT_OP_SQRT,
@@ -447,6 +456,8 @@ class CTensorOperations(AbstractTensor):
             "isnan": C.CT_OP_ISNAN,
             "isinf": C.CT_OP_ISINF,
             "logical_not": C.CT_OP_LOGICAL_NOT,
+            "sign": C.CT_OP_SIGN,
+            "invert": C.CT_OP_INVERT,
         }
         if isinstance(left, CTensor) and right is None:
             code = unary_codes.get(op)

@@ -142,9 +142,19 @@ class Handler(Enum):
     # iteration order is observable when the regions overlap.
     StridedMemoryCopy = "StridedMemoryCopy"
     GetElementPtr = "GetElementPtr"
+    # Structured source operations retained until record/index legalization.
+    # Indexed forms are rewritten to GetElementPtr+Load/Store before target
+    # emission; GetAttr is resolved against record/class descriptors.
+    GetAttr       = "GetAttr"
+    Indexed       = "Indexed"
+    IndexedStore  = "IndexedStore"
 
     # Casts & Conversions
     Cast          = "Cast"
+    # Convert the first operand to the schema/dtype represented by the second.
+    # The second edge is compile-time type evidence, not discarded Python
+    # control flow around isinstance/type/constructor calls.
+    CastLike      = "CastLike"
     Trunc         = "Trunc"
     ZExt          = "ZExt"
     SExt          = "SExt"
@@ -173,6 +183,9 @@ class Handler(Enum):
     # Misc
     Select        = "Select"
     Const         = "Const"  # literal constants
+    # A fixed-width identity for a program object. Unlike ``ptr`` this is not
+    # a dereferenceable repository address; it may name host-resident state.
+    StaticRef     = "StaticRef"
 
     def __str__(self) -> str:
         return self.value
@@ -262,6 +275,7 @@ sympy_ssa_name_map: Dict[str, Handler] = {
 
     # Casts & Conversions
     'cast':                Handler.Cast,
+    'cast_like':           Handler.CastLike,
     'trunc':               Handler.Trunc,
     'zext':                Handler.ZExt,
     'sext':                Handler.SExt,

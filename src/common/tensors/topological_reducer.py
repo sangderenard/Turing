@@ -287,6 +287,8 @@ def function_parameter_names(definition: Any) -> tuple[str, ...]:
                 *arguments.posonlyargs,
                 *arguments.args,
                 *arguments.kwonlyargs,
+                *((arguments.vararg,) if arguments.vararg is not None else ()),
+                *((arguments.kwarg,) if arguments.kwarg is not None else ()),
             )
         )
     declaration = getattr(definition, "decl", None)
@@ -886,6 +888,7 @@ def _normalize_lexical_values(
     loop_target_bindings_by_ast: dict[int, int] = {}
     static_reference_nodes: dict[tuple[int, str], int] = {}
     first_class_function_nodes: dict[int, int] = {}
+    materialized_attribute_nodes: dict[int, int] = {}
     static_constant_nodes: dict[str, int] = {}
     static_attribute_values: dict[tuple[int, str], int] = {}
     parameter_names = set(function_parameter_names(statement))
@@ -1116,7 +1119,7 @@ def _normalize_lexical_values(
         return node_id
 
     def is_static_literal(value: Any) -> bool:
-        if value is None or isinstance(
+        if value is None or value is Ellipsis or isinstance(
             value,
             (bool, bytes, complex, float, int, str),
         ):
@@ -1354,6 +1357,90 @@ def _normalize_lexical_values(
             else_value = resolve_expression(expression.orelse)
             node_id = id(expression)
             if node_id in graph.G:
+                # ``x if isinstance(x, T) else normalize_T(x)`` is an
+                # authored type-normalization idiom, not runtime branching.
+                # A constructor/factory opts in declaratively through its
+                # Python identity program's ``ensures_schema_type`` attribute.
+                # Keep that ordinary operator as the sole SSA producer; the
+                # type guard and merge then disappear without specializing on
+                # a Python object or inventing backend-specific machinery.
+                def dotted_name(value: ast.AST) -> str | None:
+                    parts = []
+                    while isinstance(value, ast.Attribute):
+                        parts.append(str(value.attr))
+                        value = value.value
+                    if isinstance(value, ast.Name):
+                        parts.append(str(value.id))
+                        return ".".join(reversed(parts))
+                    return None
+
+                guard = expression.test
+                if (
+                    isinstance(guard, ast.Call)
+                    and isinstance(guard.func, ast.Name)
+                    and guard.func.id == "isinstance"
+                    and len(guard.args) == 2
+                    and isinstance(test_value, int)
+                    and test_value in graph.G
+                ):
+                    test_attributes = graph.G.nodes[test_value].get(
+                        "attributes"
+                    ) or {}
+                    test_program = test_attributes.get(
+                        "python_identity_program"
+                    ) or {}
+                    subject_id = next((
+                        int(parent)
+                        for parent, role in graph.G.nodes[test_value].get(
+                            "parents", ()
+                        )
+                        if str(role) == "arg:0"
+                    ), None)
+                    normalized_id = (
+                        int(else_value)
+                        if isinstance(else_value, int) else None
+                    )
+                    normalized_data = (
+                        graph.G.nodes[normalized_id]
+                        if normalized_id is not None
+                        and normalized_id in graph.G else {}
+                    )
+                    normalized_attributes = normalized_data.get(
+                        "attributes"
+                    ) or {}
+                    ensured_type = normalized_attributes.get(
+                        "ensures_schema_type"
+                    )
+                    normalized_subject = next((
+                        int(parent)
+                        for parent, role in normalized_data.get("parents", ())
+                        if str(role) == "arg:0"
+                    ), None)
+                    guarded_type = dotted_name(guard.args[1])
+                    if (
+                        test_program.get("object_type")
+                        == "schema_type_guard"
+                        and subject_id is not None
+                        and body_value == subject_id
+                        and normalized_subject == subject_id
+                        and ensured_type
+                        and guarded_type
+                        and (
+                            str(ensured_type) == guarded_type
+                            or str(ensured_type).endswith(
+                                "." + guarded_type
+                            )
+                        )
+                    ):
+                        graph.G.nodes[normalized_id].setdefault(
+                            "attributes", {}
+                        )["source_type_normalization"] = {
+                            "guard": "schema_type_guard",
+                            "schema_type": str(ensured_type),
+                            "source_ifexp": int(node_id),
+                        }
+                        _redirect_value(graph, node_id, normalized_id)
+                        return normalized_id
                 parents = tuple(
                     (value, role)
                     for value, role in (
@@ -1520,10 +1607,26 @@ def _normalize_lexical_values(
                         value,
                         f"{receiver.path}.{expression.attr}",
                     )
-            elif isinstance(receiver, int) and id(expression) in graph.G:
+            elif isinstance(receiver, int):
+                expression_id = id(expression)
+                attribute_id = (
+                    expression_id
+                    if expression_id in graph.G
+                    else materialized_attribute_nodes.get(expression_id)
+                )
+                if attribute_id is None:
+                    attribute_id = new_node(
+                        "GetAttr",
+                        f"getattr[{expression.attr}]",
+                        attributes={
+                            "attribute": expression.attr,
+                            "source_type": "Attribute",
+                        },
+                    )
+                    materialized_attribute_nodes[expression_id] = attribute_id
                 _replace_inputs(
                     graph,
-                    id(expression),
+                    attribute_id,
                     ((receiver, "value"),),
                 )
                 if isinstance(expression.value, ast.Name):
@@ -1539,7 +1642,7 @@ def _normalize_lexical_values(
                             class_identity, expression.attr
                         )
                         if slot is not None:
-                            graph.G.nodes[id(expression)].setdefault(
+                            graph.G.nodes[attribute_id].setdefault(
                                 "attributes", {}
                             )["attribute_slot"] = (class_identity, slot)
                 field_kind = (
@@ -1554,7 +1657,7 @@ def _normalize_lexical_values(
                     else None
                 )
                 if field_kind is not None:
-                    graph.G.nodes[id(expression)].setdefault(
+                    graph.G.nodes[attribute_id].setdefault(
                         "attributes", {}
                     ).update({
                         "producer_kind": "record_field",
@@ -1581,7 +1684,7 @@ def _normalize_lexical_values(
                 # correctly but never reported back that it did, severing
                 # the receiver as a dependency for anything built from this
                 # expression (a method call, a chained attribute, ...).
-                return id(expression)
+                return attribute_id
 
         if isinstance(expression, ast.Call):
             node_id = id(expression)
@@ -1897,6 +2000,53 @@ def _normalize_lexical_values(
                     if (resolved, role) not in parents:
                         parents.append((resolved, role))
 
+            # Rebuild every call from the values resolved at this lexical
+            # program point.  Ingestion may omit a repeated Attribute/Name
+            # occurrence even though the enclosing Call is retained; keeping
+            # its earlier raw-AST-id inputs then leaves a real argument behind
+            # an Untranslated placeholder.  The lexical reducer already owns
+            # the authoritative environment, so use those resolved values for
+            # ordinary arguments as well as first-class-function arguments.
+            if node_id in graph.G:
+                call_data = graph.G.nodes[node_id]
+                call_attributes = call_data.get("attributes") or {}
+                resolved_inputs: list[tuple[int, str]] = []
+                if isinstance(expression.func, ast.Attribute):
+                    receiver = resolve_expression(expression.func.value)
+                    if isinstance(receiver, int):
+                        resolved_inputs.append((receiver, "operand"))
+                    if (
+                        isinstance(callee, int)
+                        and callee in graph.G
+                        and (graph.G.nodes[callee].get("attributes") or {}).get(
+                            "method_ref"
+                        ) is not None
+                    ):
+                        resolved_inputs.append((callee, "callee"))
+                elif not (
+                    "callee_ref" in call_attributes
+                    or "external_callee_ref" in call_attributes
+                ):
+                    if isinstance(callee, int):
+                        resolved_inputs.append((callee, "callee"))
+                    elif isinstance(callee, _StaticPythonReference):
+                        resolved_inputs.append((
+                            static_reference_node(callee),
+                            "callee",
+                        ))
+                for index, argument in enumerate(expression.args):
+                    resolved = resolve_expression(argument)
+                    if isinstance(resolved, int):
+                        resolved_inputs.append((resolved, f"arg:{index}"))
+                for keyword in expression.keywords:
+                    resolved = resolve_expression(keyword.value)
+                    if isinstance(resolved, int):
+                        resolved_inputs.append((
+                            resolved,
+                            f"kw:{keyword.arg}" if keyword.arg else "kwargs",
+                        ))
+                _replace_inputs(graph, node_id, tuple(resolved_inputs))
+
         # A named callee already represented by a function-table reference is
         # not a runtime value.  Its arguments still are.
         children = tuple(source_child_nodes(expression))
@@ -2088,13 +2238,15 @@ def _normalize_lexical_values(
             _remove_node(graph, id(target))
             return
         if isinstance(target, ast.Attribute):
+            static_value_path = None
             if isinstance(value, _StaticPythonReference):
-                raise TypeError(
-                    "a static Python reference cannot be stored as a runtime "
-                    f"object attribute in {statement.name}: "
-                    f"target={ast.dump(target, include_attributes=False)}, "
-                    f"value={value.path}"
-                )
+                # Retain the Python/runtime seam explicitly. Autograd tape and
+                # similar bookkeeping references are not numerical values, but
+                # assigning one must not truncate the surrounding mathematical
+                # program. StaticReference is the planner's established host
+                # boundary node and keeps the effect visible in full geometry.
+                static_value_path = value.path
+                value = static_reference_node(value)
             receiver = resolve_expression(target.value)
             static_receiver = (
                 receiver if isinstance(receiver, _StaticPythonReference) else None
@@ -2133,6 +2285,10 @@ def _normalize_lexical_values(
             node_data["type"] = "SetAttr"
             node_data["op"] = "setattr"
             node_data.setdefault("attributes", {})["attribute"] = target.attr
+            if static_value_path is not None:
+                node_data["attributes"]["static_value_boundary"] = (
+                    static_value_path
+                )
             _replace_inputs(
                 graph,
                 node_id,
@@ -2266,21 +2422,46 @@ def _normalize_lexical_values(
                     "a static Python reference cannot be destructured as "
                     "a runtime graph value"
                 )
+            starred = tuple(
+                index
+                for index, element in enumerate(target.elts)
+                if isinstance(element, ast.Starred)
+            )
+            if len(starred) > 1:
+                raise ValueError("destructuring permits at most one starred target")
+            starred_index = starred[0] if starred else None
+            trailing = (
+                len(target.elts) - starred_index - 1
+                if starred_index is not None else 0
+            )
             for index, element in enumerate(target.elts):
+                if isinstance(element, ast.Starred):
+                    projection = slice(
+                        index,
+                        -trailing if trailing else None,
+                    )
+                    binding_target = element.value
+                else:
+                    projection = (
+                        index - len(target.elts)
+                        if starred_index is not None and index > starred_index
+                        else index
+                    )
+                    binding_target = element
                 index_id = new_node(
                     "Constant",
-                    str(index),
-                    attributes={"value": index},
+                    repr(projection),
+                    attributes={"value": projection},
                 )
                 projected_id = new_node(
                     "Indexed",
-                    f"unpack[{index}]",
+                    f"unpack[{projection!r}]",
                     parents=(
                         (value, "base"),
                         (index_id, "index"),
                     ),
                 )
-                bind_target(element, projected_id)
+                bind_target(binding_target, projected_id)
 
     def delete_target(target: ast.AST) -> int | None:
         """Lower one Python deletion target to its explicit state effect."""
@@ -2588,15 +2769,28 @@ def _normalize_lexical_values(
                     and isinstance(body_value, int)
                     and isinstance(else_value, int)
                 ):
-                    environment[name] = new_node(
+                    merged_value = new_node(
                         "Phi",
                         name,
-                        attributes={"binding_name": name},
+                        attributes={
+                            "binding_name": name,
+                            "source_conditional_id": id(body_statement),
+                        },
                         parents=(
                             (test_value, "test"),
                             (body_value, "body"),
                             (else_value, "orelse"),
                         ),
+                    )
+                    environment[name] = merged_value
+                    # The identity history is the authoritative lexical
+                    # version chain used by conditional-control lowering.
+                    # Omitting the merge made a nested branch's continuation
+                    # visible to later expressions but invisible to the
+                    # control overlay, so no executable Phi was emitted for
+                    # either the inner or enclosing conditional.
+                    identity_bindings.setdefault(name, []).append(
+                        merged_value
                     )
             def terminal_branch(statements: list[ast.stmt]) -> bool:
                 if not statements:
@@ -2845,7 +3039,7 @@ def _normalize_lexical_values(
                         direct_targets: tuple[ast.AST, ...] = ()
                         if isinstance(nested, ast.Assign):
                             direct_targets = tuple(nested.targets)
-                        elif isinstance(nested, (ast.AnnAssign, ast.AugAssign)):
+                        elif isinstance(nested, ast.AnnAssign):
                             direct_targets = (nested.target,)
                         assigned = any(
                             target_name.id == name
@@ -3256,6 +3450,12 @@ def _normalize_lexical_values(
                 ].items()
                 if initial in mapping
             }
+        if "source_conditional_id" in attributes:
+            source_conditional_id = attributes["source_conditional_id"]
+            if source_conditional_id in mapping:
+                attributes["source_conditional_id"] = mapping[
+                    source_conditional_id
+                ]
         if "terminal_return_values" in attributes:
             attributes["terminal_return_values"] = tuple(
                 mapping[value_id]
@@ -4155,6 +4355,114 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         for function_node_id, reference in function_nodes.items()
         if method_owners.get(function_node_id) is not None
     }
+    returned_class_by_reference: dict[int, str] = {}
+    def returned_class(definition: Any) -> str | None:
+        if not isinstance(
+            definition, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            return None
+        declared_class = (
+            definition.returns.id
+            if isinstance(definition.returns, ast.Name)
+            and definition.returns.id in graph.G.graph["class_table"]
+            else None
+        )
+        returned_classes = {
+            returned.func.id
+            for returned in (
+                node.value for node in ast.walk(definition)
+                if isinstance(node, ast.Return) and node.value is not None
+            )
+            if isinstance(returned, ast.Call)
+            and isinstance(returned.func, ast.Name)
+            and returned.func.id in graph.G.graph["class_table"]
+        }
+        inferred_class = declared_class or (
+            next(iter(returned_classes))
+            if len(returned_classes) == 1 else None
+        )
+        return None if inferred_class is None else str(inferred_class)
+
+    for function_node_id, reference in function_nodes.items():
+        definition = graph.G.nodes.get(function_node_id, {}).get("expr_obj")
+        inferred_class = returned_class(definition)
+        if inferred_class is not None:
+            returned_class_by_reference[int(reference.address)] = inferred_class
+    for entry in function_table:
+        inferred_class = returned_class(
+            entry.metadata.get("source_node")
+        )
+        if inferred_class is not None:
+            returned_class_by_reference[int(entry.reference.address)] = (
+                inferred_class
+            )
+
+    def propagate_returned_receiver_types(target_graph: Any) -> None:
+        target_class_table = graph.G.graph.get("class_table", {})
+        calls = tuple(target_graph.nodes(data=True))
+        for _node_id, call_data in calls:
+            expression = call_data.get("expr_obj")
+            if not isinstance(expression, ast.Call):
+                continue
+            attributes = call_data.setdefault("attributes", {})
+            callee_reference = attributes.get("callee_ref")
+            returned_class = (
+                None if callee_reference is None
+                else returned_class_by_reference.get(int(callee_reference))
+            )
+            if returned_class is not None:
+                attributes["result_class_ref"] = returned_class
+        for _node_id, call_data in calls:
+            expression = call_data.get("expr_obj")
+            attributes = call_data.setdefault("attributes", {})
+            if (
+                not isinstance(expression, ast.Call)
+                or not isinstance(expression.func, ast.Attribute)
+                or attributes.get("method_ref") is not None
+            ):
+                continue
+            receiver_id = next((
+                int(parent)
+                for parent, role in call_data.get("parents", ())
+                if str(role) in {"operand", "value", "base", "object"}
+            ), None)
+            receiver_attributes = (
+                {}
+                if receiver_id is None or receiver_id not in target_graph
+                else target_graph.nodes[receiver_id].get("attributes") or {}
+            )
+            receiver_class = receiver_attributes.get(
+                "result_class_ref", receiver_attributes.get("class_ref")
+            )
+            method_reference = (
+                target_class_table.get(str(receiver_class), {})
+                .get("methods", {})
+                .get(expression.func.attr)
+            )
+            if method_reference is None:
+                continue
+            method_reference = int(method_reference)
+            attributes.update({
+                "method_ref": method_reference,
+                "callee_ref": method_reference,
+            })
+            accessor_id = id(expression.func)
+            if accessor_id in target_graph:
+                target_graph.nodes[accessor_id].setdefault(
+                    "attributes", {}
+                ).update({
+                    "accessor_kind": "method",
+                    "method_ref": method_reference,
+                })
+
+    propagated_graphs = {id(graph.G)}
+    propagate_returned_receiver_types(graph.G)
+    for entry in function_table:
+        entry_graph = getattr(getattr(entry, "graph", None), "G", None)
+        if entry_graph is None or id(entry_graph) in propagated_graphs:
+            continue
+        propagated_graphs.add(id(entry_graph))
+        propagate_returned_receiver_types(entry_graph)
     # Source pursuit has already made an exact definition->call dependency
     # edge. Preserve that identity directly in SSA call metadata instead of
     # attempting receiver-name inference again. This is especially important
@@ -4174,6 +4482,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             continue
         attributes = call_data.setdefault("attributes", {})
         attributes["callee_ref"] = int(reference.address)
+        returned_class = returned_class_by_reference.get(
+            int(reference.address)
+        )
+        if returned_class is not None:
+            attributes["result_class_ref"] = returned_class
         if isinstance(expression.func, ast.Attribute):
             attributes["method_ref"] = int(reference.address)
             accessor_id = id(expression.func)
@@ -4182,6 +4495,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     "accessor_kind": "method",
                     "method_ref": int(reference.address),
                 })
+
+    # The exact callee references above are attached after lexical child
+    # graphs have been normalized.  Re-run the returned-object propagation on
+    # this graph now that those identities are available.
+    propagate_returned_receiver_types(graph.G)
 
     contextual_requirements = list(
         graph.G.graph.get("contextual_requirements", ())
@@ -4679,6 +4997,41 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     if accessor_id in graph.G:
                         accessor = graph.G.nodes[accessor_id]
                         accessor.setdefault("attributes", {}).update({
+                            "accessor_kind": "method",
+                            "method_ref": method_reference,
+                        })
+            if data.get("attributes", {}).get("method_ref") is None:
+                receiver_id = next((
+                    int(parent)
+                    for parent, role in data.get("parents", ())
+                    if str(role) in {"operand", "value", "base", "object"}
+                ), None)
+                receiver_attributes = (
+                    {}
+                    if receiver_id is None or receiver_id not in graph.G
+                    else graph.G.nodes[receiver_id].get("attributes") or {}
+                )
+                receiver_class = receiver_attributes.get(
+                    "result_class_ref",
+                    receiver_attributes.get("class_ref"),
+                )
+                method_reference = (
+                    graph.G.graph.get("class_table", {})
+                    .get(str(receiver_class), {})
+                    .get("methods", {})
+                    .get(expression.func.attr)
+                )
+                if method_reference is not None:
+                    method_reference = int(method_reference)
+                    data.setdefault("attributes", {})["method_ref"] = (
+                        method_reference
+                    )
+                    data["attributes"]["callee_ref"] = method_reference
+                    accessor_id = id(expression.func)
+                    if accessor_id in graph.G:
+                        graph.G.nodes[accessor_id].setdefault(
+                            "attributes", {}
+                        ).update({
                             "accessor_kind": "method",
                             "method_ref": method_reference,
                         })

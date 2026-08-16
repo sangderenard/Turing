@@ -10,6 +10,91 @@ from src.common.tensors.topological_reducer import (
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
 
+def test_schema_guard_constructor_idiom_becomes_one_normalization_operator():
+    module = ast.parse(
+        """
+def kernel(x):
+    return x if isinstance(x, AbstractTensor) else AbstractTensor.tensor(x)
+"""
+    )
+    conditional = next(
+        node for node in ast.walk(module) if isinstance(node, ast.IfExp)
+    )
+    calls = [node for node in ast.walk(module) if isinstance(node, ast.Call)]
+    guard = next(
+        node for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "isinstance"
+    )
+    normalizer = next(
+        node for node in calls
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "tensor"
+    )
+    guard._extraction_contract = {
+        "identity": "builtins.isinstance", "action": "intrinsic",
+    }
+    normalizer._extraction_contract = {
+        "identity": (
+            "src.common.tensors.abstraction.AbstractTensor.tensor"
+        ),
+        "action": "intrinsic",
+    }
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+
+    reduce_abstract_tensor_topology(graph)
+
+    executable = graph.function_table.entry(
+        graph.function_table.reference("kernel")
+    ).graph.G
+    normalized = next(
+        data
+        for _node_id, data in executable.nodes(data=True)
+        if (data.get("attributes") or {}).get(
+            "source_type_normalization"
+        )
+    )
+    assert not any(
+        isinstance(data.get("expr_obj"), ast.IfExp)
+        for _node_id, data in executable.nodes(data=True)
+    )
+    assert normalized["op"] == "tensor"
+    assert normalized["attributes"]["source_type_normalization"] == {
+        "guard": "schema_type_guard",
+        "schema_type": (
+            "src.common.tensors.abstraction.AbstractTensor"
+        ),
+        "source_ifexp": id(conditional),
+    }
+
+
+def test_annotated_receiver_discovers_authored_method_without_instance():
+    class Receiver:
+        def scale(self, value):
+            return value * 2.0
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"Receiver": Receiver}
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            "def kernel(receiver: Receiver, value):\n"
+            "    return receiver.scale(value)\n",
+            resolve_unresolved_parents=True,
+            pursuit_roots=("kernel",),
+        )
+    reduce_abstract_tensor_topology(graph)
+
+    scale = graph.function_table.reference("scale")
+    assert scale is not None
+    kernel = graph.function_table.entry("kernel").graph
+    call = next(
+        data
+        for _node_id, data in kernel.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("callee_ref") is not None
+    )
+    assert call["attributes"]["callee_ref"] == scale.address
+
+
 def test_descendant_loop_targets_are_not_enclosing_loop_carried_state():
     module = ast.parse(
         """
@@ -34,6 +119,31 @@ def kernel(rows):
     ).get("loop_carried_bindings", {})
     assert "i" not in carried
     assert "size" not in carried
+
+
+def test_augmented_assignment_is_exact_loop_carried_state():
+    module = ast.parse(
+        """
+def kernel(max_iters):
+    iters = 0
+    while iters < max_iters:
+        iters += 1
+    return iters
+"""
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+
+    reduce_abstract_tensor_topology(graph)
+
+    loop = module.body[0].body[1]
+    carried = (
+        graph.G.nodes[id(loop)].get("attributes") or {}
+    ).get("loop_carried_bindings", {})
+    assert "iters" in carried
+    initial, updated = carried["iters"]
+    assert initial != updated
 
 
 def test_only_name_assign_and_call_receive_existing_process_graph_aliases():
@@ -354,6 +464,44 @@ class Graph:
         if isinstance(data.get("expr_obj"), ast.For)
     )
     assert not (loop.get("attributes") or {}).get("loop_state_effects")
+
+
+def test_method_resolution_follows_an_authored_function_returned_class():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Worker:
+    def apply(self, value):
+        return value + 1
+
+def build_worker() -> Worker:
+    return Worker()
+
+def run(value):
+    worker = build_worker()
+    return worker.apply(value)
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    run_graph = graph.function_table.entry("run").graph
+    calls = {
+        ast.unparse(data["expr_obj"]): data
+        for _node_id, data in run_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+    }
+    method_ref = graph.G.graph["class_table"]["Worker"]["methods"][
+        "apply"
+    ]
+    assert calls["build_worker()"]["attributes"]["result_class_ref"] == (
+        "Worker"
+    )
+    assert calls["worker.apply(value)"]["attributes"]["method_ref"] == (
+        method_ref
+    )
 
 
 def test_descendant_loop_owns_its_sequence_mutation_effect():
@@ -856,6 +1004,67 @@ class Accumulator:
         and isinstance(data["expr_obj"].ctx, ast.Store)
         for _node_id, data in function_graph.G.nodes(data=True)
     )
+
+
+def test_static_python_attribute_value_remains_an_explicit_host_boundary():
+    class Registry:
+        handler = object()
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"registry": Registry}
+    module = ast.parse(
+        """
+def attach(parameter):
+    parameter.callback = registry.handler
+    return parameter
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("attach").graph
+
+    set_attr = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "SetAttr"
+    )
+    value_id = next(
+        parent for parent, role in set_attr["parents"] if role == "value"
+    )
+    assert function_graph.G.nodes[value_id]["type"] == "StaticReference"
+    assert set_attr["attributes"]["static_value_boundary"] == "registry.handler"
+
+
+def test_autograd_tape_assignment_remains_an_explicit_recursive_seam():
+    class AutogradState:
+        tape = object()
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"autograd": AutogradState}
+    module = ast.parse(
+        """
+def attach(parameter):
+    parameter._tape = autograd.tape
+    return parameter
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("attach").graph
+
+    set_attr = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "SetAttr"
+        and data.get("attributes", {}).get("attribute") == "_tape"
+    )
+    value_id = next(
+        parent for parent, role in set_attr["parents"] if role == "value"
+    )
+    assert function_graph.G.nodes[value_id]["type"] == "StaticReference"
+    assert set_attr["attributes"]["static_value_boundary"] == "autograd.tape"
 
 
 def test_static_class_attribute_update_uses_reference_and_latest_ssa_value():

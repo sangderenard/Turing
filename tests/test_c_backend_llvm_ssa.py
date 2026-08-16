@@ -45,6 +45,9 @@ _REAL_TRANSLATED_SYMBOLS = {
     "slice_copy_double",
     "index_select_double",
     "index_assign_double",
+    "index_set_double",
+    "unfold2d_double",
+    "fold2d_double",
     "sign_double",
     "count_true_double",
     "mask_select_double",
@@ -185,6 +188,46 @@ def test_handwritten_binary_ssa_matches_real_c_kernel(
 @pytest.mark.parametrize(
     ("c_opcode", "llvm_opcode"),
     [
+        ("CT_OP_BITAND", 42),
+        ("CT_OP_BITOR", 43),
+        ("CT_OP_BITXOR", 44),
+        ("CT_OP_SHL", 45),
+        ("CT_OP_SHR", 46),
+        ("CT_OP_LOGICAL_AND", 47),
+        ("CT_OP_LOGICAL_OR", 48),
+    ],
+)
+def test_handwritten_integer_and_logical_binary_ssa_matches_c(
+    llvm_engine, c_opcode, llvm_opcode,
+):
+    left = [7.0, 12.0, 8.0, 0.0]
+    right = [3.0, 5.0, 1.0, 2.0]
+    c_left = _c_array(left)
+    c_right = _c_array(right)
+    c_output = _c_array([0.0] * len(left))
+    C.binary_double(
+        c_left, c_right, c_output, len(left), getattr(C, c_opcode)
+    )
+    llvm_output = (ctypes.c_double * len(left))()
+    function = _llvm_function(
+        llvm_engine, "binary_double",
+        ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double), ctypes.c_int32, ctypes.c_int32,
+    )
+    function(
+        (ctypes.c_double * len(left))(*left),
+        (ctypes.c_double * len(right))(*right),
+        llvm_output, len(left), llvm_opcode,
+    )
+    np.testing.assert_equal(
+        np.asarray(llvm_output),
+        np.asarray([c_output[index] for index in range(len(left))]),
+    )
+
+
+@pytest.mark.parametrize(
+    ("c_opcode", "llvm_opcode"),
+    [
         ("CT_OP_NEG", 10),
         ("CT_OP_ABS", 11),
         ("CT_OP_ISFINITE", 16),
@@ -215,6 +258,33 @@ def test_handwritten_unary_ssa_matches_real_c_kernel(
     )
     function(llvm_input, llvm_output, len(values), llvm_opcode)
 
+    np.testing.assert_equal(
+        np.asarray(llvm_output),
+        np.asarray([c_output[index] for index in range(len(values))]),
+    )
+
+
+@pytest.mark.parametrize(
+    ("c_opcode", "llvm_opcode"),
+    [("CT_OP_SIGN", 40), ("CT_OP_INVERT", 41)],
+)
+def test_handwritten_sign_and_invert_ssa_match_c(
+    llvm_engine, c_opcode, llvm_opcode,
+):
+    values = [-8.0, -1.0, 0.0, 1.0, 7.0]
+    c_input = _c_array(values)
+    c_output = _c_array([0.0] * len(values))
+    C.unary_double(c_input, c_output, len(values), getattr(C, c_opcode))
+    llvm_output = (ctypes.c_double * len(values))()
+    function = _llvm_function(
+        llvm_engine, "unary_double",
+        ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int32, ctypes.c_int32,
+    )
+    function(
+        (ctypes.c_double * len(values))(*values), llvm_output,
+        len(values), llvm_opcode,
+    )
     np.testing.assert_equal(
         np.asarray(llvm_output),
         np.asarray([c_output[index] for index in range(len(values))]),
@@ -319,6 +389,87 @@ def test_handwritten_broadcast_ssa_matches_real_c_kernel(llvm_engine):
         len(output_shape),
     )
     assert list(llvm_output) == [c_output[index] for index in range(6)]
+
+
+def test_handwritten_unfold_fold_ssa_match_reference_and_are_adjoint(llvm_engine):
+    dimensions = (1, 1, 3, 4, 2, 2, 1, 1, 1, 1, 1, 1)
+    n, channels, height, width, kh, kw, sh, sw, ph, pw, dh, dw = dimensions
+    output_h = (height + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+    output_w = (width + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+    input_values = np.linspace(-0.7, 1.1, n * channels * height * width)
+    column_values = np.linspace(
+        0.9, -0.4,
+        n * channels * kh * kw * output_h * output_w,
+    )
+
+    image = input_values.reshape(n, channels, height, width)
+    padded = np.pad(image, ((0, 0), (0, 0), (ph, ph), (pw, pw)))
+    expected_unfolded = np.empty(
+        (n, channels, kh, kw, output_h, output_w), dtype=np.float64,
+    )
+    for kernel_row in range(kh):
+        for kernel_column in range(kw):
+            expected_unfolded[:, :, kernel_row, kernel_column] = padded[
+                :,
+                :,
+                kernel_row * dh:kernel_row * dh + sh * output_h:sh,
+                kernel_column * dw:kernel_column * dw + sw * output_w:sw,
+            ]
+    llvm_unfolded = (ctypes.c_double * column_values.size)()
+    integer_arguments = (ctypes.c_int32,) * len(dimensions)
+    _llvm_function(
+        llvm_engine,
+        "unfold2d_double",
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        *integer_arguments,
+    )(
+        (ctypes.c_double * input_values.size)(*input_values),
+        llvm_unfolded,
+        *dimensions,
+    )
+    np.testing.assert_allclose(
+        np.asarray(llvm_unfolded),
+        expected_unfolded.reshape(-1),
+    )
+
+    expected_folded_padded = np.zeros_like(padded)
+    columns = column_values.reshape(
+        n, channels, kh, kw, output_h, output_w,
+    )
+    for kernel_row in range(kh):
+        for kernel_column in range(kw):
+            expected_folded_padded[
+                :,
+                :,
+                kernel_row * dh:kernel_row * dh + sh * output_h:sh,
+                kernel_column * dw:kernel_column * dw + sw * output_w:sw,
+            ] += columns[:, :, kernel_row, kernel_column]
+    expected_folded = expected_folded_padded[
+        :, :, ph:ph + height, pw:pw + width,
+    ].reshape(-1)
+    llvm_folded = (ctypes.c_double * input_values.size)()
+    _llvm_function(
+        llvm_engine,
+        "fold2d_double",
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        *integer_arguments,
+    )(
+        (ctypes.c_double * column_values.size)(*column_values),
+        llvm_folded,
+        *dimensions,
+    )
+    np.testing.assert_allclose(
+        np.asarray(llvm_folded),
+        expected_folded,
+    )
+    np.testing.assert_allclose(
+        np.dot(np.asarray(llvm_unfolded), column_values),
+        np.dot(input_values, np.asarray(llvm_folded)),
+        rtol=1e-13,
+        atol=1e-13,
+    )
 
 
 def test_handwritten_slice_ssa_matches_real_c_kernel(llvm_engine):

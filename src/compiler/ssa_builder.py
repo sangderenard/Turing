@@ -42,6 +42,10 @@ def process_graph_to_ssa_instrs(pg: ProcessGraph, schedule: str = "alap") -> Lis
     ret = pg.compute_levels(method=schedule, order="dependency")
     levels = ret if ret is not None else pg.levels
     order = sorted(levels, key=lambda n: levels[n])
+    distinct_levels = tuple(sorted({int(level) for level in levels.values()}))
+    schedule_groups = {
+        level: ordinal for ordinal, level in enumerate(distinct_levels)
+    }
 
     values: Dict[int, SSAValue] = {}
     instrs: List[Instr] = []
@@ -83,6 +87,11 @@ def process_graph_to_ssa_instrs(pg: ProcessGraph, schedule: str = "alap") -> Lis
 
         args = [values.setdefault(p, SSAValue(p)) for p in parents]
         attributes = dict(data.get("attributes") or data.get("extra_args") or {})
+        attributes.update({
+            "schedule_level": int(levels[nid]),
+            "schedule_group": schedule_groups[int(levels[nid])],
+            "schedule_method": str(schedule),
+        })
         from .semantic_translation import (
             SemanticRepresentation, semantic_identity,
         )

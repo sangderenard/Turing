@@ -141,6 +141,15 @@
             case CT_OP_NE: return a != b;
             case CT_OP_MAXIMUM: return a > b ? a : b;
             case CT_OP_MINIMUM: return a < b ? a : b;
+            case CT_OP_BITAND: return (double)((long long)a & (long long)b);
+            case CT_OP_BITOR: return (double)((long long)a | (long long)b);
+            case CT_OP_BITXOR: return (double)((long long)a ^ (long long)b);
+            case CT_OP_SHL:
+                return (double)((long long)a << ((unsigned long long)b & 63));
+            case CT_OP_SHR:
+                return (double)((long long)a >> ((unsigned long long)b & 63));
+            case CT_OP_LOGICAL_AND: return (a != 0.0) && (b != 0.0);
+            case CT_OP_LOGICAL_OR: return (a != 0.0) || (b != 0.0);
             default: return NAN;
         }
     }
@@ -202,6 +211,11 @@
                 case CT_OP_ASINH: out[i] = asinh(value); break;
                 case CT_OP_ACOSH: out[i] = acosh(value); break;
                 case CT_OP_ATANH: out[i] = atanh(value); break;
+                case CT_OP_SIGN:
+                    out[i] = value > 0.0 ? 1.0 : (value < 0.0 ? -1.0 : 0.0);
+                    break;
+                case CT_OP_INVERT:
+                    out[i] = (double)(~(long long)value); break;
                 default: out[i] = value; break;
             }
         }
@@ -231,7 +245,7 @@
     static int is_unary_op(int op) {
         return (
             (op >= CT_OP_SQRT && op <= CT_OP_LOGICAL_NOT)
-            || (op >= CT_OP_TANH && op <= CT_OP_ATANH)
+            || (op >= CT_OP_TANH && op <= CT_OP_INVERT)
         );
     }
 
@@ -566,6 +580,80 @@
             }
             target[target_flat] = values[value_count == 1 ? 0 : flat];
         }
+    }
+
+    void index_set_double(
+        const double* input, double* output, const int* shape, int ndim,
+        const int* axis_offsets, const int* axis_indices,
+        const double* values, int value_count) {
+        int element_count = 1;
+        for (int axis = 0; axis < ndim; ++axis)
+            element_count *= shape[axis];
+        memcpy(output, input, element_count * sizeof(double));
+        index_assign_double(
+            output, shape, ndim, axis_offsets, axis_indices,
+            values, value_count);
+    }
+
+    void unfold2d_double(
+        const double* input, double* output,
+        int n, int c, int h, int w,
+        int kernel_h, int kernel_w,
+        int stride_h, int stride_w,
+        int padding_h, int padding_w,
+        int dilation_h, int dilation_w) {
+        int effective_h = (kernel_h - 1) * dilation_h + 1;
+        int effective_w = (kernel_w - 1) * dilation_w + 1;
+        int output_h = (h + 2 * padding_h - effective_h) / stride_h + 1;
+        int output_w = (w + 2 * padding_w - effective_w) / stride_w + 1;
+        for (int batch = 0; batch < n; ++batch)
+            for (int channel = 0; channel < c; ++channel)
+                for (int kh = 0; kh < kernel_h; ++kh)
+                    for (int kw = 0; kw < kernel_w; ++kw)
+                        for (int oh = 0; oh < output_h; ++oh)
+                            for (int ow = 0; ow < output_w; ++ow) {
+                                int ih = oh * stride_h - padding_h + kh * dilation_h;
+                                int iw = ow * stride_w - padding_w + kw * dilation_w;
+                                int column = (((channel * kernel_h + kh) * kernel_w) + kw);
+                                int output_index = (
+                                    (batch * c * kernel_h * kernel_w + column)
+                                    * output_h + oh) * output_w + ow;
+                                output[output_index] = (
+                                    ih >= 0 && ih < h && iw >= 0 && iw < w
+                                ) ? input[((batch * c + channel) * h + ih) * w + iw]
+                                  : 0.0;
+                            }
+    }
+
+    void fold2d_double(
+        const double* columns, double* output,
+        int n, int c, int h, int w,
+        int kernel_h, int kernel_w,
+        int stride_h, int stride_w,
+        int padding_h, int padding_w,
+        int dilation_h, int dilation_w) {
+        int effective_h = (kernel_h - 1) * dilation_h + 1;
+        int effective_w = (kernel_w - 1) * dilation_w + 1;
+        int output_h = (h + 2 * padding_h - effective_h) / stride_h + 1;
+        int output_w = (w + 2 * padding_w - effective_w) / stride_w + 1;
+        memset(output, 0, (size_t)n * c * h * w * sizeof(double));
+        for (int batch = 0; batch < n; ++batch)
+            for (int channel = 0; channel < c; ++channel)
+                for (int kh = 0; kh < kernel_h; ++kh)
+                    for (int kw = 0; kw < kernel_w; ++kw)
+                        for (int oh = 0; oh < output_h; ++oh)
+                            for (int ow = 0; ow < output_w; ++ow) {
+                                int ih = oh * stride_h - padding_h + kh * dilation_h;
+                                int iw = ow * stride_w - padding_w + kw * dilation_w;
+                                if (ih < 0 || ih >= h || iw < 0 || iw >= w)
+                                    continue;
+                                int column = (((channel * kernel_h + kh) * kernel_w) + kw);
+                                int column_index = (
+                                    (batch * c * kernel_h * kernel_w + column)
+                                    * output_h + oh) * output_w + ow;
+                                output[((batch * c + channel) * h + ih) * w + iw]
+                                    += columns[column_index];
+                            }
     }
 
     void sign_double(const double* input, double* output, int n) {

@@ -15,6 +15,7 @@ from src.compiler.ssa_fortran_backend import (
     emit_function,
     emit_module,
     fortran_compiler,
+    supported_tensor_operations,
 )
 from src.transmogrifier.ssa import (
     BasicBlock,
@@ -267,6 +268,31 @@ def test_empty_array_constant_has_a_typed_fortran_constructor():
     assert "reshape([real(c_double) ::], [0, 3])" in module.source
 
 
+def test_captured_scalar_in_values_is_not_treated_as_an_array():
+    scalar = SSAValue(0, "float64", ())
+    function = Function(
+        "captured_scalar_constant",
+        [],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("Const", [], scalar, attributes={"values": 2.0}),
+                    Instr("Ret", [], SSAValue(1)),
+                ],
+            )
+        },
+    )
+
+    module = emit_module(
+        IRModule({function.name: function}),
+        outputs={function.name: [scalar]},
+    )
+
+    assert module.complete, [shortfall.format() for shortfall in module.shortfalls]
+    assert "2.0_c_double" in module.source
+
+
 def test_imported_llvm_scalar_literals_emit_fortran_constants():
     zero = SSAValue(0, "i32", ())
     positive_infinity = SSAValue(1, "float64", ())
@@ -382,6 +408,57 @@ def test_scalar_reduction_is_identity_and_logical_arithmetic_is_numeric():
     assert module.complete, [item.format() for item in module.shortfalls]
     assert "sum(" not in module.source
     assert ".true._c_bool +" not in module.source
+
+
+def test_fortran_converts_logical_values_at_cast_phi_and_store_boundaries():
+    logical = SSAValue(0, "bool")
+    cast_result = SSAValue(1, "float64")
+    cast_function = Function("logical_cast", [logical], {
+        "entry": BasicBlock("entry", [
+            Instr("Cast", [logical], cast_result),
+            Instr("Ret", [cast_result], SSAValue(2)),
+        ]),
+    })
+    cast_source = emit_function(
+        cast_function, outputs=[cast_result]
+    ).source
+    assert "merge(1.0_c_double, 0.0_c_double, t0)" in cast_source
+    assert "real(t0" not in cast_source
+
+    initial = SSAValue(0, "bool")
+    current = SSAValue(1, "float64")
+    phi_function = Function("logical_phi", [initial], {
+        "entry": BasicBlock("entry", [
+            Instr("Br", [], SSAValue(90), attributes={"target": "join"}),
+        ], ["join"]),
+        "join": BasicBlock("join", [
+            Instr(
+                "Phi", [initial], current,
+                attributes={"incoming_blocks": ("entry",)},
+            ),
+            Instr("Ret", [current], SSAValue(91)),
+        ]),
+    })
+    phi_source = emit_function(phi_function, outputs=[current]).source
+    assert "t1 = merge(1.0_c_double, 0.0_c_double, t0)" in phi_source
+
+    collection = SSAValue(0, "float64", (4,))
+    stored = SSAValue(1, "bool")
+    index = SSAValue(2, "int32")
+    address = SSAValue(3, "float64")
+    store_function = Function("logical_store", [collection, stored, index], {
+        "entry": BasicBlock("entry", [
+            Instr("GetElementPtr", [collection, index], address),
+            Instr("Store", [stored, address], None),
+        ]),
+    })
+    store_source = emit_function(
+        store_function, array_base_ids={collection.id}
+    ).source
+    assert (
+        "t0(t2 + 1) = merge(1.0_c_double, 0.0_c_double, t1)"
+        in store_source
+    )
 
 
 def test_index_set_accepts_a_scalar_value_without_reducing_it():
@@ -533,8 +610,49 @@ def test_argument_output_alias_emits_one_inout_fortran_arena():
     assert source.count(":: t20(extent_4)") == 1
     assert [parameter.role for parameter in entry.parameters] == [
         "extent",
-        "input",
+        "inout",
     ]
+
+
+def test_argument_assigned_by_linked_result_is_an_inout_slot():
+    frame_slot = SSAValue(20, "float64")
+    function = Function("wrapper", [frame_slot], {
+        "entry": BasicBlock("entry", [
+            Instr("Cast", [frame_slot], frame_slot),
+            Instr("Ret", [], SSAValue(99)),
+        ]),
+    })
+
+    source = emit_function(function).source
+
+    assert "intent(inout) :: t20" in source
+    assert "intent(in), value :: t20" not in source
+
+
+def test_fortran_shortens_internal_procedure_names_but_preserves_bind_symbol():
+    callee_name = "program__specialized_" + "a" * 70
+    caller_name = "program__wrapper_" + "b" * 70
+    callee = Function(callee_name, [], {
+        "entry": BasicBlock("entry", [Instr("Ret", [], None)]),
+    })
+    caller = Function(caller_name, [], {
+        "entry": BasicBlock("entry", [
+            Instr("Call", [], None, attributes={"callee": callee_name}),
+            Instr("Ret", [], None),
+        ]),
+    })
+
+    emitted = emit_module(
+        IRModule({caller_name: caller, callee_name: callee}),
+        extra_roots=(caller_name,),
+    )
+    symbols = emitted.api.metadata["fortran_internal_symbols"]
+
+    assert len(symbols[callee_name]) <= 63
+    assert len(symbols[caller_name]) <= 63
+    assert f'bind(C, name="{callee_name}")' in emitted.source
+    assert f"call {symbols[callee_name]}()" in emitted.source
+    assert emitted.api.entry_point(callee_name).symbol == callee_name
 
 
 def test_inout_region_load_and_phi_retain_resident_arena_rank():
@@ -580,6 +698,93 @@ def test_inout_region_load_and_phi_retain_resident_arena_rank():
     assert "real(c_double) :: t13(extent_4)" in source
     assert "t12 = t1" in source
     assert "call advance(extent_4, t12)" in source
+
+
+def test_repeated_aggregate_output_identity_is_one_native_argument():
+    repeated = SSAValue(30, "float64")
+    callee = Function(
+        "repeat_value",
+        [],
+        {"entry": BasicBlock("entry", [Instr("Ret", [], SSAValue(99))])},
+    )
+    aggregate = SSAValue(10, "aggregate")
+    first_address = SSAValue(11, "pointer")
+    second_address = SSAValue(12, "pointer")
+    projected = SSAValue(13, "float64")
+    caller = Function("consume_repeat", [], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "Call", [], aggregate,
+                attributes={
+                    "callee": "repeat_value",
+                    "result_convention": "ssa.aggregate",
+                },
+            ),
+            Instr(
+                "GetElementPtr", [aggregate], first_address,
+                attributes={"aggregate_index": 0},
+            ),
+            Instr("Load", [first_address], projected),
+            Instr(
+                "GetElementPtr", [aggregate], second_address,
+                attributes={"aggregate_index": 1},
+            ),
+            Instr("Load", [second_address], projected),
+            Instr("Ret", [], SSAValue(100)),
+        ]),
+    })
+
+    source = emit_module(
+        IRModule({"repeat_value": callee, "consume_repeat": caller}),
+        outputs={
+            "repeat_value": [repeated, repeated],
+            "consume_repeat": [projected],
+        },
+    ).source
+
+    assert "subroutine repeat_value(t30)" in source
+    assert "call repeat_value(t13)" in source
+    assert "call repeat_value(t13, t13)" not in source
+
+
+def test_aggregate_projection_inherits_callee_output_dtype():
+    predicate = SSAValue(30, "bool")
+    callee = Function(
+        "make_predicate",
+        [],
+        {"entry": BasicBlock("entry", [Instr("Ret", [], SSAValue(99))])},
+    )
+    aggregate = SSAValue(10, "aggregate")
+    address = SSAValue(11, "pointer")
+    untyped_projection = SSAValue(12)
+    caller = Function("consume_predicate", [], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "Call", [], aggregate,
+                attributes={
+                    "callee": "make_predicate",
+                    "result_convention": "ssa.aggregate",
+                },
+            ),
+            Instr(
+                "GetElementPtr", [aggregate], address,
+                attributes={"aggregate_index": 0},
+            ),
+            Instr("Load", [address], untyped_projection),
+            Instr("Ret", [], SSAValue(100)),
+        ]),
+    })
+
+    source = emit_module(
+        IRModule({"make_predicate": callee, "consume_predicate": caller}),
+        outputs={
+            "make_predicate": [predicate],
+            "consume_predicate": [untyped_projection],
+        },
+    ).source
+
+    assert "logical(c_bool), intent(out) :: t12" in source
+    assert "call make_predicate(t12)" in source
 
 
 def test_generic_index_addresses_lower_to_fortran_loads_and_stores():
@@ -674,11 +879,41 @@ def test_api_describes_transitive_callee_extents_from_final_signature():
         ]),
     })
 
+    outer_aggregate = SSAValue(20, "aggregate")
+    outer_address = SSAValue(21, "pointer")
+    outer_result = SSAValue(22, "float64", (4,))
+    outer = Function("outer_program", [field], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "Call", [field], outer_aggregate,
+                attributes={
+                    "callee": "whole_program",
+                    "result_convention": "ssa.aggregate",
+                },
+            ),
+            Instr(
+                "GetElementPtr", [outer_aggregate], outer_address,
+                attributes={"aggregate_index": 0},
+            ),
+            Instr("Load", [outer_address], outer_result),
+            Instr("Ret", [], SSAValue(92)),
+        ]),
+    })
+
     module = emit_module(
-        IRModule({"region": callee, "whole_program": caller}),
-        outputs={"region": [result], "whole_program": [public_result]},
+        IRModule({
+            "region": callee,
+            "whole_program": caller,
+            "outer_program": outer,
+        }),
+        outputs={
+            "region": [result],
+            "whole_program": [public_result],
+            "outer_program": [outer_result],
+        },
     )
     control_api = module.api.entry_point("whole_program")
+    outer_api = module.api.entry_point("outer_program")
 
     assert [
         parameter.name
@@ -686,6 +921,13 @@ def test_api_describes_transitive_callee_extents_from_final_signature():
         if parameter.role == "extent"
     ] == ["extent_1", "extent_4"]
     assert "subroutine whole_program(extent_1, extent_4" in module.source
+    assert [
+        parameter.name
+        for parameter in outer_api.parameters
+        if parameter.role == "extent"
+    ] == ["extent_1", "extent_4"]
+    assert "subroutine outer_program(extent_1, extent_4" in module.source
+    assert "call whole_program(extent_1, extent_4" in module.source
 
 
 def test_unreferenced_block_labels_are_not_emitted():
@@ -890,8 +1132,159 @@ def test_dynamic_array_extent_is_an_explicit_pointer_length_abi_pair():
 
     assert subroutine.complete, [item.format() for item in subroutine.shortfalls]
     assert "extent_dynamic_0" in subroutine.extent_names
-    assert "intent(in) :: t0(*)" in subroutine.source
+    assert "intent(in) :: t0(extent_dynamic_0)" in subroutine.source
     assert "t1 = extent_dynamic_0" in subroutine.source
+
+
+def test_dynamic_rank_two_contract_preserves_rank_with_leading_extent():
+    values = SSAValue(
+        0,
+        "float64",
+        (),
+        accounting={"program_abi_storage": "span", "program_abi_rank": 2},
+    )
+    row = SSAValue(1, "int32")
+    column = SSAValue(2, "int32")
+    address = SSAValue(3, "ptr")
+    loaded = SSAValue(4, "float64")
+    function = Function(
+        "dynamic_matrix",
+        [values, row, column],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("GetElementPtr", [values, row, column], address),
+                    Instr("Load", [address], loaded),
+                    Instr("Ret", [], SSAValue(5)),
+                ],
+            )
+        },
+    )
+
+    subroutine = emit_function(
+        function,
+        outputs=[loaded],
+        array_base_ids={values.id},
+    )
+
+    assert subroutine.complete, [item.format() for item in subroutine.shortfalls]
+    assert "extent_dynamic_0_1" in subroutine.extent_names
+    assert "extent_dynamic_0_2" in subroutine.extent_names
+    assert (
+        "intent(in) :: t0(extent_dynamic_0_1, extent_dynamic_0_2)"
+        in subroutine.source
+    )
+    assert "t4 = t0(t1 + 1, t2 + 1)" in subroutine.source
+
+
+def test_cast_like_rank_closure_is_monotonic():
+    scalar_value = SSAValue(0, "float64")
+    reference = SSAValue(1, "float64")
+    result = SSAValue(2, "float64")
+    caller = Function(
+        "cast_like_rank",
+        [scalar_value, reference],
+        {"entry": BasicBlock("entry", [
+            Instr("CastLike", [scalar_value, reference], result),
+            Instr("Call", [result], None, attributes={"callee": "rank_consumer"}),
+            Instr("Ret", [], SSAValue(3)),
+        ])},
+    )
+    array = SSAValue(
+        0,
+        "float64",
+        accounting={"program_abi_storage": "span", "program_abi_rank": 2},
+    )
+    callee = Function(
+        "rank_consumer",
+        [array],
+        {"entry": BasicBlock("entry", [Instr("Ret", [], SSAValue(1))])},
+    )
+
+    module = emit_module(
+        {caller.name: caller, callee.name: callee},
+    )
+
+    assert module.complete, [item.format() for item in module.shortfalls]
+    assert "call rank_consumer" in module.source
+
+
+def test_dynamic_rank_two_workspace_is_described_without_becoming_input():
+    workspace = SSAValue(
+        0,
+        "float64",
+        (),
+        accounting={
+            "linked_call_frame_storage": "callee.buffer",
+            "ssa_call_rank": 2,
+        },
+    )
+    row = SSAValue(1, "int32")
+    column = SSAValue(2, "int32")
+    address = SSAValue(3, "ptr")
+    loaded = SSAValue(4, "float64")
+    function = Function(
+        "dynamic_workspace",
+        [workspace, row, column],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("GetElementPtr", [workspace, row, column], address),
+                    Instr("Load", [address], loaded),
+                    Instr("Ret", [], SSAValue(5)),
+                ],
+            )
+        },
+    )
+
+    module = emit_module({function.name: function})
+    entry = module.api.entry_point(function.name)
+    parameter = next(item for item in entry.parameters if item.name == "t0")
+
+    assert parameter.role == "workspace"
+    assert parameter.extent is None
+    assert len(parameter.extents) == 2
+    assert parameter.extents[0].endswith("_0_1")
+    assert parameter.extents[1].endswith("_0_2")
+
+
+def test_python_float_is_scalar_extraction_from_a_resident_array():
+    values = SSAValue(
+        0,
+        "float64",
+        (),
+        accounting={"program_abi_storage": "span", "program_abi_rank": 1},
+    )
+    scalar = SSAValue(1, "float64")
+    function = Function(
+        "scalar_extract",
+        [values],
+        {"entry": BasicBlock("entry", [
+            Instr(
+                "Cast",
+                [values],
+                scalar,
+                attributes={
+                    "extraction_identity": "builtins.float",
+                    "source_operator": "float",
+                    "target_dtype": "float64",
+                },
+            ),
+            Instr("Ret", [scalar], None),
+        ])},
+    )
+
+    module = emit_module(
+        {function.name: function},
+        outputs={function.name: (scalar,)},
+    )
+    source = module.source
+
+    assert "intent(in) :: t0(extent_dynamic_" in source
+    assert "real(c_double), intent(out) :: t1" in source
+    assert "t1 = real(t0(1), c_double)" in source
 
 
 def test_resident_representation_boundaries_and_native_transpose_emit_directly():
@@ -930,6 +1323,40 @@ def test_resident_representation_boundaries_and_native_transpose_emit_directly()
 
     assert subroutine.complete, [item.format() for item in subroutine.shortfalls]
     assert "transpose(t0)" in subroutine.source
+    assert {"cpu", "detach", "tolist", "transpose"} <= supported_tensor_operations()
+
+
+@pytest.mark.parametrize(
+    ("operation", "dtype", "expression"),
+    [
+        ("double", "float64", "real(t0, c_double)"),
+        ("float", "float32", "real(t0, c_float)"),
+        ("int", "int32", "int(t0, c_int32_t)"),
+        ("long", "int64", "int(t0, c_int64_t)"),
+        ("to_dtype", "int64", "int(t0, c_int64_t)"),
+    ],
+)
+def test_resident_dtype_conversions_use_explicit_fortran_kinds(
+    operation, dtype, expression
+):
+    source = SSAValue(0, "float64", ())
+    result = SSAValue(1, dtype, ())
+    attributes = {"tensor_operation": operation}
+    if operation == "to_dtype":
+        attributes["dtype"] = dtype
+    function = Function(
+        "convert_value",
+        [source],
+        {"entry": BasicBlock(
+            "entry",
+            [Instr("Call", [source], result, attributes=attributes)],
+        )},
+    )
+
+    subroutine = emit_function(function, outputs=[result])
+
+    assert subroutine.complete, [item.format() for item in subroutine.shortfalls]
+    assert expression in subroutine.source
 
 
 @pytest.mark.parametrize(

@@ -754,7 +754,22 @@ def evaporate_unrolled_loops(
                 )
                 mapping[source_id] = add_clone(source_id, parents)
             for _name, initial, updated in carried_bindings:
-                carried_values[int(initial)] = int(mapping[int(updated)])
+                if int(updated) in mapping:
+                    carried_values[int(initial)] = int(mapping[int(updated)])
+                elif int(updated) not in graph.G:
+                    # Static branch specialization may remove the update Phi
+                    # before this finite loop is evaporated.  That is a proven
+                    # no-update iteration, so retain the incoming carried
+                    # identity instead of manufacturing an ABI input.
+                    carried_values[int(initial)] = int(
+                        mapping.get(int(initial), int(initial))
+                    )
+                else:
+                    raise ValueError(
+                        "unrolled loop omitted a live carried update: "
+                        f"loop={loop.node_id}, binding={_name!r}, "
+                        f"initial={initial}, updated={updated}"
+                    )
             for effect in state_effects:
                 if (
                     effect.mode
@@ -1750,7 +1765,55 @@ class LoopComposer:
                         int(candidate),
                         signature_nodes.get(signature, int(candidate)),
                     )
-            return signature_nodes.get(ast_signature(member))
+            matched = signature_nodes.get(ast_signature(member))
+            if matched is not None:
+                return matched
+            # Lexical normalization materializes Name/GetAttr values without
+            # retaining a raw ``expr_obj`` on those synthetic nodes. Recover
+            # them from their canonical identity and receiver edge rather than
+            # requiring an AST object that intentionally no longer exists.
+            if isinstance(member, ast.Name):
+                history = tuple(
+                    (graph.G.graph.get("identity_table") or {}).get(
+                        member.id, ()
+                    )
+                )
+                for candidate in reversed(history):
+                    if int(candidate) in graph.G:
+                        return int(candidate)
+                candidates = [
+                    int(candidate)
+                    for candidate, node_data in graph.G.nodes(data=True)
+                    if (
+                        (node_data.get("attributes") or {}).get(
+                            "binding_name"
+                        ) == member.id
+                        or node_data.get("label") == member.id
+                    )
+                ]
+                return min(candidates) if candidates else None
+            if isinstance(member, ast.Attribute):
+                receiver = graph_node_for_ast(member.value)
+                candidates = [
+                    int(candidate)
+                    for candidate, node_data in graph.G.nodes(data=True)
+                    if node_data.get("type") == "GetAttr"
+                    and (node_data.get("attributes") or {}).get(
+                        "attribute"
+                    ) == member.attr
+                    and (
+                        receiver is None
+                        or any(
+                            int(parent) == int(receiver)
+                            for parent, role in (
+                                node_data.get("parents") or ()
+                            )
+                            if str(role) in {"value", "object", "operand"}
+                        )
+                    )
+                ]
+                return min(candidates) if candidates else None
+            return None
 
         loop_controls: list[tuple[str, int, int | None, bool]] = []
 
@@ -1839,6 +1902,54 @@ class LoopComposer:
                 *body_nodes,
                 *ast_body_nodes,
             )))
+            # ``graph_node_for_ast(Name)`` may resolve a load in this body to
+            # the value defined before the loop.  That value is a captured
+            # dependency, not loop-owned work.  Keeping it in ``body_nodes``
+            # makes sequential loops which exchange a value appear to overlap
+            # lexically and can assign both controls to one numerical region.
+            # Retain only nodes whose authored source span is inside the loop
+            # body, plus the loop's target bindings (which are synthetic and
+            # intentionally have no source span).
+            body_lines = tuple(
+                (
+                    int(getattr(statement, "lineno", -1)),
+                    int(getattr(
+                        statement,
+                        "end_lineno",
+                        getattr(statement, "lineno", -1),
+                    )),
+                )
+                for statement in expression.body
+                if getattr(statement, "lineno", None) is not None
+            )
+            target_value_ids = frozenset(map(
+                int,
+                (attributes.get("loop_target_bindings") or {}).values(),
+            ))
+
+            def is_lexical_body_node(candidate: int) -> bool:
+                candidate = int(candidate)
+                if candidate in target_value_ids:
+                    return True
+                if candidate not in graph.G:
+                    return False
+                source_span = graph.G.nodes[candidate].get("source_span") or {}
+                line = source_span.get("line")
+                if line is None:
+                    candidate_expression = graph.G.nodes[candidate].get(
+                        "expr_obj"
+                    )
+                    line = getattr(candidate_expression, "lineno", None)
+                if line is None:
+                    return False
+                line = int(line)
+                return any(start <= line <= end for start, end in body_lines)
+
+            body_nodes = tuple(
+                candidate
+                for candidate in body_nodes
+                if is_lexical_body_node(candidate)
+            )
         elif not body_nodes and isinstance(expression, ast.comprehension):
             body_nodes = tuple(
                 parent
@@ -1889,6 +2000,15 @@ class LoopComposer:
             iter(by_role.get("iterable", ()) or by_role.get("iter", ())),
             None,
         )
+        if iterable_node is None and iterator_expression is not None:
+            # Lexical reduction can retain the loop and the iterable
+            # expression as separate nodes while dropping their redundant raw
+            # AST parent edge. Recover the already-ingested value by the same
+            # identity/signature rule used for range arguments and loop bodies;
+            # this is the authored iterable, not a captured trip-count guess.
+            recovered_iterable = graph_node_for_ast(iterator_expression)
+            if recovered_iterable is not None and recovered_iterable in graph.G:
+                iterable_node = int(recovered_iterable)
 
         # Numeric bounds belong only to source arithmetic sequences.  Graph
         # ingestion may annotate an ordinary iterable loop with the iteration
@@ -2581,6 +2701,13 @@ def analyze_shader_loop_reductions(
             return f"(-{operand})", uniforms
         return f"u_control_{node_id}", (node_id,)
 
+    carried_initial_value_ids = {
+        int(initial)
+        for planned_loop in plans
+        for _name, initial, updated in planned_loop.loop.carried_bindings
+        if int(initial) != int(updated)
+    }
+
     def structured_control_expression(
         node_id: int,
         visiting: frozenset[int] = frozenset(),
@@ -2589,6 +2716,8 @@ def analyze_shader_loop_reductions(
         if node_id in visiting:
             return ControlExpression("value", value_id=node_id)
         data = graph.G.nodes[node_id]
+        if node_id in carried_initial_value_ids:
+            return ControlExpression("value", value_id=node_id)
         known, literal = _constant(graph, node_id)
         if known and isinstance(literal, (bool, int, float)):
             return ControlExpression(
@@ -2694,7 +2823,7 @@ def analyze_shader_loop_reductions(
         for effect in consumer_plan.loop.state_effects:
             if (
                 effect.mode is not LoopStateEffectMode.SEQUENCE_MUTATION
-                or effect.argument_kind != "generator"
+                or effect.argument_kind not in {"generator", "filtered_sequence"}
                 or len(effect.argument_value_ids) != 1
                 or effect.sequence_policy is None
             ):
@@ -2707,7 +2836,7 @@ def analyze_shader_loop_reductions(
             if not isinstance(expression, (ast.GeneratorExp, ast.ListComp)):
                 continue
             generators = tuple(expression.generators)
-            # A nested generator is several dependent retained loops.  Route
+            # A nested generator/comprehension is several dependent retained loops.  Route
             # it only once hierarchy composition has an explicit multi-loop
             # yield edge; keeping the typed iterator shortfall is safer than
             # flattening or materializing it here.
@@ -3139,6 +3268,10 @@ def analyze_shader_loop_reductions(
             )
             for _name, initial, updated in loop.carried_bindings
             if int(updated) != int(initial)
+            # Callsite structural specialization can prove the only branch
+            # containing this update unreachable. The carried identity then
+            # has no backedge value in the specialized graph.
+            and int(updated) in graph.G
             # An IndexedStore is the write instruction for resident table
             # storage, not a newly produced table value.  The table pointer
             # remains the same across iterations; requiring this instruction
@@ -3230,6 +3363,7 @@ def analyze_shader_loop_reductions(
                     recursion_region_id=recursion_region_id,
                     predicate_expression=while_predicate_expression,
                     sequence_mutations=sequence_mutations,
+                    source_loop_node_id=int(loop.node_id),
                 )
             return LoopBlock(
                 induction=induction_name,

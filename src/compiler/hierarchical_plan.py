@@ -101,14 +101,29 @@ def plan_region_to_ssa_instrs(region: PlanClosure) -> tuple[Instr, ...]:
         "logical_not", "is", "is_not", "contains", "not_contains",
     }
     integer_result_ops = {"len", "length", "extent"}
+    scalar_cast_dtypes = {
+        "float": "float64",
+        "int": "int",
+        "bool": "bool",
+    }
     for item in region.items:
         if not isinstance(item, PlanLine):
             continue
         opcode = str(item.opcode).casefold()
+        if item.outputs and opcode in {"const", "constant"}:
+            literal = dict(item.attributes).get("value")
+            if isinstance(literal, bool):
+                dtype_of[int(item.outputs[0])] = "bool"
+            elif isinstance(literal, int):
+                dtype_of[int(item.outputs[0])] = "int"
+            elif isinstance(literal, float):
+                dtype_of[int(item.outputs[0])] = "float64"
         if item.outputs and opcode in predicate_ops:
             dtype_of[int(item.outputs[0])] = "bool"
         elif item.outputs and opcode in integer_result_ops:
             dtype_of[int(item.outputs[0])] = "int"
+        elif item.outputs and opcode in scalar_cast_dtypes:
+            dtype_of[int(item.outputs[0])] = scalar_cast_dtypes[opcode]
         if opcode == "getelementptr":
             # Only repository address arithmetic requires integer indices.
             # High-level Indexed/IndexedStore may be a dictionary lookup whose
@@ -131,6 +146,24 @@ def plan_region_to_ssa_instrs(region: PlanClosure) -> tuple[Instr, ...]:
         return made
 
     values: dict[int, SSAValue] = {}
+    next_value_id = max((
+        int(value_id)
+        for item in region.items
+        if isinstance(item, PlanLine)
+        for value_id in (*item.inputs, *item.outputs)
+    ), default=-1) + 1
+
+    def fresh_like(result: SSAValue) -> SSAValue:
+        nonlocal next_value_id
+        made = SSAValue(
+            next_value_id,
+            dtype=result.dtype,
+            shape=tuple(result.shape),
+        )
+        values[next_value_id] = made
+        next_value_id += 1
+        return made
+
     instructions = []
     for item in region.items:
         if not isinstance(item, PlanLine):
@@ -144,12 +177,113 @@ def plan_region_to_ssa_instrs(region: PlanClosure) -> tuple[Instr, ...]:
         result = (
             value(int(item.outputs[0])) if item.outputs else None
         )
+        # A Python identity replacement is already the call's graph-native
+        # meaning.  Its callable/definition input is provenance, not runtime
+        # data.  Keep this distinction explicit through argument roles instead
+        # of teaching each backend that ``float`` (or every future identity)
+        # happens to carry a CPython function object in operand zero.
+        paired_inputs = tuple(zip(item.inputs, item.input_roles))
+        if len(item.input_roles) == len(item.inputs):
+            semantic_inputs = tuple(
+                int(value_id)
+                for value_id, role in paired_inputs
+                if str(role).casefold() not in {
+                    "callee", "func", "function", "definition",
+                }
+            )
+            semantic_roles = tuple(
+                str(role)
+                for _value_id, role in paired_inputs
+                if str(role).casefold() not in {
+                    "callee", "func", "function", "definition",
+                }
+            )
+        else:
+            semantic_inputs = tuple(int(value_id) for value_id in item.inputs)
+            semantic_roles = tuple(str(role) for role in item.input_roles)
+
+        opcode = str(item.opcode)
+        attributes = dict(item.attributes)
+        if opcode.casefold() in scalar_cast_dtypes:
+            attributes.setdefault("source_operator", opcode)
+            attributes.setdefault(
+                "target_dtype", scalar_cast_dtypes[opcode.casefold()]
+            )
+            opcode = "Cast"
+        elif opcode.casefold() == "tensor":
+            # AbstractTensor.tensor(x) is the general ensure-type idiom.  Once
+            # x reaches typed repository SSA, normalization is represented by
+            # a same-value cast carrying the schema promise; target code does
+            # not reconstruct or invoke a Python object.
+            attributes.setdefault("source_operator", opcode)
+            attributes.setdefault("target_dtype", dtype_of.get(
+                int(item.outputs[0]) if item.outputs else -1, "float64"
+            ))
+            opcode = "Cast"
+
+        scalar_spelling = {
+            "add": "Add", "sub": "Sub", "mul": "Mul",
+            "truediv": "Div", "div": "Div", "floordiv": "FloorDiv",
+            "mod": "Mod", "pow": "Pow", "neg": "Neg", "abs": "Abs",
+            "equal": "Eq", "not_equal": "Ne", "less": "Lt",
+            "less_equal": "Le", "greater": "Gt", "greater_equal": "Ge",
+            "logical_and": "LAnd", "logical_or": "LOr",
+            "logical_not": "LNot", "maximum": "Max", "minimum": "Min",
+            "sqrt": "Sqrt", "exp": "Exp", "log": "Log",
+        }
+        is_scalar = (
+            result is not None
+            and not tuple(result.shape)
+            and all(not tuple(value(value_id).shape) for value_id in semantic_inputs)
+        )
+        if is_scalar and opcode.casefold() in scalar_spelling:
+            opcode = scalar_spelling[opcode.casefold()]
+
+        # Python's variadic min/max and the tensor clamp convenience are
+        # ordinary binary SSA folds.  Decomposing them here keeps evaluation
+        # order and data dependencies visible, and gives every backend the
+        # same primitive program instead of four bespoke builtin handlers.
+        fold_opcode = {"max": "Max", "min": "Min"}.get(opcode.casefold())
+        if is_scalar and fold_opcode is not None and len(semantic_inputs) >= 2:
+            operands = [value(value_id) for value_id in semantic_inputs]
+            accumulator = operands[0]
+            for position, operand in enumerate(operands[1:], 1):
+                fold_result = (
+                    result if position == len(operands) - 1
+                    else fresh_like(result)
+                )
+                instructions.append(Instr(
+                    fold_opcode,
+                    [accumulator, operand],
+                    fold_result,
+                    arg_roles=["left", "right"],
+                    attributes={**attributes, "source_operator": opcode},
+                ))
+                accumulator = fold_result
+            continue
+        if is_scalar and opcode.casefold() == "clamp" and len(semantic_inputs) == 3:
+            operand, lower, upper = (
+                value(value_id) for value_id in semantic_inputs
+            )
+            bounded_below = fresh_like(result)
+            instructions.append(Instr(
+                "Max", [operand, lower], bounded_below,
+                arg_roles=["operand", "lower"],
+                attributes={**attributes, "source_operator": opcode},
+            ))
+            instructions.append(Instr(
+                "Min", [bounded_below, upper], result,
+                arg_roles=["operand", "upper"],
+                attributes={**attributes, "source_operator": opcode},
+            ))
+            continue
+
         instructions.append(Instr(
-            item.opcode,
-            [value(value_id) for value_id in item.inputs],
+            opcode,
+            [value(value_id) for value_id in semantic_inputs],
             result,
-            arg_roles=list(item.input_roles),
-            attributes=dict(item.attributes),
+            arg_roles=list(semantic_roles),
+            attributes=attributes,
         ))
     return tuple(instructions)
 

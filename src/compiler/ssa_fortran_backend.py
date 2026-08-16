@@ -29,6 +29,8 @@ common case here.
 from __future__ import annotations
 
 import math
+import hashlib
+import re
 import shutil
 import struct
 import subprocess
@@ -46,6 +48,41 @@ from ..transmogrifier.ssa import (
     SSATensorTable,
 )
 from .string_table import NONE_TOKEN as _NONE_TOKEN, string_token as _string_token
+
+
+_FORTRAN_IDENTIFIER_LIMIT = 63
+
+
+def _fortran_symbol_table(names: Iterable[str]) -> dict[str, str]:
+    """Return stable, collision-free Fortran identifiers for authored names.
+
+    The authored name remains the bind(C) symbol and public API identity.
+    Only the module-local procedure identifier is shortened, because Fortran
+    2008 limits identifiers to 63 characters and compares them case
+    insensitively.
+    """
+
+    result: dict[str, str] = {}
+    occupied: set[str] = set()
+    for authored in sorted(map(str, names)):
+        cleaned = re.sub(r"[^A-Za-z0-9_]", "_", authored)
+        if not cleaned or not cleaned[0].isalpha():
+            cleaned = "f_" + cleaned
+        candidate = cleaned
+        if (
+            len(candidate) > _FORTRAN_IDENTIFIER_LIMIT
+            or candidate.casefold() in occupied
+        ):
+            digest = hashlib.sha256(authored.encode("utf-8")).hexdigest()[:12]
+            suffix = "__" + digest
+            candidate = cleaned[:_FORTRAN_IDENTIFIER_LIMIT - len(suffix)] + suffix
+        if candidate.casefold() in occupied:
+            raise FortranEmissionError(
+                f"Fortran symbol shortening collided for {authored!r}"
+            )
+        occupied.add(candidate.casefold())
+        result[authored] = candidate
+    return result
 
 # Fortran intrinsic (or expression template) for each SSA operation.  ``{0}``
 # and ``{1}`` are the operand expressions.  Anything absent is reported as an
@@ -79,6 +116,8 @@ _BINARY: dict[str, str] = {
     "Shr": "shiftr({0}, {1})",
     "AShr": "shifta({0}, {1})",
     "MatMul": "matmul({0}, {1})",
+    "Max": "max({0}, {1})",
+    "Min": "min({0}, {1})",
     # Canonical lowercase spellings used by FusedProgram steps.
     "add": "({0} + {1})",
     "sub": "({0} - {1})",
@@ -129,6 +168,9 @@ _UNARY: dict[str, str] = {
     "sqrt": "sqrt({0})",
     "exp": "exp({0})",
     "log": "log({0})",
+    "Sqrt": "sqrt({0})",
+    "Exp": "exp({0})",
+    "Log": "log({0})",
     "sin": "sin({0})",
     "cos": "cos({0})",
     "tan": "tan({0})",
@@ -217,7 +259,10 @@ _COMPARISON = frozenset(
 _SHAPE_ONLY = frozenset(
     {
         "slice", "reshape", "view", "broadcast_to", "permute", "pad", "stack",
-        "concat", "gather", "scatter", "index_set", "repeat",
+        "concat", "cat", "concatenate", "gather", "scatter", "index_set",
+        "repeat", "flatten",
+        "squeeze", "unsqueeze", "expand", "clone", "copy", "detach",
+        "swapaxes", "transpose",
     }
 )
 
@@ -244,6 +289,7 @@ _DTYPE_KIND: dict[str, str] = {
     "int32": "integer(c_int32_t)",
     "int": "integer(c_int32_t)",
     "bool": "logical(c_bool)",
+    "opaque_ref": "integer(c_int64_t)",
 }
 
 DEFAULT_DTYPE = "float64"
@@ -262,6 +308,7 @@ def supported_tensor_operations() -> frozenset[str]:
     from ..common.tensors.operator_catalog import (
         CANONICAL_ABSTRACT_TENSOR_OPERATORS,
     )
+    from .ssa_numeric_operators import TENSOR_SSA_OPERATORS
 
     registered = (
         frozenset(_BINARY)
@@ -271,7 +318,16 @@ def supported_tensor_operations() -> frozenset[str]:
         | frozenset({
             "tensor_from_list", "where", "fill", "zeros", "zeros_like",
             "empty", "empty_like", "ones", "ones_like", "full", "full_like",
+            "arange", "cumsum",
+            "boolean_mask_select", "double", "float", "int", "long",
+            "long_cast", "to_dtype", "cpu", "tolist",
         })
+    )
+    scalar = frozenset(_BINARY) | frozenset(_UNARY)
+    registered |= frozenset(
+        row.name
+        for row in TENSOR_SSA_OPERATORS
+        if row.is_direct and row.handler.value in scalar
     )
     return frozenset(registered & CANONICAL_ABSTRACT_TENSOR_OPERATORS)
 
@@ -305,6 +361,11 @@ class FortranSubroutine:
     # Rankless SSA values used as address bases are C pointers.  Any ``extent``
     # operation over one requires an explicit companion length in the ABI.
     dynamic_array_extents: tuple[tuple[int, str], ...] = ()
+    # Full runtime dimensions for every shape-dynamic array, including rank
+    # two and higher buffers whose allocation cannot be described by one size.
+    dynamic_array_dimensions: tuple[tuple[int, tuple[str, ...]], ...] = ()
+    # Exact dummy arguments emitted without Fortran ``value``.
+    reference_argument_ids: tuple[int, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -433,7 +494,16 @@ def _array_literal(
     instead of 124416.
     """
 
-    elements = tuple(values)
+    def flatten(items: Sequence[Any]) -> tuple[Any, ...]:
+        flattened = []
+        for item in items:
+            if isinstance(item, (list, tuple)):
+                flattened.extend(flatten(item))
+            else:
+                flattened.append(item)
+        return tuple(flattened)
+
+    elements = flatten(values)
     if not elements:
         kind = _DTYPE_KIND.get(dtype or DEFAULT_DTYPE)
         if kind is None:
@@ -525,15 +595,27 @@ class _FunctionEmitter:
         callee_extents: Mapping[str, Sequence[str]] | None = None,
         callee_arity: Mapping[str, int] | None = None,
         callee_output_count: Mapping[str, int] | None = None,
+        callee_outputs: Mapping[str, Sequence[SSAValue]] | None = None,
+        callee_arguments: Mapping[str, Sequence[SSAValue]] | None = None,
         callee_array_arguments: Mapping[str, Sequence[int]] | None = None,
         callee_inout_pairs: Mapping[
             str, Sequence[tuple[int, int]]
         ] | None = None,
         array_base_ids: Sequence[int] = (),
         mutated_base_ids: Sequence[int] = (),
+        dynamic_array_ranks: Mapping[int, int] | None = None,
+        value_dtypes: Mapping[int, str] | None = None,
         tensor_table: SSATensorTable | None = None,
+        native_symbol: str | None = None,
+        callee_native_symbols: Mapping[str, str] | None = None,
+        extent_namespace: str = "",
     ):
         self.function = function
+        self.native_symbol = str(native_symbol or function.name)
+        self.callee_native_symbols = dict(callee_native_symbols or {})
+        self.extent_namespace = (
+            str(extent_namespace) + "_" if extent_namespace else ""
+        )
         self.dtype = dtype
         self.outputs = tuple(outputs)
         self.tensor_table = tensor_table or SSATensorTable()
@@ -543,10 +625,32 @@ class _FunctionEmitter:
         # assumed-size array it is, with matching intent, and caller and callee
         # agree on rank without positional signature matching.
         self.array_base_ids = {int(value_id) for value_id in array_base_ids}
+        self.array_base_ids.update(
+            int(argument.id)
+            for argument in self.function.args
+            if (
+                str((argument.accounting or {}).get("program_abi_storage"))
+                == "span"
+                or int((argument.accounting or {}).get(
+                    "program_abi_rank", 0
+                )) > 0
+                or int((argument.accounting or {}).get(
+                    "ssa_call_rank", 0
+                )) > 0
+            )
+        )
         self.mutated_base_ids = {int(value_id) for value_id in mutated_base_ids}
         self.callee_extents = dict(callee_extents or {})
         self.callee_arity = dict(callee_arity or {})
         self.callee_output_count = dict(callee_output_count or {})
+        self.callee_outputs = {
+            str(name): tuple(values)
+            for name, values in (callee_outputs or {}).items()
+        }
+        self.callee_arguments = {
+            str(name): tuple(values)
+            for name, values in (callee_arguments or {}).items()
+        }
         self.callee_array_arguments = {
             str(name): frozenset(int(position) for position in positions)
             for name, positions in (callee_array_arguments or {}).items()
@@ -557,8 +661,23 @@ class _FunctionEmitter:
         }
         self._value_types: dict[int, SSAValue] = {}
         self._infer_control_value_types()
+        for value_id, value_dtype in (value_dtypes or {}).items():
+            current = self._value_types.get(int(value_id))
+            if current is None:
+                continue
+            self._value_types[int(value_id)] = SSAValue(
+                current.id,
+                str(value_dtype),
+                tuple(current.shape),
+                current.device,
+                dict(current.accounting or {}),
+            )
+        self.outputs = tuple(self._typed(value) for value in self.outputs)
         self.dynamic_array_extents = {
-            int(instr.args[0].id): f"extent_dynamic_{int(instr.args[0].id)}"
+            int(instr.args[0].id): (
+                f"extent_dynamic_{self.extent_namespace}"
+                f"{int(instr.args[0].id)}"
+            )
             for block in self.function.blocks.values()
             for instr in block.instrs
             if (
@@ -567,6 +686,58 @@ class _FunctionEmitter:
                 and instr.args
                 and int(instr.args[0].id) in self.array_base_ids
                 and not self._typed(instr.args[0]).shape
+            )
+        }
+        # A contracted Python span can deliberately remain shape-dynamic while
+        # still carrying an exact rank.  Fortran assumed-size dummies preserve
+        # that ABI without a descriptor, but every dimension except the last
+        # needs an explicit runtime extent: ``a(n, *)`` for rank two, etc.
+        indexed_ranks: dict[int, int] = {}
+        for block in self.function.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    instruction.op in {"GetElementPtr", "getelementptr"}
+                    and instruction.args
+                ):
+                    base_id = int(instruction.args[0].id)
+                    indexed_ranks[base_id] = max(
+                        indexed_ranks.get(base_id, 0),
+                        len(instruction.args) - 1,
+                    )
+        self.dynamic_array_ranks: dict[int, int] = {
+            int(value_id): int(rank)
+            for value_id, rank in dict(dynamic_array_ranks or {}).items()
+            if int(rank) > 0
+        }
+        for argument in self.function.args:
+            argument_id = int(argument.id)
+            if argument_id not in self.array_base_ids:
+                continue
+            self.dynamic_array_ranks[argument_id] = max(
+                1,
+                self.dynamic_array_ranks.get(argument_id, 0),
+                indexed_ranks.get(argument_id, 0),
+                len(tuple(self._typed(argument).shape or ())),
+                int((argument.accounting or {}).get("program_abi_rank", 0)),
+                int((argument.accounting or {}).get("ssa_call_rank", 0)),
+            )
+        self.dynamic_array_leading_extents = {
+            value_id: (
+                (self.dynamic_array_extents[value_id],)
+                if rank == 1 and value_id in self.dynamic_array_extents
+                else tuple(
+                    f"extent_dynamic_{self.extent_namespace}{value_id}_{axis}"
+                    for axis in range(1, rank + 1)
+                )
+            )
+            for value_id, rank in self.dynamic_array_ranks.items()
+            if (
+                rank > 0
+                and not tuple(
+                    self._value_types[value_id].shape
+                    if value_id in self._value_types
+                    else ()
+                )
             )
         }
         self.shortfalls: list[FortranShortfall] = []
@@ -630,6 +801,37 @@ class _FunctionEmitter:
                 if instr.res is not None:
                     self._prefer_value_type(instr.res)
 
+        # An indexed load has the element dtype of its address base even when
+        # the structural linker left the load occurrence itself untyped.
+        for block in self.function.blocks.values():
+            address_bases: dict[int, SSAValue] = {}
+            for instr in block.instrs:
+                if (
+                    instr.op in {"GetElementPtr", "getelementptr"}
+                    and instr.res is not None
+                    and instr.args
+                    and instr.attributes.get("aggregate_index") is None
+                ):
+                    address_bases[int(instr.res.id)] = self._typed(instr.args[0])
+                elif (
+                    instr.op in {"Load", "load"}
+                    and instr.res is not None
+                    and instr.args
+                    and int(instr.args[0].id) in address_bases
+                ):
+                    base = address_bases[int(instr.args[0].id)]
+                    current = self._typed(instr.res)
+                    self._value_types[int(instr.res.id)] = SSAValue(
+                        instr.res.id,
+                        base.dtype or current.dtype,
+                        tuple(current.shape),
+                        base.device or current.device,
+                        {
+                            **dict(current.accounting or {}),
+                            **dict(base.accounting or {}),
+                        },
+                    )
+
         # A region result paired with an input denotes that input's arena.
         for block in self.function.blocks.values():
             calls: dict[int, tuple[str, Sequence[SSAValue]]] = {}
@@ -668,6 +870,20 @@ class _FunctionEmitter:
                     callee, arguments, output_index = addresses[
                         instr.args[0].id
                     ]
+                    contract_outputs = self.callee_outputs.get(callee, ())
+                    if output_index < len(contract_outputs):
+                        contract = contract_outputs[output_index]
+                        current = self._typed(instr.res)
+                        self._value_types[instr.res.id] = SSAValue(
+                            instr.res.id,
+                            contract.dtype or current.dtype,
+                            tuple(contract.shape or current.shape),
+                            contract.device or current.device,
+                            {
+                                **dict(current.accounting or {}),
+                                **dict(contract.accounting or {}),
+                            },
+                        )
                     for input_index, paired_output in self.callee_inout_pairs.get(
                         callee, ()
                     ):
@@ -842,11 +1058,38 @@ class _FunctionEmitter:
         shape = instr.res.shape
         rank = len(shape)
 
-        if operation in ("cpu", "detach", "tolist") and len(args) == 1:
+        if operation in (
+            "cpu", "detach", "tolist", "clone", "copy", "contiguous",
+        ) and len(args) == 1:
             # These operations cross Python/backend representation boundaries.
             # Inside an already-resident Fortran program the value is in its
             # target representation, so the numerical value is unchanged.
             return args[0]
+
+        if (
+            operation
+            in {"double", "float", "int", "long", "long_cast", "to_dtype"}
+            and len(args) == 1
+        ):
+            requested = str(
+                attributes.get("dtype")
+                or attributes.get("target_dtype")
+                or operation
+            ).lower()
+            if requested in {"double", "float", "float32", "float64"}:
+                kind = "c_float" if requested in {"float", "float32"} else "c_double"
+                return f"real({args[0]}, {kind})"
+            if requested in {"int", "int32", "long", "long_cast", "int64"}:
+                kind = (
+                    "c_int64_t"
+                    if requested in {"long", "long_cast", "int64"}
+                    else "c_int32_t"
+                )
+                return f"int({args[0]}, {kind})"
+            return None
+
+        if operation == "boolean_mask_select" and len(args) == 2:
+            return f"pack({args[0]}, {args[1]})"
 
         reduction_axis = attributes.get("dim", attributes.get("axis"))
         if operation == "extent" and len(args) == 1:
@@ -860,6 +1103,12 @@ class _FunctionEmitter:
             dynamic_extent = self.dynamic_array_extents.get(
                 int(instr.args[0].id)
             )
+            if attributes.get("extent_kind") == "numel":
+                if source_rank > 0:
+                    return f"size({args[0]})"
+                if dynamic_extent is not None:
+                    return dynamic_extent
+                return None
             if source_rank == 0 and dim == 0 and dynamic_extent is not None:
                 return dynamic_extent
             if source_rank == 0 or not (-source_rank <= dim < source_rank):
@@ -901,7 +1150,9 @@ class _FunctionEmitter:
             # already broadcasts into a singleton destination.
             return args[0]
 
-        if operation in ("reshape", "view") and len(args) == 1:
+        if operation in (
+            "reshape", "view", "flatten", "squeeze", "unsqueeze",
+        ) and len(args) == 1:
             # A reshape is defined by row-major element order, but Fortran
             # traverses column-major, so both ends need stating.
             #
@@ -940,7 +1191,7 @@ class _FunctionEmitter:
             order = ", ".join(str(value) for value in range(rank, 0, -1))
             return f"reshape({source}, [{extents}], order=[{order}])"
 
-        if operation == "broadcast_to" and len(args) == 1:
+        if operation in ("broadcast_to", "expand") and len(args) == 1:
             source_shape = tuple(instr.args[0].shape)
             target_shape = tuple(shape)
             if source_shape == target_shape:
@@ -1068,10 +1319,10 @@ class _FunctionEmitter:
             extents = ", ".join(str(int(size)) for size in shape)
             return f"reshape({args[0]}, [{extents}], order=[{order}])"
 
-        if operation == "transpose" and len(args) == 1:
+        if operation in ("transpose", "swapaxes") and len(args) == 1:
             source_rank = len(self._typed(instr.args[0]).shape)
-            dim0 = int(attributes.get("dim0", 0))
-            dim1 = int(attributes.get("dim1", 1))
+            dim0 = int(attributes.get("dim0", attributes.get("axis1", 0)))
+            dim1 = int(attributes.get("dim1", attributes.get("axis2", 1)))
             if source_rank == 2 and {dim0 % 2, dim1 % 2} == {0, 1}:
                 return f"transpose({args[0]})"
 
@@ -1088,6 +1339,7 @@ class _FunctionEmitter:
         instruction that produced it.
         """
 
+        value = self._typed(value)
         # LLVM's i1 is intrinsically a logical value.  Check the recorded
         # scalar kind before examining an inlined producer: an imported
         # ``fcmp`` is represented as an ordinary Call and would otherwise be
@@ -1221,7 +1473,9 @@ class _FunctionEmitter:
             # the scalar keys None, so a boolean mask constant is only
             # visible here.
             values = instr.attributes.get("values")
-            if values is not None and len(values) and all(
+            if isinstance(values, bool):
+                return True
+            if isinstance(values, (list, tuple)) and values and all(
                 isinstance(element, bool) for element in values
             ):
                 return True
@@ -1311,7 +1565,17 @@ class _FunctionEmitter:
         branch before spelling the intrinsic.
         """
 
-        result_dtype = str(getattr(instr.res, "dtype", None) or self.dtype)
+        return self._coerce_value_to_target(instr.res, value, expression)
+
+    def _coerce_value_to_target(
+        self,
+        target: SSAValue,
+        value: SSAValue,
+        expression: str,
+    ) -> str:
+        """Convert a scalar expression to an SSA target's inferred kind."""
+
+        result_dtype = str(self._typed(target).dtype or self.dtype)
         target_logical = result_dtype in _LOGICAL_DTYPES
         source_logical = self._is_logical(value)
         if target_logical:
@@ -1342,6 +1606,49 @@ class _FunctionEmitter:
             else f"int({expression}, c_int64_t)"
         )
 
+    def _coerce_call_operand(
+        self, value: SSAValue, expression: str, target: SSAValue | None
+    ) -> str:
+        """Spell the explicit scalar conversion required by a native formal."""
+
+        if target is None:
+            return expression
+        source_dtype = str(self._typed(value).dtype or self.dtype)
+        target_dtype = str(target.dtype or self.dtype)
+        source_logical = source_dtype in _LOGICAL_DTYPES
+        target_logical = target_dtype in _LOGICAL_DTYPES
+        if source_logical and target_logical:
+            return f"logical({expression}, kind=c_bool)"
+        if source_logical != target_logical:
+            if target_logical:
+                zero = (
+                    "0_c_int64_t" if source_dtype.endswith("int64")
+                    else "0_c_int32_t" if source_dtype.endswith(("int32", "int"))
+                    else "0.0_c_double"
+                )
+                return f"({expression} /= {zero})"
+            numeric = _UNARY["bool_to_float64"].format(expression)
+            return (
+                f"int({numeric}, c_int64_t)"
+                if target_dtype in _INTEGER_DTYPES
+                else numeric
+            )
+        source_integer = source_dtype in _INTEGER_DTYPES
+        target_integer = target_dtype in _INTEGER_DTYPES
+        if target_integer:
+            kind = (
+                "c_int64_t" if target_dtype.endswith("64")
+                else "c_int32_t"
+            )
+            return (
+                expression
+                if source_dtype == target_dtype
+                else f"int({expression}, {kind})"
+            )
+        if source_integer and not target_integer:
+            return f"real({expression}, c_double)"
+        return expression
+
     def _conform(self, instr: Instr, args: list[str]) -> list[str] | None:
         """Make an elementwise op's operands conform to its result shape.
 
@@ -1356,6 +1663,9 @@ class _FunctionEmitter:
         if instr.res is None:
             return args
         result_shape = tuple(instr.res.shape)
+        result_rank = self.dynamic_array_ranks.get(
+            int(instr.res.id), len(result_shape)
+        )
         result_count = _element_count(result_shape)
         conformed: list[str] = []
         for position, expression in enumerate(args):
@@ -1367,6 +1677,13 @@ class _FunctionEmitter:
                 continue
             value = instr.args[position]
             shape = tuple(value.shape)
+            source_rank = self.dynamic_array_ranks.get(
+                int(value.id), len(shape)
+            )
+            if result_rank == 0 and source_rank > 0 and not shape:
+                subscripts = ", ".join("1" for _ in range(source_rank))
+                conformed.append(f"{expression}({subscripts})")
+                continue
             if shape == result_shape or not shape:
                 conformed.append(expression)
                 continue
@@ -1472,7 +1789,25 @@ class _FunctionEmitter:
                 return None
             consumed.append(aggregate)
 
-        ordered_outputs = [outputs[key] for key in sorted(outputs)]
+        # Repository outputs are identities, not tuple-slot occurrences.  A
+        # source return may deliberately repeat one value in more than one
+        # aggregate position; module signature construction canonicalizes
+        # those positions by SSA id.  Apply the same canonicalization at the
+        # call site so a repeated projection does not become an extra native
+        # argument (the caller linker already makes both projections name the
+        # same SSA value).
+        ordered_outputs = []
+        seen_output_ids: set[int] = set()
+        for position in sorted(outputs):
+            value = outputs[position]
+            value_id = int(value.id)
+            if value_id in seen_output_ids:
+                continue
+            seen_output_ids.add(value_id)
+            ordered_outputs.append(value)
+        expected_outputs = int(self.callee_output_count.get(str(callee), 0))
+        if expected_outputs and len(ordered_outputs) != expected_outputs:
+            return None
         for value in ordered_outputs:
             self._locals[value.id] = self._typed(value)
         for value in consumed:
@@ -1492,12 +1827,22 @@ class _FunctionEmitter:
         array_positions = self.callee_array_arguments.get(
             str(callee), frozenset()
         )
-        input_arguments = [
-            self._call_operand(
-                value, array_expected=index in array_positions
+        formal_arguments = self.callee_arguments.get(str(callee), ())
+        input_arguments = []
+        for argument_index, value in enumerate(instr.args):
+            array_expected = argument_index in array_positions
+            operand = self._call_operand(
+                value, array_expected=array_expected
             )
-            for index, value in enumerate(instr.args)
-        ]
+            if not array_expected:
+                operand = self._coerce_call_operand(
+                    value,
+                    operand,
+                    formal_arguments[argument_index]
+                    if argument_index < len(formal_arguments)
+                    else None,
+                )
+            input_arguments.append(operand)
         output_arguments = [_name(value) for value in ordered_outputs]
         prelude = []
         aliased_output_indices = set()
@@ -1510,8 +1855,27 @@ class _FunctionEmitter:
             ):
                 return None
             output_argument = output_arguments[output_index]
+            source_value = self._typed(instr.args[input_index])
+            target_value = self._typed(ordered_outputs[output_index])
+            source_expression = input_arguments[input_index]
+            source_logical = self._is_logical(source_value)
+            target_logical = str(target_value.dtype or "") in _LOGICAL_DTYPES
+            if target_logical and not source_logical:
+                source_dtype = str(source_value.dtype or self.dtype)
+                zero = (
+                    "0_c_int64_t" if source_dtype.endswith("int64")
+                    else "0_c_int32_t" if source_dtype.endswith(("int32", "int"))
+                    else "0.0_c_double"
+                )
+                source_expression = f"({source_expression} /= {zero})"
+            elif source_logical and not target_logical:
+                source_expression = _UNARY["bool_to_float64"].format(
+                    source_expression
+                )
+                if str(target_value.dtype or self.dtype) in _INTEGER_DTYPES:
+                    source_expression = f"int({source_expression}, c_int64_t)"
             prelude.append(
-                f"    {output_argument} = {input_arguments[input_index]}"
+                f"    {output_argument} = {source_expression}"
             )
             input_arguments[input_index] = output_argument
             aliased_output_indices.add(int(output_index))
@@ -1524,7 +1888,8 @@ class _FunctionEmitter:
                 if index not in aliased_output_indices
             ),
         ]
-        return [*prelude, f"    call {callee}({', '.join(arguments)})"]
+        native_callee = self.callee_native_symbols.get(str(callee), str(callee))
+        return [*prelude, f"    call {native_callee}({', '.join(arguments)})"]
 
     def _ssa_call(self, instr: Instr) -> list[str] | None:
         """Emit an ordinary call to another fully present SSA function."""
@@ -1541,6 +1906,7 @@ class _FunctionEmitter:
         output_count = int(self.callee_output_count.get(callee, 0))
         output_argument = instr.attributes.get("ssa_output_argument")
         array_positions = self.callee_array_arguments.get(callee, frozenset())
+        formal_arguments = self.callee_arguments.get(callee, ())
         call_operands = []
         for position, value in enumerate(instr.args):
             operand = self._call_operand(
@@ -1551,6 +1917,14 @@ class _FunctionEmitter:
                 if _element_count(tuple(typed.shape)) != 1:
                     return None
                 operand += "(" + ", ".join("1" for _ in typed.shape) + ")"
+            if position not in array_positions:
+                operand = self._coerce_call_operand(
+                    value,
+                    operand,
+                    formal_arguments[position]
+                    if position < len(formal_arguments)
+                    else None,
+                )
             call_operands.append(operand)
         arguments = [
             *self.callee_extents.get(callee, ()),
@@ -1571,7 +1945,8 @@ class _FunctionEmitter:
             arguments.append(_name(instr.res))
         elif output_count != 0 or instr.res is not None:
             return None
-        return [f"    call {callee}({', '.join(arguments)})"]
+        native_callee = self.callee_native_symbols.get(str(callee), str(callee))
+        return [f"    call {native_callee}({', '.join(arguments)})"]
 
     def _indexed_store(self, instr: Instr) -> list[str] | None:
         """``collection[i] = value``, without materialising an address.
@@ -1608,12 +1983,16 @@ class _FunctionEmitter:
         )
         source_expression = self._operand(source)
         collection_dtype = str(self._typed(collection).dtype or self.dtype)
-        if collection_dtype in _LOGICAL_DTYPES and not self._is_logical(source):
-            source_expression = f"({source_expression} /= 0)"
-        elif collection_dtype in _INTEGER_DTYPES:
-            source_dtype = str(self._typed(source).dtype or self.dtype)
-            if source_dtype not in _INTEGER_DTYPES:
-                source_expression = f"int({source_expression}, c_int)"
+        source_dtype = str(self._typed(source).dtype or self.dtype)
+        if source_dtype == "opaque_ref" and collection_dtype not in _INTEGER_DTYPES:
+            # Object scalar arenas are fixed-width f64 words. Preserve an
+            # opaque handle's bits exactly instead of numerically converting
+            # i64 through a lossy real value.
+            source_expression = f"transfer({source_expression}, 0.0_c_double)"
+        else:
+            source_expression = self._coerce_value_to_target(
+                collection, source, source_expression
+            )
         return [
             f"    {self._operand(collection)}({subscripts})"
             f" = {source_expression}"
@@ -1815,7 +2194,7 @@ class _FunctionEmitter:
                 f"    {target}({', '.join(subscripts)}) = {value}",
             ]
 
-        if operation in ("concat", "concatenate"):
+        if operation in ("concat", "concatenate", "cat"):
             # Concatenation writes each source into its own run of the joined
             # dimension. Fortran has no general concat intrinsic, but a
             # section assignment per source says it exactly, at any rank.
@@ -1946,6 +2325,30 @@ class _FunctionEmitter:
         if op in {"SiToFp", "UiToFp"} and len(instr.args) == 1 and self._is_logical(instr.args[0]):
             return _UNARY["bool_to_float64"].format(args[0])
 
+        if op in {"LAnd", "LOr", "logical_and", "logical_or"} and len(args) == 2:
+            logical_args = []
+            for value, expression in zip(instr.args, args):
+                if (
+                    self.dynamic_array_ranks.get(int(instr.res.id), 0) == 0
+                    and self.dynamic_array_ranks.get(int(value.id), 0) > 0
+                ):
+                    rank = self.dynamic_array_ranks[int(value.id)]
+                    expression += "(" + ", ".join(
+                        "1" for _ in range(rank)
+                    ) + ")"
+                if self._is_logical(value):
+                    logical_args.append(expression)
+                    continue
+                dtype = str(self._typed(value).dtype or self.dtype)
+                zero = (
+                    "0_c_int64_t" if dtype.endswith("int64")
+                    else "0_c_int32_t" if dtype.endswith(("int32", "int"))
+                    else "0.0_c_double"
+                )
+                logical_args.append(f"({expression} /= {zero})")
+            operator = ".and." if op in {"LAnd", "logical_and"} else ".or."
+            return f"({logical_args[0]} {operator} {logical_args[1]})"
+
         if op in {"And", "Or", "Xor"} and len(instr.args) == 2 and all(
             self._is_logical(value) for value in instr.args
         ):
@@ -2005,6 +2408,9 @@ class _FunctionEmitter:
             token = int(instr.attributes["token"])
             return f"{token}_c_int64_t"
 
+        if op == "StaticRef":
+            return f"{int(instr.attributes['reference_handle'])}_c_int64_t"
+
         # A token comparison is a direct identity test on typed i64 values.
         if instr.attributes.get("string_compare") and op in (
             "equal", "not_equal", "Eq", "Ne"
@@ -2020,8 +2426,16 @@ class _FunctionEmitter:
                 # the scalar "constant" key.  Reading only "constant" here
                 # yielded None and reported "cannot express literal None",
                 # which named the missing key rather than the real content.
+                values = instr.attributes["values"]
+                if not instr.res.shape and not isinstance(values, (list, tuple)):
+                    # ``tensor_from_list`` is also the historical spelling
+                    # used for captured scalar and word constants.  Those
+                    # values are already scalar; iterating a float is an
+                    # error and iterating a word would silently turn it into
+                    # an array of character tokens.
+                    return _literal(values)
                 return _array_literal(
-                    instr.attributes["values"],
+                    values,
                     instr.res.shape,
                     dtype=instr.res.dtype or self.dtype,
                 )
@@ -2053,17 +2467,28 @@ class _FunctionEmitter:
                     )
                     for position in positions
                 )
-                return f"{self._operand(collection)}({subscripts})"
+                loaded = f"{self._operand(collection)}({subscripts})"
+                if str(instr.res.dtype or "") == "opaque_ref" and str(
+                    self._typed(collection).dtype or self.dtype
+                ) not in _INTEGER_DTYPES:
+                    return f"transfer({loaded}, 0_c_int64_t)"
+                return loaded
             if int(instr.args[0].id) in self.array_base_ids:
                 return f"{self._operand(instr.args[0])}(1)"
 
-        if op == "Cast" and len(args) == 1:
-            result_dtype = str(instr.res.dtype or self.dtype)
-            if result_dtype in {"double", "float", "float32", "float64"}:
-                return f"real({args[0]}, c_double)"
-            if result_dtype in _INTEGER_DTYPES:
-                return f"int({args[0]}, c_int)"
-            return args[0]
+        if op in {"Cast", "CastLike", "cast_like"} and args:
+            operand = args[0]
+            source_rank = self.dynamic_array_ranks.get(
+                int(instr.args[0].id), len(tuple(self._typed(instr.args[0]).shape))
+            )
+            result_rank = self.dynamic_array_ranks.get(
+                int(instr.res.id), len(tuple(self._typed(instr.res).shape))
+            )
+            if source_rank > 0 and result_rank == 0:
+                operand += "(" + ", ".join("1" for _ in range(source_rank)) + ")"
+            return self._coerce_value_to_target(
+                instr.res, instr.args[0], operand
+            )
 
         structural = self._structural(instr, args, op)
         if structural is not None:
@@ -2325,7 +2750,10 @@ class _FunctionEmitter:
         for predecessor, result, incoming in self._phi_targets.get(target, ()):
             if predecessor != source:
                 continue
-            body.append(f"{pad}{_name(result)} = {_name(incoming)}")
+            expression = self._coerce_value_to_target(
+                result, incoming, _name(incoming)
+            )
+            body.append(f"{pad}{_name(result)} = {expression}")
 
     def _label(self, block_name: str) -> int:
         ordered = list(self.function.blocks)
@@ -2431,10 +2859,21 @@ class _FunctionEmitter:
             set(dim_extents.values())
             | called_extent_names
             | set(self.dynamic_array_extents.values())
+            | {
+                extent
+                for extents in self.dynamic_array_leading_extents.values()
+                for extent in extents
+            }
         )
         self.extent_names = tuple(extent_names)
         argument_ids = {argument.id for argument in self.function.args}
         output_ids = {value.id for value in self.outputs}
+        assigned_ids = {
+            int(instruction.res.id)
+            for block in self.function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        }
         arguments = list(extent_names)
         arguments.extend(_name(a) for a in self.function.args)
         arguments.extend(
@@ -2447,6 +2886,24 @@ class _FunctionEmitter:
             f"    integer(c_int), intent(in), value :: {extent}"
             for extent in extent_names
         ]
+        reference_argument_ids = {
+            int(argument.id)
+            for occurrence in self.function.args
+            for argument in (self._typed(occurrence),)
+            if (
+                _is_array(argument)
+                or int(argument.id) in self.array_base_ids
+                or int(argument.id) in output_ids
+                or int(argument.id) in assigned_ids
+                or int(argument.id) in self.mutated_base_ids
+                or (
+                    int(argument.id) in self._collections
+                    and self._collection_extent(
+                        self._collections[int(argument.id)]
+                    ) is not None
+                )
+            )
+        }
         # A parameter used as an address base but with no compile-time shape is
         # a DYNAMIC array: a runtime-sized buffer indexed by a runtime value.
         # bind(C) forbids assumed-shape (needs a descriptor the C caller cannot
@@ -2454,7 +2911,8 @@ class _FunctionEmitter:
         # indexes without knowing the extent -- is interoperable and is exactly
         # this case. So compile it as-is, no reduction to a fixed size and no
         # passed extent.
-        for argument in self.function.args:
+        for argument_occurrence in self.function.args:
+            argument = self._typed(argument_occurrence)
             kind = _DTYPE_KIND.get(argument.dtype or self.dtype, "real(c_double)")
             if int(argument.id) in self.array_base_ids and not _is_array(argument):
                 mutated = (
@@ -2462,11 +2920,35 @@ class _FunctionEmitter:
                     or argument.id in output_ids
                 )
                 intent = "inout" if mutated else "in"
+                leading_extents = self.dynamic_array_leading_extents.get(
+                    int(argument.id), ()
+                )
+                dimensions = ", ".join(
+                    leading_extents if leading_extents else ("*",)
+                )
                 declarations.append(
-                    f"    {kind}, intent({intent}) :: {_name(argument)}(*)"
+                    f"    {kind}, intent({intent}) :: "
+                    f"{_name(argument)}({dimensions})"
                 )
                 continue
             if argument.id in output_ids:
+                if _is_array(argument):
+                    declarations.append(
+                        f"    {kind}, intent(inout) :: {_name(argument)}({dims(argument)})"
+                    )
+                else:
+                    declarations.append(
+                        f"    {kind}, intent(inout) :: {_name(argument)}"
+                    )
+                continue
+            if (
+                int(argument.id) in assigned_ids
+                or int(argument.id) in self.mutated_base_ids
+            ):
+                # A linked callee may publish directly into a caller value
+                # that is also part of this wrapper's incoming frame.  That
+                # is a genuine in/out ABI slot, even when it is not one of
+                # the wrapper's final public outputs.
                 if _is_array(argument):
                     declarations.append(
                         f"    {kind}, intent(inout) :: {_name(argument)}({dims(argument)})"
@@ -2507,7 +2989,15 @@ class _FunctionEmitter:
             if value.id in argument_ids:
                 continue
             kind = _DTYPE_KIND.get(value.dtype or self.dtype, "real(c_double)")
-            if _is_array(value):
+            dynamic_extents = self.dynamic_array_leading_extents.get(
+                int(value.id), ()
+            )
+            if dynamic_extents:
+                declarations.append(
+                    f"    {kind}, intent(out) :: {_name(value)}"
+                    f"({', '.join(dynamic_extents)})"
+                )
+            elif _is_array(value):
                 declarations.append(
                     f"    {kind}, intent(out) :: {_name(value)}({dims(value)})"
                 )
@@ -2523,7 +3013,15 @@ class _FunctionEmitter:
             if value.id in bound:
                 continue
             kind = _DTYPE_KIND.get(value.dtype or self.dtype, "real(c_double)")
-            if _is_array(value):
+            dynamic_extents = self.dynamic_array_leading_extents.get(
+                int(value.id), ()
+            )
+            if dynamic_extents:
+                declarations.append(
+                    f"    {kind} :: {_name(value)}"
+                    f"({', '.join(dynamic_extents)})"
+                )
+            elif _is_array(value):
                 # An automatic array sized by its own extents: no allocate,
                 # no heap.
                 declarations.append(
@@ -2537,15 +3035,16 @@ class _FunctionEmitter:
         )
 
         name = self.function.name
+        native_name = self.native_symbol
         lines = [
-            f"  subroutine {name}({', '.join(arguments)}) bind(C, name=\"{name}\")",
+            f"  subroutine {native_name}({', '.join(arguments)}) bind(C, name=\"{name}\")",
             "    use, intrinsic :: iso_c_binding",
             "    use, intrinsic :: ieee_arithmetic",
             "    implicit none",
             *declarations,
             "",
             *body,
-            f"  end subroutine {name}",
+            f"  end subroutine {native_name}",
         ]
         return FortranSubroutine(
             name,
@@ -2553,6 +3052,11 @@ class _FunctionEmitter:
             tuple(self.shortfalls),
             tuple(extent_names),
             tuple(sorted(self.dynamic_array_extents.items())),
+            tuple(sorted(
+                (int(value_id), tuple(dimensions))
+                for value_id, dimensions in self.dynamic_array_leading_extents.items()
+            )),
+            tuple(sorted(reference_argument_ids)),
         )
 
 
@@ -2564,13 +3068,20 @@ def emit_function(
     callee_extents: Mapping[str, Sequence[str]] | None = None,
     callee_arity: Mapping[str, int] | None = None,
     callee_output_count: Mapping[str, int] | None = None,
+    callee_outputs: Mapping[str, Sequence[SSAValue]] | None = None,
+    callee_arguments: Mapping[str, Sequence[SSAValue]] | None = None,
     callee_array_arguments: Mapping[str, Sequence[int]] | None = None,
     callee_inout_pairs: Mapping[
         str, Sequence[tuple[int, int]]
     ] | None = None,
     array_base_ids: Sequence[int] = (),
     mutated_base_ids: Sequence[int] = (),
+    dynamic_array_ranks: Mapping[int, int] | None = None,
+    value_dtypes: Mapping[int, str] | None = None,
     tensor_table: SSATensorTable | None = None,
+    native_symbol: str | None = None,
+    callee_native_symbols: Mapping[str, str] | None = None,
+    extent_namespace: str = "",
 ) -> FortranSubroutine:
     """Translate one SSA function into a bind(C) Fortran subroutine.
 
@@ -2605,11 +3116,18 @@ def emit_function(
         callee_extents=callee_extents,
         callee_arity=callee_arity,
         callee_output_count=callee_output_count,
+        callee_outputs=callee_outputs,
+        callee_arguments=callee_arguments,
         callee_array_arguments=callee_array_arguments,
         callee_inout_pairs=callee_inout_pairs,
         array_base_ids=array_base_ids,
         mutated_base_ids=mutated_base_ids,
+        dynamic_array_ranks=dynamic_array_ranks,
+        value_dtypes=value_dtypes,
         tensor_table=tensor_table,
+        native_symbol=native_symbol,
+        callee_native_symbols=callee_native_symbols,
+        extent_namespace=extent_namespace,
     ).emit()
 
 
@@ -2824,6 +3342,12 @@ def emit_module(
         )
         if resolved:
             named_outputs[function_name] = resolved
+    named_outputs = {
+        function_name: tuple({
+            int(value.id): value for value in values
+        }.values())
+        for function_name, values in named_outputs.items()
+    }
     roots = {
         str(name)
         for name in named_outputs
@@ -2888,6 +3412,13 @@ def emit_module(
             for name, function in functions.items()
             if name in reachable
         }
+    native_symbols = _fortran_symbol_table(functions)
+    extent_namespaces = {
+        function_name: hashlib.sha256(
+            str(function_name).encode("utf-8")
+        ).hexdigest()[:12]
+        for function_name in functions
+    }
     # Two passes: a subroutine that calls another must pass exactly the
     # extents that one declares, and those are only known once it has been
     # emitted. The first pass is discarded apart from its signatures.
@@ -2899,45 +3430,29 @@ def emit_module(
         function_name: len(named_outputs.get(function_name, ()))
         for function_name in functions
     }
-    callee_extents = {
-        function_name: emit_function(
-            function,
-            dtype=dtype,
-            outputs=named_outputs.get(function_name, ()),
-            callee_arity=callee_arity,
-            callee_output_count=callee_output_count,
-            tensor_table=module_tensor_tables.get(function_name),
-        ).extent_names
-        for function_name, function in functions.items()
-    }
-    callee_inout_pairs = {
-        function_name: tuple(
-            (input_index, output_index)
-            for input_index, argument in enumerate(function.args)
-            for output_index, output in enumerate(
-                named_outputs.get(function_name, ())
-            )
-            if int(argument.id) == int(output.id)
-        )
-        for function_name, function in functions.items()
-    }
-    # A dynamic array's base is the same value id across ONE method's functions
-    # (a region's captured base is the id the control passes it), but value ids
-    # are only unique within a method -- a region and its control share them,
-    # different methods reuse the same low ids. So group the functions by method
-    # (a region ``M__planned_region_k`` belongs to control ``M``) and collect the
-    # address bases and store-mutated bases per group; every function then sees
-    # exactly its own method's arrays, not another method's collisions.
-    def _method_of(function_name: str) -> str:
-        marker = "__planned_region_"
-        return function_name.split(marker, 1)[0] if marker in function_name else function_name
-
+    # SSA value ids are function-local. Determine address bases from each
+    # function's own operators and explicit ABI contracts; a same-numbered
+    # value in a sibling region is not evidence that this value is an array.
     method_array_bases: dict[str, set[int]] = {}
     method_mutated_bases: dict[str, set[int]] = {}
     for function_name, function in functions.items():
-        method = _method_of(function_name)
+        method = str(function_name)
         array_bases = method_array_bases.setdefault(method, set())
         mutated_bases = method_mutated_bases.setdefault(method, set())
+        array_bases.update(
+            int(argument.id)
+            for argument in function.args
+            if (
+                str((argument.accounting or {}).get("program_abi_storage"))
+                == "span"
+                or int((argument.accounting or {}).get(
+                    "program_abi_rank", 0
+                )) > 0
+                or int((argument.accounting or {}).get(
+                    "ssa_call_rank", 0
+                )) > 0
+            )
+        )
         sequence_arrays = set(map(
             int, function.metadata.get("sequence_array_argument_ids", ())
         ))
@@ -2949,6 +3464,7 @@ def emit_module(
                 if (
                     instruction.op in ("GetElementPtr", "getelementptr")
                     and instruction.args
+                    and instruction.attributes.get("aggregate_index") is None
                 ):
                     array_bases.add(int(instruction.args[0].id))
                     if instruction.res is not None:
@@ -2961,6 +3477,632 @@ def emit_module(
                     base = address_to_base.get(int(instruction.args[1].id))
                     if base is not None:
                         mutated_bases.add(base)
+    # Rank follows actual call edges by argument position. Numeric ids remain
+    # function-local: only the caller operand and the corresponding callee
+    # parameter are unified. This reaches pass-through wrappers without
+    # treating same-numbered values in sibling regions as aliases.
+    function_value_ranks: dict[str, dict[int, int]] = {}
+    for function_name, function in functions.items():
+        ranks: dict[int, int] = {}
+        for value in (
+            *function.args,
+            *(
+                instruction.res
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.res is not None
+            ),
+        ):
+            ranks[int(value.id)] = max(
+                ranks.get(int(value.id), 0),
+                len(tuple(value.shape or ())),
+                int((value.accounting or {}).get("program_abi_rank", 0)),
+                int((value.accounting or {}).get("ssa_call_rank", 0)),
+            )
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    instruction.op in {"GetElementPtr", "getelementptr"}
+                    and instruction.args
+                    and instruction.attributes.get("aggregate_index") is None
+                ):
+                    base_id = int(instruction.args[0].id)
+                    ranks[base_id] = max(
+                        ranks.get(base_id, 0), len(instruction.args) - 1
+                    )
+        for base_id in method_array_bases.get(str(function_name), set()):
+            ranks[int(base_id)] = max(ranks.get(int(base_id), 0), 1)
+        function_value_ranks[str(function_name)] = ranks
+    changed_ranks = True
+
+    def is_scalar_extraction(instruction: Instr, operation: str) -> bool:
+        identity = str(
+            instruction.attributes.get("extraction_identity") or ""
+        )
+        source_operator = str(
+            instruction.attributes.get("source_operator") or ""
+        ).casefold()
+        return (
+            operation in {"Cast", "cast"}
+            and (
+                identity in {"builtins.float", "builtins.int", "builtins.bool"}
+                or source_operator in {"float", "int", "bool"}
+            )
+        )
+
+    def unify_rank(
+        left_ranks: dict[int, int],
+        left: SSAValue,
+        right_ranks: dict[int, int],
+        right: SSAValue,
+    ) -> bool:
+        left_id = int(left.id)
+        right_id = int(right.id)
+        rank = max(
+            left_ranks.get(left_id, 0), right_ranks.get(right_id, 0)
+        )
+        changed = False
+        if left_ranks.get(left_id, 0) != rank:
+            left_ranks[left_id] = rank
+            changed = True
+        if right_ranks.get(right_id, 0) != rank:
+            right_ranks[right_id] = rank
+            changed = True
+        return changed
+
+    while changed_ranks:
+        changed_ranks = False
+        for caller_name, caller in functions.items():
+            caller_ranks = function_value_ranks[str(caller_name)]
+            for block in caller.blocks.values():
+                for instruction in block.instrs:
+                    operation = str(
+                        instruction.attributes.get("tensor_operation")
+                        or instruction.op
+                    )
+                    if (
+                        is_scalar_extraction(instruction, operation)
+                        and instruction.res is not None
+                    ):
+                        # Scalar Python constructors consume one value even
+                        # when their source is represented by a singleton
+                        # arena. Do not inherit the source arena's rank.
+                        pass
+                    elif (
+                        operation in {"CastLike", "cast_like"}
+                        and instruction.res is not None
+                        and instruction.args
+                    ):
+                        result_id = int(instruction.res.id)
+                        value_rank = max(
+                            caller_ranks.get(result_id, 0),
+                            caller_ranks.get(int(instruction.args[0].id), 0),
+                        )
+                        if caller_ranks.get(result_id, 0) != value_rank:
+                            caller_ranks[result_id] = value_rank
+                            changed_ranks = True
+                    elif (
+                        instruction.res is not None
+                        and instruction.args
+                        and (
+                            operation in _BINARY
+                            or operation in _UNARY
+                            or operation in _SHAPE_ONLY
+                            or operation in {"Cast", "cast", "where"}
+                        )
+                    ):
+                        result_id = int(instruction.res.id)
+                        result_rank = max(
+                            caller_ranks.get(result_id, 0),
+                            *(caller_ranks.get(int(value.id), 0)
+                              for value in instruction.args),
+                        )
+                        if caller_ranks.get(result_id, 0) != result_rank:
+                            caller_ranks[result_id] = result_rank
+                            changed_ranks = True
+                    if instruction.op not in {"Call", "call"}:
+                        continue
+                    callee_name = str(
+                        instruction.attributes.get("callee") or ""
+                    )
+                    callee = functions.get(callee_name)
+                    if callee is None:
+                        continue
+                    callee_ranks = function_value_ranks[callee_name]
+                    for actual, formal in zip(instruction.args, callee.args):
+                        if unify_rank(
+                            caller_ranks, actual, callee_ranks, formal
+                        ):
+                            changed_ranks = True
+                    callee_outputs = tuple(named_outputs.get(callee_name, ()))
+                    if not callee_outputs:
+                        continue
+                    caller_outputs: dict[int, SSAValue] = {}
+                    if (
+                        instruction.res is not None
+                        and instruction.attributes.get("result_convention")
+                        == "ssa.aggregate"
+                    ):
+                        addresses = {
+                            int(candidate.res.id): int(
+                                candidate.attributes["aggregate_index"]
+                            )
+                            for candidate in block.instrs
+                            if (
+                                candidate.op in {"GetElementPtr", "getelementptr"}
+                                and candidate.res is not None
+                                and candidate.args
+                                and candidate.args[0] is instruction.res
+                                and candidate.attributes.get("aggregate_index")
+                                is not None
+                            )
+                        }
+                        caller_outputs = {
+                            addresses[int(candidate.args[0].id)]: candidate.res
+                            for candidate in block.instrs
+                            if (
+                                candidate.op in {"Load", "load"}
+                                and candidate.res is not None
+                                and candidate.args
+                                and int(candidate.args[0].id) in addresses
+                            )
+                        }
+                    elif instruction.res is not None and len(callee_outputs) == 1:
+                        caller_outputs[0] = instruction.res
+                    for output_index, callee_output in enumerate(callee_outputs):
+                        caller_output = caller_outputs.get(output_index)
+                        if caller_output is not None and unify_rank(
+                            caller_ranks,
+                            caller_output,
+                            callee_ranks,
+                            callee_output,
+                        ):
+                            changed_ranks = True
+    scalar_control_ids: dict[str, set[int]] = {}
+    for function_name, function in functions.items():
+        named_scalar_parameters = {
+            str(name)
+            for name, receipt in dict(
+                function.metadata.get("parameter_value_abi") or {}
+            ).items()
+            if int(receipt.get("rank", 0)) == 0
+        }
+        parameter_names = {
+            int(value_id): str(name)
+            for name, value_id in function.metadata.get(
+                "parameter_names", ()
+            )
+        }
+        explicit_scalars = {
+            int(value.id)
+            for value in function.args
+            if (
+                str((value.accounting or {}).get("program_abi_storage"))
+                == "scalar"
+                or parameter_names.get(int(value.id))
+                in named_scalar_parameters
+            )
+        }
+        explicit_scalars.update(
+            int(instruction.res.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if (
+                instruction.res is not None
+                and is_scalar_extraction(
+                    instruction,
+                    str(
+                        instruction.attributes.get("tensor_operation")
+                        or instruction.op
+                    ),
+                )
+            )
+        )
+        scalar_control_ids[function_name] = explicit_scalars | {
+            int(instruction.args[0].id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in {"CondBr", "condbr"} and instruction.args
+        }
+    direct_scalar_control_ids = {
+        function_name: set(value_ids)
+        for function_name, value_ids in scalar_control_ids.items()
+    }
+    changed_scalars = True
+    while changed_scalars:
+        changed_scalars = False
+        for function_name, function in functions.items():
+            scalar_ids = scalar_control_ids[function_name]
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    operation = str(
+                        instruction.attributes.get("tensor_operation")
+                        or instruction.op
+                    )
+                    if (
+                        operation in {"CastLike", "cast_like"}
+                        and instruction.res is not None
+                        and len(instruction.args) >= 2
+                        and int(instruction.args[1].id) in scalar_ids
+                    ):
+                        for value in (
+                            instruction.args[0], instruction.res
+                        ):
+                            if int(value.id) not in scalar_ids:
+                                scalar_ids.add(int(value.id))
+                                changed_scalars = True
+                    if (
+                        instruction.res is not None
+                        and int(instruction.res.id) in scalar_ids
+                        and (
+                            operation in _BINARY
+                            or operation in _UNARY
+                            or operation in _SHAPE_ONLY
+                            or instruction.op in {"Phi", "phi"}
+                        )
+                    ):
+                        for argument in instruction.args:
+                            if int(argument.id) not in scalar_ids:
+                                scalar_ids.add(int(argument.id))
+                                changed_scalars = True
+                    if instruction.op not in {"Call", "call"}:
+                        continue
+                    callee_name = str(instruction.attributes.get("callee") or "")
+                    callee = functions.get(callee_name)
+                    if callee is None:
+                        continue
+                    callee_scalars = scalar_control_ids[callee_name]
+                    for actual, formal in zip(instruction.args, callee.args):
+                        actual_id, formal_id = int(actual.id), int(formal.id)
+                        if actual_id in scalar_ids or formal_id in callee_scalars:
+                            if actual_id not in scalar_ids:
+                                scalar_ids.add(actual_id)
+                                changed_scalars = True
+                            if formal_id not in callee_scalars:
+                                callee_scalars.add(formal_id)
+                                changed_scalars = True
+                        if (
+                            actual_id in direct_scalar_control_ids[function_name]
+                            or formal_id in direct_scalar_control_ids[callee_name]
+                        ):
+                            if actual_id not in direct_scalar_control_ids[function_name]:
+                                direct_scalar_control_ids[function_name].add(actual_id)
+                                changed_scalars = True
+                            if formal_id not in direct_scalar_control_ids[callee_name]:
+                                direct_scalar_control_ids[callee_name].add(formal_id)
+                                changed_scalars = True
+                    if instruction.res is None:
+                        continue
+                    addresses = {
+                        int(candidate.res.id): int(candidate.attributes["aggregate_index"])
+                        for candidate in block.instrs
+                        if (
+                            candidate.op in {"GetElementPtr", "getelementptr"}
+                            and candidate.res is not None
+                            and candidate.args
+                            and candidate.args[0] is instruction.res
+                            and candidate.attributes.get("aggregate_index") is not None
+                        )
+                    }
+                    caller_outputs = {
+                        addresses[int(candidate.args[0].id)]: candidate.res
+                        for candidate in block.instrs
+                        if (
+                            candidate.op in {"Load", "load"}
+                            and candidate.res is not None
+                            and candidate.args
+                            and int(candidate.args[0].id) in addresses
+                        )
+                    }
+                    for output_index, callee_output in enumerate(
+                        named_outputs.get(callee_name, ())
+                    ):
+                        caller_output = caller_outputs.get(output_index)
+                        if caller_output is None:
+                            continue
+                        caller_id, callee_id = (
+                            int(caller_output.id), int(callee_output.id)
+                        )
+                        if caller_id in scalar_ids or callee_id in callee_scalars:
+                            if caller_id not in scalar_ids:
+                                scalar_ids.add(caller_id)
+                                changed_scalars = True
+                            if callee_id not in callee_scalars:
+                                callee_scalars.add(callee_id)
+                                changed_scalars = True
+                        if (
+                            caller_id in direct_scalar_control_ids[function_name]
+                            or callee_id in direct_scalar_control_ids[callee_name]
+                        ):
+                            if caller_id not in direct_scalar_control_ids[function_name]:
+                                direct_scalar_control_ids[function_name].add(caller_id)
+                                changed_scalars = True
+                            if callee_id not in direct_scalar_control_ids[callee_name]:
+                                direct_scalar_control_ids[callee_name].add(callee_id)
+                                changed_scalars = True
+    array_contract_ids = {
+        function_name: set(map(int, method_array_bases.get(function_name, set())))
+        for function_name in functions
+    }
+    changed_array_contracts = True
+    while changed_array_contracts:
+        changed_array_contracts = False
+        for caller_name, caller in functions.items():
+            caller_arrays = array_contract_ids[caller_name]
+            for block in caller.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.op not in {"Call", "call"}:
+                        continue
+                    callee_name = str(instruction.attributes.get("callee") or "")
+                    callee = functions.get(callee_name)
+                    if callee is None:
+                        continue
+                    callee_arrays = array_contract_ids[callee_name]
+                    for actual, formal in zip(instruction.args, callee.args):
+                        actual_id, formal_id = int(actual.id), int(formal.id)
+                        if actual_id in caller_arrays or formal_id in callee_arrays:
+                            if actual_id not in caller_arrays:
+                                caller_arrays.add(actual_id)
+                                changed_array_contracts = True
+                            if formal_id not in callee_arrays:
+                                callee_arrays.add(formal_id)
+                                changed_array_contracts = True
+                    if instruction.res is None:
+                        continue
+                    addresses = {
+                        int(candidate.res.id): int(candidate.attributes["aggregate_index"])
+                        for candidate in block.instrs
+                        if (
+                            candidate.op in {"GetElementPtr", "getelementptr"}
+                            and candidate.res is not None
+                            and candidate.args
+                            and candidate.args[0] is instruction.res
+                            and candidate.attributes.get("aggregate_index") is not None
+                        )
+                    }
+                    caller_outputs = {
+                        addresses[int(candidate.args[0].id)]: candidate.res
+                        for candidate in block.instrs
+                        if (
+                            candidate.op in {"Load", "load"}
+                            and candidate.res is not None
+                            and candidate.args
+                            and int(candidate.args[0].id) in addresses
+                        )
+                    }
+                    for output_index, callee_output in enumerate(
+                        named_outputs.get(callee_name, ())
+                    ):
+                        caller_output = caller_outputs.get(output_index)
+                        if caller_output is None:
+                            continue
+                        caller_id, callee_id = int(caller_output.id), int(callee_output.id)
+                        if caller_id in caller_arrays or callee_id in callee_arrays:
+                            if caller_id not in caller_arrays:
+                                caller_arrays.add(caller_id)
+                                changed_array_contracts = True
+                            if callee_id not in callee_arrays:
+                                callee_arrays.add(callee_id)
+                                changed_array_contracts = True
+    for function_name, scalar_ids in scalar_control_ids.items():
+        for value_id in scalar_ids:
+            if value_id not in array_contract_ids[function_name]:
+                function_value_ranks[function_name][value_id] = 0
+    for function_name, array_ids in array_contract_ids.items():
+        protected_scalars = (
+            direct_scalar_control_ids[function_name]
+            - set(map(int, method_array_bases.get(function_name, set())))
+            - set(map(int, array_ids))
+        )
+        for value_id in array_ids:
+            if value_id in protected_scalars:
+                continue
+            function_value_ranks[function_name][value_id] = max(
+                1, function_value_ranks[function_name].get(value_id, 0)
+            )
+    # Dtypes obey the same graph-wide signature constraints as ranks.  In
+    # particular, aggregate loads frequently carry no dtype occurrence of
+    # their own, while logical consumers provide stronger evidence than a
+    # provisional numeric default inherited from Python scalar handling.
+    function_value_dtypes: dict[str, dict[int, str]] = {}
+    logical_dtype_ids: dict[str, set[int]] = {}
+    for function_name, function in functions.items():
+        dtypes: dict[int, str] = {}
+        logical_ids: set[int] = set()
+        values = [*function.args, *named_outputs.get(function_name, ())]
+        values.extend(
+            value
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            for value in (
+                *instruction.args,
+                *((instruction.res,) if instruction.res is not None else ()),
+            )
+        )
+        for value in values:
+            candidate = str(value.dtype or "")
+            if candidate and candidate not in {"unknown", "aggregate", "ptr", "pointer", "void"}:
+                dtypes.setdefault(int(value.id), candidate)
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                operation = str(
+                    instruction.attributes.get("tensor_operation")
+                    or instruction.op
+                )
+                if (
+                    operation in {"CastLike", "cast_like"}
+                    and instruction.res is not None
+                    and len(instruction.args) >= 2
+                ):
+                    reference_dtype = dtypes.get(
+                        int(instruction.args[1].id)
+                    )
+                    if reference_dtype is not None:
+                        dtypes[int(instruction.res.id)] = reference_dtype
+                if operation in {
+                    "LAnd", "LOr", "logical_and", "logical_or"
+                }:
+                    if instruction.res is not None:
+                        logical_ids.add(int(instruction.res.id))
+                elif operation in {"LNot", "Not", "logical_not"}:
+                    logical_ids.update(int(value.id) for value in instruction.args)
+                    if instruction.res is not None:
+                        logical_ids.add(int(instruction.res.id))
+                elif operation in _COMPARISON and instruction.res is not None:
+                    logical_ids.add(int(instruction.res.id))
+                if instruction.op in {"CondBr", "condbr"} and instruction.args:
+                    logical_ids.add(int(instruction.args[0].id))
+        for value_id in logical_ids:
+            dtypes[value_id] = "bool"
+        function_value_dtypes[str(function_name)] = dtypes
+        logical_dtype_ids[str(function_name)] = logical_ids
+
+    changed_dtypes = True
+    while changed_dtypes:
+        changed_dtypes = False
+        for caller_name, caller in functions.items():
+            caller_dtypes = function_value_dtypes[str(caller_name)]
+            caller_logical = logical_dtype_ids[str(caller_name)]
+            for block in caller.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.op not in {"Call", "call"}:
+                        continue
+                    callee_name = str(instruction.attributes.get("callee") or "")
+                    callee = functions.get(callee_name)
+                    if callee is None:
+                        continue
+                    callee_dtypes = function_value_dtypes[callee_name]
+                    callee_logical = logical_dtype_ids[callee_name]
+                    for actual, formal in zip(instruction.args, callee.args):
+                        actual_id, formal_id = int(actual.id), int(formal.id)
+                        if actual_id in caller_logical or formal_id in callee_logical:
+                            settled = "bool"
+                            caller_logical.add(actual_id)
+                            callee_logical.add(formal_id)
+                        else:
+                            actual_dtype = caller_dtypes.get(actual_id)
+                            formal_dtype = callee_dtypes.get(formal_id)
+                            if actual_dtype is None and formal_dtype is not None:
+                                caller_dtypes[actual_id] = formal_dtype
+                                changed_dtypes = True
+                            elif formal_dtype is None and actual_dtype is not None:
+                                callee_dtypes[formal_id] = actual_dtype
+                                changed_dtypes = True
+                            continue
+                        if settled and caller_dtypes.get(actual_id) != settled:
+                            caller_dtypes[actual_id] = settled
+                            changed_dtypes = True
+                        if settled and callee_dtypes.get(formal_id) != settled:
+                            callee_dtypes[formal_id] = settled
+                            changed_dtypes = True
+                    callee_output_values = tuple(named_outputs.get(callee_name, ()))
+                    if not callee_output_values or instruction.res is None:
+                        continue
+                    addresses = {
+                        int(candidate.res.id): int(candidate.attributes["aggregate_index"])
+                        for candidate in block.instrs
+                        if (
+                            candidate.op in {"GetElementPtr", "getelementptr"}
+                            and candidate.res is not None
+                            and candidate.args
+                            and candidate.args[0] is instruction.res
+                            and candidate.attributes.get("aggregate_index") is not None
+                        )
+                    }
+                    caller_outputs = {
+                        addresses[int(candidate.args[0].id)]: candidate.res
+                        for candidate in block.instrs
+                        if (
+                            candidate.op in {"Load", "load"}
+                            and candidate.res is not None
+                            and candidate.args
+                            and int(candidate.args[0].id) in addresses
+                        )
+                    }
+                    for output_index, callee_output in enumerate(callee_output_values):
+                        caller_output = caller_outputs.get(output_index)
+                        if caller_output is None:
+                            continue
+                        caller_id = int(caller_output.id)
+                        callee_id = int(callee_output.id)
+                        if caller_id in caller_logical or callee_id in callee_logical:
+                            settled = "bool"
+                            caller_logical.add(caller_id)
+                            callee_logical.add(callee_id)
+                        else:
+                            caller_dtype = caller_dtypes.get(caller_id)
+                            callee_dtype = callee_dtypes.get(callee_id)
+                            if callee_dtype is not None and caller_dtype != callee_dtype:
+                                caller_dtypes[caller_id] = callee_dtype
+                                changed_dtypes = True
+                            elif callee_dtype is None and caller_dtype is not None:
+                                callee_dtypes[callee_id] = caller_dtype
+                                changed_dtypes = True
+                            continue
+                        if settled and caller_dtypes.get(caller_id) != settled:
+                            caller_dtypes[caller_id] = settled
+                            changed_dtypes = True
+                        if settled and callee_dtypes.get(callee_id) != settled:
+                            callee_dtypes[callee_id] = settled
+                            changed_dtypes = True
+    for function_name, ranks in function_value_ranks.items():
+        method_array_bases.setdefault(function_name, set()).update(
+            value_id for value_id, rank in ranks.items() if rank > 0
+        )
+    function_mutated_values = {
+        function_name: set(method_mutated_bases.get(function_name, set())) | {
+            int(argument.id)
+            for argument in function.args
+            if (
+                any(
+                    int(argument.id) == int(output.id)
+                    for output in named_outputs.get(function_name, ())
+                )
+                or any(
+                    instruction.res is not None
+                    and int(instruction.res.id) == int(argument.id)
+                    for block in function.blocks.values()
+                    for instruction in block.instrs
+                )
+            )
+        }
+        for function_name, function in functions.items()
+    }
+    changed_mutation = True
+    while changed_mutation:
+        changed_mutation = False
+        for caller_name, caller in functions.items():
+            caller_mutated = function_mutated_values[caller_name]
+            for block in caller.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.op not in {"Call", "call"}:
+                        continue
+                    callee_name = str(
+                        instruction.attributes.get("callee") or ""
+                    )
+                    callee = functions.get(callee_name)
+                    if callee is None:
+                        continue
+                    callee_mutated = function_mutated_values[callee_name]
+                    for actual, formal in zip(instruction.args, callee.args):
+                        if (
+                            int(formal.id) in callee_mutated
+                            and int(actual.id) not in caller_mutated
+                        ):
+                            caller_mutated.add(int(actual.id))
+                            changed_mutation = True
+    method_mutated_bases = function_mutated_values
+    callee_inout_pairs = {
+        function_name: tuple(
+            (input_index, output_index)
+            for input_index, argument in enumerate(function.args)
+            for output_index, output in enumerate(
+                named_outputs.get(function_name, ())
+            )
+            if int(argument.id) == int(output.id)
+        )
+        for function_name, function in functions.items()
+    }
     callee_array_arguments = {
         function_name: tuple(
             position
@@ -2971,43 +4113,147 @@ def emit_module(
             ))
             and (
                 int(argument.id) in method_array_bases.get(
-                    _method_of(function_name), set()
+                    function_name, set()
                 )
+                or int((argument.accounting or {}).get(
+                    "program_abi_rank", 0
+                )) > 0
+                or int((argument.accounting or {}).get(
+                    "ssa_call_rank", 0
+                )) > 0
+                or function_value_ranks.get(function_name, {}).get(
+                    int(argument.id), 0
+                ) > 0
                 or _is_array(argument)
             )
         )
         for function_name, function in functions.items()
     }
-    subroutines = tuple(
-        emit_function(
-            function,
-            dtype=dtype,
-            outputs=named_outputs.get(function_name, ()),
-            callee_extents=callee_extents,
-            callee_arity=callee_arity,
-            callee_output_count=callee_output_count,
-            callee_array_arguments=callee_array_arguments,
-            callee_inout_pairs=callee_inout_pairs,
-            array_base_ids=(
-                method_array_bases.get(_method_of(function_name), set())
-                - set(map(
-                    int,
-                    function.metadata.get(
-                        "scalar_variant_argument_ids", ()
-                    ),
-                ))
-            ),
-            mutated_base_ids=method_mutated_bases.get(_method_of(function_name), set()),
-            tensor_table=module_tensor_tables.get(function_name),
-        )
-        for function_name, function in functions.items()
-    )
-    emitted_extents = {
-        function_name: subroutine.extent_names
-        for function_name, subroutine in zip(functions, subroutines)
+    # Extents are a finite set-union dataflow problem. Emit each function once
+    # to discover only its local requirements, then close those sets over the
+    # call graph. Re-emitting every function on every iteration is equivalent
+    # but needlessly rebuilds enormous source strings for large programs.
+    local_extents = {
+            function_name: emit_function(
+                function,
+                dtype=dtype,
+                outputs=named_outputs.get(function_name, ()),
+                callee_extents={},
+                callee_arity=callee_arity,
+                callee_output_count=callee_output_count,
+                callee_outputs=named_outputs,
+                callee_arguments={
+                    name: candidate.args for name, candidate in functions.items()
+                },
+                callee_array_arguments=callee_array_arguments,
+                callee_inout_pairs=callee_inout_pairs,
+                array_base_ids=(
+                    method_array_bases.get(function_name, set())
+                    - set(map(
+                        int,
+                        function.metadata.get(
+                            "scalar_variant_argument_ids", ()
+                        ),
+                    ))
+                ),
+                mutated_base_ids=method_mutated_bases.get(
+                    function_name, set()
+                ),
+                dynamic_array_ranks=function_value_ranks.get(
+                    function_name, {}
+                ),
+                value_dtypes=function_value_dtypes.get(function_name, {}),
+                tensor_table=module_tensor_tables.get(function_name),
+                native_symbol=native_symbols[function_name],
+                callee_native_symbols=native_symbols,
+                extent_namespace=extent_namespaces[function_name],
+            ).extent_names
+            for function_name, function in functions.items()
     }
+    direct_callees = {
+        function_name: {
+            str(instruction.attributes.get("callee") or "")
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if (
+                instruction.op in {"Call", "call"}
+                and str(instruction.attributes.get("callee") or "") in functions
+            )
+        }
+        for function_name, function in functions.items()
+    }
+    callee_extents: dict[str, tuple[str, ...]] = dict(local_extents)
+    for _ in range(max(1, len(functions) + 1)):
+        updated_extents = {
+            function_name: tuple(sorted(
+                set(local_extents[function_name]).union(*(
+                    set(callee_extents[callee])
+                    for callee in direct_callees[function_name]
+                ))
+            ))
+            for function_name in functions
+        }
+        if updated_extents == callee_extents:
+            break
+        callee_extents = updated_extents
+    else:  # pragma: no cover - finite extent-name unions must converge.
+        raise RuntimeError("Fortran call ABI extents did not reach a fixed point")
+    def emit_subroutines(
+        signatures: Mapping[str, Sequence[str]],
+    ) -> tuple[FortranSubroutine, ...]:
+        return tuple(
+            emit_function(
+                function,
+                dtype=dtype,
+                outputs=named_outputs.get(function_name, ()),
+                callee_extents=signatures,
+                callee_arity=callee_arity,
+                callee_output_count=callee_output_count,
+                callee_outputs=named_outputs,
+                callee_arguments={
+                    key: candidate.args for key, candidate in functions.items()
+                },
+                callee_array_arguments=callee_array_arguments,
+                callee_inout_pairs=callee_inout_pairs,
+                array_base_ids=(
+                    method_array_bases.get(function_name, set())
+                    - set(map(
+                        int,
+                        function.metadata.get("scalar_variant_argument_ids", ()),
+                    ))
+                ),
+                mutated_base_ids=method_mutated_bases.get(function_name, set()),
+                dynamic_array_ranks=function_value_ranks.get(function_name, {}),
+                value_dtypes=function_value_dtypes.get(function_name, {}),
+                tensor_table=module_tensor_tables.get(function_name),
+                native_symbol=native_symbols[function_name],
+                callee_native_symbols=native_symbols,
+                extent_namespace=extent_namespaces[function_name],
+            )
+            for function_name, function in functions.items()
+        )
+
+    for _ in range(max(1, len(functions) + 1)):
+        subroutines = emit_subroutines(callee_extents)
+        emitted_extents = {
+            function_name: subroutine.extent_names
+            for function_name, subroutine in zip(functions, subroutines)
+        }
+        if emitted_extents == callee_extents:
+            break
+        callee_extents = emitted_extents
+    else:  # pragma: no cover - final signatures must stabilize.
+        raise RuntimeError("Fortran emitted extents did not stabilize")
     emitted_dynamic_arrays = {
         function_name: dict(subroutine.dynamic_array_extents)
+        for function_name, subroutine in zip(functions, subroutines)
+    }
+    emitted_dynamic_dimensions = {
+        function_name: dict(subroutine.dynamic_array_dimensions)
+        for function_name, subroutine in zip(functions, subroutines)
+    }
+    emitted_reference_arguments = {
+        function_name: subroutine.reference_argument_ids
         for function_name, subroutine in zip(functions, subroutines)
     }
     lines = [
@@ -3024,6 +4270,7 @@ def emit_module(
     # Describe what was generated, from the same Function objects, so callers
     # stop rediscovering the signature by reading emitted source.
     from .compiled_program_api import CompiledProgramAPI, describe_fortran_function
+    from .output_publication import publication_metadata
 
     def _kind(function_name: str) -> str:
         function = functions[function_name]
@@ -3059,6 +4306,40 @@ def emit_module(
                 "parameter_names", ()
             )
         })
+        # Record-valued parameters are expanded into fields and carry their
+        # own accounting names. Scalar source parameters can survive that
+        # expansion without a ``parameter_names`` pair, while the extraction
+        # contract still retains their ordered ``parameter_value_abi``. Use
+        # that receipt only when the remaining source arguments match it
+        # exactly; ambiguity must stay visible rather than guessed by id.
+        scalar_abi_names = tuple(
+            str(source_name)
+            for source_name, receipt in dict(
+                function.metadata.get("parameter_value_abi") or {}
+            ).items()
+            if str(receipt.get("function") or "") in {
+                "",
+                str(function_name),
+                str(function_name).rsplit("__", 1)[-1],
+            }
+        )
+        unnamed_source_args = tuple(
+            value
+            for value in function.args
+            if (
+                int(value.id) not in source_names
+                and not (value.accounting or {}).get("program_abi_parameter")
+                and not (value.accounting or {}).get("linked_call_frame_storage")
+                and not (value.accounting or {}).get("returned_record_storage")
+            )
+        )
+        if scalar_abi_names and len(unnamed_source_args) == len(scalar_abi_names):
+            source_names.update(
+                (int(value.id), source_name)
+                for value, source_name in zip(
+                    unnamed_source_args, scalar_abi_names
+                )
+            )
         entry_points.append(
             describe_fortran_function(
                 function_name,
@@ -3075,11 +4356,17 @@ def emit_module(
                 dynamic_array_extents=emitted_dynamic_arrays.get(
                     function_name, {}
                 ),
+                dynamic_array_dimensions=emitted_dynamic_dimensions.get(
+                    function_name, {}
+                ),
                 array_argument_ids=(
                     int(function.args[position].id)
                     for position in callee_array_arguments.get(
                         function_name, ()
                     )
+                ),
+                reference_argument_ids=emitted_reference_arguments.get(
+                    function_name, ()
                 ),
             )
         )
@@ -3091,6 +4378,8 @@ def emit_module(
         entry_points=tuple(entry_points),
         metadata={
             "dtype": dtype,
+            "fortran_internal_symbols": dict(native_symbols),
+            **publication_metadata(functions),
             "tensor_table_schema": "turing.repository-ssa-tensor-table.v1",
             "tensor_tables": {
                 function_name: [
@@ -3239,7 +4528,9 @@ def compile_module(
         standalone_runtime_shim_sources,
     )
 
-    workdir = Path(directory or tempfile.mkdtemp(prefix="turing_fortran_"))
+    workdir = Path(
+        directory or tempfile.mkdtemp(prefix="turing_fortran_")
+    ).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     source = module.write(workdir)
     suffix = ".dll" if sys.platform == "win32" else ".so"

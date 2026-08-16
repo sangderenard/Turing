@@ -12,9 +12,11 @@ from __future__ import annotations
 from .threaded import GLRenderThread
 
 try:  # pragma: no cover - best effort in headless CI
-    from .renderer import GLRenderer, MeshLayer, LineLayer, PointLayer, DebugRenderer
+    from .renderer import (
+        CudaGraphLayer, GLRenderer, MeshLayer, LineLayer, PointLayer, DebugRenderer,
+    )
 except Exception:  # noqa: BLE001 - tolerate missing OpenGL libs
-    GLRenderer = MeshLayer = LineLayer = PointLayer = DebugRenderer = None  # type: ignore
+    CudaGraphLayer = GLRenderer = MeshLayer = LineLayer = PointLayer = DebugRenderer = None  # type: ignore
 
 try:  # pragma: no cover - best effort in headless CI
     from .api import (
@@ -40,6 +42,7 @@ __all__ = [
     "MeshLayer",
     "LineLayer",
     "PointLayer",
+    "CudaGraphLayer",
     # API helpers
     "rainbow_colors",
     "rainbow_history_points",

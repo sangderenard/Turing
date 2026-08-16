@@ -25,6 +25,97 @@ roots:
   repository:
     - ..
 
+# Physical records crossing the Python/native program boundary. These entries
+# describe storage only; they neither execute Python objects nor authorize
+# dependency pursuit. Wildcard bindings apply the same record ABI to pursued
+# helper functions whose parameter keeps the declared semantic role.
+program_abi:
+  records:
+    SymbolicFluidGridState:
+      identity: src.compiler.symbolic_fluid_dt.SymbolicFluidGridState
+      fields:
+        height: {storage: span, dtype: float64, rank: 2, mutable: true}
+        momentum_x: {storage: span, dtype: float64, rank: 2, mutable: true}
+        momentum_y: {storage: span, dtype: float64, rank: 2, mutable: true}
+        tracer: {storage: span, dtype: float64, rank: 2, mutable: true}
+        next_height: {storage: span, dtype: float64, rank: 2, mutable: true}
+        next_momentum_x: {storage: span, dtype: float64, rank: 2, mutable: true}
+        next_momentum_y: {storage: span, dtype: float64, rank: 2, mutable: true}
+        next_tracer: {storage: span, dtype: float64, rank: 2, mutable: true}
+        force_x: {storage: span, dtype: float64, rank: 2, mutable: false}
+        force_y: {storage: span, dtype: float64, rank: 2, mutable: false}
+        dx: {storage: scalar, dtype: float64, mutable: false}
+        gravity: {storage: scalar, dtype: float64, mutable: false}
+        viscosity: {storage: scalar, dtype: float64, mutable: false}
+        tracer_diffusivity: {storage: scalar, dtype: float64, mutable: false}
+        linear_drag: {storage: scalar, dtype: float64, mutable: false}
+        coriolis: {storage: scalar, dtype: float64, mutable: false}
+        minimum_height: {storage: scalar, dtype: float64, mutable: false}
+        last_wave_speed: {storage: scalar, dtype: float64, mutable: true}
+        last_height_violation: {storage: scalar, dtype: float64, mutable: true}
+        last_tracer_violation: {storage: scalar, dtype: float64, mutable: true}
+    Targets:
+      identity: src.common.dt_system.dt_controller.Targets
+      fields:
+        cfl: {storage: scalar, dtype: float64, mutable: false}
+        div_max: {storage: scalar, dtype: float64, mutable: false}
+        mass_max: {storage: scalar, dtype: float64, mutable: false}
+        # Keyed by scientific channel name. The keys are words, so they lower
+        # to the repository's universal string tokens rather than to one
+        # opaque handle; a constant channel name and one derived at run time
+        # resolve to the same slot.
+        error_limits: {storage: keyed, dtype: float64, mutable: false}
+    STController:
+      identity: src.common.dt_system.dt_controller.STController
+      fields:
+        Kp: {storage: scalar, dtype: float64, mutable: false}
+        Ki: {storage: scalar, dtype: float64, mutable: false}
+        A: {storage: scalar, dtype: float64, mutable: false}
+        shrink: {storage: scalar, dtype: float64, mutable: false}
+        dt_min: {storage: scalar, dtype: float64, mutable: false}
+        dt_max: {storage: scalar, dtype: float64, mutable: true}
+        acc: {storage: scalar, dtype: float64, mutable: true}
+        max_vel_ever: {storage: scalar, dtype: float64, mutable: true}
+        clamp_events: {storage: scalar, dtype: int64, mutable: true}
+    Metrics:
+      identity: src.common.dt_system.dt_scaler.Metrics
+      fields:
+        max_vel: {storage: scalar, dtype: float64, mutable: true}
+        max_flux: {storage: scalar, dtype: float64, mutable: true}
+        div_inf: {storage: scalar, dtype: float64, mutable: true}
+        mass_err: {storage: scalar, dtype: float64, mutable: true}
+        osc_flag: {storage: scalar, dtype: bool, mutable: true, default: false}
+        stiff_flag: {storage: scalar, dtype: bool, mutable: true, default: false}
+        sim_frame: {storage: scalar, dtype: int64, mutable: true, default: 0}
+        proc_ms: {storage: scalar, dtype: float64, mutable: true, default: 0.0}
+        dt_limit: {storage: scalar, dtype: float64, mutable: true, default: null}
+        error_channels: {storage: keyed, dtype: float64, mutable: true}
+        hard_failure: {storage: scalar, dtype: bool, mutable: true, default: false}
+        advanced_dt: {storage: scalar, dtype: float64, mutable: true, default: null}
+  bindings:
+    - {function: "*", parameter: state, record: SymbolicFluidGridState}
+    - {function: "*", parameter: targets, record: Targets}
+    - {function: "*", parameter: controller, record: STController}
+    - {function: "*", parameter: ctrl, record: STController}
+    - {function: "*", parameter: metrics, record: Metrics}
+    - {function: "*coerce_metrics", parameter: value, record: Metrics}
+  # Native scalar entry values have an explicit source-language type.  This
+  # makes authored type-preserving guards deterministic during preprocessing;
+  # the compiler does not guess whether a float64 slot is still a Python or
+  # AbstractTensor object.
+  values:
+    - {function: symbolic_fluid_advance, parameter: dt, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: symbolic_fluid_frame, parameter: frame_duration, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: symbolic_fluid_frame, parameter: dt_initial, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: step_with_dt_control_used, parameter: dt, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: step_with_dt_control_used, parameter: dx, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: step_with_dt_control_used, parameter: ref, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: run_superstep, parameter: round_max, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: run_superstep, parameter: dt_init, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: run_superstep, parameter: dx, storage: scalar, dtype: float64, python_type: builtins.float}
+    - {function: _restore_type, parameter: value, storage: scalar, dtype: float64, python_type: src.common.tensors.abstraction.AbstractTensor}
+    - {function: _restore_type, parameter: ref, storage: scalar, dtype: float64, python_type: builtins.float}
+
 # Every callable must land in exactly one class, and every class has a choice.
 # No implicit "inspect it and see" fallback exists.
 defaults:
@@ -54,6 +145,19 @@ defaults:
     parameters: {reason: provenance_not_declared}
 
 rules:
+  # These are ordinary live Python objects, not runtime graph parameters.
+  # When an instance or one of its definitions occurs on a reachable source
+  # path, pursue the referenced attribute into repository source (and onward
+  # to any declared native boundary).
+  - id: abstract-tensor-autograd-object-surface
+    match:
+      module: src.common.tensors.autograd
+      occurrence: [instance, definition]
+    action: ingest_python
+    parameters:
+      follow_reachable_calls: true
+      occurrence_pursuit: referenced_attributes
+
   - id: authored-abstract-nn-is-real-program
     match:
       module: src.common.tensors.abstract_nn*
@@ -127,11 +231,13 @@ rules:
 
 limits:
   python_source:
-    max_files: 4096
-    max_total_bytes: 67108864
-    max_definitions: 100000
-    max_work_items: 200000
-    max_dependency_depth: 512
+    # Zero means unbounded. Reachability is bounded by the exhaustive action
+    # table above, not by arbitrary program-size truncation.
+    max_files: 0
+    max_total_bytes: 0
+    max_definitions: 0
+    max_work_items: 0
+    max_dependency_depth: 0
   machine_decompilation:
     enabled_by_default: false
     max_functions: 0

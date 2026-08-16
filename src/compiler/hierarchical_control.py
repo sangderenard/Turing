@@ -65,6 +65,8 @@ def _present_loop_ids(block: ControlBlock) -> "frozenset[int]":
                     pass
             walk(b.body)
         elif isinstance(b, WhileBlock):
+            if b.source_loop_node_id is not None:
+                found.add(int(b.source_loop_node_id))
             walk(b.condition)
             walk(b.body)
         elif isinstance(b, SequenceBlock):
@@ -485,10 +487,17 @@ def compose_hierarchical_control(
                     block.schedule_preference,
                 )
             if isinstance(block, WhileBlock):
+                body = rewrite(block.body)
+                loop_id = block.source_loop_node_id
+                if loop_id is not None and int(loop_id) in calls_at_loop_end:
+                    body = SequenceBlock((
+                        body,
+                        *calls_at_loop_end.pop(int(loop_id)),
+                    ))
                 return WhileBlock(
                     value(block.predicate_value_id),
                     rewrite(block.condition),
-                    rewrite(block.body),
+                    body,
                     tuple(
                         (value(updated), value(initial))
                         for updated, initial in block.carried_aliases
@@ -498,6 +507,8 @@ def compose_hierarchical_control(
                         else recursion_region_map[int(block.recursion_region_id)]
                     ),
                     rewrite_expression(block.predicate_expression),
+                    (),
+                    block.source_loop_node_id,
                 )
             if isinstance(block, LoopControlBlock):
                 return LoopControlBlock(

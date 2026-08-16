@@ -576,6 +576,20 @@ def ingest_sympy_expression(
         # runtimes can normalize singleton identity tests; the mathematical
         # type is the durable distinction.  In particular ``One`` must remain
         # integer 1 while BooleanTrue remains a Boolean atom.
+        if value == sympy.pi:
+            # Pi remains a semantic operation until backend lowering.  This
+            # lets a caller choose a native literal, a bounded construction,
+            # or rejection without changing the authored SymPy expression.
+            rule = SympyProcessGraphRule("Pi", node_type="Constant")
+            node_id = make_node(
+                value, rule, (), (), {"constant_identity": "pi"}
+            )
+            graph.G.nodes[node_id]["tensor"] = {
+                "dtype": "float64", "shape": (),
+            }
+            memo[value] = node_id
+            return node_id
+
         if value.is_Number:
             if value.is_Integer:
                 literal: Any = int(value)
@@ -583,6 +597,11 @@ def ingest_sympy_expression(
                 literal = float(value)
             else:
                 literal = value
+        elif isinstance(value, sympy.NumberSymbol):
+            # Exact named constants such as pi and E are symbolic atoms, not
+            # calls or uninterpreted operators. Retain the exact SymPy value
+            # as a canonical ProcessGraph constant.
+            literal = value
         elif value is sympy.true or value is sympy.false:
             literal = bool(value)
         elif function_name == "Bytes":
@@ -641,6 +660,27 @@ def ingest_sympy_expression(
             return selected_id
 
         arguments = tuple(value.args)
+        # SymPy represents associative arithmetic as variadic nodes, while
+        # repository SSA and every scalar backend give Add/Mul/Min/Max an
+        # exact binary arity.  Preserve the authored expression as a stable
+        # left-associated ProcessGraph chain instead of asking each backend to
+        # invent its own n-ary convention.
+        if rule.operation in {"Add", "Mul", "Min", "Max"} and len(arguments) > 2:
+            left = add_node(arguments[0])
+            accumulated = arguments[0]
+            for index, argument in enumerate(arguments[1:], start=1):
+                right = add_node(argument)
+                accumulated = value if index == len(arguments) - 1 else value.func(
+                    accumulated, argument, evaluate=False,
+                )
+                left = make_node(
+                    accumulated,
+                    rule,
+                    (left, right),
+                    ("arg:0", "arg:1"),
+                )
+            memo[value] = left
+            return left
         parent_ids = tuple(add_node(argument) for argument in arguments)
         if isinstance(value, sympy.Indexed) or function_name == "getitem":
             roles = ("base", *("index" for _ in arguments[1:]))
@@ -675,6 +715,65 @@ def ingest_sympy_expression(
     )
     graph.G.graph["sympy_translation_fallbacks"] = tuple(fallbacks)
     return root
+
+
+def ingest_sympy_expressions(
+    graph: Any,
+    expressions: Sequence[sympy.Basic],
+    *,
+    output_names: Sequence[str] | None = None,
+    strict: bool = False,
+) -> tuple[int, ...]:
+    """Ingest a named expression set as one shared canonical ProcessGraph.
+
+    A temporary SymPy ``Tuple`` gives :func:`ingest_sympy_expression` one tree
+    in which its existing memo can retain common subexpressions across every
+    result.  The tuple is only a construction envelope: it is removed again,
+    and its operands become the graph's actual deployment roots.  Thus no
+    invented tuple operation reaches repository SSA or a backend.
+    """
+
+    authored = tuple(sympy.sympify(expression) for expression in expressions)
+    if not authored:
+        raise ValueError("SymPy expression set must contain at least one output")
+    names = (
+        tuple(str(name) for name in output_names)
+        if output_names is not None
+        else tuple(f"result_{index}" for index in range(len(authored)))
+    )
+    if len(names) != len(authored):
+        raise ValueError("SymPy output names must match the expression count")
+    if len(names) != len(set(names)):
+        raise ValueError("SymPy output names must be unique")
+
+    tuple_root = ingest_sympy_expression(
+        graph, sympy.Tuple(*authored), strict=strict,
+    )
+    tuple_data = graph.G.nodes[tuple_root]
+    if tuple_data.get("op") != "Tuple":
+        raise RuntimeError("SymPy expression-set envelope did not lower to Tuple")
+    roots = tuple(int(parent) for parent, _role in tuple_data.get("parents", ()))
+    if len(roots) != len(authored):
+        raise RuntimeError("SymPy expression-set envelope lost an output")
+
+    for root in roots:
+        children = graph.G.nodes[root].get("children") or []
+        graph.G.nodes[root]["children"] = [
+            child for child in children if int(child[0]) != int(tuple_root)
+        ]
+    graph.G.remove_node(tuple_root)
+    graph.node_map.pop(tuple_root, None)
+    graph.roots = list(roots)
+    graph.G.graph.update(
+        function_outputs=names,
+        deployment_outputs=roots,
+        deployment_inputs=tuple(
+            int(node_id)
+            for node_id, data in graph.G.nodes(data=True)
+            if data.get("op") in {"input", "Input", "Symbol"}
+        ),
+    )
+    return roots
 
 
 def process_graph_to_sympy_expressions(
@@ -1393,6 +1492,7 @@ __all__ = [
     "SymbolicProcessNode",
     "SymbolicProcessModel",
     "ingest_sympy_expression",
+    "ingest_sympy_expressions",
     "process_graph_to_sympy_expressions",
     "process_graph_to_sympy_relations",
     "ingest_sympy_process_model",

@@ -326,6 +326,8 @@ def test_real_abstract_nn_linear_loss_runs_process_graph_adjoint_natively(tmp_pa
     from src.compiler.ssa_llvm_backend import (
         compile_artifact,
         emit_ssa_function_to_llvm,
+        prepare_artifact_execution,
+        with_native_sgd_loop,
     )
 
     program = SSATensorProgram("abstract_nn_linear_mse")
@@ -362,6 +364,13 @@ def test_real_abstract_nn_linear_loss_runs_process_graph_adjoint_natively(tmp_pa
         entry_name=lowering.function_name,
     )
     assert llvm.shortfalls == ()
+    loop = with_native_sgd_loop(
+        llvm,
+        parameter_gradient_pairs=(
+            (1, lowering.outputs["grad_1"]),
+            (2, lowering.outputs["grad_2"]),
+        ),
+    )
     native = compile_artifact(llvm, directory=tmp_path / "abstract_nn_native")
 
     x_value = np.asarray([[0.2, -0.3, 0.7], [1.1, 0.4, -0.2]])
@@ -405,6 +414,255 @@ def test_real_abstract_nn_linear_loss_runs_process_graph_adjoint_natively(tmp_pa
     buffers[2][...] -= 0.1 * buffers[lowering.outputs["grad_2"]]
     entry(pointers, extents)
     assert float(buffers[lowering.outputs["loss_0"]]) < first_loss
+
+    native_loop = compile_artifact(
+        loop, directory=tmp_path / "abstract_nn_native_loop",
+    )
+    execution = prepare_artifact_execution(native_loop, {
+        0: x_value,
+        1: weight_value.copy(),
+        2: bias_value.copy(),
+        3: target_value,
+        native_loop.training_steps_value_id: 8,
+        native_loop.learning_rate_value_id: 0.1,
+    })
+    execution.run()
+    assert float(execution.buffers[lowering.outputs["loss_0"]]) < first_loss
+    assert not np.array_equal(execution.buffers[1], weight_value)
+    assert not np.array_equal(execution.buffers[2], bias_value)
+
+
+def test_real_rectconv2d_graph_adjoint_lowers_and_executes_natively(tmp_path):
+    from src.common.tensors.abstract_nn import MSELoss, RectConv2d
+    from src.common.tensors.accelerator_backends.ssa_backend import (
+        SSATensorOperations,
+        SSATensorProgram,
+    )
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact,
+        emit_ssa_function_to_llvm,
+        prepare_artifact_execution,
+    )
+
+    program = SSATensorProgram("rectconv2d_graph_adjoint")
+    x, weight, bias, target = [
+        SSATensorOperations.input(program, shape)
+        for shape in (
+            (1, 1, 4, 4), (2, 1, 3, 3), (2,), (1, 2, 4, 4),
+        )
+    ]
+    layer = RectConv2d(1, 2, 3, padding=1, like=x)
+    layer.W, layer.b = weight, bias
+    loss = MSELoss()(layer.forward(x), target)
+    forward = abstract_tensor_program_to_process_graph(loss, bindings={
+        "x": x, "weight": weight, "bias": bias, "target": target,
+    })
+    product = compile_process_graph_backward(
+        forward, wrt=(1, 2), packaging="combined",
+    )
+    lowering = lower_training_motion_to_repository_ssa(
+        product.motion, function_name="rectconv2d_graph_adjoint",
+    )
+    emitted = emit_ssa_function_to_llvm(
+        lowering.module, lowering.function_name,
+        entry_name=lowering.function_name,
+    )
+    assert lowering.shortfalls == ()
+    assert emitted.shortfalls == ()
+    artifact = compile_artifact(emitted, directory=tmp_path)
+
+    x_value = np.arange(16, dtype=np.float64).reshape(1, 1, 4, 4) / 15.0
+    weight_value = np.asarray([
+        [[[.1, -.2, .05], [.3, .4, -.1], [.2, 0., -.3]]],
+        [[[-.2, .1, .25], [.05, -.15, .35], [.4, -.05, .2]]],
+    ])
+    bias_value = np.asarray([.03, -.07])
+    target_value = np.stack((
+        x_value[:, 0] * .5 + .1,
+        1.0 - x_value[:, 0] * .25,
+    ), axis=1)
+    execution = prepare_artifact_execution(artifact, {
+        0: x_value, 1: weight_value, 2: bias_value, 3: target_value,
+    }).run()
+
+    padded = np.pad(x_value, ((0, 0), (0, 0), (1, 1), (1, 1)))
+    prediction = np.empty_like(target_value)
+    for channel in range(2):
+        for row in range(4):
+            for column in range(4):
+                prediction[0, channel, row, column] = (
+                    bias_value[channel]
+                    + np.sum(
+                        padded[0, :, row:row + 3, column:column + 3]
+                        * weight_value[channel]
+                    )
+                )
+    output_gradient = 2.0 * (prediction - target_value) / prediction.size
+    expected_weight_gradient = np.zeros_like(weight_value)
+    for channel in range(2):
+        for kh in range(3):
+            for kw in range(3):
+                expected_weight_gradient[channel, 0, kh, kw] = np.sum(
+                    output_gradient[0, channel]
+                    * padded[0, 0, kh:kh + 4, kw:kw + 4]
+                )
+    expected_bias_gradient = output_gradient.sum(axis=(0, 2, 3))
+
+    assert float(execution.buffers[lowering.outputs["loss_0"]]) == pytest.approx(
+        float(np.mean((prediction - target_value) ** 2)), abs=1e-15,
+    )
+    np.testing.assert_allclose(
+        execution.buffers[lowering.outputs["grad_1"]],
+        expected_weight_gradient,
+        rtol=1e-13,
+        atol=1e-13,
+    )
+    np.testing.assert_allclose(
+        execution.buffers[lowering.outputs["grad_2"]],
+        expected_bias_gradient,
+        rtol=1e-13,
+        atol=1e-13,
+    )
+
+
+def test_real_abstract_nn_xor_has_exact_native_adjoint_and_training_loop(
+    tmp_path,
+):
+    from src.common.tensors.abstract_nn import (
+        Linear, Model, MSELoss, Sigmoid, Tanh,
+    )
+    from src.common.tensors.accelerator_backends.ssa_backend import (
+        SSATensorOperations,
+        SSATensorProgram,
+    )
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact,
+        emit_ssa_function_to_llvm,
+        prepare_artifact_execution,
+        with_native_sgd_loop,
+    )
+
+    program = SSATensorProgram("abstract_nn_xor_mse")
+    shapes = ((4, 2), (2, 8), (1, 8), (8, 1), (1, 1), (4, 1))
+    x, w1, b1, w2, b2, target = [
+        SSATensorOperations.input(program, shape) for shape in shapes
+    ]
+    first = Linear(2, 8, like=x, init="xavier")
+    first.W, first.b = w1, b1
+    second = Linear(8, 1, like=x, init="xavier")
+    second.W, second.b = w2, b2
+    loss = MSELoss()(
+        Model([first, second], [Tanh(), Sigmoid()]).forward(x), target,
+    )
+    forward = abstract_tensor_program_to_process_graph(loss, bindings={
+        "x": x, "W1": w1, "b1": b1,
+        "W2": w2, "b2": b2, "target": target,
+    })
+    product = compile_process_graph_backward(
+        forward, wrt=(1, 2, 3, 4), packaging="combined",
+    )
+    assert product.motion is not None
+    assert product.adjoint.backward.G.graph["python_backward_callbacks"] is False
+    assert product.adjoint.backward.G.graph["backward_rule_registry"].endswith(
+        "BACKWARD_RULES"
+    )
+
+    lowering = lower_training_motion_to_repository_ssa(
+        product.motion, function_name="abstract_nn_xor_mse",
+    )
+    artifact = emit_ssa_function_to_llvm(
+        lowering.module,
+        lowering.function_name,
+        entry_name=lowering.function_name,
+    )
+    assert lowering.shortfalls == ()
+    assert artifact.shortfalls == ()
+    assert artifact.buffer_order == (
+        0, 1, 2, 3, 4, 5,
+        lowering.outputs["loss_0"],
+        lowering.outputs["grad_1"],
+        lowering.outputs["grad_2"],
+        lowering.outputs["grad_3"],
+        lowering.outputs["grad_4"],
+    )
+
+    x_value = np.asarray([
+        [-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0],
+    ])
+    w1_value = np.asarray([
+        [.15, -.2, .35, -.4, .25, .1, -.3, .45],
+        [-.3, .4, .2, -.1, .5, -.35, .15, .25],
+    ])
+    b1_value = np.asarray([[.05, -.1, .08, .02, -.04, .06, .03, -.07]])
+    w2_value = np.asarray([
+        [.3], [-.25], [.4], [-.35], [.2], [.15], [-.45], [.5],
+    ])
+    b2_value = np.asarray([[.02]])
+    target_value = np.asarray([[0.0], [1.0], [1.0], [0.0]])
+    input_values = {
+        0: x_value, 1: w1_value, 2: b1_value,
+        3: w2_value, 4: b2_value, 5: target_value,
+    }
+
+    loop = with_native_sgd_loop(
+        artifact,
+        parameter_gradient_pairs=tuple(
+            (parameter, lowering.outputs[f"grad_{parameter}"])
+            for parameter in (1, 2, 3, 4)
+        ),
+        entry_name="abstract_nn_xor_training_loop",
+    )
+    native = compile_artifact(
+        artifact, directory=tmp_path / "abstract_nn_xor_native",
+    )
+    execution = prepare_artifact_execution(native, input_values)
+    execution.run()
+    hidden = np.tanh(x_value @ w1_value + b1_value)
+    prediction = 1.0 / (1.0 + np.exp(-(hidden @ w2_value + b2_value)))
+    output_adjoint = (
+        2.0 * (prediction - target_value) / target_value.size
+        * prediction * (1.0 - prediction)
+    )
+    hidden_adjoint = (
+        output_adjoint @ w2_value.T * (1.0 - hidden * hidden)
+    )
+    references = {
+        "loss_0": np.mean((prediction - target_value) ** 2),
+        "grad_1": x_value.T @ hidden_adjoint,
+        "grad_2": hidden_adjoint.sum(axis=0, keepdims=True),
+        "grad_3": hidden.T @ output_adjoint,
+        "grad_4": output_adjoint.sum(axis=0, keepdims=True),
+    }
+    for name, reference in references.items():
+        np.testing.assert_allclose(
+            execution.buffers[lowering.outputs[name]],
+            reference,
+            rtol=1e-11,
+            atol=1e-12,
+        )
+
+    native_loop = compile_artifact(
+        loop, directory=tmp_path / "abstract_nn_xor_loop",
+    )
+    loop_execution = prepare_artifact_execution(native_loop, {
+        **{key: value.copy() for key, value in input_values.items()},
+        loop.training_steps_value_id: 80,
+        loop.learning_rate_value_id: 0.5,
+    })
+    loop_execution.run()
+    trained_hidden = np.tanh(
+        x_value @ loop_execution.buffers[1] + loop_execution.buffers[2]
+    )
+    trained_prediction = 1.0 / (1.0 + np.exp(-(
+        trained_hidden @ loop_execution.buffers[3]
+        + loop_execution.buffers[4]
+    )))
+    trained_loss = np.mean((trained_prediction - target_value) ** 2)
+    assert trained_loss < references["loss_0"]
+    assert all(
+        np.isfinite(loop_execution.buffers[value_id]).all()
+        for value_id in (1, 2, 3, 4)
+    )
 
 
 def test_control_adjoint_preserves_branch_and_reverses_each_selected_arm():

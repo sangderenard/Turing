@@ -47,6 +47,15 @@ typedef enum CTensorOp {
     CT_OP_ASINH,
     CT_OP_ACOSH,
     CT_OP_ATANH,
+    CT_OP_SIGN,
+    CT_OP_INVERT,
+    CT_OP_BITAND,
+    CT_OP_BITOR,
+    CT_OP_BITXOR,
+    CT_OP_SHL,
+    CT_OP_SHR,
+    CT_OP_LOGICAL_AND,
+    CT_OP_LOGICAL_OR,
     CT_OP_COUNT
 } CTensorOp;
 
@@ -110,6 +119,48 @@ void index_assign_double(
     const int* axis_indices,
     const double* values,
     int value_count);
+
+void index_set_double(
+    const double* input,
+    double* output,
+    const int* shape,
+    int ndim,
+    const int* axis_offsets,
+    const int* axis_indices,
+    const double* values,
+    int value_count);
+
+void unfold2d_double(
+    const double* input,
+    double* output,
+    int n,
+    int c,
+    int h,
+    int w,
+    int kernel_h,
+    int kernel_w,
+    int stride_h,
+    int stride_w,
+    int padding_h,
+    int padding_w,
+    int dilation_h,
+    int dilation_w);
+
+void fold2d_double(
+    const double* columns,
+    double* output,
+    int n,
+    int c,
+    int h,
+    int w,
+    int kernel_h,
+    int kernel_w,
+    int stride_h,
+    int stride_w,
+    int padding_h,
+    int padding_w,
+    int dilation_h,
+    int dilation_w);
 
 void sign_double(const double* input, double* output, int n);
 

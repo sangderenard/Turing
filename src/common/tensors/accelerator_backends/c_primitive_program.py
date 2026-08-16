@@ -22,7 +22,6 @@ from ..fused_ir import (
     OpStep,
     canonical_elementwise_op,
     ordered_feed_ids,
-    primary_output_id,
 )
 from .c_backend import C, CTensor, ffi
 
@@ -105,7 +104,13 @@ class _SlotPlan:
     instructions: tuple[_SlotInstruction, ...]
     feed_ids: tuple[int, ...]
     slot_count: int
-    output_slot: int
+    output_slots: tuple[tuple[str, int], ...]
+
+    @property
+    def output_slot(self) -> int:
+        """Primary output slot retained for the single-output API."""
+
+        return self.output_slots[0][1]
 
     @property
     def feed_count(self) -> int:
@@ -212,6 +217,15 @@ class PreparedFusedProgram:
     def output(self) -> CTensor:
         return self.slots[self.plan.output_slot]
 
+    @property
+    def outputs(self) -> dict[str, CTensor]:
+        """Every named result resident in the native slot arena."""
+
+        return {
+            name: self.slots[slot]
+            for name, slot in self.plan.output_slots
+        }
+
     def execute(self) -> CTensor:
         ok = C.ctensor_execute_primitive_program_slots(
             self.native_instructions,
@@ -284,11 +298,16 @@ def compile_fused_program(program: FusedProgram) -> _SlotPlan:
             )
         )
 
-    output_id = primary_output_id(program)
-    if output_id not in slots:
-        raise ValueError("FusedProgram output is not produced")
+    output_slots = []
+    for name, output_id in program.outputs.items():
+        if output_id not in slots:
+            raise ValueError(f"FusedProgram output {name!r} is not produced")
+        output_slots.append((str(name), slots[output_id]))
+    if not output_slots:
+        raise ValueError("FusedProgram has no outputs")
     return _SlotPlan(
-        tuple(instructions), feed_ids, len(feed_ids) + len(instructions), slots[output_id]
+        tuple(instructions), feed_ids, len(feed_ids) + len(instructions),
+        tuple(output_slots),
     )
 
 

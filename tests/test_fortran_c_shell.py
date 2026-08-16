@@ -883,6 +883,36 @@ def choose(flags, mask, add):
     )
 
 
+def test_nested_if_threads_inner_phi_into_outer_phi():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    module, outputs, _exports = lower_ast_source_to_ssa(
+        "def nested(x, outer, inner):\n"
+        "    value = x\n"
+        "    if outer:\n"
+        "        value = x + 1.0\n"
+        "        if inner:\n"
+        "            value = value * 2.0\n"
+        "    return value\n",
+        "nested",
+        name="nested_conditional",
+    )
+    function = module.functions["nested_conditional__nested"]
+    phis = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Phi"
+        and instruction.attributes.get("binding") == "conditional_carried"
+    ]
+
+    assert len(phis) == 2
+    inner, outer = sorted(phis, key=lambda instruction: instruction.res.id)
+    assert outer.args[0].id == inner.res.id
+    assert outputs[function.name] == (outer.res,)
+    assert not function.metadata.get("structural_output_shortfalls")
+
+
 def test_pursued_re_compile_uses_one_external_multikey_table_contract():
     import ast
     import contextlib
@@ -1459,6 +1489,46 @@ end module two_extent_fortran
     assert payload["outputs"]["y"] == {"first": 1.0, "sum": 36.0}
 
 
+def test_c_shell_allocates_dynamic_rank_two_workspace_from_explicit_extents():
+    parameters = (
+        Parameter(
+            "extent_dynamic_0_1", "extent", "int32", "int32_t",
+            "c_int32", "value",
+        ),
+        Parameter(
+            "extent_dynamic_0_2", "extent", "int32", "int32_t",
+            "c_int32", "value",
+        ),
+        Parameter(
+            "scratch", "workspace", "float64", "double", "c_double",
+            "reference", source_name="callee.scratch",
+            extents=("extent_dynamic_0_1", "extent_dynamic_0_2"),
+        ),
+    )
+    module = FortranModule(
+        "workspace_fortran",
+        "",
+        api=CompiledProgramAPI(
+            "workspace_fortran", "fortran", "workspace",
+            (EntryPoint("workspace", "workspace", "control", parameters),),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="require explicit positive"):
+        emit_fortran_c_shell_source(module)
+
+    source = emit_fortran_c_shell_source(
+        module,
+        extent_overrides={
+            "extent_dynamic_0_1": 3,
+            "extent_dynamic_0_2": 4,
+        },
+    )
+
+    assert "slots[0] = calloc(12, sizeof(double));" in source
+    assert "short initial state at callee.scratch" not in source
+
+
 @pytest.mark.skipif(
     fortran_compiler() is None,
     reason="no Fortran compiler installed",
@@ -1615,6 +1685,34 @@ def test_generated_c_shell_reads_declared_file_port_into_bound_abi_parameters():
     assert "(uint8_t *)slots[0], 16" in source
     assert "*((int64_t *)slots[1]) = (int64_t)loaded_bytes" in source
     assert "short initial state at binary_bytes" not in source
+
+
+def test_generated_c_shell_loads_and_publishes_inout_state():
+    parameters = (
+        Parameter(
+            "state", "inout", "float64", "double", "c_double",
+            "reference", (4,), "extent_4", "state.values",
+        ),
+        Parameter(
+            "state_snapshot", "input", "float64", "double", "c_double",
+            "reference", (4,), "extent_4", "state.values",
+        ),
+    )
+    api = CompiledProgramAPI(
+        "resident_state", "fortran", "advance",
+        (EntryPoint("advance", "advance", "control", parameters),),
+    )
+    module = FortranModule("resident_state", "", api=api)
+
+    source = emit_fortran_c_shell_source(module)
+
+    assert "fread(slots[0], sizeof(double), 4, state)" in source
+    assert '\\"state.values\\":{\\"first\\":%.17g,\\"sum\\":%.17g}' in source
+    assert "((double *)slots[0])[0], sum" in source
+    assert "((double *)slots[1])[0], sum" not in source
+    assert 'strcmp(argv[argument_index], "--stream-frames") == 0' in source
+    assert '\\"event\\":\\"frame\\"' in source
+    assert "fflush(stdout);" in source
 
 
 @pytest.mark.skipif(

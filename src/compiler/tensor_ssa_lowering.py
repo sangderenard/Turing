@@ -32,8 +32,170 @@ class TensorSSALoweringShortfall:
     reason: str
 
 
+def wire_repository_ssa_region_products(module: IRModule) -> bool:
+    """Connect region outputs to later region feeds inside each function.
+
+    Region planning records semantic source identities in ``output_ids`` and
+    ``feed_ids``.  Source-call linking can temporarily materialize a
+    caller-owned frame argument when a producer region has not yet been
+    inserted.  Once the complete repository module exists, the declared
+    identities provide an exact, deterministic replacement: use the
+    producer's projected SSA value and schedule its call/projection cluster
+    before the consumer.
+    """
+
+    changed = False
+    for function in module.functions.values():
+        for block in function.blocks.values():
+            instructions = block.instrs
+            producer_by_source: dict[int, tuple[Instr, SSAValue, list[Instr]]] = {}
+            for index, instruction in enumerate(tuple(instructions)):
+                if (
+                    instruction.op not in {"Call", "call"}
+                    or instruction.res is None
+                    or not tuple(instruction.attributes.get("output_ids", ()))
+                ):
+                    continue
+                cluster = [instruction]
+                cursor = index + 1
+                while cursor < len(instructions) and instructions[cursor].op in {
+                    "Const", "GetElementPtr", "getelementptr", "Load", "load",
+                }:
+                    cluster.append(instructions[cursor])
+                    cursor += 1
+                for projected in cluster:
+                    if (
+                        projected.op in {"Load", "load"}
+                        and projected.res is not None
+                        and projected.attributes.get("source_output_id") is not None
+                    ):
+                        producer_by_source[int(
+                            projected.attributes["source_output_id"]
+                        )] = (instruction, projected.res, cluster)
+
+            for consumer in tuple(instructions):
+                if consumer.op not in {"Call", "call"}:
+                    continue
+                feeds = tuple(map(
+                    int, consumer.attributes.get("feed_ids", ())
+                ))
+                if not feeds:
+                    continue
+                for position, feed_id in enumerate(feeds):
+                    producer = producer_by_source.get(feed_id)
+                    if producer is None or producer[0] is consumer:
+                        continue
+                    producer_call, produced_value, cluster = producer
+                    if position >= len(consumer.args):
+                        continue
+                    if int(consumer.args[position].id) != int(produced_value.id):
+                        consumer.args[position] = produced_value
+                        changed = True
+                    producer_index = instructions.index(producer_call)
+                    consumer_index = instructions.index(consumer)
+                    if producer_index > consumer_index:
+                        for member in cluster:
+                            instructions.remove(member)
+                        consumer_index = instructions.index(consumer)
+                        instructions[consumer_index:consumer_index] = cluster
+                        changed = True
+    return changed
+
+
+def settle_shape_only_repository_returns(module: IRModule) -> bool:
+    """Restore identity returns erased from pure shape-only regions.
+
+    The numeric isolator can place a terminal ``reshape`` whose source and
+    target descriptors are already identical on the boundary of a planned
+    region.  Structural SSA then quite correctly removes the data-moving
+    operation, but older region assembly also removes the return itself.  The
+    caller still records the exact one-input/one-output region contract.  Use
+    that contract to spell the remaining operation as an identity return so
+    the caller-owned output buffer is populated instead of left uninitialized.
+
+    This is deliberately limited to pure regions and an unambiguous unary
+    call edge with an identical tensor descriptor.  Numeric regions, scalar
+    transforms, broadcasts, and shape-changing views are not inferred here.
+    """
+
+    calls_by_callee: dict[str, list[tuple[Any, Instr]]] = {}
+    for caller in module.functions.values():
+        for block in caller.blocks.values():
+            for instruction in block.instrs:
+                if instruction.op not in {"Call", "call"}:
+                    continue
+                callee = str(instruction.attributes.get("callee") or "")
+                if callee in module.functions:
+                    calls_by_callee.setdefault(callee, []).append((
+                        caller, instruction,
+                    ))
+
+    changed = False
+    harmless = {"Const", "StaticRef", "extent", "getattr", "GetAttr"}
+    return_ops = {Handler.Ret.value, "ret", "Return", "return"}
+    for name, function in module.functions.items():
+        instructions = [
+            instruction
+            for block in function.blocks.values()
+            for instruction in block.instrs
+        ]
+        if any(instruction.op in return_ops for instruction in instructions):
+            continue
+        if any(instruction.op not in harmless for instruction in instructions):
+            continue
+        if len(function.args) != 1:
+            continue
+        callsites = calls_by_callee.get(name, ())
+        if not callsites:
+            continue
+        source = function.args[0]
+        source_shape = tuple(source.shape or ())
+        source_dtype = source.dtype
+        exact = True
+        for caller, call in callsites:
+            output_ids = tuple(map(
+                int, call.attributes.get("output_ids", ())
+            ))
+            if len(call.args) != 1 or len(output_ids) != 1:
+                exact = False
+                break
+            projected = next((
+                instruction.res
+                for block in caller.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"Load", "load"}
+                and instruction.res is not None
+                and int(instruction.attributes.get(
+                    "source_output_id", -1
+                )) == output_ids[0]
+            ), None)
+            if projected is None:
+                exact = False
+                break
+            if tuple(projected.shape or ()) != source_shape:
+                exact = False
+                break
+            if (
+                source_dtype is not None
+                and projected.dtype is not None
+                and source_dtype != projected.dtype
+            ):
+                exact = False
+                break
+        if not exact:
+            continue
+        last_block = next(reversed(tuple(function.blocks.values())), None)
+        if last_block is None:
+            continue
+        last_block.instrs.append(Instr(Handler.Ret.value, [source], None))
+        function.metadata["source_output_value_ids"] = (int(source.id),)
+        changed = True
+    return changed
+
+
 _VIEW_OPERATIONS = frozenset({
     "reshape", "view", "flatten", "unsqueeze", "squeeze", "contiguous",
+    "detach",
 })
 _CAST_OPERATIONS = {
     "float": "cast_double_to_float_values",
@@ -57,6 +219,7 @@ _SHAPED_SSA_OPERATIONS = {
     "min": "min", "max": "max", "any": "any", "all": "all",
     "matmul": "matmul", "transpose": "transpose",
     "broadcast_to": "broadcast_to", "expand": "expand",
+    "unfold2d": "unfold2d", "fold2d": "fold2d",
 }
 
 
@@ -113,7 +276,9 @@ def _attribute(attributes: dict[str, Any], *names: str) -> Any:
     return None
 
 
-def propagate_repository_ssa_call_metadata(module: IRModule) -> bool:
+def propagate_repository_ssa_call_metadata(
+    module: IRModule, *, authoritative_returns: bool = False,
+) -> bool:
     """Settle tensor dtype/shape facts across repository-SSA call edges.
 
     Planned regions return through explicit aggregate projections while source
@@ -125,8 +290,30 @@ def propagate_repository_ssa_call_metadata(module: IRModule) -> bool:
 
     changed_any = False
 
-    def values(function) -> list[SSAValue]:
-        return [
+    # The SSA instruction topology is immutable throughout this metadata
+    # fixed point.  Only ``SSAValue.shape``, ``dtype``, and ``accounting`` are
+    # enriched.  The old implementation nevertheless rebuilt whole-function
+    # value, constant, return, and aggregate-projection indices for every
+    # call edge on every iteration.  A training motion has many calls into
+    # the same planned regions, so that made propagation a repeated
+    # all-module scan rather than a metadata fixed point.
+    #
+    # Cache references to the live SSAValue objects, not copies of their
+    # metadata.  Enrichment therefore remains immediately visible through
+    # every cached index and the convergence semantics are unchanged.
+    value_cache: dict[int, tuple[SSAValue, ...]] = {}
+    values_by_id_cache: dict[int, dict[int, tuple[SSAValue, ...]]] = {}
+    constant_result_ids_cache: dict[int, frozenset[int]] = {}
+    constant_indices_cache: dict[int, dict[int, int]] = {}
+    returned_cache: dict[int, tuple[SSAValue, ...]] = {}
+    projection_cache: dict[tuple[int, int], dict[int, SSAValue]] = {}
+
+    def values(function) -> tuple[SSAValue, ...]:
+        key = id(function)
+        cached = value_cache.get(key)
+        if cached is not None:
+            return cached
+        discovered = [
             *function.args,
             *(
                 value
@@ -136,22 +323,85 @@ def propagate_repository_ssa_call_metadata(module: IRModule) -> bool:
                 if value is not None
             ),
         ]
+        # One SSAValue is normally referenced by several instructions.  Keep
+        # each live object once while retaining distinct objects that share a
+        # canonical integer value id and all need the same metadata.
+        cached = tuple({id(value): value for value in discovered}.values())
+        value_cache[key] = cached
+        return cached
 
-    def enrich(function, value_id: int, source: SSAValue) -> bool:
+    def values_by_id(function) -> dict[int, tuple[SSAValue, ...]]:
+        key = id(function)
+        cached = values_by_id_cache.get(key)
+        if cached is not None:
+            return cached
+        grouped: dict[int, list[SSAValue]] = {}
+        for value in values(function):
+            grouped.setdefault(int(value.id), []).append(value)
+        cached = {
+            value_id: tuple(group)
+            for value_id, group in grouped.items()
+        }
+        values_by_id_cache[key] = cached
+        return cached
+
+    def constant_result_ids(function) -> frozenset[int]:
+        key = id(function)
+        cached = constant_result_ids_cache.get(key)
+        if cached is not None:
+            return cached
+        cached = frozenset(
+            int(instruction.res.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op == "Const" and instruction.res is not None
+        )
+        constant_result_ids_cache[key] = cached
+        return cached
+
+    def enrich(
+        function, value_id: int, source: SSAValue, *, authoritative: bool = False,
+    ) -> bool:
         changed = False
         source_shape = tuple(source.shape or ())
         source_dtype = source.dtype
         source_aggregate = tuple(
             (source.accounting or {}).get("ssa_aggregate_outputs", ())
         )
-        for value in values(function):
-            if int(value.id) != int(value_id):
-                continue
-            if source_shape and not tuple(value.shape or ()):
+        source_physical_dtype = (source.accounting or {}).get(
+            "physical_dtype"
+        )
+        fixed_constant = int(value_id) in constant_result_ids(function)
+        for value in values_by_id(function).get(int(value_id), ()):
+            if (
+                not fixed_constant
+                and authoritative
+                and tuple(value.shape or ()) != source_shape
+            ):
                 value.shape = source_shape
                 changed = True
-            if source_dtype is not None and value.dtype is None:
+            elif (
+                not fixed_constant
+                and source_shape
+                and not tuple(value.shape or ())
+            ):
+                value.shape = source_shape
+                changed = True
+            if (
+                source_dtype is not None
+                and (value.dtype is None or authoritative)
+                and value.dtype != source_dtype
+            ):
                 value.dtype = source_dtype
+                changed = True
+            if (
+                source_physical_dtype is not None
+                and (value.accounting or {}).get("physical_dtype") is None
+            ):
+                value.accounting = {
+                    **dict(value.accounting or {}),
+                    "physical_dtype": str(source_physical_dtype),
+                }
                 changed = True
             if (
                 source_aggregate
@@ -169,14 +419,24 @@ def propagate_repository_ssa_call_metadata(module: IRModule) -> bool:
         return changed
 
     def returned(function) -> tuple[SSAValue, ...]:
-        return next((
+        key = id(function)
+        cached = returned_cache.get(key)
+        if cached is not None:
+            return cached
+        cached = next((
             tuple(instruction.args)
             for block in function.blocks.values()
             for instruction in block.instrs
             if instruction.op in {"Ret", "ret", "Return", "return"}
         ), ())
+        returned_cache[key] = cached
+        return cached
 
     def constant_indices(function) -> dict[int, int]:
+        key = id(function)
+        cached = constant_indices_cache.get(key)
+        if cached is not None:
+            return cached
         result = {}
         for block in function.blocks.values():
             for instruction in block.instrs:
@@ -185,9 +445,14 @@ def propagate_repository_ssa_call_metadata(module: IRModule) -> bool:
                 payload = _constant_payload(instruction)
                 if isinstance(payload, (int, float)):
                     result[int(instruction.res.id)] = int(payload)
+        constant_indices_cache[key] = result
         return result
 
     def projections(function, aggregate_id: int) -> dict[int, SSAValue]:
+        key = (id(function), int(aggregate_id))
+        cached = projection_cache.get(key)
+        if cached is not None:
+            return cached
         constants = constant_indices(function)
         addresses: dict[int, int] = {}
         result: dict[int, SSAValue] = {}
@@ -211,9 +476,18 @@ def propagate_repository_ssa_call_metadata(module: IRModule) -> bool:
                     and int(instruction.args[0].id) in addresses
                 ):
                     result[addresses[int(instruction.args[0].id)]] = instruction.res
+        projection_cache[key] = result
         return result
 
     changed = True
+    settle_exact_formals = True
+    # Authoritative return metadata is a settling phase, not a permanent
+    # overwrite mode.  Leaving it enabled for every fixed-point round lets
+    # distinct SSA aliases with the same canonical id overwrite one another
+    # on every scan, so ``changed`` can remain true forever even though no new
+    # fact enters the module.  Apply the exact return contract once, then let
+    # the ordinary fill-only propagation carry those settled facts outward.
+    settle_exact_returns = bool(authoritative_returns)
     while changed:
         changed = False
         for function_name, function in module.functions.items():
@@ -228,11 +502,12 @@ def propagate_repository_ssa_call_metadata(module: IRModule) -> bool:
                         or instruction.attributes.get("tensor_operation")
                         or instruction.op
                     )
+                    opcode = c_tensor_opcode(operation)
                     if operation not in {
                         "Div", "Sub", "Add", "Mul",
                         "div", "truediv", "sub", "add", "mul",
                         "broadcast_to", "expand",
-                    }:
+                    } and not (opcode is not None and opcode[0] == "unary"):
                         continue
                     shaped = next(
                         (value for value in instruction.args if tuple(value.shape or ())),
@@ -249,8 +524,28 @@ def propagate_repository_ssa_call_metadata(module: IRModule) -> bool:
                     callee = module.functions.get(callee_name)
                     if callee is None:
                         continue
+                    if instruction.attributes.get("ssa_output_argument") is not None:
+                        # Authored repository kernels are generic definitions
+                        # shared by every tensor shape. Their concrete call
+                        # operands are already complete; propagating one
+                        # invocation's shapes through the shared formals and
+                        # back into another invocation corrupts metadata.
+                        continue
+                    specialized_call = (
+                        "__planned_region_" in callee_name
+                    )
                     for actual, formal in zip(instruction.args, callee.args):
-                        changed |= enrich(callee, int(formal.id), actual)
+                        # The caller's actual value is the concrete contract
+                        # for this specialized formal, including the
+                        # distinction between a scalar ``()`` and a tensor.
+                        # Reverse propagation remains fill-only so a stale
+                        # placeholder cannot reshape the actual argument.
+                        changed |= enrich(
+                            callee, int(formal.id), actual,
+                            authoritative=(
+                                specialized_call and settle_exact_formals
+                            ),
+                        )
                         changed |= enrich(function, int(actual.id), formal)
 
                     callee_returns = returned(callee)
@@ -259,7 +554,10 @@ def propagate_repository_ssa_call_metadata(module: IRModule) -> bool:
                     ))
                     if declared and instruction.res is not None:
                         caller_outputs = projections(function, int(instruction.res.id))
-                        callee_values = {int(value.id): value for value in values(callee)}
+                        callee_values = {
+                            value_id: candidates[0]
+                            for value_id, candidates in values_by_id(callee).items()
+                        }
                         for position, output_id in enumerate(declared):
                             caller_value = caller_outputs.get(position)
                             callee_value = callee_values.get(output_id)
@@ -278,18 +576,23 @@ def propagate_repository_ssa_call_metadata(module: IRModule) -> bool:
                             if caller_value is None or callee_value is None:
                                 continue
                             changed |= enrich(
-                                function, int(caller_value.id), callee_value
+                                function, int(caller_value.id), callee_value,
+                                authoritative=settle_exact_returns,
                             )
-                            changed |= enrich(
-                                callee, int(callee_value.id), caller_value
-                            )
+                            if not authoritative_returns:
+                                changed |= enrich(
+                                    callee, int(callee_value.id), caller_value
+                                )
                     elif len(callee_returns) == 1 and instruction.res is not None:
                         changed |= enrich(
-                            function, int(instruction.res.id), callee_returns[0]
+                            function, int(instruction.res.id), callee_returns[0],
+                            authoritative=settle_exact_returns,
                         )
-                        changed |= enrich(
-                            callee, int(callee_returns[0].id), instruction.res
-                        )
+                        if not authoritative_returns:
+                            changed |= enrich(
+                                callee, int(callee_returns[0].id),
+                                instruction.res,
+                            )
                     elif len(callee_returns) > 1 and instruction.res is not None:
                         # An aggregate may be forwarded into a small adapter
                         # whose sole job is to project its members.
@@ -311,8 +614,11 @@ def propagate_repository_ssa_call_metadata(module: IRModule) -> bool:
                                         projected = adapter_outputs.get(output_index)
                                         if projected is not None:
                                             changed |= enrich(
-                                                adapter, int(projected.id), source
+                                                adapter, int(projected.id), source,
+                                                authoritative=settle_exact_returns,
                                             )
+        settle_exact_formals = False
+        settle_exact_returns = False
         changed_any |= changed
     return changed_any
 
@@ -500,7 +806,16 @@ def lower_tensor_calls_to_repository_ssa(
                 return cached
             minted: dict[str, SSAValue] = {}
             for kind in ("shape", "rank", "element_count"):
-                value = fresh(dtype="int32")
+                # Shape metadata is an integer vector with one slot per
+                # tensor axis.  Treating it as a scalar under-allocates the
+                # native frame and lets extent emission overwrite the
+                # adjacent rank/count values.  Rank and element count remain
+                # ordinary scalar metadata.
+                value = fresh(
+                    shape=(len(tuple(tensor.shape or ())),)
+                    if kind == "shape" else (),
+                    dtype="int32",
+                )
                 prefix.append(Instr(
                     "extent", [tensor], value,
                     attributes={
@@ -652,6 +967,131 @@ def lower_tensor_calls_to_repository_ssa(
                     if position != 0 and int(argument.id) in constants
                 ]
                 source = data_args[0] if data_args else (args[0] if args else None)
+                if (
+                    source is not None
+                    and tuple(source.shape or ())
+                    and (operation in _REDUCTION_CODES or operation == "mean")
+                ):
+                    reduction_axis = _attribute(
+                        instruction.attributes, "axis", "dim"
+                    )
+                    if reduction_axis is None:
+                        reduction_axis = next((
+                            item for item in metadata
+                            if isinstance(item, (int, float))
+                            or _as_sequence(item) is not None
+                        ), None)
+                    reduction_keepdim = bool(
+                        _attribute(instruction.attributes, "keepdim")
+                        or False
+                    )
+                    if reduction_axis is None and operation in {"sum", "mean"}:
+                        result.shape = ()
+                    elif reduction_axis is not None:
+                        raw_axes = _as_sequence(reduction_axis)
+                        axes = (
+                            tuple(raw_axes)
+                            if raw_axes is not None
+                            else (reduction_axis,)
+                        )
+                        rank = len(source.shape)
+                        normalized = {
+                            int(axis) % rank for axis in axes
+                        }
+                        result.shape = tuple(
+                            1 if reduction_keepdim and index in normalized else extent
+                            for index, extent in enumerate(source.shape)
+                            if reduction_keepdim or index not in normalized
+                        )
+                sequence_metadata = tuple(
+                    tuple(map(int, sequence))
+                    for item in metadata
+                    if (sequence := _as_sequence(item)) is not None
+                    and all(isinstance(member, (int, float)) for member in sequence)
+                )
+                if (
+                    operation == "unfold2d"
+                    and source is not None
+                    and len(tuple(source.shape or ())) == 4
+                ):
+                    n, channels, height, width = map(int, source.shape)
+                    kernel = _as_sequence(_attribute(
+                        instruction.attributes, "kernel_size"
+                    ))
+                    stride = _as_sequence(_attribute(
+                        instruction.attributes, "stride"
+                    )) or (1, 1)
+                    padding = _as_sequence(_attribute(
+                        instruction.attributes, "padding"
+                    )) or (0, 0)
+                    dilation = _as_sequence(_attribute(
+                        instruction.attributes, "dilation"
+                    )) or (1, 1)
+                    if kernel is not None and all(
+                        len(pair) == 2
+                        for pair in (kernel, stride, padding, dilation)
+                    ):
+                        kh, kw = map(int, kernel)
+                        sh, sw = map(int, stride)
+                        ph, pw = map(int, padding)
+                        dh, dw = map(int, dilation)
+                        output_h = (
+                            height + 2 * ph - dh * (kh - 1) - 1
+                        ) // sh + 1
+                        output_w = (
+                            width + 2 * pw - dw * (kw - 1) - 1
+                        ) // sw + 1
+                        result.shape = (
+                            n, channels * kh * kw, output_h * output_w,
+                        )
+                elif operation == "fold2d":
+                    output_size = _as_sequence(_attribute(
+                        instruction.attributes, "output_size"
+                    ))
+                    if output_size is None and sequence_metadata:
+                        output_size = sequence_metadata[0]
+                    if output_size is not None and len(output_size) == 4:
+                        result.shape = tuple(map(int, output_size))
+                opcode_contract = c_tensor_opcode(operation)
+                if (
+                    source is not None
+                    and opcode_contract is not None
+                ):
+                    result.accounting = {
+                        **dict(result.accounting or {}),
+                        # Both authored C dispatch kernels take ``double *``
+                        # outputs. Tensor comparison masks may remain
+                        # semantically Boolean while retaining that physical
+                        # storage ABI.
+                        "physical_dtype": "float64",
+                    }
+                    if opcode_contract[0] == "binary":
+                        shaped_operands = [
+                            tuple(operand.shape or ())
+                            for operand in data_args
+                            if tuple(operand.shape or ())
+                        ]
+                        if shaped_operands:
+                            import numpy as _np
+
+                            result.shape = tuple(_np.broadcast_shapes(
+                                *shaped_operands
+                            ))
+                        elif len(data_args) == 1:
+                            result.shape = tuple(source.shape or ())
+                if (
+                    source is not None
+                    and opcode_contract is not None
+                    and opcode_contract[0] == "unary"
+                ):
+                    # ``unary_double`` is an elementwise authored kernel: its
+                    # output descriptor is identical to its data source.  A
+                    # stale cross-call hint must not turn that identity into
+                    # a fabricated broadcast (or size an internal frame for
+                    # a different model layer).
+                    result.shape = tuple(source.shape or ())
+                    if source.dtype is not None:
+                        result.dtype = source.dtype
                 source_descriptor = None
                 if source is not None:
                     source_descriptor = register_tensor(
@@ -930,6 +1370,99 @@ def lower_tensor_calls_to_repository_ssa(
                             result, instruction, output_argument=1,
                         ))
 
+                elif operation == "unfold2d" and source is not None:
+                    kernel = _as_sequence(_attribute(
+                        instruction.attributes, "kernel_size"
+                    ))
+                    stride = _as_sequence(_attribute(
+                        instruction.attributes, "stride"
+                    )) or (1, 1)
+                    padding = _as_sequence(_attribute(
+                        instruction.attributes, "padding"
+                    )) or (0, 0)
+                    dilation = _as_sequence(_attribute(
+                        instruction.attributes, "dilation"
+                    )) or (1, 1)
+                    if (
+                        len(tuple(source.shape or ())) == 4
+                        and kernel is not None
+                        and all(
+                            len(pair) == 2
+                            for pair in (kernel, stride, padding, dilation)
+                        )
+                    ):
+                        dimensions = (
+                            *map(int, source.shape), *map(int, kernel),
+                            *map(int, stride), *map(int, padding),
+                            *map(int, dilation),
+                        )
+                        dimension_values = []
+                        for extent in dimensions:
+                            value, definition = constant(extent, "int32")
+                            dimension_values.append(value)
+                            prefix.append(definition)
+                        emitted.append(call(
+                            "unfold2d_double",
+                            [source, result, *dimension_values],
+                            result, instruction, output_argument=1,
+                        ))
+
+                elif operation == "fold2d" and source is not None:
+                    sequences = list(sequence_metadata)
+                    output_size = _as_sequence(_attribute(
+                        instruction.attributes, "output_size"
+                    ))
+                    kernel = _as_sequence(_attribute(
+                        instruction.attributes, "kernel_size"
+                    ))
+                    stride = _as_sequence(_attribute(
+                        instruction.attributes, "stride"
+                    ))
+                    padding = _as_sequence(_attribute(
+                        instruction.attributes, "padding"
+                    ))
+                    dilation = _as_sequence(_attribute(
+                        instruction.attributes, "dilation"
+                    ))
+                    if output_size is None and sequences:
+                        output_size = sequences.pop(0)
+                    resolved = []
+                    for explicit, default in (
+                        (kernel, None), (stride, (1, 1)),
+                        (padding, (0, 0)), (dilation, (1, 1)),
+                    ):
+                        if explicit is not None:
+                            resolved.append(tuple(explicit))
+                        elif sequences:
+                            resolved.append(tuple(sequences.pop(0)))
+                        else:
+                            resolved.append(default)
+                    kernel, stride, padding, dilation = resolved
+                    if (
+                        output_size is not None
+                        and len(output_size) == 4
+                        and kernel is not None
+                        and all(
+                            pair is not None and len(pair) == 2
+                            for pair in (kernel, stride, padding, dilation)
+                        )
+                    ):
+                        dimensions = (
+                            *map(int, output_size), *map(int, kernel),
+                            *map(int, stride), *map(int, padding),
+                            *map(int, dilation),
+                        )
+                        dimension_values = []
+                        for extent in dimensions:
+                            value, definition = constant(extent, "int32")
+                            dimension_values.append(value)
+                            prefix.append(definition)
+                        emitted.append(call(
+                            "fold2d_double",
+                            [source, result, *dimension_values],
+                            result, instruction, output_argument=1,
+                        ))
+
                 elif operation == "sign" and source is not None:
                     count = need_count(source, source_count)
                     emitted.append(call("sign_double", [source, result, count], result, instruction, output_argument=1))
@@ -971,7 +1504,7 @@ def lower_tensor_calls_to_repository_ssa(
                         opcode_ssa, opcode_instruction = constant(opcode_value, "int32")
                         if count is not None:
                             prefix.append(opcode_instruction)
-                            if kind == "unary" and len(data_args) == 1:
+                            if kind == "unary":
                                 emitted.append(call(
                                     "unary_double", [source, result, count, opcode_ssa], result,
                                     instruction, output_argument=1,
@@ -1133,4 +1666,6 @@ __all__ = [
     "TensorSSALoweringShortfall",
     "lower_tensor_calls_to_repository_ssa",
     "propagate_repository_ssa_call_metadata",
+    "settle_shape_only_repository_returns",
+    "wire_repository_ssa_region_products",
 ]

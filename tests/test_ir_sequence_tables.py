@@ -26,9 +26,13 @@ from src.compiler.control_source import (
     LoopBlock,
     SequenceBlock,
 )
-from src.compiler.precompile_to_ssa import lower_control_sections_to_ssa
+from src.compiler.precompile_to_ssa import (
+    lower_control_sections_to_ssa,
+    ssa_module_dictionary,
+)
 from src.compiler.ssa_fortran_backend import FortranEmissionError, emit_module
 from src.compiler.ssa_fortran_backend import fortran_compiler
+from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
 from src.compiler.fortran_c_shell import compile_fortran_module_c_shell
 from src.transmogrifier.ssa import (
     BasicBlock,
@@ -675,3 +679,58 @@ def test_retained_field_sequence_populates_typed_record_from_lowered_storage():
     assert emitted.api.metadata["record_tables"]["planned_control"] == [
         record.to_mapping()
     ]
+
+
+def test_static_program_reference_is_typed_ssa_and_native_handle_storage():
+    handle = -734_921
+    module, shortfalls, _ = lower_control_sections_to_ssa(
+        ControlProgram(SequenceBlock(())),
+        identity_table={"self": (5,)},
+        self_value_id=5,
+        field_ops=(("write", 11, 0),),
+        field_const_sources={11: {
+            "ssa_reference_identity": "autograd.tape",
+            "reference_kind": "static-python",
+            "reference_handle": handle,
+            "host_resident": True,
+        }},
+        field_count=1,
+        field_names=("_tape",),
+        record_identity="AbstractTensor",
+    )
+
+    assert shortfalls == ()
+    function = module.functions["planned_control"]
+    instructions = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+    reference = next(item for item in instructions if item.op == "StaticRef")
+    store = next(item for item in instructions if item.op == "Store")
+    assert reference.res.dtype == "opaque_ref"
+    assert reference.attributes["reference_identity"] == "autograd.tape"
+    assert store.args[0].dtype == "opaque_ref"
+    descriptor = module.reference_tables["planned_control"].references[handle]
+    assert descriptor.identity == "autograd.tape"
+    assert descriptor.host_resident
+    assert ssa_module_dictionary(module)["reference_tables"]["planned_control"] == [
+        descriptor.to_mapping()
+    ]
+    record = module.record_tables["planned_control"].records[5]
+    assert record.fields[0].storage is SSARecordFieldStorage.REFERENCE
+    assert record.fields[0].dtype == "opaque_ref"
+
+    fortran = emit_module(
+        module, name="opaque_reference_probe",
+        extra_roots=("planned_control",),
+    )
+    assert fortran.complete
+    assert f"{handle}_c_int64_t" in fortran.source
+    assert f"transfer({handle}_c_int64_t, 0.0_c_double)" in fortran.source
+
+    llvm = emit_ssa_function_to_llvm(
+        module, "planned_control", entry_name="opaque_reference_probe",
+    )
+    assert llvm.shortfalls == ()
+    assert f"store i64 {handle}" in llvm.llvm_ir

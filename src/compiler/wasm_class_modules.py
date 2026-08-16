@@ -523,11 +523,11 @@ def emit_control_region_modules(
         api_entry = module.api.entry_points[0]
         inputs = [
             parameter.name for parameter in api_entry.parameters
-            if parameter.role == "input"
+            if parameter.role in {"input", "inout"}
         ]
         outputs = [
             parameter.name for parameter in api_entry.parameters
-            if parameter.role == "output"
+            if parameter.role in {"output", "inout"}
         ]
         feed_ids = tuple(map(int, program_feed_order(program)))
         if len(feed_ids) != len(inputs):
@@ -981,8 +981,8 @@ def build_manifest(
     for spec in specs:
         module = modules[spec.index]
         entry_point = module.api.entry_points[0]
-        inputs = [p.name for p in entry_point.parameters if p.role == "input"]
-        outputs = [p.name for p in entry_point.parameters if p.role == "output"]
+        inputs = [p.name for p in entry_point.parameters if p.role in {"input", "inout"}]
+        outputs = [p.name for p in entry_point.parameters if p.role in {"output", "inout"}]
         module_entries.append({
             "name": spec.module_name,
             "url": f"{module_dir}/{spec.module_name}.wasm",

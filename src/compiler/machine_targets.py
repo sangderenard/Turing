@@ -307,20 +307,11 @@ class _WasmTarget:
 
     def __init__(self):
         from .fused_program_wasm_backend import (
-            _BINARY_INSTRUCTION,
-            _COMPARISON_INSTRUCTION,
-            _LUT_OPS,
             _NO_WASM_INSTRUCTION,
-            _UNARY_INSTRUCTION,
+            supported_tensor_operations,
         )
 
-        supported = frozenset(
-            set(_BINARY_INSTRUCTION)
-            | set(_COMPARISON_INSTRUCTION)
-            | set(_LUT_OPS)
-            | set(_UNARY_INSTRUCTION)
-            | {"tensor_from_list"}
-        )
+        supported = supported_tensor_operations()
 
         self.capabilities = TargetCapabilities(
             name="wasm",
@@ -333,12 +324,17 @@ class _WasmTarget:
             # form at ProcessGraph intake, before flattening.
             tensor_native=False,
             supported_operations=supported,
-            unsupported_operations=frozenset(_NO_WASM_INSTRUCTION),
+            unsupported_operations=frozenset(
+                operation
+                for operation in _NO_WASM_INSTRUCTION
+                if operation not in supported
+            ),
             assembler="wat2wasm",
             note=(
-                "WebAssembly has no transcendental instructions, so exp/log/"
-                "pow and the trigonometric family cannot be expressed; they "
-                "are reported rather than approximated"
+                "Numeric tables and exact compositions cover the floating "
+                "transcendental subset; bitwise and logical operations use "
+                "the integral route. supported_operations is their union; "
+                "emission still validates the selected working dtype."
             ),
         )
 

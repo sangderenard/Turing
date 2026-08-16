@@ -14,6 +14,7 @@ from math import prod
 from typing import Any
 
 from ..abstraction import AbstractTensor
+from ..abstraction_methods.indexing import lower_basic_index, normalize_index
 from ....transmogrifier.ssa import (
     BasicBlock,
     Function,
@@ -278,8 +279,62 @@ class SSATensorProgram:
         tensor_scalar_broadcast = None
         if canonical == "matmul" and len(tensor_operands) == 2:
             left_shape, right_shape = tensor_operands[0].shape, tensor_operands[1].shape
+            if len(left_shape) in {2, 3} and len(right_shape) in {2, 3} and (
+                len(left_shape) == 3 or len(right_shape) == 3
+            ):
+                if left_shape[-1] != right_shape[-2]:
+                    raise ValueError("SSA batched matmul inner dimensions differ")
+                left_batch = left_shape[0] if len(left_shape) == 3 else 1
+                right_batch = right_shape[0] if len(right_shape) == 3 else 1
+                if left_batch != right_batch and left_batch != 1 and right_batch != 1:
+                    raise ValueError("SSA batched matmul batch dimensions differ")
+                batch = max(left_batch, right_batch)
+
+                # A singleton batch has no numerical indexing semantics.  It
+                # is one ordinary matrix product with a leading layout axis.
+                # Expressing it through index_select/index_set needlessly
+                # retains the complete indexing-adjoint helper closure in
+                # graph autograd and makes a tiny convolution compile like a
+                # general scatter program.
+                if batch == 1:
+                    left_matrix = (
+                        self.view(tensor_operands[0], left_shape[1:])
+                        if len(left_shape) == 3 else tensor_operands[0]
+                    )
+                    right_matrix = (
+                        self.view(tensor_operands[1], right_shape[1:])
+                        if len(right_shape) == 3 else tensor_operands[1]
+                    )
+                    product = self.operation("matmul", left_matrix, right_matrix)
+                    return self.view(
+                        product,
+                        (1, left_shape[-2], right_shape[-1]),
+                    )
+
+                output = self.full((batch, left_shape[-2], right_shape[-1]), 0.0)
+
+                def matrix_at(value: SSATensorValue, position: int) -> SSATensorValue:
+                    if len(value.shape) == 2:
+                        return value
+                    selected = self.index_select(
+                        value, 0, [position if value.shape[0] > 1 else 0]
+                    )
+                    return self.view(selected, selected.shape[1:])
+
+                for position in range(batch):
+                    product = self.operation(
+                        "matmul",
+                        matrix_at(tensor_operands[0], position),
+                        matrix_at(tensor_operands[1], position),
+                    )
+                    output = self.index_set(
+                        output,
+                        (position, slice(None), slice(None)),
+                        product,
+                    )
+                return output
             if len(left_shape) != 2 or len(right_shape) != 2 or left_shape[1] != right_shape[0]:
-                raise NotImplementedError("the fundamental SSA matmul kernel is rank-2")
+                raise NotImplementedError("the fundamental SSA matmul kernel supports rank two or three")
             shape = (left_shape[0], right_shape[1])
         elif right is None:
             shape = tensor_operands[0].shape
@@ -381,6 +436,25 @@ class SSATensorProgram:
         count = self._constant(prod(shape) if shape else 1, "int32")
         return self._call(
             "fill_double", [result, scalar, count], result, output_argument=0
+        )
+
+    def view(self, source: SSATensorValue, shape: tuple[int, ...]) -> SSATensorValue:
+        target = tuple(int(size) for size in shape)
+        if prod(target) != source.size:
+            raise ValueError("SSA tensor view has incompatible element count")
+        result = self._fresh(shape=target, dtype=source.dtype)
+        self.block.instrs.append(Instr(
+            "reshape",
+            [source.value],
+            result,
+            attributes={"shape": target},
+        ))
+        return self._tensor(
+            result,
+            storage="view",
+            alias_of=source.tensor_id,
+            data_value_id=source.descriptor.data_value_id,
+            writable=source.descriptor.writable,
         )
 
     def constant(
@@ -505,6 +579,86 @@ class SSATensorProgram:
             "index_select_double",
             [source.value, result, source_shape, ndim, dim_value, index_value, count],
             result, output_argument=1,
+        )
+
+    def index_set(
+        self, source: SSATensorValue, index, values: SSATensorValue,
+    ) -> SSATensorValue:
+        if source.program is not self or values.program is not self:
+            raise ValueError("SSA index assignment values must share one program")
+        axes, selection_shape = normalize_index(index, source.shape)
+        selection_count = prod(selection_shape) if selection_shape else 1
+        if values.size not in (1, selection_count):
+            raise ValueError(
+                f"assignment value has {values.size} elements; selection "
+                f"requires 1 or {selection_count}"
+            )
+        offsets = [0]
+        flattened_indices: list[int] = []
+        for axis in axes:
+            flattened_indices.extend(int(item) for item in axis.indices)
+            offsets.append(len(flattened_indices))
+        result = self._fresh(shape=source.shape, dtype=source.dtype)
+        shape = self._int_vector(source.shape)
+        ndim = self._constant(len(source.shape), "int32")
+        axis_offsets = self._int_vector(offsets)
+        axis_indices = self._int_vector(flattened_indices)
+        value_count = self._constant(values.size, "int32")
+        assigned = self._call(
+            "index_set_double",
+            [
+                source.value, result, shape, ndim, axis_offsets,
+                axis_indices, values.value, value_count,
+            ],
+            result,
+            output_argument=1,
+        )
+        self.block.instrs[-1].attributes["semantic_index"] = index
+        return assigned
+
+    def unfold2d(
+        self, source: SSATensorValue, kernel_size, stride, padding, dilation,
+    ) -> SSATensorValue:
+        n, c, h, w = source.shape
+        kh, kw = tuple(map(int, kernel_size))
+        sh, sw = tuple(map(int, stride))
+        ph, pw = tuple(map(int, padding))
+        dh, dw = tuple(map(int, dilation))
+        output_h = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+        output_w = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+        result = self._fresh(shape=(n, c * kh * kw, output_h * output_w))
+        dimensions = tuple(
+            self._constant(value, "int32") for value in (
+                n, c, h, w, kh, kw, sh, sw, ph, pw, dh, dw,
+            )
+        )
+        return self._call(
+            "unfold2d_double",
+            [source.value, result, *dimensions],
+            result,
+            output_argument=1,
+        )
+
+    def fold2d(
+        self, columns: SSATensorValue, output_size, kernel_size,
+        stride, padding, dilation,
+    ) -> SSATensorValue:
+        n, c, h, w = tuple(map(int, output_size))
+        kh, kw = tuple(map(int, kernel_size))
+        sh, sw = tuple(map(int, stride))
+        ph, pw = tuple(map(int, padding))
+        dh, dw = tuple(map(int, dilation))
+        result = self._fresh(shape=(n, c, h, w))
+        dimensions = tuple(
+            self._constant(value, "int32") for value in (
+                n, c, h, w, kh, kw, sh, sw, ph, pw, dh, dw,
+            )
+        )
+        return self._call(
+            "fold2d_double",
+            [columns.value, result, *dimensions],
+            result,
+            output_argument=1,
         )
 
     def pad(self, source: SSATensorValue, padding, value: float) -> SSATensorValue:
@@ -795,18 +949,7 @@ class SSATensorOperations(AbstractTensor):
         return source.program.operation("add", source, 0.0)
 
     def _view_value(self, shape: tuple[int, ...]) -> SSATensorValue:
-        value = SSAValue(
-            self.data.value.id,
-            dtype=self.data.dtype,
-            shape=tuple(shape),
-        )
-        return self.data.program._tensor(
-            value,
-            storage="view",
-            alias_of=self.data.tensor_id,
-            data_value_id=self.data.descriptor.data_value_id,
-            writable=self.data.descriptor.writable,
-        )
+        return self.data.program.view(self.data, tuple(shape))
 
     def reshape_(self, shape) -> SSATensorValue:
         requested = list(shape)
@@ -934,10 +1077,50 @@ class SSATensorOperations(AbstractTensor):
             raise NotImplementedError("dynamic SSA index vectors require an SSA input vector")
         return self.data.program.index_select(self.data, int(dim), indices)
 
+    def get_item_(self, data, index) -> SSATensorValue:
+        def select(source, axis, indices):
+            return source.program.index_select(source, axis, indices)
+
+        return lower_basic_index(
+            data,
+            index,
+            shape_of=lambda source: source.shape,
+            index_select=select,
+            reshape=lambda source, shape: self._view_of(source, shape),
+        )
+
+    @staticmethod
+    def _view_of(source: SSATensorValue, shape) -> SSATensorValue:
+        return source.program.view(source, tuple(shape))
+
+    def set_item_(self, data, index, value) -> None:
+        if not isinstance(value, SSATensorValue):
+            if not isinstance(value, (int, float, bool)):
+                raise TypeError("SSA indexed assignment requires tensor or scalar values")
+            value = data.program.full((1,), float(value))
+        self.data = data.program.index_set(data, index, value)
+
     def pad_(self, pad, value=0, mode="constant") -> SSATensorValue:
         if mode != "constant":
             raise NotImplementedError("the fundamental SSA pad kernel is constant mode")
         return self.data.program.pad(self.data, pad, float(value))
+
+    def unfold2d_(self, kernel_size, stride=1, padding=0, dilation=1):
+        pair = lambda value: (value, value) if isinstance(value, int) else tuple(value)
+        return self.data.program.unfold2d(
+            self.data,
+            pair(kernel_size), pair(stride), pair(padding), pair(dilation),
+        )
+
+    def fold2d_(
+        self, output_size, kernel_size, stride=1, padding=0, dilation=1,
+    ):
+        pair = lambda value: (value, value) if isinstance(value, int) else tuple(value)
+        return self.data.program.fold2d(
+            self.data,
+            tuple(output_size), pair(kernel_size), pair(stride),
+            pair(padding), pair(dilation),
+        )
 
     def matmul_(self, tensor, other) -> SSATensorValue:
         left, right = self._data(tensor), self._data(other)

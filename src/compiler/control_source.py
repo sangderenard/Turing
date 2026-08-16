@@ -97,6 +97,10 @@ class LoopBlock:
     recursion_region_id: int | None = None
     schedule_preference: str = "alap"
     sequence_mutations: tuple[ControlSequenceMutation, ...] = ()
+    # Forward ranges normally use ``lt``. Reverse schedules use ``gt`` with a
+    # negative step; keeping this explicit prevents C/SSA renderers from
+    # silently applying a forward-only comparison to an adjoint loop.
+    comparison: str = "lt"
 
     def __post_init__(self) -> None:
         preference = str(self.schedule_preference).lower()
@@ -105,6 +109,10 @@ class LoopBlock:
                 "loop schedule preference must be 'asap' or 'alap'"
             )
         object.__setattr__(self, "schedule_preference", preference)
+        comparison = str(self.comparison).lower()
+        if comparison not in {"lt", "gt"}:
+            raise ValueError("loop comparison must be 'lt' or 'gt'")
+        object.__setattr__(self, "comparison", comparison)
 
 
 @dataclass(frozen=True)
@@ -124,6 +132,11 @@ class WhileBlock:
     recursion_region_id: int | None = None
     predicate_expression: ControlExpression | None = None
     sequence_mutations: tuple[ControlSequenceMutation, ...] = ()
+    # Exact source ProcessGraph loop identity.  A source-linked call retains
+    # this same identity in ``PlanCall.enclosing_loop_ids``; carrying it into
+    # Control IR lets the SSA linker place that call in the authored while
+    # body instead of guessing from a later result consumer.
+    source_loop_node_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -324,6 +337,97 @@ class ControlProgram:
     ] = ()
 
 
+def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[int]:
+    """Return every value identity explicitly consumed by planned control."""
+
+    values: set[int] = set()
+    if control is None:
+        return frozenset()
+
+    values.update(int(uniform.value_id) for uniform in control.uniforms)
+    for bindings in (
+        control.value_aliases,
+        control.iterable_bindings,
+        control.static_iterable_bindings,
+        control.collection_bindings,
+        control.closure_iterable_bindings,
+        control.projected_iterable_bindings,
+    ):
+        for binding in bindings:
+            for value in binding:
+                if isinstance(value, int):
+                    values.add(int(value))
+                elif isinstance(value, tuple):
+                    values.update(int(item) for item in value if isinstance(item, int))
+
+    def expression_values(expression: ControlExpression | None) -> None:
+        if expression is None:
+            return
+        if expression.value_id is not None:
+            values.add(int(expression.value_id))
+        for operand in expression.operands:
+            expression_values(operand)
+
+    def carried_values(bindings) -> None:
+        values.update(int(value_id) for binding in bindings for value_id in binding)
+
+    def mutation_values(mutations) -> None:
+        for mutation in mutations:
+            values.add(int(mutation.sequence_value_id))
+            values.update(int(value_id) for value_id in mutation.argument_value_ids)
+            expression_values(mutation.predicate_expression)
+
+    def visit(block: ControlBlock) -> None:
+        if isinstance(block, ValidationBlock):
+            values.add(int(block.predicate_value_id))
+        elif isinstance(block, StreamPublishBlock):
+            values.add(int(block.value_id))
+            if block.count_value_id is not None:
+                values.add(int(block.count_value_id))
+            if block.predicate_value_id is not None:
+                values.add(int(block.predicate_value_id))
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                visit(child)
+        elif isinstance(block, ConditionalBlock):
+            values.add(int(block.predicate_value_id))
+            expression_values(block.predicate_expression)
+            carried_values(block.carried_aliases)
+            visit(block.body)
+            if block.orelse is not None:
+                visit(block.orelse)
+        elif isinstance(block, LoopBlock):
+            carried_values(block.carried_aliases)
+            mutation_values(block.sequence_mutations)
+            visit(block.body)
+        elif isinstance(block, WhileBlock):
+            values.add(int(block.predicate_value_id))
+            expression_values(block.predicate_expression)
+            carried_values(block.carried_aliases)
+            mutation_values(block.sequence_mutations)
+            visit(block.condition)
+            visit(block.body)
+        elif isinstance(block, LoopControlBlock):
+            if block.predicate_value_id is not None:
+                values.add(int(block.predicate_value_id))
+            expression_values(block.predicate_expression)
+        elif isinstance(block, StateMachineTick):
+            for _case, body in block.cases:
+                visit(body)
+            if block.default is not None:
+                visit(block.default)
+        elif isinstance(block, ParallelDeployment):
+            for lane in block.lanes:
+                visit(lane)
+        elif isinstance(block, CallBlock):
+            carried_values(block.argument_bindings)
+            carried_values(block.result_bindings)
+            visit(block.callee)
+
+    visit(control.root)
+    return frozenset(values)
+
+
 @dataclass(frozen=True)
 class ControlUniform:
     name: str
@@ -385,16 +489,18 @@ def _render_loop(block: LoopBlock, target: ControlTarget) -> tuple[str, ...]:
     if target is ControlTarget.FORTRAN:
         # A Fortran do-loop bound is inclusive, so the exclusive stop used by
         # every other target becomes stop - 1.
+        exclusive_adjustment = "- 1" if block.comparison == "lt" else "+ 1"
         return (
             f"do {block.induction} = {block.start}, "
-            f"({block.stop}) - 1, {block.step}",
+            f"({block.stop}) {exclusive_adjustment}, {block.step}",
             *body,
             "end do",
         )
     declaration = "int " if target in {ControlTarget.C, ControlTarget.GLSL} else ""
+    comparison = "<" if block.comparison == "lt" else ">"
     return (
         f"for ({declaration}{block.induction} = {block.start}; "
-        f"{block.induction} < {block.stop}; "
+        f"{block.induction} {comparison} {block.stop}; "
         f"{block.induction} += {block.step}) {{",
         *body,
         "}",
@@ -746,6 +852,7 @@ def compose_region_code(
                 block.recursion_region_id,
                 block.predicate_expression,
                 block.sequence_mutations,
+                block.source_loop_node_id,
             )
         if isinstance(block, LoopControlBlock):
             return block
@@ -914,6 +1021,7 @@ def project_control_regions(
                 block.recursion_region_id,
                 block.predicate_expression,
                 block.sequence_mutations,
+                block.source_loop_node_id,
             )
         if isinstance(block, LoopControlBlock):
             if (
@@ -1245,6 +1353,7 @@ def overlay_scheduled_control(
                     block.recursion_region_id,
                     block.predicate_expression,
                     block.sequence_mutations,
+                    block.source_loop_node_id,
                 ),
                 condition_consumed or body_consumed,
             )
@@ -1430,15 +1539,45 @@ def overlay_scheduled_control(
             blocks.append(StatementBlock((
                 f"__scheduled_region_{region_index}__",
             )))
+
+    def stable_key(value):
+        if isinstance(value, slice):
+            return ("slice", value.start, value.stop, value.step)
+        if isinstance(value, tuple):
+            return ("tuple", tuple(stable_key(item) for item in value))
+        if isinstance(value, list):
+            return ("list", tuple(stable_key(item) for item in value))
+        if isinstance(value, dict):
+            return (
+                "dict",
+                tuple(sorted(
+                    (stable_key(key), stable_key(item))
+                    for key, item in value.items()
+                )),
+            )
+        try:
+            hash(value)
+        except TypeError:
+            return (type(value).__qualname__, repr(value))
+        return ("value", value)
+
+    def unique_unhashable(values):
+        seen = set()
+        unique = []
+        for value in values:
+            key = stable_key(value)
+            if key not in seen:
+                seen.add(key)
+                unique.append(value)
+        return tuple(unique)
+
     return ControlProgram(
         root=SequenceBlock(tuple(blocks)),
         region_indices=order,
         uniforms=tuple(dict.fromkeys(uniforms)),
         value_aliases=tuple(dict.fromkeys(aliases)),
         iterable_bindings=tuple(dict.fromkeys(iterable_bindings)),
-        static_iterable_bindings=tuple(
-            dict.fromkeys(static_iterable_bindings)
-        ),
+        static_iterable_bindings=unique_unhashable(static_iterable_bindings),
         collection_bindings=tuple(dict.fromkeys(collection_bindings)),
         closure_iterable_bindings=tuple(
             dict.fromkeys(closure_iterable_bindings)

@@ -55,7 +55,7 @@ class Parameter:
     """One dummy argument, in declaration order."""
 
     name: str
-    role: str  # "extent" | "input" | "output"
+    role: str  # "extent" | "input" | "inout" | "workspace" | "output"
     dtype: str
     c_type: str
     ctypes_name: str
@@ -66,7 +66,12 @@ class Parameter:
     shape: tuple[int, ...] = ()
     extent: str | None = None
     # Stable source/IR name retained beside the ABI-local ``t<ID>`` spelling.
+    # Keep this before newer optional fields because some established callers
+    # construct Parameters positionally through this slot.
     source_name: str | None = None
+    # Exact runtime dimensions for a shape-dynamic array. ``extent`` remains
+    # as the rank-one/backward-compatible spelling.
+    extents: tuple[str, ...] = ()
 
     def to_mapping(self) -> dict[str, Any]:
         mapping: dict[str, Any] = {
@@ -81,6 +86,8 @@ class Parameter:
             mapping["shape"] = list(self.shape)
         if self.extent is not None:
             mapping["extent"] = self.extent
+        if self.extents:
+            mapping["extents"] = list(self.extents)
         if self.source_name is not None:
             mapping["source_name"] = self.source_name
         return mapping
@@ -159,7 +166,9 @@ def describe_fortran_function(
     note: str | None = None,
     source_names: Mapping[int, str] | None = None,
     dynamic_array_extents: Mapping[int, str] | None = None,
+    dynamic_array_dimensions: Mapping[int, Sequence[str]] | None = None,
     array_argument_ids: Iterable[int] = (),
+    reference_argument_ids: Iterable[int] = (),
 ) -> EntryPoint:
     """Describe one emitted Fortran subroutine's calling contract.
 
@@ -174,7 +183,14 @@ def describe_fortran_function(
         int(value_id): str(extent)
         for value_id, extent in dict(dynamic_array_extents or {}).items()
     }
+    dynamic_array_dimensions = {
+        int(value_id): tuple(map(str, dimensions))
+        for value_id, dimensions in dict(dynamic_array_dimensions or {}).items()
+    }
     array_argument_ids = {int(value_id) for value_id in array_argument_ids}
+    reference_argument_ids = {
+        int(value_id) for value_id in reference_argument_ids
+    }
     for extent in extent_names:
         parameters.append(
             Parameter(
@@ -195,6 +211,20 @@ def describe_fortran_function(
             or dynamic_extent is not None
             or int(value.id) in array_argument_ids
         )
+        accounting = dict(value.accounting or {})
+        workspace = (
+            not accounting.get("program_abi_parameter")
+            and (
+                accounting.get("linked_call_frame_storage") is not None
+                or accounting.get("returned_record_storage") is not None
+            )
+        )
+        dimensions = dynamic_array_dimensions.get(int(value.id), ())
+        authored_source_name = source_names.get(int(value.id))
+        if authored_source_name is None and accounting.get("program_abi_parameter"):
+            authored_source_name = str(accounting["program_abi_parameter"])
+            if accounting.get("program_abi_field"):
+                authored_source_name += "." + str(accounting["program_abi_field"])
         parameters.append(
             Parameter(
                 name=f"t{value.id}",
@@ -202,7 +232,11 @@ def describe_fortran_function(
                 # preallocated Fortran intent(inout) arena.  Keep it an input
                 # in the shell contract so its initial contents are loaded;
                 # feedback/output aliases refer to the same resident slot.
-                role="input",
+                role=(
+                    "workspace"
+                    if workspace
+                    else "inout" if int(value.id) in output_ids else "input"
+                ),
                 dtype=str(value.dtype or "float64"),
                 c_type=c_type,
                 ctypes_name=ctypes_name,
@@ -210,21 +244,32 @@ def describe_fortran_function(
                 # never is.
                 passing=(
                     "reference"
-                    if array or int(value.id) in output_ids
+                    if (
+                        array
+                        or int(value.id) in output_ids
+                        or int(value.id) in reference_argument_ids
+                    )
                     else "value"
                 ),
                 shape=tuple(value.shape or ()),
                 extent=(
                     dynamic_extent
-                    or (str(extent_names[-1]) if array and extent_names else None)
+                    or (dimensions[0] if len(dimensions) == 1 else None)
+                    or (
+                        str(extent_names[-1])
+                        if array and extent_names and not dimensions
+                        else None
+                    )
                 ),
-                source_name=source_names.get(int(value.id)),
+                extents=dimensions,
+                source_name=authored_source_name,
             )
         )
     for value in outputs:
         if value.id in {argument.id for argument in function.args}:
             continue
         c_type, ctypes_name = _c_type_for(value.dtype)
+        dimensions = dynamic_array_dimensions.get(int(value.id), ())
         parameters.append(
             Parameter(
                 name=f"t{value.id}",
@@ -234,7 +279,16 @@ def describe_fortran_function(
                 ctypes_name=ctypes_name,
                 passing="reference",
                 shape=tuple(value.shape or ()),
-                extent=str(extent_names[-1]) if extent_names else None,
+                extent=(
+                    dimensions[0]
+                    if len(dimensions) == 1
+                    else (
+                        str(extent_names[-1])
+                        if extent_names and not dimensions
+                        else None
+                    )
+                ),
+                extents=dimensions,
                 source_name=source_names.get(int(value.id)),
             )
         )

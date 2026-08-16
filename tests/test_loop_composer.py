@@ -410,6 +410,41 @@ def test_iterable_loop_discards_observed_numeric_capture_bound():
     assert plan.loop.iterable_node is not None
 
 
+def test_iterable_loop_recovers_authored_attribute_after_parent_edge_loss():
+    graph = _function_graph(
+        "def kernel(owner):\n"
+        "    total = 0\n"
+        "    for item in owner.items:\n"
+        "        total = total + item\n"
+        "    return total\n",
+        "kernel",
+    )
+    loop_id = next(
+        node_id
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    )
+    iterable_parent = next(
+        parent
+        for parent, role in graph.G.nodes[loop_id]["parents"]
+        if str(role) in {"iterable", "iter"}
+    )
+    graph.G.nodes[loop_id]["parents"] = tuple(
+        (parent, role)
+        for parent, role in graph.G.nodes[loop_id]["parents"]
+        if int(parent) != int(iterable_parent)
+        or str(role) not in {"iterable", "iter"}
+    )
+    if graph.G.has_edge(iterable_parent, loop_id):
+        graph.G.remove_edge(iterable_parent, loop_id)
+    graph.G.nodes[iterable_parent]["expr_obj"] = None
+
+    plan, = _glsl_composer(unroll_limit=0).compose(graph)
+
+    assert plan.loop.iterable_node == iterable_parent
+    assert graph.G.nodes[plan.loop.iterable_node]["type"] == "GetAttr"
+
+
 def test_reducer_does_not_create_loop_ports_before_planning():
     graph = _function_graph(
         "def kernel(items):\n"
@@ -1181,3 +1216,34 @@ def test_while_ternary_assignment_is_explicit_loop_carried_state():
     assert carried["data"][0] != carried["data"][1]
     assert plan.loop.condition_nodes
     assert plan.loop.body_nodes
+
+
+def test_sequential_loop_body_does_not_own_captured_predecessor_values():
+    graph = _function_graph(
+        "def kernel(xs, ys):\n"
+        "    total = 0\n"
+        "    for x in xs:\n"
+        "        total = total + x\n"
+        "    outputs = []\n"
+        "    for y in ys:\n"
+        "        outputs.append(total * y)\n"
+        "    return outputs\n",
+        "kernel",
+    )
+
+    plans = sorted(
+        _glsl_composer().discover(graph),
+        key=lambda plan: graph.G.nodes[plan.loop.node_id]["source_span"]["line"],
+    )
+    first, second = plans
+    first_result = next(
+        node_id for node_id in first.loop.body_nodes
+        if (graph.G.nodes[node_id].get("source_span") or {}).get("line") == 4
+    )
+
+    assert first_result not in second.loop.body_nodes
+    assert all(
+        node_id in dict(second.loop.target_bindings).values()
+        or (graph.G.nodes[node_id].get("source_span") or {}).get("line") == 7
+        for node_id in second.loop.body_nodes
+    )

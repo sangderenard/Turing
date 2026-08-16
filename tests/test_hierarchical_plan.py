@@ -29,9 +29,11 @@ from src.common.tensors.accelerator_backends.aot_compile import (
 from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.control_source import (
     CallBlock,
+    ControlExpression,
     ControlTarget,
     StatementBlock,
     StreamPublishBlock,
+    WhileBlock,
     render_control_block,
     ControlProgram,
     LoopBlock,
@@ -88,6 +90,102 @@ def test_shell_hierarchy_plan_lists_mixed_operator_without_capture():
         (0, (1, 4), "float32"),
     )
 
+
+def test_control_loop_backedges_are_exact_hierarchy_dependencies():
+    process = nx.DiGraph()
+    process.add_node(
+        1,
+        type="Input",
+        attributes={"binding_name": "initial"},
+    )
+    process.add_node(
+        2,
+        type="Add",
+        op="Add",
+        parents=((1, "lhs"), (1, "rhs")),
+        attributes={},
+    )
+    process.add_edge(1, 2)
+    region = nx.DiGraph()
+    region.graph.update({
+        "deployment_nodes": (2,),
+        "deployment_inputs": (1,),
+    })
+    control = ControlProgram(
+        LoopBlock(
+            "iteration_0",
+            "0",
+            "1",
+            "1",
+            StatementBlock(("__scheduled_region_0__",)),
+            carried_aliases=((2, 1),),
+        ),
+        region_indices=(0,),
+    )
+    shell = SimpleNamespace(
+        process_graph=SimpleNamespace(G=process),
+        dispatch_subgraphs=(SimpleNamespace(G=region),),
+        callsite_function_shells={},
+        loop_plans=(),
+        shell_control_program=control,
+    )
+
+    plan = _build_shell_hierarchy_plan(shell)
+
+    assert plan.captures == (1, 2)
+
+
+def test_loop_carried_initializer_is_region_capture_not_body_constant():
+    process = nx.DiGraph()
+    process.add_node(
+        1,
+        type="Constant",
+        op="const",
+        parents=(),
+        attributes={"value": 0},
+    )
+    process.add_node(
+        2,
+        type="Add",
+        op="Add",
+        parents=((1, "lhs"), (1, "rhs")),
+        attributes={},
+    )
+    process.add_edge(1, 2)
+    region = nx.DiGraph()
+    region.add_nodes_from(process.nodes(data=True))
+    region.add_edge(1, 2)
+    region.graph.update({
+        "deployment_nodes": (1, 2),
+        "deployment_inputs": (),
+        "deployment_outputs": (1, 2),
+    })
+    loop = SimpleNamespace(
+        loop=SimpleNamespace(carried_bindings=(("iters", 1, 2),)),
+    )
+    shell = SimpleNamespace(
+        process_graph=SimpleNamespace(G=process),
+        dispatch_subgraphs=(SimpleNamespace(G=region),),
+        callsite_function_shells={},
+        loop_plans=(loop,),
+        shell_control_program=ControlProgram(
+            LoopBlock(
+                "iteration_0", "0", "1", "1",
+                StatementBlock(("__scheduled_region_0__",)),
+                carried_aliases=((2, 1),),
+            ),
+            region_indices=(0,),
+        ),
+    )
+
+    plan = _build_shell_hierarchy_plan(shell)
+    planned_region = next(
+        item for item in plan.items
+        if isinstance(item, PlanClosure) and item.name == "region_0"
+    )
+
+    assert planned_region.captures == (1,)
+    assert [line.outputs for line in planned_region.items] == [(2,)]
 
 def test_region_pursues_structural_constant_expression_captures_into_source():
     process = nx.DiGraph()
@@ -298,6 +396,78 @@ def test_planned_operators_attach_existing_tensor_kernel_and_plain_lowering():
     ]
     assert instructions[1].args[0].id == 1
     assert instructions[1].res.id == 2
+
+
+def test_python_identity_callables_lower_to_typed_ssa_value_flow():
+    region = PlanClosure(
+        "region_0",
+        (0, 1),
+        (
+            PlanLine.create(
+                "float",
+                inputs=(0, 1),
+                outputs=(2,),
+                input_roles=("callee", "arg:0"),
+            ),
+            PlanLine.create(
+                "tensor",
+                inputs=(2,),
+                outputs=(3,),
+                input_roles=("arg:0",),
+                attributes={"ensures_schema_type": "AbstractTensor"},
+            ),
+        ),
+        value_shapes=(
+            (0, (), "opaque_ref"),
+            (1, (), "int"),
+            (2, (), "float64"),
+            (3, (), "float64"),
+        ),
+    )
+
+    instructions = plan_region_to_ssa_instrs(region)
+
+    assert [instruction.op for instruction in instructions] == ["Cast", "Cast"]
+    assert [argument.id for argument in instructions[0].args] == [1]
+    assert instructions[0].arg_roles == ["arg:0"]
+    assert instructions[0].res.dtype == "float64"
+    assert instructions[0].attributes["source_operator"] == "float"
+    assert [argument.id for argument in instructions[1].args] == [2]
+    assert instructions[1].attributes["ensures_schema_type"] == "AbstractTensor"
+
+
+def test_python_variadic_max_and_clamp_decompose_to_binary_ssa_flow():
+    region = PlanClosure(
+        "region_0",
+        (0, 1, 2, 3, 4, 5),
+        (
+            PlanLine.create(
+                "max", inputs=(0, 1, 2), outputs=(6,),
+                input_roles=("arg:0", "arg:1", "arg:2"),
+            ),
+            PlanLine.create(
+                "clamp", inputs=(6, 4, 5), outputs=(7,),
+                input_roles=("operand", "kw:min", "kw:max"),
+            ),
+        ),
+        value_shapes=tuple(
+            (value_id, (), "float64") for value_id in range(8)
+        ),
+    )
+
+    instructions = plan_region_to_ssa_instrs(region)
+
+    assert [instruction.op for instruction in instructions] == [
+        "Max", "Max", "Max", "Min",
+    ]
+    assert [argument.id for argument in instructions[1].args][1] == 2
+    assert instructions[1].res.id == 6
+    assert instructions[-1].res.id == 7
+    temporary_ids = {
+        instructions[0].res.id,
+        instructions[2].res.id,
+    }
+    assert temporary_ids.isdisjoint(range(8))
 
 
 def test_graph_only_aot_does_not_require_mutable_runtime_feed():
@@ -593,6 +763,56 @@ def test_hierarchical_call_without_later_region_stays_in_enclosing_loop():
     composed = compose_hierarchical_control(planned, controls, table)
     loop = composed.program.root
     assert isinstance(loop, LoopBlock)
+    assert isinstance(loop.body, SequenceBlock)
+    assert isinstance(loop.body.blocks[-1], CallBlock)
+
+
+def test_hierarchical_call_without_later_region_stays_in_enclosing_while():
+    child = PlanClosure(
+        "advance",
+        (0,),
+        (PlanClosure("region_0", (0,), (), -1),),
+    )
+    root = PlanClosure(
+        "superstep",
+        (0,),
+        (
+            PlanClosure("region_0", (0,), (), -1),
+            PlanCall(
+                8,
+                child,
+                (0,),
+                (2,),
+                argument_bindings=((0, 0),),
+                result_bindings=((1, 2),),
+                enclosing_loop_ids=(178,),
+            ),
+        ),
+    )
+    planned, table = assign_hierarchy_ids(root)
+    child_plan = planned.items[1].callee
+    controls = {
+        planned.closure_id: ControlProgram(
+            WhileBlock(
+                predicate_value_id=5,
+                condition=SequenceBlock(()),
+                body=StatementBlock(("__scheduled_region_0__",)),
+                predicate_expression=ControlExpression(
+                    "literal", literal=True
+                ),
+                source_loop_node_id=178,
+            ),
+            (0,),
+        ),
+        child_plan.closure_id: ControlProgram(
+            StatementBlock(("__scheduled_region_0__",)),
+            (0,),
+        ),
+    }
+
+    composed = compose_hierarchical_control(planned, controls, table)
+    loop = composed.program.root
+    assert isinstance(loop, WhileBlock)
     assert isinstance(loop.body, SequenceBlock)
     assert isinstance(loop.body.blocks[-1], CallBlock)
 

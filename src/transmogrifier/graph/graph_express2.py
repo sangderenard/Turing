@@ -32,6 +32,7 @@ from .python_special_cases import (
     extraction_receipt,
     interpret_python_special_case,
 )
+from .python_identity_programs import resolve_python_identity
 import colorsys
 import random
 import time
@@ -303,6 +304,39 @@ def _resolve_ast_value_reference(expression, bindings, seen=frozenset()):
         return type(None)
     if isinstance(expression, ast.Call):
         target = _resolve_ast_parent_reference(expression.func, bindings, seen)
+        if (
+            target is getattr
+            and len(expression.args) >= 2
+            and isinstance(expression.args[1], ast.Constant)
+            and isinstance(expression.args[1].value, str)
+        ):
+            owner = _resolve_ast_value_reference(
+                expression.args[0], bindings, seen
+            )
+            selected = (
+                None
+                if owner is None
+                else _resolve_ast_parent_reference(
+                    ast.Attribute(
+                        value=ast.Name(id="__owner"),
+                        attr=expression.args[1].value,
+                    ),
+                    {"__owner": owner},
+                    seen,
+                )
+            )
+            fallback = (
+                _resolve_ast_value_reference(
+                    expression.args[2], bindings, seen
+                )
+                if len(expression.args) >= 3
+                else None
+            )
+            if selected is None:
+                return fallback
+            if fallback is None:
+                return selected
+            return _merge_ast_reference(selected, fallback)
         if target is None and isinstance(expression.func, ast.Name):
             target = {
                 "bytearray": bytearray,
@@ -312,7 +346,38 @@ def _resolve_ast_value_reference(expression, bindings, seen=frozenset()):
                 "set": set,
                 "tuple": tuple,
             }.get(expression.func.id)
-        return target if inspect.isclass(target) else None
+        if inspect.isclass(target):
+            return target
+        annotation_target = target.__func__ if inspect.ismethod(target) else target
+        if inspect.isfunction(annotation_target):
+            try:
+                annotation = inspect.get_annotations(
+                    annotation_target,
+                    eval_str=True,
+                ).get("return")
+            except (NameError, TypeError, ValueError):
+                annotation = None
+            if inspect.isclass(annotation):
+                return annotation
+        return None
+    if isinstance(expression, ast.BoolOp):
+        # A source identity may be selected by Python's ordinary short-circuit
+        # control (for example ``getattr(x, 'field', None) or owner.field``).
+        # Preserve every statically resolvable alternative; this does not
+        # evaluate the expression or turn the selected object into an input.
+        resolved = tuple(
+            value
+            for item in expression.values
+            if (value := _resolve_ast_value_reference(
+                item, bindings, seen
+            )) is not None
+        )
+        if not resolved:
+            return None
+        result = resolved[0]
+        for value in resolved[1:]:
+            result = _merge_ast_reference(result, value)
+        return result
     if isinstance(expression, ast.IfExp):
         left = _resolve_ast_value_reference(expression.body, bindings, seen)
         right = _resolve_ast_value_reference(expression.orelse, bindings, seen)
@@ -345,15 +410,16 @@ def _resolve_ast_parent_reference(expression, bindings, seen=frozenset()):
             )
             if value is not None
         )
-        # Attribute lookup itself narrows a union to alternatives that carry
-        # that field/method. An alternative lacking it would raise before this
-        # source dependency could run; it is not a competing method target.
+        # Attribute lookup narrows away alternatives that lack the member and
+        # carries the remaining source identities forward. Do not require an
+        # intermediate field's class-level and instance-level representations
+        # to be identical: a following attribute can still converge them to
+        # one exact callable (``GradTape.graph.add_node`` is the common case).
         if not resolved:
             return None
         result = resolved[0]
         for value in resolved[1:]:
-            if not _same_ast_reference(result, value):
-                return None
+            result = _merge_ast_reference(result, value)
         return result
     try:
         return getattr(owner, expression.attr)
@@ -840,6 +906,17 @@ def _ast_definition_bindings(value):
         bindings.update(closure.builtins)
         bindings.update(closure.globals)
         bindings.update(closure.nonlocals)
+        # Annotation-only names do not appear in function bytecode and are
+        # therefore absent from getclosurevars(). They still declare receiver
+        # schemas needed to resolve ``parameter.method`` source. Admit only
+        # resolved class identities, not the function module wholesale.
+        try:
+            annotations = inspect.get_annotations(value, eval_str=True)
+        except (NameError, TypeError, ValueError):
+            annotations = {}
+        for annotation in annotations.values():
+            if inspect.isclass(annotation):
+                bindings.setdefault(str(annotation.__name__), annotation)
         owner = module
         for component in str(value.__qualname__).split(".")[:-1]:
             if component == "<locals>":
@@ -883,7 +960,12 @@ def _ast_definition_bindings(value):
     return bindings
 
 
-def _ast_call_argument_bindings(call, target, call_bindings):
+def _ast_call_argument_bindings(
+    call,
+    target,
+    call_bindings,
+    occurrence_policy=None,
+):
     """Map resolvable actual source identities onto a callee's formal names."""
 
     definition = _source_ast_definition(target)
@@ -903,6 +985,20 @@ def _ast_call_argument_bindings(call, target, call_bindings):
             return actual
         if inspect.isclass(actual) or inspect.ismodule(actual):
             return actual
+        if occurrence_policy is not None and hasattr(
+            occurrence_policy,
+            "decide",
+        ):
+            decision = occurrence_policy.decide(actual)
+            if decision.parameters.get("occurrence_pursuit") in {
+                "referenced_attributes",
+                "source_definition",
+            }:
+                # This is compile-time lookup context, not a runtime argument.
+                # Keeping the watched receiver lets ordinary attribute pursuit
+                # follow mutable fields such as Autograd.tape without freezing
+                # every Python instance into the generated ABI.
+                return actual
         owner = type(actual)
         return owner if _source_ast_definition(owner) is not None else actual
 
@@ -930,7 +1026,14 @@ def _ast_call_argument_bindings(call, target, call_bindings):
 
 
 def _ast_local_constructor_bindings(definition, bindings):
-    """Recover local storage kinds from explicit constructors and literals."""
+    """Recover local storage kinds from annotations, constructors and literals.
+
+    A parameter annotation naming a class is a source-level receiver schema.
+    Binding the parameter name to that class for *discovery only* lets an
+    ordinary ``receiver.method(...)`` resolve to authored method source.  It
+    does not instantiate the class or substitute a Python object into the
+    ProcessGraph; runtime storage remains governed by the record/field ABI.
+    """
 
     def lexical_nodes():
         pending = list(reversed(getattr(definition, "body", ())))
@@ -945,6 +1048,22 @@ def _ast_local_constructor_bindings(definition, bindings):
             pending.extend(reversed(tuple(ast.iter_child_nodes(node))))
 
     resolved = dict(bindings)
+    arguments = getattr(definition, "args", None)
+    if arguments is not None:
+        parameters = (
+            *tuple(getattr(arguments, "posonlyargs", ())),
+            *tuple(getattr(arguments, "args", ())),
+            *tuple(getattr(arguments, "kwonlyargs", ())),
+            *((arguments.vararg,) if arguments.vararg is not None else ()),
+            *((arguments.kwarg,) if arguments.kwarg is not None else ()),
+        )
+        for parameter in parameters:
+            annotation = getattr(parameter, "annotation", None)
+            if annotation is None or parameter.arg in resolved:
+                continue
+            reference = _resolve_ast_parent_reference(annotation, resolved)
+            if inspect.isclass(reference):
+                resolved[str(parameter.arg)] = reference
     changed = True
     while changed:
         changed = False
@@ -1220,6 +1339,39 @@ def _expand_unresolved_ast_parents(
         """
 
         lexical_target = _resolve_ast_parent_reference(call.func, call_bindings)
+        if (
+            include is not None
+            and hasattr(include, "decide")
+            and isinstance(call.func, ast.Attribute)
+        ):
+            occurrence = _resolve_ast_parent_reference(
+                call.func.value,
+                call_bindings,
+            )
+            if (
+                occurrence is not None
+                and not callable(occurrence)
+                and not inspect.ismodule(occurrence)
+            ):
+                occurrence_decision = include.decide(occurrence)
+                occurrence_mode = occurrence_decision.parameters.get(
+                    "occurrence_pursuit"
+                )
+                if occurrence_mode in {
+                    "referenced_attributes",
+                    "source_definition",
+                }:
+                    receipts = list(getattr(
+                        call,
+                        "_extraction_occurrences",
+                        (),
+                    ))
+                    receipt = occurrence_decision.receipt()
+                    if receipt not in receipts:
+                        receipts.append(receipt)
+                    call._extraction_occurrences = tuple(receipts)
+                    if occurrence_mode == "source_definition":
+                        admit_occurrence_class(occurrence)
         if lexical_target is not None:
             return lexical_target
         tensor_name = tensor_operation_name(call)
@@ -1389,6 +1541,69 @@ def _expand_unresolved_ast_parents(
         all_calls.extend(calls)
         pending_calls.extend(calls)
 
+    def admit_occurrence_class(instance):
+        """Admit one configured live object's class as source/schema context."""
+
+        owner = type(instance)
+        identity = (
+            str(getattr(owner, "__module__", "")),
+            str(getattr(owner, "__qualname__", owner.__name__)),
+        )
+        if identity in target_definitions:
+            return target_definitions[identity]
+        definition = _source_ast_definition(owner)
+        if not isinstance(definition, ast.ClassDef):
+            return None
+        definition._python_source_identity = identity
+        module.body.append(definition)
+        admitted = [definition]
+        admitted.extend(
+            member
+            for member, _depth in _walk_definitions_with_depth(definition)
+        )
+        definitions.extend(admitted)
+        for member in admitted:
+            definitions_by_name.setdefault(member.name, []).append(member)
+            definition_depths[id(member)] = 0
+
+        definition_bindings = _import_ast_bindings(
+            definition,
+            _ast_definition_bindings(owner),
+            package=str(
+                getattr(inspect.getmodule(owner), "__package__", "") or ""
+            ),
+        )
+        definition_bindings["self"] = instance
+        definition_bindings["cls"] = owner
+        definition_bindings = _ast_local_constructor_bindings(
+            definition,
+            definition_bindings,
+        )
+        target_definitions[identity] = definition
+        target_bindings[identity] = definition_bindings
+        install_definition_bindings(definition, definition_bindings)
+
+        for member in definition.body:
+            if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            member_target = getattr(owner, member.name, None)
+            if inspect.ismethod(member_target):
+                member_target = member_target.__func__
+            if not callable(member_target):
+                continue
+            member_identity = (
+                str(getattr(member_target, "__module__", "")),
+                str(getattr(
+                    member_target,
+                    "__qualname__",
+                    getattr(member_target, "__name__", ""),
+                )),
+            )
+            member._python_source_identity = member_identity
+            target_definitions[member_identity] = member
+            target_bindings[member_identity] = definition_bindings
+        return definition
+
     while pending_calls:
         if max_work_items and work_items >= max_work_items:
             raise RuntimeError(
@@ -1420,6 +1635,22 @@ def _expand_unresolved_ast_parents(
         )
         if extraction_decision is not None:
             node._extraction_contract = extraction_decision.receipt()
+        identity_text = ".".join(filter(None, (
+            str(getattr(identity_target, "__module__", "")),
+            str(getattr(
+                identity_target,
+                "__qualname__",
+                getattr(identity_target, "__name__", ""),
+            )),
+        )))
+        if resolve_python_identity(identity_text) is not None:
+            # A declared graph-native identity is already a complete lowering
+            # decision.  Retain its extraction receipt on this occurrence,
+            # but do not also ingest and call the Python implementation body.
+            # Doing both leaves two competing producers for one authored call
+            # and makes the helper's constructor/backend internals part of the
+            # submitted program.
+            continue
         if include is not None and not (
             extraction_decision.ingest_parent
             if extraction_decision is not None
@@ -1444,7 +1675,10 @@ def _expand_unresolved_ast_parents(
             )),
         )
         argument_bindings = _ast_call_argument_bindings(
-            node, identity_target, call_bindings,
+            node,
+            identity_target,
+            call_bindings,
+            occurrence_policy=include,
         )
         if identity in target_definitions:
             definition = target_definitions[identity]
@@ -1452,6 +1686,10 @@ def _expand_unresolved_ast_parents(
                 target_bindings.get(identity, {}), argument_bindings,
             )
             if bindings_changed:
+                combined = _ast_local_constructor_bindings(
+                    definition,
+                    combined,
+                )
                 target_bindings[identity] = combined
                 install_definition_bindings(definition, combined)
                 requeue_definition(definition)
@@ -1466,8 +1704,13 @@ def _expand_unresolved_ast_parents(
         else:
             call_name = None
         existing = definitions_by_name.get(call_name, ())
-        if len(existing) == 1:
-            definition = existing[0]
+        exact_existing = tuple(
+            definition
+            for definition in existing
+            if getattr(definition, "_python_source_identity", None) == identity
+        )
+        if len(exact_existing) == 1:
+            definition = exact_existing[0]
             target_definitions[identity] = definition
             definition_bindings, changed = _merge_ast_bindings(
                 _ast_local_constructor_bindings(
@@ -1502,19 +1745,33 @@ def _expand_unresolved_ast_parents(
                 materialize_host_code_library,
             )
 
+            decompile_machine = (
+                extraction_decision is None
+                or str(getattr(extraction_decision.action, "value", ""))
+                == "decompile_machine"
+            )
             decompile_parameters = (
                 dict(extraction_decision.parameters)
-                if extraction_decision is not None else {}
+                if extraction_decision is not None and decompile_machine
+                else {}
             )
-            host_library = extract_host_code_library(
-                source_target,
-                **({
-                    "max_functions": int(decompile_parameters["max_functions"]),
-                    "max_total_bytes": int(decompile_parameters["max_total_bytes"]),
-                    "max_dependency_depth": int(
-                        decompile_parameters["max_dependency_depth"]
-                    ),
-                } if extraction_decision is not None else {}),
+            host_library = (
+                extract_host_code_library(
+                    source_target,
+                    **({
+                        "max_functions": int(
+                            decompile_parameters["max_functions"]
+                        ),
+                        "max_total_bytes": int(
+                            decompile_parameters["max_total_bytes"]
+                        ),
+                        "max_dependency_depth": int(
+                            decompile_parameters["max_dependency_depth"]
+                        ),
+                    } if extraction_decision is not None else {}),
+                )
+                if decompile_machine
+                else None
             )
             if host_library is not None:
                 host_root = host_library.root
@@ -1686,13 +1943,18 @@ def _expand_unresolved_ast_parents(
             # and no runtime attribute lookup is performed.
             definition_bindings.setdefault("self", source_target)
             definition_bindings.setdefault("cls", source_target)
-        definition_bindings = _ast_local_constructor_bindings(
-                source_definition,
-                definition_bindings,
-            )
         definition_bindings, _changed = _merge_ast_bindings(
                 definition_bindings,
                 argument_bindings,
+            )
+        # Local aliases depend on the actual receiver/argument identities.
+        # Compute them only after those call-site bindings have been merged;
+        # otherwise a method is analyzed once with merely its owner class and
+        # fields selected from a watched instance (for example ``self.tape``)
+        # never enter the local environment.
+        definition_bindings = _ast_local_constructor_bindings(
+                source_definition,
+                definition_bindings,
             )
         target_bindings[identity] = definition_bindings
         install_definition_bindings(source_definition, definition_bindings)
@@ -1702,6 +1964,37 @@ def _expand_unresolved_ast_parents(
                 getattr(source_definition, "_python_aggregate_binding_kinds", {})
                 or {}
             )
+        if isinstance(source_definition, ast.ClassDef):
+            # A class admission brings its directly-owned methods with it.
+            # Register those methods by exact live identity now; matching a
+            # later call by basename can alias unrelated methods such as
+            # MSELoss.backward and AbstractTensor.backward.
+            for member_definition in source_definition.body:
+                if not isinstance(member_definition, (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                )):
+                    continue
+                member_target = getattr(
+                    source_target,
+                    member_definition.name,
+                    None,
+                )
+                if inspect.ismethod(member_target):
+                    member_target = member_target.__func__
+                if not callable(member_target):
+                    continue
+                member_identity = (
+                    str(getattr(member_target, "__module__", "")),
+                    str(getattr(
+                        member_target,
+                        "__qualname__",
+                        getattr(member_target, "__name__", ""),
+                    )),
+                )
+                member_definition._python_source_identity = member_identity
+                target_definitions[member_identity] = member_definition
+                target_bindings[member_identity] = definition_bindings
         requeue_definition(source_definition)
         if profile_verbose:
                 print(
@@ -1733,6 +2026,18 @@ def _expand_unresolved_ast_parents(
         target = call_target(call, call_bindings)
         if inspect.ismethod(target):
             target = target.__func__
+        target_identity = ".".join(filter(None, (
+            str(getattr(target, "__module__", "")),
+            str(getattr(
+                target,
+                "__qualname__",
+                getattr(target, "__name__", ""),
+            )),
+        ))) if callable(target) else ""
+        if resolve_python_identity(target_identity) is not None:
+            # The call node itself carries the declarative operator/program
+            # replacement.  It must not acquire a FunctionTable callee edge.
+            continue
         definition = None
         if callable(target):
             identity = (
@@ -2339,6 +2644,14 @@ class ProcessGraph:
             semantic_attributes = (
                 dict(special_case.attributes) if special_case is not None else {}
             )
+            occurrence_receipts = tuple(
+                getattr(node, "_extraction_occurrences", ()) or ()
+            )
+            if occurrence_receipts:
+                semantic_attributes.setdefault(
+                    "extraction_occurrences",
+                    occurrence_receipts,
+                )
             if receipt is not None:
                 semantic_attributes.setdefault("extraction_contract", receipt)
                 semantic_attributes.setdefault("extraction_action", receipt["action"])
@@ -2381,10 +2694,19 @@ class ProcessGraph:
             self.node_map[nid] = node
             self.observe_evolution_node(nid, self.G.nodes[nid])
 
-            new_nid = self.deduplicate_node(self.G, nid)
-            if new_nid != nid:
-                del self.node_map[nid]
-                return new_nid, True
+            # AST nodes are source occurrences.  Two separate attributes,
+            # calls, names, or constants may have the same display label and
+            # type while denoting different values and edges.  Their object
+            # identity already deduplicates a repeated visit to the *same*
+            # occurrence; label-based deduplication must be reserved for
+            # non-AST structural objects.  In particular, merging every
+            # ``GetAttr`` occurrence collapsed ``x.detach().tanh()`` into a
+            # self-cycle and discarded the tensor receiver.
+            if deduplicate and not isinstance(node, ast.AST):
+                new_nid = self.deduplicate_node(self.G, nid)
+                if new_nid != nid:
+                    del self.node_map[nid]
+                    return new_nid, True
             return nid, False
 
     def connect(self, src_id, tgt_id, producer_role, consumer_role, store_id=None):
@@ -2936,6 +3258,23 @@ class ProcessGraph:
                 f"elapsed={time.perf_counter() - build_started:.3f}s",
                 flush=True,
             )
+        # Occurrence policy is attached while the dependency worklist reaches
+        # its fixed point. Some call nodes may already have been materialized
+        # by an earlier AST walk, so publish the final receipts onto their
+        # canonical graph nodes here as well.
+        for node_id, data in self.G.nodes(data=True):
+            occurrence_receipts = tuple(getattr(
+                data.get("expr_obj"),
+                "_extraction_occurrences",
+                (),
+            ) or ())
+            if occurrence_receipts:
+                data.setdefault("attributes", {})[
+                    "extraction_occurrences"
+                ] = occurrence_receipts
+                data.setdefault("extra_args", {})[
+                    "extraction_occurrences"
+                ] = occurrence_receipts
         for definition, call in parent_links:
             definition_id = id(definition)
             call_id = id(call)
@@ -3162,6 +3501,16 @@ class ProcessGraph:
         """
         self.finalize_graph_with_outputs()  # ensure min_outputs satisfied
         self.levels = self.scheduler.compute_levels(method, order)
+        if self._evolution_metagraph is not None and self._evolution_graph is not None:
+            # The embedded ProcessGraph scheduler is authoritative. Publish
+            # its exact result after finalization so observers never need to
+            # (and must not) derive a second schedule from visual topology.
+            self._evolution_metagraph.finalize_schedule(
+                self._evolution_graph,
+                self.levels,
+                method=method,
+                order=order,
+            )
         if not self.materialize_memory:
             return self.levels
         

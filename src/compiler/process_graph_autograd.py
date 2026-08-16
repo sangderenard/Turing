@@ -5,10 +5,11 @@ The forward ``ProcessGraph`` is the authority.  This module constructs a new
 it does not execute Python backward callables and it does not discover a
 backward program by observing a tape traversal.
 
-This first tranche covers acyclic numerical graphs.  Logical control is
-rejected explicitly until the planner-owned ``ControlProgram`` adjoint is
-attached: silently differentiating one observed branch would be a false
-whole-program result.
+Numerical dataflow is differentiated directly as graph dataflow.  Logical
+control is differentiated through the planner-owned ``ControlProgram``
+adjoint, which retains predicates and loop history explicitly; a cyclic raw
+``ProcessGraph`` is still rejected because silently differentiating one
+observed traversal would be a false whole-program result.
 """
 
 from __future__ import annotations
@@ -257,6 +258,20 @@ def abstract_tensor_program_to_process_graph(
                 attributes={"value": copy.deepcopy(payload)},
             )
             continue
+        if instruction.op in {"reshape", "view"} and result is not None:
+            add_node(
+                int(result.id),
+                "reshape",
+                (int(instruction.args[0].id),),
+                shape=result.shape,
+                dtype=result.dtype,
+                attributes={
+                    "shape": tuple(
+                        instruction.attributes.get("shape") or result.shape
+                    )
+                },
+            )
+            continue
         if instruction.op not in {"Call", "call"} or result is None:
             continue
         callee = str(instruction.attributes.get("callee") or "")
@@ -266,6 +281,9 @@ def abstract_tensor_program_to_process_graph(
         attributes: dict[str, Any] = {}
         if callee == "matmul_double":
             operation, parents = "matmul", (int(args[0].id), int(args[1].id))
+        elif callee == "fill_double":
+            operation, parents = "const", ()
+            attributes["value"] = const_value(args[1])
         elif callee in {"binary_double", "binary_scalar_double"}:
             opcode = int(const_value(args[4]))
             operation = canonical_opcode.get(
@@ -298,6 +316,48 @@ def abstract_tensor_program_to_process_graph(
         elif callee == "where_double":
             operation = "where"
             parents = tuple(int(value.id) for value in args[:3])
+        elif callee == "index_select_double":
+            source = int(args[0].id)
+            dim = int(const_value(args[4]))
+            indices = tuple(map(int, const_value(args[5])))
+            selector: Any
+            if not indices:
+                selector = slice(0, 0, 1)
+            elif len(indices) == 1:
+                selector = slice(indices[0], indices[0] + 1, 1)
+            else:
+                step = indices[1] - indices[0]
+                selector = (
+                    slice(indices[0], indices[-1] + step, step)
+                    if step and indices == tuple(range(
+                        indices[0], indices[-1] + step, step,
+                    ))
+                    else indices
+                )
+            source_shape = tuple(
+                (graph.G.nodes[source].get("tensor") or {}).get("shape") or ()
+            )
+            slices = [slice(None)] * len(source_shape)
+            slices[dim] = selector
+            operation, parents = "slice", (source,)
+            attributes["slices"] = tuple(slices)
+        elif callee == "index_set_double":
+            operation = "index_set"
+            parents = (int(args[0].id), int(args[6].id))
+            attributes["idx"] = instruction.attributes.get("semantic_index")
+        elif callee in {"unfold2d_double", "fold2d_double"}:
+            dimensions = tuple(int(const_value(value)) for value in args[2:14])
+            n, c, h, w, kh, kw, sh, sw, ph, pw, dh, dw = dimensions
+            operation = "unfold2d" if callee == "unfold2d_double" else "fold2d"
+            parents = (int(args[0].id),)
+            attributes.update({
+                "kernel_size": (kh, kw),
+                "stride": (sh, sw),
+                "padding": (ph, pw),
+                "dilation": (dh, dw),
+            })
+            if operation == "fold2d":
+                attributes["output_size"] = (n, c, h, w)
         if operation is None:
             raise ProcessGraphAutogradError(
                 "SSA AbstractTensor semantic bridge has no exact authored "
@@ -1773,6 +1833,26 @@ def _annotate_numeric_metadata(graph: ProcessGraph) -> None:
             shape = tuple(tensor.get("shape") or ())
         elif op == "indexed" and shape:
             shape = tuple(shape)
+        elif op == "slice" and shape:
+            # Forward observation already records the exact indexed result;
+            # broadcasting source and result shapes would erase the slice.
+            shape = tuple(shape)
+        elif op == "index_set" and parent_shapes:
+            # Functional indexed assignment preserves the base tensor shape;
+            # the assigned value has the selection shape and is not a
+            # broadcast peer of the complete base.
+            shape = parent_shapes[0]
+        elif op == "unfold2d" and parent_shapes:
+            n, c, h, w = parent_shapes[0]
+            kh, kw = tuple(attrs["kernel_size"])
+            sh, sw = tuple(attrs.get("stride", (1, 1)))
+            ph, pw = tuple(attrs.get("padding", (0, 0)))
+            dh, dw = tuple(attrs.get("dilation", (1, 1)))
+            output_h = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+            output_w = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+            shape = (n, c * kh * kw, output_h * output_w)
+        elif op == "fold2d":
+            shape = tuple(attrs["output_size"])
         elif op == "reshape":
             shape = tuple(attrs.get("shape") or ())
         elif op in {"transpose", "swapaxes", "permute"} and parent_shapes:
@@ -1912,6 +1992,21 @@ def differentiate_process_graph(
         parents = _parents(forward, int(node_id))
         if op in {"input", "const"}:
             continue
+        attributes = data.get("attributes") or {}
+        if (
+            op in _AdjointBindingGraphBuilder._PREDICATE_OPERATIONS
+            or bool(
+                attributes.get("predicate")
+                or attributes.get("control_predicate")
+            )
+        ):
+            # Predicate values are resident backward-routing facts, not a
+            # differentiable numerical surface. Gradient contributions can
+            # reach a mask through ordinary arithmetic (for example the two
+            # stable-sigmoid arms), but must stop at the comparison itself.
+            # The exact predicate remains retained by the binding graph for
+            # every backward rule that consumes it.
+            continue
         registry_op = {
             "truediv": "div",
             "mm": "matmul",
@@ -1928,7 +2023,7 @@ def differentiate_process_graph(
             gradient,
             int(node_id),
             parents,
-            data.get("attributes") or {},
+            attributes,
         ):
             contribute(parent, parent_gradient)
 
@@ -2245,6 +2340,7 @@ def lower_training_motion_to_repository_ssa(
     *,
     function_name: str = "forward_loss_backward",
     tensor_ssa_reference: Any | None = None,
+    observed_outputs: Mapping[str, int] | None = None,
 ) -> TrainingMotionSSALowering:
     """Lower the complete semantic training motion through repository SSA.
 
@@ -2267,7 +2363,32 @@ def lower_training_motion_to_repository_ssa(
     graph = motion.graph
     _annotate_numeric_metadata(graph)
 
+    observations = {
+        str(name): int(value_id)
+        for name, value_id in dict(observed_outputs or {}).items()
+    }
+    missing_observations = {
+        name: value_id
+        for name, value_id in observations.items()
+        if value_id not in graph.G
+    }
+    if missing_observations:
+        raise ProcessGraphAutogradError(
+            "training-motion observations are not graph values: "
+            f"{missing_observations!r}"
+        )
+    reserved_output_names = {
+        *(f"loss_{index}" for index in range(len(motion.loss_value_ids))),
+        *(f"grad_{forward_id}" for forward_id in motion.gradient_value_ids),
+    }
+    collisions = reserved_output_names.intersection(observations)
+    if collisions:
+        raise ProcessGraphAutogradError(
+            "training-motion observation names collide with generated "
+            f"outputs: {tuple(sorted(collisions))!r}"
+        )
     outputs = {
+        **observations,
         **{f"loss_{index}": int(value_id)
            for index, value_id in enumerate(motion.loss_value_ids)},
         **{f"grad_{forward_id}": int(value_id)
@@ -2384,11 +2505,17 @@ def lower_training_motion_to_repository_ssa(
     from .tensor_ssa_lowering import (
         lower_tensor_calls_to_repository_ssa,
         propagate_repository_ssa_call_metadata,
+        settle_shape_only_repository_returns,
+        wire_repository_ssa_region_products,
     )
     reference = tensor_ssa_reference or c_backend_repository_ssa_reference()
+    wire_repository_ssa_region_products(module)
+    settle_shape_only_repository_returns(module)
     propagate_repository_ssa_call_metadata(module)
     tensor_shortfalls = lower_tensor_calls_to_repository_ssa(module, reference)
-    propagate_repository_ssa_call_metadata(module)
+    propagate_repository_ssa_call_metadata(
+        module, authoritative_returns=True,
+    )
     if tensor_shortfalls:
         raise ProcessGraphAutogradError(
             "training-motion tensor SSA remained incomplete after call "

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 
 
 def is_gnu_fortran(compiler: str) -> bool:
@@ -17,7 +18,7 @@ def aggressive_fortran_flags(compiler: str) -> tuple[str, ...]:
     if "gfortran" in name:
         return (
             "-O3", "-march=native", "-flto", "-funroll-loops",
-            "-fomit-frame-pointer",
+            "-fomit-frame-pointer", "-ffree-line-length-none",
         )
     if name.startswith(("ifx", "ifort")):
         return ("-O3", "-xHost", "-ipo")
@@ -101,10 +102,43 @@ def standalone_runtime_shim_sources(
     return (str(path),)
 
 
+GNU_RUNTIME_DLLS = (
+    "libgfortran-5.dll",
+    "libquadmath-0.dll",
+    "libgcc_s_seh-1.dll",
+    "libwinpthread-1.dll",
+)
+
+
+def stage_fortran_runtime_dependencies(
+    compiler: str,
+    destination: str | Path,
+) -> tuple[Path, ...]:
+    """Place GNU Fortran runtime DLLs beside a dynamically linked artifact."""
+
+    if os.name != "nt" or not is_gnu_fortran(compiler):
+        return ()
+    target = Path(destination)
+    target.mkdir(parents=True, exist_ok=True)
+    compiler_bin = Path(compiler).resolve().parent
+    copied = []
+    for name in GNU_RUNTIME_DLLS:
+        source = compiler_bin / name
+        if not source.is_file():
+            continue
+        output = target / name
+        if source.resolve() != output.resolve():
+            shutil.copy2(source, output)
+        copied.append(output)
+    return tuple(copied)
+
+
 __all__ = [
     "aggressive_c_flags",
     "aggressive_fortran_flags",
+    "GNU_RUNTIME_DLLS",
     "is_gnu_fortran",
+    "stage_fortran_runtime_dependencies",
     "standalone_fortran_link_flags",
     "standalone_runtime_shim_sources",
 ]
