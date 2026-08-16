@@ -889,6 +889,7 @@ def _emit_repository_call_module(
 
         def emit_return_values() -> None:
             for output_index, output in enumerate(outputs):
+                destination = f"%out.{output_index}"
                 source = pointers.get(int(output.id))
                 if source is None:
                     tensor_table = getattr(module, "tensor_tables", {}).get(name)
@@ -898,7 +899,6 @@ def _emit_repository_call_module(
                     )
                     if descriptor is not None:
                         source = pointers.get(int(descriptor.data_value_id))
-                destination = f"%out.{output_index}"
                 if source is None or source == destination:
                     continue
                 llvm_type = _value_llvm_type(output)
