@@ -1008,13 +1008,12 @@ def project_control_regions(
                     # value whose only consumer is its LoopResult port is not
                     # in retained_values at all, yet the port IS its
                     # retention: the loop itself declares the continuation.
-                    # OPEN (see tools/HANDOFF_carried_reductions.md): also
-                    # admitting pairs retained only through result_ports made
-                    # the planner treat their const seeds as carried
-                    # boundaries, and the max region evaporated -- the seam
-                    # continues one level down, in region formation.
                     if retained_values is None
                     or int(updated) in retained_values
+                    or any(
+                        int(updated) == int(port_updated)
+                        for _port, _init, port_updated in block.result_ports
+                    )
                 ),
                 carried_seeds=block.carried_seeds,
                 result_ports=block.result_ports,
@@ -1044,13 +1043,12 @@ def project_control_regions(
                     # value whose only consumer is its LoopResult port is not
                     # in retained_values at all, yet the port IS its
                     # retention: the loop itself declares the continuation.
-                    # OPEN (see tools/HANDOFF_carried_reductions.md): also
-                    # admitting pairs retained only through result_ports made
-                    # the planner treat their const seeds as carried
-                    # boundaries, and the max region evaporated -- the seam
-                    # continues one level down, in region formation.
                     if retained_values is None
                     or int(updated) in retained_values
+                    or any(
+                        int(updated) == int(port_updated)
+                        for _port, _init, port_updated in block.result_ports
+                    )
                 ),
                 carried_seeds=block.carried_seeds,
                 result_ports=block.result_ports,

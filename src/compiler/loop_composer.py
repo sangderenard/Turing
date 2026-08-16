@@ -1503,6 +1503,9 @@ def materialize_retained_loop_ports(
             })
         if effects:
             attributes["loop_state_effects"] = tuple(effects)
+        attributes["loop_carried_updated_ids"] = tuple(
+            int(updated) for _name, _initial, updated in loop.carried_bindings
+        )
         attributes["loop_result_ports"] = {
             **carried_results,
             **{
