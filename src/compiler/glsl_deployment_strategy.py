@@ -4168,22 +4168,24 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     stop,
                     block.step,
                     fix_aggregate_loop_bounds(block.body),
-                    block.carried_aliases,
-                    block.parallel_iterations,
-                    block.dispatch_shell,
-                    block.recursion_region_id,
-                    block.schedule_preference,
+                    carried_aliases=block.carried_aliases,
+                    result_ports=block.result_ports,
+                    parallel_iterations=block.parallel_iterations,
+                    dispatch_shell=block.dispatch_shell,
+                    recursion_region_id=block.recursion_region_id,
+                    schedule_preference=block.schedule_preference,
                 )
             if isinstance(block, WhileBlock):
                 return WhileBlock(
                     block.predicate_value_id,
                     fix_aggregate_loop_bounds(block.condition),
                     fix_aggregate_loop_bounds(block.body),
-                    block.carried_aliases,
-                    block.recursion_region_id,
-                    block.predicate_expression,
-                    block.sequence_mutations,
-                    block.source_loop_node_id,
+                    carried_aliases=block.carried_aliases,
+                    result_ports=block.result_ports,
+                    recursion_region_id=block.recursion_region_id,
+                    predicate_expression=block.predicate_expression,
+                    sequence_mutations=block.sequence_mutations,
+                    source_loop_node_id=block.source_loop_node_id,
                 )
             if isinstance(block, LoopControlBlock):
                 return block

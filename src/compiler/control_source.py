@@ -85,6 +85,16 @@ class LoopBlock:
     # Storage aliases remain listed on ControlProgram for allocation, while
     # the actual carried-state commits belong only to this lexical loop.
     carried_aliases: tuple[tuple[int, int], ...] = ()
+    # ``(port id, initial id, updated id)`` per carried binding: the
+    # LoopResult port is the value id every post-loop consumer was rewired
+    # to, so the SSA lowering must define it as the carried Phi's exit value.
+    # Left uncarried, each port materialized as a producerless argument and
+    # every reduction result after the loop read its own seed.
+    result_ports: tuple[tuple[int, int, int], ...] = ()
+    #: ``(initial id, literal)`` for carried seeds that folded to constants;
+    #: the SSA lowering materializes these as Const instead of inventing a
+    #: producerless argument for an evaporated node.
+    carried_seeds: tuple[tuple[int, float], ...] = ()
     # The planner has proved that iterations communicate only through
     # induction-indexed publications.  A parallel backend may map one
     # iteration to one workgroup; ordinary renderers retain a serial loop.
@@ -129,6 +139,8 @@ class WhileBlock:
     condition: "ControlBlock"
     body: "ControlBlock"
     carried_aliases: tuple[tuple[int, int], ...] = ()
+    result_ports: tuple[tuple[int, int, int], ...] = ()
+    carried_seeds: tuple[tuple[int, float], ...] = ()
     recursion_region_id: int | None = None
     predicate_expression: ControlExpression | None = None
     sequence_mutations: tuple[ControlSequenceMutation, ...] = ()
@@ -836,23 +848,27 @@ def compose_region_code(
                 block.stop,
                 block.step,
                 substitute(block.body),
-                block.carried_aliases,
-                block.parallel_iterations,
-                block.dispatch_shell,
-                block.recursion_region_id,
-                block.schedule_preference,
-                block.sequence_mutations,
+                carried_aliases=block.carried_aliases,
+                result_ports=block.result_ports,
+                carried_seeds=block.carried_seeds,
+                parallel_iterations=block.parallel_iterations,
+                dispatch_shell=block.dispatch_shell,
+                recursion_region_id=block.recursion_region_id,
+                schedule_preference=block.schedule_preference,
+                sequence_mutations=block.sequence_mutations,
             )
         if isinstance(block, WhileBlock):
             return WhileBlock(
                 block.predicate_value_id,
                 substitute(block.condition),
                 substitute(block.body),
-                block.carried_aliases,
-                block.recursion_region_id,
-                block.predicate_expression,
-                block.sequence_mutations,
-                block.source_loop_node_id,
+                carried_aliases=block.carried_aliases,
+                result_ports=block.result_ports,
+                carried_seeds=block.carried_seeds,
+                recursion_region_id=block.recursion_region_id,
+                predicate_expression=block.predicate_expression,
+                sequence_mutations=block.sequence_mutations,
+                source_loop_node_id=block.source_loop_node_id,
             )
         if isinstance(block, LoopControlBlock):
             return block
@@ -983,20 +999,30 @@ def project_control_regions(
                 block.stop,
                 block.step,
                 body or SequenceBlock(()),
-                tuple(
+                carried_aliases=tuple(
                     (updated, initial)
                     for updated, initial in block.carried_aliases
+                    # The UPDATE is what the body must produce; requiring the
+                    # initial too dropped every reduction whose seed folded to
+                    # a constant (max/sum seeds are literal zeros).  A carried
+                    # value whose only consumer is its LoopResult port is not
+                    # in retained_values at all, yet the port IS its
+                    # retention: the loop itself declares the continuation.
+                    # OPEN (see tools/HANDOFF_carried_reductions.md): also
+                    # admitting pairs retained only through result_ports made
+                    # the planner treat their const seeds as carried
+                    # boundaries, and the max region evaporated -- the seam
+                    # continues one level down, in region formation.
                     if retained_values is None
-                    or (
-                        int(updated) in retained_values
-                        and int(initial) in retained_values
-                    )
+                    or int(updated) in retained_values
                 ),
-                block.parallel_iterations,
-                block.dispatch_shell,
-                block.recursion_region_id,
-                block.schedule_preference,
-                block.sequence_mutations,
+                carried_seeds=block.carried_seeds,
+                result_ports=block.result_ports,
+                parallel_iterations=block.parallel_iterations,
+                dispatch_shell=block.dispatch_shell,
+                recursion_region_id=block.recursion_region_id,
+                schedule_preference=block.schedule_preference,
+                sequence_mutations=block.sequence_mutations,
             )
         if isinstance(block, WhileBlock):
             condition = project(block.condition)
@@ -1009,19 +1035,29 @@ def project_control_regions(
                 block.predicate_value_id,
                 condition or SequenceBlock(()),
                 body,
-                tuple(
+                carried_aliases=tuple(
                     (updated, initial)
                     for updated, initial in block.carried_aliases
+                    # The UPDATE is what the body must produce; requiring the
+                    # initial too dropped every reduction whose seed folded to
+                    # a constant (max/sum seeds are literal zeros).  A carried
+                    # value whose only consumer is its LoopResult port is not
+                    # in retained_values at all, yet the port IS its
+                    # retention: the loop itself declares the continuation.
+                    # OPEN (see tools/HANDOFF_carried_reductions.md): also
+                    # admitting pairs retained only through result_ports made
+                    # the planner treat their const seeds as carried
+                    # boundaries, and the max region evaporated -- the seam
+                    # continues one level down, in region formation.
                     if retained_values is None
-                    or (
-                        int(updated) in retained_values
-                        and int(initial) in retained_values
-                    )
+                    or int(updated) in retained_values
                 ),
-                block.recursion_region_id,
-                block.predicate_expression,
-                block.sequence_mutations,
-                block.source_loop_node_id,
+                carried_seeds=block.carried_seeds,
+                result_ports=block.result_ports,
+                recursion_region_id=block.recursion_region_id,
+                predicate_expression=block.predicate_expression,
+                sequence_mutations=block.sequence_mutations,
+                source_loop_node_id=block.source_loop_node_id,
             )
         if isinstance(block, LoopControlBlock):
             if (
@@ -1322,12 +1358,14 @@ def overlay_scheduled_control(
                     block.stop,
                     block.step,
                     body,
-                    block.carried_aliases,
-                    block.parallel_iterations,
-                    block.dispatch_shell,
-                    block.recursion_region_id,
-                    block.schedule_preference,
-                    block.sequence_mutations,
+                    carried_aliases=block.carried_aliases,
+                    result_ports=block.result_ports,
+                    carried_seeds=block.carried_seeds,
+                    parallel_iterations=block.parallel_iterations,
+                    dispatch_shell=block.dispatch_shell,
+                    recursion_region_id=block.recursion_region_id,
+                    schedule_preference=block.schedule_preference,
+                    sequence_mutations=block.sequence_mutations,
                 ),
                 consumed,
             )
@@ -1349,11 +1387,13 @@ def overlay_scheduled_control(
                     block.predicate_value_id,
                     condition,
                     body,
-                    block.carried_aliases,
-                    block.recursion_region_id,
-                    block.predicate_expression,
-                    block.sequence_mutations,
-                    block.source_loop_node_id,
+                    carried_aliases=block.carried_aliases,
+                    result_ports=block.result_ports,
+                    carried_seeds=block.carried_seeds,
+                    recursion_region_id=block.recursion_region_id,
+                    predicate_expression=block.predicate_expression,
+                    sequence_mutations=block.sequence_mutations,
+                    source_loop_node_id=block.source_loop_node_id,
                 ),
                 condition_consumed or body_consumed,
             )

@@ -2802,6 +2802,19 @@ class _ControlSSABuilder:
             loop.step,
             location=f"{path}.step",
         )
+        # A carried seed whose graph node was folded to a constant must enter
+        # as that literal; external_value would otherwise invent a
+        # producerless argument for it.
+        for seed_id, seed_literal in getattr(loop, "carried_seeds", ()):
+            seed_id = int(seed_id)
+            if seed_id in self.external_values:
+                continue
+            seed_value = self.fresh_value(dtype="float64")
+            self.emit(
+                Handler.Const, [], seed_value,
+                attributes={"value": float(seed_literal)},
+            )
+            self.external_values[seed_id] = seed_value
         carried: list[tuple[int, int, SSAValue, SSAValue, SSAValue]] = []
         for updated_id, initial_id in loop.carried_aliases:
             updated_id = int(updated_id)
@@ -3204,6 +3217,17 @@ class _ControlSSABuilder:
                         )),
                     )
                 )
+        # After the loop, each carried NAME means its LoopResult port, and
+        # every post-loop consumer was rewired to that port id.  Define the
+        # port as the carried Phi's exit value; left undefined it
+        # materialized as a producerless argument and every reduction after
+        # the loop read its own seed.
+        for port_id, _initial_id, updated_id in getattr(
+            loop, "result_ports", ()
+        ):
+            phi = carried_phis.get(int(updated_id))
+            if phi is not None and phi.res is not None:
+                self.external_values[int(port_id)] = phi.res
         for source_id, collection_id, induction_name, start in (
             self.program.collection_bindings
         ):
@@ -3301,6 +3325,19 @@ class _ControlSSABuilder:
         )
         next_predicate = self.fresh_value(dtype="bool")
 
+        # A carried seed whose graph node was folded to a constant must enter
+        # as that literal; external_value would otherwise invent a
+        # producerless argument for it.
+        for seed_id, seed_literal in getattr(loop, "carried_seeds", ()):
+            seed_id = int(seed_id)
+            if seed_id in self.external_values:
+                continue
+            seed_value = self.fresh_value(dtype="float64")
+            self.emit(
+                Handler.Const, [], seed_value,
+                attributes={"value": float(seed_literal)},
+            )
+            self.external_values[seed_id] = seed_value
         carried: list[tuple[int, int, SSAValue, SSAValue, SSAValue]] = []
         for updated_id, initial_id in loop.carried_aliases:
             updated_id = int(updated_id)

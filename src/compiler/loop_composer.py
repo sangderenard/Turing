@@ -3491,6 +3491,41 @@ def analyze_shader_loop_reductions(
         ))
 
         def planned_root():
+            # The materialized ports (name -> LoopResult id) are the graph's
+            # own statement of what each carried name means after the loop;
+            # pair them with the discovery's (name, initial, updated) so the
+            # SSA lowering can bind each port to its carried Phi's exit.
+            loop_ports = dict(
+                (
+                    graph.G.nodes[int(loop.node_id)].get("attributes") or {}
+                ).get("loop_result_ports") or {}
+            ) if int(loop.node_id) in graph.G else {}
+            result_ports = tuple(
+                (int(loop_ports[str(name)]), int(initial), int(updated))
+                for name, initial, updated in loop.carried_bindings
+                if str(name) in loop_ports
+            )
+            # A carried seed that is a literal in the graph (``peak = 0.0``)
+            # may be folded away by region planning; carry the literal so the
+            # SSA lowering emits a Const instead of a producerless argument.
+            carried_seeds = []
+            for _name, initial, _updated in loop.carried_bindings:
+                initial = int(initial)
+                if initial not in graph.G:
+                    continue
+                seed_data = graph.G.nodes[initial]
+                if str(seed_data.get("type")) not in {
+                    "Const", "const", "Constant",
+                }:
+                    continue
+                literal = seed_data.get("constant")
+                if literal is None:
+                    literal = (seed_data.get("attributes") or {}).get("value")
+                if isinstance(literal, (int, float)) and not isinstance(
+                    literal, bool
+                ):
+                    carried_seeds.append((initial, float(literal)))
+            carried_seeds = tuple(carried_seeds)
             if loop.source_type == "While":
                 return WhileBlock(
                     predicate_value_id=int(loop.condition_nodes[0]),
@@ -3500,6 +3535,8 @@ def analyze_shader_loop_reductions(
                     )),
                     body=scheduled_body,
                     carried_aliases=carried_aliases,
+                    result_ports=result_ports,
+                    carried_seeds=carried_seeds,
                     recursion_region_id=recursion_region_id,
                     predicate_expression=while_predicate_expression,
                     sequence_mutations=sequence_mutations,
@@ -3507,6 +3544,8 @@ def analyze_shader_loop_reductions(
                 )
             return LoopBlock(
                 induction=induction_name,
+                result_ports=result_ports,
+                carried_seeds=carried_seeds,
                 start=(
                     bound_expressions.get("start", "0")
                     if loop.start is None else str(loop.start)
