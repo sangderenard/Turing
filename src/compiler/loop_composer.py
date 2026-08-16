@@ -3200,11 +3200,28 @@ def analyze_shader_loop_reductions(
             body_region_indices = tuple(nx.lexicographical_topological_sort(
                 region_dependencies, key=earliest_member,
             ))
-        except nx.NetworkXUnfeasible as error:
-            raise ValueError(
-                f"loop {loop.node_id} has mutually dependent body regions; "
-                "region formation must not fuse across a dependency cycle"
-            ) from error
+        except nx.NetworkXUnfeasible:
+            # A retained loop deliberately has feedback: a region may consume
+            # another's loop-carried value from the previous iteration.  That
+            # is irreducible recursion, not an ordering error -- the same
+            # verdict _rebuild_graph_edges already reaches for the node
+            # graph.  Order the condensation; mutually-recursive regions
+            # share a rank and fall to the earliest-member tie-break.
+            condensed = nx.condensation(region_dependencies)
+            body_region_indices = tuple(
+                member
+                for component in nx.lexicographical_topological_sort(
+                    condensed,
+                    key=lambda component: min(
+                        earliest_member(member)
+                        for member in condensed.nodes[component]["members"]
+                    ),
+                )
+                for member in sorted(
+                    condensed.nodes[component]["members"],
+                    key=earliest_member,
+                )
+            )
         body_region_positions = {}
         for index in body_region_indices:
             body_region_positions[index] = max((
@@ -3212,6 +3229,10 @@ def analyze_shader_loop_reductions(
                 *(
                     body_region_positions[producer]
                     for producer in region_dependencies.predecessors(index)
+                    # A feedback predecessor (same strongly connected
+                    # component, later in the condensed order) constrains the
+                    # NEXT iteration, not this statement's position.
+                    if producer in body_region_positions
                 ),
             ))
         condition = set(map(int, loop.condition_nodes))

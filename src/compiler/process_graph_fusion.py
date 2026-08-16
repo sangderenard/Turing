@@ -800,16 +800,33 @@ def reduce_scheduled_shader_regions(
     # Every accepted merge keeps the quotient acyclic, so a topological order
     # always exists; the earliest-member index remains the tie-break, which
     # leaves every already-legal listing exactly as it was.
-    region_order = {
-        region_id: position
-        for position, region_id in enumerate(
+    # Projected edges through structural nodes can put two regions in an
+    # apparent mutual dependency the merge legality never examined, so the
+    # quotient is not guaranteed acyclic.  Order through the condensation:
+    # strongly-connected regions share a rank (their internal order falls to
+    # the earliest-member tie-break) while every true dependency still holds.
+    quotient_graph = quotient()
+    condensed = nx.condensation(quotient_graph)
+    component_rank = {
+        member: position
+        for position, component in enumerate(
             nx.lexicographical_topological_sort(
-                quotient(),
-                key=lambda region_id: min(
-                    order_index[node_id] for node_id in regions[region_id]
+                condensed,
+                key=lambda component: min(
+                    order_index[node_id]
+                    for member in condensed.nodes[component]["members"]
+                    for node_id in regions[member]
                 ),
             )
         )
+        for member in condensed.nodes[component]["members"]
+    }
+    region_order = {
+        region_id: (
+            component_rank[region_id],
+            min(order_index[node_id] for node_id in regions[region_id]),
+        )
+        for region_id in regions
     }
     dispatches = []
     for region_id, members in sorted(
