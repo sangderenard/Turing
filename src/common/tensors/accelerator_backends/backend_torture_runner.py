@@ -355,7 +355,7 @@ def run_torture_matrix(
     tiers: Iterable[TortureTier | str] = DEFAULT_TIERS,
     case_names: Iterable[str] | None = None,
     compile_only: bool = False,
-    trig_solver: str = "libm",
+    trig_solver: str = "lut",
     trig_epsilon: float | None = None,
     cache: RepositoryArtifactCache | None = None,
     llvm_profile: Any | None = None,
@@ -433,8 +433,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument(
         "--trig-solver",
-        choices=("libm", "lut", "continuous"),
-        default="libm",
+        choices=("lut", "continuous"),
+        default="lut",
     )
     parser.add_argument("--trig-epsilon", type=float)
     parser.add_argument(

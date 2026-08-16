@@ -205,7 +205,7 @@ class LLVMJITProgram:
 def compile_torture_case_to_llvm(
     captured: CapturedTortureCase,
     *,
-    trig_solver: str = "libm",
+    trig_solver: str = "lut",
     trig_epsilon: float | None = None,
     cache: RepositoryArtifactCache | None = None,
     llvm_profile: Any | None = None,

@@ -148,12 +148,9 @@ Verified: `advanced=0.033333333  attempts=1470` on consecutive frames, valid
 `RIFF`/`AVI ` header, JPEG frames present, PCM muxed. Cost is real -- about
 23 s per video frame at 24^2.
 
-Two hacks in there that the `pinned` interior should delete:
-
-- `dt` is re-imposed as `sample_period` at the top of every frame, because
-  `update_dt_max` raises it between frames.
-- `max_iters` is computed as `frame_duration/dt * 2 + 32`, because the default
-  256 cannot cover 1470 substeps.
+Both former hacks are **gone**: the `pinned` interior holds the substep, so dt
+is no longer re-imposed each frame, and `max_iters` is derived from the pinned
+period rather than from whatever dt the controller last proposed.
 
 Body forcing was **removed** from the equations entirely
 (`symbolic_fluid_model.py`); the model is unforced again and no longer needs
@@ -250,11 +247,26 @@ SSA:      loop loads keys/values with zero consumers; `any` receives
           an anonymous linked_call_frame_storage slot
 ```
 
-So the fix is in the planner (graph -> plan), not in `Handler` alone. Note the
-existing shortfall check at `precompile_to_ssa.py:5947` only inspects
-instructions that *reached* a region, so an op dropped before planning is
-invisible to it. **Fix that reporting first** -- it is cheap, and it will say
-whether anything else has been falling out of the census all along.
+Narrowed once more, later the same day, and the earlier reading was wrong.
+
+`compute_lines` in `glsl_deployment_strategy.py:1697` emits a `PlanLine` for
+**every** node in `region_nodes`, so an op is not skipped by dispatch. `get` is
+missing from `region_nodes` itself -- it never joins a region. And a census
+comparing authored nodes against realised SSA values does **not** flag it,
+which means `get`'s value id *does* exist as an SSA value somewhere: the value
+survives, the operation does not.
+
+So this is not a missing `Handler` entry and not an unhandled-op drop. It is
+region membership. Look at how `deployment_nodes` is selected
+(`glsl_deployment_strategy.py:5660`, fed from `node_ids`) and why a mapping
+lookup is not considered part of the numeric compartment.
+
+A census of "authored node with no SSA value" was written and **deliberately
+removed**: it produced false positives for `items`/`loopresult`, which are
+resolved away into the keyed-mapping slots on purpose, and it missed `get` for
+the reason above. Do not re-add that shape of check without solving the
+replaced-vs-dropped distinction first -- a diagnostic that reports false drops
+and misses real ones is worse than none.
 
 ### The render is the other cost, and it is not the compiler's fault
 

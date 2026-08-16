@@ -144,6 +144,27 @@ class InfluenceContract:
 
     enabled: bool = False
     categories: tuple[str, ...] = (DYNAMIC, BAKED)
+    # What an edge does to the influence crossing it.
+    #
+    # ``divide`` splits a node's outgoing influence among its successors, so
+    # the quantity is conserved the way mass in a pipe network is: a tee
+    # divides the dye, it does not clone it. The transport operator is then
+    # sub-stochastic and its spectral radius stays below one, so a fixed point
+    # exists on any graph, cyclic or not.
+    #
+    # ``copy`` hands every successor the node's full weight, which is the
+    # correct reading for dependency -- a value genuinely does influence all of
+    # its consumers. But duplication manufactures weight at every fan-out, and
+    # on a cyclic graph weight can return to a node larger than it left. That
+    # is not a solver bug and no search strategy fixes it: measured on a Dual
+    # IR control shell, out-degree 1.36 against attenuation 0.94 gives a
+    # spectral radius of 1.0468, and a series with radius at or above one has
+    # no limit to converge to. ``copy`` is well-posed on acyclic graphs only.
+    #
+    # The default is ``divide`` because the rendering already committed to it:
+    # what these solvers draw is dye in pipes, and dye is mass.
+    fan_out: str = "divide"
+
     scopes: tuple[str, ...] = ()
     stages: tuple[str, ...] = ()
     # Per-hop survival. Below 1.0 the field also decays with distance, which
@@ -178,6 +199,10 @@ class InfluenceContract:
         if not self.categories:
             raise InfluenceContractError(
                 "an enabled influence contract must trace at least one category"
+            )
+        if self.fan_out not in {"divide", "copy"}:
+            raise InfluenceContractError(
+                f"fan_out must be 'divide' or 'copy'; got {self.fan_out!r}"
             )
         if not 0.0 < self.attenuation <= 1.0:
             raise InfluenceContractError(
@@ -499,6 +524,10 @@ class InfluenceField:
         self._moments: dict[Any, dict[str, Moments]] = {}
         self._transports: list[Transport] = []
         self._converged = False
+        # Order in which the compiled program actually activates its values.
+        # Empty unless a producer knows it -- a dependency graph carries no
+        # such order, but a lowered region does: its steps are linearised.
+        self.activation_order: tuple[Any, ...] = ()
 
     # -- topology intake -------------------------------------------------
 
@@ -598,11 +627,23 @@ class InfluenceField:
         scaling a merged bundle by an edge factor gives precisely the sum of
         scaling each contribution separately. The fixed point is identical.
 
-        Loop depth stays in the key rather than being merged away, so
-        ``Transport.iteration`` remains an exact count of back-edge crossings
-        instead of an average over merged paths. Depth is bounded by decay --
-        ``decay**k < epsilon`` -- so this costs a small constant factor over
-        the node count rather than reintroducing the explosion.
+        Bundles merge on node and category alone. An earlier attempt kept loop
+        depth in the key, on the reasoning that decay bounds depth at
+        ``decay**k < epsilon`` and exact per-path iteration counts were worth a
+        small constant factor. That reasoning was wrong, and measurably so: a
+        recorded control shell contains cycles with *no* back edge -- when one
+        numeric region is dispatched from two sites, ``dispatch-result`` feeds
+        a consumer that routes back through ``dispatch-feed`` into the same
+        region. Those cycles decay only by attenuation and never increment
+        depth, but they keep re-injecting into the real loop, so every
+        re-injection minted a fresh key and merging never happened. Depth ran
+        past 1600 and the run hit ``max_transports``.
+
+        So ``Transport.iteration`` is the back-edge depth at which a bundle was
+        moved, not an exact per-path count: bundles arriving at one node from
+        different depths are merged and report the depth of the merge. The
+        accumulated field is unaffected -- only the per-transport annotation
+        loses that resolution.
 
         Weight strictly decreases along every hop and bundles under ``epsilon``
         retire, so the relaxation terminates. ``max_transports`` is a backstop
@@ -621,33 +662,36 @@ class InfluenceField:
             if source.category in contract.categories
         }
 
-        # Undelivered influence, keyed by (node, loop depth).
-        pending: dict[tuple[Any, int], dict[str, Moments]] = {}
-        heap: list[tuple[float, int, Any, int]] = []
+        # Undelivered influence, keyed by node alone.
+        pending: dict[Any, dict[str, Moments]] = {}
+        depth: dict[Any, int] = {}
+        heap: list[tuple[float, int, Any]] = []
         ordinal = 0
 
-        def enqueue(node: Any, iteration: int, weight: float) -> None:
+        def enqueue(node: Any, weight: float) -> None:
             nonlocal ordinal
             # Heaviest first, ties broken on insertion order, so the result is
             # deterministic and meaningful at any point before convergence.
-            heapq.heappush(heap, (-weight, ordinal, node, iteration))
+            heapq.heappush(heap, (-weight, ordinal, node))
             ordinal += 1
 
-        def hold(node: Any, iteration: int, bundle: Mapping[str, Moments]) -> None:
-            slot = pending.setdefault((node, iteration), {})
+        def hold(node: Any, arrival: int, bundle: Mapping[str, Moments]) -> None:
+            slot = pending.setdefault(node, {})
             for category, moments in bundle.items():
                 slot[category] = slot.get(category, Moments()) + moments
+            depth[node] = max(depth.get(node, 0), arrival)
 
         for source in sorted(selected.values(), key=lambda item: item.ordinal):
             unit = Moments().deposited(source.hue, 1.0)
             self._deposit(source.key, source.category, source.hue, 1.0)
             hold(source.key, 0, {source.category: unit})
-            enqueue(source.key, 0, 1.0)
+            enqueue(source.key, 1.0)
 
         step = 0
         while heap and step < contract.max_transports:
-            _, _, node, iteration = heapq.heappop(heap)
-            bundle = pending.pop((node, iteration), None)
+            _, _, node = heapq.heappop(heap)
+            bundle = pending.pop(node, None)
+            iteration = depth.pop(node, 0)
             if not bundle:
                 # A stale heap entry: this slot was already drained by an
                 # earlier pop that collected everything waiting there.
@@ -658,14 +702,19 @@ class InfluenceField:
             if not edges:
                 continue
             forks = sum(1 for _, role in edges if role in FORK_ROLES)
+            dividing = contract.fan_out == "divide"
+            # Under ``divide`` the split across all successors already accounts
+            # for branch arms; applying the fork rule as well would halve them
+            # twice.
+            share = 1.0 / len(edges) if dividing else 1.0
 
             for target, role in edges:
-                factor = contract.attenuation
+                factor = contract.attenuation * share
                 arrival = iteration
                 if role in BACK_EDGE_ROLES:
                     factor *= contract.decay
                     arrival += 1
-                if role in FORK_ROLES and forks:
+                if role in FORK_ROLES and forks and not dividing:
                     # Alternatives, not parallel successors: the arms divide
                     # the weight between them rather than each taking all.
                     factor /= forks
@@ -702,7 +751,7 @@ class InfluenceField:
                     ))
                     step += 1
                 hold(target, arrival, moved)
-                enqueue(target, arrival, delivered)
+                enqueue(target, delivered)
 
         self._converged = True
         return len(self._transports)
@@ -954,6 +1003,7 @@ def field_from_dual_ir(
     shell: Any,
     contract: InfluenceContract,
     *,
+    regions: Mapping[int, Any] | None = None,
     classifier: Callable[[str, Mapping[str, Any]], str | None] = default_classifier,
     label: str = "dual-ir influence",
 ) -> InfluenceField:
@@ -982,6 +1032,7 @@ def field_from_dual_ir(
         return field_view
 
     from .evolution_metagraph import (
+        EvolutionComponentRef,
         EvolutionMetaGraph,
         record_compiled_execution_evolution,
         record_evolution,
@@ -993,11 +1044,21 @@ def field_from_dual_ir(
 
     numeric = getattr(shell, "compiled_shell_program", None)
     control = getattr(shell, "shell_control_program", None)
-    regions = dict(getattr(shell, "region_programs", None) or {})
+    # ``DualIRShell`` pairs the numeric and control programs but does not carry
+    # the region table -- that lives on the ``AOTCompilation`` that produced it,
+    # so a caller holding one passes it here. Reading ``shell.region_programs``
+    # silently found nothing and fell back to ``compiled_shell_program``, which
+    # on the precompile path is an intentionally empty sentinel: the field then
+    # had no sources and transported nothing, while looking like it had worked.
+    regions = dict(
+        regions
+        if regions is not None
+        else (getattr(shell, "region_programs", None) or {})
+    )
     if not regions and numeric is not None:
-        # A bare shell is the numeric/control pair and nothing more; its single
-        # numeric program is region 0 as far as dispatch references go.
-        regions = {0: numeric}
+        steps = getattr(getattr(numeric, "program", numeric), "steps", ())
+        if steps:
+            regions = {0: numeric}
 
     with record_evolution(metagraph):
         region_graphs: dict[int, Any] = {}
@@ -1006,6 +1067,66 @@ def field_from_dual_ir(
             region_graphs[int(index)] = record_fused_program_evolution(
                 program, label=f"{label} numeric region {int(index)}"
             )
+        # The region steps are already linearised, so their order is the order
+        # the program brings values into existence. Unrolling does not destroy
+        # that -- it makes it explicit, and a body that ran four times appears
+        # as four activations, which is exactly how often ink should fire.
+        activation: list[Any] = []
+        for index, captured in sorted(regions.items()):
+            program = getattr(captured, "program", captured)
+            graph = region_graphs.get(int(index))
+            if graph is None:
+                continue
+            for step in getattr(program, "steps", ()) or ():
+                ref = EvolutionComponentRef(graph.id, str(step.result_id))
+                if metagraph.has_component(ref):
+                    activation.append(ref)
+        field_view.activation_order = tuple(activation)
+
+        # Phi lives in Dual IR as ``carried_aliases`` on the control blocks --
+        # a ConditionalBlock carries (true, false, pre-branch, merged) and a
+        # LoopBlock carries (updated, initial) -- and SSA only materialises it
+        # later. ``record_compiled_execution_evolution`` walks the same tree
+        # but never reads those tuples, so the structural edges appear while
+        # the value merges they describe do not. Recovering them here keeps
+        # the confluence in the field where it belongs.
+        _phi_pairs: list[tuple[int, int]] = []
+
+        def _collect_phi(block: Any) -> None:
+            name = type(block).__name__
+            if name == "SequenceBlock":
+                for child in block.blocks:
+                    _collect_phi(child)
+            elif name == "ConditionalBlock":
+                for entry in getattr(block, "carried_aliases", ()) or ():
+                    if len(entry) == 4:
+                        true_value, false_value, _pre, merged = entry
+                        _phi_pairs.append((int(true_value), int(merged)))
+                        _phi_pairs.append((int(false_value), int(merged)))
+                _collect_phi(block.body)
+                if getattr(block, "orelse", None) is not None:
+                    _collect_phi(block.orelse)
+            elif name in {"LoopBlock", "WhileBlock"}:
+                for entry in getattr(block, "carried_aliases", ()) or ():
+                    if len(entry) == 2:
+                        updated, initial = entry
+                        # The header phi takes the entry value and the value
+                        # the latch carries back around.
+                        _phi_pairs.append((int(initial), int(updated)))
+                _collect_phi(getattr(block, "body", None) or SequenceBlockStub())
+                condition = getattr(block, "condition", None)
+                if condition is not None:
+                    _collect_phi(condition)
+
+        class SequenceBlockStub:
+            blocks: tuple = ()
+
+        if control is not None:
+            try:
+                _collect_phi(control.root)
+            except Exception:
+                _phi_pairs = []
+
         if control is not None:
             record_compiled_execution_evolution(
                 control,
@@ -1016,6 +1137,138 @@ def field_from_dual_ir(
                 },
                 label=label,
             )
+
+        # ``carried_aliases`` names values in the compiler's cross-region
+        # value-id space -- the same space ``precompile_to_ssa`` resolves
+        # through ``external_value`` when it emits the Phi. A loop-carried
+        # value lives *across* regions by definition, so looking it up in one
+        # region's feeds and results finds the wrong table and misses most of
+        # them. Components are keyed by value id wherever they were recorded,
+        # so resolve against every component the run produced.
+        owner: dict[int, Any] = {}
+        for component in metagraph.snapshot().components:
+            try:
+                value_id = int(component.ref.local_id)
+            except (TypeError, ValueError):
+                continue
+            owner.setdefault(value_id, component.ref)
+        for produced, merged in _phi_pairs:
+            source = owner.get(produced)
+            target = owner.get(merged)
+            if source is not None and target is not None and source != target:
+                field_view.add_edge(source, target, role="phi")
+
+    return field_view
+
+
+def field_from_ssa(
+    module: Any,
+    contract: InfluenceContract,
+    *,
+    functions: Sequence[str] | None = None,
+    classifier: Callable[[str, Mapping[str, Any]], str | None] = default_classifier,
+) -> InfluenceField:
+    """Build a field over lowered SSA: def-use plus real block control flow.
+
+    This is the representation that actually carries the control structure. A
+    dependency graph has none, and a control shell that has been unrolled no
+    longer has a loop to describe -- but SSA keeps blocks, so a ``CondBr`` is a
+    fork, a ``Br`` back to an already-seen block is a back edge, and a ``Phi``
+    is where two paths' values recombine.
+
+    Roles are assigned so the solver's existing transport applies unchanged:
+    branch arms divide, back edges decay and reclassify as loop-carried, and a
+    phi merges by adding power sums exactly as any other confluence does.
+    """
+
+    field_view = InfluenceField(contract)
+    if not contract.enabled:
+        return field_view
+
+    table = dict(getattr(module, "functions", None) or {})
+    selected = [
+        name for name in (functions if functions is not None else table)
+        if name in table
+    ]
+
+    staged: list[tuple[Any, str, int, str, str]] = []
+    activation: list[Any] = []
+    ordinal = 0
+
+    for name in selected:
+        function = table[name]
+        blocks = dict(getattr(function, "blocks", None) or {})
+        order = list(blocks)
+        position = {label: index for index, label in enumerate(order)}
+        # A value's defining instruction is its node; an argument is a node
+        # with no definition inside this function.
+        defined: dict[Any, Any] = {}
+        for label in order:
+            for instruction in getattr(blocks[label], "instrs", ()) or ():
+                result = getattr(instruction, "res", None)
+                if result is not None:
+                    defined[(name, result.id)] = (name, label, result.id)
+
+        first_of_block: dict[str, Any] = {}
+        for label in order:
+            instructions = list(getattr(blocks[label], "instrs", ()) or ())
+            if instructions:
+                result = getattr(instructions[0], "res", None)
+                first_of_block[label] = (
+                    (name, label, result.id) if result is not None
+                    else (name, label, "entry")
+                )
+
+        for label in order:
+            block = blocks[label]
+            successors = list(getattr(block, "successors", ()) or ())
+            instructions = list(getattr(block, "instrs", ()) or ())
+            for index, instruction in enumerate(instructions):
+                result = getattr(instruction, "res", None)
+                key = ((name, label, result.id) if result is not None
+                       else (name, label, f"op{index}"))
+                field_view.add_node(key)
+                activation.append(key)
+
+                operation = str(getattr(instruction, "op", ""))
+                for argument in getattr(instruction, "args", ()) or ():
+                    source = defined.get((name, getattr(argument, "id", None)))
+                    if source is None:
+                        # An operand with no definition here is an entry value:
+                        # a parameter or an incoming constant, and therefore an
+                        # origin of influence rather than a derivation.
+                        source = (name, "entry", getattr(argument, "id", None))
+                        field_view.add_node(source)
+                        staged.append((
+                            source, DYNAMIC, ordinal, f"{name}:arg", name,
+                        ))
+                        ordinal += 1
+                        defined[(name, getattr(argument, "id", None))] = source
+                    role = "phi" if operation == "Phi" else "data"
+                    field_view.add_edge(source, key, role=role)
+
+                if operation in {"Const"}:
+                    staged.append((key, BAKED, ordinal, f"{name}:const", name))
+                    ordinal += 1
+
+                # Control edges leave from the terminator of the block.
+                if index == len(instructions) - 1 and successors:
+                    forking = operation == "CondBr" and len(successors) > 1
+                    for arm, target in enumerate(successors):
+                        entry = first_of_block.get(target)
+                        if entry is None:
+                            continue
+                        backward = position.get(target, 0) <= position[label]
+                        if backward:
+                            role = "loop-back"
+                        elif forking:
+                            role = "branch-true" if arm == 0 else "branch-false"
+                        else:
+                            role = "control-next"
+                        field_view.add_edge(key, entry, role=role)
+
+    field_view.add_sources(staged)
+    field_view.activation_order = tuple(activation)
     return field_view
 
 
@@ -1028,5 +1281,5 @@ __all__ = [
     "Moments", "CategoryReading", "InfluenceReading", "Transport",
     "InfluenceField",
     "semantic_marker_hue", "allocate_hues", "default_classifier",
-    "attach_to_metagraph", "field_from_process_graph", "field_from_dual_ir",
+    "attach_to_metagraph", "field_from_process_graph", "field_from_dual_ir", "field_from_ssa",
 ]

@@ -42,8 +42,8 @@ program_abi:
         next_momentum_x: {storage: span, dtype: float64, rank: 2, mutable: true}
         next_momentum_y: {storage: span, dtype: float64, rank: 2, mutable: true}
         next_tracer: {storage: span, dtype: float64, rank: 2, mutable: true}
-        force_x: {storage: span, dtype: float64, rank: 2, mutable: false}
-        force_y: {storage: span, dtype: float64, rank: 2, mutable: false}
+        forcing_amplitude: {storage: scalar, dtype: float64, mutable: false}
+        forcing_wavenumber: {storage: scalar, dtype: float64, mutable: false}
         dx: {storage: scalar, dtype: float64, mutable: false}
         gravity: {storage: scalar, dtype: float64, mutable: false}
         viscosity: {storage: scalar, dtype: float64, mutable: false}

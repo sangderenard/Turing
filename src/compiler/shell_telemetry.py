@@ -43,7 +43,13 @@ LOG = "log"
 ERROR = "error"
 PROFILE = "profile"
 PROGRESS = "progress"
-KINDS = (LOG, ERROR, PROFILE, PROGRESS)
+# What executed, when. A ``trace`` record says a region of the compiled
+# artifact entered or left, carrying the identity that survives recomposition,
+# so a consumer can follow the running program rather than replay its
+# structure on a clock of its own. Distinct from ``profile``, which reports
+# how long something took after the fact -- a trace is the event itself.
+TRACE = "trace"
+KINDS = (LOG, ERROR, PROFILE, PROGRESS, TRACE)
 
 
 @dataclass(frozen=True)
@@ -125,6 +131,31 @@ class TelemetryChannel:
     ) -> Record:
         return self.emit(
             PROGRESS, message, done=int(done), total=int(total), **detail
+        )
+
+    def trace(
+        self,
+        message: str,
+        *,
+        region: int,
+        phase: str = "enter",
+        path: str = "",
+        **detail: Any,
+    ) -> Record:
+        """Record that a region of the running artifact entered or left.
+
+        ``region`` is the identity that survives recomposition -- the same
+        index the control shell dispatches through -- so a consumer can attach
+        to it without knowing how the planner grouped or nested anything.
+        """
+
+        return self.emit(
+            TRACE,
+            message,
+            path=path,
+            region=int(region),
+            phase=str(phase),
+            **detail,
         )
 
     def exception(

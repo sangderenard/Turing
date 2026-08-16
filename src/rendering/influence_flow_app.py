@@ -47,55 +47,106 @@ def _orthographic(width: float, height: float) -> np.ndarray:
     ], dtype=np.float32)
 
 
-def build_scene(expression: str, width: int, height: int):
-    """Graph, field, layout, and pipe lengths for one expression."""
+DEFAULT_PROGRAM_FILE = "examples/xor_project/train_xor.py"
+DEFAULT_ENTRYPOINT = "train"
+DEFAULT_FEEDS = {"steps": 200, "lr": 1e-2}
+DEFAULT_MUTABLE = ("steps", "lr")
 
-    import sympy
 
+def build_scene(program_file: str, entrypoint: str, width: int, height: int):
+    """Compile a real program and lay out the Dual IR it produced.
+
+    ``precompile_only`` selects graph ingestion over the discovery tape. That
+    is the documented route for a program capture: the tape linearises one
+    observed run and cannot carry a graph portion's full operand set, so it
+    drops boundary operands and needs every operation present in its captured
+    kernel tables.
+
+    The parameters stay symbolic. Concrete feeds are compile-time constants,
+    so the compiler folds the body away and returns the answer -- correctly,
+    but leaving no program to watch.
+    """
+
+    from pathlib import Path as _Path
+
+    from ..common.tensors.accelerator_backends.aot_compile import compile_ast_aot
     from ..compiler.influence_field import (
-        InfluenceContract, field_from_process_graph,
+        DYNAMIC, BAKED, RECURRENT, InfluenceContract, field_from_dual_ir,
     )
-    from ..transmogrifier.graph.graph_express2 import ProcessGraph
     from .influence_field_shader import reduce_crossings
 
-    graph = ProcessGraph(materialize_memory=False, source_language="sympy")
-    graph.build_from_expression(sympy.sympify(expression, evaluate=False))
-    graph.compute_levels(method="asap", order="dependency")
+    root = _Path(__file__).resolve().parents[2]
+    source = _Path(program_file)
+    if not source.is_absolute():
+        source = root / program_file
 
-    field = field_from_process_graph(graph, InfluenceContract(enabled=True))
+    aot = compile_ast_aot(
+        source.read_text(encoding="utf-8"),
+        entrypoint,
+        dict(DEFAULT_FEEDS),
+        precompile_only=True,
+        unroll_limit=8,
+        mutable_parameters=DEFAULT_MUTABLE,
+        boundary_namespace=str(root / "boundary_namespaces"),
+        source_language="python",
+        extraction_contract=str(
+            root / "extraction_contracts" / "program_extraction.yaml"
+        ),
+    )
+    regions = dict(aot.region_programs)
+    field = field_from_dual_ir(
+        aot.shell,
+        InfluenceContract(enabled=True,
+                          categories=(DYNAMIC, BAKED, RECURRENT)),
+        regions=regions,
+    )
     field.propagate()
+    print(f"dual ir: {len(regions)} region(s), "
+          f"{sum(len(getattr(getattr(c, 'program', c), 'steps', []) or []) for c in regions.values())} "
+          f"numeric steps")
 
-    edges = list(graph.G.edges())
+    edges = [(a, b) for a, outs in field._outgoing.items() for b, _r in outs]
+    nodes = sorted(field._nodes, key=str)
+    rank = {key: index for index, key in enumerate(field.activation_order)}
+
+    successors: dict = {}
+    for a, b in edges:
+        successors.setdefault(a, []).append(b)
+    depth = {key: 0 for key in nodes}
+    for key in sorted(nodes, key=lambda k: rank.get(k, 0)):
+        for nxt in successors.get(key, ()):
+            if rank.get(nxt, 0) > rank.get(key, 0):
+                depth[nxt] = max(depth.get(nxt, 0), depth[key] + 1)
+
     layers: dict[int, list] = collections.defaultdict(list)
-    for node in graph.G.nodes():
-        layers[graph.levels[node]].append(node)
+    for key in nodes:
+        layers[depth[key]].append(key)
     ordered = reduce_crossings(layers, edges)
 
-    deepest = max(ordered)
-    widest = max(len(members) for members in ordered.values())
-    margin = 80.0
+    deepest = max(ordered) if ordered else 1
+    widest = max((len(v) for v in ordered.values()), default=1)
+    margin = 60.0
     positions = {}
     for level, members in ordered.items():
-        for index, node in enumerate(members):
-            positions[node] = (
+        for index, key in enumerate(members):
+            positions[key] = (
                 margin + (width - 2 * margin) * level / max(1, deepest),
                 height / 2.0
                 + (index - (len(members) - 1) / 2.0)
                 * (height - 2 * margin) / max(6, widest),
             )
     lengths = {
-        (source, target): math.hypot(
-            positions[target][0] - positions[source][0],
-            positions[target][1] - positions[source][1],
-        )
-        for source, target in edges
+        (a, b): math.hypot(positions[b][0] - positions[a][0],
+                           positions[b][1] - positions[a][1])
+        for a, b in edges if a in positions and b in positions
     }
     return field, positions, lengths
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--expression", default=DEFAULT_EXPRESSION)
+    parser.add_argument("--program-file", default=DEFAULT_PROGRAM_FILE)
+    parser.add_argument("--entrypoint", default=DEFAULT_ENTRYPOINT)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=760)
     parser.add_argument("--pipe-width", type=float, default=6.0)
@@ -134,14 +185,17 @@ def main(argv: list[str] | None = None) -> int:
     from .influence_field_image import bake_palette
     from .influence_flow import FlowSettings, InfluenceFlow
     from .influence_flow_gpu import (
-        B_GEOMETRY, B_INCIDENT_ENTRY, B_INCIDENT_OFFSET, B_PIPE_IN,
-        BULB_FRAGMENT, BULB_VERTEX, GPUInfluenceFlow, PIPE_FRAGMENT,
-        PIPE_VERTEX, TransparencyLists, draw_program, storage_buffer,
+        B_BEADS, B_GEOMETRY, B_INCIDENT_ENTRY, B_INCIDENT_OFFSET, B_PIPE_IN,
+        GLASS_FRAGMENT, GLASS_VERTEX, GPUInfluenceFlow,
+        draw_program, storage_buffer,
     )
 
     field, positions, lengths = build_scene(
-        args.expression, args.width, args.height
+        args.program_file, args.entrypoint, args.width, args.height
     )
+    print(f"program: {len(field._nodes)} nodes, "
+          f"{sum(len(v) for v in field._outgoing.values())} edges, "
+          f"{len(field.activation_order)} activations")
     flow = InfluenceFlow(field, lengths=lengths, settings=FlowSettings(
         emission_period=args.emission_period,
         emission_duty=args.emission_duty,
@@ -160,98 +214,60 @@ def main(argv: list[str] | None = None) -> int:
     def locations(program, names):
         return {name: glGetUniformLocation(program, name) for name in names}
 
-    shared = (
-        "uMVP", "uPalette", "uWaterColour", "uDyeStrength", "uPeakWeight",
-        "uBakedCategory", "uCells", "uCategories", "uMaxFragments",
-    )
-    pipe_draw = draw_program(PIPE_VERTEX, PIPE_FRAGMENT)
-    pipe_uniforms = locations(pipe_draw, shared + ("uPipeWidth", "uPipeDepth"))
-    bulb_draw = draw_program(BULB_VERTEX, BULB_FRAGMENT)
-    bulb_uniforms = locations(
-        bulb_draw, shared + ("uBeadRadius", "uBlend", "uBulbDepth")
-    )
-    lists = TransparencyLists(args.width, args.height)
+    glass = draw_program(GLASS_VERTEX, GLASS_FRAGMENT)
+    glass_uniforms = locations(glass, (
+        "uOrigin", "uExtent", "uPalette", "uWaterColour", "uDyeStrength",
+        "uPeakWeight", "uBakedCategory", "uCells", "uCategories",
+        "uCapsules", "uBeadCount", "uBlend", "uThickness", "uBackground",
+        "uReferenceSpan",
+    ))
 
-    # Tube geometry: two triangles per edge. aCorner carries position along and
-    # across the pipe and the vertex stage extrudes it.
-    corners = ((0.0, -1.0), (1.0, -1.0), (1.0, 1.0),
-               (0.0, -1.0), (1.0, 1.0), (0.0, 1.0))
-    vertices = []
-    for index, (source, target, _role) in enumerate(flow.edges):
-        if (source, target) not in lengths:
-            continue
-        x0, y0 = positions[source]
-        x1, y1 = positions[target]
-        for corner_x, corner_y in corners:
-            vertices.append((corner_x, corner_y, x0, y0, x1, y1, float(index)))
-    mesh = np.asarray(vertices, dtype=np.float32)
-
-    def upload(data, layout):
-        vao = glGenVertexArrays(1)
-        vbo = glGenBuffers(1)
-        glBindVertexArray(vao)
-        glBindBuffer(GL_ARRAY_BUFFER, vbo)
-        glBufferData(GL_ARRAY_BUFFER, data.nbytes, data, GL_STATIC_DRAW)
-        stride = data.shape[1] * 4
-        for location, size, offset in layout:
-            glEnableVertexAttribArray(location)
-            glVertexAttribPointer(location, size, GL_FLOAT, GL_FALSE,
-                                  stride, ctypes.c_void_p(offset))
-        glBindVertexArray(0)
-        return vao
-
-    pipe_vao = upload(mesh, ((0, 2, 0), (1, 2, 8), (2, 2, 16), (3, 1, 24)))
-
-    # Scene description the bead shader evaluates: one capsule per tube, and
-    # for each node the tubes meeting there plus which end is near. The bead
-    # needs both -- the capsules to smooth-union its surface against, and the
-    # near cells to read the fluid genuinely present at that junction.
+    # The scene is described, not tessellated: one capsule per tube and one
+    # sphere per junction, both read by a single fullscreen field evaluation.
     capsules = np.zeros(len(flow.edges), dtype=np.dtype([
         ("from", np.float32, 2), ("to", np.float32, 2),
         ("radius", np.float32), ("edge", np.uint32),
     ]))
-    incident: dict[int, list[tuple[int, int]]] = {}
+    drawn = 0
+    spans = [
+        math.hypot(positions[b][0] - positions[a][0],
+                   positions[b][1] - positions[a][1])
+        for (a, b, _r) in flow.edges if a in positions and b in positions
+    ]
+    reference_span = float(np.median(spans)) if spans else 1.0
     for index, (source, target, _role) in enumerate(flow.edges):
         if (source, target) not in lengths:
             continue
+        span = math.hypot(positions[target][0] - positions[source][0],
+                          positions[target][1] - positions[source][1])
+        # A stretched pipe is a thinner pipe: the same dye occupies more
+        # length, so its cross-section narrows rather than its contents
+        # thinning out of sight.
+        radius = args.pipe_width * math.sqrt(
+            min(1.0, reference_span / max(span, 1e-6)))
         capsules[index] = (
-            positions[source], positions[target], args.pipe_width, index
+            positions[source], positions[target],
+            max(radius, args.pipe_width * 0.35), index
         )
-        # end 0 = head cell (fluid leaving here), 1 = tail cell (arriving here)
-        incident.setdefault(flow._node_index[source], []).append((index, 0))
-        incident.setdefault(flow._node_index[target], []).append((index, 1))
+        drawn += 1
 
-    incident_offsets = np.zeros(len(flow.nodes) + 1, dtype=np.uint32)
-    incident_entries: list[tuple[int, int]] = []
-    for node in range(len(flow.nodes)):
-        incident_offsets[node] = len(incident_entries)
-        incident_entries.extend(incident.get(node, ()))
-    incident_offsets[len(flow.nodes)] = len(incident_entries)
-    entry_array = np.asarray(
-        incident_entries or [(0, 0)], dtype=np.uint32
-    ).reshape(-1, 2)
+    bead_radius = args.pipe_width * args.bead_radius
+    beads = np.zeros((max(1, len(positions)), 4), dtype=np.float32)
+    for slot, node in enumerate(positions):
+        beads[slot] = (positions[node][0], positions[node][1], bead_radius, 0.0)
 
     storage_buffer(B_GEOMETRY, capsules)
-    storage_buffer(B_INCIDENT_OFFSET, incident_offsets)
-    storage_buffer(B_INCIDENT_ENTRY, entry_array)
+    storage_buffer(B_BEADS, beads)
 
-    # Bead quads, oversized so the smooth union with the tubes has room to
-    # spread beyond the sphere itself.
-    bead_radius = args.pipe_width * args.bead_radius
-    quad_radius = bead_radius + args.blend * 2.0
-    bead_corners = ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0),
-                    (-1.0, -1.0), (1.0, 1.0), (-1.0, 1.0))
-    bead_vertices = []
-    for node, index in flow._node_index.items():
-        if node not in positions:
-            continue
-        cx, cy = positions[node]
-        for corner_x, corner_y in bead_corners:
-            bead_vertices.append(
-                (corner_x, corner_y, cx, cy, quad_radius, float(index))
-            )
-    beads = np.asarray(bead_vertices, dtype=np.float32)
-    bead_vao = upload(beads, ((0, 2, 0), (1, 2, 8), (2, 1, 16), (3, 1, 20)))
+    screen = np.asarray([-1, -1, 3, -1, -1, 3], dtype=np.float32)
+    screen_vao = glGenVertexArrays(1)
+    screen_vbo = glGenBuffers(1)
+    glBindVertexArray(screen_vao)
+    glBindBuffer(GL_ARRAY_BUFFER, screen_vbo)
+    glBufferData(GL_ARRAY_BUFFER, screen.nbytes, screen, GL_STATIC_DRAW)
+    glEnableVertexAttribArray(0)
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, ctypes.c_void_p(0))
+    glBindVertexArray(0)
 
     palette_rgb, _reserved = bake_palette()
     palette = glGenTextures(1)
@@ -271,23 +287,6 @@ def main(argv: list[str] | None = None) -> int:
     background = (0.055, 0.055, 0.07)
     water = (0.60, 0.72, 0.80)
 
-    def bind_shared(program, slots, peak):
-        glUseProgram(program)
-        glUniformMatrix4fv(slots["uMVP"], 1, GL_TRUE, mvp)
-        glUniform1f(slots["uPeakWeight"], peak)
-        glUniform1f(slots["uDyeStrength"], args.dye_strength)
-        glUniform3f(slots["uWaterColour"], *water)
-        glUniform1ui(slots["uCells"], gpu.cells)
-        glUniform1i(slots["uCategories"], gpu.categories)
-        glUniform1i(slots["uBakedCategory"], baked_category)
-        glUniform1ui(slots["uMaxFragments"], lists.capacity)
-        glActiveTexture(GL_TEXTURE0)
-        glBindTexture(GL_TEXTURE_2D, palette)
-        glUniform1i(slots["uPalette"], 0)
-
-    # Peak concentration normalises the density channel. Reading it back every
-    # frame would stall the pipeline for a number that barely moves, so it is
-    # refreshed occasionally and held between refreshes.
     peak = 1e-3
     clock = pygame.time.Clock()
     frame = 0
@@ -302,10 +301,6 @@ def main(argv: list[str] | None = None) -> int:
         for _ in range(max(1, args.steps_per_frame)):
             gpu.step(dt)
         if frame % 30 == 0:
-            # A high percentile, not the maximum. Diffusion-free transport
-            # concentrates a whole emission pulse into very few cells, so the
-            # max is a rare outlier; normalising against it drags every
-            # ordinary cell toward the water colour and the dye disappears.
             live = gpu.read_state()[..., 0].sum(axis=2)
             carrying = live[live > 1e-9]
             peak = max(1e-3, float(
@@ -313,24 +308,31 @@ def main(argv: list[str] | None = None) -> int:
             ))
 
         glViewport(0, 0, args.width, args.height)
+        glDisable(GL_BLEND)
+        glDisable(GL_DEPTH_TEST)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, B_PIPE_IN, gpu.state_buffer)
-        lists.begin()
 
-        bind_shared(pipe_draw, pipe_uniforms, peak)
-        glUniform1f(pipe_uniforms["uPipeWidth"], args.pipe_width)
-        glUniform1f(pipe_uniforms["uPipeDepth"], 0.5)
-        glBindVertexArray(pipe_vao)
-        glDrawArrays(GL_TRIANGLES, 0, len(mesh))
-
-        bind_shared(bulb_draw, bulb_uniforms, peak)
-        glUniform1f(bulb_uniforms["uBeadRadius"], bead_radius)
-        glUniform1f(bulb_uniforms["uBlend"], args.blend)
-        glUniform1f(bulb_uniforms["uBulbDepth"], 0.3)
-        glBindVertexArray(bead_vao)
-        glDrawArrays(GL_TRIANGLES, 0, len(beads))
+        glUseProgram(glass)
+        glUniform2f(glass_uniforms["uOrigin"], 0.0, 0.0)
+        glUniform2f(glass_uniforms["uExtent"], float(args.width), float(args.height))
+        glUniform1f(glass_uniforms["uPeakWeight"], peak)
+        glUniform1f(glass_uniforms["uDyeStrength"], args.dye_strength)
+        glUniform3f(glass_uniforms["uWaterColour"], *water)
+        glUniform3f(glass_uniforms["uBackground"], *background)
+        glUniform1ui(glass_uniforms["uCells"], gpu.cells)
+        glUniform1i(glass_uniforms["uCategories"], gpu.categories)
+        glUniform1i(glass_uniforms["uBakedCategory"], baked_category)
+        glUniform1ui(glass_uniforms["uCapsules"], len(capsules))
+        glUniform1ui(glass_uniforms["uBeadCount"], len(beads))
+        glUniform1f(glass_uniforms["uBlend"], args.blend)
+        glUniform1f(glass_uniforms["uThickness"], bead_radius)
+        glUniform1f(glass_uniforms["uReferenceSpan"], reference_span)
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, palette)
+        glUniform1i(glass_uniforms["uPalette"], 0)
+        glBindVertexArray(screen_vao)
+        glDrawArrays(GL_TRIANGLES, 0, 3)
         glBindVertexArray(0)
-
-        lists.resolve(background)
 
         pygame.display.flip()
         clock.tick(60)
@@ -338,7 +340,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.frames and frame >= args.frames:
             running = False
 
-    used = lists.used_fragments()
     if args.screenshot:
         raw = glReadPixels(
             0, 0, args.width, args.height, GL_RGB, GL_UNSIGNED_BYTE
@@ -353,10 +354,10 @@ def main(argv: list[str] | None = None) -> int:
 
     elapsed = time.perf_counter() - started
     print(
-        f"tubes={len(mesh) // 6} beads={len(beads) // 6} cells={gpu.cells} "
+        f"tubes={drawn} beads={len(beads)} cells={gpu.cells} "
         f"frames={frame} in {elapsed:.1f}s "
         f"({frame / max(elapsed, 1e-6):.0f} fps) solver t={gpu.time:.1f}s "
-        f"peak={peak:.4f} list-fragments={used}/{lists.capacity}"
+        f"peak={peak:.4f}"
     )
     pygame.quit()
     return 0

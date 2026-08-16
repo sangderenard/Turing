@@ -40,7 +40,7 @@ def _symbols() -> dict[str, sympy.Symbol]:
     ]
     names.extend((
         "dt", "dx", "gravity", "viscosity", "tracer_diffusivity",
-        "linear_drag", "coriolis", "force_x", "force_y", "minimum_height",
+        "linear_drag", "coriolis", "minimum_height",
     ))
     return {name: sympy.Symbol(name, real=True) for name in names}
 
@@ -133,14 +133,12 @@ def symbolic_viscous_shallow_water_equations() -> SymbolicFluidModel:
         + nu * laplacian("momentum_x")
         - drag * state("momentum_x", "center")
         + coriolis * state("momentum_y", "center")
-        + s["force_x"] * state("height", "center")
     )
     momentum_y_next = state("momentum_y", "center") + dt * (
         time_derivative("momentum_y")
         + nu * laplacian("momentum_y")
         - drag * state("momentum_y", "center")
         - coriolis * state("momentum_x", "center")
-        + s["force_y"] * state("height", "center")
     )
     tracer_next = state("tracer", "center") + dt * (
         time_derivative("tracer") + kappa * laplacian("tracer")

@@ -166,20 +166,7 @@ _UNARY: dict[str, str] = {
     "neg": "(-{0})",
     "abs": "abs({0})",
     "sqrt": "sqrt({0})",
-    "exp": "exp({0})",
-    "log": "log({0})",
     "Sqrt": "sqrt({0})",
-    "Exp": "exp({0})",
-    "Log": "log({0})",
-    "sin": "sin({0})",
-    "cos": "cos({0})",
-    "tan": "tan({0})",
-    "asin": "asin({0})",
-    "acos": "acos({0})",
-    "atan": "atan({0})",
-    "sinh": "sinh({0})",
-    "cosh": "cosh({0})",
-    "tanh": "tanh({0})",
     # FLOOR/CEILING/NINT return INTEGER in Fortran, where the numpy
     # equivalents return a float. Keeping the recorded program's type means
     # converting back, which also stops these from poisoning every intrinsic
@@ -191,9 +178,6 @@ _UNARY: dict[str, str] = {
     "round": "real(nint({0}), c_double)",
     "sign": "sign(1.0_c_double, {0})",
     "logical_not": "(.not. {0})",
-    "asinh": "asinh({0})",
-    "acosh": "acosh({0})",
-    "atanh": "atanh({0})",
     "trunc": "aint({0})",
     "copy": "{0}",
     "isnan": "ieee_is_nan({0})",
@@ -522,6 +506,73 @@ def _array_literal(
     return f"reshape({constructor}, [{extents}])"
 
 
+
+def sin_table_declaration() -> str:
+    """The shared baked table as a Fortran parameter array."""
+
+    from .fused_program_wasm_backend import lut_for
+
+    values, _achieved, _lower, _upper, _periodic = lut_for("sin")
+    items = ", ".join(
+        f"{value!r}".replace("e", "d") + "_c_double" for value in values
+    )
+    return (
+        f"    real(c_double), parameter :: turing_sin_table(0:{len(values) - 1})"
+        f" = [ {items} ]"
+    )
+
+
+def _table_sin_fortran(argument: str, shift: float) -> str:
+    """sin(argument + shift) by interpolating the shared baked table."""
+
+    from .fused_program_wasm_backend import lut_for
+    from .bounded_constants import materialize_pi
+
+    values, _achieved, lower, upper, periodic = lut_for("sin")
+    intervals = len(values) - 1
+    def literal(value: float) -> str:
+        return f"{value!r}".replace("e", "d") + "_c_double"
+    x = argument if shift == 0.0 else f"({argument} + {literal(shift)})"
+    span = upper - lower
+    placed = (
+        f"({x} - {literal(span)} * floor(({x} - {literal(lower)})"
+        f" * {literal(1.0 / span)}))"
+        if periodic else x
+    )
+    t = (
+        f"min(max(({placed} - {literal(lower)}) * "
+        f"{literal(intervals / span)}, 0.0_c_double), {literal(float(intervals))})"
+    )
+    index = f"min(int({t}), {intervals - 1})"
+    return (
+        f"(turing_sin_table({index}) + ({t} - real({index}, c_double)) * "
+        f"(turing_sin_table({index} + 1) - turing_sin_table({index})))"
+    )
+
+
+def _series_sin_fortran(argument: str, shift: float) -> str:
+    """sin(argument + shift) as one Fortran expression, from the shared series.
+
+    Fortran has no statement expression, so the reduced argument is spelled out
+    at each use; the compiler removes the repetition. The coefficients and the
+    constant come from bounded_constants, not from a second series stated here.
+    """
+
+    from .bounded_constants import sin_series_terms
+
+    coefficients, pi, _bound = sin_series_terms()
+    def literal(value: float) -> str:
+        return f"{value!r}".replace("e", "d") + "_c_double"
+    x = argument if shift == 0.0 else f"({argument} + {literal(shift)})"
+    turns = f"nint({x} * {literal(1.0 / pi)})"
+    r = f"({x} - {literal(pi)} * real({turns}, c_double))"
+    horner = literal(coefficients[0])
+    for coefficient in coefficients[1:]:
+        horner = f"({horner} * ({r} * {r}) + {literal(coefficient)})"
+    series = f"({horner} * {r})"
+    return f"merge(-{series}, {series}, mod(abs({turns}), 2) == 1)"
+
+
 def _literal(value: Any) -> str:
     # None and words are typed signed 64-bit identities.  Realise them at the
     # one point every literal passes through to become Fortran; never project
@@ -601,6 +652,7 @@ class _FunctionEmitter:
         callee_inout_pairs: Mapping[
             str, Sequence[tuple[int, int]]
         ] | None = None,
+        trig_solver: str = "lut",
         array_base_ids: Sequence[int] = (),
         mutated_base_ids: Sequence[int] = (),
         dynamic_array_ranks: Mapping[int, int] | None = None,
@@ -610,6 +662,13 @@ class _FunctionEmitter:
         callee_native_symbols: Mapping[str, str] | None = None,
         extent_namespace: str = "",
     ):
+        if str(trig_solver) not in {"lut", "continuous"}:
+            raise ValueError(
+                f"unknown trig solver {trig_solver!r}; expected 'lut' or "
+                "'continuous'"
+            )
+        self.trig_solver = str(trig_solver)
+        self.uses_sin_table = False
         self.function = function
         self.native_symbol = str(native_symbol or function.name)
         self.callee_native_symbols = dict(callee_native_symbols or {})
@@ -2288,21 +2347,7 @@ class _FunctionEmitter:
                 callee = str(instr.attributes.get("callee") or "")
                 intrinsic = {
                     "pow": "{0} ** {1}",
-                    "exp": "exp({0})",
-                    "log": "log({0})",
-                    "tanh": "tanh({0})",
-                    "sin": "sin({0})",
-                    "cos": "cos({0})",
-                    "tan": "tan({0})",
-                    "asin": "asin({0})",
-                    "acos": "acos({0})",
-                    "atan": "atan({0})",
-                    "sinh": "sinh({0})",
-                    "cosh": "cosh({0})",
-                    "asinh": "asinh({0})",
-                    "acosh": "acosh({0})",
-                    "atanh": "atanh({0})",
-                    "llvm.sqrt.f64": "sqrt({0})",
+                                                                                                                                                                                                                                                    "llvm.sqrt.f64": "sqrt({0})",
                     "llvm.fabs.f64": "abs({0})",
                     "llvm.round.f64": "anint({0})",
                     "llvm.trunc.f64": "aint({0})",
@@ -2417,6 +2462,32 @@ class _FunctionEmitter:
         ) and len(args) == 2:
             comparator = "==" if op in ("equal", "Eq") else "/="
             return f"({args[0]} {comparator} {args[1]})"
+
+        if op.casefold() in {"sin", "cos"} and len(args) == 1:
+            from .bounded_constants import materialize_pi
+
+            shift = (
+                0.0 if op.casefold() == "sin"
+                else float(materialize_pi("literal").value) * 0.5
+            )
+            if self.trig_solver == "lut":
+                self.uses_sin_table = True
+                return _table_sin_fortran(args[0], shift)
+            return _series_sin_fortran(args[0], shift)
+
+        if op == "Pi":
+            # The same materialisation the other three lanes use, so one
+            # constant with one declared error bound serves all of them
+            # instead of each spelling its own literal.
+            from .bounded_constants import materialize_pi
+
+            materialization = materialize_pi(
+                instr.attributes.get("constant_solver") or "literal",
+                instr.attributes.get("requested_epsilon"),
+            )
+            if materialization.value is None:
+                return None
+            return _literal(float(materialization.value))
 
         if op in ("Const", "const"):
             if constant is None and "llvm_literal" in instr.attributes:
@@ -2886,6 +2957,10 @@ class _FunctionEmitter:
             f"    integer(c_int), intent(in), value :: {extent}"
             for extent in extent_names
         ]
+        # A referenced table must also be declared. Rendering the body sets
+        # this flag, and the body is rendered before this point.
+        if self.uses_sin_table:
+            declarations.append(sin_table_declaration())
         reference_argument_ids = {
             int(argument.id)
             for occurrence in self.function.args
@@ -3074,6 +3149,7 @@ def emit_function(
     callee_inout_pairs: Mapping[
         str, Sequence[tuple[int, int]]
     ] | None = None,
+    trig_solver: str = "lut",
     array_base_ids: Sequence[int] = (),
     mutated_base_ids: Sequence[int] = (),
     dynamic_array_ranks: Mapping[int, int] | None = None,
@@ -3112,6 +3188,7 @@ def emit_function(
     return _FunctionEmitter(
         function,
         dtype=dtype,
+        trig_solver=trig_solver,
         outputs=outputs,
         callee_extents=callee_extents,
         callee_arity=callee_arity,
@@ -3169,6 +3246,7 @@ def emit_module(
     dtype: str = DEFAULT_DTYPE,
     outputs: Mapping[str, Sequence[SSAValue]] | None = None,
     extra_roots: Sequence[str] = (),
+    trig_solver: str = "lut",
 ) -> FortranModule:
     """Translate an SSA module into one Fortran module.
 
@@ -4137,6 +4215,7 @@ def emit_module(
             function_name: emit_function(
                 function,
                 dtype=dtype,
+                trig_solver=trig_solver,
                 outputs=named_outputs.get(function_name, ()),
                 callee_extents={},
                 callee_arity=callee_arity,
@@ -4204,6 +4283,7 @@ def emit_module(
         return tuple(
             emit_function(
                 function,
+                trig_solver=trig_solver,
                 dtype=dtype,
                 outputs=named_outputs.get(function_name, ()),
                 callee_extents=signatures,

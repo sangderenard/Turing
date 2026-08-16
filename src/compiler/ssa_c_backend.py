@@ -97,10 +97,67 @@ _BINARY = {
     "Add": "+", "Sub": "-", "Mul": "*", "Div": "/",
 }
 _UNARY = {"Abs": "fabs", "Sqrt": "sqrt", "Neg": None}
+_UNARY_FOLDED = {
+    key.casefold(): value for key, value in _UNARY.items()
+    if value is not None
+}
+
+
+#: Operator spellings differ in case between the source vocabularies and the
+#: repository SSA ("sin" vs "Sin"), so every table here is consulted through a
+#: casefolded key. A capability that exists but is spelled differently is
+#: indistinguishable from a missing one, which is how the Fortran lane's trig
+#: sat unreachable.
+_TRANSCENDENTAL = {"sin", "cos"}
+
+
+def _table_sin_c(argument: str, shift: float, table: str, intervals: int,
+                 lower: float, upper: float, periodic: bool) -> str:
+    """sin(argument + shift) by interpolating the shared baked table."""
+
+    shifted = argument if shift == 0.0 else f"({argument} + {shift.hex()})"
+    span = upper - lower
+    placed = (
+        f"({shifted} - {span.hex()} * floor(({shifted} - {lower.hex()})"
+        f" * {(1.0 / span).hex()}))"
+        if periodic else shifted
+    )
+    scaled = f"(({placed} - {lower.hex()}) * {(intervals / span).hex()})"
+    return (
+        "({ double _t = " + scaled + "; "
+        f"if (_t < 0.0) _t = 0.0; if (_t > {float(intervals).hex()}) "
+        f"_t = {float(intervals).hex()}; "
+        "long _i = (long)_t; "
+        f"if (_i >= {intervals}) _i = {intervals - 1}; "
+        "double _f = _t - (double)_i; "
+        f"{table}[_i] + _f * ({table}[_i + 1] - {table}[_i]); }})"
+    )
+
+
+def _series_sin_c(argument: str, shift: float) -> str:
+    """sin(argument + shift) as arithmetic, from the shared series."""
+
+    from .bounded_constants import sin_series_terms
+
+    coefficients, pi, _bound = sin_series_terms()
+    shifted = argument if shift == 0.0 else f"({argument} + {shift.hex()})"
+    reduced = (
+        f"({shifted} - {pi.hex()} * nearbyint({shifted} * {(1.0/pi).hex()}))"
+    )
+    horner = coefficients[0].hex()
+    for coefficient in coefficients[1:]:
+        horner = f"({horner} * _r2 + {coefficient.hex()})"
+    return (
+        "({ double _r = " + reduced + "; double _r2 = _r * _r; "
+        "double _s = " + horner + " * _r; "
+        "(((long long)nearbyint(" + shifted + " * " + (1.0/pi).hex()
+        + ")) & 1) ? -_s : _s; })"
+    )
 
 
 def emit_ssa_function_to_c(
     module: IRModule, function_name: str, *, entry_name: str | None = None,
+    trig_solver: str = "lut",
 ) -> CFunctionArtifact:
     function: Function = module.functions[function_name]
     name = str(entry_name or function_name)
@@ -118,6 +175,7 @@ def emit_ssa_function_to_c(
     lines: list[str] = []
     outputs: tuple[int, ...] = ()
     shortfalls: list[CEmissionShortfall] = []
+    emitted_tables: dict[str, str] = {}
 
     def expression(value_id: int) -> str | None:
         value = expressions.get(int(value_id))
@@ -134,6 +192,27 @@ def emit_ssa_function_to_c(
             continue
         if op == "Ret":
             outputs = tuple(int(value.id) for value in instruction.args)
+            continue
+        if op == "Pi" and instruction.res is not None:
+            # One home for the constant across every lane: the same
+            # materialisation, and the same declared error bound, the LLVM
+            # backend uses. A local 3.14159... literal here would be a second
+            # definition that could drift from it.
+            from .bounded_constants import materialize_pi
+
+            materialization = materialize_pi(
+                instruction.attributes.get("constant_solver") or "literal",
+                instruction.attributes.get("requested_epsilon"),
+            )
+            if materialization.value is None:
+                shortfalls.append(CEmissionShortfall(
+                    op, "pi materialisation was rejected",
+                ))
+                continue
+            constants[int(instruction.res.id)] = float(materialization.value)
+            expressions[int(instruction.res.id)] = float(
+                materialization.value
+            ).hex()
             continue
         if instruction.res is None:
             shortfalls.append(CEmissionShortfall(op, "instruction has no result"))
@@ -163,8 +242,39 @@ def emit_ssa_function_to_c(
             rendered = f"f{op.lower()}({args[0]}, {args[1]})"
         elif op == "Neg" and len(args) == 1:
             rendered = f"(-{args[0]})"
-        elif op in _UNARY and len(args) == 1:
-            rendered = f"{_UNARY[op]}({args[0]})"
+        elif op.casefold() in _TRANSCENDENTAL and len(args) == 1:
+            from .bounded_constants import materialize_pi
+
+            if str(trig_solver) not in {"lut", "continuous"}:
+                shortfalls.append(CEmissionShortfall(
+                    op, f"unknown trig solver {trig_solver!r}; expected 'lut' or 'continuous'",
+                ))
+                continue
+            shift = (
+                0.0 if op.casefold() == "sin"
+                else float(materialize_pi("literal").value) * 0.5
+            )
+            if str(trig_solver) == "lut":
+                from .fused_program_wasm_backend import lut_for
+
+                values, _achieved, lower, upper, periodic = lut_for("sin")
+                table_name = f"_turing_sin_table"
+                if table_name not in emitted_tables:
+                    emitted_tables[table_name] = (
+                        "    static const double "
+                        + table_name
+                        + f"[{len(values)}] = {{"
+                        + ", ".join(value.hex() for value in values)
+                        + "};"
+                    )
+                rendered = _table_sin_c(
+                    args[0], shift, table_name, len(values) - 1,
+                    lower, upper, periodic,
+                )
+            else:
+                rendered = _series_sin_c(args[0], shift)
+        elif op.casefold() in _UNARY_FOLDED and len(args) == 1:
+            rendered = f"{_UNARY_FOLDED[op.casefold()]}({args[0]})"
         elif op == "Pow" and len(args) == 2:
             exponent = constants.get(int(instruction.args[1].id))
             rendered = {
@@ -197,6 +307,7 @@ def emit_ssa_function_to_c(
         "#define TURING_EXPORT __attribute__((visibility(\"default\")))",
         "#endif",
         f"TURING_EXPORT void {name}(const double *in, double *out) {{",
+        *emitted_tables.values(),
         *lines,
         *stores,
         "}",

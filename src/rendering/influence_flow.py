@@ -42,6 +42,8 @@ import numpy as np
 
 from ..compiler.influence_field import (
     BACK_EDGE_ROLES,
+    DYNAMIC,
+    SPECTRUM_END,
     CATEGORIES,
     FORK_ROLES,
     MAX_DISPERSION,
@@ -137,16 +139,28 @@ class InfluenceFlow:
         for source, _, role in self.edges:
             if role in FORK_ROLES:
                 forks[source] = forks.get(source, 0) + 1
+        outgoing: dict[Any, int] = {}
+        for source, _, _ in self.edges:
+            outgoing[source] = outgoing.get(source, 0) + 1
+        dividing = contract.fan_out == "divide"
+
         self.edge_factor = np.ones(len(self.edges), dtype=np.float64)
         self.edge_is_back = np.zeros(len(self.edges), dtype=bool)
+        # Share of a junction's outflow that enters this pipe. Under ``divide``
+        # a tee splits its dye rather than cloning it, which is what the
+        # rendered picture has always depicted; under ``copy`` every pipe
+        # receives the junction's whole quantity.
+        self.edge_split = np.ones(len(self.edges), dtype=np.float64)
         for index, (source, _, role) in enumerate(self.edges):
             factor = contract.attenuation
             if role in BACK_EDGE_ROLES:
                 factor *= contract.decay
                 self.edge_is_back[index] = True
-            if role in FORK_ROLES and forks.get(source):
+            if role in FORK_ROLES and forks.get(source) and not dividing:
                 factor /= forks[source]
             self.edge_factor[index] = factor
+            if dividing:
+                self.edge_split[index] = 1.0 / max(1, outgoing.get(source, 1))
 
         self._edge_source = np.asarray(
             [self._node_index[edge[0]] for edge in self.edges], dtype=np.int64
@@ -155,18 +169,44 @@ class InfluenceFlow:
             [self._node_index[edge[1]] for edge in self.edges], dtype=np.int64
         )
 
-        # Emitters, staggered across the period by their arc position so two
-        # origins never pulse together.
+        # Emitters. When the producing IR knows the order its values actually
+        # come into existence, ink is released in that order: node k opens at
+        # phase k/N of the period, so the release sweeps the program exactly as
+        # the program runs. Nothing has to be reconstructed and no loop needs
+        # special handling -- an unrolled body simply has more nodes, and each
+        # of them activates when it activates.
         self.emitters: list[tuple[int, int, float, float]] = []
-        for source in field.sources:
-            if source.category not in self._category_index:
-                continue
-            self.emitters.append((
-                self._node_index[source.key],
-                self._category_index[source.category],
-                source.hue,
-                (source.ordinal * 0.6180339887) % 1.0,
-            ))
+        order = [
+            key for key in getattr(field, "activation_order", ())
+            if key in self._node_index
+        ]
+        if order:
+            self.activation_length = len(order)
+            category = self._category_index.get(
+                DYNAMIC, next(iter(self._category_index.values()))
+            )
+            for rank, key in enumerate(order):
+                self.emitters.append((
+                    self._node_index[key],
+                    category,
+                    # Hue is the node's place in the activation order, so the
+                    # colour of a drop says when in the run it was released.
+                    SPECTRUM_END * rank / max(1, len(order) - 1),
+                    rank / len(order),
+                ))
+        else:
+            # No authored order: fall back to the origins, staggered against
+            # one another so they never pulse in lockstep.
+            self.activation_length = 0
+            for source in field.sources:
+                if source.category not in self._category_index:
+                    continue
+                self.emitters.append((
+                    self._node_index[source.key],
+                    self._category_index[source.category],
+                    source.hue,
+                    (source.ordinal * 0.6180339887) % 1.0,
+                ))
 
         self._recurrent_index = self._category_index.get(RECURRENT)
 
@@ -229,11 +269,19 @@ class InfluenceFlow:
         # Junctions push what arrived into every outgoing pipe's head cell.
         # Power sums add, so a junction mixes by the field's merge operator.
         #
-        # Injected undiluted, not scaled by ``shift``. Arrivals are a quantity,
-        # not a density: the advection step already removed exactly ``outflow``
-        # from each pipe, so adding less than the full arrival here would leak
-        # mass every hop and the network would starve however long it ran.
-        self.pipes[:, 0] += self.arrivals[self._edge_source]
+        # Not scaled by ``shift``. Arrivals are a quantity, not a density: the
+        # advection step already removed exactly ``outflow`` from each pipe, so
+        # adding less than the full arrival here would leak mass every hop and
+        # the network would starve however long it ran.
+        #
+        # ``edge_split`` is a different thing entirely -- how a junction
+        # apportions its outflow between the pipes leaving it. Handing every
+        # outgoing pipe the whole arrival manufactures dye at each tee, which
+        # is invisible on an acyclic graph but compounds without bound once the
+        # network has a cycle.
+        self.pipes[:, 0] += (
+            self.arrivals[self._edge_source] * self.edge_split[:, None, None]
+        )
         self.time += dt
 
     def cell_readings(self, edge_index: int) -> np.ndarray:

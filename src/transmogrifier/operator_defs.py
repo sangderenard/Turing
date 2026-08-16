@@ -1,3 +1,4 @@
+import builtins
 import math
 import operator
 
@@ -629,8 +630,21 @@ def _abstract_tensor_method(name):
         if not operands:
             raise ValueError(f"AbstractTensor.{name} requires an operand")
         if not hasattr(operands[0], name):
+            # ``math`` covers the transcendentals, but a conversion like
+            # ``float`` or ``int`` is a builtin and has no ``math`` entry, so
+            # the lookup fell through to ``getattr(operands[0], name)`` and
+            # raised there instead.
             scalar_function = getattr(math, name, None)
+            if not callable(scalar_function):
+                scalar_function = getattr(builtins, name, None)
             if callable(scalar_function):
+                # A statically-referenced conversion arrives with the callable
+                # itself as the leading operand -- ``float(i + 1)`` binds the
+                # ``float`` type and then the value. That first entry is the
+                # operator, not something to convert, so applying the function
+                # to the whole list would pass it itself.
+                if operands[0] is scalar_function:
+                    return scalar_function(*operands[1:], **kwargs)
                 return scalar_function(*operands, **kwargs)
         return getattr(operands[0], name)(*operands[1:], **kwargs)
     return apply

@@ -134,4 +134,32 @@ def materialize_pi(
     )
 
 
-__all__ = ["PiMaterialization", "PiSolver", "materialize_pi"]
+#: Odd Taylor coefficients for sin(r), outermost first, for Horner in r**2:
+#:     sin(r) = r * (((...)*r2 + c) ... )
+#: Used after reducing the argument onto [-pi/2, pi/2], where truncating here
+#: leaves (pi/2)**15 / 15! ~ 7e-10. One definition, rendered by each backend in
+#: its own syntax, so the lanes cannot drift into different series.
+SIN_SERIES_COEFFICIENTS: tuple[float, ...] = (
+    1.0 / 6227020800.0, -1.0 / 39916800.0, 1.0 / 362880.0,
+    -1.0 / 5040.0, 1.0 / 120.0, -1.0 / 6.0, 1.0,
+)
+
+#: The truncation bound the coefficients above deliver over the reduced range.
+SIN_SERIES_ERROR_BOUND = 7.0e-10
+
+
+def sin_series_terms() -> tuple[tuple[float, ...], float, float]:
+    """(coefficients, pi, error bound) for the reduced-argument sine series.
+
+    A backend renders the reduction -- k = nearest(x/pi), r = x - k*pi, and a
+    sign flip on odd k -- in its own syntax, but the constant and the series
+    it evaluates come from here rather than being restated per lane.
+    """
+
+    return SIN_SERIES_COEFFICIENTS, float(materialize_pi("literal").value),         SIN_SERIES_ERROR_BOUND
+
+
+__all__ = [
+    "PiMaterialization", "PiSolver", "materialize_pi",
+    "SIN_SERIES_COEFFICIENTS", "SIN_SERIES_ERROR_BOUND", "sin_series_terms",
+]

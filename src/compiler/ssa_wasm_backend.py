@@ -15,6 +15,7 @@ from .wasm_binary import (
     CodeBuilder,
     OP_F64_CONVERT_I32_S,
     OP_I32_ADD,
+    OP_I32_AND,
     OP_I32_TRUNC_F64_S,
     build_module,
 )
@@ -55,7 +56,17 @@ class SSAWasmArtifact:
 
 def emit_ssa_function_to_wasm(
     module: IRModule, function_name: str, *, entry_name: str | None = None,
+    trig_solver: str = "lut", trig_epsilon: float | None = None,
 ) -> SSAWasmArtifact:
+    """Emit one scalar SSA function as a WebAssembly module.
+
+    ``trig_solver`` selects how a function WebAssembly has no instruction for
+    is realised, mirroring ``LLVMTrigSolver`` in the LLVM lane: ``"lut"``
+    bakes the sampled table into linear memory, ``"continuous"`` evaluates a
+    reduced argument series in arithmetic alone and needs no data segment.
+    Both are available deliberately -- a table costs memory and an interpolation,
+    a series costs multiplies, and which is cheaper depends on the target.
+    """
     function: Function = module.functions[function_name]
     name = str(entry_name or function_name)
     input_names = tuple(function.metadata.get("argument_names", ()))
@@ -67,6 +78,32 @@ def emit_ssa_function_to_wasm(
         )
     if len(input_names) != len(function.args):
         input_names = tuple(f"arg{index}" for index in range(len(function.args)))
+
+    # WebAssembly has no transcendental instruction, so these reach the module
+    # as baked lookup tables -- the same tables, laid out by the same planner,
+    # that the fused lane already uses. The tables occupy the front of linear
+    # memory, so the value arena starts past them.
+    from .fused_program_wasm_backend import plan_tables
+
+    _TABLE_OPS = {"Sin": "sin", "Cos": "cos", "Tan": "tan", "Exp": "exp",
+                  "Log": "log", "Tanh": "tanh"}
+    required_tables = sorted({
+        _TABLE_OPS[str(instruction.op)]
+        for instruction in function.blocks["entry"].instrs
+        if str(instruction.op) in _TABLE_OPS
+    })
+    if str(trig_solver) not in {"lut", "continuous"}:
+        raise ValueError(
+            f"unknown trig solver {trig_solver!r}; expected 'lut' or "
+            "'continuous'"
+        )
+    tables = (
+        plan_tables(required_tables, trig_epsilon)
+        if required_tables and str(trig_solver) == "lut"
+        else {"entries": {}, "data": b"", "reserved_bytes": 0}
+    )
+    # Keep the arena eight-byte aligned behind the tables.
+    arena_base = (int(tables["reserved_bytes"]) + 7) // 8 * 8
 
     builder = CodeBuilder("f64", parameter_count=1)
     locals_by_id: dict[int, int] = {}
@@ -85,7 +122,9 @@ def emit_ssa_function_to_wasm(
     for value_id in sorted(all_result_ids):
         locals_by_id[value_id] = builder.declare_local("f64")
         wat_lines.append(f"    (local $t{value_id} f64)")
-    input_offsets = tuple(index * 8 for index in range(len(function.args)))
+    input_offsets = tuple(
+        arena_base + index * 8 for index in range(len(function.args))
+    )
     for value, offset in zip(function.args, input_offsets):
         value_id = int(value.id)
         builder.local_get(0).i32_const(offset).raw(OP_I32_ADD).load().local_set(
@@ -117,6 +156,26 @@ def emit_ssa_function_to_wasm(
             builder.value_const(value).local_set(locals_by_id[result_id])
             wat_lines.append(f"    f64.const {value.hex()} local.set $t{result_id}")
             continue
+        if op == "Pi":
+            # The shared materialisation, as in the C and LLVM lanes, so the
+            # four backends carry one constant with one declared bound rather
+            # than four literals that can drift apart.
+            from .bounded_constants import materialize_pi
+
+            materialization = materialize_pi(
+                instruction.attributes.get("constant_solver") or "literal",
+                instruction.attributes.get("requested_epsilon"),
+            )
+            if materialization.value is None:
+                shortfalls.append(WasmEmissionShortfall(
+                    op, "pi materialisation was rejected",
+                ))
+                continue
+            value = float(materialization.value)
+            constants[result_id] = value
+            builder.value_const(value).local_set(locals_by_id[result_id])
+            wat_lines.append(f"    f64.const {value.hex()} local.set $t{result_id}")
+            continue
         args = tuple(int(value.id) for value in instruction.args)
         wat_operation = None
         if op in {"Cast", "CastLike", "cast_like"} and len(args) >= 1:
@@ -143,6 +202,62 @@ def emit_ssa_function_to_wasm(
         elif op in {"Add", "Sub", "Mul", "Div", "Max", "Min"} and len(args) == 2:
             get(args[0]); get(args[1]); builder.op(op.lower())
             wat_operation = f"local.get $t{args[0]} local.get $t{args[1]} f64.{op.lower()}"
+        elif str(op) in _TABLE_OPS and str(trig_solver) == "continuous" and (
+            str(op) in {"Sin", "Cos"} and len(args) == 1
+        ):
+            # Argument reduced onto [-pi/2, pi/2], then the odd series through
+            # r^13, whose truncation error there is (pi/2)^15 / 15! ~ 7e-10.
+            # No data segment is needed, which is the point of the option.
+            from .bounded_constants import materialize_pi
+
+            pi = float(materialize_pi("literal").value)
+            shifted = builder.declare_local("f64")
+            rounded = builder.declare_local("f64")
+            reduced = builder.declare_local("f64")
+            squared = builder.declare_local("f64")
+            series = builder.declare_local("f64")
+            parity = builder.declare_local("i32")
+            get(args[0])
+            if op == "Cos":
+                builder.value_const(pi * 0.5).op("add")
+            builder.local_set(shifted)
+            builder.local_get(shifted).value_const(1.0 / pi).op("mul")
+            builder.op("nearest").local_set(rounded)
+            builder.local_get(rounded).raw(OP_I32_TRUNC_F64_S)
+            builder.i32_const(1).raw(OP_I32_AND).local_set(parity)
+            builder.local_get(shifted)
+            builder.local_get(rounded).value_const(pi).op("mul")
+            builder.op("sub").local_set(reduced)
+            builder.local_get(reduced).local_get(reduced).op("mul")
+            builder.local_set(squared)
+            for index, coefficient in enumerate((
+                1.0 / 6227020800.0, -1.0 / 39916800.0, 1.0 / 362880.0,
+                -1.0 / 5040.0, 1.0 / 120.0, -1.0 / 6.0, 1.0,
+            )):
+                if index == 0:
+                    builder.value_const(coefficient)
+                else:
+                    builder.local_get(squared).op("mul")
+                    builder.value_const(coefficient).op("add")
+            builder.local_get(reduced).op("mul").local_set(series)
+            builder.local_get(series).op("neg")
+            builder.local_get(series)
+            builder.local_get(parity)
+            builder.select()
+            wat_operation = f"(; {op.lower()} by reduced-argument series ;)"
+        elif str(op) in _TABLE_OPS and len(args) == 1:
+            from .fused_program_wasm_backend import _emit_lut
+
+            entry = tables["entries"][_TABLE_OPS[str(op)]]
+            _emit_lut(
+                builder, locals_by_id[args[0]], _TABLE_OPS[str(op)],
+                entry["base"], entry["intervals"], entry["lower"],
+                entry["upper"], entry["periodic"],
+            )
+            wat_operation = (
+                f"(; {_TABLE_OPS[str(op)]} from the baked table at "
+                f"byte {entry['base']}, measured error {entry['bound']:.2e} ;)"
+            )
         elif op in {"Abs", "Sqrt", "Neg"} and len(args) == 1:
             get(args[0]); builder.op(op.lower())
             wat_operation = f"local.get $t{args[0]} f64.{op.lower()}"
@@ -179,7 +294,10 @@ def emit_ssa_function_to_wasm(
         output_names = tuple(f"output{index}" for index in range(len(outputs)))
     if len(output_names) != len(outputs):
         shortfalls.append(WasmEmissionShortfall("Ret", "output names do not match return arity"))
-    output_offsets = tuple((len(function.args) + index) * 8 for index in range(len(outputs)))
+    output_offsets = tuple(
+        arena_base + (len(function.args) + index) * 8
+        for index in range(len(outputs))
+    )
     for value_id, offset in zip(outputs, output_offsets):
         builder.local_get(0).i32_const(offset).raw(OP_I32_ADD)
         get(value_id)
@@ -188,10 +306,14 @@ def emit_ssa_function_to_wasm(
             f"    local.get $io i32.const {offset} i32.add local.get $t{value_id} f64.store"
         )
     wat_lines.extend(("  )", ")", ""))
+    arena_bytes = arena_base + (len(function.args) + len(outputs)) * 8
     binary = b"" if shortfalls else build_module(
         function_name=name,
         parameter_types=["i32"],
         body=builder,
+        memory_pages=max(1, (arena_bytes + 65535) // 65536),
+        data=tables["data"],
+        data_offset=0,
     )
     publications = function_output_publications(function)
     return SSAWasmArtifact(

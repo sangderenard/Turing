@@ -54,11 +54,13 @@ GLSL_VERSION = "#version 460 core\n"
 B_PIPE_IN, B_PIPE_OUT, B_ARRIVALS = 0, 1, 2
 B_EDGES, B_CSR_OFFSET, B_CSR_ENTRY, B_EMITTER = 3, 4, 5, 6
 B_FRAGMENTS, B_INCIDENT_OFFSET, B_INCIDENT_ENTRY, B_GEOMETRY = 7, 8, 9, 10
+B_BEADS = 11
 
 MAX_CATEGORIES = 4
 
 SOLVER_STORAGE = """
-struct EdgeRecord { uint source; uint target; float factor; uint isBack; };
+struct EdgeRecord { uint source; uint target; float factor; uint isBack;
+                    float split; float pad0; float pad1; float pad2; };
 struct CsrEntry   { uint edge; float factor; uint isBack; uint pad; };
 struct Emitter    { float hue; float phase; float duty; float pad; };
 
@@ -154,7 +156,12 @@ void main() {
         // Arrivals enter undiluted: advection already removed exactly the
         // outflow, so scaling the injection would leak mass every hop.
         uint slot = (edges[edge].source * uCategories + category) * 3u;
-        next += vec3(arrivals[slot], arrivals[slot + 1u], arrivals[slot + 2u]);
+        // ``split`` is how the junction apportions its outflow between the
+        // pipes leaving it. Handing every pipe the whole arrival manufactures
+        // dye at each tee -- harmless on an acyclic graph, unbounded once the
+        // network has a cycle.
+        next += vec3(arrivals[slot], arrivals[slot + 1u], arrivals[slot + 2u])
+                * edges[edge].split;
     } else {
         next += readPipe(edge, category, cell - 1u) * uShift;
     }
@@ -175,6 +182,7 @@ layout(std430, binding = 0) readonly buffer PipeState { float pipeState[]; };
 layout(std430, binding = 8) readonly buffer IncidentOffset { uint incidentOffset[]; };
 layout(std430, binding = 9) readonly buffer IncidentEntry { uvec2 incidentEntry[]; };
 layout(std430, binding = 10) readonly buffer Geometry { Capsule capsules[]; };
+layout(std430, binding = 11) readonly buffer Beads { vec4 beads[]; };  // xy centre, z radius
 
 uniform uint uCells;
 uniform int uCategories;
@@ -182,6 +190,32 @@ uniform int uCategories;
 vec3 cellMoments(uint edge, int category, uint cell) {
     uint base = (((edge * uint(uCategories)) + uint(category)) * uCells + cell) * 3u;
     return vec3(pipeState[base], pipeState[base + 1u], pipeState[base + 2u]);
+}
+
+// Cells are samples of a continuous column of fluid, not tiles. Taking the
+// nearest one draws the pipe as a row of flat blocks; power sums are linear,
+// so interpolating the moments and collapsing afterwards is exact -- which
+// interpolating the collapsed colours would not be.
+vec3 cellMomentsAt(uint edge, int category, float along) {
+    float slot = clamp(along * float(uCells) - 0.5, 0.0, float(uCells) - 1.0);
+    uint lo = uint(floor(slot));
+    uint hi = min(lo + 1u, uCells - 1u);
+    return mix(cellMoments(edge, category, lo),
+               cellMoments(edge, category, hi), fract(slot));
+}
+
+float capsuleDistance(vec2 point, vec2 a, vec2 b, float radius) {
+    vec2 pa = point - a, ba = b - a;
+    float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+    return length(pa - ba * h) - radius;
+}
+
+// Polynomial smooth minimum. Both passes must use the identical field, or the
+// tube surface and the bead surface disagree and the tube visibly juts into
+// the bead's interior instead of merging with it.
+float smoothUnion(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / max(k, 1e-6), 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
 }
 """
 
@@ -256,16 +290,27 @@ uniform mat4 uMVP;
 uniform float uPipeWidth;
 
 out vec2 vPipe;
+out vec2 vWorld;
 flat out uint vEdge;
+flat out vec2 vFrom;
+flat out vec2 vTo;
+
+uniform float uJointSpread;   // how far the quad grows to cover the joint
 
 void main() {
     vec2 axis = aTo - aFrom;
     float span = max(length(axis), 1e-6);
     vec2 forward = axis / span;
     vec2 side = vec2(-forward.y, forward.x);
-    vec2 world = aFrom + forward * (span * aCorner.x)
-               + side * (uPipeWidth * aCorner.y);
+    // Grown along and across so the swollen joint has somewhere to be drawn.
+    float along = aCorner.x * span
+                + (aCorner.x * 2.0 - 1.0) * uJointSpread;
+    vec2 world = aFrom + forward * along
+               + side * ((uPipeWidth + uJointSpread) * aCorner.y);
     vPipe = aCorner;
+    vWorld = world;
+    vFrom = aFrom;
+    vTo = aTo;
     vEdge = uint(aEdgeIndex + 0.5);
     gl_Position = uMVP * vec4(world, 0.0, 1.0);
 }
@@ -273,30 +318,51 @@ void main() {
 
 PIPE_FRAGMENT = GLSL_VERSION + SCENE_STORAGE + DYE_GLSL + OIT_APPEND_GLSL + """
 in vec2 vPipe;
+in vec2 vWorld;
 flat in uint vEdge;
+flat in vec2 vFrom;
+flat in vec2 vTo;
+
+uniform float uPipeWidth;
+uniform float uBeadRadius;
+uniform float uBlend;
 uniform float uPipeDepth;
 
 void main() {
-    float across = clamp(abs(vPipe.y), 0.0, 1.0);
-    float profile = sqrt(max(0.0, 1.0 - across * across));
-    if (profile <= 0.02) discard;
+    // The same field the bead pass evaluates. Drawing the tube as a plain
+    // capsule and the bead as a separate sphere means two different surfaces
+    // overlapping, which is exactly why the tube appeared to run on into the
+    // bead's interior. Sharing the field makes the tube swell toward the joint
+    // by precisely the amount the bead swells toward the tube.
+    float tube = capsuleDistance(vWorld, vFrom, vTo, uPipeWidth);
+    float headBead = length(vWorld - vFrom) - uBeadRadius;
+    float tailBead = length(vWorld - vTo) - uBeadRadius;
+    float field = smoothUnion(smoothUnion(tube, headBead, uBlend),
+                              tailBead, uBlend);
+    if (field > 0.0) discard;
+    // Inside a bead's own sphere the bead pass owns the surface and shades it
+    // as a volume; drawing the tube there too would double the fragment.
+    if (min(headBead, tailBead) < 0.0) discard;
 
-    uint cell = uint(clamp(vPipe.x * float(uCells), 0.0, float(uCells) - 1.0));
+    float profile = clamp(-field / max(uPipeWidth, 1e-6), 0.0, 1.0);
+    profile = sqrt(profile);
+
+    float along = clamp(
+        dot(vWorld - vFrom, vTo - vFrom)
+        / max(dot(vTo - vFrom, vTo - vFrom), 1e-6), 0.0, 1.0);
     vec3 sums[4];
     for (int c = 0; c < MAX_CATEGORIES_C; ++c) sums[c] = vec3(0.0);
-    for (int c = 0; c < uCategories; ++c) sums[c] = cellMoments(vEdge, c, cell);
+    for (int c = 0; c < uCategories; ++c) sums[c] = cellMomentsAt(vEdge, c, along);
 
     float density;
     vec3 body = collapseDye(sums, density);
 
-    // Tube shading: the round section darkens toward the walls and a narrow
-    // highlight sits off-centre. Geometry only; carries no measurement.
     float shade = 0.44 + 0.56 * profile;
-    float highlight = pow(max(0.0, 1.0 - abs(vPipe.y + 0.42) * 2.6), 8.0);
+    float across = clamp(dot(normalize(vec2(-(vTo - vFrom).y, (vTo - vFrom).x)),
+                             vWorld - vFrom) / max(uPipeWidth, 1e-6), -1.0, 1.0);
+    float highlight = pow(max(0.0, 1.0 - abs(across + 0.42) * 2.6), 8.0);
     vec3 colour = body * shade + vec3(highlight * 0.30);
 
-    // Translucent, and more so where the tube is thin, so liquid behind shows
-    // through liquid in front rather than being occluded by it.
     float alpha = clamp(0.20 + 0.34 * profile, 0.0, 1.0);
     appendFragment(colour, alpha, uPipeDepth + 0.0005 * float(vEdge));
 }
@@ -331,60 +397,51 @@ flat in uint vNode;
 flat in float vRadius;
 
 uniform float uBeadRadius;
-uniform float uBlend;      // smooth-union radius, in world units
+uniform float uBlend;
 uniform float uBulbDepth;
 
-float capsuleDistance(vec2 point, vec2 a, vec2 b, float radius) {
-    vec2 pa = point - a, ba = b - a;
-    float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
-    return length(pa - ba * h) - radius;
-}
-
-// Polynomial smooth minimum. This is what makes the joint one body instead of
-// a sphere parked on top of some tubes.
-float smoothUnion(float a, float b, float k) {
-    float h = clamp(0.5 + 0.5 * (b - a) / max(k, 1e-6), 0.0, 1.0);
-    return mix(b, a, h) - k * h * (1.0 - h);
-}
-
 void main() {
-    // Surface: a sphere at the junction, smoothly unioned with every tube that
-    // meets it, so the tube ends blend outward into a single volume.
     float field = length(vLocal) - uBeadRadius;
     for (uint i = incidentOffset[vNode]; i < incidentOffset[vNode + 1u]; ++i) {
         Capsule capsule = capsules[incidentEntry[i].x];
-        field = smoothUnion(
-            field,
+        field = smoothUnion(field,
             capsuleDistance(vWorld, capsule.from, capsule.to, capsule.radius),
-            uBlend
-        );
+            uBlend);
     }
     if (field > 0.0) discard;
 
-    // Thickness through the body at this pixel, which is what gives the bead
-    // volume and makes its centre read as deeper liquid than its rim.
     float thickness = clamp(-field / max(uBeadRadius, 1e-6), 0.0, 1.0);
     float depth = sqrt(max(0.0, thickness));
 
-    // The fluid actually present at the junction: the near cell of every tube
-    // that meets here. Power sums add, so this mixes by the field's own merge
-    // operator rather than by a blend chosen to look right.
+    // The fluid *travelling through* this junction, not a fixed average of it.
+    // Every incident tube contributes in proportion to how near this pixel is
+    // to it, and each contributes the fluid at the point on that tube nearest
+    // here -- so a drop arriving down one tube colours the side of the bead it
+    // enters and sweeps across as it passes, and the colour is continuous with
+    // the tube at the boundary because both read the same column of fluid.
     vec3 sums[4];
     for (int c = 0; c < MAX_CATEGORIES_C; ++c) sums[c] = vec3(0.0);
+    float total = 0.0;
     for (uint i = incidentOffset[vNode]; i < incidentOffset[vNode + 1u]; ++i) {
-        uvec2 entry = incidentEntry[i];
-        uint edge = capsules[entry.x].edge;
-        uint cell = entry.y == 0u ? 0u : uCells - 1u;
+        Capsule capsule = capsules[incidentEntry[i].x];
+        float distance = capsuleDistance(vWorld, capsule.from, capsule.to,
+                                         capsule.radius);
+        float weight = exp(-max(0.0, distance) / max(uBlend, 1e-6));
+        vec2 axis = capsule.to - capsule.from;
+        float along = clamp(dot(vWorld - capsule.from, axis)
+                            / max(dot(axis, axis), 1e-6), 0.0, 1.0);
         for (int c = 0; c < uCategories; ++c) {
-            sums[c] += cellMoments(edge, c, cell);
+            sums[c] += cellMomentsAt(capsule.edge, c, along) * weight;
         }
+        total += weight;
+    }
+    if (total > 0.0) {
+        for (int c = 0; c < MAX_CATEGORIES_C; ++c) sums[c] /= total;
     }
 
     float density;
     vec3 body = collapseDye(sums, density);
 
-    // Glass bead: lambert off a fixed key, a tight specular, and a fresnel rim
-    // that brightens at the silhouette where a real bead is thickest.
     vec3 normal = normalize(vec3(vLocal / max(vRadius, 1e-6), depth + 0.35));
     vec3 key = normalize(vec3(-0.42, -0.55, 0.72));
     float lambert = 0.44 + 0.56 * max(0.0, dot(normal, key));
@@ -394,6 +451,134 @@ void main() {
 
     float alpha = clamp(0.22 + 0.40 * depth, 0.0, 1.0);
     appendFragment(colour, alpha, uBulbDepth);
+}
+""".replace("MAX_CATEGORIES_C", str(MAX_CATEGORIES))
+
+
+
+GLASS_VERTEX = GLSL_VERSION + """
+layout(location=0) in vec2 aPos;
+uniform vec2 uOrigin;
+uniform vec2 uExtent;
+out vec2 vWorld;
+void main() {
+    vWorld = uOrigin + (aPos * 0.5 + 0.5) * uExtent;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+"""
+
+GLASS_FRAGMENT = GLSL_VERSION + SCENE_STORAGE + DYE_GLSL + """
+in vec2 vWorld;
+out vec4 fragColour;
+
+uniform uint uCapsules;
+uniform uint uBeadCount;
+uniform float uBlend;
+uniform float uThickness;
+uniform float uReferenceSpan;
+uniform vec3 uBackground;
+
+// One field for the whole network. Tubes and junctions are not two kinds of
+// object that meet at a boundary -- they are one surface, evaluated once, so
+// there is no seam to hide and no question of which pass owns a pixel. That
+// was the actual cause of the tube appearing to run on into the bead: two
+// passes shading two different surfaces that happened to overlap.
+// Polynomial smooth minimum, but only between operands actually close enough
+// to fuse. The ``- k*h*(1-h)`` term is subtracted on *every* pairing, so with a
+// hundred operands the field is driven negative far outside any surface and a
+// crowded region grows a wide dim halo that is not part of the object. Falling
+// back to a plain min beyond the blend radius keeps the fusion local, which is
+// the only place it was ever meant to act.
+float smoothUnionAccum(float a, float b, float k, out float blend) {
+    if (abs(a - b) >= k) {
+        blend = a < b ? 1.0 : 0.0;
+        return min(a, b);
+    }
+    float h = clamp(0.5 + 0.5 * (b - a) / max(k, 1e-6), 0.0, 1.0);
+    blend = h;
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+void main() {
+    float field = 1e9;
+    vec2 gradient = vec2(0.0);
+    vec3 sums[4];
+    for (int c = 0; c < MAX_CATEGORIES_C; ++c) sums[c] = vec3(0.0);
+    float fluidWeight = 0.0;
+
+    for (uint i = 0u; i < uCapsules; ++i) {
+        Capsule capsule = capsules[i];
+        vec2 pa = vWorld - capsule.from;
+        vec2 ba = capsule.to - capsule.from;
+        float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+        vec2 offset = pa - ba * h;
+        float distance = length(offset) - capsule.radius;
+
+        float blend;
+        field = smoothUnionAccum(distance, field, uBlend, blend);
+        gradient += normalize(offset + vec2(1e-6)) * blend;
+
+        // Fluid is carried only by the tubes; the junction volume takes the
+        // dye of whichever tubes are near it, which is what makes a drop
+        // colour the side of a junction it enters and sweep across as it
+        // passes -- and why the colour is continuous across the joint.
+        float weight = exp(-max(0.0, distance) / max(uBlend, 1e-6));
+        if (weight > 1e-4) {
+            // Every edge is traversed in the same time, so a pipe holds the
+            // same quantity of dye however long it is drawn. Spread over more
+            // distance that is a lower concentration per unit length -- the
+            // stretch dilutes it -- so the reading has to be per length, not
+            // per cell, or a long pipe would falsely read as strong as a short
+            // one carrying the same drop.
+            float span = max(length(capsule.to - capsule.from), 1e-6);
+            float dilution = uReferenceSpan / span;
+            for (int c = 0; c < uCategories; ++c) {
+                sums[c] += cellMomentsAt(capsule.edge, c, h) * weight * dilution;
+            }
+            fluidWeight += weight;
+        }
+    }
+    for (uint i = 0u; i < uBeadCount; ++i) {
+        vec4 bead = beads[i];
+        vec2 offset = vWorld - bead.xy;
+        float distance = length(offset) - bead.z;
+        float blend;
+        field = smoothUnionAccum(distance, field, uBlend, blend);
+        gradient += normalize(offset + vec2(1e-6)) * blend;
+    }
+
+    if (field > 0.0) { fragColour = vec4(uBackground, 1.0); return; }
+    if (fluidWeight > 0.0) {
+        for (int c = 0; c < MAX_CATEGORIES_C; ++c) sums[c] /= fluidWeight;
+    }
+
+    // Thickness through the body, which is what makes it read as blown glass
+    // rather than a flat silhouette: the surface is thin at the silhouette and
+    // deep through the middle of a junction.
+    float depth = sqrt(clamp(-field / max(uThickness, 1e-6), 0.0, 1.0));
+
+    float density;
+    vec3 body = collapseDye(sums, density);
+
+    // The gradient is a sum over every primitive that blended into this
+    // pixel, so where many overlap its magnitude swamps the z component and
+    // the normal tips into the plane -- which shaded those regions almost
+    // black. Direction is the only part that carries meaning here.
+    vec2 slope = length(gradient) > 1e-5 ? normalize(gradient) : vec2(0.0);
+    vec3 normal = normalize(vec3(-slope * (1.0 - depth), depth + 0.35));
+    vec3 key = normalize(vec3(-0.42, -0.55, 0.72));
+    float lambert = 0.42 + 0.58 * max(0.0, dot(normal, key));
+    float specular = pow(max(0.0, dot(normal, key)), 56.0) * 0.5;
+    float rim = pow(1.0 - depth, 4.0) * 0.30;
+
+    // ``collapseDye`` has already taken the water toward the dye by
+    // Beer-Lambert on concentration. Mixing toward water a second time by
+    // depth diluted every drop back out again, which is why the glass read
+    // almost colourless. Thickness belongs on lightness, not on the dye.
+    vec3 colour = body * (0.72 + 0.28 * depth) * lambert
+                + vec3(specular + rim);
+    float alpha = clamp(0.30 + 0.62 * depth, 0.0, 1.0);
+    fragColour = vec4(mix(uBackground, colour, alpha), 1.0);
 }
 """.replace("MAX_CATEGORIES_C", str(MAX_CATEGORIES))
 
@@ -524,6 +709,8 @@ class GPUInfluenceFlow:
         edge_records = np.zeros(self.edges, dtype=np.dtype([
             ("source", np.uint32), ("target", np.uint32),
             ("factor", np.float32), ("isBack", np.uint32),
+            ("split", np.float32), ("pad0", np.float32),
+            ("pad1", np.float32), ("pad2", np.float32),
         ]))
         incoming: dict[int, list[tuple[int, float, int]]] = {}
         for index, (source, target, role) in enumerate(reference.edges):
@@ -531,7 +718,8 @@ class GPUInfluenceFlow:
             factor = float(reference.edge_factor[index])
             edge_records[index] = (
                 reference._node_index[source], reference._node_index[target],
-                factor, back,
+                factor, back, float(reference.edge_split[index]),
+                0.0, 0.0, 0.0,
             )
             incoming.setdefault(reference._node_index[target], []).append(
                 (index, factor, back)
@@ -586,46 +774,69 @@ class GPUInfluenceFlow:
             }
             for program in (self.arrivals_program, self.advect_program)
         }
+        # Hoisted out of the step: dispatch extents and the flow rate are
+        # fixed by the network, not recomputed per call.
+        self._arrival_groups = (self.nodes * self.categories + 63) // 64
+        self._advect_groups = (
+            self.edges * self.categories * self.cells + 63) // 64
+        self._flow_speed = float(reference.settings.flow_speed)
+        self._install_invariants()
 
     @property
     def state_buffer(self) -> int:
         return self.pipe_buffers[0]
 
-    def _set_common(self, program: int, shift: float, dt: float) -> None:
-        slots = self._uniforms[program]
-        glUniform1ui(slots["uNodes"], self.nodes)
-        glUniform1ui(slots["uEdges"], self.edges)
-        glUniform1ui(slots["uCells"], self.cells)
-        glUniform1ui(slots["uCategories"], self.categories)
-        glUniform1i(slots["uRecurrent"], self.recurrent)
-        glUniform1f(slots["uShift"], shift)
-        glUniform1f(slots["uTime"], self.time)
-        glUniform1f(slots["uPeriod"], self.reference.settings.emission_period)
-        glUniform1f(slots["uDt"], dt)
+    def _install_invariants(self) -> None:
+        """Send the uniforms that never change, once.
+
+        Uniform values are program state and persist across dispatches, so
+        re-sending the topology every step was pure driver traffic: twelve of
+        the eighteen uniform calls per step carried numbers that cannot change
+        for the lifetime of the solver. On a step that is already
+        driver-call-bound rather than GPU-bound, that is most of the cost.
+        """
+
+        for program in (self.arrivals_program, self.advect_program):
+            glUseProgram(program)
+            slots = self._uniforms[program]
+            glUniform1ui(slots["uNodes"], self.nodes)
+            glUniform1ui(slots["uEdges"], self.edges)
+            glUniform1ui(slots["uCells"], self.cells)
+            glUniform1ui(slots["uCategories"], self.categories)
+            glUniform1i(slots["uRecurrent"], self.recurrent)
+            glUniform1f(slots["uPeriod"],
+                        self.reference.settings.emission_period)
+        glUseProgram(0)
 
     def step(self, dt: float) -> None:
-        shift = min(1.0, self.reference.settings.flow_speed * dt)
+        shift = min(1.0, self._flow_speed * dt)
 
-        def groups(count: int) -> int:
-            return (int(count) + 63) // 64
-
+        # The buffers alternate, so only the two that swap are rebound; every
+        # other binding was made once and is still resident.
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, B_PIPE_IN, self.pipe_buffers[0])
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, B_PIPE_OUT, self.pipe_buffers[1])
 
+        arrivals_slots = self._uniforms[self.arrivals_program]
         glUseProgram(self.arrivals_program)
-        self._set_common(self.arrivals_program, shift, dt)
-        glDispatchCompute(groups(self.nodes * self.categories), 1, 1)
+        glUniform1f(arrivals_slots["uShift"], shift)
+        glUniform1f(arrivals_slots["uTime"], self.time)
+        glUniform1f(arrivals_slots["uDt"], dt)
+        glDispatchCompute(self._arrival_groups, 1, 1)
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
+        advect_slots = self._uniforms[self.advect_program]
         glUseProgram(self.advect_program)
-        self._set_common(self.advect_program, shift, dt)
-        glDispatchCompute(groups(self.edges * self.categories * self.cells), 1, 1)
+        glUniform1f(advect_slots["uShift"], shift)
+        glDispatchCompute(self._advect_groups, 1, 1)
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
         self.pipe_buffers.reverse()
         self.time += dt
 
     def read_state(self) -> np.ndarray:
+        # Compute wrote this buffer; a client readback is not ordered against
+        # those writes on its own.
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT)
         count = self.edges * self.categories * self.cells * MOMENTS
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, self.pipe_buffers[0])
         raw = glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, count * 4)
@@ -685,6 +896,24 @@ class TransparencyLists:
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, B_FRAGMENTS,
                          self.fragment_buffer)
         glBindImageTexture(0, self.heads, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI)
+
+        # The head reset and the allocator reset above are ordinary client
+        # writes; the append pass reaches them through image atomics and an
+        # atomic counter, which are *not* ordered against client writes without
+        # an explicit barrier. Missing it means a frame can start appending
+        # against last frame's heads and a stale allocator, so fragments chain
+        # into pool records belonging to the previous frame and the resolve
+        # walks indices that were never written this frame. The layer cap keeps
+        # that from hanging, but it is an out-of-bounds read of a 373 MB buffer
+        # and it renders garbage.
+        glMemoryBarrier(
+            GL_TEXTURE_UPDATE_BARRIER_BIT
+            | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT
+            | GL_ATOMIC_COUNTER_BARRIER_BIT
+            | GL_BUFFER_UPDATE_BARRIER_BIT
+            | GL_SHADER_STORAGE_BARRIER_BIT
+        )
+
         # Appending is the only output of the geometry pass, so no colour is
         # written and blending and depth testing are irrelevant to it.
         glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE)
@@ -704,6 +933,9 @@ class TransparencyLists:
         glBindVertexArray(0)
 
     def used_fragments(self) -> int:
+        # The shader increments this through an atomic counter; reading it back
+        # from the client without a barrier can report a stale value.
+        glMemoryBarrier(GL_ATOMIC_COUNTER_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT)
         glBindBuffer(GL_ATOMIC_COUNTER_BUFFER, self.allocator)
         raw = glGetBufferSubData(GL_ATOMIC_COUNTER_BUFFER, 0, 4)
         return int(np.frombuffer(raw, dtype=np.uint32)[0])
@@ -713,6 +945,7 @@ __all__ = [
     "GLSL_VERSION", "MAX_CATEGORIES",
     "ARRIVALS_COMPUTE", "ADVECT_COMPUTE",
     "PIPE_VERTEX", "PIPE_FRAGMENT", "BULB_VERTEX", "BULB_FRAGMENT",
+    "GLASS_VERTEX", "GLASS_FRAGMENT", "B_BEADS",
     "RESOLVE_VERTEX", "RESOLVE_FRAGMENT",
     "compute_program", "draw_program", "storage_buffer",
     "GPUInfluenceFlow", "TransparencyLists",

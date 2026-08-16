@@ -28,8 +28,6 @@ class SymbolicFluidGridState:
     next_momentum_x: np.ndarray
     next_momentum_y: np.ndarray
     next_tracer: np.ndarray
-    force_x: np.ndarray
-    force_y: np.ndarray
     dx: float
     gravity: float
     viscosity: float
@@ -60,6 +58,7 @@ class SymbolicFluidGridState:
         vortex_y = 0.08 * (xx - 0.5) * np.exp(
             -((xx - 0.5) ** 2 + (yy - 0.5) ** 2) / 0.08
         )
+        linear_drag = 2.0e-3
         h = base + wave
         return cls(
             height=h,
@@ -70,13 +69,11 @@ class SymbolicFluidGridState:
             next_momentum_x=zeros.copy(),
             next_momentum_y=zeros.copy(),
             next_tracer=zeros.copy(),
-            force_x=zeros.copy(),
-            force_y=zeros.copy(),
             dx=1.0 / float(max(width, height)),
             gravity=1.0,
             viscosity=2.0e-4,
             tracer_diffusivity=1.0e-4,
-            linear_drag=2.0e-3,
+            linear_drag=linear_drag,
             coriolis=0.08,
             minimum_height=1.0e-4,
         )
@@ -131,8 +128,6 @@ def symbolic_fluid_advance(state, dt):
                 state.coriolis,
                 dt,
                 state.dx,
-                state.force_x[row, column],
-                state.force_y[row, column],
                 state.gravity,
                 state.height[row, column],
                 state.height[row, east],

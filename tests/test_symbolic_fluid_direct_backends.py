@@ -95,14 +95,21 @@ const fs = require('fs');
   const instance = await WebAssembly.instantiate(bytes, {});
   const memory = new Float64Array(instance.instance.exports.memory.buffer);
   const inputs = JSON.parse(process.argv[2]);
-  memory.set(inputs, 0);
+  // The artifact publishes where its values live; the tables occupy the
+  // front of linear memory, so this layout is not implicit.
+  const inputSlot = Number(process.argv[3]) / 8;
+  const outputSlot = Number(process.argv[4]) / 8;
+  memory.set(inputs, inputSlot);
   instance.instance.exports.symbolic_fluid_step(0);
-  const start = inputs.length;
+  const start = outputSlot;
   console.log(JSON.stringify(Array.from(memory.slice(start, start + 11))));
 })().catch(error => { console.error(error); process.exit(1); });
 """
     completed = subprocess.run(
-        [node, "-e", script, str(wasm), json.dumps(ordered)],
+        [
+            node, "-e", script, str(wasm), json.dumps(ordered),
+            str(artifact.input_offsets[0]), str(artifact.output_offsets[0]),
+        ],
         capture_output=True,
         text=True,
         check=False,

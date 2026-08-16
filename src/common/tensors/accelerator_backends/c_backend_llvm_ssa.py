@@ -2184,7 +2184,7 @@ class TapeLLVMModule:
     output_ids: Mapping[str, int]
     workspace_sizes: tuple[int, ...]
     shortfalls: tuple[TapeLLVMShortfall, ...]
-    trig_solver: str = "libm"
+    trig_solver: str = "lut"
     trig_epsilon: float | None = None
 
     @property
@@ -2613,7 +2613,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
     outputs: Mapping[str, Any] | Any,
     *,
     function_name: str = "abstract_tensor_tape",
-    trig_solver: str = "libm",
+    trig_solver: str = "lut",
     trig_epsilon: float | None = None,
 ) -> TapeLLVMModule:
     """Lower a recorded AbstractTensor tape directly to real C-kernel LLVM.
@@ -3160,7 +3160,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
     ]
     llvm_ir = LLVM_SSA_MODULE.rstrip() + "\n\n" + "\n".join(wrapper) + "\n"
     selected_epsilon = None
-    if trig_solver != "libm":
+    if trig_solver:
         from .llvm_signal_math import link_llvm_trig_solver
 
         llvm_ir, signal = link_llvm_trig_solver(

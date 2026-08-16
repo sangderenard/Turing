@@ -106,7 +106,8 @@ def step_with_dt_control_used(state,
                              ctrl: STController,
                              advance,
                              retries: int = 0,
-                             failures: list[tuple[float, Metrics]] | None = None,
+                             max_retries: int = 3,
+                             failures: list[tuple[float, Metrics, tuple[str, ...]]] | None = None,
                              ref=None,
                              attempt_log: list[dict] | None = None):
     if failures is None:
@@ -128,32 +129,107 @@ def step_with_dt_control_used(state,
         float(metrics.error_channels.get(name, 0.0)) > float(limit)
         for name, limit in targets.error_limits.items()
     )
-    rejected = (
-        (not ok)
-        or bool(metrics.hard_failure)
-        or (metrics.mass_err > targets.mass_max)
-        or (metrics.div_inf > targets.div_max * 10.0)
-        or channel_failure
+    # Name the term that rejected, not merely that something did. Reporting
+    # only mass/div/vel meant a rejection coming from `ok` or a named error
+    # channel printed four healthy-looking attempts and no cause.
+    reasons: list[str] = []
+    if not ok:
+        reasons.append("advance reported a physical-bound violation")
+    if bool(metrics.hard_failure):
+        reasons.append("hard_failure")
+    if metrics.mass_err > targets.mass_max:
+        reasons.append(
+            f"mass_err {float(metrics.mass_err):.3e} > {float(targets.mass_max):.3e}"
+        )
+    if metrics.div_inf > targets.div_max * 10.0:
+        reasons.append(
+            f"div_inf {float(metrics.div_inf):.3e} > "
+            f"{float(targets.div_max) * 10.0:.3e}"
+        )
+    reasons.extend(
+        f"channel {name} {float(metrics.error_channels.get(name, 0.0)):.3e} "
+        f"> {float(limit):.3e}"
+        for name, limit in targets.error_limits.items()
+        if float(metrics.error_channels.get(name, 0.0)) > float(limit)
     )
+    rejected = bool(reasons)
     if attempt_log is not None:
         attempt_log.append({
             "dt": float(dt_for_advance),
             "accepted": not rejected,
             "metrics": metrics,
+            "reasons": tuple(reasons),
         })
+    if rejected and retries >= max_retries:
+        # The search is out of room. Subdivision cannot resolve an
+        # irregularity, and a bisection can run out of bracket the same way, so
+        # refusing to continue would make every such case fatal. Keep the step
+        # that was taken, record exactly what it violated, and carry on: an
+        # unresolved step that is traceable is worth more than a halted run.
+        ctrl.clamp_events += 1
+        metrics.hard_failure = True
+        channels = dict(metrics.error_channels or {})
+        channels["dt_unresolved"] = float(dt_for_advance)
+        channels["dt_unresolved_attempts"] = float(len(failures) + 1)
+        metrics.error_channels = channels
+        # The trace rides on the metrics; a substep must not narrate. At a
+        # pinned audio-rate interior this runs thousands of times a frame, and
+        # printing each one buries the very thing it is reporting.
+        lines = [
+            "timestep controller proceeded unresolved after "
+            f"{len(failures) + 1} attempt(s):"
+        ]
+        for index, (dt_f, m, why) in enumerate(
+            (*failures, (float(dt_for_advance), metrics, tuple(reasons))), 1,
+        ):
+            lines.append(
+                f"  attempt {index}: dt={dt_f:.6g} mass_err={m.mass_err:.3e} "
+                f"div_inf={m.div_inf:.3e} max_vel={m.max_vel:.3e}"
+            )
+            lines.extend(f"      rejected by: {reason}" for reason in why)
+        if max_retries == 0:
+            lines.append(
+                "  the substep is pinned, so there was no smaller candidate to "
+                "analyse; this is a physical rejection, not an exhausted search."
+            )
+        elif len({tuple(why) for _dt, _m, why in failures}) <= 1:
+            lines.append(
+                "  every attempt was rejected for the same reason at every dt, "
+                "so subdividing further could not have resolved it."
+            )
+        channels["dt_unresolved_report"] = 0.0
+        metrics.unresolved_report = tuple(lines)
+        if is_enabled():
+            dbg("ctrl").warning(chr(10).join(lines))
+        # Fall through to the ordinary accepted path so the proposal for the
+        # next step is computed the same way it always is.
+        rejected = False
     if rejected:
         state.restore(saved)
-        failures.append((float(dt_for_advance), metrics))
+        failures.append((float(dt_for_advance), metrics, tuple(reasons)))
         if is_enabled():
             dbg("ctrl").warning(
                 f"advance failed: dt={float(dt.item() if isinstance(dt, AbstractTensor) else dt):.6g} metrics=({pretty_metrics(metrics)})"
             )
-        if retries >= 3:
+        if retries >= max_retries:
             ctrl.clamp_events += 1
             lines = [f"timestep controller failed after {len(failures)} attempts:"]
-            for i, (dt_f, m) in enumerate(failures, 1):
+            for i, (dt_f, m, why) in enumerate(failures, 1):
                 lines.append(
-                    f"  attempt {i}: dt={dt_f:.6g} mass_err={m.mass_err:.3e} div_inf={m.div_inf:.3e} max_vel={m.max_vel:.3e}"
+                    f"  attempt {i}: dt={dt_f:.6g} mass_err={m.mass_err:.3e} "
+                    f"div_inf={m.div_inf:.3e} max_vel={m.max_vel:.3e}"
+                )
+                lines.extend(f"      rejected by: {reason}" for reason in why)
+            if max_retries == 0:
+                lines.append(
+                    "  the substep is pinned, so there is no smaller candidate "
+                    "to analyse: this is a physical rejection, not a dt search "
+                    "that ran out of room."
+                )
+            elif len({tuple(why) for _dt, _m, why in failures}) == 1:
+                lines.append(
+                    "  every attempt was rejected for the same reason at every "
+                    "dt, so halving could not have resolved it."
                 )
             print("\n".join(lines))
             raise RuntimeError("adaptive timestep controller failed")
@@ -181,6 +257,7 @@ def step_with_dt_control_used(state,
             ctrl,
             advance,
             retries + 1,
+            max_retries,
             failures,
             ref=ref,
             attempt_log=attempt_log,
@@ -228,11 +305,25 @@ def run_superstep(state,
                   ctrl: STController,
                   advance,
                   *,
+                  substep: str = "steered",
+                  substep_dt: float | None = None,
                   allow_increase_mid_round: bool = False,
                   max_iters: int = 10000,
                   eps: float = 1e-15,
                   event_boundaries: tuple[float, ...] = (),
                   attempt_log: list[dict] | None = None):
+    if substep not in {"pinned", "steered"}:
+        raise ValueError(
+            f"unknown substep interior {substep!r}; expected 'pinned' or "
+            "'steered'"
+        )
+    if substep == "pinned":
+        if substep_dt is None or float(substep_dt) <= 0.0:
+            raise ValueError("a pinned interior requires a positive substep_dt")
+        # A pinned substep is a constant, so the controller must not steer it
+        # and the CFL ceiling must not raise it. Nothing about the window
+        # landing or the rejection test changes.
+        dt_init = float(substep_dt)
     ref_dt = dt_init
     round_max_t = round_max if isinstance(round_max, AbstractTensor) else AbstractTensor.tensor(round_max)
     total = AbstractTensor.tensor(0.0)
@@ -249,6 +340,7 @@ def run_superstep(state,
         if eps < float(value) < float(round_max_t.item()) - eps
     }))
 
+    unresolved: list[Metrics] = []
     iters = 0
     if is_enabled():
         dbg("ctrl").debug(
@@ -273,27 +365,44 @@ def run_superstep(state,
             targets,
             ctrl,
             advance,
+            max_retries=0 if substep == "pinned" else 3,
             ref=ref_dt,
             attempt_log=attempt_log,
         )
         last_metrics = metrics
+        if float((metrics.error_channels or {}).get("dt_unresolved", 0.0)) > 0.0:
+            unresolved.append(metrics)
         if dt_used <= 0.0:
             break
         total += dt_used
-        if allow_increase_mid_round:
+        if substep == "pinned":
+            # Held at the requested constant; the controller's proposal and its
+            # CFL ceiling are both irrelevant here by construction.
+            dt_cap = AbstractTensor.tensor(float(substep_dt))
+        elif allow_increase_mid_round:
             dt_cap = dt_next
         else:
             dt_cap = AbstractTensor.minimum(dt_cap, dt_next)
-        if ctrl.dt_min is not None:
-            dt_cap = AbstractTensor.maximum(ctrl.dt_min, dt_cap)
-        if ctrl.dt_max is not None:
-            dt_cap = AbstractTensor.minimum(ctrl.dt_max, dt_cap)
+        if substep != "pinned":
+            if ctrl.dt_min is not None:
+                dt_cap = AbstractTensor.maximum(ctrl.dt_min, dt_cap)
+            if ctrl.dt_max is not None:
+                dt_cap = AbstractTensor.minimum(ctrl.dt_max, dt_cap)
         last_dt_next = dt_next
         if is_enabled():
             dbg("ctrl").debug(
                 f"  iter={iters} used={float(dt_used.item() if isinstance(dt_used, AbstractTensor) else dt_used):.6g} total={float(total.item()):.6g}/{round_max:.6g} next_cap={float(dt_cap.item()):.6g}"
             )
 
+    if unresolved:
+        first = unresolved[0]
+        print(
+            f"{len(unresolved)} of {iters} substep(s) advanced unresolved; "
+            f"first at dt="
+            f"{float(first.error_channels.get('dt_unresolved', 0.0)):.6g}"
+        )
+        for line in getattr(first, "unresolved_report", ())[1:]:
+            print(f"  {line.strip()}")
     remaining = float((round_max_t - total).item())
     if remaining > eps:
         raise RuntimeError(
