@@ -106,3 +106,18 @@ already is) over scalar operands is numeric work, not coordination; or
 keep the hierarchy planner's membership stable under carried boundaries.
 The first is the honest one -- it removes the asymmetry between ``+`` and
 ``max`` instead of patching around it.
+
+
+## Attempted classifier whitelist (reverted; keep the lesson)
+
+Whitelisting ``Call + extraction_action=intrinsic + tensor in
+abstract_tensor_funcs + all operands is_scalar_value`` did NOT admit the
+maxes: ``is_scalar_value`` is syntactic (consts, scalar Inputs, scalar
+expressions) and the max's operands are a carried current value and a
+region output -- neither satisfies it.  The scalarity evidence lives in
+region value META (rank-0 dtype float64), not syntax.  Next attempt:
+gate on the operands' region_value_meta / planner domain rank instead of
+is_scalar_value, or admit intrinsic extractions unconditionally when the
+consumer is a carried continuation (the port set names them exactly).
+Both build-failure modes are honest now -- the loop_carried shortfall
+names the value the moment membership drops it.
