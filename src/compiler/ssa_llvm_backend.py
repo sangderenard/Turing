@@ -1564,6 +1564,12 @@ def _emit_repository_call_module(
                     _value_llvm_type(instruction.args[0])
                     if instruction.args else result_type
                 )
+                # The logical templates are spelled over i1; an operand that
+                # arrives in its double storage type must be coerced to a
+                # boolean, not passed through in whatever width it was
+                # stored (`or i1 <double>` fails LLVM verification).
+                if operation in {"LAnd", "LOr", "LNot"}:
+                    operand_type = "i1"
                 operands = [
                     load_as(argument, operand_type, f"{tag}.{position}")
                     for position, argument in enumerate(instruction.args)
