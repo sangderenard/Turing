@@ -120,7 +120,15 @@ def compile_sympy_autogenesis(
         ssa_graph = metagraph.open_graph("ssa", "SymPy expression SSA")
         ssa_components: dict[int, EvolutionComponentRef] = {}
         for ordinal, instruction in enumerate(instructions):
-            result = getattr(instruction, "result", None)
+            # ``Instr`` names its result ``res``. Reading ``result`` always
+            # missed, so ``value_id`` silently fell back to the loop ordinal:
+            # every SSA component was keyed by position and handed off to
+            # whichever ProcessGraph node happened to share that number, which
+            # is only the right node by coincidence. The value id is the
+            # compiler's cross-representation identity -- it is what lets a
+            # colour authored over the ProcessGraph follow the same value into
+            # SSA -- so keying on anything else silently reroutes the lineage.
+            result = getattr(instruction, "res", None)
             value_id = int(getattr(result, "id", ordinal))
             process_source = EvolutionComponentRef(
                 graph._evolution_graph.id, str(value_id)
