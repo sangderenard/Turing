@@ -1784,6 +1784,9 @@ class LLVMExecution:
     buffers: dict[int, _Any]
     pointers: _Any
     extents: _Any
+    #: One contiguous array per scalar dtype, and each scalar's slot in it.
+    scalar_arena: dict = _field(default_factory=dict)
+    scalar_index: dict = _field(default_factory=dict)
 
     def run(self) -> "LLVMExecution":
         self.artifact.entry()(self.pointers, self.extents)
@@ -1846,6 +1849,30 @@ def prepare_artifact_execution(
                 ) from error
         buffers[value_id] = np.zeros(runtime_shape or (), dtype=dtype)
 
+    # Scalars are the overwhelming majority of a stencil ABI and were each an
+    # independent allocation, so a caller could only fill them one element at a
+    # time. Re-seat them as views into one contiguous arena per dtype: the
+    # addresses in the pointer table are unchanged in kind, but a caller can
+    # now write or read the whole set with a single indexed operation.
+    scalar_arena: dict[_Any, _Any] = {}
+    scalar_index: dict[int, int] = {}
+    for wanted in {
+        buffers[int(value_id)].dtype
+        for value_id in artifact.buffer_order
+        if buffers[int(value_id)].ndim == 0
+    }:
+        members = [
+            int(value_id) for value_id in artifact.buffer_order
+            if buffers[int(value_id)].ndim == 0
+            and buffers[int(value_id)].dtype == wanted
+        ]
+        arena = np.zeros(len(members), dtype=wanted)
+        for slot, value_id in enumerate(members):
+            arena[slot] = buffers[value_id]
+            buffers[value_id] = arena[slot:slot + 1].reshape(())
+            scalar_index[value_id] = slot
+        scalar_arena[wanted] = arena
+
     pointers = (_ctypes.c_void_p * len(artifact.buffer_order))(*(
         _ctypes.c_void_p(int(buffers[int(value_id)].ctypes.data))
         for value_id in artifact.buffer_order
@@ -1871,6 +1898,8 @@ def prepare_artifact_execution(
         buffers=buffers,
         pointers=pointers,
         extents=extents,
+        scalar_arena=scalar_arena,
+        scalar_index=scalar_index,
     )
 
 

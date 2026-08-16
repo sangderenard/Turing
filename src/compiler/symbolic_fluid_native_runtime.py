@@ -41,20 +41,65 @@ class NativeSymbolicFluidStep:
     input_ids: tuple[int, ...]
     output_names: tuple[str, ...]
     output_ids: tuple[int, ...]
+    _inputs: tuple = ()
+    _outputs: tuple = ()
+    _entry: Any = None
+    _arena: Any = None
+    _in_slots: Any = None
+    _out_slots: Any = None
+    _pointers: Any = None
+    _extents: Any = None
+
+    def __post_init__(self) -> None:
+        # The buffer a name refers to never changes, so resolving it on every
+        # call was a dictionary lookup per argument per cell -- forty-one of
+        # them, plus the indirection through ``run`` and ``entry``, for a
+        # stencil that is already native. Bind them once.
+        self._inputs = tuple(
+            self.execution.buffers[value_id] for value_id in self.input_ids
+        )
+        self._outputs = tuple(
+            self.execution.buffers[value_id] for value_id in self.output_ids
+        )
+        self._entry = self.artifact.entry()
+        self._pointers = self.execution.pointers
+        self._extents = self.execution.extents
+        # Every scalar of one dtype shares an arena, so the whole argument set
+        # moves in one indexed write instead of one write per argument.
+        index = self.execution.scalar_index
+        arenas = {
+            self.execution.buffers[value_id].dtype
+            for value_id in (*self.input_ids, *self.output_ids)
+        }
+        self._arena = None
+        if len(arenas) == 1 and all(
+            value_id in index
+            for value_id in (*self.input_ids, *self.output_ids)
+        ):
+            import numpy as _np
+
+            self._arena = self.execution.scalar_arena[next(iter(arenas))]
+            self._in_slots = _np.array(
+                [index[value_id] for value_id in self.input_ids], dtype=_np.intp
+            )
+            self._out_slots = _np.array(
+                [index[value_id] for value_id in self.output_ids], dtype=_np.intp
+            )
 
     def __call__(self, *values: Any) -> tuple[float, ...]:
-        if len(values) != len(self.input_ids):
+        if len(values) != len(self._inputs):
             raise TypeError(
                 f"{self.artifact.name} expects {len(self.input_ids)} arguments, "
                 f"received {len(values)}"
             )
-        for value_id, value in zip(self.input_ids, values):
-            self.execution.buffers[value_id][...] = value
-        self.execution.run()
-        return tuple(
-            float(self.execution.buffers[value_id])
-            for value_id in self.output_ids
-        )
+        if self._arena is None:
+            for buffer, value in zip(self._inputs, values):
+                buffer[()] = value
+            self._entry(self._pointers, self._extents)
+            return tuple(buffer[()] for buffer in self._outputs)
+        self._arena[self._in_slots] = values
+        self._entry(self._pointers, self._extents)
+        return tuple(self._arena[self._out_slots].tolist())
 
 
 def compile_native_symbolic_fluid_step(
