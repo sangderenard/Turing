@@ -26,7 +26,14 @@ _BINARY: dict[str, str] = {
     "Sub": "{out} = fsub double {0}, {1}",
     "Mul": "{out} = fmul double {0}, {1}",
     "Div": "{out} = fdiv double {0}, {1}",
-    "Mod": "{out} = frem double {0}, {1}",
+    # Python's % is FLOORED for floats too; frem alone is C sign semantics.
+    "Mod": (
+        "{out}.rem = frem double {0}, {1}\n"
+        "{out}.mix = fmul double {out}.rem, {1}\n"
+        "{out}.opposed = fcmp olt double {out}.mix, 0.0\n"
+        "{out}.adjust = select i1 {out}.opposed, double {1}, double 0.0\n"
+        "{out} = fadd double {out}.rem, {out}.adjust"
+    ),
     "Pow": "{out} = call double @llvm.pow.f64(double {0}, double {1})",
     "FloorDiv": (
         "{out}.q = fdiv double {0}, {1}\n"
@@ -814,16 +821,6 @@ def _emit_repository_call_module(
                 entry_allocas.append(
                     f"  {register} = alloca {llvm_type}, i64 {count}, align 8"
                 )
-                # Diagnostic sentinel: any consumed value derived from this
-                # constant identifies a read-before-write cell by value.
-                if count == 1 and llvm_type == "double":
-                    entry_allocas.append(
-                        f"  store double 1.0e250, ptr {register}, align 8"
-                    )
-                elif count == 1 and llvm_type in {"i32", "i64"}:
-                    entry_allocas.append(
-                        f"  store {llvm_type} 123456789, ptr {register}, align 8"
-                    )
                 allocated.add(value_id)
             pointers[value_id] = register
             return register
@@ -3143,7 +3140,7 @@ def compile_artifact(
     # Same LLVM toolchain resolution the C backend uses: the ziglang package
     # bundles clang, invoked through the interpreter, no PATH assumptions.
     import sys as _sys
-    command = [_sys.executable, "-m", "ziglang", "cc", "-shared", "-O0",
+    command = [_sys.executable, "-m", "ziglang", "cc", "-shared", "-O2",
                "-o", str(library), str(source)]
     if artifact.needs_text_sink:
         command.append(str(
