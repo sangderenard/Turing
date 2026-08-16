@@ -137,3 +137,23 @@ verified correct by this same program.  Fix where induction values bind to
 region feeds (precompile loop lowering, external_values[target]=induction
 around the projected-binding block); the outer induction consumed by an
 inner-body region must resolve to the OUTER phi value, not the start cell.
+
+
+## Session 4: every ingredient proven; one diff remains
+
+Executable proofs, all exact:
+- nested sum+max: (120, 15)
+- linked callee with selective outputs (root->helper): 8.0
+- linked callee inside nested carried loop: (4,1)/(18,2)
+- THE REAL sympy stencil, linked, in a nested carried max loop:
+  peak = 3.132091952673165 = sqrt(9.81) EXACT (build/miniwave-native)
+- the stencil standalone from the fluid closure: wave_speed exact
+
+Only the full advance still zeros its wave/violation chain.  The remaining
+delta between miniwave (works) and advance (zeros) is span-fed stencil
+inputs (state.height[row,col] via multi-axis GEP/extents) and in/out
+record fields.  Both emit calls to the SAME callee: diff the two emitted
+call sites -- the `call void @__ssa_...symbolic_fluid_step(...)` operand
+list and each one's result_ptrs/aggregate members -- in
+build/miniwave-native vs the advance emission.  The mismatch in that diff
+IS the defect.
