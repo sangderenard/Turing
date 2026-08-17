@@ -33,6 +33,37 @@ from .python_special_cases import (
     interpret_python_special_case,
 )
 from .python_identity_programs import resolve_python_identity
+
+import threading as _threading
+
+_IDENTITY_BASE = 1 << 40
+_IDENTITY_LOCK = _threading.Lock()
+_IDENTITY_BY_ADDRESS: dict = {}
+_IDENTITY_KEEPALIVE: dict = {}
+_IDENTITY_NEXT = _IDENTITY_BASE
+
+
+def new_identity() -> int:
+    global _IDENTITY_NEXT
+    with _IDENTITY_LOCK:
+        minted = _IDENTITY_NEXT
+        _IDENTITY_NEXT += 1
+    return minted
+
+
+def stable_identity(obj):
+    global _IDENTITY_NEXT
+    address = id(obj)
+    with _IDENTITY_LOCK:
+        found = _IDENTITY_BY_ADDRESS.get(address)
+        if found is not None and _IDENTITY_KEEPALIVE.get(address) is obj:
+            return found
+        minted = _IDENTITY_NEXT
+        _IDENTITY_NEXT += 1
+        _IDENTITY_BY_ADDRESS[address] = minted
+        _IDENTITY_KEEPALIVE[address] = obj
+    return minted
+
 import colorsys
 import random
 import time
@@ -691,7 +722,7 @@ def _class_schema_from_ast(definition):
     return {
         "class_name": definition.name,
         "class_identity": class_identity,
-        "class_node_id": id(definition),
+        "class_node_id": stable_identity(definition),
         "permissions": (),
         "attributes": tuple(attributes),
         "methods": tuple({
@@ -749,7 +780,7 @@ def _state_machine_schema_from_ast(definition):
             if "transition" in methods
             else None
         ),
-        "ast_node_id": id(definition),
+        "ast_node_id": stable_identity(definition),
     }
 
 
@@ -864,7 +895,7 @@ def _map_ir_from_ast(tree):
         if isinstance(statement, ast.AnnAssign)
     )
     schema_node_ids = tuple(dict.fromkeys(
-        id(node)
+        stable_identity(node)
         for statement in schema_statements
         for node in ast.walk(statement)
     ))
@@ -2611,7 +2642,7 @@ class ProcessGraph:
         self, node, store_id=None, deduplicate=True, special_case=None,
     ):
 
-        nid = id(node)
+        nid = stable_identity(node)
 
             
 
@@ -3276,8 +3307,14 @@ class ProcessGraph:
                     "extraction_occurrences"
                 ] = occurrence_receipts
         for definition, call in parent_links:
-            definition_id = id(definition)
-            call_id = id(call)
+            # These look up nodes `ensure_node` created, so they must
+            # use the same mint. Keyed by id() they matched only because
+            # ensure_node also keyed by id() -- and when it stopped, every
+            # lookup missed and the `continue` below dropped EVERY
+            # definition->callee edge in silence. The module fell from 45
+            # functions to 2 and the build still reported success.
+            definition_id = stable_identity(definition)
+            call_id = stable_identity(call)
             if definition_id not in self.G or call_id not in self.G:
                 continue
             self.connect(
