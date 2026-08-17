@@ -70,11 +70,32 @@ report names an authored local rather than a final field.
 
 ---
 
-## Phase 3b — python ↔ ssa
+## Phase 3b — python ↔ ssa  ✅ BUILT AND CALIBRATED
 
-The missing half of the routing decision. Needs a **reference evaluator for
-repository SSA**: walk `Function.blocks`, honour `Phi`/`Br`/`CondBr`, and
-execute the instruction vocabulary against NumPy values.
+`src/compiler/ssa_reference_evaluator.py`, calibrated in
+`tests/test_ssa_reference_evaluator.py` on a pure function, on a synthetic
+traversal with hand-computable truth, and on the real fluid traversal
+against the authored oracle (exact, 0.0 difference).
+
+**It has already produced the routing answer it was built for:** the fluid
+traversal's SSA matches the authored mathematics exactly while the LLVM
+artifact does not, so the outstanding defect is in **emission** — after a
+long search of the planner and the AST/SymPy inlet on the assumption it
+was upstream.
+
+Two things that made it work, both worth copying into any future
+evaluator:
+
+* the vocabulary is **derived** from `ssa_llvm_backend`'s likeness table
+  and audited at import, so it cannot grow a private opinion of what an
+  opcode means;
+* inputs are bound **by declared identity**, and a parameter with no
+  accounting is found through the callee formal it feeds, by name — the
+  rule the compiled runtime binder already uses. Binding by dtype-and-rank
+  was tried, hit an ambiguity, fell through to a scratch default of 0.0,
+  and made a working compiler look broken for a full session.
+
+Original design notes retained below, since they still describe the shape:
 
 * Scope it to the vocabulary the programs actually use; a shortfall on an
   unhandled op is fine and honest, and mirrors how the backends already
@@ -165,13 +186,18 @@ wants.
 
 ## Order of work, and why
 
-1. **3b** (python ↔ ssa) — unlocks the routing decision; everything else is
-   easier once the layer is known.
-2. **3c** (ssa ↔ backend) — nearly free after 3b, and closes the lattice.
+1. ~~**3b** (python ↔ ssa)~~ — **done**, and it routed the outstanding
+   defect to emission.
+2. **3c** (ssa ↔ backend) — now nearly free: the evaluator and the watch
+   mechanism can be compared per value, which turns "emission is wrong"
+   into "this instruction is wrong".
 3. **6** (manifest on the canonical path) — makes every report speak in
    authored names.
 4. **4** (inlet hooks) — needed for defects that are *inside* one stage.
+   Note that the fluid defect turned out NOT to be here, so this is no
+   longer urgent.
 5. **5** (protocol) — do this when a second program needs it, not before.
 
-Phase 3a is built. The next defect in this tree should be routed with it
-before anyone reads code.
+Phases 3a and 3b are built. **Route the layer before reading code**: two
+of the longest hunts in this tree were spent in a layer that turned out to
+be innocent, and both would have been redirected in minutes by this.

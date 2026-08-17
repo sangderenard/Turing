@@ -191,6 +191,47 @@ the false reassurance this whole mechanism exists to end.
 
 ---
 
+## Q5c — Which LAYER owns it? (the routing question)
+
+This is the question that decides where to read code, and getting it wrong
+costs days. Run the SSA itself and see which side it agrees with:
+
+```bash
+python tools/differential_matrix.py          # oracle / ssa / llvm / fortran
+```
+
+```python
+from src.compiler.ssa_reference_evaluator import (
+    SSAReferenceEvaluator, bind_program_abi_arguments,
+)
+arguments, unbound = bind_program_abi_arguments(
+    function, record=state,
+    named={"dt": 0.2, "height_count": 4, "width_count": 4},
+    functions=module.functions,      # needed to find parameters BY NAME
+)
+SSAReferenceEvaluator(module).run(name, arguments)
+```
+
+| result | means |
+|---|---|
+| ssa == oracle, backend differs | **emission** changed the meaning |
+| ssa == backend, oracle differs | **lowering/planning** changed it |
+| all three differ | the evaluator is not calibrated for this shape — fix that first |
+| ssa == oracle == backend | the defect is in something none of them observes |
+
+Worked example, and the reason this step exists: the fluid traversal read
+`ssa vs oracle = 0.0` and `llvm vs oracle = 6.66e-03`, which put the
+defect in LLVM **emission** — after days of searching the planner and the
+AST/SymPy inlet on the assumption it was upstream.
+
+**The evaluator is only usable while its calibration passes.**
+`tests/test_ssa_reference_evaluator.py` calibrates it on a pure function,
+on a synthetic traversal with hand-computable truth, and on the real
+traversal against the authored oracle. If those fail, no routing claim
+from it means anything, and the tests say so in their failure messages.
+
+---
+
 ## Q6 — Which layer disagrees with which?
 
 ```bash
@@ -325,7 +366,8 @@ tool — each answer narrowed what the next tool had to look at.
 | 8 | `watch=` (built here) | what IS this value at runtime | turned NOT OBSERVABLE into a measurement |
 | 9 | `history=N` (built here) | which ITERATION went wrong | the series, not just the final value — this cracked it |
 | 10 | `differential_translation.py` (built here) | is the translation faithful | an independent oracle; found a second, larger defect |
-| 11 | `ssa_reference_evaluator.py` (built here) | lowering's fault or emission's | **partial** — see its docstring before citing it |
+| 11 | `ssa_reference_evaluator.py` (built here) | lowering's fault or emission's | **the routing answer** — SSA matched the oracle exactly, so emission owns it |
+| 12 | `differential_matrix.py` (built here) | all representations at once | one table; backend-vs-backend needs no oracle |
 
 **What each stage cost when skipped.** Steps 8 and 9 existed only after
 days of reasoning about structure. Every one of those days would have been
@@ -493,7 +535,38 @@ Stage 2 now checks exactly that, and names them:
 > A check that fires on everything teaches nothing. Narrow it to the
 > configuration that actually causes harm, and say what the harm is.
 
-### 9. What all of these have in common
+### 9. A zero that made the compiler look guilty
+
+The SSA evaluator reproduced neither the artifact nor the oracle, and its
+traversal looked like it was collapsing neighbour reads: every cell's
+`height_next` came out exactly equal to its own centre height, and the
+mass accumulator summed the OLD grid. That is precisely what a compiler
+dropping its flux terms would look like, and it was investigated as such.
+
+The cause was in the instrument. `dt` carries no per-argument accounting,
+so the binder matched it by dtype-and-rank, found **two** float64 scalar
+candidates, correctly refused the ambiguity — and then let it fall through
+to a scratch fill that bound it to **0.0**.
+
+Nothing crashed. Every other value stayed plausible: neighbour reads were
+being resolved perfectly the whole time, `wave_speed` was exactly right,
+the loop visited all sixteen cells and read each one correctly. With
+`dt = 0`, `h + dt*(fluxes)` is just `h`, for any fluxes at all.
+
+Fixing the binding changed `ssa vs oracle` from "wrong everywhere" to
+**exactly 0.0**, and with it the whole conclusion: the SSA was correct all
+along and the defect is in emission.
+
+> **A default is a claim.** `unbound` and `zero` are different statements,
+> and code that turns the first into the second manufactures evidence. The
+> binder now reports what it could not bind, and identifies a parameter the
+> way the runtime does — through the callee formal it feeds, by name.
+>
+> Note the shape: this is the SAME defect as field note 1, in a new place,
+> committed by someone who had just written field note 1. Silent defaults
+> are that easy to reintroduce.
+
+### 10. What all of these have in common
 
 Most were **the instrument lying, not the program**. The program under
 investigation was deterministic and consistent the entire time; what varied
@@ -515,6 +588,11 @@ The compressed version, for anyone starting a hunt here:
 5. **Same number or same object?** `is`, not `==`.
 6. **Is my artifact current?** A stale lowering makes a fix look like a
    no-op.
+7. **Which LAYER owns it?** (Q5c.) Answer this before reading code, not
+   after. Two of the longest hunts here were spent in the wrong layer.
+8. **Did anything default silently?** An unbound input that became a zero
+   will implicate the compiler for a bug in your harness — and it will
+   look exactly like a real one.
 
 ---
 
