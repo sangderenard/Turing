@@ -234,7 +234,34 @@ unwired formals, a misbinding oracle, and misgathered height neighbours.
 Each was killed by measurement, and three of them by a script after an
 eyeball reading had already "confirmed" them.
 
-**Next:** find where the 1.0 substitution happens. Both parameters are
+**Mechanism (corrected).** It is NOT a folded constant. Neither value is
+a `Const`: both are array GATHERS.
+
+    viscosity          <- GetElementPtr [54, row, (col + 1) mod n]
+    tracer_diffusivity <- GetElementPtr [45, row, col]
+
+They read 1.0 because they gather HEIGHT, which starts at ~1.0 -- not
+because a literal was baked in. Checking the defining instruction rather
+than the observed value is what separated those two stories, and the
+observed value alone had already suggested the wrong one.
+
+The call's 28 arguments split into 8 scalar parameters and 20 neighbour
+gathers. Six scalars -- coriolis, dt, dx, gravity, linear_drag,
+minimum_height -- arrive correctly, as FORMALS of `advance`: hoisted,
+unresolved parameters, exactly as they should be. The failing two are not
+formals at all; their slots are fed from other regions' aggregate outputs
+(region_2 output 6, region_1 output 22), both height gathers.
+
+The discriminator is position. In the authored call, the six that work sit
+at group BOUNDARIES, while `tracer_diffusivity` sits INSIDE the tracer
+gather run (between `tracer[row, column]` and `tracer[row, east]`) and
+`viscosity` sits immediately after that run ends. So a contiguous gather
+run is claiming argument slots by position and swallowing a scalar
+interleaved into it -- which is the same disease as every other bug in
+this file: a positional assumption over a set whose order is incidental.
+Alphabetical argument ordering is what puts a scalar inside a gather run.
+
+**Next:** find the pass that builds the advance-to-step argument list. Both parameters are
 state scalars that are NOT function formals of `advance` (the binder
 reports them unbound and they have no defining instruction in the frame),
 so the substitution is upstream of SSA — in the ProcessGraph/planner
