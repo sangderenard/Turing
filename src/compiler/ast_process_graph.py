@@ -66,6 +66,90 @@ def _call_spelling(node: ast.AST) -> str | None:
     return None
 
 
+#: The constructs that open a scope in the source language. These are
+#: language facts, not a judgement about the program: Python opens a new
+#: binding scope at exactly these nodes and nowhere else.
+_SCOPE_BOUNDARIES = (
+    ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef,
+    ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+)
+
+
+def _scope_label(node: ast.AST) -> str:
+    name = getattr(node, "name", None)
+    if name:
+        return f"{type(node).__name__.casefold()}:{name}"
+    return f"{type(node).__name__.casefold()}:{getattr(node, 'lineno', 0)}"
+
+
+#: Width of a colour flag. 48 bits divided by 2**48 is exact in binary, so
+#: a flag is an exactly-representable float and two flags compare equal or
+#: they do not. No tolerance, no near-match, no ordering implied.
+_FLAG_BITS = 48
+
+
+def colour_flag(*parts: object) -> float:
+    """Collapse an identity into one float frequency.
+
+    The identity is a real, structured thing at the moment it is computed
+    -- a scope path, a region index, a pass name. Once computed it stops
+    being structure and becomes a flag: one float, carried, compared by
+    equality, never parsed back apart. Anything that needs the original
+    text asks the side table; nothing in the pipeline does.
+
+    Deterministic across processes: built from a digest, not from Python's
+    randomised ``hash``.
+    """
+    import hashlib
+
+    material = "\x1f".join(str(part) for part in parts).encode("utf-8")
+    digest = hashlib.blake2b(material, digest_size=_FLAG_BITS // 8).digest()
+    return int.from_bytes(digest, "big") / float(1 << _FLAG_BITS)
+
+
+def add_layer(layers: tuple, flag: float) -> tuple:
+    """Append one translation's flag, building OUTWARD from the ingested form.
+
+    Layer 0 is whatever form the program was ingested as. Each translation
+    that touches a value appends its own flag, so the tuple read left to
+    right is the order the value was transformed in, and two values sharing
+    a prefix shared that much history exactly.
+
+    Never inserts, never rewrites an existing layer, never reorders: an
+    inner layer is a fact about a translation that already happened.
+    """
+    return tuple(layers) + (float(flag),)
+
+
+def scope_paths(root: ast.AST, base: tuple = ()) -> dict[int, tuple]:
+    """Map every AST node to the scope path enclosing it.
+
+    Taken ONCE, here, at ingestion, where the boundaries are still written
+    down in the syntax. Every later representation carries the path it was
+    given rather than recovering it: a scope recomputed downstream is a
+    guess about a fact that was known exactly at the point of entry, and a
+    guess is what this must never be.
+
+    Keyed by ``id(node)``, so the caller must hold the tree alive while the
+    map is in use -- which ``build_semantic_ast`` does.
+    """
+    paths: dict[int, tuple] = {}
+
+    def walk(node: ast.AST, path: tuple) -> None:
+        paths[id(node)] = path
+        for child in ast.iter_child_nodes(node):
+            walk(
+                child,
+                path + (_scope_label(child),)
+                if isinstance(child, _SCOPE_BOUNDARIES) else path,
+            )
+
+    walk(root, base + (
+        (_scope_label(root),) if isinstance(root, _SCOPE_BOUNDARIES) else ()
+    ))
+    return paths
+
+
 def build_semantic_ast(
     graph, tree: ast.AST, *, filename: str | None = None,
     helpers: dict | None = None, self_constants: dict | None = None,
@@ -86,13 +170,36 @@ def build_semantic_ast(
     while next_id in graph.G:
         next_id += 1
 
+    # The scope division is taken here, once, from the syntax. It is a real
+    # structured thing for exactly as long as it takes to compute; then it
+    # becomes layer 0, one float, and the structure is not carried.
+    #
+    # Every later translation appends ITS flag to these layers by direct
+    # provenance -- the value it produces inherits the layers of the value
+    # it was produced FROM, at the point of exchange, plus one. A layer is
+    # never recovered by matching or by looking at the finished form.
+    enclosing = scope_paths(tree)
+    ingest_flags = {
+        node_id: colour_flag("scope", path)
+        for node_id, path in enclosing.items()
+    }
+    # The side table: flag -> what it was, kept for readers only. Nothing in
+    # the pipeline consults it, exactly as the runtime never reads
+    # trace_manifest.
+    graph.G.graph.setdefault("layer_names", {}).update({
+        colour_flag("scope", path): ".".join(path) or "<module>"
+        for path in set(enclosing.values())
+    })
+
     def span(node):
+        flag = ingest_flags.get(id(node))
         return {
             "filename": filename,
             "line": getattr(node, "lineno", None),
             "column": getattr(node, "col_offset", None),
             "end_line": getattr(node, "end_lineno", None),
             "end_column": getattr(node, "end_col_offset", None),
+            "layers": () if flag is None else (flag,),
         }
 
     def add_node(
