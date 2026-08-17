@@ -1,48 +1,40 @@
-"""Generate a static site: pick a source, pick a layer, read the colour.
+"""Static site over ONE field, coloured by colorimetry.
 
-One page, two dropdowns and a switch.
+Pick a source text, pick a view. Every colour on the page comes from the
+same diffusion over the same translation graph, so the representations
+cannot disagree -- they are one spectral map seen from different sides.
 
-* **source** -- which representation's text you are reading: the authored
-  Python, the authored SymPy equations, or the lowered SSA;
-* **layer** -- which stage's influence field supplies the colour;
-* **blended / categories** -- how the colour is formed.
+Views
+-----
+* **spectral** -- the location's normalised spectrum integrated against
+  the CIE 1931 matching functions and taken to sRGB. Composition only:
+  intensity is deliberately excluded so a value deep in a fan-out is not
+  reported as uncertain merely for being dim.
+* **spectral x power** -- the same chromaticity with luminance carrying
+  the arrived weight, for reading how much rather than what.
+* **state** -- live / attenuated / unreachable. Reachability is a graph
+  fact and does not move with epsilon; only the live/attenuated split
+  does. This is the view that answers "is this path dead".
 
-The two dropdowns are independent on purpose. "The Python source coloured
-by the SSA field" is the question that is hard to answer any other way,
-and it is just a pair of selections here.
+Hovering any highlight dissects its spectrum: which authored text reached
+that location, and in what proportion. Every source is allotted a distinct
+frequency, so the inversion is exact rather than an attribution guess.
 
-Blended versus categories
--------------------------
-`categories` is the field's own convention: each binding-time category
-collapses to its own hue and they are kept apart, because averaging a
-dynamic hue with a baked one reports a dispersion that describes nothing.
-
-`blended` uses the retained ``Spectrum``: every individual contributing
-frequency is converted to colour and ADDED, the way light adds. It is the
-真 mix rather than a centroid -- a location fed by six origins looks like
-those six mixed, not like their mean, and two different origin sets that
-share a mean no longer look identical.
-
-Both are computed HERE, in Python, through `influence_field_image.dye_rgb`.
-The page only swaps between precomputed colours: putting a colour model in
-JavaScript would be a second model that disagrees with the shader about
-the same field.
-
-Correlation uses the strongest identity each pane has. Where a text
-states which value it means (SSA tN tokens) it is read by key. Where it
-names an authored quantity it is read by name. And a stage boundary is
-not 1:1: an authored equation SPREADS over every instruction its
-expansion produced, and instructions reached by several equations MIX
-them by adding spectra. Nothing is matched on position.
+What this replaced
+------------------
+This used to build a field per representation and correlate them by
+authored name afterwards. A name lookup is one-to-one, so it could not
+express a translation that spreads one thing into many or mixes many into
+one, and the panes had to be patched with cone walks to fake it. Those
+tables and that patch are gone: diffusion on a graph that includes the
+crossings does both by construction.
 
     python tools/build_tracer_site.py
-    python tools/build_tracer_site.py --out build/tracer_site.html
 """
 from __future__ import annotations
 
 import argparse
 import json
-import pickle
 import re
 import sys
 from pathlib import Path
@@ -50,22 +42,15 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tools"))
 
-ADVANCE = "symbolic_fluid_control__symbolic_fluid_advance"
 STEP = "symbolic_fluid_control__symbolic_fluid_step"
 REGION = STEP + "__planned_region_0"
-IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-UNCOLOURED = "#1a1a20"
-
-
-def newest_lowering() -> Path:
-    found = sorted(
-        (ROOT / "build").glob("*/control_repository_ssa.pkl"),
-        key=lambda path: path.stat().st_mtime, reverse=True,
-    )
-    if not found:
-        raise SystemExit("no lowered SSA under build/")
-    return found[0]
+ADVANCE = "symbolic_fluid_control__symbolic_fluid_advance"
+DARK = "#14141a"
+STATE_COLOUR = {
+    "live": "#2f7d55", "attenuated": "#7d6f2f", "unreachable": "#6e3030",
+}
 
 
 def to_hex(triple) -> str:
@@ -73,310 +58,155 @@ def to_hex(triple) -> str:
     return f"#{red:02x}{green:02x}{blue:02x}"
 
 
-def category_colour(reading: Any) -> str:
-    from src.rendering.influence_field_image import dye_rgb
+def colour_for(field: Any, key: Any, view: str, states: dict) -> str:
+    from src.compiler.spectral_colorimetry import spectrum_rgb
 
-    category = (reading.categories or {}).get("dynamic")
-    if category is None:
-        return UNCOLOURED
-    return to_hex(dye_rgb(
-        getattr(category, "hue", 0.0),
-        getattr(category, "saturation", 0.0),
-        max(0.25, min(1.0, float(reading.value))),
-    ))
-
-
-def blended_colour(accumulator: Any) -> str:
-    """Add every individual hue, weighted -- real mixing, not a centroid."""
-    from src.rendering.influence_field_image import dye_rgb
-
+    if view == "state":
+        for state, keys in states.items():
+            if key in keys:
+                return STATE_COLOUR[state]
+        return DARK
+    accumulator = field.moments(key).get("dynamic")
     lines = tuple(getattr(accumulator, "lines", ()) or ())
     if not lines:
-        return UNCOLOURED
-    red = green = blue = 0.0
-    for frequency, weight in lines:
-        r, g, b = dye_rgb(float(frequency), 1.0, 1.0)
-        red, green, blue = red + r * weight, green + g * weight, blue + b * weight
-    peak = max(red, green, blue)
-    if peak <= 0.0:
-        return UNCOLOURED
-    return to_hex((red / peak, green / peak, blue / peak))
+        return DARK
+    red, green, blue = spectrum_rgb(accumulator.normalised().lines)
+    if view == "power":
+        # Luminance carries arrived weight; chromaticity is untouched, so
+        # dimness reads as "less got here" and never as "less certain".
+        power = float(getattr(accumulator, "power", 0.0) or 0.0)
+        scale = max(0.12, min(1.0, power) ** 0.5)
+        red, green, blue = red * scale, green * scale, blue * scale
+    return to_hex((red, green, blue))
 
 
-def build_layers(contract: Any) -> tuple[dict, dict]:
-    """{layer id: {name: (reading, accumulator)}} plus labels."""
-    from src.compiler.influence_field import (
-        field_from_ssa, field_from_sympy,
-    )
-    from src.compiler.symbolic_fluid_model import (
-        symbolic_viscous_shallow_water_equations,
-    )
-
-    layers: dict[str, dict[str, tuple]] = {}
-    keyed: dict[str, dict[Any, tuple]] = {}
-    labels: dict[str, str] = {}
-
-    model = symbolic_viscous_shallow_water_equations()
-    field = field_from_sympy(model.equations, contract)
-    table = {reading.key: reading for reading in field.table()}
-    entries: dict[str, tuple] = {}
-    for equation in model.equations:
-        if equation.lhs in table:
-            entries[str(equation.lhs)] = (
-                table[equation.lhs],
-                field.moments(equation.lhs).get("dynamic"),
-            )
-    for symbol in model.symbols.values():
-        if symbol in table:
-            entries[str(symbol)] = (
-                table[symbol], field.moments(symbol).get("dynamic"),
-            )
-    layers["sympy"] = entries
-    labels["sympy"] = "authored SymPy equations"
-
-    with newest_lowering().open("rb") as stream:
-        module, _outputs, _exports = pickle.load(stream)
-    field = field_from_ssa(module, contract, functions=[ADVANCE, STEP, REGION])
-    table = {reading.key: reading for reading in field.table()}
-    entries = {}
-    for source_name in (REGION, STEP, ADVANCE):
-        function = module.functions.get(source_name)
-        if function is None:
-            continue
-        pairs = list(function.metadata.get("value_names") or ())
-        pairs += list(function.metadata.get("parameter_names") or ())
-        if source_name == STEP:
-            pairs += list(function.metadata.get("named_outputs") or ())
-        home = REGION if source_name == STEP else source_name
-        target = module.functions.get(home)
-        if target is None:
-            continue
-        for label, value in pairs:
-            for block_name, block in target.blocks.items():
-                for instruction in block.instrs:
-                    if (
-                        instruction.res is not None
-                        and int(instruction.res.id) == int(value)
-                    ):
-                        key = (home, block_name, int(value))
-                        reading = table.get(key)
-                        if reading is not None and str(label) not in entries:
-                            entries[str(label)] = (
-                                reading, field.moments(key).get("dynamic"),
-                            )
-    layers["ssa"] = entries
-    labels["ssa"] = "lowered repository SSA"
-    # The same field, addressed by key instead of by name. A representation
-    # that states which value it means should be read that way.
-    keyed["ssa"] = {
-        reading.key: (reading, field.moments(reading.key).get("dynamic"))
-        for reading in field.table()
+def origins(field: Any, key: Any, limit: int = 8) -> list:
+    """Dissect: which authored text reached here, and how much of it."""
+    by_frequency = {
+        float(source.hue): str(source.label) for source in field.sources
     }
-    return layers, keyed, labels, module, model
-
-
-def source_texts(module: Any, model: Any) -> tuple[dict, dict]:
-    from src.compiler.symbolic_fluid_dt import SYMBOLIC_FLUID_DT_SOURCE
-
-    direct: dict[str, list] = {}
-    texts = {"python": SYMBOLIC_FLUID_DT_SOURCE}
-    labels = {"python": "authored Python (the traversal)"}
-
-    texts["sympy"] = "\n".join(
-        f"{equation.lhs} = {equation.rhs}" for equation in model.equations
+    accumulator = field.moments(key).get("dynamic")
+    lines = tuple(getattr(accumulator, "lines", ()) or ())
+    total = sum(weight for _frequency, weight in lines)
+    if total <= 0.0:
+        return []
+    rows = sorted(
+        ((by_frequency.get(float(f), "?"), w / total) for f, w in lines),
+        key=lambda row: -row[1],
     )
-    labels["sympy"] = "authored SymPy equations"
-
-    region = module.functions.get(REGION)
-    if region is not None:
-        names = {
-            int(value): str(label)
-            for label, value in (
-                module.functions[STEP].metadata.get("named_outputs") or ()
-            )
-        }
-        # Each rendered line remembers its block, so every tN token can be
-        # resolved to the field key it denotes. Colouring this pane by NAME
-        # lights only the values whose authored name reached a comment --
-        # eleven highlights over three hundred lines of real instructions,
-        # which is what made it look like the tracer had nothing to say
-        # about the SSA.
-        rows: list[tuple[str, str]] = []
-        for block_name, block in region.blocks.items():
-            rows.append((f"{block_name}:", block_name))
-            for instruction in block.instrs:
-                result = instruction.res
-                target = "" if result is None else f"t{int(result.id)}"
-                named = names.get(int(result.id)) if result is not None else None
-                arguments = ", ".join(
-                    f"t{int(a.id)}" for a in instruction.args
-                )
-                label = f"  {target:>7} = {instruction.op}({arguments})"
-                rows.append((
-                    label + (f"    # {named}" if named else ""), block_name,
-                ))
-        tokens = []
-        for row, (line, block_name) in enumerate(rows):
-            for match in re.finditer(r"t(\d+)", line):
-                tokens.append((
-                    row, match.start(), match.end(),
-                    (REGION, block_name, int(match.group(1))),
-                ))
-        direct["ssa"] = tokens
-        texts["ssa"] = "\n".join(line for line, _block in rows)
-        labels["ssa"] = f"lowered SSA: {REGION.split('__')[-1]}"
-    return texts, labels, direct
-
-
-def spread_and_mix(module: Any, sympy_entries: dict) -> dict:
-    """Carry each authored quantity onto every value its expansion produced.
-
-    Provenance is a relation, not a function, and treating it as 1:1 is why
-    the cross-stage panes were nearly empty. A translation does two things
-    a one-to-one map cannot express:
-
-    * it SPREADS -- one authored equation becomes tens of instructions, and
-      every one of them descends from that equation;
-    * it MIXES -- an instruction reached by several equations descends from
-      all of them, which is what common subexpression means.
-
-    Both fall out of the backward cone plus the Spectrum's algebra. A value
-    in one cone takes that equation's spectrum; a value in six takes the
-    SUM of six, which is a real mixture rather than a winner. Addition is
-    the merge, so the result does not depend on which cone is walked first.
-    """
-    region = module.functions.get(REGION)
-    step = module.functions.get(STEP)
-    if region is None or step is None:
-        return {}
-    produced: dict[int, Any] = {}
-    home: dict[int, str] = {}
-    for block_name, block in region.blocks.items():
-        for instruction in block.instrs:
-            if instruction.res is not None:
-                produced[int(instruction.res.id)] = instruction
-                home[int(instruction.res.id)] = block_name
-
-    def cone(root: int) -> set[int]:
-        seen: set[int] = set()
-        pending = [root]
-        while pending:
-            value_id = pending.pop()
-            if value_id in seen or value_id not in produced:
-                continue
-            seen.add(value_id)
-            pending.extend(int(a.id) for a in produced[value_id].args)
-        return seen
-
-    carried: dict[Any, tuple] = {}
-    for label, value in tuple(step.metadata.get("named_outputs") or ()):
-        entry = sympy_entries.get(str(label))
-        if entry is None or int(value) not in produced:
-            continue
-        reading, accumulator = entry
-        if accumulator is None:
-            continue
-        for value_id in cone(int(value)):
-            key = (REGION, home[value_id], value_id)
-            previous = carried.get(key)
-            carried[key] = (
-                reading if previous is None else previous[0],
-                accumulator if previous is None else previous[1] + accumulator,
-            )
-    return carried
-
-
-def colour_by_key(tokens: list, keyed: dict, mode: str) -> list:
-    """Colour tokens that name a field key outright.
-
-    Where a representation states which value it means, use that. Falling
-    back to name matching there would colour only the few values whose
-    authored name survived into a comment, which is what made the SSA pane
-    read as a couple of highlights over three hundred lines of real
-    instructions.
-    """
-    spans = []
-    for row, start, end, key in tokens:
-        found = keyed.get(key)
-        if found is None:
-            continue
-        reading, accumulator = found
-        colour = (
-            blended_colour(accumulator) if mode == "blended"
-            else category_colour(reading)
-        )
-        if colour != UNCOLOURED:
-            spans.append([row, start, end, colour])
-    return spans
-
-
-def colour_spans(text: str, entries: dict, mode: str) -> list:
-    spans = []
-    for row, line in enumerate(text.splitlines()):
-        for match in IDENTIFIER.finditer(line):
-            found = entries.get(match.group(0))
-            if found is None:
-                continue
-            reading, accumulator = found
-            colour = (
-                blended_colour(accumulator) if mode == "blended"
-                else category_colour(reading)
-            )
-            if colour != UNCOLOURED:
-                spans.append([row, match.start(), match.end(), colour])
-    return spans
+    return [[name, round(share, 4)] for name, share in rows[:limit]]
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="build/tracer_site.html")
+    parser.add_argument("--epsilon", type=float, default=1e-6)
     arguments = parser.parse_args()
 
+    from translation_graph import build, classify
     from src.compiler.influence_field import InfluenceContract
+    from src.compiler.symbolic_fluid_dt import SYMBOLIC_FLUID_DT_SOURCE
 
-    # spectral=True is what makes `blended` possible at all: without the
-    # retained lines there is nothing to mix, only a centroid to restate.
     contract = InfluenceContract(enabled=True, spectral=True)
-    layers, keyed, layer_labels, module, model = build_layers(contract)
-    texts, text_labels, direct = source_texts(module, model)
-    # The authored mathematics, spread across every SSA value its expansion
-    # produced and mixed where expansions overlap.
-    keyed["sympy"] = spread_and_mix(module, layers["sympy"])
+    field, occurrences, _home, module, model, _crossings, edges = build(contract)
+    states = {
+        state: set(keys)
+        for state, keys in classify(
+            edges, [source.key for source in field.sources], field,
+            arguments.epsilon,
+        ).items()
+    }
 
+    sources: dict[str, dict] = {
+        "python": {
+            "label": "authored Python -- the traversal",
+            "lines": SYMBOLIC_FLUID_DT_SOURCE.splitlines(),
+            "tokens": [
+                (row, start, end, ("py", row, start, end))
+                for _key, _name, row, start, end in occurrences
+            ],
+        },
+    }
+
+    equation_lines, equation_tokens = [], []
+    for row, equation in enumerate(model.equations):
+        equation_lines.append(f"{equation.lhs} = {equation.rhs}")
+        equation_tokens.append(
+            (row, 0, len(str(equation.lhs)), ("sy", equation.lhs))
+        )
+    sources["sympy"] = {
+        "label": "authored SymPy -- the mathematics",
+        "lines": equation_lines,
+        "tokens": equation_tokens,
+    }
+
+    # Every function of the translated program, so the whole sim is here
+    # rather than the one region that happens to hold the arithmetic.
+    for function_name, function in module.functions.items():
+        rows, marks = [], []
+        for block_name, block in function.blocks.items():
+            rows.append(f"{block_name}:")
+            for instruction in block.instrs:
+                result = instruction.res
+                target = "" if result is None else f"t{int(result.id)}"
+                operands = ", ".join(f"t{int(a.id)}" for a in instruction.args)
+                callee = instruction.attributes.get("callee")
+                suffix = f"    ; {str(callee).split('__')[-1]}" if callee else ""
+                rows.append(
+                    f"  {target:>7} = {instruction.op}({operands}){suffix}"
+                )
+        for row, line in enumerate(rows):
+            for match in re.finditer(r"\bt(\d+)\b", line):
+                marks.append((
+                    row, match.start(), match.end(),
+                    ("ssa", function_name, int(match.group(1))),
+                ))
+        short = function_name.split("__", 1)[-1]
+        sources[function_name] = {
+            "label": f"SSA  {short}",
+            "lines": rows,
+            "tokens": marks,
+        }
+
+    views = {
+        "spectral": "spectral colour (composition)",
+        "power": "spectral colour x arrived power",
+        "state": "live / attenuated / unreachable",
+    }
     payload = {
         "sources": {
-            key: {"label": text_labels[key], "lines": value.splitlines()}
-            for key, value in texts.items()
+            key: {"label": value["label"], "lines": value["lines"]}
+            for key, value in sources.items()
         },
-        "layers": {key: layer_labels[key] for key in layers},
+        "views": views,
         "colours": {
-            source_key: {
-                layer_key: {
-                    mode: (
-                        colour_by_key(
-                            direct[source_key], keyed[layer_key], mode,
-                        )
-                        if source_key in direct and layer_key in keyed
-                        else colour_spans(texts[source_key], entries, mode)
-                    )
-                    for mode in ("categories", "blended")
-                }
-                for layer_key, entries in layers.items()
+            key: {
+                view: [
+                    [row, start, end, colour_for(field, node, view, states)]
+                    for row, start, end, node in value["tokens"]
+                ]
+                for view in views
             }
-            for source_key in texts
+            for key, value in sources.items()
         },
-        "counts": {
-            layer_key: len(entries) for layer_key, entries in layers.items()
+        "dissect": {
+            key: {
+                f"{row},{start}": origins(field, node)
+                for row, start, end, node in value["tokens"]
+            }
+            for key, value in sources.items()
         },
     }
 
     destination = ROOT / arguments.out
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(_page(payload), encoding="utf-8")
-    for layer_key, entries in layers.items():
-        print(f"layer {layer_key}: {len(entries)} authored names carry a reading")
-    for source_key, text in texts.items():
-        print(f"source {source_key}: {len(text.splitlines())} lines")
+    for state, keys in states.items():
+        print(f"  {state:12} {len(keys):6}")
+    coloured = sum(
+        1 for value in sources.values() for _t in value["tokens"]
+    )
+    print(f"  {len(sources)} sources, {coloured} coloured tokens")
     print(f"wrote {destination}")
     return 0
 
@@ -384,59 +214,57 @@ def main() -> int:
 def _page(payload: dict) -> str:
     data = json.dumps(payload)
     return (
-        "<!doctype html><meta charset='utf-8'><title>tracer</title>"
+        "<!doctype html><meta charset='utf-8'><title>fluid sim tracer</title>"
         "<style>"
-        "body{background:#0d0d11;color:#dcdce4;font:13px/1.55 ui-monospace,"
+        "body{background:#0b0b0f;color:#d6d6e0;font:13px/1.55 ui-monospace,"
         "Consolas,monospace;margin:0;padding:16px 20px}"
         "header{display:flex;gap:14px;align-items:center;flex-wrap:wrap;"
-        "margin-bottom:12px}"
-        "select,label{font:12px ui-sans-serif,system-ui}"
-        "select{background:#191922;color:#dcdce4;border:1px solid #333;"
-        "border-radius:4px;padding:4px 6px}"
-        "#note{color:#7b7b8c;font:12px ui-sans-serif,system-ui;margin:0 0 12px}"
-        ".l{white-space:pre}.n{color:#3f3f52;display:inline-block;width:3.5em;"
+        "margin-bottom:10px}select,label{font:12px ui-sans-serif,system-ui}"
+        "select{background:#16161e;color:#d6d6e0;border:1px solid #2e2e3c;"
+        "border-radius:4px;padding:4px 6px;max-width:34em}"
+        "#note{color:#76768a;font:12px ui-sans-serif,system-ui;margin:0 0 10px}"
+        ".l{white-space:pre}.n{color:#35354a;display:inline-block;width:4em;"
         "text-align:right;padding-right:1em;user-select:none}"
-        "b{font-weight:600;color:#111;border-radius:2px}"
-        "</style>"
-        "<header>"
+        "b{font-weight:600;color:#08080a;border-radius:2px;cursor:help}"
+        "#tip{position:fixed;background:#191922;border:1px solid #35354a;"
+        "border-radius:5px;padding:8px 10px;font:11px ui-sans-serif,system-ui;"
+        "pointer-events:none;display:none;max-width:24em;z-index:9;"
+        "box-shadow:0 6px 20px #0008}"
+        "</style><header>"
         "<label>source <select id='source'></select></label>"
-        "<label>layer <select id='layer'></select></label>"
-        "<label><input type='checkbox' id='blend'> blended individual hues"
-        "</label>"
-        "</header><p id='note'></p><div id='code'></div>"
-        f"<script>const DATA={data};"
-        "const source=document.getElementById('source'),"
-        "layer=document.getElementById('layer'),"
-        "blend=document.getElementById('blend'),"
-        "code=document.getElementById('code'),note=document.getElementById('note');"
-        "for(const k in DATA.sources){const o=document.createElement('option');"
-        "o.value=k;o.textContent=DATA.sources[k].label;source.append(o);}"
-        "for(const k in DATA.layers){const o=document.createElement('option');"
-        "o.value=k;o.textContent=DATA.layers[k];layer.append(o);}"
+        "<label>view <select id='view'></select></label></header>"
+        "<p id='note'></p><div id='code'></div><div id='tip'></div>"
+        f"<script>const D={data};"
+        "const S=document.getElementById('source'),V=document.getElementById('view'),"
+        "C=document.getElementById('code'),N=document.getElementById('note'),"
+        "T=document.getElementById('tip');"
+        "for(const k in D.sources){const o=document.createElement('option');"
+        "o.value=k;o.textContent=D.sources[k].label;S.append(o);}"
+        "for(const k in D.views){const o=document.createElement('option');"
+        "o.value=k;o.textContent=D.views[k];V.append(o);}"
         "function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;')"
         ".replace(/>/g,'&gt;');}"
-        "function draw(){const s=source.value,l=layer.value,"
-        "m=blend.checked?'blended':'categories';"
-        "const lines=DATA.sources[s].lines,spans=DATA.colours[s][l][m];"
-        "const byRow={};for(const sp of spans){(byRow[sp[0]]||(byRow[sp[0]]=[]))"
-        ".push(sp);}"
-        "let html='';"
-        "for(let r=0;r<lines.length;r++){const line=lines[r];let out='',at=0;"
-        "for(const sp of (byRow[r]||[]).sort((a,b)=>a[1]-b[1])){"
-        "if(sp[1]<at)continue;out+=esc(line.slice(at,sp[1]));"
-        "out+='<b style=\"background:'+sp[3]+'\">'+esc(line.slice(sp[1],sp[2]))"
-        "+'</b>';at=sp[2];}"
-        "out+=esc(line.slice(at));"
-        "html+='<div class=\"l\"><span class=\"n\">'+(r+1)+'</span>'+out+'</div>';}"
-        "code.innerHTML=html;"
-        "const n=spans.length;note.textContent=DATA.sources[s].label+', coloured "
-        "by '+DATA.layers[l]+' ('+DATA.counts[l]+' authored names carry a "
-        "reading; '+n+' occurrences coloured here). '+(m==='blended'?'Blended: "
-        "every contributing frequency added, the way light adds.':'Categories: "
-        "each binding-time category collapsed to its own hue, kept apart.')"
-        "+' Uncoloured means no reading under that name in this layer.';}"
-        "source.onchange=layer.onchange=blend.onchange=draw;draw();"
-        "</script>"
+        "function draw(){const s=S.value,v=V.value,L=D.sources[s].lines,"
+        "sp=D.colours[s][v],by={};for(const x of sp){(by[x[0]]||(by[x[0]]=[]))"
+        ".push(x);}let h='';"
+        "for(let r=0;r<L.length;r++){const line=L[r];let o='',at=0;"
+        "for(const x of (by[r]||[]).sort((a,b)=>a[1]-b[1])){if(x[1]<at)continue;"
+        "o+=esc(line.slice(at,x[1]));o+='<b data-k=\"'+r+','+x[1]+'\" style="
+        "\"background:'+x[3]+'\">'+esc(line.slice(x[1],x[2]))+'</b>';at=x[2];}"
+        "o+=esc(line.slice(at));h+='<div class=\"l\"><span class=\"n\">'+(r+1)"
+        "+'</span>'+o+'</div>';}C.innerHTML=h;"
+        "N.textContent=D.sources[s].label+' \\u2014 '+D.views[v]+'. '+sp.length+"
+        "' tokens. Hover a highlight to dissect its spectrum.';}"
+        "C.addEventListener('mousemove',e=>{const b=e.target.closest('b');"
+        "if(!b){T.style.display='none';return;}"
+        "const rows=(D.dissect[S.value]||{})[b.dataset.k]||[];"
+        "if(!rows.length){T.style.display='none';return;}"
+        "T.innerHTML='<b style=\"background:none;color:#8ab\">reached by</b><br>'"
+        "+rows.map(r=>esc(r[0])+' <span style=\"color:#9cf\">'"
+        "+(100*r[1]).toFixed(1)+'%</span>').join('<br>');"
+        "T.style.display='block';T.style.left=Math.min(e.clientX+14,"
+        "window.innerWidth-320)+'px';T.style.top=(e.clientY+14)+'px';});"
+        "S.onchange=V.onchange=draw;draw();</script>"
     )
 
 

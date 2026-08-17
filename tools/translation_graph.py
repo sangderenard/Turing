@@ -281,6 +281,15 @@ def classify(edges, source_keys, field, epsilon: float) -> dict:
     epsilon, which is the honest division of labour: topology answers
     whether a path exists, numerics answer whether anything got through.
     """
+    # Materialise the field FIRST. `moments()` reads the solved state but
+    # does not trigger the solve, so classifying before anything calls
+    # `table()` reports every node at zero power -- reachable, no weight,
+    # therefore "attenuated". It is silent and entirely plausible: the
+    # totals still add up and only the live/attenuated split is wrong.
+    # Depending on call order for that is a trap, so the order is fixed
+    # here rather than documented for callers to get right.
+    field.table()
+
     forward: dict = {}
     for source_key, target_key in edges:
         forward.setdefault(source_key, []).append(target_key)
