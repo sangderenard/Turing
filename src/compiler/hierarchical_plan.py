@@ -73,6 +73,27 @@ class PlanCall:
 PlanItem = PlanLine | PlanClosure | PlanCall
 
 
+#: How a tensor operation is spelled once it is known to act on scalars.
+#:
+#: The planner applies this ONLY when the result and every operand have an
+#: empty shape; a genuinely tensor-shaped operation keeps its lowercase
+#: name and is resolved through the tensor likeness table instead. The two
+#: spellings are therefore the same operation at different ranks, which is
+#: why anything interpreting repository SSA -- a backend, or the reference
+#: evaluator -- must read them through this one table rather than keep a
+#: private copy that can drift from it.
+TENSOR_OPERATION_SCALAR_SPELLING: dict[str, str] = {
+    "add": "Add", "sub": "Sub", "mul": "Mul",
+    "truediv": "Div", "div": "Div", "floordiv": "FloorDiv",
+    "mod": "Mod", "pow": "Pow", "neg": "Neg", "abs": "Abs",
+    "equal": "Eq", "not_equal": "Ne", "less": "Lt",
+    "less_equal": "Le", "greater": "Gt", "greater_equal": "Ge",
+    "logical_and": "LAnd", "logical_or": "LOr",
+    "logical_not": "LNot", "maximum": "Max", "minimum": "Min",
+    "sqrt": "Sqrt", "exp": "Exp", "log": "Log",
+}
+
+
 def plan_region_to_ssa_instrs(region: PlanClosure) -> tuple[Instr, ...]:
     """Lower one planner-owned flat region to repository SSA instructions.
 
@@ -221,16 +242,7 @@ def plan_region_to_ssa_instrs(region: PlanClosure) -> tuple[Instr, ...]:
             ))
             opcode = "Cast"
 
-        scalar_spelling = {
-            "add": "Add", "sub": "Sub", "mul": "Mul",
-            "truediv": "Div", "div": "Div", "floordiv": "FloorDiv",
-            "mod": "Mod", "pow": "Pow", "neg": "Neg", "abs": "Abs",
-            "equal": "Eq", "not_equal": "Ne", "less": "Lt",
-            "less_equal": "Le", "greater": "Gt", "greater_equal": "Ge",
-            "logical_and": "LAnd", "logical_or": "LOr",
-            "logical_not": "LNot", "maximum": "Max", "minimum": "Min",
-            "sqrt": "Sqrt", "exp": "Exp", "log": "Log",
-        }
+        scalar_spelling = TENSOR_OPERATION_SCALAR_SPELLING
         is_scalar = (
             result is not None
             and not tuple(result.shape)

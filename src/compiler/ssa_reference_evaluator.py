@@ -51,6 +51,17 @@ The last one did: linked callees publish through ``Ret`` positionally
 while regions keep the caller's numbering, and reading `output_ids` out of
 a linked callee's namespace succeeded on 10 of 11 ids while returning
 unrelated values.
+
+CURRENT LEAD, characterised rather than guessed at. On the traversal,
+``state.next_height`` starts at 0 and ends at exactly the ORIGINAL height,
+so the stores are landing but carrying the wrong value -- the centre
+height rather than the step's ``height_next``. The next thing to check is
+therefore narrow: whether the linked step's ``Ret`` argument ORDER
+corresponds to the call's ``output_ids`` order. Positional publication is
+only correct if it does, and nothing has yet verified that it does; the
+callee's Ret args are its own ids and their order is an emission detail.
+A test comparing one named step output between the evaluator and the
+artifact would settle it.
 """
 from __future__ import annotations
 
@@ -116,6 +127,9 @@ class EvaluationResult:
 # the drift-prone duplicate this tree keeps paying for. The tables below
 # supply only SEMANTICS, keyed to that vocabulary, and `_audit_vocabulary`
 # refuses to let the two disagree.
+from .hierarchical_plan import (  # noqa: E402
+    TENSOR_OPERATION_SCALAR_SPELLING,
+)
 from .ssa_llvm_backend import _BINARY as _LIKENESS_BINARY  # noqa: E402
 from .ssa_llvm_backend import _UNARY as _LIKENESS_UNARY  # noqa: E402
 
@@ -305,6 +319,22 @@ def bind_program_abi_arguments(
     return arguments, tuple(unbound)
 
 
+def _cast_to(payload: Any, dtype: str) -> Any:
+    """Produce ``payload`` in ``dtype``, as the backends' casts do.
+
+    Both backends render a cast as "the operand in the RESULT's type" and
+    neither consults the operand's own type, so this does not either.
+    """
+    name = str(dtype).lower()
+    if name in {"bool", "i1"}:
+        return np.asarray(payload).astype(bool)
+    if name in {"int", "int32", "i32"}:
+        return np.asarray(payload).astype(np.int32)
+    if name in {"int64", "i64", "long"}:
+        return np.asarray(payload).astype(np.int64)
+    return np.asarray(payload).astype(np.float64)
+
+
 class SSAReferenceEvaluator:
     """Executes one repository-SSA module."""
 
@@ -389,6 +419,36 @@ class SSAReferenceEvaluator:
             previous, current = current, next_block
         return returned
 
+    @staticmethod
+    def _operation_name(instruction: Any) -> str:
+        """The instruction's operation, resolved the way backends resolve it.
+
+        Two conventions meet here and both are already established in the
+        tree, so neither is reinvented:
+
+        * ``attributes["tensor_operation"] or op`` is how every backend
+          reads an instruction's operation (see ssa_fortran_backend, which
+          spells exactly this in several passes);
+        * a tensor operation acting on scalars is respelled by the planner
+          through ``TENSOR_OPERATION_SCALAR_SPELLING``, and one acting on
+          arrays keeps its lowercase name. The two spellings are the same
+          operation at different ranks, so reading them through that one
+          table is what keeps this evaluator from drifting away from the
+          planner's own idea of what an op means.
+
+        NumPy supplies the rank difference for free: the same semantics
+        applied to arrays broadcast elementwise, which is precisely what
+        the tensor likeness table's ``binary_double``/``unary_double``
+        kernels do.
+        """
+        operation = str(
+            (instruction.attributes or {}).get("tensor_operation")
+            or instruction.op
+        )
+        return TENSOR_OPERATION_SCALAR_SPELLING.get(
+            operation.casefold(), operation,
+        )
+
     def _step(
         self,
         function: Any,
@@ -396,7 +456,7 @@ class SSAReferenceEvaluator:
         values: dict[int, Any],
         previous: str | None,
     ) -> None:
-        operation = str(instruction.op)
+        operation = self._operation_name(instruction)
         result = instruction.res
 
         if operation in {"Const", "const"}:
@@ -454,6 +514,34 @@ class SSAReferenceEvaluator:
 
         if operation in {"Call", "call"}:
             self._call(instruction, values)
+            return
+
+        if operation in {"Cast", "CastLike", "cast_like"} and instruction.args:
+            # Both backends render a cast as "produce the operand in the
+            # RESULT's type" -- ssa_llvm_backend loads the operand as
+            # `_value_llvm_type(result)`, ssa_fortran_backend converts to
+            # the declared result kind. Neither consults the operand's own
+            # type, so neither does this.
+            payload = self._operand(values, instruction.args[0])
+            values[int(result.id)] = _cast_to(
+                payload,
+                str(
+                    (instruction.attributes or {}).get("target_dtype")
+                    or getattr(result, "dtype", None)
+                    or "float64"
+                ),
+            )
+            return
+
+        if operation in {"Select", "where"} and len(instruction.args) == 3:
+            # Select(mask, when_true, when_false), with the same truthiness
+            # conversion every target applies to a numeric mask.
+            mask = self._operand(values, instruction.args[0])
+            when_true = self._operand(values, instruction.args[1])
+            when_false = self._operand(values, instruction.args[2])
+            values[int(result.id)] = np.where(
+                np.asarray(mask).astype(bool), when_true, when_false,
+            )
             return
 
         if operation in _BINARY:
