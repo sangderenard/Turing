@@ -49,7 +49,17 @@ DECL = re.compile(
     r'^\s*(real|integer|logical)\([^)]*\),\s*intent\((\w+)\)(?:,\s*value)?\s*'
     r':: (\w+)\b'
 )
-ARRAY_WRITE = re.compile(r'^\s*(\w+)\s*\(')
+# Two spellings write into a formal's OWN memory, and both must be caught:
+#   t108(i, j) = expr           element-wise store
+#   t122 = expr                 WHOLE-ARRAY Fortran assignment, no subscript
+# The second is what `state.field = state.next_field + 0.0` -- a Python
+# attribute rebind lowered correctly -- actually looks like in Fortran.
+# Missing it here previously produced a false "never written" finding for
+# exactly this pattern: `trace_fortran_alias.py`'s first version reported
+# `state.height` as unwritten everywhere, when planned_region_4 contained
+# `t122 = (t120 + 0.0_c_double)` the whole time -- an element-write-only
+# regex simply never looked at a bare `name = ...` line.
+ARRAY_WRITE = re.compile(r'^\s*(\w+)\s*(?:\([^()]*\))?\s*=(?!=)')
 
 
 @dataclass(frozen=True)

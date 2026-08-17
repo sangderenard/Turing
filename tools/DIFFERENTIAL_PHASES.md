@@ -604,32 +604,77 @@ assignment to the pointer), and a whole-array zero broadcast targeting
 this token (grepped every bare `tN = 0.0_c_double`; none match the
 traced chain).
 
-Remaining, in order of cost to test:
+### Correction #2: "state.height is never written" was also wrong -- a tool bug
 
-1. **There is no prior WORKING whole-program build to diff against.**
-   The executable could not be compiled at all before this session's
-   Fortran fixes (predicate typing, discard-slot dtype, literal dtype
-   threading) -- it failed at the `t419` type-mismatch error every time.
-   So "did this session's edits cause it" cannot be answered by rebuilding
-   an older lowering; there is nothing to compare it to. This defect may
-   be exposed by this session's fixes rather than caused by them.
-2. **Run under a bounds/memory checker** (gfortran `-fcheck=bounds` on a
-   rebuild, or a C-side sanitizer on the shell) rather than continuing to
-   read source by hand. At least two input slots decoded as
-   `-1.24e+123` earlier this session (uninitialised bytes reaching
-   `initial-state.bin` from an unresolved source), which is independent
-   evidence that some buffer in this program is sized or initialised
-   incorrectly -- a live, checkable hypothesis rather than another guess.
-3. **Check the accept/reject/retry commit path specifically.** The
-   authored `run_superstep` accepts a step and commits it, or rejects and
-   restores a snapshot; the earlier LLVM-path investigation this session
-   already established that EVERY attempt gets rejected (the
-   `viscosity`/`tracer_diffusivity` defect drives the tracer out of
-   bounds at every dt). If the compiled Fortran's rollback path writes
-   from an unloaded/zero-initialised snapshot buffer rather than
-   preserving the caller's original array, that is consistent with
-   everything measured here and does not require a new binding error --
-   only that "restore" and "leave untouched" were not the same operation
-   in this lowering. `trace_fortran_alias.py --token` can follow whatever
-   the "saved"/snapshot buffer is called once it is identified in the
-   authored source.
+Everything above this line, up through "disproven, not merely
+unverified," was itself resting on a defective instrument. Corrected
+here rather than silently, per the standing rule.
+
+`trace_fortran_alias.py`'s write-detector only matched
+`identifier(subscript) = ...` -- an ELEMENT-wise store. It never matched
+a bare `identifier = ...` with NO subscript, which is exactly how
+Fortran spells a WHOLE-ARRAY assignment. And a whole-array assignment is
+exactly what `state.height = state.next_height + 0.0` -- the authored
+commit, a Python attribute rebind -- lowers to. The regex was blind to
+the one pattern it most needed to see.
+
+Direct grep the regex missed: `planned_region_4`'s body contains
+
+    t122 = (t120 + 0.0_c_double)
+
+`t122` is `state.height` (confirmed via the api contract) and `t120` is
+`state.next_height`. The commit is there. It is correctly emitted. The
+tool's regex is fixed (now matches both forms) and the full retrace,
+re-run, confirms it: `t122` shows `WRITES here`, both in `advance` and in
+`planned_region_4`, exactly where the authored source puts it.
+
+Independently confirmed at the Python/LLVM boundary too: calling the
+already-working `compile_native_symbolic_fluid_advance` DLL twice and
+diffing `state.height` before/after shows it genuinely changes
+(`max abs diff 0.00083`, exactly matching `next_height`'s own diff from
+its pre-call value) -- the LLVM path's commit is real, not an artefact
+of Python-side buffer aliasing as an earlier draft of this note
+(corrected in-session, never published) briefly suspected.
+
+### The real root cause: an ordering bug, not a missing write
+
+`symbolic_fluid_advance`'s body is eight `call` statements, no `do` loop
+at this level (each planned region carries its own internal loop).
+Their program order, read directly from the generated `.f90`:
+
+    line 315  call ...__p__64695e515673(...)
+    line 341  call ...__p__7c0bc4d00b48(...)     <- planned_region_4: THE COMMIT
+    line 342  call ...__p__47e6d11e11e1(...)
+    line 346  call ...__p__d32aa61a75ff(...)
+    line 364  call ...__p__ac43f7a0073b(...)      <- planned_region_1
+    line 365  call ...__p__4a6973293a81(...)      <- planned_region_2
+    line 366  call symbolic_fluid_control__symbolic_fluid_step(...)
+    line 367  call ...__p__affd8a064c08(...)      <- planned_region_3: computes next_height
+
+**The commit (line 341) runs before the computation that fills
+`next_height` (lines 366-367).** `region_4` reads `t120`
+(`state.next_height`) and writes it into `t122` (`state.height`) at line
+341 -- while the per-cell loop that actually produces `next_height`'s
+real values, inside `planned_region_3`, has not run yet. `t120` and
+`t108` (`planned_region_3`'s own formal for the same buffer) are
+confirmed the same source (`state.next_height`) via the api contract, so
+they are the same underlying memory. At line 341, that memory holds
+whatever a freshly-allocated buffer holds before anything writes it --
+which is exactly consistent with the observed all-zero `state.height`.
+
+This is a genuine scheduling defect: the pass that orders these eight
+calls did not respect the data dependency `next_height` (written by
+region_3) -> `height` (read by region_4). The authored Python is
+unambiguous about the order -- the loop that fills `next_height`
+textually precedes `state.height = state.next_height + 0.0` -- so this
+is a real ordering violation introduced during lowering, not an
+ambiguity in the source.
+
+**Not yet done, and the concrete next step:** find the pass that decides
+the call order for a function's planned regions (likely in
+`hierarchical_plan.py` or the region-sequencing logic in
+`fortran_c_shell.py`) and check whether it consults data dependencies
+between regions at all, or only some other criterion (declaration order,
+region index, discovery order). This is a scheduling/ordering question,
+not a missing-instruction question -- narrower and more mechanical to
+fix than anything hypothesised earlier in this file.
