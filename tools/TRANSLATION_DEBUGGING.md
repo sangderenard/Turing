@@ -308,6 +308,48 @@ down than quietly deleted.
 
 ---
 
+# The tool log: what was reached for, in what order, and what it bought
+
+One real hunt, end to end. The order matters more than any individual
+tool — each answer narrowed what the next tool had to look at.
+
+| # | Reached for | Question it answered | What it bought |
+|---|---|---|---|
+| 1 | `git log` / reading the handoff | what was already known | avoided re-deriving four fixed defects |
+| 2 | `emit_module` + `gfortran` | does it build at all | 9 errors → a concrete, finite list |
+| 3 | Isolating caller+callee into one small `.f90` | what is the REAL diagnostic | full-file compiles truncate the error; isolation revealed it |
+| 4 | Reading the pickled SSA directly | does the IR say what I think | disproved three plausible theories in minutes |
+| 5 | `correlate_compile.py` (built here) | which layer disagrees | SSA vs LLVM vs runtime, side by side, per id |
+| 6 | `diagnose_translation.py` (built here) | which STAGE owns it | routing, instead of reading the wrong altitude |
+| 7 | `influence_field` dye (already existed) | what reaches this value | closed the "are they aliased" question |
+| 8 | `watch=` (built here) | what IS this value at runtime | turned NOT OBSERVABLE into a measurement |
+| 9 | `history=N` (built here) | which ITERATION went wrong | the series, not just the final value — this cracked it |
+| 10 | `differential_translation.py` (built here) | is the translation faithful | an independent oracle; found a second, larger defect |
+| 11 | `ssa_reference_evaluator.py` (built here) | lowering's fault or emission's | **partial** — see its docstring before citing it |
+
+**What each stage cost when skipped.** Steps 8 and 9 existed only after
+days of reasoning about structure. Every one of those days would have been
+saved by asking "what is this value, actually?" on day one — which was
+impossible, because the answer was `NOT OBSERVABLE` and the tool returned
+`0.0` instead of saying so.
+
+**The shape of the whole hunt**, which is the transferable part:
+
+1. A symptom (`mass_err = 0.0`) that turned out to be **correct behaviour**.
+2. A "ground truth" (`1.68e-04`) that turned out to be **computed from the
+   bug itself**.
+3. Structural checks that all passed, repeatedly, because the defect was
+   not structural.
+4. A measurement that could not be taken, silently reported as a zero.
+5. The real defect — a whole-array copy moving one element — found only
+   once values became observable, and found *next to* where everyone was
+   looking, not inside it.
+
+If a hunt here is going badly, the odds strongly favour one of those five
+over an exotic compiler bug.
+
+---
+
 # Field notes: counterintuitive things that actually happened
 
 These are not hypotheticals. Each cost real time in this tree, each looked
