@@ -566,7 +566,6 @@ def _emit_repository_call_module(
                     projected_position = address_position[int(follower.args[0].id)]
                     live_positions.append(projected_position)
                     projected_values[projected_position] = follower.res
-            selected = tuple(dict.fromkeys(live_positions))
             consumed_whole = any(
                 follower is not instruction
                 and follower.op not in {"GetElementPtr", "getelementptr"}
@@ -576,8 +575,13 @@ def _emit_repository_call_module(
                 )
                 for follower in instructions
             )
-            if consumed_whole or not selected:
-                selected = tuple(range(len(declared)))
+            # The authored program declares these outputs; ALL of them are
+            # published.  Shrinking the ABI to a use-count snapshot created
+            # a 7-of-11 pairing problem every later pass tripped over -- a
+            # dead output costs one store to a cell nobody reads, which is
+            # nothing.  Removal belongs to the planner's proof, never to an
+            # emitter-local count.
+            selected = tuple(range(len(declared)))
             if consumed_whole:
                 aggregate_escapes_whole.add(
                     (caller_name, int(instruction.res.id))
@@ -1015,8 +1019,6 @@ def _emit_repository_call_module(
             operation = str(instruction.op)
             result = instruction.res
             result_id = int(result.id) if result is not None else None
-            if result_id is not None and result_id in dead_unpack_results:
-                continue
             tag = f"{instruction_index}.{result_id if result_id is not None else 'v'}"
 
             if operation in {"Const", "StaticRef"} and result is not None:
@@ -1497,10 +1499,27 @@ def _emit_repository_call_module(
                         and int(forwarded[0]) == result_id
                         and str(forwarded[1]) == symbol
                     ):
-                        result_ptrs = [
-                            f"%out.{index}"
-                            for index in range(len(callee_outputs))
-                        ]
+                        # Forwarding maps by OUTPUT ID -- output_pointer is
+                        # that map.  Positional %out.i handed the wrapper's
+                        # 7 selected out params the callee's FIRST seven
+                        # outputs (velocity_x into the wave slot) and wrote
+                        # the rest past the parameter list.
+                        result_ptrs = []
+                        for output_index, value in enumerate(callee_outputs):
+                            known = output_pointer.get(int(value.id))
+                            if known is not None:
+                                result_ptrs.append(known)
+                                continue
+                            llvm_type = _value_llvm_type(value)
+                            count = _value_element_count(value)
+                            temporary = (
+                                f"%forward.output.{tag}.{output_index}"
+                            )
+                            body.append(
+                                f"  {temporary} = alloca {llvm_type}, "
+                                f"i64 {count}, align 8"
+                            )
+                            result_ptrs.append(temporary)
                     elif declared_ids:
                         if len(selected) != len(callee_outputs):
                             shortfalls.append(LLVMEmissionShortfall(
