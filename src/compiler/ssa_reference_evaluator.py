@@ -52,16 +52,36 @@ while regions keep the caller's numbering, and reading `output_ids` out of
 a linked callee's namespace succeeded on 10 of 11 ids while returning
 unrelated values.
 
-CURRENT LEAD, characterised rather than guessed at. On the traversal,
-``state.next_height`` starts at 0 and ends at exactly the ORIGINAL height,
-so the stores are landing but carrying the wrong value -- the centre
-height rather than the step's ``height_next``. The next thing to check is
-therefore narrow: whether the linked step's ``Ret`` argument ORDER
-corresponds to the call's ``output_ids`` order. Positional publication is
-only correct if it does, and nothing has yet verified that it does; the
-callee's Ret args are its own ids and their order is an emission detail.
-A test comparing one named step output between the evaluator and the
-artifact would settle it.
+CURRENT LEAD, narrowed by measurement. Established so far:
+
+* Publication order is NOT the problem. The linked step's declared
+  outputs match its Ret order everywhere both exist, republished names
+  agree, and the aggregate unpack indices line up with the call's
+  ``output_ids`` (``height_next`` at index 2, ``wave_speed`` at 8). All
+  covered by tests.
+* CENTRE reads are correct. The traversal's mass accumulator comes out at
+  exactly ``16.017591076142676``, the true sum of the perturbed grid, so
+  the loop visits all 16 cells and reads each one's own height correctly.
+  Loop induction, modulo wrapping and address arithmetic are therefore
+  sound.
+* ``wave_speed`` evaluates exactly right (1.0042549047726228), matching
+  the artifact.
+* But ``next_mass`` equals the sum of the OLD heights rather than the new
+  ones, which can only happen if ``height_next == height_centre`` for
+  EVERY cell. That is the signature of the NEIGHBOUR contributions
+  vanishing: with all four neighbours equal to the centre, the fluxes
+  cancel and the update degenerates to the identity.
+
+So the question is why neighbour reads collapse inside the traversal when
+``planned_region_1`` reads them correctly in isolation, given explicit
+row/column. Final-iteration values cannot distinguish this, because the
+last cell [3,3] genuinely has a uniform neighbourhood.
+
+The next step is therefore per-iteration recording in the evaluator --
+cheap here, since it is ordinary Python, unlike the watch machinery the
+LLVM artifact needed -- compared against the artifact's history watch for
+the same iteration and a cell whose neighbourhood is NOT uniform, such as
+[1,1].
 """
 from __future__ import annotations
 
