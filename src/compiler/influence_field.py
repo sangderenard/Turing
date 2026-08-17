@@ -167,6 +167,10 @@ class InfluenceContract:
 
     scopes: tuple[str, ...] = ()
     stages: tuple[str, ...] = ()
+    #: Keep the whole distribution per node instead of three moments, so
+    #: a location can be analysed rather than only rendered. Costs memory
+    #: proportional to distinct contributing sources, so it is opt-in.
+    spectral: bool = False
     # Per-hop survival. Below 1.0 the field also decays with distance, which
     # makes locality visible; at exactly 1.0 only ``decay`` and ``epsilon``
     # bound the walk.
@@ -330,6 +334,92 @@ class Moments:
         """Normalised spread of contributing hues, in [0, 1]."""
 
         return min(1.0, math.sqrt(self.variance) / MAX_DISPERSION)
+
+
+@dataclass(frozen=True, slots=True)
+class Spectrum:
+    """The full distribution, not a projection of it.
+
+    ``Moments`` keeps three numbers, so by the time anything asks a
+    question the spectrum has already been collapsed to a centroid and a
+    spread -- and RGB collapses it again to three channels. Both are
+    lossy in the same direction: two completely different sets of origins
+    can produce identical moments, and at exactly the high-mixing nodes
+    worth reading they usually do.
+
+    This keeps every contributing frequency with its weight, so a location
+    can be analysed rather than only displayed: which origins reached it,
+    in what proportion, and whether its colour is one source or six
+    cancelling into the same mean.
+
+    It is a drop-in for ``Moments`` -- same constructor, ``deposited``,
+    ``scaled``, ``+``, and the same derived properties -- so the solver
+    uses it unchanged. Crucially it keeps the property the whole design
+    rests on: merging is addition over a keyed map, which is commutative
+    and associative, so transports arriving in any order give the same
+    spectrum. Lines are held sorted by frequency so equal spectra have
+    equal representations.
+    """
+
+    lines: tuple[tuple[float, float], ...] = ()
+
+    def __add__(self, other: "Spectrum") -> "Spectrum":
+        merged: dict[float, float] = {}
+        for frequency, weight in self.lines:
+            merged[frequency] = merged.get(frequency, 0.0) + weight
+        for frequency, weight in getattr(other, "lines", ()):
+            merged[frequency] = merged.get(frequency, 0.0) + weight
+        return Spectrum(tuple(sorted(merged.items())))
+
+    def deposited(self, hue: float, weight: float) -> "Spectrum":
+        return self + Spectrum(((float(hue), float(weight)),))
+
+    def scaled(self, factor: float) -> "Spectrum":
+        return Spectrum(tuple(
+            (frequency, weight * factor) for frequency, weight in self.lines
+        ))
+
+    @property
+    def s0(self) -> float:
+        return sum(weight for _frequency, weight in self.lines)
+
+    @property
+    def s1(self) -> float:
+        return sum(frequency * weight for frequency, weight in self.lines)
+
+    @property
+    def s2(self) -> float:
+        return sum(
+            frequency * frequency * weight for frequency, weight in self.lines
+        )
+
+    @property
+    def weight(self) -> float:
+        return self.s0
+
+    @property
+    def mean(self) -> float:
+        total = self.s0
+        return 0.0 if total <= 0.0 else self.s1 / total
+
+    @property
+    def variance(self) -> float:
+        total = self.s0
+        if total <= 0.0:
+            return 0.0
+        mean = self.s1 / total
+        return max(0.0, self.s2 / total - mean * mean)
+
+    @property
+    def dispersion(self) -> float:
+        return min(1.0, math.sqrt(self.variance) / MAX_DISPERSION)
+
+    def at(self, frequency: float, tolerance: float = 1e-12) -> float:
+        """Weight arriving from one frequency -- the analysable question."""
+        return sum(
+            weight for line, weight in self.lines
+            if abs(line - float(frequency)) <= tolerance
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -522,6 +612,11 @@ class InfluenceField:
         self._nodes: set[Any] = set()
         self._barriers: dict[Any, set[str]] = {}
         self._moments: dict[Any, dict[str, Moments]] = {}
+        # Spectrum is a drop-in for Moments: same algebra, same derived
+        # properties, and it keeps the lines instead of collapsing them.
+        self._accumulator = (
+            Spectrum if getattr(contract, 'spectral', False) else Moments
+        )
         self._transports: list[Transport] = []
         self._converged = False
         # Order in which the compiled program actually activates its values.
@@ -678,11 +773,11 @@ class InfluenceField:
         def hold(node: Any, arrival: int, bundle: Mapping[str, Moments]) -> None:
             slot = pending.setdefault(node, {})
             for category, moments in bundle.items():
-                slot[category] = slot.get(category, Moments()) + moments
+                slot[category] = slot.get(category, self._accumulator()) + moments
             depth[node] = max(depth.get(node, 0), arrival)
 
         for source in sorted(selected.values(), key=lambda item: item.ordinal):
-            unit = Moments().deposited(source.hue, 1.0)
+            unit = self._accumulator().deposited(source.hue, 1.0)
             self._deposit(source.key, source.category, source.hue, 1.0)
             hold(source.key, 0, {source.category: unit})
             enqueue(source.key, 1.0)
@@ -722,7 +817,7 @@ class InfluenceField:
                 if role in BACK_EDGE_ROLES and RECURRENT in contract.categories:
                     # Influence that crossed a back edge is loop-carried from
                     # here on, whatever binding time it started with.
-                    carried = Moments()
+                    carried = self._accumulator()
                     for moments in bundle.values():
                         carried = carried + moments
                     moved = {RECURRENT: carried.scaled(factor)}
@@ -742,7 +837,7 @@ class InfluenceField:
                 for category, moments in moved.items():
                     per_category = self._moments.setdefault(target, {})
                     per_category[category] = (
-                        per_category.get(category, Moments()) + moments
+                        per_category.get(category, self._accumulator()) + moments
                     )
                     self._transports.append(Transport(
                         step=step, source_key=node, target_key=target,
@@ -761,7 +856,7 @@ class InfluenceField:
     ) -> None:
         per_category = self._moments.setdefault(key, {})
         per_category[category] = per_category.get(
-            category, Moments()
+            category, self._accumulator()
         ).deposited(hue, weight)
 
     # -- readout ---------------------------------------------------------
@@ -777,7 +872,7 @@ class InfluenceField:
         normaliser = scale if scale is not None else self._weight_scale()
         readings: dict[str, CategoryReading] = {}
         for category in contract.categories:
-            moments = per_category.get(category, Moments())
+            moments = per_category.get(category, self._accumulator())
             shaped = (1.0 - moments.dispersion) ** contract.saturation_gamma
             readings[category] = CategoryReading(
                 category=category,
@@ -1341,7 +1436,7 @@ __all__ = [
     "SPECTRUM_END", "RESERVED_BAND", "MAX_DISPERSION",
     "BACK_EDGE_ROLES", "FORK_ROLES", "BARRIER_ROLES",
     "InfluenceContractError", "InfluenceContract", "InfluenceSource",
-    "Moments", "CategoryReading", "InfluenceReading", "Transport",
+    "Moments", "Spectrum", "CategoryReading", "InfluenceReading", "Transport",
     "InfluenceField",
     "semantic_marker_hue", "allocate_hues", "default_classifier",
     "attach_to_metagraph", "field_from_sympy", "field_from_process_graph",
