@@ -546,8 +546,11 @@ def _array_literal(
         extents = ", ".join(str(int(size)) for size in shape)
         return f"reshape({constructor}, [{extents}])"
     if len(set(elements)) == 1:
-        return _literal(elements[0])
-    constructor = "[" + ", ".join(_literal(element) for element in elements) + "]"
+        return _literal(elements[0], dtype)
+    constructor = (
+        "[" + ", ".join(_literal(element, dtype) for element in elements)
+        + "]"
+    )
     if len(shape) <= 1:
         return constructor
     extents = ", ".join(str(int(size)) for size in shape)
@@ -621,7 +624,35 @@ def _series_sin_fortran(argument: str, shift: float) -> str:
     return f"merge(-{series}, {series}, mod(abs({turns}), 2) == 1)"
 
 
-def _literal(value: Any) -> str:
+def _literal(value: Any, dtype: str | None = None) -> str:
+    """Spell one SSA constant as Fortran, in the type the SSA declares.
+
+    ``dtype`` is not decoration. This used to render purely from the Python
+    payload's own type, so a float64 constant carrying an integer payload --
+    256 rather than 256.0, which is what a captured Python literal usually
+    is -- came out as the Fortran INTEGER literal ``256``. Call-site
+    coercion could not save it either: coercion compares the SSA dtypes,
+    saw float64 against float64, and correctly did nothing. The declared
+    type and the emitted token disagreed with nobody in a position to
+    notice, and gfortran rejected the call with
+
+        Type mismatch in argument 't419'; passed INTEGER(4) to REAL(8)
+
+    So the declared type decides the spelling, and the payload only decides
+    the value.
+    """
+    if (
+        dtype
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+        and str(dtype) not in _INTEGER_DTYPES
+        and str(_DTYPE_KIND.get(str(dtype), "")).startswith("real")
+    ):
+        value = float(value)
+    return _literal_payload(value)
+
+
+def _literal_payload(value: Any) -> str:
     # None and words are typed signed 64-bit identities.  Realise them at the
     # one point every literal passes through to become Fortran; never project
     # them through f64 bits.
@@ -2040,8 +2071,23 @@ class _FunctionEmitter:
                 typed_formal = self._typed(formal)
                 if _is_array(typed_formal):
                     return None
+                # The callee's DECLARED dtype for this slot, the same
+                # authority the bridge above uses when the slot is consumed.
+                #
+                # Only the consumed path honoured it. A discarded slot was
+                # typed from the raw formal instead, which carries the
+                # caller's view and is often the wrong one -- so an output
+                # the caller ignores was declared integer(c_int32_t) against
+                # a callee formal of real(c_double), and gfortran refused
+                # the call with "passed INTEGER(4) to REAL(8)". Whether a
+                # caller happens to USE a result cannot change that
+                # result's type.
+                slot_dtype = (
+                    slot_dtypes[slot] if slot < len(slot_dtypes) else None
+                )
                 kind = _DTYPE_KIND.get(
-                    typed_formal.dtype or self.dtype, "real(c_double)"
+                    slot_dtype or typed_formal.dtype or self.dtype,
+                    "real(c_double)",
                 )
                 scratch = f"discard_c{callsite}_p{slot}"
                 self._discard_declarations[scratch] = kind
@@ -2735,7 +2781,10 @@ class _FunctionEmitter:
                     # values are already scalar; iterating a float is an
                     # error and iterating a word would silently turn it into
                     # an array of character tokens.
-                    return _literal(values)
+                    return _literal(
+                    values,
+                    instr.res.dtype if instr.res is not None else None,
+                )
                 return _array_literal(
                     values,
                     instr.res.shape,
@@ -2748,14 +2797,20 @@ class _FunctionEmitter:
                 # with a vestigial "value" of None, so testing it first would
                 # discard the real elements.
                 try:
-                    return _literal(instr.attributes["value"])
+                    return _literal(
+                        instr.attributes["value"],
+                        instr.res.dtype if instr.res is not None else None,
+                    )
                 except FortranEmissionError as error:
                     raise FortranEmissionError(
                         f"{error}; function={self.function.name!r}; "
                         f"result_value_id={getattr(instr.res, 'id', None)!r}; "
                         f"attributes={instr.attributes!r}"
                     ) from error
-            return _literal(constant)
+            return _literal(
+                constant,
+                instr.res.dtype if instr.res is not None else None,
+            )
 
         if op in ("Load", "load") and len(instr.args) == 1:
             producer = self._address_producers.get(instr.args[0].id)
