@@ -138,42 +138,86 @@ same mechanism that fixed `max_vel`/`dt_limit`). The runtime genuinely reads
 **Traced so far, with exact LLVM IR references** (from
 `compile_native_symbolic_fluid_advance(...).artifact.llvm_ir`):
 
-- The repository SSA is structurally sound: region_6's call passes
-  `next_mass`/`previous_mass` at the correctly-named positions
-  (`value_names` confirms), region_6's own `Sub[171, 172]` subtracts them in
-  the right order, and its `Div` correctly produces the id `_bind` now
-  correctly labels `mass_err`.
-- The LLVM control flow places the call correctly: `loop_exit:` (after the
-  outer loop, not inside it) contains
-  `call ... @...planned_region_6(..., ptr %phi.192, ptr %phi.193, ...)`.
-- `%phi.192`/`%phi.193` are defined in `loop_header:` as
-  `phi ptr [ %value.187/%value.188, %entry ], [ %phi.207/%phi.208, %loop_latch ]`
-  -- i.e. LLVM expects `%phi.207`/`%phi.208` (the accumulated per-iteration
-  results) to be available wherever control reaches `%loop_latch`.
-- But `loop_latch:`'s own visible instructions only update the induction
-  variable (`%value.195` feeding `%phi.194`) -- `%phi.207`/`%phi.208` are
-  never mentioned there. They are defined instead inside the INNER loop nest
-  (`%phi.207 = phi ptr [ %phi.192, %loop_body ], [ %value.116, %loop_latch.1 ]`,
-  i.e. the inner loop's own accumulation, which must reach `%loop_latch`
-  through the inner loop's own exit block by dominance, not by a literal
-  reference inside `%loop_latch:` itself).
+**Every hypothesis testable via static IR reading has now been checked and
+ruled out.** In order:
 
-**Next step, not yet done:** trace the inner loop's own exit block (find
-where `%loop_header.1`/`%loop_body.1`/`%loop_latch.1` branch back out to the
-outer `%loop_latch`) and confirm whether `%phi.207`/`%phi.208` genuinely
-dominate that branch with their fully-accumulated value, or whether the
-inner loop exits too early / branches around them. This is a real LLVM CFG
-question, not a naming or binding question -- don't re-check `_bind` or the
-repository SSA again, both are confirmed correct for this value.
+1. **Binding.** Confirmed correct independently of everything else --
+   `by_kwarg["mass_err"]` resolves to id 141 by name, and reading it via
+   `adv._read(141)` after a normal (unmodified) run genuinely returns
+   `0.0`. This is not a `_read`/lookup artifact: `adv._read(147)`
+   (`dt_limit`, resolved by the exact same mechanism) correctly returns
+   `0.111279` in the same call. Also confirmed `adv._read(136)` (the raw
+   `Sub` result, one step upstream of `Abs`/`Div`) is *itself* `0.0` --
+   the zero originates at the subtraction, not later in the division or in
+   readback.
+
+2. **Aliasing.** Every alloca involved is textually distinct and confirmed
+   via `grep` on the LLVM IR text: `%value.47`/`%value.116` (the two
+   accumulators' own output slots) and `%value.187`/`%value.188` (their
+   seeds) are four separate `alloca double` instructions, each appearing
+   exactly once, hoisted to function entry (not re-allocated per
+   iteration). They cannot be the same memory.
+
+3. **CFG placement.** `%phi.192`/`%phi.193` are defined in `loop_header:`
+   as `phi ptr [ %value.187/%value.188, %entry ], [ %phi.207/%phi.208,
+   %loop_latch ]`. The inner loop's own exit block, `loop_exit.1:`,
+   unconditionally branches straight to `%loop_latch`
+   (`loop_exit.1: br label %loop_latch`, nothing else in that block), and
+   `%phi.207`/`%phi.208` are defined in `loop_header.1:` -- the inner
+   loop's header, which dominates every path to `loop_exit.1` including
+   the one that exits the inner loop. This is valid, ordinary SSA
+   dominance for a nested accumulator; LLVM would have rejected the IR at
+   verification if it were not.
+
+4. **Carried-port grouping in the repository SSA** (before LLVM, in
+   `precompile_to_ssa.py`'s own loop lowering). Dumped every
+   `binding: loop_carried` Phi in the function: `next_mass`'s pair is
+   `(initial=19, updated=116)`, `previous_mass`'s is
+   `(initial=18, updated=47)` -- genuinely distinct groups, no accidental
+   key collision between the two reductions.
+
+5. **The analogous, working case.** `max_wave_speed` -- computed and
+   carried the same way, also consumed after the outer loop -- reads
+   correctly (see the fixed defects above). The one structural difference:
+   `max_wave_speed` is computed entirely inside ONE region call
+   (`planned_region_3`'s own `Max` instruction). `next_mass` and
+   `previous_mass` are each accumulated by a DIFFERENT region call
+   (`planned_region_3` and `planned_region_2` respectively) within the
+   SAME shared inner loop body. This is the one remaining structural
+   difference between the working and broken cases, and is the most
+   promising lead for whoever continues this -- but it is a lead, not a
+   confirmed cause; nothing above proves that a two-separate-regions
+   pattern is where the defect lives, only that it's the one thing left
+   unruled-out.
+
+**What this means for continuing:** the defect is not in naming/binding,
+not in memory aliasing, and not in any SSA/CFG structure readable from the
+IR text. It's either in something the IR text can't show (how LLVM's own
+backend lowers `phi ptr` to actual machine registers/stack slots for this
+specific two-region-accumulator shape) or in a genuine computation error
+that hasn't been isolated yet despite `Sub`'s operands checking out
+structurally. The next real step is not more IR reading -- it's building a
+MINIMAL standalone repro (two region calls, each accumulating a different
+scalar, inside one shared loop nest, stripped of everything else in this
+program) to see whether the zero reproduces in isolation. If it does, a
+debugger on the JIT'd machine code becomes tractable on a small case in a
+way it is not on this one. If it does NOT reproduce in isolation, the
+defect is specific to something else in this program's shape that a
+minimal case would help surface by comparison.
 
 **Diagnostic trap already hit, worth avoiding:** probing `next_mass`/
 `previous_mass` by adding a NEW `state.field = next_mass + 0.0`-style
 expression to the source is unsafe as a diagnostic -- it was exactly this
 kind of extra reference that, applied to `max_wave_speed` while debugging
 defect 5, corrupted a DIFFERENT existing consumer of the same reduction
-before the name-based `_bind` fix went in. Any new probe that adds a source
-expression should be verified not to change surrounding values before
-trusting its own readout.
+before the name-based `_bind` fix went in. An early probe of this exact
+shape (`state.last_height_violation = next_mass + 0.0`, `state.last_tracer_violation
+= previous_mass + 0.0`) showed both reading identically -- that result was
+NOT trusted as evidence for this reason, and correctly so: reading `Sub`'s
+own operands directly via `adv._read()` (no source change at all, see point
+1 above) is what actually confirmed the zero originates at the
+subtraction. Prefer `adv._read(internal_id)` after a normal run over adding
+any new source-level expression.
 
 Useful commands, all cheap:
 
