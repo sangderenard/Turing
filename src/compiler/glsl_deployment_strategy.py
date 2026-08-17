@@ -111,6 +111,7 @@ from ..common.tensors.operator_catalog import (
     ACCESSOR_OPERATORS,
     CREATION_OPERATORS,
 )
+from ..transmogrifier.graph.edge_roles import positional_argument_index
 from ..transmogrifier.graph.graph_deep_compiler import GraphDeepCompiler
 from ..transmogrifier.operator_defs import (
     abstract_tensor_funcs,
@@ -1148,14 +1149,16 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
 
 
 def _positional_argument_index(role: str) -> int | None:
-    """Normalize the two ProcessGraph spellings used for positional edges."""
+    """Normalize the two ProcessGraph spellings used for positional edges.
 
-    role = str(role)
-    if role.startswith("arg:") and role[4:].isdigit():
-        return int(role[4:])
-    if role.startswith("arg") and role[3:].isdigit():
-        return int(role[3:])
-    return None
+    Delegates to the graph package, which owns edge roles and therefore
+    owns the operator that reads them. Kept as a name here because callers
+    in this module already use it; the implementation must not be a second
+    copy, since the two would drift and a position is not a thing to be
+    slightly wrong about.
+    """
+
+    return positional_argument_index(role)
 
 
 def _method_parameter_layout(graph: Any) -> tuple[
