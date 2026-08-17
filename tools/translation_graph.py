@@ -81,6 +81,11 @@ def build(contract: Any):
     # so every colour in every representation ultimately originates at a
     # place the author actually wrote, and a node's colour says which
     # authored text reached it.
+    # Every authored function in the source, not just the advance. The
+    # control shell, the frame driver and the dt controller are as much
+    # the program as the traversal is, and a function nothing crosses into
+    # shows up as untraced -- which reads as "the compiler lost it" when it
+    # actually means "nothing here was ever connected to authored text".
     tree = ast.parse(SYMBOLIC_FLUID_DT_SOURCE)
     occurrences: list[tuple[Any, str, int, int, int]] = []
     for node in ast.walk(tree):
@@ -232,12 +237,42 @@ def build(contract: Any):
                 )
                 crossings += 1
 
-    entries = [
-        (key, DYNAMIC, ordinal, name, "")
-        for ordinal, (key, name, _row, _start, _end) in enumerate(occurrences)
-    ]
+    # Sources at every representation, not only at ingestion.
+    #
+    # One layer answers "what authored text reached here". Three layers
+    # answer "and what did it look like once it was mathematics, and once
+    # it was an instruction" -- which is the question that needs the
+    # SymPy and SSA stages to inject too. Each source keeps a distinct
+    # frequency regardless of layer, so a location's spectrum can be
+    # filtered to any subset of layers and re-projected without solving
+    # again: the lines are already separable by origin.
+    entries: list[tuple[Any, str, int, str, str]] = []
+    layer_of: dict[Any, str] = {}
+    ordinal = 0
+    for key, name, _row, _start, _end in occurrences:
+        entries.append((key, DYNAMIC, ordinal, name, "python"))
+        layer_of[key] = "python"
+        ordinal += 1
+    for name, symbol in sorted(symbols.items()):
+        key = ("sy", symbol)
+        entries.append((key, DYNAMIC, ordinal, name, "sympy"))
+        layer_of[key] = "sympy"
+        ordinal += 1
+    for function_name, function in module.functions.items():
+        for formal in function.args:
+            key = ("ssa", function_name, int(formal.id))
+            if key in layer_of:
+                continue
+            entries.append((
+                key, DYNAMIC, ordinal,
+                f"{function_name.split('__')[-1]}:t{int(formal.id)}", "ssa",
+            ))
+            layer_of[key] = "ssa"
+            ordinal += 1
     field.add_sources(entries)
-    return field, occurrences, home, module, model, crossings, edges
+    return (
+        field, occurrences, home, module, model, crossings, edges, layer_of
+    )
 
 
 def dissect(field: Any, key: Any) -> list[tuple[str, float, float]]:
@@ -341,11 +376,15 @@ def main() -> int:
     from src.compiler.influence_field import InfluenceContract
 
     contract = InfluenceContract(enabled=True, spectral=True)
-    field, occurrences, home, module, model, crossings, edges = build(contract)
+    (
+        field, occurrences, home, module, model, crossings, edges,
+        layer_of,
+    ) = build(contract)
     readings = list(field.table())
     print(f"one field over three representations")
-    print(f"  ingestion sources (authored identifier occurrences): "
-          f"{len(occurrences)}")
+    import collections as _c
+    print("  injection layers:", dict(_c.Counter(layer_of.values())))
+    print(f"  authored identifier occurrences: {len(occurrences)}")
     print(f"  cross-language edges: {crossings}")
     print(f"  ssa values in the region: {len(home)}")
     print(f"  nodes with a reading: {len(readings)}")
