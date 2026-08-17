@@ -65,70 +65,117 @@ that parameter from a callable to a `build_directory`. It now passes
 `tmp_path`. The test had been failing with a `TypeError` before reaching any
 compiler code.
 
-## What is NOT done: the LLVM lane's loop-carried reductions
+## Two more real defects found and fixed, in the native-runtime Python binder
+
+These are NOT in the Fortran/LLVM emission at all -- they are in
+`symbolic_fluid_native_runtime.py`, the hand-written Python shim that reads
+compiled results back out by name. Both were found by direct execution-buffer
+inspection (compile, run, print `.accounting` and actual returned values),
+not by reading code and guessing.
+
+5. **`state.last_wave_speed`/`last_height_violation`/`last_tracer_violation`
+   never wrote back.** `symbolic_fluid_dt.py`'s source used a bare alias
+   (`state.last_wave_speed = max_wave_speed`) for a loop-carried reduction.
+   A bare alias produces no real instruction, so the compiler had nothing to
+   route through `carried_port_values` the way the `Ret` path already does --
+   the ABI argument stayed `intent(in)` and the runtime read back its own
+   seed. The array fields three lines above already work around this with a
+   `+ 0.0` forced-copy idiom (`state.height = state.next_height + 0.0`);
+   applying the same idiom to the three scalar fields fixed them identically.
+   Fixed in `symbolic_fluid_dt.py`.
+
+6. **`Metrics(...)`'s return record was bound to field names by raw
+   position** -- `zip(dataclasses.fields(Metrics), record[1:])` in
+   `symbolic_fluid_native_runtime.py`'s `_bind`. The dataclass's declared
+   field order has no relation to the actual return record's order (that
+   order reflects which fields ended up literals vs defaults vs
+   region-call results, an internal compilation detail, confirmed by direct
+   inspection to be `[div_inf, mass_err, osc_flag, stiff_flag, sim_frame,
+   proc_ms, dt_limit, hard_failure, max_vel, max_flux]` -- nothing like
+   declaration order). `dt_limit`'s real value was landing under `max_vel`'s
+   name; `div_inf`'s literal 0.0 was landing under `max_vel` too. This only
+   ever "worked" for `max_vel` by coincidence of the offsets at the time --
+   fixing defect 5 above changed the record's shape slightly and broke even
+   that coincidence, which is what surfaced this.
+
+   Replaced with name-based resolution using each component's own
+   accounting instead: a defaulted field names itself directly
+   (`program_abi_default`), a literal keyword names itself directly
+   (`program_abi_constructor_literal`), and a computed field resolves via
+   the producing region's own captured-operand names (a planner region
+   keeps the caller's own identity for anything it CAPTURES rather than
+   computes itself, so a reduction's non-self-computed operand -- e.g.
+   `max(carried, wave_speed)`'s `wave_speed` -- still carries its outer
+   name even though the reduction's own result does not). Also gave
+   `dt_limit`'s previously-inline expression a local name
+   (`dt_stable_limit`) so it resolves the same way as `mass_error`. A hard
+   `RuntimeError` now fires if a required field can't be named, instead of
+   silently mispairing.
+
+Verified together: `max_vel`, `max_flux`, `dt_limit`, and all three
+`state.last_*` fields now read correct values matching independently
+computed ground truth (1.010970, 1.010970, 0.111279, matching a fresh
+NumPy-computed max wave speed and CFL limit for the same state).
+
+## What is NOT done: `mass_err` reads exactly `0.0`
 
 `tests/test_symbolic_fluid_native_runtime.py::test_native_sympy_fluid_step_rejects_rolls_back_and_lands_on_frame`
-now compiles and runs (~21 s) and fails on a PHYSICS assertion, not a build
-error: attempt 1 at `dt=0.2` is accepted where the reference expects it
-rejected, because `metrics.mass_err` comes back `0.0`.
+now compiles and runs (~19-21s) and fails on one remaining physics assertion:
+attempt 1 at `dt=0.2` is accepted where the reference expects it rejected,
+because `metrics.mass_err` comes back `0.0` against a true `1.680060e-04`
+(computed independently from grid state before/after in the test harness).
+This is the ONLY remaining blocker for this test -- confirmed by reading
+`step_with_dt_control_used` in `dt_controller.py`: the accept/reject decision
+never consults `dt_limit`/CFL at all, only `mass_err > mass_max`, `div_inf`,
+and named `error_channels`; `dt_limit` being correct now (see above) does not
+matter to this test.
 
-This is the pre-existing defect commit `5c774c7` documented ("the loop-carried
-scalar reductions ... never update across the traversal"). It is NOT a
-regression from the work above.
+**Ruled out:** the name-binding bug above. `mass_err`'s id resolves correctly
+by name now (confirmed: `by_kwarg["mass_err"]` points at the right SSA value,
+same mechanism that fixed `max_vel`/`dt_limit`). The runtime genuinely reads
+`0.0` out of that value's buffer.
 
-Measured, not assumed:
+**Traced so far, with exact LLVM IR references** (from
+`compile_native_symbolic_fluid_advance(...).artifact.llvm_ir`):
 
-| quantity | native | truth |
-|---|---|---|
-| `metrics.mass_err` | `0.0` | `1.680060e-04` (computed from grid state before/after) |
-| `metrics.max_vel` | `1.0109701635896629` | `1.0042038251280456` (`max sqrt(g*h)`) -- **correct** |
-| `state.last_wave_speed` | `0.0` | should equal `max_vel` |
-| `state.last_height_violation` | `0.0` | (same write-back path) |
+- The repository SSA is structurally sound: region_6's call passes
+  `next_mass`/`previous_mass` at the correctly-named positions
+  (`value_names` confirms), region_6's own `Sub[171, 172]` subtracts them in
+  the right order, and its `Div` correctly produces the id `_bind` now
+  correctly labels `mass_err`.
+- The LLVM control flow places the call correctly: `loop_exit:` (after the
+  outer loop, not inside it) contains
+  `call ... @...planned_region_6(..., ptr %phi.192, ptr %phi.193, ...)`.
+- `%phi.192`/`%phi.193` are defined in `loop_header:` as
+  `phi ptr [ %value.187/%value.188, %entry ], [ %phi.207/%phi.208, %loop_latch ]`
+  -- i.e. LLVM expects `%phi.207`/`%phi.208` (the accumulated per-iteration
+  results) to be available wherever control reaches `%loop_latch`.
+- But `loop_latch:`'s own visible instructions only update the induction
+  variable (`%value.195` feeding `%phi.194`) -- `%phi.207`/`%phi.208` are
+  never mentioned there. They are defined instead inside the INNER loop nest
+  (`%phi.207 = phi ptr [ %phi.192, %loop_body ], [ %value.116, %loop_latch.1 ]`,
+  i.e. the inner loop's own accumulation, which must reach `%loop_latch`
+  through the inner loop's own exit block by dominance, not by a literal
+  reference inside `%loop_latch:` itself).
 
-Note `g ~= 1.0` in this program, not 9.81 -- so `max_vel` being ~1.01 is
-CORRECT, and the max reductions genuinely work. An earlier reading of this
-table as "max_vel is wrong" was based on assuming g=9.81; measure before
-concluding.
+**Next step, not yet done:** trace the inner loop's own exit block (find
+where `%loop_header.1`/`%loop_body.1`/`%loop_latch.1` branch back out to the
+outer `%loop_latch`) and confirm whether `%phi.207`/`%phi.208` genuinely
+dominate that branch with their fully-accumulated value, or whether the
+inner loop exits too early / branches around them. This is a real LLVM CFG
+question, not a naming or binding question -- don't re-check `_bind` or the
+repository SSA again, both are confirmed correct for this value.
 
-### The SSA is correct -- verified, not assumed
+**Diagnostic trap already hit, worth avoiding:** probing `next_mass`/
+`previous_mass` by adding a NEW `state.field = next_mass + 0.0`-style
+expression to the source is unsafe as a diagnostic -- it was exactly this
+kind of extra reference that, applied to `max_wave_speed` while debugging
+defect 5, corrupted a DIFFERENT existing consumer of the same reduction
+before the name-based `_bind` fix went in. Any new probe that adds a source
+expression should be verified not to change surrounding values before
+trusting its own readout.
 
-Do not go looking for a missing reduction in the IR. All five are present and
-correctly wired in `build/*/control_repository_ssa.pkl`:
-
-- `planned_region_2`: `47 = Add[18, 46]` -- `previous_mass += height[r,c]`
-- `planned_region_3`: `116 = Add[19, 97]` (`next_mass`), `117/118/119 = Max`
-  (`max_wave_speed`, `max_height_violation`, `max_tracer_violation`)
-- inner phis `198..202` carry each one, outer phis `183..187` carry them across
-  the outer loop, `carried_port_values` in function metadata maps port ->
-  carried phi
-- every region-call out-param slot index matches the declared output order
-  (checked exhaustively; all OK)
-- `planned_region_6` computes `136 = Sub[165, 166]` (`next_mass -
-  previous_mass`), `137 = Abs`, `141 = Div` -- and the call passes `%phi.186`
-  and `%phi.187`, two distinct pointers
-
-### Where the defect actually lives
-
-In the LLVM emission (`ssa_llvm_backend.py`), not the IR. Carried scalars are
-emitted as `phi ptr` -- pointers to fixed allocas -- e.g.
-
-```llvm
-%phi.202 = phi ptr [ %phi.187, %loop_body ], [ %value.47, %loop_latch.1 ]
-```
-
-Region calls use an out-param convention (`region_2` takes 8 in-params + 7
-out-params) and the in/out pairing is correct at the call site.
-
-The sharpest lead: **the same reduction publishes correctly through the `Ret`
-path but lands as `0.0` through the `state.last_* = ...` store path.**
-`max_vel` (Ret) is right while `state.last_wave_speed` (store) is zero, from
-one identical `max_wave_speed` value. Start there -- it isolates the failure to
-the write-back/publication of carried values rather than to the reductions
-themselves, and it likely explains `mass_err` too (`Sub` of two accumulators
-yielding exactly `0.0` is the signature of both operands reading a slot that
-was never written back, not of two nearly-equal sums).
-
-Useful probes, all cheap:
+Useful commands, all cheap:
 
 ```python
 # per-instruction SSA dump of the advance function
@@ -136,10 +183,11 @@ import pickle
 module, outputs, exports = pickle.load(open("build/sfdc/control_repository_ssa.pkl","rb"))
 fn = module.functions["symbolic_fluid_control__symbolic_fluid_advance"]
 
-# the generated LLVM IR as text
-from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
-art = emit_ssa_function_to_llvm(module, "symbolic_fluid_control__symbolic_fluid_advance")
-art.llvm_ir  # str
+# the generated LLVM IR as text, and the module_functions dict _bind uses
+from src.compiler.symbolic_fluid_native_runtime import compile_native_symbolic_fluid_advance
+adv = compile_native_symbolic_fluid_advance(build_directory)
+adv.artifact.llvm_ir       # str
+adv._module_functions       # dict[str, Function], one entry per planned_region_N
 ```
 
 The `.f90` is also worth reading directly; isolating just a caller and its
