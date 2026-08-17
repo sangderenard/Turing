@@ -2151,9 +2151,30 @@ def _emit_repository_call_module(
 
             if template is not None and result is not None:
                 result_type = _value_llvm_type(result)
+                operand_argument_types = [
+                    _value_llvm_type(argument)
+                    for argument in instruction.args
+                ]
+                # Promote, never demote. Taking the domain from args[0] alone
+                # made a mixed operation run in whatever domain its FIRST
+                # operand happened to have, so `Mul(int -1, float64 x)` --
+                # how the lowering spells negation -- ran as an integer
+                # multiply and `load_as` reached it by fptosi. Every
+                # fractional operand truncated to zero, which silently
+                # deleted whole terms from an expression rather than failing:
+                # the compiled fluid step ignored six of its inputs and
+                # never saw a tracer go negative.
+                #
+                # If any operand is floating point the operation is floating
+                # point. That is the ordinary promotion rule, and it is the
+                # safe direction: widening an integer operand is exact, while
+                # narrowing a float discards its value. Where the DECLARED
+                # result is integral the reconciliation below still converts
+                # the result back.
                 operand_type = (
-                    _value_llvm_type(instruction.args[0])
-                    if instruction.args else result_type
+                    "double" if "double" in operand_argument_types
+                    else operand_argument_types[0]
+                    if operand_argument_types else result_type
                 )
                 # The logical templates are spelled over i1; an operand that
                 # arrives in its double storage type must be coerced to a
