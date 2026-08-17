@@ -27,7 +27,9 @@ from typing import Callable
 
 import numpy as np
 
-from ..common.tensors.accelerator_backends.profiled_c_shell import _C_SOURCE
+from ..common.tensors.accelerator_backends.profiled_c_shell import (
+    _C_SOURCE, _C_TRACE_SOURCE,
+)
 from ..transmogrifier.graph.edge_roles import (
     keyword_argument_name,
     ordered_arguments,
@@ -363,8 +365,19 @@ def emit_fortran_c_shell_source(
     extent_overrides: Mapping[str, int] | None = None,
     initial_state_filename: str = "initial-state.bin",
     final_outputs_filename: str = "final-outputs.bin",
+    trace: bool = False,
+    trace_capacity: int = 4096,
 ) -> str:
-    """Emit a standalone C main around one described Fortran entry point."""
+    """Emit a standalone C main around one described Fortran entry point.
+
+    ``trace`` compiles the launch digest IN. It is a compile-time decision,
+    not a runtime flag: with it off the ring, its logger and the hook that
+    would call it are absent from the binary entirely, so a launch pays
+    nothing for a facility it was not built with. With it on, every launch
+    writes one fixed-size record -- sequence, shell ns, device ns, region,
+    status -- into a ring the executable owns, and main drains it at the
+    end. Nothing crosses a language boundary while the program runs.
+    """
 
     entry = _entrypoint(module, entrypoint)
     parameters = tuple(entry.parameters)
@@ -724,7 +737,18 @@ static void turing_display_close(void) {
         display_close_lines = ["    turing_display_close();"]
 
     source = "\n".join((
+        # The macro has to precede the base source: the launch hook inside
+        # it is guarded by `#if TURING_TRACE`, so defining it afterwards
+        # would compile the ring in while leaving the hook that feeds it
+        # compiled out -- a digest that is present and permanently empty.
+        f"#define TURING_TRACE {1 if trace else 0}",
         _C_SOURCE,
+        # `_C_TRACE_SOURCE` defines the ring types itself. The companion
+        # `_C_TRACE_DECLARATIONS` exists for cffi's cdef, where the types
+        # must be announced without bodies; pasting it into a real
+        # translation unit redefines every struct and forward-references
+        # TuringLaunchProfile before the base source declares it.
+        _C_TRACE_SOURCE if trace else "",
         "",
         "#include <stdbool.h>",
         "#include <stdio.h>",
@@ -816,6 +840,11 @@ static int turing_read_file(
         f"    void *slots[{len(values)}] = {{0}};",
         "    TuringLaunchProfile profile = {0};",
         "    TuringLaunchStats stats = {0};",
+        *((
+            "    TuringTraceRing trace_ring = {0};",
+            f"    TuringTraceRecord trace_storage[{trace_capacity}];",
+            "    TuringTraceSite trace_site = {0};",
+        ) if trace else ()),
         "    int frame;",
         "    { int argument_index;",
         "      for (argument_index = 2; argument_index < argc; ++argument_index)",
@@ -829,10 +858,20 @@ static int turing_read_file(
         "    fclose(state);",
         *display_open_lines,
         "    turing_launch_stats_reset(&stats);",
+        *((
+            f"    turing_trace_ring_reset(&trace_ring, trace_storage, {trace_capacity});",
+            "    trace_site.ring = &trace_ring;",
+            "    trace_site.region = 0;",
+        ) if trace else ()),
         f"    for (frame = 0; {display_loop_condition}; ++frame) {{",
         *display_message_lines,
         "        if (turing_profiled_launch_ex(turing_fortran_compute, slots,",
-        "                &profile, &stats, NULL, NULL, 3) != 1) return 5;",
+        (
+            "                &profile, &stats, turing_trace_logger_address(),"
+            " &trace_site, 3) != 1) return 5;"
+            if trace else
+            "                &profile, &stats, NULL, NULL, 3) != 1) return 5;"
+        ),
         *display_present_lines,
         *feedback_lines,
         "        if (stream_frames) {",
@@ -844,6 +883,25 @@ static int turing_read_file(
         "    }",
         *display_close_lines,
         *feedback_finalize_lines,
+        *((
+            "    { unsigned long long available ="
+            " turing_trace_available(&trace_ring);",
+            "      unsigned long long lost = turing_trace_lost(&trace_ring);",
+            "      unsigned long long index;",
+            "      fprintf(stderr,"
+            " \"{\\\"trace\\\":{\\\"records\\\":%llu,"
+            "\\\"lost\\\":%llu,\\\"launches\\\":[\", available, lost);",
+            "      for (index = 0; index < available; ++index) {",
+            "        const TuringTraceRecord *record ="
+            " &trace_ring.records[index % trace_ring.capacity];",
+            "        fprintf(stderr, \"%s{\\\"seq\\\":%llu,"
+            "\\\"shell_ns\\\":%llu,\\\"device_ns\\\":%llu,"
+            "\\\"region\\\":%d,\\\"status\\\":%d}\","
+            " index ? \",\" : \"\", record->sequence, record->shell_ns,"
+            " record->device_ns, record->region, record->status);",
+            "      }",
+            "      fprintf(stderr, \"]}}\"); fputc(10, stderr); }",
+        ) if trace else ()),
         "    printf(\"{\\\"status\\\":%d,\\\"frames\\\":%d,\\\"shell_ns_total\\\":%llu,\\\"outputs\\\":{\",",
         "           profile.status, frame, stats.shell_ns_total);",
         *output_lines,
@@ -871,6 +929,7 @@ def compile_fortran_module_c_shell(
     name: str = "turing_fortran_c_shell",
     standalone: bool = True,
     library: bool = False,
+    trace: bool = False,
 ) -> FortranCShellExecutable:
     """Compile generated Fortran plus the generic profiled C main.
 
@@ -940,6 +999,7 @@ def compile_fortran_module_c_shell(
     c_path.write_text(
         emit_fortran_c_shell_source(
             module,
+            trace=trace,
             entrypoint=entry.name,
             state_feedback=state_feedback,
             extent_overrides=extents,

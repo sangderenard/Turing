@@ -40,7 +40,8 @@ def _resolve(source: str, roots: dict) -> object:
 
 
 def build(pkl_path: Path, directory: Path, *, grid: int = 32,
-          frame_duration: float = 1.0 / 30.0, dt_initial: float = 1.0e-3):
+          frame_duration: float = 1.0 / 30.0, dt_initial: float = 1.0e-3,
+          trace: bool = False):
     with pkl_path.open("rb") as stream:
         module, outputs, exports = pickle.load(stream)
 
@@ -166,6 +167,7 @@ def build(pkl_path: Path, directory: Path, *, grid: int = 32,
         fortran,
         inputs,
         directory,
+        trace=trace,
         state_feedback={"dt_initial": "t14"},
         extent_overrides=extent_overrides,
         name="symbolic_fluid_frame_shell",
@@ -199,5 +201,9 @@ if __name__ == "__main__":
     out = Path(sys.argv[2]) if len(sys.argv) > 2 else (
         ROOT / "build" / "fluid-c-shell"
     )
-    executable = build(pkl, out)
-    print("built:", executable.executable_path)
+    # `--trace` compiles the launch digest into the executable. It is a
+    # build-time choice, not a runtime switch: without it the ring and its
+    # logger are not in the binary at all.
+    trace = "--trace" in sys.argv[3:]
+    executable = build(pkl, out, trace=trace)
+    print("built:", executable.executable_path, "(trace)" if trace else "")
