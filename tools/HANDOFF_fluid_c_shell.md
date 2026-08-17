@@ -169,6 +169,17 @@ The arrays lost their shape somewhere before region_4 was built -- that is
 the next thing to find, and it is an *extent/shape propagation* question,
 not an aliasing or identity one.
 
+**Where to look for the shape loss (owner's steer, recorded before it is
+lost).** Do not assume the loss happens near region_4. It may originate far
+upstream, at the AST/SymPy process-graph *inlet* -- in the special-cases
+and schema-replacement machinery that conforms nodes on the way in
+(`node_special_cases`, `python_special_cases`, `interpret_special_case`,
+and the tensor-intrinsic recognition around them). A tensor intrinsic
+misrecognised there would produce exactly this: a whole-array operation
+that arrives downstream already shaped as a scalar, with every later stage
+faithfully preserving that mistake. Start there before instrumenting
+region_4 itself.
+
 This also explains the failing test without any appeal to `mass_err`: the
 grid never actually advances (15/16 cells keep their old values), so the
 controller sees a nearly-static field, nothing violates a bound, and
