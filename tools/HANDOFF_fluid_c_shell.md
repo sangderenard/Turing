@@ -233,6 +233,60 @@ The arrays lost their shape somewhere before region_4 was built -- that is
 the next thing to find, and it is an *extent/shape propagation* question,
 not an aliasing or identity one.
 
+### ROOT CAUSE OF THE SHAPE LOSS — found by reading, not by instrument
+
+Two facts in `glsl_deployment_strategy.py`, which together turn every
+whole-array record field into a scalar:
+
+**1. The record-field ABI fact drops rank.** Resolving `state.next_height`
+reaches the `parameter_record_abi` field descriptor and builds a
+`_ProgramABIValueFact` from **dtype and storage only** (~line 13102):
+
+```python
+return _ProgramABIValueFact(
+    python_type,
+    str(field.get("storage") or "unknown"),   # "span"
+    None if dtype is None else str(dtype),
+)
+```
+
+The same `field` dict carries `rank: 2`. It is never read. `storage` is
+known to be `"span"` and that is not used to imply a rank either.
+
+**2. The default domain then collapses to scalar.** `_value_shape_dtype`'s
+`declared()` (~line 1793) takes shape from `tensor["shape"]`, else a
+planner specialization, else `domain_node.shape`. A node carrying no
+tensor record gets `ensure_node`'s default `DomainNode(shape=(1,1,1))`,
+and the logical-shape line filters unit dimensions:
+
+```python
+tuple(int(dim) for dim in shape if int(dim) != 1)   # (1,1,1) -> ()
+```
+
+So the value arrives at planning with shape `()`.
+
+`plan_region_to_ssa_instrs` is then faithful to what it was given and
+emits a scalar `Add` -- while its own docstring promises "a value is the
+array it is and array ops lower as array ops rather than scalars". It can
+only keep that promise if `value_shapes` is right; nothing upstream ever
+told it the rank.
+
+This is the owner's "intrinsics read in without their type overrides",
+concretely: the ABI *declares* rank 2, the abstract-tensor path never sees
+it, and the default domain silently means scalar. It explains every
+instance of the one-element pattern -- `height`, `momentum_x`,
+`momentum_y`, `tracer` are all rank-2 fields and all were copied one
+element.
+
+**Fix shape (not yet applied).** Carry rank on `_ProgramABIValueFact` and
+have `declared()` prefer an ABI-declared rank over the default domain.
+Note the extents are dynamic, so the useful fact is the RANK, not a static
+shape -- the Fortran backend already resolves such values through the
+extents vector, which is why it handles rank-2 spans correctly while the
+static-shape path does not. Verify with
+`diagnose_translation.py --stages 2`, which now reports exactly these four
+values, and with `differential_translation.py`.
+
 **Where to look for the shape loss (owner's steer, recorded before it is
 lost).** Do not assume the loss happens near region_4. It may originate far
 upstream, at the AST/SymPy process-graph *inlet* -- in the special-cases
