@@ -13,8 +13,14 @@ This exists because manually grepping IR text and cross-referencing pickled
 SSA by hand, one id at a time, does not scale -- this makes one fresh
 compile answer "what does every layer believe about id N" in one shot.
 
-Usage:
-    python tools/correlate_compile.py 116 47 117 187 188 192 193 206 207 208
+Usage (ids accept commas, spaces, and inclusive ranges):
+    python tools/correlate_compile.py 116 47 117
+    python tools/correlate_compile.py 116,47,117
+    python tools/correlate_compile.py 100-120
+    python tools/correlate_compile.py 100-120,141,187..193
+
+See tools/TRANSLATION_DEBUGGING.md for when to reach for this versus
+tools/diagnose_translation.py.
 """
 from __future__ import annotations
 
@@ -85,7 +91,12 @@ def find_llvm_lines(llvm_ir: str, value_id: int) -> list[str]:
 
 
 def main() -> int:
-    value_ids = [int(a) for a in sys.argv[1:]]
+    from diagnose_translation import parse_id_spec
+
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 1
+    value_ids = list(parse_id_spec(" ".join(sys.argv[1:])))
     if not value_ids:
         print(__doc__)
         return 1

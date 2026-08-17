@@ -82,6 +82,42 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
+def parse_id_spec(spec: str) -> tuple[int, ...]:
+    """Parse an id selection: ``116``, ``116,47``, ``100-120``, mixed.
+
+    Accepts commas and/or whitespace as separators and ``a-b`` (inclusive)
+    or ``a..b`` as ranges, so a caller can sweep a numbering neighbourhood
+    without typing every id. Order is preserved and duplicates collapse,
+    because these ids are printed as report sections and a repeated
+    section reads as a different value rather than the same one twice.
+    """
+    found: list[int] = []
+    for token in str(spec).replace(",", " ").split():
+        token = token.strip()
+        if not token:
+            continue
+        body = token.replace("..", "-")
+        if "-" in body.lstrip("-"):
+            low_text, _, high_text = body.lstrip("-").partition("-")
+            try:
+                low, high = int(low_text), int(high_text)
+            except ValueError:
+                raise SystemExit(f"could not read id range {token!r}")
+            if low > high:
+                low, high = high, low
+            if high - low > 4096:
+                raise SystemExit(
+                    f"id range {token!r} spans {high - low} ids; narrow it"
+                )
+            found.extend(range(low, high + 1))
+            continue
+        try:
+            found.append(int(body))
+        except ValueError:
+            raise SystemExit(f"could not read id {token!r}")
+    return tuple(dict.fromkeys(found))
+
+
 def _ok(msg: str) -> None:
     print(f"  [ok]   {msg}")
 
@@ -286,6 +322,8 @@ def stage_5_influence(fn: Any, ids: tuple[int, ...]) -> None:
     transports = field.propagate()
     _info(f"{transports} transports over {name.split('__')[-1]}")
 
+    readings: dict[int, dict[str, float]] = {}
+
     def locate(vid: int):
         for label, block in fn.blocks.items():
             for instr in block.instrs:
@@ -307,6 +345,31 @@ def stage_5_influence(fn: Any, ids: tuple[int, ...]) -> None:
             for category, entry in (reading.categories or {}).items()
         }
         _info(f"id {vid} in {label}: {parts}")
+        readings[vid] = {
+            category: round(getattr(entry, "weight", 0.0), 6)
+            for category, entry in (reading.categories or {}).items()
+        }
+
+    # The signal here is comparative, so do the comparison rather than
+    # leaving it to the reader: identical weights between two values that
+    # should be independent means they share an influence path.
+    identical: list[tuple[int, int]] = []
+    seen = list(readings.items())
+    for index, (left, left_weights) in enumerate(seen):
+        for right, right_weights in seen[index + 1:]:
+            if left_weights and left_weights == right_weights:
+                identical.append((left, right))
+    if identical:
+        for left, right in identical:
+            _bad(
+                f"ids {left} and {right} have IDENTICAL influence weights -- "
+                "they share an influence path. Expected if they are two "
+                "outputs of the SAME region call (the def-use view treats "
+                "that call as one node); a real finding otherwise."
+            )
+    elif len(readings) > 1:
+        _ok("no two selected ids share an identical influence profile")
+
     _info(
         "Read these COMPARATIVELY, never absolutely. Baked dominance is the "
         "norm in this program (dt/dx/gravity/limits feed nearly everything), "
@@ -319,12 +382,30 @@ def stage_5_influence(fn: Any, ids: tuple[int, ...]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ids", default="")
-    args = parser.parse_args()
-    ids = tuple(
-        int(x) for x in args.ids.replace(",", " ").split() if x.strip()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Staged decision tree for translation defects. See "
+            "tools/TRANSLATION_DEBUGGING.md for the full questionnaire."
+        ),
+        epilog=(
+            "ids accept commas, spaces, and inclusive ranges: "
+            "--ids 141 | --ids 141,47 | --ids 100-120 | --ids 100-120,141"
+        ),
     )
+    parser.add_argument(
+        "--ids", default="",
+        help="value ids to inspect; commas/spaces/ranges (a-b or a..b)",
+    )
+    parser.add_argument(
+        "--stages", default="",
+        help="run only these stages, e.g. --stages 2,3 (default: all)",
+    )
+    args = parser.parse_args()
+    ids = parse_id_spec(args.ids)
+    wanted = set(parse_id_spec(args.stages)) if args.stages else set()
+
+    def run(stage: int) -> bool:
+        return not wanted or stage in wanted
 
     from src.compiler.symbolic_fluid_native_runtime import (
         compile_native_symbolic_fluid_advance,
@@ -337,17 +418,22 @@ def main() -> int:
     fn = adv.function
     module_functions = adv._module_functions or {}
 
-    healthy = stage_1_shortfalls(adv.artifact)
-    print()
-    healthy &= stage_2_ssa_wellformed(fn)
-    print()
-    healthy &= stage_3_inplace_safety(fn, module_functions)
-    print()
-    if ids:
+    healthy = True
+    if run(1):
+        healthy &= stage_1_shortfalls(adv.artifact)
+        print()
+    if run(2):
+        healthy &= stage_2_ssa_wellformed(fn)
+        print()
+    if run(3):
+        healthy &= stage_3_inplace_safety(fn, module_functions)
+        print()
+    if run(4) and ids:
         stage_4_observability(adv, ids)
         print()
-    stage_5_influence(fn, ids)
-    print()
+    if run(5):
+        stage_5_influence(fn, ids)
+        print()
     print("VERDICT:", "no stage proved inconsistent" if healthy
           else "a stage above is provably inconsistent -- start there")
     return 0
