@@ -187,8 +187,78 @@ def spectrum_rgb(
     return tuple(float(channel) for channel in xyz_to_srgb(xyz).tolist())
 
 
+# -- viewing conditions ---------------------------------------------------
+#
+# Colour is judged against its surround, not in isolation. A black page
+# makes every swatch read lighter and more saturated than it is, and a
+# white one does the reverse; either way the reader is comparing hues
+# against a bias that changes with the swatch. A neutral achromatic
+# surround is the standard answer, and it is the one thing that lets two
+# colours on the same page be compared honestly.
+#
+# ISO 3664 puts the surround for graphic-arts appraisal at L* 60 +/- 10,
+# achromatic. L* 60 is used here, converted through the CIE lightness
+# function rather than picked by eye, so it is genuinely neutral and
+# genuinely mid-lightness rather than merely "some grey".
+NEUTRAL_SURROUND_LSTAR = 60.0
+
+
+def lstar_to_srgb_grey(lightness: float = NEUTRAL_SURROUND_LSTAR) -> float:
+    """CIE L* to an achromatic sRGB channel value in [0, 1].
+
+    L* is perceptually uniform and sRGB is not, so a "50% grey" chosen as
+    128/255 is nowhere near mid-lightness. This does the actual inversion.
+    """
+    value = float(lightness)
+    luminance = (
+        ((value + 16.0) / 116.0) ** 3 if value > 8.0
+        else value / 903.3
+    )
+    if luminance <= SRGB_LINEAR_CUTOFF:
+        return SRGB_LINEAR_SLOPE * luminance
+    return SRGB_SCALE * luminance ** (1.0 / SRGB_GAMMA) - SRGB_OFFSET
+
+
+def relative_luminance(rgb: Sequence[float]) -> float:
+    """WCAG relative luminance: linearise, then weight by the sRGB primaries."""
+    linear = []
+    for channel in tuple(rgb)[:3]:
+        value = max(0.0, min(1.0, float(channel)))
+        linear.append(
+            value / SRGB_LINEAR_SLOPE if value <= 0.04045
+            else ((value + SRGB_OFFSET) / SRGB_SCALE) ** SRGB_GAMMA
+        )
+    red, green, blue = linear
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def contrast_ratio(first: Sequence[float], second: Sequence[float]) -> float:
+    """WCAG contrast ratio between two colours, in [1, 21]."""
+    light = relative_luminance(first)
+    dark = relative_luminance(second)
+    if light < dark:
+        light, dark = dark, light
+    return (light + 0.05) / (dark + 0.05)
+
+
+def contrasting_ink(background: Sequence[float]) -> tuple[float, float, float]:
+    """Black or white on `background`, whichever a reader can actually read.
+
+    Chosen by measured contrast rather than by a luminance threshold. A
+    fixed cutoff gets saturated blues and yellows wrong, and those are
+    exactly the ends of the spectral arc -- so the mistake would land on
+    the deepest and shallowest provenance, where it is least affordable.
+    """
+    black, white = (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)
+    return (
+        white if contrast_ratio(background, white)
+        >= contrast_ratio(background, black) else black
+    )
+
+
 __all__ = [
     "WAVELENGTH", "VIOLET_NM", "RED_NM", "XYZ_TO_LINEAR_SRGB",
     "matching_functions", "wavelength_of", "tristimulus", "xyz_to_srgb",
-    "spectrum_rgb",
+    "spectrum_rgb", "NEUTRAL_SURROUND_LSTAR", "lstar_to_srgb_grey",
+    "relative_luminance", "contrast_ratio", "contrasting_ink",
 ]

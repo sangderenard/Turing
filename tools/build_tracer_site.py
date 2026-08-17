@@ -47,9 +47,13 @@ sys.path.insert(0, str(ROOT / "tools"))
 STEP = "symbolic_fluid_control__symbolic_fluid_step"
 REGION = STEP + "__planned_region_0"
 ADVANCE = "symbolic_fluid_control__symbolic_fluid_advance"
-DARK = "#14141a"
+#: An unstamped token sits at the surround lightness so it recedes without
+#: becoming a second colour competing with the spectrum.
+UNSTAMPED = None
 STATE_COLOUR = {
-    "live": "#2f7d55", "attenuated": "#7d6f2f", "unreachable": "#6e3030",
+    "live": (0.24, 0.62, 0.40),
+    "attenuated": (0.72, 0.60, 0.20),
+    "unreachable": (0.62, 0.26, 0.26),
 }
 
 
@@ -58,26 +62,37 @@ def to_hex(triple) -> str:
     return f"#{red:02x}{green:02x}{blue:02x}"
 
 
-def colour_for(field: Any, key: Any, view: str, states: dict) -> str:
-    from src.compiler.spectral_colorimetry import spectrum_rgb
+def colour_for(field: Any, key: Any, view: str, states: dict):
+    """(background, ink) for one token, both decided here.
+
+    The ink is chosen by measured contrast against the background it will
+    actually sit on, so a token stays readable whether the spectrum put it
+    at saturated violet or at dim red. Deciding it in the page would mean a
+    second colour model in JavaScript disagreeing with this one.
+    """
+    from src.compiler.spectral_colorimetry import contrasting_ink, spectrum_rgb
 
     if view == "state":
         for state, keys in states.items():
             if key in keys:
-                return STATE_COLOUR[state]
-        return DARK
+                rgb = STATE_COLOUR[state]
+                return to_hex(rgb), to_hex(contrasting_ink(rgb))
+        return None, None
     accumulator = field.moments(key).get("dynamic")
     lines = tuple(getattr(accumulator, "lines", ()) or ())
     if not lines:
-        return DARK
+        return None, None
     red, green, blue = spectrum_rgb(accumulator.normalised().lines)
     if view == "power":
         # Luminance carries arrived weight; chromaticity is untouched, so
         # dimness reads as "less got here" and never as "less certain".
+        # It also drives the ink flip: the same hue at low power needs the
+        # opposite ink from the same hue at full power.
         power = float(getattr(accumulator, "power", 0.0) or 0.0)
-        scale = max(0.12, min(1.0, power) ** 0.5)
+        scale = max(0.10, min(1.0, power) ** 0.5)
         red, green, blue = red * scale, green * scale, blue * scale
-    return to_hex((red, green, blue))
+    rgb = (red, green, blue)
+    return to_hex(rgb), to_hex(contrasting_ink(rgb))
 
 
 def origins(field: Any, key: Any, limit: int = 8) -> list:
@@ -182,8 +197,9 @@ def main() -> int:
         "colours": {
             key: {
                 view: [
-                    [row, start, end, colour_for(field, node, view, states)]
+                    [row, start, end, *colour_for(field, node, view, states)]
                     for row, start, end, node in value["tokens"]
+                    if colour_for(field, node, view, states)[0] is not None
                 ]
                 for view in views
             }
@@ -212,24 +228,49 @@ def main() -> int:
 
 
 def _page(payload: dict) -> str:
+    """Render the page against a measured neutral surround.
+
+    Every colour below is derived from the L* 60 achromatic surround, so
+    the page is a viewing condition rather than a theme: a swatch is judged
+    against neutral grey, which is the only background that does not bias
+    the hue being read. Ink is whichever of black or white measures higher
+    contrast against it, so it flips with the surround instead of being
+    asserted.
+    """
+    from src.compiler.spectral_colorimetry import (
+        contrasting_ink, lstar_to_srgb_grey,
+    )
+
+    grey = lstar_to_srgb_grey()
+    surround = to_hex((grey, grey, grey))
+    ink = to_hex(contrasting_ink((grey, grey, grey)))
+    panel = to_hex((grey * 0.88, grey * 0.88, grey * 0.88))
+    edge = to_hex((grey * 0.72, grey * 0.72, grey * 0.72))
+    muted = to_hex(tuple(
+        channel * 0.45 + grey * 0.55 for channel in contrasting_ink(
+            (grey, grey, grey)
+        )
+    ))
     data = json.dumps(payload)
     return (
         "<!doctype html><meta charset='utf-8'><title>fluid sim tracer</title>"
         "<style>"
-        "body{background:#0b0b0f;color:#d6d6e0;font:13px/1.55 ui-monospace,"
+        f"body{{background:{surround};color:{ink};font:13px/1.55 ui-monospace,"
         "Consolas,monospace;margin:0;padding:16px 20px}"
         "header{display:flex;gap:14px;align-items:center;flex-wrap:wrap;"
         "margin-bottom:10px}select,label{font:12px ui-sans-serif,system-ui}"
-        "select{background:#16161e;color:#d6d6e0;border:1px solid #2e2e3c;"
+        f"select{{background:{panel};color:{ink};border:1px solid {edge};"
         "border-radius:4px;padding:4px 6px;max-width:34em}"
-        "#note{color:#76768a;font:12px ui-sans-serif,system-ui;margin:0 0 10px}"
-        ".l{white-space:pre}.n{color:#35354a;display:inline-block;width:4em;"
+        f"#note{{color:{muted};font:12px ui-sans-serif,system-ui;margin:0 0 10px}}"
+        ".l{white-space:pre}"
+        f".n{{color:{muted};display:inline-block;width:4em;"
         "text-align:right;padding-right:1em;user-select:none}"
-        "b{font-weight:600;color:#08080a;border-radius:2px;cursor:help}"
-        "#tip{position:fixed;background:#191922;border:1px solid #35354a;"
+        "b{font-weight:600;border-radius:2px;cursor:help}"
+        f"#tip{{position:fixed;background:{panel};color:{ink};"
+        f"border:1px solid {edge};"
         "border-radius:5px;padding:8px 10px;font:11px ui-sans-serif,system-ui;"
         "pointer-events:none;display:none;max-width:24em;z-index:9;"
-        "box-shadow:0 6px 20px #0008}"
+        "box-shadow:0 6px 20px rgba(0,0,0,.35)}"
         "</style><header>"
         "<label>source <select id='source'></select></label>"
         "<label>view <select id='view'></select></label></header>"
@@ -250,7 +291,8 @@ def _page(payload: dict) -> str:
         "for(let r=0;r<L.length;r++){const line=L[r];let o='',at=0;"
         "for(const x of (by[r]||[]).sort((a,b)=>a[1]-b[1])){if(x[1]<at)continue;"
         "o+=esc(line.slice(at,x[1]));o+='<b data-k=\"'+r+','+x[1]+'\" style="
-        "\"background:'+x[3]+'\">'+esc(line.slice(x[1],x[2]))+'</b>';at=x[2];}"
+        "\"background:'+x[3]+';color:'+x[4]+'\">'+esc(line.slice(x[1],x[2]))"
+        "+'</b>';at=x[2];}"
         "o+=esc(line.slice(at));h+='<div class=\"l\"><span class=\"n\">'+(r+1)"
         "+'</span>'+o+'</div>';}C.innerHTML=h;"
         "N.textContent=D.sources[s].label+' \\u2014 '+D.views[v]+'. '+sp.length+"
@@ -259,8 +301,8 @@ def _page(payload: dict) -> str:
         "if(!b){T.style.display='none';return;}"
         "const rows=(D.dissect[S.value]||{})[b.dataset.k]||[];"
         "if(!rows.length){T.style.display='none';return;}"
-        "T.innerHTML='<b style=\"background:none;color:#8ab\">reached by</b><br>'"
-        "+rows.map(r=>esc(r[0])+' <span style=\"color:#9cf\">'"
+        "T.innerHTML='<b style=\"background:none\">reached by</b><br>'"
+        "+rows.map(r=>esc(r[0])+' <span style=\"opacity:.72\">'"
         "+(100*r[1]).toFixed(1)+'%</span>').join('<br>');"
         "T.style.display='block';T.style.left=Math.min(e.clientX+14,"
         "window.innerWidth-320)+'px';T.style.top=(e.clientY+14)+'px';});"
