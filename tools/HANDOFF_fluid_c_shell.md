@@ -117,7 +117,70 @@ Verified together: `max_vel`, `max_flux`, `dt_limit`, and all three
 computed ground truth (1.010970, 1.010970, 0.111279, matching a fresh
 NumPy-computed max wave speed and CFL limit for the same state).
 
-## What is NOT done: `mass_err` reads exactly `0.0`
+## RESOLVED: `mass_err = 0.0` was CORRECT. The real defect is the array copy.
+
+Found with the value watch (`emit_ssa_function_to_llvm(..., watch=..., history=N)`),
+which made the previously-unobservable accumulators readable per iteration.
+
+**The measurement that settled it.** Watching the two carried accumulators
+with `history=24` gave their per-iteration series:
+
+```
+next_mass: 0.0, 0.997309, 1.993802, 2.997286, 3.999977, ... 16.017591
+prev_mass: 0.0, 1.0,      2.0,      3.0,      4.0,      ... 16.017591
+```
+
+The summands genuinely differ (`0.997309` vs `1.0`), so the two
+accumulators are NOT aliased and never were -- and they converge to the
+same total because **the scheme conserves mass**. `next_mass ==
+prev_mass` is the physically correct result, so `mass_err = 0.0` is the
+correct answer and was never the bug.
+
+(The 20 samples for a 16-cell grid are 4 outer iterations x (4 inner + 1
+exit-check re-entry); the repeated values in the series are the exit
+checks, not lost work.)
+
+**What is actually broken.** `state.next_height` is computed correctly in
+all 16 cells (`sum = 16.017591076142672`, matching the old sum to 4 ulp --
+mass conserved). But after `advance` returns:
+
+```
+cells where state.height != state.next_height: 15 of 16
+```
+
+Only cell `[0,0]` is updated. So `state.height = state.next_height + 0.0`
+-- the whole-array copy -- copies **one element instead of the array**.
+
+**Root cause, confirmed.** That copy is `planned_region_4`, and every one
+of its values is shaped `()`:
+
+```
+region_4 formals: [(120, 'float64', ()), (124, ...), ...]   # all scalar
+  122 = Add[120, 121]   res_shape=()
+  126 = Add[124, 125]   res_shape=()
+  130 = Add[128, 129]   res_shape=()
+  134 = Add[132, 133]   res_shape=()
+```
+
+The emitter's copy path branches on `_value_element_count(output)`: count
+1 emits a scalar load/store, otherwise a `memcpy`. With `()` shape the
+count is 1, so a 16-element array copy is emitted as a single scalar copy.
+The arrays lost their shape somewhere before region_4 was built -- that is
+the next thing to find, and it is an *extent/shape propagation* question,
+not an aliasing or identity one.
+
+This also explains the failing test without any appeal to `mass_err`: the
+grid never actually advances (15/16 cells keep their old values), so the
+controller sees a nearly-static field, nothing violates a bound, and
+`dt=0.2` is accepted where the reference rejects it.
+
+**Correcting the record:** the "truth" value of `1.680060e-04` used
+throughout this handoff as the expected `mass_err` was itself derived from
+`state.height` *after* the call -- i.e. from the corrupted copy. It was
+never the right target. Two separate wrong conclusions came from trusting
+it; see the field notes in `tools/TRANSLATION_DEBUGGING.md`.
+
+## Superseded: the old `mass_err` investigation
 
 `tests/test_symbolic_fluid_native_runtime.py::test_native_sympy_fluid_step_rejects_rolls_back_and_lands_on_frame`
 now compiles and runs (~19-21s) and fails on one remaining physics assertion:

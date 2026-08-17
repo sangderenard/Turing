@@ -353,6 +353,21 @@ from typing import (
 )
 
 from ..transmogrifier.ssa import IRModule as _IRModule, SSAValue as _SSAValue
+
+# Synthetic buffer ids for history watches. They are deliberately far above
+# any real SSA numbering so a history slot can never be mistaken for, or
+# collide with, a value the program actually owns -- the id-collision class
+# of bug this tree has already paid for more than once.
+_HISTORY_RING_BASE = 1_000_000_000
+_HISTORY_COUNT_BASE = 2_000_000_000
+
+
+def history_ids(value_id: int) -> tuple[int, int]:
+    """Buffer ids carrying ``value_id``'s history ring and its sample count."""
+    return (
+        _HISTORY_RING_BASE + int(value_id),
+        _HISTORY_COUNT_BASE + int(value_id),
+    )
 from .output_publication import (
     function_output_publications,
     publication_surface_plan,
@@ -477,6 +492,7 @@ def _emit_repository_call_module(
     entry_name: str,
     text_sink: bool,
     watch: _Sequence[int] = (),
+    history: int = 0,
 ) -> "LLVMFunctionArtifact":
     """Emit a repository-SSA call closure with a pointer-only internal ABI.
 
@@ -761,6 +777,38 @@ def _emit_repository_call_module(
         raw_id for raw_id in watched_ids
         if raw_id in (phi_backed if watch else {})
     )
+    # A history watch keeps every value the phi selected, not just the last
+    # one, in a ring. A final value proves an accumulator ended wrong; only
+    # the per-iteration series shows WHICH step it went wrong on, which is
+    # the difference between knowing there is a bug and knowing where.
+    #
+    # The ring is written with `urem`, so it is branch-free and cannot run
+    # off its end no matter how many iterations execute. The companion
+    # counter records how many samples were taken, so a reader can tell a
+    # full ring from a partly-filled one and can recover ordering when the
+    # count exceeds the depth.
+    history_slots: dict[int, tuple[int, int]] = {}
+    if watch and history:
+        depth = max(1, int(history))
+        root_values = values_by_function.get(function_name, {})
+        appended_history = []
+        for raw_id in sorted(phi_watch_ids):
+            value = root_values.get(raw_id)
+            if value is None:
+                continue
+            ring_id = _HISTORY_RING_BASE + raw_id
+            count_id = _HISTORY_COUNT_BASE + raw_id
+            appended_history.append(_SSAValue(
+                ring_id,
+                dtype=getattr(value, "dtype", None) or "float64",
+                shape=(depth,),
+            ))
+            appended_history.append(_SSAValue(count_id, dtype="int64"))
+            history_slots[raw_id] = (ring_id, count_id)
+        if appended_history:
+            function_outputs[function_name] = (
+                *function_outputs[function_name], *appended_history,
+            )
 
     internal_symbols = {
         name: "__ssa_" + _re.sub(r"[^A-Za-z0-9_$.-]", "_", name)
@@ -888,6 +936,19 @@ def _emit_repository_call_module(
                     f"  {slot} = alloca {llvm_type}, i64 {count}, align 8"
                 )
                 watch_shadows[watched_id] = slot
+        # The ring and its counter are ordinary outputs, so they already have
+        # %out slots; bind them by id here so the phi capture can address them.
+        history_pointers: dict[int, tuple[str, str, int]] = {}
+        if name == function_name and history_slots:
+            depth = max(1, int(history))
+            for watched_id, (ring_id, count_id) in history_slots.items():
+                ring_pointer = output_pointer.get(ring_id)
+                count_pointer = output_pointer.get(count_id)
+                if ring_pointer is None or count_pointer is None:
+                    continue
+                history_pointers[watched_id] = (
+                    ring_pointer, count_pointer, depth,
+                )
 
         def pointer(value: _Any) -> str:
             value_id = int(value.id)
@@ -1184,6 +1245,28 @@ def _emit_repository_call_module(
                         f"  store {shadow_type} {captured}, ptr {shadow}, "
                         "align 8"
                     )
+                    ring = history_pointers.get(result_id)
+                    if ring is not None:
+                        ring_pointer, count_pointer, depth = ring
+                        seen = f"%watch.seen.{tag}"
+                        slot_index = f"%watch.slot.{tag}"
+                        slot_address = f"%watch.at.{tag}"
+                        advanced = f"%watch.next.{tag}"
+                        pending_shadow.extend((
+                            f"  {seen} = load i64, ptr {count_pointer}, "
+                            "align 8",
+                            # urem, not a bounds branch: straight-line code
+                            # cannot run off the ring and cannot disturb the
+                            # block structure the phi group depends on.
+                            f"  {slot_index} = urem i64 {seen}, {depth}",
+                            f"  {slot_address} = getelementptr {shadow_type}, "
+                            f"ptr {ring_pointer}, i64 {slot_index}",
+                            f"  store {shadow_type} {captured}, ptr "
+                            f"{slot_address}, align 8",
+                            f"  {advanced} = add i64 {seen}, 1",
+                            f"  store i64 {advanced}, ptr {count_pointer}, "
+                            "align 8",
+                        ))
                 continue
 
             if operation in {"Br", "br"}:
@@ -2431,6 +2514,7 @@ def emit_ssa_function_to_llvm(
     pi_solver: str | None = None,
     pi_epsilon: float | None = None,
     watch: _Sequence[int] = (),
+    history: int = 0,
 ) -> LLVMFunctionArtifact:
     """Render one SSA function of table-covered instructions as LLVM IR.
 
@@ -2476,6 +2560,7 @@ def emit_ssa_function_to_llvm(
             entry_name=entry_name or function_name,
             text_sink=text_sink,
             watch=watch,
+            history=history,
         )
 
     function = module.functions[function_name]
