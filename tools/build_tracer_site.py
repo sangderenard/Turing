@@ -28,9 +28,12 @@ The page only swaps between precomputed colours: putting a colour model in
 JavaScript would be a second model that disagrees with the shader about
 the same field.
 
-Correlation is by authored name, everywhere, and an identifier with no
-reading in the selected layer stays uncoloured rather than being matched
-on position.
+Correlation uses the strongest identity each pane has. Where a text
+states which value it means (SSA tN tokens) it is read by key. Where it
+names an authored quantity it is read by name. And a stage boundary is
+not 1:1: an authored equation SPREADS over every instruction its
+expansion produced, and instructions reached by several equations MIX
+them by adding spectra. Nothing is matched on position.
 
     python tools/build_tracer_site.py
     python tools/build_tracer_site.py --out build/tracer_site.html
@@ -110,6 +113,7 @@ def build_layers(contract: Any) -> tuple[dict, dict]:
     )
 
     layers: dict[str, dict[str, tuple]] = {}
+    keyed: dict[str, dict[Any, tuple]] = {}
     labels: dict[str, str] = {}
 
     model = symbolic_viscous_shallow_water_equations()
@@ -162,12 +166,19 @@ def build_layers(contract: Any) -> tuple[dict, dict]:
                             )
     layers["ssa"] = entries
     labels["ssa"] = "lowered repository SSA"
-    return layers, labels, module, model
+    # The same field, addressed by key instead of by name. A representation
+    # that states which value it means should be read that way.
+    keyed["ssa"] = {
+        reading.key: (reading, field.moments(reading.key).get("dynamic"))
+        for reading in field.table()
+    }
+    return layers, keyed, labels, module, model
 
 
 def source_texts(module: Any, model: Any) -> tuple[dict, dict]:
     from src.compiler.symbolic_fluid_dt import SYMBOLIC_FLUID_DT_SOURCE
 
+    direct: dict[str, list] = {}
     texts = {"python": SYMBOLIC_FLUID_DT_SOURCE}
     labels = {"python": "authored Python (the traversal)"}
 
@@ -184,9 +195,15 @@ def source_texts(module: Any, model: Any) -> tuple[dict, dict]:
                 module.functions[STEP].metadata.get("named_outputs") or ()
             )
         }
-        rows = []
+        # Each rendered line remembers its block, so every tN token can be
+        # resolved to the field key it denotes. Colouring this pane by NAME
+        # lights only the values whose authored name reached a comment --
+        # eleven highlights over three hundred lines of real instructions,
+        # which is what made it look like the tracer had nothing to say
+        # about the SSA.
+        rows: list[tuple[str, str]] = []
         for block_name, block in region.blocks.items():
-            rows.append(f"{block_name}:")
+            rows.append((f"{block_name}:", block_name))
             for instruction in block.instrs:
                 result = instruction.res
                 target = "" if result is None else f"t{int(result.id)}"
@@ -195,10 +212,102 @@ def source_texts(module: Any, model: Any) -> tuple[dict, dict]:
                     f"t{int(a.id)}" for a in instruction.args
                 )
                 label = f"  {target:>7} = {instruction.op}({arguments})"
-                rows.append(label + (f"    # {named}" if named else ""))
-        texts["ssa"] = "\n".join(rows)
+                rows.append((
+                    label + (f"    # {named}" if named else ""), block_name,
+                ))
+        tokens = []
+        for row, (line, block_name) in enumerate(rows):
+            for match in re.finditer(r"t(\d+)", line):
+                tokens.append((
+                    row, match.start(), match.end(),
+                    (REGION, block_name, int(match.group(1))),
+                ))
+        direct["ssa"] = tokens
+        texts["ssa"] = "\n".join(line for line, _block in rows)
         labels["ssa"] = f"lowered SSA: {REGION.split('__')[-1]}"
-    return texts, labels
+    return texts, labels, direct
+
+
+def spread_and_mix(module: Any, sympy_entries: dict) -> dict:
+    """Carry each authored quantity onto every value its expansion produced.
+
+    Provenance is a relation, not a function, and treating it as 1:1 is why
+    the cross-stage panes were nearly empty. A translation does two things
+    a one-to-one map cannot express:
+
+    * it SPREADS -- one authored equation becomes tens of instructions, and
+      every one of them descends from that equation;
+    * it MIXES -- an instruction reached by several equations descends from
+      all of them, which is what common subexpression means.
+
+    Both fall out of the backward cone plus the Spectrum's algebra. A value
+    in one cone takes that equation's spectrum; a value in six takes the
+    SUM of six, which is a real mixture rather than a winner. Addition is
+    the merge, so the result does not depend on which cone is walked first.
+    """
+    region = module.functions.get(REGION)
+    step = module.functions.get(STEP)
+    if region is None or step is None:
+        return {}
+    produced: dict[int, Any] = {}
+    home: dict[int, str] = {}
+    for block_name, block in region.blocks.items():
+        for instruction in block.instrs:
+            if instruction.res is not None:
+                produced[int(instruction.res.id)] = instruction
+                home[int(instruction.res.id)] = block_name
+
+    def cone(root: int) -> set[int]:
+        seen: set[int] = set()
+        pending = [root]
+        while pending:
+            value_id = pending.pop()
+            if value_id in seen or value_id not in produced:
+                continue
+            seen.add(value_id)
+            pending.extend(int(a.id) for a in produced[value_id].args)
+        return seen
+
+    carried: dict[Any, tuple] = {}
+    for label, value in tuple(step.metadata.get("named_outputs") or ()):
+        entry = sympy_entries.get(str(label))
+        if entry is None or int(value) not in produced:
+            continue
+        reading, accumulator = entry
+        if accumulator is None:
+            continue
+        for value_id in cone(int(value)):
+            key = (REGION, home[value_id], value_id)
+            previous = carried.get(key)
+            carried[key] = (
+                reading if previous is None else previous[0],
+                accumulator if previous is None else previous[1] + accumulator,
+            )
+    return carried
+
+
+def colour_by_key(tokens: list, keyed: dict, mode: str) -> list:
+    """Colour tokens that name a field key outright.
+
+    Where a representation states which value it means, use that. Falling
+    back to name matching there would colour only the few values whose
+    authored name survived into a comment, which is what made the SSA pane
+    read as a couple of highlights over three hundred lines of real
+    instructions.
+    """
+    spans = []
+    for row, start, end, key in tokens:
+        found = keyed.get(key)
+        if found is None:
+            continue
+        reading, accumulator = found
+        colour = (
+            blended_colour(accumulator) if mode == "blended"
+            else category_colour(reading)
+        )
+        if colour != UNCOLOURED:
+            spans.append([row, start, end, colour])
+    return spans
 
 
 def colour_spans(text: str, entries: dict, mode: str) -> list:
@@ -228,8 +337,11 @@ def main() -> int:
     # spectral=True is what makes `blended` possible at all: without the
     # retained lines there is nothing to mix, only a centroid to restate.
     contract = InfluenceContract(enabled=True, spectral=True)
-    layers, layer_labels, module, model = build_layers(contract)
-    texts, text_labels = source_texts(module, model)
+    layers, keyed, layer_labels, module, model = build_layers(contract)
+    texts, text_labels, direct = source_texts(module, model)
+    # The authored mathematics, spread across every SSA value its expansion
+    # produced and mixed where expansions overlap.
+    keyed["sympy"] = spread_and_mix(module, layers["sympy"])
 
     payload = {
         "sources": {
@@ -240,7 +352,13 @@ def main() -> int:
         "colours": {
             source_key: {
                 layer_key: {
-                    mode: colour_spans(texts[source_key], entries, mode)
+                    mode: (
+                        colour_by_key(
+                            direct[source_key], keyed[layer_key], mode,
+                        )
+                        if source_key in direct and layer_key in keyed
+                        else colour_spans(texts[source_key], entries, mode)
+                    )
                     for mode in ("categories", "blended")
                 }
                 for layer_key, entries in layers.items()
