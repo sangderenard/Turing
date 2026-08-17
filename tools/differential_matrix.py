@@ -185,13 +185,21 @@ def run_ssa(grid: int, dt: float, build: Path) -> dict[str, np.ndarray]:
         )
     SSAReferenceEvaluator(module).run(name, arguments)
     # The evaluator mutates caller-owned storage exactly as the compiled ABI
-    # does, so the state fields it wrote are readable here. Metrics are NOT
-    # reconstructed, so this column reports the state observables only --
-    # `compare` intersects keys, and a metric absent from one side is left
-    # out of the comparison rather than counted as agreement.
+    # does, so the state fields the SSA itself stores are readable here.
+    #
+    # Only those, though. `advance` computes the next_* fields; copying them
+    # back over tracer/height/momentum and publishing last_* is done by the
+    # RUNTIME WRAPPER around it, which this column does not run. Reporting
+    # those fields anyway compared a field the SSA never wrote against one
+    # the other column did, and produced a confident 1.795e+00 in
+    # state.tracer that was purely an artefact of the harness -- the mirror
+    # image of manufacturing agreement, and just as misleading.
+    #
+    # Metrics are not reconstructed either. `compare` intersects keys, so an
+    # observable absent here is left out rather than counted as agreement.
     return {
         key: value for key, value in _observables(state, _NoMetrics()).items()
-        if key.startswith("state.")
+        if key.startswith("state.next_")
     }
 
 
