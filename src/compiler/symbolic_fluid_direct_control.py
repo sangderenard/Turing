@@ -182,6 +182,52 @@ def bounded_compile(
             and (destination / "control_repository_ssa.pkl").is_file()
         ),
     }
+    # A zero exit and a file on disk is not evidence the program was built.
+    #
+    # A change to node identity once left this reporting "completed": true
+    # for a module that had fallen from 45 functions to 2 -- every callsite
+    # shell silently unattributed, the whole control program missing, the
+    # pickle present and well formed. Six builds were spent before anyone
+    # looked inside it. So the report now says what is in there, and the
+    # named entry points this program is FOR have to be among them.
+    report.update(_structure_report(destination))
+    if report.get("missing_entry_points"):
+        report["completed"] = False
+    return report
+
+
+#: The functions this compile exists to produce. Absent any one of them the
+#: build did not build the program, whatever the exit code says.
+REQUIRED_ENTRY_POINTS = (
+    "symbolic_fluid_control__symbolic_fluid_advance",
+    "symbolic_fluid_control__symbolic_fluid_step",
+    "symbolic_fluid_control__symbolic_fluid_frame",
+)
+
+
+def _structure_report(destination: Path) -> dict:
+    """What the lowering actually contains, for the report to carry."""
+    lowering = destination / "control_repository_ssa.pkl"
+    if not lowering.is_file():
+        return {"function_count": 0, "missing_entry_points": list(
+            REQUIRED_ENTRY_POINTS
+        )}
+    try:
+        with lowering.open("rb") as stream:
+            module, _outputs, _exports = pickle.load(stream)
+        names = set(getattr(module, "functions", {}) or {})
+    except Exception as error:  # a pickle that will not load is a failure
+        return {
+            "function_count": 0,
+            "structure_error": f"{type(error).__name__}: {error}",
+            "missing_entry_points": list(REQUIRED_ENTRY_POINTS),
+        }
+    return {
+        "function_count": len(names),
+        "missing_entry_points": [
+            name for name in REQUIRED_ENTRY_POINTS if name not in names
+        ],
+    }
     (destination / "bounded_compile_report.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8",
     )
