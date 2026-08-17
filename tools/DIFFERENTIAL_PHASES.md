@@ -678,3 +678,64 @@ between regions at all, or only some other criterion (declaration order,
 region index, discovery order). This is a scheduling/ordering question,
 not a missing-instruction question -- narrower and more mechanical to
 fix than anything hypothesised earlier in this file.
+
+### Root cause traced to the ProcessGraph itself: a missing dependency edge
+
+Per instruction, looked at the graphs directly rather than continuing to
+read emitted text. Built the ProcessGraph the real compile path actually
+uses (`graph.build_from_ast`, the same call `lower_ast_source_to_ssa`
+makes) over the real authored source, and located the exact node for the
+commit statement's read of `state.next_height` at line 67
+(`state.height = state.next_height + 0.0`).
+
+**Its only parent, in the raw ingested graph, is the `Name('state')`
+node.** There is no edge to the loop body's write at line 59
+(`state.next_height[row, column] = height_next`) -- none at all. Grepped
+`graph_express2.py` and `ast_process_graph.py` for any read-after-write /
+memory-SSA / mutation-ordering mechanism that might add this edge in a
+later pass (`read.after.write`, `mutation_order`, `memory_ssa`,
+`field_write_order`, `attribute_mutation`, `last_write`); found none by
+any of the obvious names.
+
+This is consistent with everything measured earlier in this file,
+INCLUDING why it is consistent. `reduce_scheduled_shader_regions`
+(`process_graph_fusion.py`) computes a genuine topological sort over the
+planning graph -- verified by reading its code, not assumed -- and a
+topological sort is only as correct as the edges it is given. If the
+edge from "the loop's writes" to "this later whole-array read" was never
+present in the graph the scheduler sorts, a perfectly correct scheduler
+still orders them wrong. That matches the observed bug exactly (region_4,
+the commit, scheduled before region_3, the computation) without
+requiring any bug in the scheduling algorithm itself. The earlier
+sessions of this investigation were, in a real sense, all correct about
+where they looked -- the scheduler, the backends, the call emission --
+and all innocent; the defect is one layer further upstream, at
+ingestion, in what `state.next_height` (a mutable record field, written
+through element-wise subscript assignment inside a loop) means as a
+dependency when READ later as a whole array.
+
+**A concrete, checkable difference between the two capture paths**,
+found while looking for why the isolated capture (proven correct) and
+the whole-program capture (proven broken) diverge on the SAME authored
+function: `symbolic_fluid_direct_control.py` (whole-program) passes
+`extraction_contract=.../extraction_contracts/program_extraction.yaml`.
+`compile_native_symbolic_fluid_advance` (isolated, the one verified this
+session to correctly commit `state.height`) passes none. A direct test --
+rebuilding the whole-source SSA with `extraction_contract=None` and
+inspecting `symbolic_fluid_advance`'s own call order -- was started to
+check whether the extraction contract's own pursuit/pruning logic is
+specifically where this edge gets lost (which would narrow the fix to
+one pass) or whether it is missing even without the contract (which
+would point at the general-purpose ingestion code every capture path
+shares, in `graph_express2.py`'s handling of `Attribute`/`GetAttr` nodes
+for a mutable object field). Result pending as of this note.
+
+**What the fix likely needs to be, once localised**: when a record field
+reached through element-wise subscript assignment (`obj.field[i, j] =
+...`) inside a loop is later read as a whole value (`obj.field`), the
+READ must carry a dependency edge on the assignment(s) that mutate it --
+not merely on the object (`state`) it is fetched from. Whatever pass adds
+this needs to handle it once, generally, for any mutable record field
+under this pattern -- not specifically for `height`/`next_height`, since
+`momentum_x`/`momentum_y`/`tracer` follow the identical authored pattern
+at lines 68-70 and would carry the identical missing edge.
