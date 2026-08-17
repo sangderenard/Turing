@@ -192,7 +192,9 @@ _UNARY: dict[str, str] = {
     # array operands before concluding the emitted Fortran is as fast as it
     # can be.
     "exp": "exp({0})",
+    "Exp": "exp({0})",
     "log": "log({0})",
+    "Log": "log({0})",
     "sin": "sin({0})",
     "cos": "cos({0})",
     "tan": "tan({0})",
@@ -388,6 +390,14 @@ class FortranSubroutine:
     dynamic_array_dimensions: tuple[tuple[int, tuple[str, ...]], ...] = ()
     # Exact dummy arguments emitted without Fortran ``value``.
     reference_argument_ids: tuple[int, ...] = ()
+    # The RESOLVED dtype of every SSA formal, in argument order.  A caller
+    # must coerce call operands to these -- the declaration is typed by the
+    # callee's own local inference, which raw formal occurrences don't carry.
+    argument_dtypes: tuple[str, ...] = ()
+    # The RESOLVED dtype of every canonical output slot, in slot order.  A
+    # caller's projection cell must match these at the call, bridging any
+    # difference with an explicit conversion after the call returns.
+    output_dtypes: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -685,7 +695,10 @@ class _FunctionEmitter:
         callee_arity: Mapping[str, int] | None = None,
         callee_output_count: Mapping[str, int] | None = None,
         callee_outputs: Mapping[str, Sequence[SSAValue]] | None = None,
+        callee_output_records: Mapping[str, Sequence[SSAValue]] | None = None,
         callee_arguments: Mapping[str, Sequence[SSAValue]] | None = None,
+        callee_argument_dtypes: Mapping[str, Sequence[str]] | None = None,
+        callee_output_dtypes: Mapping[str, Sequence[str]] | None = None,
         callee_array_arguments: Mapping[str, Sequence[int]] | None = None,
         callee_inout_pairs: Mapping[
             str, Sequence[tuple[int, int]]
@@ -744,9 +757,25 @@ class _FunctionEmitter:
             str(name): tuple(values)
             for name, values in (callee_outputs or {}).items()
         }
+        # The UN-canonicalized declared return record per callee: one entry
+        # per source return position, repeats intact.  ``aggregate_index``
+        # positions at a call site index THIS record; the native slot list
+        # (``callee_outputs``) is this record deduplicated by SSA id.
+        self.callee_output_records = {
+            str(name): tuple(values)
+            for name, values in (callee_output_records or {}).items()
+        }
         self.callee_arguments = {
             str(name): tuple(values)
             for name, values in (callee_arguments or {}).items()
+        }
+        self.callee_argument_dtypes = {
+            str(name): tuple(str(dtype) for dtype in dtypes)
+            for name, dtypes in (callee_argument_dtypes or {}).items()
+        }
+        self.callee_output_dtypes = {
+            str(name): tuple(str(dtype) for dtype in dtypes)
+            for name, dtypes in (callee_output_dtypes or {}).items()
         }
         self.callee_array_arguments = {
             str(name): frozenset(int(position) for position in positions)
@@ -861,6 +890,10 @@ class _FunctionEmitter:
         self._inlined: dict[int, str] = {}
         self._use_sites: dict[int, list[tuple[str, int]]] = {}
         self._locals: dict[int, SSAValue] = {}
+        # Scalar cells binding a callee's declared-but-unconsumed output
+        # slots at a call site: identifier -> Fortran kind.  Named per
+        # callsite/position, so they can never collide with ``t{id}`` locals.
+        self._discard_declarations: dict[str, str] = {}
         self._phi_targets: dict[str, list[tuple[str, SSAValue, SSAValue]]] = {}
         self._loop_variables: list[str] = []
         # Values emitted as part of a multi-instruction group (a region call,
@@ -1703,6 +1736,32 @@ class _FunctionEmitter:
             else f"int({expression}, c_int64_t)"
         )
 
+    def _resolved_formal(
+        self, callee: str, position: int
+    ) -> SSAValue | None:
+        """The callee's formal at ``position``, typed as the callee DECLARES.
+
+        A raw formal occurrence often carries no dtype; the callee's emitter
+        resolves one locally (address-base rules, sequence machinery) and
+        declares it.  Coercing against the raw occurrence then spells a
+        conversion to the wrong native type, so prefer the resolved dtype
+        published by the callee's own emission.
+        """
+
+        formals = self.callee_arguments.get(str(callee), ())
+        formal = formals[position] if position < len(formals) else None
+        dtypes = self.callee_argument_dtypes.get(str(callee), ())
+        if position < len(dtypes) and dtypes[position]:
+            if formal is not None:
+                return SSAValue(
+                    formal.id,
+                    str(dtypes[position]),
+                    tuple(formal.shape),
+                    formal.device,
+                    dict(formal.accounting or {}),
+                )
+        return formal
+
     def _coerce_call_operand(
         self, value: SSAValue, expression: str, target: SSAValue | None
     ) -> str:
@@ -1902,11 +1961,100 @@ class _FunctionEmitter:
                 continue
             seen_output_ids.add(value_id)
             ordered_outputs.append(value)
-        expected_outputs = int(self.callee_output_count.get(str(callee), 0))
-        if expected_outputs and len(ordered_outputs) != expected_outputs:
-            return None
-        for value in ordered_outputs:
-            self._locals[value.id] = self._typed(value)
+        # The callee publishes its complete declared output record; a caller
+        # is free to consume any subset of those positions.  The native call
+        # still binds every declared slot -- consumed positions bind the
+        # caller's own projection values, unconsumed scalar slots bind a
+        # per-callsite discard cell.  An unconsumed ARRAY slot has no discard
+        # spelling here yet, so it stays a loud shortfall rather than a
+        # silently mis-sized call.
+        declared_record = tuple(self.callee_outputs.get(str(callee), ()))
+        output_binding_values: list[SSAValue] = []
+        output_binding_names: list[str] = []
+        postlude: list[str] = []
+        if declared_record:
+            # The caller's ``aggregate_index`` positions index the callee's
+            # declared return RECORD -- one entry per source return position,
+            # repeats intact; the native slot list is that record
+            # canonicalized by SSA id.  Translate position -> native slot
+            # through the record; a repeated projection consumed twice
+            # becomes one native argument plus an alias assignment after the
+            # call.
+            slot_index_by_id = {
+                int(value.id): index
+                for index, value in enumerate(declared_record)
+            }
+            raw_record = tuple(
+                self.callee_output_records.get(str(callee), ())
+            ) or declared_record
+            position_to_slot: dict[int, int] = {}
+            for position, record_value in enumerate(raw_record):
+                slot = slot_index_by_id.get(int(record_value.id))
+                if slot is None:
+                    return None
+                position_to_slot[position] = slot
+            if any(position not in position_to_slot for position in outputs):
+                return None
+            slot_projections: dict[int, list[SSAValue]] = {}
+            for position in sorted(outputs):
+                slot_projections.setdefault(
+                    position_to_slot[position], []
+                ).append(outputs[position])
+            callsite = int(instr.attributes.get("plan_callsite_id") or 0)
+            slot_dtypes = self.callee_output_dtypes.get(str(callee), ())
+            for slot, formal in enumerate(declared_record):
+                projections = slot_projections.get(slot, ())
+                if projections:
+                    first = projections[0]
+                    self._locals[first.id] = self._typed(first)
+                    slot_dtype = (
+                        slot_dtypes[slot] if slot < len(slot_dtypes) else None
+                    )
+                    first_dtype = str(self._typed(first).dtype or self.dtype)
+                    if slot_dtype and slot_dtype != first_dtype:
+                        kind = _DTYPE_KIND.get(slot_dtype, "real(c_double)")
+                        bridge = f"bridge_c{callsite}_p{slot}"
+                        self._discard_declarations[bridge] = kind
+                        output_binding_values.append(
+                            SSAValue(
+                                first.id, slot_dtype, (), first.device,
+                                dict(first.accounting or {}),
+                            )
+                        )
+                        output_binding_names.append(bridge)
+                        postlude.append(
+                            f"    {_name(first)} = "
+                            f"{self._coerce_call_operand(SSAValue(first.id, slot_dtype, (), first.device, {}), bridge, first)}"
+                        )
+                    else:
+                        output_binding_values.append(first)
+                        output_binding_names.append(_name(first))
+                    for extra in projections[1:]:
+                        if int(extra.id) == int(first.id):
+                            continue
+                        self._locals[extra.id] = self._typed(extra)
+                        postlude.append(
+                            f"    {_name(extra)} = {_name(first)}"
+                        )
+                    continue
+                typed_formal = self._typed(formal)
+                if _is_array(typed_formal):
+                    return None
+                kind = _DTYPE_KIND.get(
+                    typed_formal.dtype or self.dtype, "real(c_double)"
+                )
+                scratch = f"discard_c{callsite}_p{slot}"
+                self._discard_declarations[scratch] = kind
+                output_binding_values.append(typed_formal)
+                output_binding_names.append(scratch)
+        else:
+            expected_outputs = int(self.callee_output_count.get(str(callee), 0))
+            if expected_outputs and len(ordered_outputs) != expected_outputs:
+                return None
+            for value in ordered_outputs:
+                self._locals[value.id] = self._typed(value)
+            output_binding_values = list(ordered_outputs)
+            output_binding_names = [_name(value) for value in ordered_outputs]
         for value in consumed:
             self._consumed.add(value.id)
 
@@ -1919,12 +2067,11 @@ class _FunctionEmitter:
         if declared is not None:
             extents = list(declared)
         else:
-            call_values = [*instr.args, *ordered_outputs]
+            call_values = [*instr.args, *output_binding_values]
             extents = sorted(dimension_extents(call_values).values())
         array_positions = self.callee_array_arguments.get(
             str(callee), frozenset()
         )
-        formal_arguments = self.callee_arguments.get(str(callee), ())
         input_arguments = []
         for argument_index, value in enumerate(instr.args):
             array_expected = argument_index in array_positions
@@ -1935,12 +2082,10 @@ class _FunctionEmitter:
                 operand = self._coerce_call_operand(
                     value,
                     operand,
-                    formal_arguments[argument_index]
-                    if argument_index < len(formal_arguments)
-                    else None,
+                    self._resolved_formal(str(callee), argument_index),
                 )
             input_arguments.append(operand)
-        output_arguments = [_name(value) for value in ordered_outputs]
+        output_arguments = list(output_binding_names)
         prelude = []
         aliased_output_indices = set()
         for input_index, output_index in self.callee_inout_pairs.get(
@@ -1953,7 +2098,7 @@ class _FunctionEmitter:
                 return None
             output_argument = output_arguments[output_index]
             source_value = self._typed(instr.args[input_index])
-            target_value = self._typed(ordered_outputs[output_index])
+            target_value = self._typed(output_binding_values[output_index])
             source_expression = input_arguments[input_index]
             source_logical = self._is_logical(source_value)
             target_logical = str(target_value.dtype or "") in _LOGICAL_DTYPES
@@ -1986,7 +2131,11 @@ class _FunctionEmitter:
             ),
         ]
         native_callee = self.callee_native_symbols.get(str(callee), str(callee))
-        return [*prelude, f"    call {native_callee}({', '.join(arguments)})"]
+        return [
+            *prelude,
+            f"    call {native_callee}({', '.join(arguments)})",
+            *postlude,
+        ]
 
     def _ssa_call(self, instr: Instr) -> list[str] | None:
         """Emit an ordinary call to another fully present SSA function."""
@@ -2003,7 +2152,6 @@ class _FunctionEmitter:
         output_count = int(self.callee_output_count.get(callee, 0))
         output_argument = instr.attributes.get("ssa_output_argument")
         array_positions = self.callee_array_arguments.get(callee, frozenset())
-        formal_arguments = self.callee_arguments.get(callee, ())
         call_operands = []
         for position, value in enumerate(instr.args):
             operand = self._call_operand(
@@ -2018,9 +2166,7 @@ class _FunctionEmitter:
                 operand = self._coerce_call_operand(
                     value,
                     operand,
-                    formal_arguments[position]
-                    if position < len(formal_arguments)
-                    else None,
+                    self._resolved_formal(callee, position),
                 )
             call_operands.append(operand)
         arguments = [
@@ -3200,6 +3346,10 @@ class _FunctionEmitter:
                 declarations.append(f"    {kind} :: {_name(value)}")
 
         declarations.extend(
+            f"    {kind} :: {identifier}"
+            for identifier, kind in self._discard_declarations.items()
+        )
+        declarations.extend(
             f"    integer(c_int) :: {index}" for index in self._loop_variables
         )
 
@@ -3226,6 +3376,14 @@ class _FunctionEmitter:
                 for value_id, dimensions in self.dynamic_array_leading_extents.items()
             )),
             tuple(sorted(reference_argument_ids)),
+            argument_dtypes=tuple(
+                str(self._typed(argument).dtype or self.dtype)
+                for argument in self.function.args
+            ),
+            output_dtypes=tuple(
+                str(self._typed(value).dtype or self.dtype)
+                for value in self.outputs
+            ),
         )
 
 
@@ -3238,7 +3396,10 @@ def emit_function(
     callee_arity: Mapping[str, int] | None = None,
     callee_output_count: Mapping[str, int] | None = None,
     callee_outputs: Mapping[str, Sequence[SSAValue]] | None = None,
+    callee_output_records: Mapping[str, Sequence[SSAValue]] | None = None,
     callee_arguments: Mapping[str, Sequence[SSAValue]] | None = None,
+    callee_argument_dtypes: Mapping[str, Sequence[str]] | None = None,
+    callee_output_dtypes: Mapping[str, Sequence[str]] | None = None,
     callee_array_arguments: Mapping[str, Sequence[int]] | None = None,
     callee_inout_pairs: Mapping[
         str, Sequence[tuple[int, int]]
@@ -3288,7 +3449,10 @@ def emit_function(
         callee_arity=callee_arity,
         callee_output_count=callee_output_count,
         callee_outputs=callee_outputs,
+        callee_output_records=callee_output_records,
         callee_arguments=callee_arguments,
+        callee_argument_dtypes=callee_argument_dtypes,
+        callee_output_dtypes=callee_output_dtypes,
         callee_array_arguments=callee_array_arguments,
         callee_inout_pairs=callee_inout_pairs,
         array_base_ids=array_base_ids,
@@ -3514,6 +3678,13 @@ def emit_module(
         )
         if resolved:
             named_outputs[function_name] = resolved
+    # Keep the record as declared (position space, repeats intact) beside the
+    # canonical native slot list: call sites translate ``aggregate_index``
+    # positions through the record into slots.
+    named_output_records = {
+        function_name: tuple(values)
+        for function_name, values in named_outputs.items()
+    }
     named_outputs = {
         function_name: tuple({
             int(value.id): value for value in values
@@ -4170,6 +4341,24 @@ def emit_module(
                     callee_output_values = tuple(named_outputs.get(callee_name, ()))
                     if not callee_output_values or instruction.res is None:
                         continue
+                    # ``aggregate_index`` positions the source RETURN RECORD
+                    # (repeats intact), not the canonicalized slot list -- the
+                    # same distinction ``_region_call`` translates through at
+                    # emission time.  Do the same translation here, or a
+                    # repeated identity earlier in the record shifts every
+                    # later position's dtype onto the wrong slot.
+                    raw_record = tuple(
+                        named_output_records.get(callee_name, ())
+                    ) or callee_output_values
+                    slot_index_by_id = {
+                        int(value.id): index
+                        for index, value in enumerate(callee_output_values)
+                    }
+                    position_to_slot = {
+                        position: slot_index_by_id[int(record_value.id)]
+                        for position, record_value in enumerate(raw_record)
+                        if int(record_value.id) in slot_index_by_id
+                    }
                     addresses = {
                         int(candidate.res.id): int(candidate.attributes["aggregate_index"])
                         for candidate in block.instrs
@@ -4182,13 +4371,14 @@ def emit_module(
                         )
                     }
                     caller_outputs = {
-                        addresses[int(candidate.args[0].id)]: candidate.res
+                        position_to_slot[addresses[int(candidate.args[0].id)]]: candidate.res
                         for candidate in block.instrs
                         if (
                             candidate.op in {"Load", "load"}
                             and candidate.res is not None
                             and candidate.args
                             and int(candidate.args[0].id) in addresses
+                            and addresses[int(candidate.args[0].id)] in position_to_slot
                         )
                     }
                     for output_index, callee_output in enumerate(callee_output_values):
@@ -4315,6 +4505,7 @@ def emit_module(
                 callee_arity=callee_arity,
                 callee_output_count=callee_output_count,
                 callee_outputs=named_outputs,
+                callee_output_records=named_output_records,
                 callee_arguments={
                     name: candidate.args for name, candidate in functions.items()
                 },
@@ -4373,6 +4564,8 @@ def emit_module(
         raise RuntimeError("Fortran call ABI extents did not reach a fixed point")
     def emit_subroutines(
         signatures: Mapping[str, Sequence[str]],
+        formal_dtypes: Mapping[str, Sequence[str]] | None = None,
+        output_dtypes: Mapping[str, Sequence[str]] | None = None,
     ) -> tuple[FortranSubroutine, ...]:
         return tuple(
             emit_function(
@@ -4381,9 +4574,12 @@ def emit_module(
                 dtype=dtype,
                 outputs=named_outputs.get(function_name, ()),
                 callee_extents=signatures,
+                callee_argument_dtypes=formal_dtypes,
+                callee_output_dtypes=output_dtypes,
                 callee_arity=callee_arity,
                 callee_output_count=callee_output_count,
                 callee_outputs=named_outputs,
+                callee_output_records=named_output_records,
                 callee_arguments={
                     key: candidate.args for key, candidate in functions.items()
                 },
@@ -4407,15 +4603,33 @@ def emit_module(
             for function_name, function in functions.items()
         )
 
-    for _ in range(max(1, len(functions) + 1)):
-        subroutines = emit_subroutines(callee_extents)
+    callee_formal_dtypes: dict[str, tuple[str, ...]] = {}
+    callee_result_dtypes: dict[str, tuple[str, ...]] = {}
+    for _ in range(max(1, len(functions) + 2)):
+        subroutines = emit_subroutines(
+            callee_extents, callee_formal_dtypes, callee_result_dtypes
+        )
         emitted_extents = {
             function_name: subroutine.extent_names
             for function_name, subroutine in zip(functions, subroutines)
         }
-        if emitted_extents == callee_extents:
+        emitted_formal_dtypes = {
+            function_name: subroutine.argument_dtypes
+            for function_name, subroutine in zip(functions, subroutines)
+        }
+        emitted_result_dtypes = {
+            function_name: subroutine.output_dtypes
+            for function_name, subroutine in zip(functions, subroutines)
+        }
+        if (
+            emitted_extents == callee_extents
+            and emitted_formal_dtypes == callee_formal_dtypes
+            and emitted_result_dtypes == callee_result_dtypes
+        ):
             break
         callee_extents = emitted_extents
+        callee_formal_dtypes = emitted_formal_dtypes
+        callee_result_dtypes = emitted_result_dtypes
     else:  # pragma: no cover - final signatures must stabilize.
         raise RuntimeError("Fortran emitted extents did not stabilize")
     emitted_dynamic_arrays = {
