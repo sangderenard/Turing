@@ -230,17 +230,23 @@ def stage_2_ssa_wellformed(fn: Any) -> bool:
                         str(instr.attributes.get("callee", "?")).split("__")[-1],
                     )
     if sized_as_scalar:
-        healthy = False
-        _bad(
-            f"{len(sized_as_scalar)} region-call OUTPUT(s) declare rank>0 but "
-            "carry an empty .shape -- the return-copy sizes from .shape, so "
-            "each moves ONE element instead of the array"
+        # NOT a failure any more. The LLVM backend now expands an
+        # elementwise op whose result is a span into a loop sized from the
+        # extents vector, so rank-with-empty-shape is handled rather than
+        # silently truncated. Reported because it is still the shape that
+        # once produced a one-element whole-array assignment, and because a
+        # backend that has NOT learned this will truncate here -- but it is
+        # informational, since flagging a fixed condition is how a checker
+        # starts lying to its reader.
+        _ok(
+            f"{len(sized_as_scalar)} region-call output(s) are rank>0 with an "
+            "empty .shape -- expanded elementwise from runtime extents"
         )
         for out_id, (field, rank, callee) in list(sized_as_scalar.items())[:10]:
             _info(f"id {out_id} (field {field}, rank {rank}) out of {callee}")
         _info(
-            "This is how a whole-array assignment silently updates a single "
-            "cell while every other structural check passes."
+            "If a NEW backend is added, this is the configuration to test "
+            "first: sizing it from .shape moves one element of the array."
         )
     else:
         _ok("no region-call output is a rank>0 value sized as a scalar")

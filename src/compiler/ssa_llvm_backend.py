@@ -444,6 +444,66 @@ def _value_llvm_type(value: _Any) -> str:
     return "double"
 
 
+def _declared_span_rank(value: _Any) -> int:
+    """How many axes this value has, by the same authority Fortran uses.
+
+    `.shape` alone is not that authority: these arrays are sized at run
+    time, so a rank-2 record field routinely carries an EMPTY static shape
+    while its accounting states `program_abi_rank: 2`. The Fortran backend
+    reads the accounting and therefore declares `t(e1, e2)` and copies the
+    whole array; a backend consulting `.shape` sees a scalar.
+    """
+    accounting = getattr(value, "accounting", None) or {}
+    return max(
+        len(tuple(getattr(value, "shape", ()) or ())),
+        int(accounting.get("program_abi_rank", 0) or 0),
+        int(accounting.get("ssa_call_rank", 0) or 0),
+    )
+
+
+def _span_element_count(
+    function_name: str,
+    value: _Any,
+    tag: str,
+    body: list,
+    public_span_value: _Any,
+    module_extent_slot: _Any,
+) -> str | None:
+    """An i32 register (or literal) holding this span's element count.
+
+    Static extents fold to a literal; dynamic ones are measured from the
+    artifact's own extents vector, the same mechanism multi-axis addressing
+    already uses. Returns None when neither is available, so the caller can
+    refuse rather than invent a size.
+    """
+    static = tuple(getattr(value, "shape", ()) or ())
+    rank = _declared_span_rank(value)
+    if static and all(isinstance(item, int) for item in static):
+        total = 1
+        for extent in static:
+            total *= int(extent)
+        return str(total)
+    public_id = public_span_value(function_name, int(value.id))
+    if public_id is None or not rank:
+        return None
+    running: str | None = None
+    for axis in range(rank):
+        slot = module_extent_slot(public_id, axis)
+        address = f"%ew.extent.addr.{tag}.{axis}"
+        register = f"%ew.extent.{tag}.{axis}"
+        body.append(
+            f"  {address} = getelementptr i32, ptr %extents, i64 {slot}"
+        )
+        body.append(f"  {register} = load i32, ptr {address}, align 4")
+        if running is None:
+            running = register
+        else:
+            product = f"%ew.extent.prod.{tag}.{axis}"
+            body.append(f"  {product} = mul i32 {running}, {register}")
+            running = product
+    return running
+
+
 def _value_element_count(value: _Any) -> int:
     from math import prod
 
@@ -872,6 +932,20 @@ def _emit_repository_call_module(
         if instruction.op in {"GetElementPtr", "getelementptr"}
         and len(instruction.args) > 2
     }
+    # An elementwise operation whose result is a span expands into a loop
+    # over that span's elements, and the trip count is measured from the
+    # extents vector. Such a function needs %extents even when it never
+    # addresses an element itself -- region_4 does exactly this: four
+    # whole-array assignments and not one GetElementPtr.
+    extent_users.update(
+        name for name in reachable
+        for block in module.functions[name].blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None
+        and _declared_span_rank(instruction.res) > 0
+        and scalar_likeness(str(instruction.op)) is not None
+        and str(instruction.op) not in {"Eq", "Ne", "Lt", "Le", "Gt", "Ge"}
+    )
     growing = True
     while growing:
         growing = False
@@ -1155,6 +1229,12 @@ def _emit_repository_call_module(
                         f"ptr {destination}, ptr {source}, i64 {count * 8}, i1 false)"
                     )
         active_block: str | None = None
+        # An elementwise op over a span expands into its own loop, which ends
+        # the SSA block early and continues in a new LLVM label. A later phi
+        # naming this SSA block as a predecessor must name the label control
+        # actually arrives from, so record where each SSA block currently
+        # exits. Identity until something splits the block.
+        block_exit_label: dict[str, str] = {}
         emitted_return = False
         # Watch-shadow copies wait here until the phi group they follow has
         # been emitted in full; see the Phi branch below.
@@ -1168,6 +1248,7 @@ def _emit_repository_call_module(
                     pending_shadow.clear()
                 body.append(f"{block_name}:")
                 active_block = block_name
+                block_exit_label[block_name] = block_name
             operation = str(instruction.op)
             if pending_shadow and operation not in {"Phi", "phi"}:
                 body.extend(pending_shadow)
@@ -1220,7 +1301,8 @@ def _emit_repository_call_module(
                 body.append(
                     f"  {register} = phi ptr "
                     + ", ".join(
-                        f"[ {pointer(value)}, %{predecessor} ]"
+                        f"[ {pointer(value)}, "
+                        f"%{block_exit_label.get(predecessor, predecessor)} ]"
                         for predecessor, value in zip(
                             incoming_blocks, incoming_values
                         )
@@ -1919,6 +2001,97 @@ def _emit_repository_call_module(
                 continue
 
             template = scalar_likeness(operation)
+            if (
+                template is not None
+                and result is not None
+                and _declared_span_rank(result) > 0
+                and operation not in {"Eq", "Ne", "Lt", "Le", "Gt", "Ge"}
+            ):
+                # An elementwise operation whose RESULT is a span is an array
+                # operation, and rendering it as one scalar load/op/store
+                # writes exactly one element of it. Fortran gets this right
+                # from the same SSA because its declaration carries the rank
+                # (`t122 = t120 + 0.0` over `t122(e1, e2)` is a whole-array
+                # assignment); the rank lives in accounting, not in `.shape`,
+                # so a backend that sizes from `.shape` alone silently
+                # degrades a whole-array assignment to its first cell. That
+                # is what left `state.height = state.next_height + 0.0`
+                # updating 1 of 16 cells.
+                element_type = _value_llvm_type(result)
+                total = _span_element_count(
+                    name, result, tag, body,
+                    public_span_value, module_extent_slot,
+                )
+                if total is None:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"elementwise {operation} over span %t{result_id} "
+                        "needs its extents, and no public origin declares "
+                        "them; refusing to emit a one-element stand-in",
+                    ))
+                    continue
+                entry_label = block_exit_label.get(
+                    active_block or "", active_block or "entry",
+                )
+                head = f"ew.head.{tag}"
+                loop_body = f"ew.body.{tag}"
+                done = f"ew.done.{tag}"
+                index = f"%ew.i.{tag}"
+                nxt = f"%ew.next.{tag}"
+                body.append(f"  br label %{head}")
+                body.append(f"{head}:")
+                body.append(
+                    f"  {index} = phi i32 [ 0, %{entry_label} ], "
+                    f"[ {nxt}, %{loop_body} ]"
+                )
+                body.append(
+                    f"  %ew.more.{tag} = icmp slt i32 {index}, {total}"
+                )
+                body.append(
+                    f"  br i1 %ew.more.{tag}, label %{loop_body}, "
+                    f"label %{done}"
+                )
+                body.append(f"{loop_body}:")
+                operands = []
+                for position, argument in enumerate(instruction.args):
+                    slot = f"%ew.op.{tag}.{position}"
+                    if _declared_span_rank(argument) > 0:
+                        body.append(
+                            f"  {slot}.addr = getelementptr {element_type}, "
+                            f"ptr {pointer(argument)}, i32 {index}"
+                        )
+                        body.append(
+                            f"  {slot} = load {element_type}, "
+                            f"ptr {slot}.addr, align 8"
+                        )
+                    else:
+                        # A rank-0 operand broadcasts, which is what `+ 0.0`
+                        # over an array means.
+                        body.append(
+                            f"  {slot} = load {element_type}, "
+                            f"ptr {pointer(argument)}, align 8"
+                        )
+                    operands.append(slot)
+                computed = f"%ew.val.{tag}"
+                for rendered_line in template.format(
+                    *operands, out=computed
+                ).splitlines():
+                    body.append(f"  {rendered_line}")
+                body.append(
+                    f"  %ew.dst.{tag} = getelementptr {element_type}, "
+                    f"ptr {pointer(result)}, i32 {index}"
+                )
+                body.append(
+                    f"  store {element_type} {computed}, "
+                    f"ptr %ew.dst.{tag}, align 8"
+                )
+                body.append(f"  {nxt} = add i32 {index}, 1")
+                body.append(f"  br label %{head}")
+                body.append(f"{done}:")
+                if active_block is not None:
+                    block_exit_label[active_block] = done
+                continue
+
             if template is not None and result is not None:
                 result_type = _value_llvm_type(result)
                 operand_type = (
