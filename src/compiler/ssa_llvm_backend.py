@@ -852,7 +852,15 @@ def _emit_repository_call_module(
         depth = max(1, int(history))
         root_values = values_by_function.get(function_name, {})
         appended_history = []
-        for raw_id in sorted(phi_watch_ids):
+        # Every watched value, not only the phi-backed ones. A phi is where a
+        # loop-carried accumulator is visible, but the value that CORRUPTED it
+        # is usually an ordinary result computed in the loop body, and a ring
+        # on the accumulator alone can only say "it was already wrong by the
+        # end". Ordinary results live in frame slots that are rewritten each
+        # iteration, so they are ringed at the block terminator -- once per
+        # execution of the block that defines them, which is once per
+        # iteration, the same cadence the phi ring records at.
+        for raw_id in sorted(watched_ids):
             value = root_values.get(raw_id)
             if value is None:
                 continue
@@ -1023,6 +1031,22 @@ def _emit_repository_call_module(
                 history_pointers[watched_id] = (
                     ring_pointer, count_pointer, depth,
                 )
+
+        # Which ordinary (non-phi) history values each block defines. Phis are
+        # excluded because the phi path already rings them at the phi itself.
+        history_by_block: dict[str, list[int]] = {}
+        if history_pointers:
+            for block_name_, block_ in function.blocks.items():
+                for instruction_ in block_.instrs:
+                    if instruction_.res is None:
+                        continue
+                    if str(instruction_.op) in {"Phi", "phi"}:
+                        continue
+                    result_id_ = int(instruction_.res.id)
+                    if result_id_ in history_pointers:
+                        history_by_block.setdefault(
+                            str(block_name_), [],
+                        ).append(result_id_)
 
         def pointer(value: _Any) -> str:
             value_id = int(value.id)
@@ -1239,6 +1263,37 @@ def _emit_repository_call_module(
         # Watch-shadow copies wait here until the phi group they follow has
         # been emitted in full; see the Phi branch below.
         pending_shadow: list[str] = []
+
+        def capture_block_history(block_name: str, tag: str) -> None:
+            """Ring every ordinary history value this block defines.
+
+            Emitted at the terminator, so each execution of the block
+            contributes exactly one sample -- the value's final content for
+            that pass. Reading the slot rather than a register keeps this
+            free of dominance concerns: the slot is in the entry frame.
+            """
+            for ringed_id in history_by_block.get(block_name, ()):
+                ringed = values_by_function[name].get(ringed_id)
+                if ringed is None:
+                    continue
+                ring_pointer, count_pointer, depth = history_pointers[ringed_id]
+                ringed_type = _value_llvm_type(ringed)
+                mark = f"{tag}.{ringed_id}"
+                body.extend((
+                    f"  %hist.val.{mark} = load {ringed_type}, ptr "
+                    f"{pointer(ringed)}, align 8",
+                    f"  %hist.seen.{mark} = load i64, ptr {count_pointer}, "
+                    "align 8",
+                    f"  %hist.slot.{mark} = urem i64 %hist.seen.{mark}, {depth}",
+                    f"  %hist.at.{mark} = getelementptr {ringed_type}, ptr "
+                    f"{ring_pointer}, i64 %hist.slot.{mark}",
+                    f"  store {ringed_type} %hist.val.{mark}, ptr "
+                    f"%hist.at.{mark}, align 8",
+                    f"  %hist.next.{mark} = add i64 %hist.seen.{mark}, 1",
+                    f"  store i64 %hist.next.{mark}, ptr {count_pointer}, "
+                    "align 8",
+                ))
+
         for instruction_index, (block_name, instruction) in enumerate(
             scheduled_instructions
         ):
@@ -1358,6 +1413,7 @@ def _emit_repository_call_module(
                         name, operation, f"unknown branch target {target!r}",
                     ))
                     continue
+                capture_block_history(block_name, tag)
                 body.append(f"  br label %{target}")
                 continue
 
@@ -1378,6 +1434,7 @@ def _emit_repository_call_module(
                     ))
                     continue
                 condition = load_as(instruction.args[0], "i1", f"{tag}.condition")
+                capture_block_history(block_name, tag)
                 body.append(
                     f"  br i1 {condition}, label %{true_target}, label %{false_target}"
                 )

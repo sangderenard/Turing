@@ -53,7 +53,7 @@ callee formal it feeds, by name.
 from __future__ import annotations
 
 from dataclasses import dataclass, field as _field
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
@@ -361,11 +361,26 @@ def _cast_to(payload: Any, dtype: str) -> Any:
 class SSAReferenceEvaluator:
     """Executes one repository-SSA module."""
 
-    def __init__(self, module: Any, *, step_limit: int = 5_000_000) -> None:
+    def __init__(
+        self,
+        module: Any,
+        *,
+        step_limit: int = 5_000_000,
+        history: Iterable[int] = (),
+    ) -> None:
         self.module = module
         self.functions = dict(getattr(module, "functions", {}) or {})
         self.step_limit = int(step_limit)
         self.steps = 0
+        # The counterpart of the backend's `history=` ring. A final value
+        # proves an accumulator ended wrong; only the per-iteration series
+        # says WHICH iteration it went wrong on -- and a series is only
+        # comparable against the artifact's ring if both sides record the
+        # same thing, so this records exactly what the ring records: every
+        # value the id took in the ROOT frame, in execution order.
+        self.history_ids = frozenset(int(value) for value in history)
+        self.history: dict[int, list[Any]] = {}
+        self._root_frame: dict[int, Any] | None = None
 
     # -- public -----------------------------------------------------------
 
@@ -384,6 +399,8 @@ class SSAReferenceEvaluator:
         if function is None:
             raise SSAEvaluationError(f"no function {function_name!r} in module")
         values: dict[int, Any] = {}
+        self._root_frame = values
+        self.history = {int(value): [] for value in self.history_ids}
         for value in function.args:
             key = int(value.id)
             if key in arguments:
@@ -434,6 +451,14 @@ class SSAReferenceEvaluator:
                     break
 
                 self._step(function, instruction, values, previous)
+                if self.history_ids and values is self._root_frame:
+                    result = instruction.res
+                    if result is not None:
+                        recorded = self.history.get(int(result.id))
+                        if recorded is not None:
+                            recorded.append(
+                                self._operand(values, result),
+                            )
 
             else:
                 successors = list(getattr(block, "successors", ()) or ())
