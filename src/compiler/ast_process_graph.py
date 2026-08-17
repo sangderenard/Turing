@@ -66,20 +66,18 @@ def _call_spelling(node: ast.AST) -> str | None:
     return None
 
 
-#: The constructs that open a scope in the source language. These are
-#: language facts, not a judgement about the program: Python opens a new
-#: binding scope at exactly these nodes and nowhere else.
-_SCOPE_BOUNDARIES = (
-    ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef,
-    ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+#: Expression constructs that carry their own nested body rather than a
+#: block list. Handled alongside the block fields below.
+_EXPRESSION_SCOPES = (
+    ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
 )
 
 
-def _scope_label(node: ast.AST) -> str:
+def _scope_label(node: ast.AST, field: str = "") -> str:
     name = getattr(node, "name", None)
-    if name:
-        return f"{type(node).__name__.casefold()}:{name}"
-    return f"{type(node).__name__.casefold()}:{getattr(node, 'lineno', 0)}"
+    kind = type(node).__name__.casefold()
+    where = name or getattr(node, "lineno", 0)
+    return f"{kind}:{field}:{where}" if field else f"{kind}:{where}"
 
 
 #: Width of a colour flag. 48 bits divided by 2**48 is exact in binary, so
@@ -137,16 +135,49 @@ def scope_paths(root: ast.AST, base: tuple = ()) -> dict[int, tuple]:
 
     def walk(node: ast.AST, path: tuple) -> None:
         paths[id(node)] = path
-        for child in ast.iter_child_nodes(node):
-            walk(
-                child,
-                path + (_scope_label(child),)
-                if isinstance(child, _SCOPE_BOUNDARIES) else path,
-            )
+        for field, value in ast.iter_fields(node):
+            # A block a construct opens is a scope. `if/else` opens two and
+            # they are distinct, so the FIELD is part of the label -- a loop
+            # body and the else that runs when it completes are different
+            # places, and a `try` body is not its handler.
+            if isinstance(value, list) and any(
+                isinstance(item, ast.stmt) for item in value
+            ):
+                inner = path + (_scope_label(node, field),)
+                for item in value:
+                    walk(item, inner)
+                continue
+            # A parameter list is a BOUNDARY, not an interior and not the
+            # exterior. Which of those a given parameter actually is depends
+            # on ref/copy: storage passed by reference stays the caller's and
+            # is merely aliased here, while a copied value is genuinely
+            # local. Ingestion cannot know which -- that is settled later, by
+            # the record ABI. So it is marked as what it verifiably is, a
+            # binding at the boundary of this function, and the pass that
+            # resolves ref/copy adds the layer that says which.
+            #
+            # Lumping parameters into the enclosing scope would assert they
+            # are the caller's; lumping them into the body would assert they
+            # are local. Both are claims ingestion has no grounds for.
+            if field == "args" and isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+            ):
+                for child in (value if isinstance(value, list) else [value]):
+                    if isinstance(child, ast.AST):
+                        walk(child, path + (_scope_label(node, "args"),))
+                continue
+            for child in (
+                value if isinstance(value, list) else [value]
+            ):
+                if not isinstance(child, ast.AST):
+                    continue
+                walk(
+                    child,
+                    path + (_scope_label(child),)
+                    if isinstance(child, _EXPRESSION_SCOPES) else path,
+                )
 
-    walk(root, base + (
-        (_scope_label(root),) if isinstance(root, _SCOPE_BOUNDARIES) else ()
-    ))
+    walk(root, base)
     return paths
 
 
