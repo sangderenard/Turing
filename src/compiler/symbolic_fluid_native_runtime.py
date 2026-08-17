@@ -10,6 +10,7 @@ attempts exercise one orchestration program.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -452,14 +453,60 @@ class NativeSymbolicFluidAdvance:
         return ok, metrics
 
 
+def _cache_is_stale(cached: Path, *, announce: bool = True) -> bool:
+    """Whether a lowered-SSA pickle predates the compiler that made it.
+
+    Repo policy: in a development context, a cached lowering is only
+    trustworthy if nothing that produces it has changed since. The cheap,
+    dependency-free test is mtime against the compiler package and the
+    authored source of the program itself. It errs toward re-lowering --
+    a spurious 30 s recompile costs a coffee, a silently stale artifact
+    costs a day and produces confident wrong conclusions on the way.
+    """
+    try:
+        stamp = cached.stat().st_mtime
+    except OSError:
+        return True
+    compiler_dir = Path(__file__).resolve().parent
+    newest = 0.0
+    newest_path: Path | None = None
+    for source in compiler_dir.rglob("*.py"):
+        if "__pycache__" in source.parts:
+            continue
+        try:
+            when = source.stat().st_mtime
+        except OSError:
+            continue
+        if when > newest:
+            newest, newest_path = when, source
+    if newest <= stamp:
+        return False
+    if announce:
+        print(
+            f"[stale-cache] re-lowering: {cached.name} predates "
+            f"{newest_path.name if newest_path else 'a compiler source'}. "
+            "A cached lowering is not trusted once the compiler that "
+            "produced it has changed.",
+            file=sys.stderr,
+        )
+    return True
+
+
 def compile_native_symbolic_fluid_advance(
     build_directory: str | Path | None = None,
 ) -> NativeSymbolicFluidAdvance:
     """Compile the whole authored traversal -- never exec it.
 
     A cached ``control_repository_ssa.pkl`` under ``build_directory`` is
-    loaded; otherwise the same whole-program lowering the direct-control
-    worker performs runs here (~30 s once).
+    loaded ONLY if it is newer than every compiler source that produces it;
+    otherwise the same whole-program lowering the direct-control worker
+    performs runs here (~30 s once).
+
+    A stale pickle is worse than no pickle. It presents a program lowered by
+    a compiler that no longer exists, so a change under test appears to do
+    nothing, or fails somewhere unrelated to itself -- both of which read as
+    evidence about the change. That has cost real time in this tree, so
+    staleness is detected rather than trusted.
     """
 
     import pickle
@@ -468,7 +515,7 @@ def compile_native_symbolic_fluid_advance(
     outputs_record = None
     if build_directory is not None:
         cached = Path(build_directory) / "control_repository_ssa.pkl"
-        if cached.is_file():
+        if cached.is_file() and not _cache_is_stale(cached):
             with cached.open("rb") as stream:
                 module, lowering_outputs, _exports = pickle.load(stream)
             outputs_record = lowering_outputs.get(

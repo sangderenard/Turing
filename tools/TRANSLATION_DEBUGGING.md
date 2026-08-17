@@ -158,6 +158,39 @@ What *does* carry signal:
 
 ---
 
+## Q5b — Watch the value directly (when it isn't observable)
+
+Q4 says an internal value cannot be read. **Watch makes it readable**, without
+touching the program:
+
+```python
+from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
+art = emit_ssa_function_to_llvm(module, name, watch=(116, 47, 136))
+# art.watched            -> ids now in the public buffer ABI
+# art.watch_shortfalls   -> ((id, reason), ...) for any that could not be
+```
+
+A watch appends an output slot and copies a value the program **already
+computed**. It adds no arithmetic, reorders nothing, renames nothing, and
+with `watch=()` the emitted IR is byte-identical. Verified on this program:
+`mass_err`, `max_vel`, `dt_limit`, the final state and the `ok` flag are all
+bit-identical with watches on and off.
+
+This is the sanctioned alternative to the thing you must not do (below).
+A source-level probe shifts value ids; a watch cannot.
+
+**Loop-carried accumulators are watchable**, including the phis. A phi's
+storage is a register that does not dominate the return, so a watch on one
+gets a *shadow slot* in the entry frame, updated wherever the phi executes.
+It therefore reads **the converged value at loop exit** — which is what you
+want from an accumulator.
+
+A watch that cannot be honoured is reported, never dropped. A watch that
+silently vanished would read as "nothing to see here", which is precisely
+the false reassurance this whole mechanism exists to end.
+
+---
+
 ## Q6 — Which layer disagrees with which?
 
 ```bash
@@ -272,6 +305,112 @@ cleared branch is the single largest time sink in this work.
 including a correction of a claim that was wrong and load-bearing. Keep it
 honest in the same way: an overturned finding is more valuable written
 down than quietly deleted.
+
+---
+
+# Field notes: counterintuitive things that actually happened
+
+These are not hypotheticals. Each cost real time in this tree, each looked
+like something else first, and each is the reason a check above exists.
+They are written down because the *shape* of these mistakes transfers even
+when the specific bug does not.
+
+### 1. A tool that answers `0.0` for "I cannot see that"
+
+`_read()` returned `0.0` for any value absent from the public buffer ABI.
+Internal allocas are absent from it. So probing an internal accumulator
+returned a zero **indistinguishable from a measured zero** — and a
+computation that was genuinely producing zero was the thing under
+investigation.
+
+I reported "the subtraction itself computes zero" as an established fact
+and reasoned onward from it for hours. It was the probe, not the program.
+
+> **The lesson is not "check for None".** It is that a diagnostic which
+> degrades gracefully is a diagnostic that lies. Every tool here now
+> refuses: `observable()` asks, `_read(required=True)` raises, and the
+> correlate tool prints `NOT OBSERVABLE` where a number would go.
+
+### 2. The heuristic that flagged the healthy value
+
+Stage 5 originally flagged "dominantly BAKED" influence as suspicious. Its
+first run flagged `max_wave_speed` — which is **correct**. Baked dominance
+is simply the norm here, because `dt`/`dx`/`gravity` feed nearly
+everything.
+
+Had it shipped, it would have sent the next reader to a known-good value
+with an authoritative-looking `[FAIL]` beside it.
+
+> Test a new check against something you *know* is healthy before you trust
+> it on something you suspect. A check is a claim; claims get verified.
+
+### 3. Two things sharing an id, where one is fine and one is fatal
+
+14 values in the advance function are **both a formal argument and an
+instruction result**. That looks exactly like the id-collision class of bug
+that had already been found twice in this session.
+
+It is not a bug. `arg97 is load97` — they are the *same object*. The
+argument cell is deliberately reused as that value's storage, which is
+in-place and fast. A real collision is two *distinct* objects on one id.
+
+> The check that matters is `is`, not `==`, and not "same number". Stage 2
+> encodes this distinction precisely because the number alone sent me
+> chasing a non-bug through the emitter.
+
+### 4. A probe that corrupted the thing it measured
+
+To observe an accumulator, I added `state.some_field = accumulator + 0.0`
+to the authored source. This **shifted value ids** and rebound a different
+consumer of that same reduction — a previously-correct value started
+reading `0.0`.
+
+The reading it produced was then used as evidence. Twice.
+
+> This is why `watch=` exists at the emitter instead. Never make a program
+> observable by editing it when you can make it observable by *emitting one
+> extra copy of what it already computed*.
+
+### 5. The compiler enforcing a rule that saved the tool
+
+The first version of `watch` appended the value to the function's outputs
+and copied it at the return. For a loop-carried phi, LLVM rejected the
+module: *"Instruction does not dominate all uses"*.
+
+That refusal was **correct and valuable**. A phi's storage is a register
+selected per-edge; it genuinely is not readable at the return. The naive
+fix (skip phis) would have made accumulators — the most interesting values
+to watch — permanently unwatchable. The real fix was a shadow slot in the
+entry frame.
+
+The second attempt then hit *"PHI nodes not grouped at top of basic
+block!"*, because the capture was emitted between two phis. Also correct,
+also load-bearing: the copies now defer to the end of the phi group.
+
+> A verifier rejecting your instrumentation is information about the IR's
+> real structure, not an obstacle. Both errors taught the mechanism
+> something it needed to know.
+
+### 6. A cached artifact that made a fix look like a no-op
+
+Loading a stale `control_repository_ssa.pkl` produced a failure in an
+*unrelated* subsystem, several layers from the change under test. The
+pickle held a program lowered by a compiler that no longer existed.
+
+> Now enforced in code: `_cache_is_stale()` compares the pickle against
+> every compiler source and re-lowers rather than trusting it. A spurious
+> 30-second recompile costs a coffee; a silently stale artifact costs a day
+> *and* produces confident wrong conclusions along the way.
+
+### 7. What all of these have in common
+
+Six of the seven were **the instrument lying, not the program**. The
+program under investigation was deterministic and consistent the entire
+time; what varied was the quality of the observation.
+
+When a result is baffling, suspect the measurement before the mechanism —
+and prefer an instrument that refuses to answer over one that answers
+plausibly.
 
 ---
 

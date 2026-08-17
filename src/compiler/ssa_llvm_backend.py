@@ -348,7 +348,9 @@ import subprocess as _subprocess
 import tempfile as _tempfile
 from dataclasses import dataclass as _dataclass, field as _field
 from pathlib import Path as _Path
-from typing import Any as _Any, Mapping as _Mapping
+from typing import (
+    Any as _Any, Mapping as _Mapping, Sequence as _Sequence,
+)
 
 from ..transmogrifier.ssa import IRModule as _IRModule, SSAValue as _SSAValue
 from .output_publication import (
@@ -474,6 +476,7 @@ def _emit_repository_call_module(
     *,
     entry_name: str,
     text_sink: bool,
+    watch: _Sequence[int] = (),
 ) -> "LLVMFunctionArtifact":
     """Emit a repository-SSA call closure with a pointer-only internal ABI.
 
@@ -701,6 +704,64 @@ def _emit_repository_call_module(
                 function_outputs[name] = callee_outputs
                 changed = True
 
+    # --- diagnostic watches ------------------------------------------------
+    # Appended AFTER the output fixed point has settled, so a watch can never
+    # influence what the program decided its real outputs are, and BEFORE
+    # emission, so the extra slots are allocated by the ordinary path rather
+    # than by a second mechanism that could disagree with it. Everything
+    # downstream -- the internal signature, the public wrapper, buffer_order
+    # -- then treats a watched value exactly like any other output.
+    watched_ids: list[int] = []
+    watch_shortfalls: list[tuple[int, str]] = []
+    phi_backed: dict[int, tuple[int, ...]] = {}
+    if watch:
+        root_values = values_by_function.get(function_name, {})
+        already = {int(value.id) for value in function_outputs[function_name]}
+        root_function = module.functions[function_name]
+        # A value whose storage is selected by a Phi lives in an SSA register
+        # defined inside the loop, not in a frame slot, so a return-site copy
+        # would reference a register that does not dominate the return --
+        # which LLVM rejects, correctly. Those get a shadow frame slot at
+        # emission instead (see `watch_shadows`), which is what makes a
+        # loop-carried accumulator watchable at all: the slot keeps whatever
+        # the phi last selected, i.e. the converged value at loop exit.
+        phi_backed.update({
+            int(instruction.res.id): tuple(
+                int(argument.id) for argument in instruction.args
+            )
+            for block in root_function.blocks.values()
+            for instruction in block.instrs
+            if str(instruction.op) in {"Phi", "phi"}
+            and instruction.res is not None
+        })
+        appended = []
+        for raw_id in dict.fromkeys(int(item) for item in watch):
+            if raw_id in already:
+                # Already public. Not an error: the caller gets what they
+                # asked for, and saying so beats silently doing nothing.
+                watched_ids.append(raw_id)
+                continue
+            value = root_values.get(raw_id)
+            if value is None:
+                watch_shortfalls.append((
+                    raw_id,
+                    f"no value {raw_id} in {function_name}'s own frame; "
+                    "region-local ids are a different numbering space",
+                ))
+                continue
+            appended.append(value)
+            watched_ids.append(raw_id)
+        if appended:
+            function_outputs[function_name] = (
+                *function_outputs[function_name], *appended,
+            )
+    # Phi-backed watches need a frame slot of their own; see `watch_shadows`
+    # at the emission site. Recorded here so emission knows which ones.
+    phi_watch_ids = frozenset(
+        raw_id for raw_id in watched_ids
+        if raw_id in (phi_backed if watch else {})
+    )
+
     internal_symbols = {
         name: "__ssa_" + _re.sub(r"[^A-Za-z0-9_$.-]", "_", name)
         for name in reachable
@@ -808,6 +869,25 @@ def _emit_repository_call_module(
             int(value.id): f"%out.{index}"
             for index, value in enumerate(outputs)
         }
+        # A watched value whose storage is a Phi register cannot be copied at
+        # the return -- the register does not dominate it. Give it a slot in
+        # the entry frame (which dominates everything) and copy the phi's
+        # CONTENT into that slot each time the phi executes. The slot then
+        # holds whatever the phi last selected, which for a loop-carried
+        # accumulator is exactly its converged value at loop exit.
+        watch_shadows: dict[int, str] = {}
+        if name == function_name:
+            for watched_id in sorted(phi_watch_ids):
+                watched_value = values_by_function[name].get(watched_id)
+                if watched_value is None:
+                    continue
+                llvm_type = _value_llvm_type(watched_value)
+                count = _value_element_count(watched_value)
+                slot = f"%watch.{watched_id}"
+                entry_allocas.append(
+                    f"  {slot} = alloca {llvm_type}, i64 {count}, align 8"
+                )
+                watch_shadows[watched_id] = slot
 
         def pointer(value: _Any) -> str:
             value_id = int(value.id)
@@ -982,6 +1062,11 @@ def _emit_repository_call_module(
                         int(returned_values[output_index].id)
                     )
                 if source is None:
+                    # A watch shadow, when one exists, is the ONLY readable
+                    # storage for that value at the return; prefer it over
+                    # the phi register it mirrors.
+                    source = watch_shadows.get(int(output.id))
+                if source is None:
                     source = pointers.get(int(output.id))
                 if source is None:
                     tensor_table = getattr(module, "tensor_tables", {}).get(name)
@@ -1010,13 +1095,22 @@ def _emit_repository_call_module(
                     )
         active_block: str | None = None
         emitted_return = False
+        # Watch-shadow copies wait here until the phi group they follow has
+        # been emitted in full; see the Phi branch below.
+        pending_shadow: list[str] = []
         for instruction_index, (block_name, instruction) in enumerate(
             scheduled_instructions
         ):
             if block_name != active_block:
+                if pending_shadow:
+                    body.extend(pending_shadow)
+                    pending_shadow.clear()
                 body.append(f"{block_name}:")
                 active_block = block_name
             operation = str(instruction.op)
+            if pending_shadow and operation not in {"Phi", "phi"}:
+                body.extend(pending_shadow)
+                pending_shadow.clear()
             result = instruction.res
             result_id = int(result.id) if result is not None else None
             tag = f"{instruction_index}.{result_id if result_id is not None else 'v'}"
@@ -1072,6 +1166,24 @@ def _emit_repository_call_module(
                     )
                 )
                 pointers[result_id] = register
+                shadow = watch_shadows.get(result_id)
+                if shadow is not None:
+                    # Diagnostic copy only: reads what the phi already
+                    # selected and writes a slot nothing else observes.
+                    # DEFERRED, not emitted here: LLVM requires every phi in
+                    # a block to be grouped at its top, and a block with two
+                    # carried values has two phis. These flush at the first
+                    # non-phi instruction of the same block.
+                    shadow_type = _value_llvm_type(result)
+                    captured = f"%watch.load.{tag}"
+                    pending_shadow.append(
+                        f"  {captured} = load {shadow_type}, ptr {register}, "
+                        "align 8"
+                    )
+                    pending_shadow.append(
+                        f"  store {shadow_type} {captured}, ptr {shadow}, "
+                        "align 8"
+                    )
                 continue
 
             if operation in {"Br", "br"}:
@@ -1974,6 +2086,8 @@ def _emit_repository_call_module(
         needs_text_sink=bool(text_sink),
         output_publications=publications,
         output_surfaces=publication_surface_plan(publications, target="llvm"),
+        watched=tuple(watched_ids),
+        watch_shortfalls=tuple(watch_shortfalls),
     )
 
 
@@ -1994,6 +2108,15 @@ class LLVMFunctionArtifact:
     library_path: _Path | None = None
     training_steps_value_id: int | None = None
     learning_rate_value_id: int | None = None
+    #: Value ids additionally exposed because a caller asked to watch them.
+    #: Diagnostics only: a watch appends an output slot and one copy of a
+    #: value that was already computed, so it cannot change what the program
+    #: computes. Empty unless asked for, and absent by default.
+    watched: tuple[int, ...] = ()
+    #: Watch requests that could not be honoured, with the reason. Never
+    #: silently dropped -- a watch that vanishes reads as "this value is
+    #: fine", which is the failure mode this whole mechanism exists to end.
+    watch_shortfalls: tuple[tuple[int, str], ...] = ()
     _entry: _Any = _field(default=None, repr=False)
 
     @property
@@ -2307,6 +2430,7 @@ def emit_ssa_function_to_llvm(
     text_sink: bool = False,
     pi_solver: str | None = None,
     pi_epsilon: float | None = None,
+    watch: _Sequence[int] = (),
 ) -> LLVMFunctionArtifact:
     """Render one SSA function of table-covered instructions as LLVM IR.
 
@@ -2315,6 +2439,23 @@ def emit_ssa_function_to_llvm(
     into it; a bare native artifact has no sink, so publications are elided
     -- they are never load-bearing for the numerics, and the same SSA runs
     either way.
+
+    ``watch`` names value ids of ``function_name`` to expose in the public
+    buffer ABI in addition to the program's own outputs, purely so a
+    diagnostic can read them. Only the root function's own values can be
+    watched, and only values that survive to its frame.
+
+    This is deliberately the *non-perturbing* way to observe an internal
+    value. It appends an output slot and copies a value the program already
+    computed; it introduces no new arithmetic, reorders nothing, and renames
+    nothing. The alternative people reach for -- adding an expression to the
+    authored source to make a value reachable -- shifts value ids and can
+    rebind the very thing being measured, which has produced false readings
+    in this tree more than once.
+
+    A watch is absent unless asked for: with ``watch=()`` the emitted module
+    is byte-identical to what it would otherwise be, so nothing about a
+    shipped artifact depends on this existing.
     """
 
     from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
@@ -2334,6 +2475,7 @@ def emit_ssa_function_to_llvm(
             function_name,
             entry_name=entry_name or function_name,
             text_sink=text_sink,
+            watch=watch,
         )
 
     function = module.functions[function_name]
@@ -3150,6 +3292,22 @@ def emit_ssa_function_to_llvm(
         needs_text_sink=publishes_text,
         output_publications=publications,
         output_surfaces=publication_surface_plan(publications, target="llvm"),
+        watched=tuple(
+            int(item) for item in watch if int(item) in set(buffer_ids)
+        ),
+        # This is the single-block path, whose buffer set is already every
+        # value the function has. A watch for anything else is reported
+        # rather than dropped: a request that quietly disappears reads as
+        # "nothing to see here", which is exactly the false reassurance the
+        # watch mechanism exists to prevent.
+        watch_shortfalls=tuple(
+            (
+                int(item),
+                "single-block emission publishes its own value set; this id "
+                "is not among them",
+            )
+            for item in watch if int(item) not in set(buffer_ids)
+        ),
     )
 
 
