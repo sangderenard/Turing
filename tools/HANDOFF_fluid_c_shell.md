@@ -1,5 +1,69 @@
 # Handoff: fluid program through the canonical AOT/Fortran/C-shell chain
 
+## CONTINUATION REPORT — read this first
+
+**State:** the compile-to-executable chain works. Two real defects are
+located, one is precisely bounded and blocked on a tool that does not exist
+yet.
+
+**Defect 1 — whole-array copy moves one element.** `state.height =
+state.next_height + 0.0` updates 1 cell of 16. Root cause confirmed:
+`planned_region_4`'s values are shaped `()` while their accounting declares
+`program_abi_rank: 2`, so `_value_element_count` returns 1 and a scalar
+load/store is emitted where an array copy belongs. Detected automatically
+now by `diagnose_translation.py --stages 2`. The fix does NOT belong in the
+emitter — the runtime extents for those values are absent from
+`extent_order` and region_4's own instructions are scalar `Add`s, so the
+emitter is faithfully rendering a plan that already lost the shape.
+
+**Defect 2 — the traversal disagrees with the authored mathematics.**
+Found by `differential_translation.py` against an independent
+SymPy/NumPy oracle. Narrowed considerably, and the narrowing matters:
+
+* The compiled **step kernel is EXACT**. All 11 outputs
+  (`height_next`, `momentum_x_next`, …, `tracer_violation`) match the
+  SymPy equations to the bit on a non-uniform sample. The kernel is not
+  the problem and should not be re-examined.
+* The **traversal around it is wrong**. `next_height` differs from the
+  oracle in 11 of 16 cells.
+* The mismatching cells are exactly those with a **perturbed neighbour**;
+  cells whose neighbourhood is uniform match the oracle exactly. So
+  neighbour *values* are being mis-fed.
+* **Ruled out by direct test**, each reproducing the full grid and
+  comparing: correct Jacobi indexing; every pairwise neighbour swap
+  (E/N/S/W); Gauss-Seidel (reading the array as it is updated in place);
+  north/south applied to the column axis; east/west applied to the row
+  axis; transposed access; all-neighbours-are-centre; flat linear
+  indexing with wraparound.
+
+**Where it stands:** none of the obvious index schemes reproduce the
+native numbers, so the mis-feed is not a simple mis-indexing. Continuing
+to guess at index arithmetic is the blind-alley pattern this tree has
+already paid for.
+
+**What is needed next, specifically.** Phase 3b from
+`tools/DIFFERENTIAL_PHASES.md`: a reference evaluator for repository SSA.
+It answers the one question that routes this defect and cannot currently
+be answered —
+
+* if the SSA evaluator reproduces the **native** numbers, the wrong
+  neighbours are already baked into the SSA, and the defect is in
+  lowering/planning (and plausibly at the AST/SymPy inlet, per the steer
+  recorded below);
+* if it reproduces the **oracle** numbers, the SSA is right and emission
+  is dropping or mis-binding the neighbour operands.
+
+Everything else about this defect should wait for that answer.
+
+**Tools available for the next session:**
+`tools/TRANSLATION_DEBUGGING.md` (the decision tree and field notes),
+`diagnose_translation.py` (staged checks, `--ids`/`--stages` with ranges),
+`correlate_compile.py` (per-id, all layers side by side),
+`differential_translation.py` (oracle vs artifact),
+and `watch=`/`history=` on `emit_ssa_function_to_llvm` for reading internal
+values without perturbing the program.
+
+
 ## Status: the C-shell chain BUILDS AND RUNS
 
 ```bash
