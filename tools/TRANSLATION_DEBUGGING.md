@@ -305,6 +305,64 @@ Two limits worth knowing before they mislead you:
 
 ---
 
+## Q5e — The whole-program native executable runs but a buffer is wrong
+
+Everything above assumes one function, reached through `watch=`/LLVM. A
+standalone Fortran/C-shell executable is a different shape of problem:
+dozens of `bind(C)` subroutines calling each other by POSITION, each
+level with its own local id numbering, and the question is no longer
+"what is this SSA value" but **"does this specific C-visible buffer ever
+get written, anywhere in the call graph reachable from here"**.
+
+Reading that by eye does not scale — a real case here required following
+one buffer through five nested `call` statements across hundreds of
+positional arguments each. `tools/trace_fortran_alias.py` does it
+mechanically:
+
+```bash
+python tools/trace_fortran_alias.py path/to/generated.f90 \
+    --entry the_bind_c_entry_name --source state.height
+```
+
+Given an entry point and a dotted source name from the `.api.yaml`
+contract beside the `.f90`, it finds the entry's own formal for that
+source, then for every `call` statement in the entry's body checks
+whether the SAME actual token is among the arguments; if so it resolves
+the CALLEE's formal at that position (by index, not by name — two
+functions' local numbering never has to agree), reports that formal's
+declared Fortran `intent` and whether the callee's own body writes an
+array element into it, and recurses. The output is the whole chain in
+one table: subroutine, formal, intent, write-or-not, at every hop.
+
+**What it is good for:** proving a buffer is never written anywhere
+reachable (a `no local write` at every hop, all the way down, is a real
+finding — not a "not observable"), and finding exactly which hop a write
+happens at when one exists.
+
+**What it does NOT do, and do not read it as if it did:** it follows one
+TOKEN. A value can arrive at a callee under MULTIPLE different formal
+names (five spatial neighbour views of `state.height` is a real example
+in this tree — `t54, t56, t58, t60, t45, t52, t122, t23, t27` are all
+"state.height" at one function, and the tracer only follows whichever one
+the caller happened to forward under the traced token). A clean trace of
+one token is not a clean trace of the value's every occurrence.
+
+> **Always verify against the api contract, never against hand-parsed
+> Fortran text.** A prior pass in this exact investigation counted 367
+> formals on a subroutine by splitting a declaration line on commas with
+> `line[line.index('('):line.rindex(')')]` — `rindex(')')` found the
+> LAST `)` on the line, which sits inside the trailing
+> `bind(C, name="...")` clause, so the split captured two fragments of
+> that string as if they were extra formal names. The real count,
+> read from the `.api.yaml` contract (which is generated data, not
+> re-derived by eye), was 366 — matching the call site exactly. The
+> wrong count was recorded as a finding and had to be corrected later.
+> `trace_fortran_alias.py` reads the contract for source-name resolution
+> and a real regex-based parser for the rest, specifically so this
+> mistake cannot recur.
+
+---
+
 ## Q6 — Which layer disagrees with which?
 
 ```bash
@@ -445,6 +503,8 @@ tool — each answer narrowed what the next tool had to look at.
 | 14 | `history=` on BOTH sides (extended here) | which ITERATION, on either side | rings every watched value, not only phis, and the evaluator rings the same way — arguments agreeing per-iteration while outputs did not is what localised the defect to one callee |
 | 15 | sensitivity fingerprint (ad hoc) | which INPUTS the artifact actually uses | perturb each input of a pure reproducer; the artifact used 3 of 9, and one coefficient equalled the sum of the 6 it lost |
 | 16 | opcode census (ad hoc) | is an instruction missing, or in the wrong domain | `fmul` 118 + `mul` 22 = SSA's 140 `Mul`. Nothing missing — 22 were integer. **This named the bug.** |
+| 17 | `--trace` on `compile_fortran_module_c_shell` (built here) | per-launch timing/status inside a standalone executable | compile-time-only ring buffer; an untraced artifact has none of this code in it at all |
+| 18 | `trace_fortran_alias.py` (built here) | does a buffer get written ANYWHERE reachable in a whole-program native build | follows one token through nested `call` statements by position; proved `state.height` is never written across 5 hops, and where `state.next_height` is |
 
 **What each stage cost when skipped.** Steps 8 and 9 existed only after
 days of reasoning about structure. Every one of those days would have been

@@ -482,10 +482,154 @@ Two leads, both concrete:
 2. **36 of the 40 array dummies in the entry are named with
    address-derived ids** (`t2147983015473`). The node-identity defect is
    not cosmetic and not confined to diagnostics: it names most of the
-   arrays in the program's ABI, and lead 1 keys its heuristic on exactly
-   those names. The `366 actuals vs 367 formals` gap is in this same
-   subroutine.
+   arrays in the program's ABI.
 
-Next: dump the api contract's declared extents for `t16..t19` and compare
-against what the shell passes. If they disagree, lead 1 is the cause and
-the fix is to bind extents from the contract instead of from name shape.
+### Correction: the "366 vs 367" arity gap was a measurement bug, not a fact
+
+The line above this originally read: *"The 366 actuals vs 367 formals gap
+is in this same subroutine."* That is **false**, and the record is
+corrected here rather than silently edited, because a wrong claim left
+standing is worse than one admitted.
+
+The 367 count came from splitting a Fortran declaration line on commas
+with a naive `line[line.index('('):line.rindex(')')]`. `rindex(')')`
+finds the **last** `)` on the line, which is inside the trailing
+`bind(C, name="...")` clause, not the argument list's own closing paren
+-- so the split silently captured `name="..."` fragments as if they were
+two extra formal names. Read correctly (splitting on `) bind(C` instead),
+`run_superstep__specialized_47985f25ff49` declares **366** formals, and
+the call site at `symbolic_fluid_frame` passes **366** actuals. They
+agree exactly. There is no arity gap in this subroutine.
+
+Lesson for this file specifically: **never hand-parse Fortran text for a
+structural fact the api contract already states.** Every measurement
+below this point uses the `.api.yaml` contract or a real parser
+(`tools/trace_fortran_alias.py`), not comma-splitting.
+
+### Extent binding (lead 1) is fine for the arrays checked
+
+Comparing the contract's declared extents for `t16..t19`
+(`state.height`/`momentum_x`/`momentum_y`/`tracer`) against what the
+frame's call into `run_superstep` actually passes: both sides agree,
+`32, 32` for every one of the four arrays, matching the real grid. Lead 1
+is not the cause, at least not for these four.
+
+### The real finding: `state.height` is never written, anywhere reachable
+
+Built `tools/trace_fortran_alias.py` (see the decision tree, Q5e) to
+follow one named buffer's identity through the whole call graph
+mechanically instead of by eye. Tracing `state.height` from
+`symbolic_fluid_frame`:
+
+    frame  t16           intent(inout)  no local write
+      -> run_superstep                  t390   intent(inout)  no local write
+        -> step_with_dt_control_used    t678   intent(inout)  no local write
+          -> symbolic_fluid_advance     t54    intent(in)     no local write
+            -> planned_region_1         t54    intent(in)     no local write
+               (no further forwarding call found under this token)
+
+Five hops deep, `state.height` is never assigned to anywhere in the
+traced graph. Tracing `state.next_height` instead, from the same root,
+finds a genuine write:
+
+    frame -> run_superstep -> step_with_dt_control_used -> advance
+      -> planned_region_3   t108   intent(inout)   WRITES here
+
+So the compiled program **does** compute a new height field correctly
+into its own buffer (`next_height`, C-shell slot 6) -- but nothing in the
+traced graph ever copies that result into the persistent `height` buffer
+(slot 2) the caller reads back. That much is consistent with the defect
+this session has already named twice in other layers: `state.height =
+state.next_height` in the authored Python REBINDS a Python attribute,
+which is free in Python and has no native equivalent unless the compiler
+specifically lowers it to an in-place array copy. See the standing memory
+note: *"No final fused reduction for multi-function programs — fusing
+kills state navigability; keep the SSA/control path."* This may be the
+same disease in a new place.
+
+**But that alone does not explain the observed value.** If `height`
+(slot 2) is genuinely never written, it should retain whatever
+`initial-state.bin` loaded (~1.0-1.12, confirmed present in the file and
+confirmed loaded into slot 2 by direct reading of the C source's `fread`
+block). The observed value is not "unchanged" -- it is **exactly 0.0** in
+every cell, in the raw `final-outputs.bin` bytes, not merely in a
+summary printf. Ruled out while chasing this:
+
+* **slot-index collision** -- `state.height` is C-shell slot 2,
+  `state.next_height` is slot 6, separate `calloc` calls, confirmed by
+  direct grep of the allocation lines. Not the same memory.
+* **a feedback-swap touching it** -- the only pointer swap in the whole
+  generated `main()` is `slots[1] <-> slots[155]` (the scalar dt
+  feedback). Slot 2 never appears in a swap.
+* **a whole-array zero broadcast on this token** -- grepped every bare
+  `tN = 0.0_c_double` statement in the file (9 of them); none target
+  `t16` or any alias on the traced chain (`t390`, `t678`, `t54`).
+
+### `state.height` arrives at `advance` under nine names -- checked, all correct
+
+`trace_fortran_alias.py`'s first version only followed the FIRST
+occurrence of a token within one call's argument list (`.index()`
+instead of every match), which would have missed exactly this case:
+`state.height` is passed into `symbolic_fluid_advance` NINE separate
+times in one call (the five spatial neighbour views, `t54, t56, t58,
+t60, t45, t52, t122, t23, t27`), all in the SAME `call` statement. Fixed
+to report and follow every position a token occupies, then re-run.
+
+Result: **all nine are correctly bound to the same real buffer**, traced
+all the way from `t16` through `t390`, `t678`, and out to all nine
+`advance` positions and their respective `planned_region` callees, with
+the RIGHT declared intent at every hop (`intent(in)` for the five
+read-only neighbour views, `intent(inout)` for the two that also feed a
+write, `no local write` confirmed at every one of them for `height`
+specifically). This was the most concrete open lead and it is now
+**disproven**, not merely unverified -- there is no cross-view binding
+error here.
+
+So, cumulatively: `state.height` is proven never written anywhere in the
+five-level call graph reachable from `symbolic_fluid_frame`, through
+EVERY path that graph contains, with EVERY occurrence checked. And
+`state.next_height` -- the buffer that legitimately IS computed correctly
+-- lives in a separate, non-aliased, correctly-sized buffer that the
+output writer never reads. Both of those are now facts, not hypotheses.
+
+What is NOT yet established: why the observed value is exactly 0.0
+rather than the ~1.0 the never-written buffer should retain from
+`initial-state.bin`. Ruled out for this: slot-index collision with
+`next_height` (separate `calloc`s, confirmed), the one pointer swap in
+`main()` (targets slot 1/155 only, a scalar, confirmed by grep), a
+second allocation of slot 2 anywhere in the file (grepped every
+`slots[2]` occurrence in the generated C -- exactly one `calloc`, one
+`fread` loop, one summary read, one final-output read; no other
+assignment to the pointer), and a whole-array zero broadcast targeting
+this token (grepped every bare `tN = 0.0_c_double`; none match the
+traced chain).
+
+Remaining, in order of cost to test:
+
+1. **There is no prior WORKING whole-program build to diff against.**
+   The executable could not be compiled at all before this session's
+   Fortran fixes (predicate typing, discard-slot dtype, literal dtype
+   threading) -- it failed at the `t419` type-mismatch error every time.
+   So "did this session's edits cause it" cannot be answered by rebuilding
+   an older lowering; there is nothing to compare it to. This defect may
+   be exposed by this session's fixes rather than caused by them.
+2. **Run under a bounds/memory checker** (gfortran `-fcheck=bounds` on a
+   rebuild, or a C-side sanitizer on the shell) rather than continuing to
+   read source by hand. At least two input slots decoded as
+   `-1.24e+123` earlier this session (uninitialised bytes reaching
+   `initial-state.bin` from an unresolved source), which is independent
+   evidence that some buffer in this program is sized or initialised
+   incorrectly -- a live, checkable hypothesis rather than another guess.
+3. **Check the accept/reject/retry commit path specifically.** The
+   authored `run_superstep` accepts a step and commits it, or rejects and
+   restores a snapshot; the earlier LLVM-path investigation this session
+   already established that EVERY attempt gets rejected (the
+   `viscosity`/`tracer_diffusivity` defect drives the tracer out of
+   bounds at every dt). If the compiled Fortran's rollback path writes
+   from an unloaded/zero-initialised snapshot buffer rather than
+   preserving the caller's original array, that is consistent with
+   everything measured here and does not require a new binding error --
+   only that "restore" and "leave untouched" were not the same operation
+   in this lowering. `trace_fortran_alias.py --token` can follow whatever
+   the "saved"/snapshot buffer is called once it is identified in the
+   authored source.
