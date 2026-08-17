@@ -66,20 +66,30 @@ def flag_rgb(flag: float) -> tuple[float, float, float]:
 
 
 def mix(layers: tuple) -> tuple[int, int, int]:
-    """Add the layers' spectra, the way light adds.
+    """Collapse layers to colour using the tree's own dye mapping.
 
-    Normalised by the brightest channel rather than by the layer count, so
-    a two-layer mix stays as vivid as a one-layer flag and the hue carries
-    the information instead of the brightness.
+    Deliberately NOT a second colour model. `influence_field` already fixes
+    how this tree turns influence into colour -- power sums over a spectral
+    ARC that terminates at violet and never wraps, so a mean hue is a real
+    centroid instead of the meaningless average two opposed hues give on a
+    circle -- and `influence_field_image.dye_rgb` already renders that in
+    OKLCH. Re-deriving either here would be a parallel mechanism that
+    disagrees with the shader for the same field.
+
+    So layers reduce the same way the field does: mean hue as the centroid,
+    dispersion as saturation, so a construct carrying one layer is vivid and
+    one carrying several reads as mixed.
     """
+    from src.rendering.influence_field_image import dye_rgb
+
     if not layers:
         return (28, 28, 32)
-    red = green = blue = 0.0
-    for flag in layers:
-        r, g, b = flag_rgb(flag)
-        red, green, blue = red + r, green + g, blue + b
-    peak = max(red, green, blue) or 1.0
-    return tuple(int(round(255 * channel / peak)) for channel in (red, green, blue))
+    weight = float(len(layers))
+    first = sum(float(flag) for flag in layers) / weight
+    second = sum(float(flag) ** 2 for flag in layers) / weight
+    spread = max(0.0, second - first * first) ** 0.5
+    red, green, blue = dye_rgb(first, max(0.0, 1.0 - 2.0 * spread), 1.0)
+    return (int(round(red * 255)), int(round(green * 255)), int(round(blue * 255)))
 
 
 def ingest(source: str, function_name: str | None):
@@ -90,21 +100,35 @@ def ingest(source: str, function_name: str | None):
     tree = ast.parse(source)
     functions = [
         node for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and (function_name is None or node.name == function_name)
     ]
     if not functions:
         raise SystemExit(f"no function {function_name!r} in the source")
-    graph = ProcessGraph(0, False, materialize_memory=False)
-    build_semantic_ast(graph, functions[0], filename="<spectral>")
+
     painted = []
-    for _node_id, data in graph.G.nodes(data=True):
-        span = data.get("source_span") or {}
-        layers = tuple(span.get("layers") or ())
-        if not layers or span.get("line") is None:
+    names: dict[float, str] = {}
+    ingested: list[str] = []
+    refused: list[tuple[str, str]] = []
+    for function in functions:
+        graph = ProcessGraph(0, False, materialize_memory=False)
+        try:
+            build_semantic_ast(graph, function, filename="<spectral>")
+        except Exception as error:
+            # A function the ingestion declines is reported, not skipped
+            # silently: an uncoloured region in the view must never be
+            # ambiguous between "nothing stamped it" and "never looked at".
+            refused.append((function.name, f"{type(error).__name__}: {error}"))
             continue
-        painted.append((span, layers, str(data.get("op"))))
-    return painted, dict(graph.G.graph.get("layer_names") or {})
+        ingested.append(function.name)
+        names.update(graph.G.graph.get("layer_names") or {})
+        for _node_id, data in graph.G.nodes(data=True):
+            span = data.get("source_span") or {}
+            layers = tuple(span.get("layers") or ())
+            if not layers or span.get("line") is None:
+                continue
+            painted.append((span, layers, str(data.get("op"))))
+    return painted, names, ingested, refused
 
 
 def paint(source: str, painted) -> list[list[tuple]]:
@@ -195,7 +219,10 @@ def render_html(source: str, grid, names: dict, destination: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default=None)
-    parser.add_argument("--function", default="symbolic_fluid_advance")
+    parser.add_argument(
+        "--function", default=None,
+        help="one function; omit to render every function in the source",
+    )
     parser.add_argument("--out", default="build/spectral_view.html")
     parser.add_argument("--no-terminal", action="store_true")
     arguments = parser.parse_args()
@@ -206,10 +233,17 @@ def main() -> int:
         from src.compiler.symbolic_fluid_dt import SYMBOLIC_FLUID_DT_SOURCE
         source = SYMBOLIC_FLUID_DT_SOURCE
 
-    painted, names = ingest(source, arguments.function)
+    painted, names, ingested, refused = ingest(source, arguments.function)
     grid = paint(source, painted)
     coloured = sum(1 for row in grid for cell in row if cell)
     total = sum(len(row) for row in grid)
+    print(f"ingested {len(ingested)} function(s): {', '.join(ingested)}")
+    if refused:
+        print(f"  {len(refused)} function(s) the ingestion declined "
+              "(their source stays uncoloured for that reason, not for "
+              "lack of a stamp):")
+        for name, why in refused:
+            print(f"    {name}: {why}")
     print(f"{len(painted)} stamped nodes; "
           f"{coloured}/{total} source characters carry a layer")
     if coloured < total:

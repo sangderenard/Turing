@@ -119,6 +119,24 @@ def add_layer(layers: tuple, flag: float) -> tuple:
     return tuple(layers) + (float(flag),)
 
 
+def layers_by_node(graph) -> dict[int, tuple]:
+    """{graph node id: its layers}, the join surface for the next pass.
+
+    A translation reading this inherits a value's layers from the node it
+    is translating FROM and appends its own flag with ``add_layer``. That
+    is the whole contract: inherit at the exchange, append outward, never
+    recompute. Downstream identifies nodes by the same id it already uses
+    (``value_id`` defaults to the node id), so no new correspondence is
+    introduced -- this exposes what is already there.
+    """
+    found: dict[int, tuple] = {}
+    for node_id, data in graph.G.nodes(data=True):
+        layers = tuple((data.get("source_span") or {}).get("layers") or ())
+        if layers:
+            found[int(node_id)] = layers
+    return found
+
+
 def scope_paths(root: ast.AST, base: tuple = ()) -> dict[int, tuple]:
     """Map every AST node to the scope path enclosing it.
 
