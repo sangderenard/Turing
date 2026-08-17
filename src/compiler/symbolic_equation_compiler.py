@@ -13,6 +13,7 @@ from typing import Any, Mapping, Sequence
 
 import sympy
 
+from .hierarchical_plan import PREDICATE_OPERATIONS
 from .ssa_builder import process_graph_to_ssa_instrs
 from .symbolic_process_graph import ingest_sympy_expressions
 from ..transmogrifier.graph.graph_express2 import ProcessGraph
@@ -111,7 +112,17 @@ def compile_sympy_equations(
     # integer/rational literals in the authored form, while the compiled ABI
     # consistently carries scalar f64 values across all native targets.
     for _node_id, data in graph.G.nodes(data=True):
-        data["tensor"] = {"dtype": "float64", "shape": ()}
+        # A relation's result is not a value of the model, it is a
+        # predicate, and blanket float64 erased that. The backend cannot
+        # recover it either: `Lt` emits `fcmp`, which yields i1 whatever
+        # the SSA declared, so the value disagreed with its own rendering
+        # and the first consumer of it -- a Piecewise select -- failed
+        # verification. Declaring it here fixes every target at once.
+        spelling = str(data.get("op") or data.get("type") or "")
+        data["tensor"] = {
+            "dtype": "bool" if spelling in PREDICATE_OPERATIONS else "float64",
+            "shape": (),
+        }
         if str(data.get("type") or data.get("op") or "").casefold() in {
             "const", "constant",
         }:

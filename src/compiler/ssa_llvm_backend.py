@@ -545,6 +545,9 @@ def _internal_call_closure(
     return module.reachable_functions(str(root), follow_call=follow), kernels
 
 
+from .hierarchical_plan import PREDICATE_OPERATIONS  # noqa: E402
+
+
 def _emit_repository_call_module(
     module: _IRModule,
     function_name: str,
@@ -952,7 +955,7 @@ def _emit_repository_call_module(
         if instruction.res is not None
         and _declared_span_rank(instruction.res) > 0
         and scalar_likeness(str(instruction.op)) is not None
-        and str(instruction.op) not in {"Eq", "Ne", "Lt", "Le", "Gt", "Ge"}
+        and str(instruction.op) not in PREDICATE_OPERATIONS
     )
     growing = True
     while growing:
@@ -2062,7 +2065,7 @@ def _emit_repository_call_module(
                 template is not None
                 and result is not None
                 and _declared_span_rank(result) > 0
-                and operation not in {"Eq", "Ne", "Lt", "Le", "Gt", "Ge"}
+                and operation not in PREDICATE_OPERATIONS
             ):
                 # An elementwise operation whose RESULT is a span is an array
                 # operation, and rendering it as one scalar load/op/store
@@ -2221,7 +2224,7 @@ def _emit_repository_call_module(
                         *operands, out=register
                     ).splitlines():
                         body.append(f"  {rendered_line}")
-                    if operation in {"Eq", "Ne", "Lt", "Le", "Gt", "Ge"}:
+                    if operation in PREDICATE_OPERATIONS:
                         result_type = "i1"
                 # The cell was alloca'd with the value's DECLARED type; a
                 # narrower computed result stored raw left garbage bytes that
@@ -3507,6 +3510,20 @@ def emit_ssa_function_to_llvm(
                     integer_lines, produced = integer
                     lines.extend(f"  {line}" for line in integer_lines)
                     scalars[result_id] = (register, produced)
+                    continue
+                # What the TEMPLATE yields, which is not always the declared
+                # type. `Lt` renders as `fcmp`, and fcmp yields i1 no matter
+                # what the value was declared as. Recording "double" below
+                # made the register disagree with its own type, and the first
+                # consumer of it emitted `fcmp one double` against an i1 --
+                # rejected by the verifier. Nothing consumed a comparison in
+                # this path until Piecewise did, so it sat unnoticed.
+                if str(operation) in PREDICATE_OPERATIONS:
+                    for rendered in template.format(
+                        *operands, out=register
+                    ).splitlines():
+                        lines.append(f"  {rendered}")
+                    scalars[result_id] = (register, "i1")
                     continue
                 if domain != "double":
                     # No exact integer spelling. Evaluate in the double column

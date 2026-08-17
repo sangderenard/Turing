@@ -141,13 +141,13 @@ operator_signatures = {
     'Log': sig_unary_elementwise,
     'Sqrt': sig_unary_elementwise,
 
-    'Equality': sig_equality,
+    'Eq': sig_equality,
 
     'Pi': sig_constant,
     'Half': sig_constant,
     'ImaginaryUnit': sig_constant,
     'E': sig_constant,
-    'StrictGreaterThan': sig_binary_elementwise,
+    'Gt': sig_binary_elementwise,
 }
 
 array_sigs_overrides = {
@@ -529,7 +529,7 @@ numpy_funcs['Equality'] = lambda role_map: role_map['lhs'][0] == role_map['rhs']
 
 import math
 ultra_basic_funcs = {
-    'Equality': lambda x: x == x,
+    'Eq': lambda x: x == x,
     'Store': lambda x: x,  # Store just returns its input
     'MatrixSymbol': matrixsymbol_op,  # from above
     'MatrixElement': matrixelement_op,  # from above
@@ -561,7 +561,7 @@ math_funcs = {
 math_funcs.update(ultra_basic_funcs)
 torch_funcs = ultra_basic_funcs.copy()
 torch_funcs.update({
-    'Equality': lambda x: torch.equal(x[0], x[1]),
+    'Eq': lambda x: torch.equal(x[0], x[1]),
     'Store': lambda x: x[0],  # Store just returns its input
     'MatrixSymbol': matrixsymbol_op,  # from above
     'MatrixElement': matrixelement_op,  # from above
@@ -583,7 +583,7 @@ torch_funcs.update({
     'Min': lambda x: torch.min(x[0]) if len(x) == 1 else torch.min(torch.stack(x)),
     'Max': lambda x: torch.max(x[0]) if len(x) == 1 else torch.max(torch.stack(x)),
     'Tuple': lambda *x: tuple(x),  # simply return the tuple of inputs
-    'StrictGreaterThan': lambda x, y: torch.gt(x, y) if len(x) == 2 else torch.gt(torch.stack(x[:-1]), x[-1]),
+    'Gt': lambda x, y: torch.gt(x, y) if len(x) == 2 else torch.gt(torch.stack(x[:-1]), x[-1]),
     'BooleanTrue': lambda: torch.tensor(True, dtype=torch.bool),
     'BooleanFalse': lambda: torch.tensor(False, dtype=torch.bool),
     'Half': lambda: torch.tensor(0.5, dtype=torch.float32),  # half precision
@@ -909,12 +909,12 @@ abstract_tensor_funcs = {
     "LShift": _at_shl,
     "RShift": _at_shr,
     "Not": _abstract_tensor_method("logical_not"),
-    "Equality": _abstract_tensor_reduce(lambda left, right: left == right),
-    "Unequality": _abstract_tensor_reduce(lambda left, right: left != right),
-    "StrictLessThan": _abstract_tensor_reduce(lambda left, right: left < right),
-    "LessThanOrEqual": _abstract_tensor_reduce(lambda left, right: left <= right),
-    "StrictGreaterThan": _abstract_tensor_reduce(lambda left, right: left > right),
-    "GreaterThanOrEqual": _abstract_tensor_reduce(lambda left, right: left >= right),
+    "Eq": _abstract_tensor_reduce(lambda left, right: left == right),
+    "Ne": _abstract_tensor_reduce(lambda left, right: left != right),
+    "Lt": _abstract_tensor_reduce(lambda left, right: left < right),
+    "Le": _abstract_tensor_reduce(lambda left, right: left <= right),
+    "Gt": _abstract_tensor_reduce(lambda left, right: left > right),
+    "Ge": _abstract_tensor_reduce(lambda left, right: left >= right),
     "Sin": _abstract_tensor_method("sin"),
     "Cos": _abstract_tensor_method("cos"),
     "Tan": _abstract_tensor_method("tan"),
@@ -1127,8 +1127,7 @@ _abstract_tensor_unary_names = {
 _abstract_tensor_binary_names = {
     "Add", "Sub", "Mul", "Div", "Mod", "Pow", "Rational", "MatMult",
     "FloorDiv",
-    "And", "Or", "Equality", "Unequality", "StrictLessThan",
-    "LessThanOrEqual", "StrictGreaterThan", "GreaterThanOrEqual",
+    "And", "Or", "Eq", "Ne", "Lt", "Le", "Gt", "Ge",
     "add", "sub", "mul", "div", "truediv", "mod", "pow", "matmul",
     "bitand", "bitor", "bitxor", "shl", "shr", "logical_and", "logical_or",
     "equal",

@@ -93,6 +93,20 @@ TENSOR_OPERATION_SCALAR_SPELLING: dict[str, str] = {
     "sqrt": "Sqrt", "exp": "Exp", "log": "Log",
 }
 
+#: Operations whose result is a truth value rather than a number.
+#:
+#: This is a fact about the vocabulary, so it lives with the vocabulary and
+#: not inside whichever backend noticed it first. A relation lowered as
+#: float64 tells every consumer the wrong thing, and the consumer cannot
+#: recover it: the LLVM template for `Lt` emits `fcmp`, which yields i1
+#: whatever the SSA claims, so a value declared double and rendered i1
+#: disagrees with itself and the verifier rejects the first instruction
+#: that consumes it. Fortran and SPIR-V have the same exposure.
+PREDICATE_OPERATIONS: frozenset[str] = frozenset({
+    "Eq", "Ne", "Lt", "Le", "Gt", "Ge", "ULt", "ULe",
+    "LAnd", "LOr", "LNot", "LXor",
+})
+
 
 def plan_region_to_ssa_instrs(region: PlanClosure) -> tuple[Instr, ...]:
     """Lower one planner-owned flat region to repository SSA instructions.

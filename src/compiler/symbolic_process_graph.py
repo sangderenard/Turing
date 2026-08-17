@@ -55,25 +55,15 @@ SYMPY_PROCESS_GRAPH_TRANSLATIONS: Mapping[object, SympyProcessGraphRule] = (
         sympy.exp: SympyProcessGraphRule("Exp"),
         sympy.log: SympyProcessGraphRule("Log"),
         sympy.floor: SympyProcessGraphRule("Floor"),
-        sympy.ceiling: SympyProcessGraphRule("Ceiling"),
+        sympy.ceiling: SympyProcessGraphRule("Ceil"),
         sympy.Min: SympyProcessGraphRule("Min"),
         sympy.Max: SympyProcessGraphRule("Max"),
-        sympy.Equality: SympyProcessGraphRule("Equality", ("left", "right")),
-        sympy.Unequality: SympyProcessGraphRule(
-            "Unequality", ("left", "right")
-        ),
-        sympy.StrictLessThan: SympyProcessGraphRule(
-            "StrictLessThan", ("left", "right")
-        ),
-        sympy.LessThan: SympyProcessGraphRule(
-            "LessThanOrEqual", ("left", "right")
-        ),
-        sympy.StrictGreaterThan: SympyProcessGraphRule(
-            "StrictGreaterThan", ("left", "right")
-        ),
-        sympy.GreaterThan: SympyProcessGraphRule(
-            "GreaterThanOrEqual", ("left", "right")
-        ),
+        sympy.Equality: SympyProcessGraphRule("Eq", ("left", "right")),
+        sympy.Unequality: SympyProcessGraphRule("Ne", ("left", "right")),
+        sympy.StrictLessThan: SympyProcessGraphRule("Lt", ("left", "right")),
+        sympy.LessThan: SympyProcessGraphRule("Le", ("left", "right")),
+        sympy.StrictGreaterThan: SympyProcessGraphRule("Gt", ("left", "right")),
+        sympy.GreaterThan: SympyProcessGraphRule("Ge", ("left", "right")),
         sympy.And: SympyProcessGraphRule("LAnd"),
         sympy.Or: SympyProcessGraphRule("LOr"),
         sympy.Not: SympyProcessGraphRule("LNot", ("operand",)),
