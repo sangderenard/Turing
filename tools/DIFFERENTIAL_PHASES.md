@@ -379,3 +379,65 @@ Also worth fixing regardless: the build reported `"completed": true` for a
 module that had fallen from 45 functions to 2. Nothing checks the
 structure of its own output, so a catastrophic regression reports success.
 That check would have caught this in one run instead of several.
+
+### Design decision: one node-id authority
+
+Multiple authorities is the defect class, not any one of its symptoms.
+The rule for this system is one authority, and the invariant that makes an
+authority correct is already demonstrated in the tree:
+
+    # symbolic_process_graph.py -- the SymPy ingester
+    next_id = max(
+        (int(node_id) for node_id in graph.G if isinstance(node_id, int)),
+        default=-1,
+    ) + 1
+
+It SEEDS ABOVE every id already in the graph. That single line is why it
+has never collided with anything, and it is the property the other
+producers lack:
+
+* `ensure_node` used `id(obj)`, which never seeded. It avoided collision
+  only because an address is astronomically large -- luck, not design;
+* minting from 1 collided immediately and let a Store node overwrite an
+  expression node, inventing a cycle in an acyclic graph;
+* basing the mint at 2**40 avoided collision the same way `id()` did, by
+  magnitude. Also luck, just more deliberate luck.
+
+**The authority.** The GRAPH owns node identity, because the graph is the
+thing ids have to be unique within:
+
+    ProcessGraph.mint_node_id() -> int
+        Monotonic. Seeded lazily to 1 + max(existing int node ids), so it
+        is correct even when a graph arrives already populated by another
+        producer or by a relabel.
+
+    ProcessGraph.identity_for(obj) -> int
+        mint_node_id(), memoised per object, retaining the object so its
+        address cannot be recycled under the memo. Replaces id(obj) for
+        deduplication: same object, same node, without the address being
+        the identity.
+
+**Producers to migrate**, all of which currently mint for themselves:
+
+1. `graph_express2.ensure_node` -- `nid = id(node)`
+2. `graph_express2` store nodes -- `id(f"Store[...]")`, the address of a
+   temporary, which is the worst of them
+3. `graph_express2` domain nodes -- `id(domain_node)`
+4. `symbolic_process_graph` -- local `next_id`, already correct; change is
+   to ask the graph rather than keep its own counter
+5. `topological_reducer` canonical relabel -- assigns 0..N through
+   `nx.relabel_nodes`. This one is a deliberate RE-AUTHORING of every id
+   at once, which is legitimate, but afterwards the graph's counter must
+   be reseeded above the new maximum or the next mint collides with a
+   canonical id.
+
+Point 5 is the open lead for the `id-identity-sweep` branch: node counts
+collapse during reduction, and the reducer orders by
+`(lineno, col_offset, type, int(node_id))` with the raw id as tiebreaker.
+Because it canonicalises ids anyway the original values should not matter,
+so the fact that changing them changes what survives says the ordering is
+load-bearing.
+
+**Order of work.** Land the authority and migrate 1-4 first, verifying at
+each step that the module still lowers 45 functions. Then 5, which is the
+one that actually changes what the reducer sees.
