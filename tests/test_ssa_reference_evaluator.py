@@ -359,3 +359,82 @@ def test_linked_call_publishes_through_ret_positionally():
         "outputs were read from the callee's namespace by id instead of "
         "from its Ret by position"
     )
+
+
+def test_declared_outputs_agree_with_ret_order(lowered_advance):
+    """The callee's declared output contract must match what Ret lists.
+
+    Two independent statements of "what this function publishes" exist:
+    `named_outputs`, which is (name, id) and is the contract, and the Ret
+    instruction's argument order, which is an emission detail. Consumers
+    that bind positionally are silently relying on them agreeing.
+
+    They are not required to agree by construction, so this checks rather
+    than assumes. If it ever fails, every positional consumer of that
+    callee is reading shifted results -- and the fix is to bind by name.
+    """
+    module, _outputs = lowered_advance
+    mismatches = []
+    for name, function in module.functions.items():
+        declared = tuple(function.metadata.get("named_outputs") or ())
+        if not declared:
+            continue
+        returns = [
+            instruction for block in function.blocks.values()
+            for instruction in block.instrs
+            if str(instruction.op) in {"Ret", "Return", "ret", "return"}
+        ]
+        if not returns:
+            continue
+        ret_ids = [int(a.id) for a in returns[0].args]
+        declared_ids = [int(value_id) for _label, value_id in declared]
+        if len(ret_ids) != len(declared_ids):
+            continue
+        if ret_ids != declared_ids:
+            mismatches.append(
+                f"{name.split('__')[-1]}: declared {declared_ids} "
+                f"but Ret lists {ret_ids}"
+            )
+    assert not mismatches, (
+        "declared outputs disagree with Ret order, so any positional "
+        "consumer reads shifted results:\n  " + "\n  ".join(mismatches)
+    )
+
+
+def test_step_outputs_bind_by_name_through_the_call(lowered_advance):
+    """A named step output must survive the call with its own identity.
+
+    The traversal calls the linked step and republishes its results under
+    the CALLER's ids. This pins that the republished value is the one the
+    callee declared under that name -- the property whose absence made 10
+    of 11 reads succeed while returning unrelated values.
+    """
+    module, _outputs = lowered_advance
+    name = "symbolic_fluid_control__symbolic_fluid_advance"
+    function = module.functions[name]
+    call = next(
+        instruction for block in function.blocks.values()
+        for instruction in block.instrs
+        if str(instruction.op) == "Call"
+        and "symbolic_fluid_step" in str(instruction.attributes.get("callee", ""))
+    )
+    callee = module.functions[str(call.attributes["callee"])]
+    declared = tuple(callee.metadata.get("named_outputs") or ())
+    output_ids = tuple(map(int, call.attributes.get("output_ids") or ()))
+    assert declared, "the linked step declares no named outputs to bind by"
+    assert len(declared) == len(output_ids), (
+        f"{len(declared)} declared outputs but {len(output_ids)} output_ids; "
+        "positional republication cannot be well defined"
+    )
+    caller_names = {
+        int(value): str(label)
+        for label, value in (function.metadata.get("value_names") or ())
+    }
+    # Where the caller also names a republished id, the names must agree.
+    for (label, _callee_id), caller_id in zip(declared, output_ids):
+        caller_label = caller_names.get(int(caller_id))
+        if caller_label is not None:
+            assert caller_label == str(label), (
+                f"output republished as {caller_label!r} but the callee "
+                f"declares it {label!r}"
+            )

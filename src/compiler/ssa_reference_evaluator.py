@@ -593,7 +593,19 @@ class SSAReferenceEvaluator:
             # step, 10 of its 11 caller ids happen to exist inside the
             # callee as unrelated values, so the read succeeds and returns
             # nonsense.
-            if returned and len(returned) == len(output_ids):
+            # Prefer the callee's DECLARED output contract over the order
+            # its Ret happens to list. `named_outputs` states (name, id)
+            # for each published result, so reading through it removes the
+            # assumption that Ret order is output order -- an assumption
+            # about an emission detail, which is the kind this tree keeps
+            # being wrong about. Ret is the fallback, for a callee that
+            # declares nothing.
+            declared = tuple(callee.metadata.get("named_outputs") or ())
+            if declared and len(declared) == len(output_ids):
+                published = [
+                    inner.get(int(value_id)) for _name, value_id in declared
+                ]
+            elif returned and len(returned) == len(output_ids):
                 published = list(returned)
             else:
                 published = [inner.get(value_id) for value_id in output_ids]
