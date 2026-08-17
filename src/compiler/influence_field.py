@@ -1161,6 +1161,69 @@ def field_from_dual_ir(
     return field_view
 
 
+def field_from_sympy(
+    equations: Sequence[Any],
+    contract: InfluenceContract,
+    *,
+    classifier: Callable[[str, Mapping[str, Any]], str | None] = default_classifier,
+) -> InfluenceField:
+    """Build a field over authored SymPy equations: the stage before compiling.
+
+    This is the origin of the correlation. Every later stage is a
+    transformation of these expressions, so tracing the same influence here
+    is what lets a reader see one quantity across all four representations
+    rather than four unrelated pictures.
+
+    Nodes are keyed by the expression itself. SymPy expressions are hashable
+    and structurally equal, so a subexpression appearing in two equations is
+    ONE node without any CSE pass being run -- which is the honest shape of
+    authored mathematics, where a repeated wave-speed term genuinely is the
+    same term rather than a copy that happens to match.
+
+    Free symbols are the sources, ordered by name so the hue arc is stable
+    across runs; ordinal is expression depth, keeping the convention the
+    other builders use, where hue reads as depth-of-origin.
+    """
+
+    field_view = InfluenceField(contract)
+    if not contract.enabled:
+        return field_view
+
+    depths: dict[Any, int] = {}
+
+    def visit(expression: Any, depth: int) -> None:
+        previous = depths.get(expression)
+        if previous is not None and previous <= depth:
+            return
+        depths[expression] = depth
+        field_view.add_node(expression)
+        for operand in getattr(expression, "args", ()) or ():
+            visit(operand, depth + 1)
+            field_view.add_edge(operand, expression, role="data")
+
+    for equation in equations:
+        right = getattr(equation, "rhs", equation)
+        visit(right, 0)
+        left = getattr(equation, "lhs", None)
+        if left is not None:
+            field_view.add_node(left)
+            field_view.add_edge(right, left, role="data")
+            depths.setdefault(left, 0)
+
+    symbols = sorted(
+        (node for node in depths if not (getattr(node, "args", ()) or ())),
+        key=str,
+    )
+    entries: list[tuple[Any, str, int, str, str]] = []
+    for ordinal, symbol in enumerate(symbols):
+        attributes = {"authored_symbol": str(symbol)}
+        category = classifier("symbol", attributes) or DYNAMIC
+        if category in contract.categories:
+            entries.append((symbol, category, ordinal, str(symbol), ""))
+    field_view.add_sources(entries)
+    return field_view
+
+
 def field_from_ssa(
     module: Any,
     contract: InfluenceContract,
@@ -1281,5 +1344,6 @@ __all__ = [
     "Moments", "CategoryReading", "InfluenceReading", "Transport",
     "InfluenceField",
     "semantic_marker_hue", "allocate_hues", "default_classifier",
-    "attach_to_metagraph", "field_from_process_graph", "field_from_dual_ir", "field_from_ssa",
+    "attach_to_metagraph", "field_from_sympy", "field_from_process_graph",
+    "field_from_dual_ir", "field_from_ssa",
 ]
