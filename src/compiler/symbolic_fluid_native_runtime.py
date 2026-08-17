@@ -383,13 +383,34 @@ class NativeSymbolicFluidAdvance:
                 return dict(argument.accounting or {})
         return {}
 
-    def _read(self, value_id: int | None) -> float:
+    def _read(self, value_id: int | None, *, required: bool = False) -> float:
+        # A value id that is not in `buffers` is not "zero" -- it is not part
+        # of the public ABI at all (an internal alloca, say). Returning 0.0
+        # for it silently turns "cannot observe this" into "observed a zero",
+        # which is indistinguishable from a real computed zero and has
+        # already produced hours of false diagnosis: internal accumulators
+        # probed this way all read 0.0 and were reported as evidence of a
+        # miscomputation that the probe could not actually see. Callers that
+        # are diagnosing should pass required=True and get a hard error.
         if value_id is None or self.execution is None:
             return 0.0
         stored = self.execution.buffers.get(int(value_id))
         if stored is None:
+            if required:
+                raise KeyError(
+                    f"value {value_id} is not in the artifact's public buffer "
+                    "ABI -- it cannot be read, and it is NOT zero. Check "
+                    "artifact.buffer_order before treating a read as evidence."
+                )
             return 0.0
         return float(np.asarray(stored).reshape(-1)[0])
+
+    def observable(self, value_id: int) -> bool:
+        """Whether ``value_id`` is actually readable via the public ABI."""
+        return (
+            self.execution is not None
+            and int(value_id) in self.execution.buffers
+        )
 
     def __call__(self, state: Any, dt: Any) -> tuple[bool, Metrics]:
         dt = float(dt)

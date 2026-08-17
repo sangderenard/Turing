@@ -146,10 +146,20 @@ ruled out.** In order:
    `adv._read(141)` after a normal (unmodified) run genuinely returns
    `0.0`. This is not a `_read`/lookup artifact: `adv._read(147)`
    (`dt_limit`, resolved by the exact same mechanism) correctly returns
-   `0.111279` in the same call. Also confirmed `adv._read(136)` (the raw
-   `Sub` result, one step upstream of `Abs`/`Div`) is *itself* `0.0` --
-   the zero originates at the subtraction, not later in the division or in
-   readback.
+   `0.111279` in the same call.
+
+   **CORRECTION -- an earlier version of this handoff claimed
+   `adv._read(136)` showed the raw `Sub` result was itself `0.0`, and
+   treated that as proof the zero originates at the subtraction. THAT
+   CLAIM WAS WRONG and must not be relied on.** Ids 136/137/140/116/47/
+   187/188 are NOT in `artifact.buffer_order` -- they are internal
+   allocas with no public buffer. `_read` used to return its `0.0`
+   fallback for any such id, which is indistinguishable from a real
+   measured zero. Every "internal accumulator reads 0.0" statement
+   derived that way was an artifact of the probe, not an observation.
+   `_read` now takes `required=True` to raise instead, and
+   `adv.observable(id)` reports whether an id is readable at all --
+   check it before treating any read as evidence.
 
 2. **Aliasing.** Every alloca involved is textually distinct and confirmed
    via `grep` on the LLVM IR text: `%value.47`/`%value.116` (the two
@@ -190,20 +200,48 @@ ruled out.** In order:
    pattern is where the defect lives, only that it's the one thing left
    unruled-out.
 
+6. **Also checked and NOT the cause** (recorded so nobody re-walks these):
+   - `deduplicate_node` in `graph_express2.py` merges graph nodes by
+     `label`+`type` alone, with no scope/version discrimination. Real
+     sharpness, but it is explicitly guarded to skip `ast.AST` nodes
+     (`ensure_node`, "label-based deduplication must be reserved for
+     non-AST structural objects"), so the authored Python accumulators
+     are not subject to it.
+   - Nothing overwrites `mass_err`'s output slot: the advance function
+     contains exactly ONE write to `%out.2` (the region_6 call itself).
+   - `planned_region_6`'s own emitted body is correct: `fsub arg.4,
+     arg.5` -> `fabs` -> `fdiv`, stored to its `%out.0`, and the caller
+     maps that to the right public slot. If its inputs were right, its
+     output would be right.
+   - 14 ids (every `symbolic_fluid_step` output: `height_next`,
+     `wave_speed`, ...) are BOTH a formal arg and an instruction result.
+     This looks alarming and is NOT a bug: `arg97 is load97` -- they are
+     the SAME SSAValue object, so the argument cell intentionally doubles
+     as that value's storage, and the freshening pass skips it correctly
+     by its own `canonical[old_id] is result` rule.
+
 **What this means for continuing:** the defect is not in naming/binding,
-not in memory aliasing, and not in any SSA/CFG structure readable from the
-IR text. It's either in something the IR text can't show (how LLVM's own
-backend lowers `phi ptr` to actual machine registers/stack slots for this
-specific two-region-accumulator shape) or in a genuine computation error
-that hasn't been isolated yet despite `Sub`'s operands checking out
-structurally. The next real step is not more IR reading -- it's building a
-MINIMAL standalone repro (two region calls, each accumulating a different
-scalar, inside one shared loop nest, stripped of everything else in this
-program) to see whether the zero reproduces in isolation. If it does, a
-debugger on the JIT'd machine code becomes tractable on a small case in a
-way it is not on this one. If it does NOT reproduce in isolation, the
-defect is specific to something else in this program's shape that a
-minimal case would help surface by comparison.
+not in memory aliasing, not in any SSA/CFG structure readable from the IR
+text, and not in region_6 itself. The remaining measurement that DOES
+carry signal, and the best thread to pull: an earlier probe that
+temporarily wrote `next_mass` and `previous_mass` into
+`state.last_height_violation`/`state.last_tracer_violation` (ids 157/160,
+which ARE public buffers, so that probe was observable and valid) showed
+BOTH reading `16.0175910761` -- exactly the sum of the OLD heights.
+`previous_mass` is correct at that value; `next_mass` should have been
+`16.0149000240`. If that probe is trustworthy, `next_mass` is accumulating
+the old height rather than `height_next`, and the question becomes what
+region_3's `Add[19, 97]` actually receives for feed 97 at runtime. The
+caveat that kept this from being conclusive: changing the source to add
+the probe shifts ids, so the probe's own binding needs re-verifying before
+its readout is trusted -- do that first (confirm via
+`adv.observable(...)` + the correlate tool that the probe ids still mean
+what you think) rather than assuming either way.
+
+`tools/correlate_compile.py` exists for exactly this: one fresh compile,
+then per-id, side by side, the repository SSA (advance + every region),
+the LLVM IR lines, and the runtime value with an explicit NOT OBSERVABLE
+marker instead of a misleading zero.
 
 **Diagnostic trap already hit, worth avoiding:** probing `next_mass`/
 `previous_mass` by adding a NEW `state.field = next_mass + 0.0`-style

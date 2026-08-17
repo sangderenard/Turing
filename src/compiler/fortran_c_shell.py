@@ -3174,6 +3174,18 @@ def _class_surface_ssa_program(
         )))
         if not desired_ids:
             continue
+        # A region-call's OUT-params are pointers passed as ARGS, not as
+        # instruction.res -- the call writes through them directly, the
+        # same in-place mechanism a loop-carried phi's own update uses.
+        # Checking only `caller.args` and `instr.res` treats an id already
+        # satisfied this way as still "desired", so the aggregate-unpack
+        # materialization below built a SECOND, competing producer for it
+        # (a GetElementPtr+Load pair reading a bogus address) -- and
+        # whichever one rendered last in the backend's id-keyed pointer
+        # cache silently won, clobbering the call's real, correct write
+        # with garbage. Any id already referenced as an operand anywhere in
+        # this function already has a valid SSAValue for it in scope and
+        # must not be re-materialized.
         available = {
             int(value.id) for value in caller.args
         } | {
@@ -3181,6 +3193,11 @@ def _class_surface_ssa_program(
             for block in caller.blocks.values()
             for instruction in block.instrs
             if instruction.res is not None
+        } | {
+            int(argument.id)
+            for block in caller.blocks.values()
+            for instruction in block.instrs
+            for argument in instruction.args
         }
         next_projection_id = 1 + max(available, default=0)
         for desired_id in desired_ids:
