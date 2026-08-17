@@ -232,6 +232,79 @@ from it means anything, and the tests say so in their failure messages.
 
 ---
 
+## Q5d — Emission owns it. Which INSTRUCTION?
+
+Once Q5c says emission, narrow inside it. Do these in order; each one
+throws away a layer, and the later steps are worthless without the
+earlier ones.
+
+```bash
+python tools/bisect_emission.py            # first divergence, program order
+```
+
+**1. Get a series, not an endpoint.** Both sides record per-iteration
+rings, and they deliberately record the same thing so they are
+comparable:
+
+```python
+artifact = emit_ssa_function_to_llvm(module, name, watch=ids, history=24)
+ring, count = history_ids(value_id)     # read execution.buffers[ring]
+
+evaluator = SSAReferenceEvaluator(module, history=ids)
+evaluator.run(name, arguments)          # evaluator.history[value_id]
+```
+
+A final value proves an accumulator ended wrong; only the series says
+which iteration spoiled it. `bisect_emission.py` orders by static block
+order, so for a loop-carried phi it names the accumulator rather than the
+cause — the series is what resolves that. **Check the cadences match**
+(some value both sides agree on, ringed at the same length) before
+trusting any disagreement between them.
+
+**2. Find the boundary where inputs agree and outputs do not.** Ring a
+call's arguments and its results. Arguments agreeing per-iteration while
+results disagree localises the defect inside that callee and rules out
+everything upstream of it.
+
+**3. Read the pattern of WHICH outputs are wrong.** In the case above the
+wrong ones were exactly the time-integrated quantities and every pure
+diagnostic was right. That shape pointed at arithmetic and away from the
+neighbour gathering, before any code was read.
+
+**4. Reproduce it standalone.** Feed the callee its exact inputs on fresh
+buffers, outside the loop:
+
+```python
+execution = prepare_artifact_execution(native, {formal_id: value})
+```
+
+If it still diverges, the loop, the gathering and in-place aliasing are
+all excluded at once. If it does NOT, the defect is in the surroundings
+and step 5 would have chased a ghost.
+
+**5. Fingerprint a pure reproducer.** Perturb each input, compare
+sensitivities on both sides. Inputs the artifact ignores, or a
+coefficient equal to the SUM of several the SSA has separately, say the
+operands are collapsing.
+
+**6. Count opcodes before believing an instruction was dropped.** Compare
+the SSA's operation census against the emitted body's, and count EVERY
+spelling — `mul` as well as `fmul`, `icmp`/`select` as well as `maxnum`.
+A shortfall that reconciles exactly once the other spellings are counted
+means nothing was lost; it means something is being emitted in the wrong
+domain, which is a different and much quieter bug.
+
+Two limits worth knowing before they mislead you:
+
+* `watch=` reaches the ROOT function's frame only. A region-local id is a
+  different numbering space and is reported, not silently dropped.
+* the single-block emission path publishes its own value set, and a
+  Ret-less region as root publishes nothing — so a region cannot be
+  bisected by making it the root. Reach it through the smallest caller
+  that has a `Ret`.
+
+---
+
 ## Q6 — Which layer disagrees with which?
 
 ```bash
@@ -368,6 +441,10 @@ tool — each answer narrowed what the next tool had to look at.
 | 10 | `differential_translation.py` (built here) | is the translation faithful | an independent oracle; found a second, larger defect |
 | 11 | `ssa_reference_evaluator.py` (built here) | lowering's fault or emission's | **the routing answer** — SSA matched the oracle exactly, so emission owns it |
 | 12 | `differential_matrix.py` (built here) | all representations at once | one table; backend-vs-backend needs no oracle |
+| 13 | `bisect_emission.py` (built here) | which VALUE emission got wrong | first divergence in program order; for a carried phi it names the accumulator, so pair it with 14 |
+| 14 | `history=` on BOTH sides (extended here) | which ITERATION, on either side | rings every watched value, not only phis, and the evaluator rings the same way — arguments agreeing per-iteration while outputs did not is what localised the defect to one callee |
+| 15 | sensitivity fingerprint (ad hoc) | which INPUTS the artifact actually uses | perturb each input of a pure reproducer; the artifact used 3 of 9, and one coefficient equalled the sum of the 6 it lost |
+| 16 | opcode census (ad hoc) | is an instruction missing, or in the wrong domain | `fmul` 118 + `mul` 22 = SSA's 140 `Mul`. Nothing missing — 22 were integer. **This named the bug.** |
 
 **What each stage cost when skipped.** Steps 8 and 9 existed only after
 days of reasoning about structure. Every one of those days would have been
@@ -566,7 +643,58 @@ along and the defect is in emission.
 > committed by someone who had just written field note 1. Silent defaults
 > are that easy to reintroduce.
 
-### 10. What all of these have in common
+### 10. The bug that deleted terms instead of failing
+
+The one the whole differential apparatus was built to find, kept here in
+full because the ROUTE is more reusable than the patch.
+
+A binary scalar operation took its arithmetic domain from `args[0]` alone.
+The lowering spells negation as `Mul(int -1, x)`, so every negation of a
+float ran as an **integer** multiply and the float operand was reached by
+`fptosi`. Fractional values truncated to zero. Nothing raised, nothing was
+dropped from the instruction stream, and the emitted code verified clean —
+whole terms simply evaluated to nothing. The compiled fluid step ignored
+six of its twenty-eight inputs, never saw a tracer go negative, and so
+accepted a frame the authored mathematics rejects.
+
+The sequence that found it, each step discarding a layer:
+
+1. **Route first.** The SSA matched the authored oracle exactly, the
+   artifact did not (Q5c). Emission owns it. Two earlier hunts through the
+   planner and the AST inlet were spent on layers that were innocent.
+2. **Series, not endpoints.** The first divergence in program order was a
+   loop-carried phi — which says an accumulator ended wrong, never which
+   iteration spoiled it. Ringing both sides per iteration showed all 28
+   call arguments agreeing while four outputs did not.
+3. **Read the pattern before reading code.** The four wrong outputs were
+   exactly the time-integrated quantities; every pure diagnostic of the
+   current state was right. That is a shape, and it pointed at arithmetic
+   rather than at the neighbour gathering.
+4. **Shrink to a reproducer.** It reproduced standalone on fresh buffers —
+   which killed the loop, the gathering, and in-place aliasing at once.
+5. **Fingerprint the reproducer.** A pure function of 28 scalars: perturb
+   each input, compare sensitivities. The artifact depended on three inputs
+   where the SSA depended on nine, and its one shared coefficient equalled
+   the SUM of the six it had lost — which is what a collapsed domain looks
+   like from the outside.
+6. **Count opcodes before believing anything is missing.** SSA `Mul` 140
+   against emitted `fmul` 118 looks like 22 dropped instructions. It was
+   not: `fmul` 118 + `mul` 22 = 140. Everything reconciled. Twenty-two
+   multiplications were simply integer ones, and that named the defect.
+
+Two confident hypotheses were killed on the way, both by measurement:
+that the call site permuted its arguments (checked against the emitted IR
+by script, not by eye — reading a 28-pointer call by eye had "confirmed"
+it, wrongly), and that six formals were unwired (`buffer_order` was
+complete and duplicate-free).
+
+> **Promote, never demote.** Widening an integer operand is exact;
+> narrowing a float discards its value. A conversion that loses data in
+> service of a type rule will not announce itself — it returns a plausible
+> number. This is field note 1's disease in the type system: a silent
+> default, wearing a cast.
+
+### 11. What all of these have in common
 
 Most were **the instrument lying, not the program**. The program under
 investigation was deterministic and consistent the entire time; what varied
