@@ -60,6 +60,17 @@ def build(contract: Any):
     )
 
     field = InfluenceField(contract)
+    # Every edge is recorded as it is added, so reachability can be
+    # decided on the GRAPH rather than inferred from weights. A path
+    # that exists but delivers less than epsilon is a different fact
+    # from a path that does not exist, and only the graph can tell them
+    # apart -- which is the distinction a dead net actually turns on.
+    edges: list[tuple[Any, Any]] = []
+
+    def link(source_key: Any, target_key: Any, role: str = "data") -> None:
+        edges.append((source_key, target_key))
+        field.add_edge(source_key, target_key, role=role)
+
     model = symbolic_viscous_shallow_water_equations()
     with newest_lowering().open("rb") as stream:
         module, _outputs, _exports = pickle.load(stream)
@@ -90,12 +101,12 @@ def build(contract: Any):
         field.add_node(("sy", expression))
         for operand in getattr(expression, "args", ()) or ():
             visit(operand)
-            field.add_edge(("sy", operand), ("sy", expression), role="data")
+            link(("sy", operand), ("sy", expression), role="data")
 
     for equation in model.equations:
         visit(equation.rhs)
         field.add_node(("sy", equation.lhs))
-        field.add_edge(("sy", equation.rhs), ("sy", equation.lhs), role="data")
+        link(("sy", equation.rhs), ("sy", equation.lhs), role="data")
 
     # -- ssa: def-use across EVERY function in the module ---------------
     #
@@ -122,7 +133,7 @@ def build(contract: Any):
                     # be an instruction RESULT dropped every edge leaving a
                     # formal, so colour entered the region and stopped.
                     field.add_node(("ssa", function_name, int(argument.id)))
-                    field.add_edge(
+                    link(
                         ("ssa", function_name, int(argument.id)),
                         ("ssa", function_name, int(instruction.res.id)),
                         role="data",
@@ -138,7 +149,7 @@ def build(contract: Any):
                 if callee is None:
                     continue
                 for argument, formal in zip(instruction.args, callee.args):
-                    field.add_edge(
+                    link(
                         ("ssa", function_name, int(argument.id)),
                         ("ssa", callee_name, int(formal.id)),
                         role="data",
@@ -149,7 +160,7 @@ def build(contract: Any):
                     if (callee_name, int(output)) in home and (
                         instruction.res is not None
                     ):
-                        field.add_edge(
+                        link(
                             ("ssa", callee_name, int(output)),
                             ("ssa", function_name, int(instruction.res.id)),
                             role="data",
@@ -165,7 +176,7 @@ def build(contract: Any):
     for key, name, _row, _start, _end in occurrences:
         symbol = symbols.get(name)
         if symbol is not None:
-            field.add_edge(key, ("sy", symbol), role="data")
+            link(key, ("sy", symbol), role="data")
             crossings += 1
 
     named = tuple(
@@ -191,7 +202,7 @@ def build(contract: Any):
         if symbol is None:
             continue
         field.add_node(("ssa", STEP, int(value)))
-        field.add_edge(
+        link(
             ("sy", symbol), ("ssa", STEP, int(value)), role="data",
         )
         crossings += 1
@@ -202,7 +213,7 @@ def build(contract: Any):
     for label, value in named:
         symbol = by_name.get(str(label))
         if symbol is not None and (STEP, int(value)) in home:
-            field.add_edge(
+            link(
                 ("sy", symbol), ("ssa", STEP, int(value)), role="data",
             )
             crossings += 1
@@ -216,7 +227,7 @@ def build(contract: Any):
             continue
         for key, name, _row, _start, _end in occurrences:
             if name == str(label):
-                field.add_edge(
+                link(
                     ("ssa", STEP, int(value)), key, role="data",
                 )
                 crossings += 1
@@ -226,7 +237,7 @@ def build(contract: Any):
         for ordinal, (key, name, _row, _start, _end) in enumerate(occurrences)
     ]
     field.add_sources(entries)
-    return field, occurrences, home, module, model, crossings
+    return field, occurrences, home, module, model, crossings, edges
 
 
 def dissect(field: Any, key: Any) -> list[tuple[str, float, float]]:
@@ -254,9 +265,64 @@ def dissect(field: Any, key: Any) -> list[tuple[str, float, float]]:
     return found
 
 
+def classify(edges, source_keys, field, epsilon: float) -> dict:
+    """Separate the three states a location can be in.
+
+    A viewer that shows only "dark" conflates three different facts, and
+    the one that matters for troubleshooting is which:
+
+      live         reachable, and carrying weight at or above epsilon
+      attenuated   reachable, but everything that arrived is under epsilon
+                   -- the path exists and the signal did not survive it
+      unreachable  no path from any source at all: a genuinely dead net
+
+    Reachability is decided by walking the graph, so it is exact and does
+    not move when epsilon does. Only the live/attenuated split depends on
+    epsilon, which is the honest division of labour: topology answers
+    whether a path exists, numerics answer whether anything got through.
+    """
+    forward: dict = {}
+    for source_key, target_key in edges:
+        forward.setdefault(source_key, []).append(target_key)
+    reachable = set()
+    pending = list(source_keys)
+    while pending:
+        node = pending.pop()
+        if node in reachable:
+            continue
+        reachable.add(node)
+        pending.extend(forward.get(node, ()))
+
+    # EVERY node in the graph, not only the ones that received something.
+    # Classifying `field.table()` reported 100% live and meant nothing:
+    # a node with no reading never appears there, so the population was
+    # exactly the set that had already arrived. A rate computed over the
+    # survivors is not a rate.
+    population = set()
+    for source_key, target_key in edges:
+        population.add(source_key)
+        population.add(target_key)
+
+    states = {"live": [], "attenuated": [], "unreachable": []}
+    for key in population:
+        accumulator = field.moments(key).get("dynamic")
+        power = float(getattr(accumulator, "power", 0.0) or 0.0)
+        if key not in reachable:
+            states["unreachable"].append(key)
+        elif power < epsilon:
+            states["attenuated"].append(key)
+        else:
+            states["live"].append(key)
+    return states
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--top", type=int, default=12)
+    parser.add_argument("--epsilon", type=float, default=1e-6)
+    parser.add_argument("--export", default=None,
+                        help="write the whole spectral array to JSON")
+    parser.add_argument("--report", action="store_true")
     parser.add_argument(
         "--dissect", default=None,
         help="FUNCTION:VALUE_ID, or an authored name, to break apart",
@@ -266,7 +332,7 @@ def main() -> int:
     from src.compiler.influence_field import InfluenceContract
 
     contract = InfluenceContract(enabled=True, spectral=True)
-    field, occurrences, home, module, model, crossings = build(contract)
+    field, occurrences, home, module, model, crossings, edges = build(contract)
     readings = list(field.table())
     print(f"one field over three representations")
     print(f"  ingestion sources (authored identifier occurrences): "
@@ -300,6 +366,71 @@ def main() -> int:
         for label, frequency, weight in rows:
             print(f"  {label:28} {frequency:>10.6f} {weight:>9.5f} "
                   f"{100.0 * weight / total:>6.1f}%")
+        return 0
+
+    if arguments.report or arguments.export:
+        source_keys = [source.key for source in field.sources]
+        states = classify(edges, source_keys, field, arguments.epsilon)
+        total = sum(len(v) for v in states.values())
+        print("")
+        print(f"reachability (graph) x power (epsilon={arguments.epsilon:g})")
+        for state in ("live", "attenuated", "unreachable"):
+            count = len(states[state])
+            share = 100.0 * count / total if total else 0.0
+            print(f"  {state:12} {count:6}  {share:5.1f}%")
+        print("  reachable is exact; only live/attenuated moves with epsilon.")
+
+        rows = []
+        for reading in field.table():
+            accumulator = field.moments(reading.key).get("dynamic")
+            if accumulator is None:
+                continue
+            normalised = accumulator.normalised()
+            rows.append({
+                "key": [str(part) for part in (
+                    reading.key if isinstance(reading.key, tuple)
+                    else (reading.key,)
+                )],
+                "power": accumulator.power,
+                "support": accumulator.support,
+                "participation": accumulator.participation,
+                "entropy": accumulator.entropy(),
+                "lines": [
+                    [frequency, weight]
+                    for frequency, weight in normalised.lines
+                ],
+            })
+        if rows:
+            depths = [r["participation"] for r in rows if r["power"] > 0]
+            if depths:
+                depths.sort()
+                middle = depths[len(depths) // 2]
+                print("")
+                print(f"  effective origins per node (participation):"
+                      f" median {middle:.2f}, max {max(depths):.2f}")
+                print("  support counts anything above zero; participation")
+                print("  weights by share, so a dominant origin plus nine")
+                print("  traces reads near 1 rather than 10.")
+        if arguments.export:
+            import json
+            payload = {
+                "basis": [
+                    {"frequency": float(source.hue),
+                     "label": str(source.label)}
+                    for source in field.sources
+                ],
+                "epsilon": arguments.epsilon,
+                "states": {
+                    state: len(keys) for state, keys in states.items()
+                },
+                "nodes": rows,
+            }
+            destination = ROOT / arguments.export
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(json.dumps(payload), encoding="utf-8")
+            print("")
+            print(f"  wrote {destination} "
+                  f"({len(rows)} nodes, {len(payload['basis'])} basis lines)")
         return 0
 
     lit = [

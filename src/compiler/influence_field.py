@@ -421,6 +421,92 @@ class Spectrum:
             if abs(line - float(frequency)) <= tolerance
         )
 
+    # -- normalisation -------------------------------------------------
+    #
+    # Composition and intensity are different questions and must not be
+    # read off the same number. Two nodes can have identical origins in
+    # identical proportion and differ a thousandfold in how much arrived;
+    # a node deep in a fan-out is dim because weight divided, not because
+    # its provenance is any less certain. Reporting raw weight as colour
+    # conflates the two and makes depth look like uncertainty.
+    #
+    # So: `normalised` answers "what is this made of", carrying unit
+    # power, and `power` answers "how much got here". A viewer maps the
+    # first to chromaticity and the second to luminance, and neither
+    # contaminates the other.
+
+    def normalised(self) -> "Spectrum":
+        """Unit-power spectrum: composition with intensity divided out."""
+        total = self.s0
+        if total <= 0.0:
+            return Spectrum(())
+        return Spectrum(tuple(
+            (frequency, weight / total) for frequency, weight in self.lines
+        ))
+
+    @property
+    def power(self) -> float:
+        """Total weight that arrived. The luminance question."""
+        return self.s0
+
+    @property
+    def support(self) -> int:
+        """How many distinct origins contributed at all."""
+        return sum(1 for _frequency, weight in self.lines if weight > 0.0)
+
+    @property
+    def participation(self) -> float:
+        """Effective number of origins: 1 / sum(p^2) over unit power.
+
+        The inverse participation ratio. `support` counts anything above
+        zero, so one dominant origin plus nine traces reads as ten; this
+        reads as ~1, which is what a person means by "where did this come
+        from". Equals `support` exactly when contributions are equal, and
+        1 when a single origin carries everything.
+        """
+        total = self.s0
+        if total <= 0.0:
+            return 0.0
+        concentration = sum(
+            (weight / total) ** 2 for _frequency, weight in self.lines
+        )
+        return 0.0 if concentration <= 0.0 else 1.0 / concentration
+
+    def entropy(self) -> float:
+        """Shannon entropy of the composition, in bits.
+
+        Zero when one origin carries everything; log2(n) when n origins
+        contribute equally. Reported alongside participation because they
+        disagree in the informative direction: entropy is sensitive to the
+        tail, participation to the bulk.
+        """
+        total = self.s0
+        if total <= 0.0:
+            return 0.0
+        accumulated = 0.0
+        for _frequency, weight in self.lines:
+            share = weight / total
+            if share > 0.0:
+                accumulated -= share * math.log2(share)
+        return accumulated
+
+    def floor(self, epsilon: float) -> "Spectrum":
+        """Drop lines under `epsilon` of the total, exactly and visibly.
+
+        A line that survives only as float dust is not evidence of a path;
+        it is the residue of one. Filtering is stated rather than implied
+        so that "this origin did not reach here" and "it reached here
+        immeasurably" stay distinguishable.
+        """
+        total = self.s0
+        if total <= 0.0:
+            return Spectrum(())
+        cutoff = float(epsilon) * total
+        return Spectrum(tuple(
+            (frequency, weight) for frequency, weight in self.lines
+            if weight >= cutoff
+        ))
+
 
 @dataclass(frozen=True, slots=True)
 class CategoryReading:
