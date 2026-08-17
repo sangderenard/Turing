@@ -97,18 +97,22 @@ def build(contract: Any):
         field.add_node(("sy", equation.lhs))
         field.add_edge(("sy", equation.rhs), ("sy", equation.lhs), role="data")
 
-    # -- ssa: def-use inside the region that holds the arithmetic -------
-    region = module.functions.get(REGION)
-    home: dict[int, str] = {}
-    if region is not None:
-        for block_name, block in region.blocks.items():
+    # -- ssa: def-use across EVERY function in the module ---------------
+    #
+    # The whole translated program, not one region. A value id is only
+    # meaningful inside its function, so the key carries the function --
+    # the same reason `watch=` refuses a region-local id.
+    home: dict[tuple[str, int], str] = {}
+    for function_name, function in module.functions.items():
+        for block_name, block in function.blocks.items():
             for instruction in block.instrs:
                 if instruction.res is None:
                     continue
                 value_id = int(instruction.res.id)
-                home[value_id] = block_name
-                field.add_node(("ssa", value_id))
-        for block in region.blocks.values():
+                home[(function_name, value_id)] = block_name
+                field.add_node(("ssa", function_name, value_id))
+    for function_name, function in module.functions.items():
+        for block in function.blocks.values():
             for instruction in block.instrs:
                 if instruction.res is None:
                     continue
@@ -117,12 +121,39 @@ def build(contract: Any):
                     # the authored inputs cross in. Requiring the operand to
                     # be an instruction RESULT dropped every edge leaving a
                     # formal, so colour entered the region and stopped.
-                    field.add_node(("ssa", int(argument.id)))
+                    field.add_node(("ssa", function_name, int(argument.id)))
                     field.add_edge(
-                        ("ssa", int(argument.id)),
-                        ("ssa", int(instruction.res.id)),
+                        ("ssa", function_name, int(argument.id)),
+                        ("ssa", function_name, int(instruction.res.id)),
                         role="data",
                     )
+        # Calls are translation crossings too: an argument becomes a formal
+        # of the callee, and the callee's outputs become the caller's
+        # result. Without these the 45 functions are 45 disconnected graphs
+        # and colour cannot leave the one it started in.
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                callee_name = str(instruction.attributes.get("callee") or "")
+                callee = module.functions.get(callee_name)
+                if callee is None:
+                    continue
+                for argument, formal in zip(instruction.args, callee.args):
+                    field.add_edge(
+                        ("ssa", function_name, int(argument.id)),
+                        ("ssa", callee_name, int(formal.id)),
+                        role="data",
+                    )
+                for output in (
+                    instruction.attributes.get("output_ids") or ()
+                ):
+                    if (callee_name, int(output)) in home and (
+                        instruction.res is not None
+                    ):
+                        field.add_edge(
+                            ("ssa", callee_name, int(output)),
+                            ("ssa", function_name, int(instruction.res.id)),
+                            role="data",
+                        )
 
     # -- the crossings -------------------------------------------------
     #
@@ -159,8 +190,10 @@ def build(contract: Any):
         symbol = symbols.get(str(name))
         if symbol is None:
             continue
-        field.add_node(("ssa", int(value)))
-        field.add_edge(("sy", symbol), ("ssa", int(value)), role="data")
+        field.add_node(("ssa", STEP, int(value)))
+        field.add_edge(
+            ("sy", symbol), ("ssa", STEP, int(value)), role="data",
+        )
         crossings += 1
 
     # Results still cross back, so a named output is reachable as itself
@@ -168,8 +201,10 @@ def build(contract: Any):
     by_name = {str(equation.lhs): equation.lhs for equation in model.equations}
     for label, value in named:
         symbol = by_name.get(str(label))
-        if symbol is not None and int(value) in home:
-            field.add_edge(("sy", symbol), ("ssa", int(value)), role="data")
+        if symbol is not None and (STEP, int(value)) in home:
+            field.add_edge(
+                ("sy", symbol), ("ssa", STEP, int(value)), role="data",
+            )
             crossings += 1
 
     # An authored result is also written back into the traversal, so the
@@ -177,11 +212,13 @@ def build(contract: Any):
     # this the python side is only ever a source and never shows what came
     # back to it.
     for label, value in named:
-        if int(value) not in home:
+        if (STEP, int(value)) not in home:
             continue
         for key, name, _row, _start, _end in occurrences:
             if name == str(label):
-                field.add_edge(("ssa", int(value)), key, role="data")
+                field.add_edge(
+                    ("ssa", STEP, int(value)), key, role="data",
+                )
                 crossings += 1
 
     entries = [
@@ -192,15 +229,44 @@ def build(contract: Any):
     return field, occurrences, home, module, model, crossings
 
 
+def dissect(field: Any, key: Any) -> list[tuple[str, float, float]]:
+    """Break a location's spectrum back into the sources that made it.
+
+    This is the whole reason for keeping frequencies instead of moments.
+    Every source is allotted a distinct slot on the arc, so a frequency
+    identifies its origin outright -- there is no overlap to disentangle
+    and no attribution to guess. Inverting the map is exact.
+
+    Returns (origin label, frequency, weight), heaviest first: WHICH
+    authored text reached this location, and how much of it.
+    """
+    by_frequency = {
+        float(source.hue): str(source.label) for source in field.sources
+    }
+    accumulator = field.moments(key).get("dynamic")
+    lines = tuple(getattr(accumulator, "lines", ()) or ())
+    found = [
+        (by_frequency.get(float(frequency), f"?{frequency:.6f}"),
+         float(frequency), float(weight))
+        for frequency, weight in lines
+    ]
+    found.sort(key=lambda row: -row[2])
+    return found
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--top", type=int, default=12)
+    parser.add_argument(
+        "--dissect", default=None,
+        help="FUNCTION:VALUE_ID, or an authored name, to break apart",
+    )
     arguments = parser.parse_args()
 
     from src.compiler.influence_field import InfluenceContract
 
     contract = InfluenceContract(enabled=True, spectral=True)
-    field, occurrences, home, _module, _model, crossings = build(contract)
+    field, occurrences, home, module, model, crossings = build(contract)
     readings = list(field.table())
     print(f"one field over three representations")
     print(f"  ingestion sources (authored identifier occurrences): "
@@ -215,6 +281,27 @@ def main() -> int:
         kinds[kind] = kinds.get(kind, 0) + 1
     print(f"  readings by representation: {kinds}")
 
+    if arguments.dissect:
+        target = None
+        if ":" in arguments.dissect:
+            function_part, _, value_part = arguments.dissect.rpartition(":")
+            for candidate in module.functions:
+                if candidate.endswith(function_part):
+                    target = ("ssa", candidate, int(value_part))
+                    break
+        if target is None:
+            raise SystemExit(f"cannot resolve {arguments.dissect!r}")
+        rows = dissect(field, target)
+        total = sum(weight for _label, _frequency, weight in rows) or 1.0
+        short = target[1].split("__")[-1]
+        print(f"\ndissection of {short} t{target[2]}")
+        print(f"  {len(rows)} distinct origins, total weight {total:.4f}\n")
+        print(f"  {'origin':28} {'frequency':>10} {'weight':>9} {'share':>7}")
+        for label, frequency, weight in rows:
+            print(f"  {label:28} {frequency:>10.6f} {weight:>9.5f} "
+                  f"{100.0 * weight / total:>6.1f}%")
+        return 0
+
     lit = [
         reading for reading in readings
         if isinstance(reading.key, tuple) and reading.key[0] == "ssa"
@@ -226,7 +313,7 @@ def main() -> int:
     for reading in lit[:arguments.top]:
         accumulator = field.moments(reading.key).get("dynamic")
         lines = len(getattr(accumulator, "lines", ()) or ())
-        print(f"  t{reading.key[1]:<5} weight={reading.value:.4f} "
+        print(f"  {reading.key[1].split('__')[-1][:26]:<26} t{reading.key[2]:<5} weight={reading.value:.4f} "
               f"origins={lines}")
     print("\nOrigins is the count of DISTINCT authored occurrences whose")
     print("influence reached that instruction. More than one is mixing, and")
