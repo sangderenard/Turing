@@ -201,3 +201,50 @@ wants.
 Phases 3a and 3b are built. **Route the layer before reading code**: two
 of the longest hunts in this tree were spent in a layer that turned out to
 be innocent, and both would have been redirected in minutes by this.
+
+---
+
+## Live defect (found by the matrix, not yet fixed)
+
+`viscosity` and `tracer_diffusivity` reach the compiled step as a constant
+**1.0**, whatever the state holds. Setting them to 0.5/0.25 changes
+nothing — both still arrive as 1.0, against authored values of 0.0002 and
+0.0001. The diffusion terms are amplified by 5000x and 10000x.
+
+The signature is what identified it, and it is worth copying: `height_next`
+matched the oracle EXACTLY in all 16 cells while both momenta and the
+tracer differed in all 16. `height_next` is the one equation using neither
+parameter. A defect that spares one output completely is naming the input
+it does not touch.
+
+Everything around it was verified faithful first, which is why the
+remaining suspect list was short enough to see:
+
+* the step's lowering — all 11 equations against SymPy at machine
+  precision (0 or 2.2e-16);
+* the traversal — `tracer_center` reproduces the initial tracer row-major,
+  and all four neighbour gathers are the correct wrapped shifts;
+* emission — ssa vs llvm is 0 across every next_* field;
+* the oracle's own binding — the authored source passes its 28 arguments
+  in `argument_names` order, position for position (checked with `ast`,
+  after a naive comma-split "disproved" it by choking on `[row, column]`).
+
+Four confident hypotheses died on the way: a permuted call site, six
+unwired formals, a misbinding oracle, and misgathered height neighbours.
+Each was killed by measurement, and three of them by a script after an
+eyeball reading had already "confirmed" them.
+
+**Next:** find where the 1.0 substitution happens. Both parameters are
+state scalars that are NOT function formals of `advance` (the binder
+reports them unbound and they have no defining instruction in the frame),
+so the substitution is upstream of SSA — in the ProcessGraph/planner
+capture of state scalars, which is where a constant would be folded in.
+Note `minimum_height` and `dx` come through correctly, so it is not all
+state scalars.
+
+Correction to the commit that restricted the SSA column: it justified the
+restriction by calling the `state.tracer = state.next_tracer + 0.0`
+write-back the runtime wrapper's job. It is not — it is the last line of
+the authored `symbolic_fluid_advance`. The restriction is still right, but
+for a different reason: the evaluator mutates arrays through Store and
+cannot REBIND a Python attribute, so that assignment is invisible to it.
