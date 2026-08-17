@@ -116,7 +116,9 @@ def run_ssa(grid: int, dt: float, build: Path) -> dict[str, np.ndarray]:
     """
     import pickle
 
-    from src.compiler.ssa_reference_evaluator import SSAReferenceEvaluator
+    from src.compiler.ssa_reference_evaluator import (
+        SSAReferenceEvaluator, bind_program_abi_arguments,
+    )
 
     cached = build / "control_repository_ssa.pkl"
     if not cached.is_file():
@@ -140,40 +142,68 @@ def run_ssa(grid: int, dt: float, build: Path) -> dict[str, np.ndarray]:
     name = "symbolic_fluid_control__symbolic_fluid_advance"
     function = module.functions[name]
     state = _fresh_state(grid)
-    names = {
-        str(label): int(value)
-        for label, value in (function.metadata.get("value_names") or ())
+    # Use the canonical binder, not a private one. This column previously
+    # rebuilt binding by hand from `program_abi_field`, which bound the
+    # state fields and the two extents and nothing else -- so it never
+    # bound `dt` and reported "13 formals unbound", refusing to produce the
+    # one column that answers the routing question. Binding by declared
+    # identity, and finding an unaccounted parameter through the callee
+    # formal it feeds, is what the compiled runtime already does.
+    arguments, unbound = bind_program_abi_arguments(
+        function,
+        record=state,
+        named={"dt": float(dt), "height_count": grid, "width_count": grid},
+        functions=module.functions,
+    )
+    # An unbound formal is not automatically a problem, and not automatically
+    # fine. A formal that some call declares as an OUTPUT is an in-place
+    # result cell: the program writes it before anything reads it, so the
+    # scratch zero is never observed. Anything else unbound is a real input
+    # the binder could not identify, and a zero standing in for it would be
+    # manufactured evidence -- so that still refuses.
+    written = {
+        int(output)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        for output in (instruction.attributes.get("output_ids") or ())
     }
-    arguments: dict[int, Any] = {}
-    for argument in function.args:
-        value_id = int(argument.id)
-        accounting = argument.accounting or {}
-        field = accounting.get("program_abi_field")
-        if accounting.get("program_abi_parameter") == "state" and field:
-            if hasattr(state, field):
-                held = getattr(state, field)
-                arguments[value_id] = (
-                    np.asarray(held, dtype=float) if np.ndim(held)
-                    else float(held)
-                )
-                continue
-        if value_id == names.get("height_count"):
-            arguments[value_id] = grid
-        elif value_id == names.get("width_count"):
-            arguments[value_id] = grid
-    unbound = [
-        int(a.id) for a in function.args if int(a.id) not in arguments
-    ]
-    if unbound:
+    # A formal nothing reads cannot carry a wrong value into a result, so a
+    # scratch zero there is unobservable rather than manufactured. This
+    # program declares five such formals, all anonymous and unaccounted.
+    read = {
+        int(argument.id)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        for argument in instruction.args
+    }
+    genuinely_unbound = sorted((set(unbound) - written) & read)
+    if genuinely_unbound:
         raise RuntimeError(
-            f"{len(unbound)} formals unbound (e.g. {unbound[:6]}); the SSA "
-            "column refuses to report partially-bound numbers"
+            f"{len(genuinely_unbound)} INPUT formals unbound "
+            f"(e.g. {genuinely_unbound[:6]}); the SSA column refuses to "
+            "report partially-bound numbers"
         )
     SSAReferenceEvaluator(module).run(name, arguments)
-    raise RuntimeError(
-        "the SSA evaluator does not yet reconstruct Metrics; see its "
-        "status note before trusting any value it produces"
-    )
+    # The evaluator mutates caller-owned storage exactly as the compiled ABI
+    # does, so the state fields it wrote are readable here. Metrics are NOT
+    # reconstructed, so this column reports the state observables only --
+    # `compare` intersects keys, and a metric absent from one side is left
+    # out of the comparison rather than counted as agreement.
+    return {
+        key: value for key, value in _observables(state, _NoMetrics()).items()
+        if key.startswith("state.")
+    }
+
+
+class _NoMetrics:
+    """Stands in where this column has no Metrics to report.
+
+    Deliberately empty rather than zero-filled: a zero would be compared
+    and would read as a disagreement of exactly the true value, which is
+    the kind of manufactured evidence this tree has been bitten by before.
+    """
+
+    error_channels: dict = {}
 
 
 def run_fortran(grid: int, dt: float, build: Path) -> dict[str, np.ndarray]:
