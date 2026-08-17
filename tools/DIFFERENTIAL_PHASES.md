@@ -441,3 +441,51 @@ load-bearing.
 **Order of work.** Land the authority and migrate 1-4 first, verifying at
 each step that the module still lowers 45 functions. Then 5, which is the
 one that actually changes what the reducer sees.
+
+### Troubleshooting the built executable: what is established
+
+The whole-program executable builds and runs. `--trace` now compiles the
+launch digest in, and five frames report cleanly:
+
+    {"trace":{"records":5,"lost":0,"launches":[
+      {"seq":0,"shell_ns":740401,...,"status":1}, ...]}}
+
+Ruled OUT by measurement, each of which looked like the answer:
+
+* **"it failed"** -- `status:1` is SUCCESS. The shell's own accounting
+  proves it: `if (!status) { stats->failures += 1; }`.
+* **"inputs never arrived"** -- `initial-state.bin` decodes exactly right:
+  `[0:2]` frame_duration 0.0333 and dt_initial 0.001, `[2:1026]` height
+  min 1.0 max 1.12 (the wave bump), `[1026:2050]` momentum_x +/-0.0097,
+  `[3074:4098]` tracer up to 0.78 (the dye blob).
+* **"outputs read the wrong slots"** -- `state.height` loads into
+  `slots[2]` and is read back from `slots[2]`, with the identical
+  transposed index `((i/32)%32 + (i%32)*32)`. And `4100 = 4*1024 + 4`
+  matches the output file exactly.
+* **"the state arrays are intent(out), so the inputs are discarded"** --
+  they are `intent(inout)`, 2-D. 5 arrays in, 35 inout, 343 scalars by
+  value, 1 scalar out. The compute CAN write them back.
+
+So the Fortran runs successfully, receives correct inputs through
+correctly-bound slots that it is allowed to write, and every state output
+comes back zero while `t14` alone is written.
+
+Two leads, both concrete:
+
+1. **Extents are guessed from generated names.** `build_fluid_c_shell`
+   sizes workspace extents with a heuristic: group extent names by their
+   `_N` suffix, and if a family has more than one dimension give each
+   `grid`, otherwise `grid*grid`. That is a rule about NAME SHAPE, not a
+   fact read from the api contract, and it decides how every array in the
+   program is sized.
+
+2. **36 of the 40 array dummies in the entry are named with
+   address-derived ids** (`t2147983015473`). The node-identity defect is
+   not cosmetic and not confined to diagnostics: it names most of the
+   arrays in the program's ABI, and lead 1 keys its heuristic on exactly
+   those names. The `366 actuals vs 367 formals` gap is in this same
+   subroutine.
+
+Next: dump the api contract's declared extents for `t16..t19` and compare
+against what the shell passes. If they disagree, lead 1 is the cause and
+the fix is to bind extents from the contract instead of from name shape.
