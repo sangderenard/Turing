@@ -28,6 +28,11 @@ from typing import Callable
 import numpy as np
 
 from ..common.tensors.accelerator_backends.profiled_c_shell import _C_SOURCE
+from ..transmogrifier.graph.edge_roles import (
+    keyword_argument_name,
+    ordered_arguments,
+    positional_argument_index,
+)
 from .fortran_toolchain import (
     aggressive_c_flags,
     aggressive_fortran_flags,
@@ -3813,11 +3818,10 @@ def _class_surface_ssa_program(
                 operation == "call"
                 and attributes.get("static_python_reference") == "id"
             ):
-                source_id = next((
-                    int(parent)
-                    for parent, role in data.get("parents") or ()
-                    if str(role).startswith("arg")
-                ), None)
+                # `id(x)` takes one argument: argument ZERO, not whichever
+                # positional edge the parent set yields first.
+                arguments = ordered_arguments(data.get("parents") or ())
+                source_id = int(arguments[0]) if arguments else None
                 if source_id is not None and source_id in values:
                     result = SSAValue(
                         output_id,
@@ -4320,10 +4324,14 @@ def _class_surface_ssa_program(
                 for parent, role in data.get("parents") or ()
                 if str(role).startswith("kw:")
             }
+            # Ordered by the role's declared index, not by the order the
+            # parent set happens to yield, and matching both ProcessGraph
+            # spellings. This list is indexed positionally just below, so
+            # taking the set's order would bind field N to whichever
+            # argument iteration happened to reach first.
             positional_values = [
                 int(parent)
-                for parent, role in data.get("parents") or ()
-                if str(role).startswith("arg:")
+                for parent in ordered_arguments(data.get("parents") or ())
             ]
             fields = []
             physical_layout = []
@@ -5035,18 +5043,15 @@ def _class_surface_ssa_program(
                         role = str(role)
                         if role in {"callee", "func", "definition"}:
                             continue
-                        argument_suffix = (
-                            role[4:] if role.startswith("arg:") else role[3:]
-                            if role.startswith("arg") else ""
-                        )
-                        if argument_suffix.isdigit():
-                            index = int(argument_suffix)
+                        index = positional_argument_index(role)
+                        keyword = keyword_argument_name(role)
+                        if index is not None:
                             name = (
                                 positional_names[index]
                                 if index < len(positional_names) else None
                             )
-                        elif role.startswith("kw:"):
-                            name = role.split(":", 1)[1]
+                        elif keyword is not None:
+                            name = keyword
                         else:
                             name = None
                         history = tuple(identities.get(name, ()))

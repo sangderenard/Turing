@@ -111,7 +111,10 @@ from ..common.tensors.operator_catalog import (
     ACCESSOR_OPERATORS,
     CREATION_OPERATORS,
 )
-from ..transmogrifier.graph.edge_roles import positional_argument_index
+from ..transmogrifier.graph.edge_roles import (
+    ordered_arguments,
+    positional_argument_index,
+)
 from ..transmogrifier.graph.graph_deep_compiler import GraphDeepCompiler
 from ..transmogrifier.operator_defs import (
     abstract_tensor_funcs,
@@ -282,13 +285,24 @@ def _observe_process_graph_node(
             # receiver-argument rewiring), "arg0", or "arg:0" (other call
             # shapes) -- so match any arg-prefixed role instead of guessing
             # one spelling, and take the first by parent id for determinism.
-            size_parent_id = min(
-                (
-                    int(parent)
-                    for parent, role in (graph_node.get("parents") or ())
-                    if str(role).lower().startswith("arg")
-                ),
-                default=None,
+            # Where the role states an index, use it: that is the actual
+            # first argument rather than the smallest parent id, which was
+            # only ever a stand-in for an order the caller could not
+            # recover. Bare "arg" carries no index, so that spelling still
+            # falls back to the deterministic-by-id choice.
+            _declared_arguments = ordered_arguments(
+                graph_node.get("parents") or ()
+            )
+            size_parent_id = (
+                int(_declared_arguments[0]) if _declared_arguments
+                else min(
+                    (
+                        int(parent)
+                        for parent, role in (graph_node.get("parents") or ())
+                        if str(role).lower().startswith("arg")
+                    ),
+                    default=None,
+                )
             )
             if (
                 size_parent_id is not None
@@ -7019,11 +7033,13 @@ def _call_arguments(
         if role in {"operand", "func", "callee"}:
             continue
         index = fallback_index
-        if role.startswith("arg:"):
-            index = int(role[4:])
-        elif role.startswith("arg") and role[3:].isdigit():
-            index = int(role[3:])
+        declared = positional_argument_index(role)
+        if declared is not None:
+            index = declared
         elif role == "arg":
+            # A bare, unnumbered positional edge: the only case where
+            # arrival order legitimately decides, because the role states
+            # no index of its own.
             index = len(positional)
         else:
             continue
@@ -8792,8 +8808,7 @@ def _coordinate_scheduled_capture_impl(
             elif node_type == "LoopAggregateResult":
                 result = tuple(
                     evaluate_node(parent)
-                    for parent, role in parents
-                    if str(role).startswith("arg")
+                    for parent in ordered_arguments(parents)
                 )
             elif isinstance(expression, (ast.Tuple, ast.List, ast.Set)):
                 element_parents = [parent for parent, _role in parents]
@@ -8977,8 +8992,7 @@ def _coordinate_scheduled_capture_impl(
                 try:
                     materialized = [
                         evaluate_node(parent)
-                        for parent, role in parents
-                        if str(role).startswith("arg")
+                        for parent in ordered_arguments(parents)
                     ]
                 except KeyError:
                     # An evaporated structural comprehension can retain a
