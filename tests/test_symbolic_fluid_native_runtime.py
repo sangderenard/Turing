@@ -8,7 +8,7 @@ from src.compiler.symbolic_fluid_native_runtime import (
 
 def test_native_sympy_fluid_step_rejects_rolls_back_and_lands_on_frame(tmp_path):
     native = compile_native_symbolic_fluid_step(tmp_path)
-    advance = load_symbolic_fluid_managed_functions(native)[
+    advance = load_symbolic_fluid_managed_functions(tmp_path)[
         "symbolic_fluid_advance"
     ]
     state = SymbolicFluidGridState.initial(4, 4)

@@ -116,8 +116,17 @@ def _storage_values(
             descriptor.column_dtypes
             or ("unknown",) * len(descriptor.column_value_ids),
         )),
-        SSAValue(descriptor.length_address_id, dtype="int", shape=(1,)),
-        SSAValue(descriptor.capacity_value_id, dtype="int"),
+        # A sequence's length/capacity cells are shared ABI storage -- every
+        # caller and every helper generated here must agree on one true
+        # width for them, the same way column dtypes already do (see
+        # _canonical_sequence_dtype in precompile_to_ssa.py). int64 matches
+        # that width and matches a caller-supplied keyed instance field's
+        # own length, which is declared int64 by the program ABI contract;
+        # declaring these int32 here caused a real Fortran ABI mismatch
+        # whenever a caller's actual value was wider than this hardcoded
+        # default.
+        SSAValue(descriptor.length_address_id, dtype="int64", shape=(1,)),
+        SSAValue(descriptor.capacity_value_id, dtype="int64"),
     ]
     if descriptor.live_flags_value_id is not None:
         values.append(SSAValue(descriptor.live_flags_value_id, dtype="bool"))

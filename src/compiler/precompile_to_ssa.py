@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import ast
+import logging
 import re
 from dataclasses import dataclass, replace
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import networkx as nx
 
@@ -420,6 +421,150 @@ def lower_fused_program_to_ssa(
     return function, tuple(shortfalls)
 
 
+_LOG = logging.getLogger(__name__)
+
+
+def _canonical_sequence_dtype(dtype: str | None) -> str | None:
+    """Widen any sub-int64 integer dtype to int64.
+
+    A sequence's storage array is one shared piece of memory that every
+    function touching that sequence declares independently (each
+    ``_ControlSSABuilder`` instance is per-function and infers column
+    dtype from whatever local evidence it has -- a query operand's dtype,
+    a fill literal's Python type). Two functions inferring different
+    integer widths for the same shared array is a real element-address
+    mismatch, not a cosmetic type error. Collapsing every integer
+    candidate to one fixed width here, at the sequence descriptor's sole
+    construction point, makes every independent inference agree by
+    construction instead of requiring them to be reconciled after the
+    fact.
+    """
+    if dtype in {"int", "int8", "int16", "int32", "i32"}:
+        return "int64"
+    return dtype
+
+
+@dataclass(frozen=True)
+class ResolvedSequenceSchema:
+    """One sequence's structural shape, resolved once across every function
+    that touches it, before any single function's local view can lock in a
+    shape another function disagrees with.
+
+    ``_ControlSSABuilder`` instances are built one per function/region, each
+    from that one function's own local ``sequence_declarations``/
+    ``table_lookups``/``table_stores`` evidence. A sequence's numeric id is a
+    genuinely global identity (it traces back to one shared ProcessGraph
+    node), so two functions touching the same sequence can each build a
+    ``SSASequenceDescriptor`` with a different number of storage cells --
+    not just a different dtype, but a structurally different shape (whether
+    a status cell or live-flags cell exists at all). That is a real
+    memory-layout bug, not a cosmetic one: it shows up as a caller passing
+    one SSA value to two formal positions a callee expects to be distinct.
+
+    This schema carries only structural facts, never concrete SSA value
+    ids -- each function still mints its own ids from its own disjoint local
+    id namespace. ``column_count``/``policy`` are the two fields with no
+    sensible "union": every function that touches this sequence must agree
+    on them exactly, or the sequence's two conflicting authored shapes ARE
+    the bug, and lowering should say so rather than silently pick one.
+    ``writable``/``retains_deleted_rows``/``nested_table`` are booleans a
+    survey resolves as an OR across every function -- if any one function
+    needs the extra storage cell, the one shared array needs it too.
+    """
+
+    column_count: int
+    policy: str
+    writable: bool
+    retains_deleted_rows: bool
+    nested_table: bool
+    nested_value_dtype: str | None = None
+
+
+def resolve_sequence_schemas(
+    shells: Iterable[Mapping[str, Any]],
+    *,
+    location: str = "sequence-schema-survey",
+) -> tuple[dict[int, ResolvedSequenceSchema], tuple[SSALoweringShortfall, ...]]:
+    """Resolve one structural schema per sequence_id from every shell's raw
+    evidence, before any shell's ``_ControlSSABuilder`` lowers and locks in
+    a shape a different shell might disagree with.
+
+    Each item in ``shells`` is a mapping carrying the same raw tuples
+    ``_ControlSSABuilder`` itself consumes for one function/region:
+    ``sequence_declarations``, ``sequence_initializations``,
+    ``table_deletions``, ``retained_sequence_ids``, ``nested_sequence_ids``.
+    Missing keys default to ``()``, so callers may pass only what they have.
+    """
+    column_counts: dict[int, int] = {}
+    policies: dict[int, str] = {}
+    writable_union: dict[int, bool] = {}
+    retains_union: dict[int, bool] = {}
+    nested_union: dict[int, bool] = {}
+    conflicted: set[int] = set()
+    shortfalls: list[SSALoweringShortfall] = []
+
+    def _observe(sequence_id: object, column_count: object, policy: object, writable: object) -> None:
+        sid = int(sequence_id)
+        if sid in column_counts and (
+            column_counts[sid] != int(column_count) or policies[sid] != str(policy)
+        ):
+            if sid not in conflicted:
+                shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", "resolved-schema-conflict", location,
+                    f"sequence value {sid} was declared with "
+                    f"{column_counts[sid]} column(s)/policy {policies[sid]!r} "
+                    "in one function and "
+                    f"{int(column_count)} column(s)/policy {str(policy)!r} "
+                    "in another -- every function touching a shared "
+                    "sequence must agree on its shape",
+                ))
+                conflicted.add(sid)
+            return
+        column_counts[sid] = int(column_count)
+        policies[sid] = str(policy)
+        writable_union[sid] = writable_union.get(sid, False) or bool(writable)
+
+    for shell in shells:
+        deletion_ids = {
+            int(sequence_id)
+            for _effect_id, _key_id, sequence_id, _storage_identity
+            in shell.get("table_deletions", ())
+            if sequence_id is not None
+        }
+        deletion_ids.update(int(sid) for sid in shell.get("retained_sequence_ids", ()))
+        nested_ids = {int(sid) for sid in shell.get("nested_sequence_ids", ())}
+        for sequence_id, policy, column_count, writable in shell.get(
+            "sequence_declarations", ()
+        ):
+            _observe(sequence_id, column_count, policy, writable)
+            sid = int(sequence_id)
+            retains_union[sid] = retains_union.get(sid, False) or sid in deletion_ids
+            nested_union[sid] = nested_union.get(sid, False) or sid in nested_ids
+        for sequence_id, policy, column_count in shell.get(
+            "sequence_initializations", ()
+        ):
+            descriptor_policy = (
+                "duplicates" if str(policy).startswith("fill=") else str(policy)
+            )
+            _observe(sequence_id, column_count, descriptor_policy, True)
+            sid = int(sequence_id)
+            retains_union[sid] = retains_union.get(sid, False) or sid in deletion_ids
+            nested_union[sid] = nested_union.get(sid, False) or sid in nested_ids
+
+    resolved = {
+        sid: ResolvedSequenceSchema(
+            column_count=column_counts[sid],
+            policy=policies[sid],
+            writable=writable_union.get(sid, False),
+            retains_deleted_rows=retains_union.get(sid, False),
+            nested_table=nested_union.get(sid, False),
+        )
+        for sid in column_counts
+        if sid not in conflicted
+    }
+    return resolved, tuple(shortfalls)
+
+
 class _ControlSSABuilder:
     def __init__(
         self,
@@ -459,6 +604,7 @@ class _ControlSSABuilder:
         table_region_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
         table_region_post_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
         table_epilogue_operations: tuple[tuple[str, tuple[Any, ...]], ...] = (),
+        resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
     ):
         from .evolution_metagraph import (
             active_evolution_metagraph,
@@ -503,6 +649,10 @@ class _ControlSSABuilder:
         self.declared_parameter_only_ids: set[int] = set()
         self.table_lookup_defaults = dict(table_lookup_defaults or {})
         self.sequence_descriptors: dict[int, SSASequenceDescriptor] = {}
+        self.resolved_sequence_schemas: dict[int, ResolvedSequenceSchema] = {
+            int(sequence_id): schema
+            for sequence_id, schema in (resolved_sequence_schemas or {}).items()
+        }
         self.sequence_storage_values: dict[int, tuple[SSAValue, ...]] = {}
         self.sequence_status_values: dict[int, SSAValue] = {}
         self.sequence_helper_functions: dict[str, Function] = {}
@@ -2386,6 +2536,32 @@ class _ControlSSABuilder:
         column_dtypes: tuple[str | None, ...] = (),
     ) -> SSASequenceDescriptor | None:
         value_id = int(value_id)
+        resolved = self.resolved_sequence_schemas.get(value_id)
+        if resolved is not None:
+            if (
+                int(resolved.column_count) != int(column_count)
+                or str(resolved.policy) != str(policy)
+            ):
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", "resolved-schema-mismatch", location,
+                    f"sequence value {value_id} disagrees with its "
+                    "whole-program resolved schema: this function sees "
+                    f"{int(column_count)} column(s)/policy {policy!r}, "
+                    f"but the survey resolved {int(resolved.column_count)} "
+                    f"column(s)/policy {resolved.policy!r} from every "
+                    "function that touches this sequence",
+                ))
+                return None
+            # writable/retains_deleted_rows/nested_table are resolved as an
+            # OR across every function during the survey -- this function's
+            # own local view is always a subset of that, never a conflict,
+            # so the resolved value simply wins rather than being checked.
+            writable = bool(writable or resolved.writable)
+            retains_deleted_rows = bool(
+                retains_deleted_rows or resolved.retains_deleted_rows
+            )
+            nested_table = bool(nested_table or resolved.nested_table)
+            nested_value_dtype = nested_value_dtype or resolved.nested_value_dtype
         key_columns = (
             tuple(range(max(1, int(column_count) - 1)))
             if policy == "unique" else ()
@@ -2417,20 +2593,36 @@ class _ControlSSABuilder:
                 ))
                 return None
             return existing
-        first_dtype = element_dtype or (
+        def _canonicalize_column(raw_dtype: str | None, column: int) -> str | None:
+            canonical = _canonical_sequence_dtype(raw_dtype)
+            if canonical != raw_dtype and _LOG.isEnabledFor(logging.DEBUG):
+                _LOG.debug(
+                    "sequence %d column %d at %s: widened dtype %r -> %r "
+                    "(this array is shared across every function that "
+                    "touches the sequence, so its element width must be "
+                    "one fact, not whatever the first function to see it "
+                    "happened to infer)",
+                    value_id, column, location, raw_dtype, canonical,
+                )
+            return canonical
+
+        first_dtype = _canonicalize_column(element_dtype or (
             column_dtypes[0] if column_dtypes else None
-        )
+        ), 0)
         data = self.external_value(value_id, dtype=first_dtype)
         extra_columns = tuple(
-            self.fresh_value(dtype=(
-                "int"
-                if nested_table and index == int(column_count) - 2
-                else str(
-                    column_dtypes[index + 1]
-                    if index + 1 < len(column_dtypes)
-                    and column_dtypes[index + 1] is not None
-                    else data.dtype or "unknown"
-                )
+            self.fresh_value(dtype=_canonicalize_column(
+                (
+                    "int64"
+                    if nested_table and index == int(column_count) - 2
+                    else str(
+                        column_dtypes[index + 1]
+                        if index + 1 < len(column_dtypes)
+                        and column_dtypes[index + 1] is not None
+                        else data.dtype or "unknown"
+                    )
+                ),
+                index + 1,
             ))
             for index in range(max(0, int(column_count) - 1))
         )
@@ -2438,8 +2630,14 @@ class _ControlSSABuilder:
         # Mutable scalar cells are one-element typed arenas at the C ABI, not
         # opaque pointer-typed scalars (which the Fortran emitter would have
         # no element type for and could accidentally pass by value).
-        length_address = self.fresh_value(dtype="int", shape=(1,))
-        capacity = self.fresh_value(dtype="int")
+        # int64, not the generic "int" default: these two cells are shared
+        # ABI storage a sequence-helper caller may bind to an externally
+        # int64-typed value (e.g. a keyed instance field's own length, see
+        # _storage_values in ir_sequence_tables.py) -- both sides of that
+        # shared value must declare the same width or the Fortran call
+        # fails with a real ABI type mismatch, not a cosmetic one.
+        length_address = self.fresh_value(dtype="int64", shape=(1,))
+        capacity = self.fresh_value(dtype="int64")
         requires_status = bool(writable) or policy == "unique"
         status_address = (
             self.fresh_value(dtype="int", shape=(1,))
@@ -3787,6 +3985,7 @@ def lower_control_program_to_ssa(
     table_region_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
     table_region_post_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
     table_epilogue_operations: tuple[tuple[str, tuple[Any, ...]], ...] = (),
+    resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
 ) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
     builder = _ControlSSABuilder(
         program,
@@ -3818,6 +4017,7 @@ def lower_control_program_to_ssa(
         table_region_operations=table_region_operations,
         table_region_post_operations=table_region_post_operations,
         table_epilogue_operations=table_epilogue_operations,
+        resolved_sequence_schemas=resolved_sequence_schemas,
     )
     builder.lower(program.root)
     for kind, arguments in builder.table_epilogue_operations:
@@ -4503,6 +4703,7 @@ def lower_control_sections_to_ssa(
     nested_row_projections: tuple[tuple[int, int, int, str], ...] = (),
     string_table: Any = None,
     tensor_ssa_reference: Any = None,
+    resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
 ) -> tuple[
     IRModule,
     tuple[SSALoweringShortfall, ...],
@@ -5691,6 +5892,7 @@ def lower_control_sections_to_ssa(
             if value_ids
         },
         nested_row_projections=nested_row_projections,
+        resolved_sequence_schemas=resolved_sequence_schemas,
         table_region_operations={
             region: tuple(operations)
             for region, operations in table_region_operations.items()

@@ -2327,7 +2327,10 @@ def _class_surface_ssa_program(
         IRModule, SSAMachineControlTable, SSAMachineIndirectTable,
     )
     from .glsl_deployment_strategy import _walk_planned_shells
-    from .precompile_to_ssa import lower_control_sections_to_ssa
+    from .precompile_to_ssa import (
+        lower_control_sections_to_ssa,
+        resolve_sequence_schemas,
+    )
     from .string_table import StringTable
 
     # One table for the whole object: every method's string constants tokenize
@@ -2491,6 +2494,57 @@ def _class_surface_ssa_program(
         for _effect, _key, sequence_id, storage_identity in field_contract[12]:
             if sequence_id is not None:
                 retained_storage_identities.add(str(storage_identity))
+    # A sequence's numeric id is a global identity across the whole program
+    # (it traces back to one shared ProcessGraph node's value_id), but each
+    # shell (method) below lowers with its own local, independently-inferred
+    # view of any sequence it touches. Two shells touching the same sequence
+    # can therefore disagree not just on element dtype but on the sequence's
+    # actual shape (how many storage cells it has) -- a real memory-layout
+    # bug, not a cosmetic one. Survey every shell's raw declarations here,
+    # before any shell's lowering commits to a shape, and resolve one
+    # structural schema per sequence_id that every shell's lowering below
+    # will be handed and required to agree with. See
+    # ResolvedSequenceSchema in precompile_to_ssa.py for the full rationale.
+    keyed_table_fields = frozenset(
+        str(_field_name)
+        for _record in dict(program_abi.get("records") or {}).values()
+        for _field_name, _field in dict(_record.get("fields") or {}).items()
+        if str(_field.get("storage") or "") == "keyed"
+    )
+    shell_sequence_evidence: list[dict[str, Any]] = []
+    for shell in planned_shells:
+        graph = getattr(shell, "process_graph", None)
+        graph_obj = graph.G if graph is not None else None
+        if graph_obj is None:
+            continue
+        (
+            _self_id, _field_ops, _const_sources, _field_count, _field_names,
+            _record_identity, sequence_initializations, _field_aliases,
+            sequence_declarations, _sequence_memberships, _table_lookups,
+            _table_lookup_defaults, _table_stores, table_deletions,
+            retained_sequence_ids, nested_sequence_ids, _nested_record_fields,
+        ) = _field_slot_ops(
+            graph_obj,
+            retained_storage_identities=frozenset(retained_storage_identities),
+            keyed_table_fields=keyed_table_fields,
+        )
+        shell_sequence_evidence.append({
+            "sequence_declarations": sequence_declarations,
+            "sequence_initializations": sequence_initializations,
+            "table_deletions": table_deletions,
+            "retained_sequence_ids": retained_sequence_ids,
+            "nested_sequence_ids": nested_sequence_ids,
+        })
+    resolved_sequence_schemas, sequence_schema_shortfalls = (
+        resolve_sequence_schemas(
+            shell_sequence_evidence, location="sequence-schema-survey",
+        )
+    )
+    if sequence_schema_shortfalls:
+        lowering_failures.extend(
+            ("<sequence-schema-survey>", item)
+            for item in sequence_schema_shortfalls
+        )
     for shell in planned_shells:
         graph = getattr(shell, "process_graph", None)
         graph_obj = graph.G if graph is not None else None
@@ -2912,6 +2966,7 @@ def _class_surface_ssa_program(
                 ),
                 string_table=string_table,
                 tensor_ssa_reference=tensor_ssa_reference,
+                resolved_sequence_schemas=resolved_sequence_schemas,
             )
         )
         if shortfalls:
@@ -6516,6 +6571,21 @@ def _class_surface_ssa_program(
             caller = all_functions[caller_symbol]
             caller_graph = source_graphs_by_symbol.get(caller_symbol)
             values = {int(value.id): value for value in caller.args}
+            # Ids genuinely produced by an existing instruction, as opposed to
+            # a shapeless placeholder some other record's processing may have
+            # `setdefault`-ed into `values` this same round. A record's own
+            # authored callsite id (below, `returns_aggregate`) is not
+            # guaranteed disjoint from some unrelated value's id drawn from a
+            # different numbering source (e.g. a required-source-value
+            # resolved earlier via aggregate unpacking) -- reusing an
+            # already-produced id for a new, unrelated result would give two
+            # different instructions the same SSA identity.
+            produced_ids = {
+                int(instruction.res.id)
+                for block in caller.blocks.values()
+                for instruction in block.instrs
+                if instruction.res is not None
+            }
             values.update({
                 int(instruction.res.id): instruction.res
                 for block in caller.blocks.values()
@@ -7619,6 +7689,24 @@ def _class_surface_ssa_program(
                         }
                     elif returns_aggregate:
                         caller_result_id = int(record.callsite_id)
+                        if caller_result_id in produced_ids:
+                            # The call-site's own AST node id coincides with
+                            # a value some OTHER, already-existing
+                            # instruction already produces -- drawn from an
+                            # unrelated numbering source (e.g. a
+                            # required-source-value pulled out of a
+                            # different call's aggregate output via
+                            # `source_output_id`). Adopting it here would
+                            # give two different instructions the same SSA
+                            # identity, which is exactly the class of bug
+                            # the freshening pass later in this function
+                            # cannot safely repair (it renames a colliding
+                            # `.res` in place but never rewrites the other
+                            # instructions that already reference the old
+                            # id by number). Allocate a genuinely fresh id
+                            # for this call's own aggregate result instead.
+                            caller_result_id = next_value_id
+                            next_value_id += 1
                         result = values.get(
                             caller_result_id,
                             SSAValue(
@@ -7637,6 +7725,7 @@ def _class_surface_ssa_program(
                                 },
                             ),
                         )
+                        produced_ids.add(caller_result_id)
                     else:
                         caller_result_id = (
                             int(record.result_bindings[0][1])
@@ -8853,11 +8942,16 @@ def _class_surface_ssa_program(
     # the slots exist only after record materialization and call-frame
     # linking.  Every frame is linked now, so bind them: keys/values/length
     # are the owner's parts, and a caller-supplied mapping is always exactly
-    # full, so capacity IS the length.  The status cell stays an ordinary
-    # frame-allocated scalar.
+    # full, so capacity IS the length -- the same value fills both formal
+    # positions.  Both formals must therefore agree with that one value's
+    # real width (int64, matching keys/query below), not the generic
+    # scalar-arena default: declaring either as int32 while the caller's
+    # actual keyed-field length is int64 is a real Fortran ABI mismatch, not
+    # a cosmetic one, since a shared value can only have one true width.
+    # The status cell stays an ordinary frame-allocated scalar.
     _keyed_helper_dtypes = (
-        ("int64", None), ("float64", None), ("int", (1,)),
-        ("int", None), ("int", (1,)), ("int64", None),
+        ("int64", None), ("float64", None), ("int64", (1,)),
+        ("int64", None), ("int", (1,)), ("int64", None),
     )
     for function in all_functions.values():
         parts_by_owner: dict[str, dict[str, Any]] = {}
