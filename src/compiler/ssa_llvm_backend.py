@@ -961,10 +961,24 @@ def _emit_repository_call_module(
                     projected.res
                 )
 
-        def emit_return_values() -> None:
+        def emit_return_values(
+            returned_values: tuple = (),
+        ) -> None:
             for output_index, output in enumerate(outputs):
                 destination = f"%out.{output_index}"
-                source = pointers.get(int(output.id))
+                # The Ret instruction's own arguments are the authoritative
+                # publication objects: a carried reduction returns its PHI,
+                # whose id differs from the declared output id (the port /
+                # field slot).  Publishing by declared id alone read the
+                # port's unwritten cell and returned zero for every carried
+                # maximum.
+                source = None
+                if output_index < len(returned_values):
+                    source = pointers.get(
+                        int(returned_values[output_index].id)
+                    )
+                if source is None:
+                    source = pointers.get(int(output.id))
                 if source is None:
                     tensor_table = getattr(module, "tensor_tables", {}).get(name)
                     descriptor = (
@@ -1141,7 +1155,7 @@ def _emit_repository_call_module(
                 continue
 
             if operation in {"Ret", "ret", "Return", "return"}:
-                emit_return_values()
+                emit_return_values(tuple(instruction.args))
                 body.append("  ret void")
                 emitted_return = True
                 continue

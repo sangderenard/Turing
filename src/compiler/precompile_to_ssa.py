@@ -3243,8 +3243,13 @@ class _ControlSSABuilder:
                 (int(initial_id), int(updated_id)), set()
             )
             group.add(int(port_id))
+            port_values = getattr(self, "_carried_port_values", None)
+            if port_values is None:
+                port_values = {}
+                self._carried_port_values = port_values
             for grouped_port in group:
                 self.external_values[int(grouped_port)] = phi.res
+                port_values[int(grouped_port)] = phi.res
             # The record-return expansion selects Ret components by RAW
             # layout id.  A port-resolved phi carries its own result id, so
             # the component silently dropped and the public return read the
@@ -3518,6 +3523,7 @@ class _ControlSSABuilder:
         returned = []
         named_returns = []
         returned_ids = set()
+        carried_port_values = getattr(self, "_carried_port_values", {})
         for name, history in self.named_output_histories.items():
             value = next((
                 self.external_values[value_id]
@@ -3526,12 +3532,18 @@ class _ControlSSABuilder:
             ), None)
             if value is None:
                 continue
+            # A returned name whose final identity is a LoopResult port means
+            # the carried phi -- the port id doubles as a written field slot
+            # whose cell nothing stores.
+            value = carried_port_values.get(int(value.id), value)
             named_returns.append((name, int(value.id)))
             if value.id not in returned_ids:
                 returned.append(value)
                 returned_ids.add(value.id)
         for value_id in self.output_value_ids:
             value = self.external_values.get(value_id)
+            if value is not None:
+                value = carried_port_values.get(int(value.id), value)
             if value is not None and value.id not in returned_ids:
                 returned.append(value)
                 returned_ids.add(value.id)
@@ -3641,6 +3653,14 @@ class _ControlSSABuilder:
                 metadata={
                     "recursion_table": dict(self.ssa_recursion_table),
                     "named_outputs": tuple(named_returns),
+                    # port id -> the carried phi VALUE standing at that
+                    # port after the loops.  The record-return expansion
+                    # resolves layout components by id, and a component
+                    # whose id doubles as a written field slot must resolve
+                    # to the phi, not the unwritten slot argument.
+                    "carried_port_values": dict(
+                        getattr(self, "_carried_port_values", {}) or {}
+                    ),
                     "value_names": tuple(value_names),
                     "parameter_names": parameter_value_names,
                     "control_ir": True,

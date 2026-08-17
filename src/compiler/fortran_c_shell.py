@@ -4550,17 +4550,25 @@ def _class_surface_ssa_program(
                     for argument in instruction.args
                 }
                 # A carried reduction returns through its LoopResult port,
-                # but the value in the Ret is the carried PHI, which has its
-                # own id.  The phi names every port it stands for; selection
-                # by raw layout id must follow that record or the component
-                # silently drops and the public return reads the port's
-                # unwritten field cell.
+                # but the value standing at that port is the carried PHI,
+                # which has its own id.  The builder exports port -> phi in
+                # metadata; selection by raw layout id must follow it, or
+                # the component resolves to the port's unwritten field cell
+                # and every carried maximum publishes zero.
                 for argument in instruction.args:
                     for port_id in (
                         (argument.accounting or {}).get("carried_port_ids")
                         or ()
                     ):
                         by_id.setdefault(int(port_id), argument)
+                for port_id, port_value in dict(
+                    function.metadata.get("carried_port_values") or {}
+                ).items():
+                    # The port map is the AUTHORITY: a stale component
+                    # object carrying the port's id may already sit in the
+                    # Ret from earlier expansion, and it names the unwritten
+                    # field cell.
+                    by_id[int(port_id)] = port_value
                 record_layouts = dict(
                     function.metadata.get("record_return_layouts", ())
                 )
@@ -8170,8 +8178,15 @@ def _class_surface_ssa_program(
                         if not layout:
                             expanded.append(argument)
                             continue
+                        carried = dict(
+                            function.metadata.get("carried_port_values")
+                            or {}
+                        )
                         expanded.extend(
-                            current_values[value_id] for value_id in layout
+                            carried.get(
+                                int(value_id), current_values[value_id]
+                            )
+                            for value_id in layout
                         )
                         layouts[int(returned_record.record_id)] = layout
                         changed_return = True
@@ -8679,7 +8694,16 @@ def _class_surface_ssa_program(
                     if not layout:
                         expanded.append(argument)
                         continue
-                    expanded.extend(values[value_id] for value_id in layout)
+                    # A component standing at a LoopResult port means the
+                    # carried phi; the raw field value is the port's
+                    # unwritten slot.
+                    carried = dict(
+                        function.metadata.get("carried_port_values") or {}
+                    )
+                    expanded.extend(
+                        carried.get(int(value_id), values[value_id])
+                        for value_id in layout
+                    )
                     layouts[int(record.record_id)] = layout
                     changed_return = True
                 if changed_return:

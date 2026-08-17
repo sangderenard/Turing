@@ -153,6 +153,7 @@ class NativeSymbolicFluidAdvance:
     artifact: LLVMFunctionArtifact
     function: Any
     _module_functions: Any = None
+    outputs_record: Any = None
     execution: LLVMExecution | None = None
     _state_feeds: tuple = ()          # (value_id, field, rank)
     _written: tuple = ()              # (value_id, field, rank)
@@ -223,84 +224,42 @@ class NativeSymbolicFluidAdvance:
         self._state_feeds = tuple(state_feeds)
         self._written = tuple(written)
         self._dt_ids = tuple(dt_ids)
-        ok_id, metrics_id = map(
-            int, self.function.metadata["source_output_value_ids"]
-        )
-        self._ok_id = ok_id
-        layout = {
-            int(record_id): tuple(map(int, component_ids))
-            for record_id, component_ids in self.function.metadata.get(
-                "record_return_layouts", ()
+        # The lowering RETURNS the gathered I/O record -- the authored
+        # return, in order, one value per component.  Consume it; do not
+        # reconstruct it from metadata plus guesses.
+        record = tuple(self.outputs_record or ())
+        if len(record) < 2:
+            raise RuntimeError(
+                "the lowering outputs record for the advance is required; "
+                "pass the second element of lower_ast_source_to_ssa's result"
             )
-        }[metrics_id]
+        self._ok_id = int(record[0].id)
+        import dataclasses as _dataclasses
+
+        metric_fields = [
+            field.name
+            for field in _dataclasses.fields(Metrics)
+            if field.name != "error_channels"
+        ]
+        components = record[1:]
+        if len(components) > len(metric_fields):
+            raise RuntimeError(
+                f"outputs record has {len(components)} Metrics components "
+                f"for {len(metric_fields)} contract fields"
+            )
+        by_kwarg = {
+            name: int(value.id)
+            for name, value in zip(metric_fields, components)
+        }
         names = dict(
             (str(name), int(value_id))
             for name, value_id in self.function.metadata.get(
                 "value_names", ()
             )
         )
-        by_kwarg: dict[str, int] = {}
-        remaining = list(layout)
-        for value_id in layout:
-            accounting = self._accounting_of(value_id)
-            tagged = accounting.get("program_abi_default") or (
-                accounting.get("program_abi_constructor_literal")
-            )
-            if tagged is not None and str(tagged) not in by_kwarg:
-                by_kwarg[str(tagged)] = value_id
-                remaining.remove(value_id)
-        if names.get("mass_error") in remaining:
-            by_kwarg["mass_err"] = names["mass_error"]
-            remaining.remove(names["mass_error"])
-        # The authored constructor sets max_vel and max_flux from the same
-        # max_wave_speed value, published through state.last_wave_speed.
-        wave = [
-            value_id for value_id in remaining
-            if self._accounting_of(value_id).get("program_abi_field")
-            == "last_wave_speed"
-        ]
-        if len(wave) == 2:
-            by_kwarg["max_vel"], by_kwarg["max_flux"] = wave
-            remaining = [v for v in remaining if v not in wave]
-        if len(remaining) == 1:
-            by_kwarg.setdefault("dt_limit", remaining[0])
-            remaining = []
-        if remaining:
-            raise RuntimeError(
-                f"unbound Metrics components {remaining!r}; the named record "
-                "does not cover the return layout"
-            )
         channels = {
             "height_positivity": names.get("max_height_violation"),
             "tracer_bounds": names.get("max_tracer_violation"),
-        }
-        # A carried reduction's component id is its LoopResult port, but the
-        # value actually returned is the carried phi under its own id; the
-        # phi names its ports.  Follow that record, or the read lands on the
-        # port's unwritten field cell.
-        port_owner = {}
-        for block in self.function.blocks.values():
-            for instruction in block.instrs:
-                if str(instruction.op) not in {"Ret", "ret"}:
-                    continue
-                for argument in instruction.args:
-                    for port_id in (
-                        (argument.accounting or {}).get("carried_port_ids")
-                        or ()
-                    ):
-                        port_owner.setdefault(
-                            int(port_id), int(argument.id)
-                        )
-        by_kwarg = {
-            kwarg: port_owner.get(int(value_id), int(value_id))
-            for kwarg, value_id in by_kwarg.items()
-        }
-        channels = {
-            name: (
-                None if value_id is None
-                else port_owner.get(int(value_id), int(value_id))
-            )
-            for name, value_id in channels.items()
         }
         self._metrics_parts = (by_kwarg, channels)
 
@@ -419,16 +378,20 @@ def compile_native_symbolic_fluid_advance(
     import pickle
 
     module = None
+    outputs_record = None
     if build_directory is not None:
         cached = Path(build_directory) / "control_repository_ssa.pkl"
         if cached.is_file():
             with cached.open("rb") as stream:
-                module, _outputs, _exports = pickle.load(stream)
+                module, lowering_outputs, _exports = pickle.load(stream)
+            outputs_record = lowering_outputs.get(
+                "symbolic_fluid_control__symbolic_fluid_advance"
+            )
     if module is None:
         from .fortran_c_shell import lower_ast_source_to_ssa
 
         symbolic = compile_symbolic_fluid_step()
-        module, _outputs, _exports = lower_ast_source_to_ssa(
+        module, lowering_outputs, _exports = lower_ast_source_to_ssa(
             SYMBOLIC_FLUID_DT_SOURCE,
             "symbolic_fluid_frame",
             python_bindings={
@@ -447,6 +410,8 @@ def compile_native_symbolic_fluid_advance(
             ),
         )
     name = "symbolic_fluid_control__symbolic_fluid_advance"
+    if outputs_record is None:
+        outputs_record = lowering_outputs.get(name)
     artifact = emit_ssa_function_to_llvm(module, name)
     if not artifact.complete:
         raise RuntimeError(
@@ -462,6 +427,7 @@ def compile_native_symbolic_fluid_advance(
     )
     return NativeSymbolicFluidAdvance(
         artifact, module.functions[name], dict(module.functions),
+        outputs_record,
     )
 
 
