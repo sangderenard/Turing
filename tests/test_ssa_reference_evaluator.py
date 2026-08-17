@@ -438,3 +438,179 @@ def test_step_outputs_bind_by_name_through_the_call(lowered_advance):
                 f"output republished as {caller_label!r} but the callee "
                 f"declares it {label!r}"
             )
+
+
+# -- calibration on regions + loop-carried state --------------------------
+
+
+def _neighbour_sum_module():
+    """A minimal traversal: out[i] = a[i] + a[(i+1) % n].
+
+    Exercises exactly the features the pure-function calibration does not
+    reach, and nothing else:
+
+      * a loop with a carried induction phi,
+      * a planner-style REGION call, which keeps the caller's numbering
+        and publishes through `output_ids` rather than Ret,
+      * an aggregate projection of that region's result,
+      * an address computed from the induction variable, and a NEIGHBOUR
+        address computed from it by wrapping arithmetic,
+      * a Store back into caller-owned storage.
+
+    The neighbour read is the point. A traversal whose neighbour addresses
+    collapse onto the centre still produces plausible numbers -- every
+    cell simply reads itself -- so the defect hides unless the expected
+    answer distinguishes them. Here a[i] + a[i+1] differs from 2*a[i] for
+    any input that is not constant.
+    """
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    a, out, n = SSAValue(1), SSAValue(2), SSAValue(3, dtype="int")
+    region = Function(
+        "reg",
+        [SSAValue(10), SSAValue(11, dtype="int"), SSAValue(12, dtype="int")],
+        {"entry": BasicBlock("entry", [
+            Instr("Const", [], SSAValue(13, dtype="int"),
+                  attributes={"value": 1}),
+            Instr("Add", [SSAValue(11), SSAValue(13)],
+                  SSAValue(14, dtype="int")),
+            # the wrap that makes the neighbour a neighbour
+            Instr("Mod", [SSAValue(14), SSAValue(12)],
+                  SSAValue(15, dtype="int")),
+            Instr("GetElementPtr", [SSAValue(10), SSAValue(11)],
+                  SSAValue(16, dtype="ptr")),
+            Instr("Load", [SSAValue(16)], SSAValue(17)),
+            Instr("GetElementPtr", [SSAValue(10), SSAValue(15)],
+                  SSAValue(18, dtype="ptr")),
+            Instr("Load", [SSAValue(18)], SSAValue(19)),
+            Instr("Add", [SSAValue(17), SSAValue(19)], SSAValue(50)),
+        ])},
+    )
+    caller = Function(
+        "main",
+        [a, out, n],
+        {
+            "entry": BasicBlock("entry", [
+                Instr("Const", [], SSAValue(20, dtype="int"),
+                      attributes={"value": 0}),
+                Instr("Const", [], SSAValue(21, dtype="int"),
+                      attributes={"value": 1}),
+                Instr("Br", [], None, attributes={"target": "header"}),
+            ], ["header"]),
+            "header": BasicBlock("header", [
+                Instr("Phi", [SSAValue(20), SSAValue(23)],
+                      SSAValue(22, dtype="int"),
+                      attributes={"incoming_blocks": ("entry", "latch")}),
+                Instr("Lt", [SSAValue(22), n], SSAValue(24, dtype="bool")),
+                Instr("CondBr", [SSAValue(24)], None,
+                      attributes={"true_target": "body",
+                                  "false_target": "exit"}),
+            ], ["body", "exit"]),
+            "body": BasicBlock("body", [
+                Instr("Call", [a, SSAValue(22), n], SSAValue(30),
+                      attributes={"callee": "reg", "region_index": 0,
+                                  "output_ids": (50,),
+                                  "result_convention": "ssa.aggregate"}),
+                Instr("Const", [], SSAValue(31, dtype="int"),
+                      attributes={"value": 0}),
+                Instr("GetElementPtr", [SSAValue(30), SSAValue(31)],
+                      SSAValue(32, dtype="ptr"),
+                      attributes={"aggregate_index": 0}),
+                Instr("Load", [SSAValue(32)], SSAValue(33)),
+                Instr("GetElementPtr", [out, SSAValue(22)],
+                      SSAValue(34, dtype="ptr")),
+                Instr("Store", [SSAValue(33), SSAValue(34)], None),
+                Instr("Br", [], None, attributes={"target": "latch"}),
+            ], ["latch"]),
+            "latch": BasicBlock("latch", [
+                Instr("Add", [SSAValue(22), SSAValue(21)],
+                      SSAValue(23, dtype="int")),
+                Instr("Br", [], None, attributes={"target": "header"}),
+            ], ["header"]),
+            "exit": BasicBlock("exit", [Instr("Ret", [], None)], []),
+        },
+    )
+
+    class _Module:
+        functions = {"main": caller, "reg": region}
+
+    return _Module()
+
+
+def test_traversal_with_region_and_carried_state():
+    """out[i] must be a[i] + a[i+1 mod n], not 2*a[i].
+
+    This is the calibration for everything the traversal needs and the
+    pure-function case never touched. A failure showing 2*a[i] means
+    neighbour addresses collapse onto the centre -- which is exactly the
+    symptom the fluid traversal shows, and would locate it here, in a case
+    small enough to read in full.
+    """
+    values = np.array([1.0, 20.0, 300.0, 4000.0])
+    out = np.zeros(4)
+    SSAReferenceEvaluator(_neighbour_sum_module()).run(
+        "main", {1: values, 2: out, 3: 4},
+    )
+    expected = values + np.roll(values, -1)
+    assert np.allclose(out, expected), (
+        f"traversal produced {out.tolist()}, expected {expected.tolist()}; "
+        f"2*a would be {(2 * values).tolist()}"
+    )
+
+
+def test_traversal_evaluation_matches_the_authored_mathematics(lowered_advance):
+    """CALIBRATION on the real traversal, and the routing result it gives.
+
+    Executing the whole fluid traversal's SSA -- regions, a linked call,
+    loop-carried accumulators, array stores -- reproduces the authored
+    SymPy equations EXACTLY. The evaluator is therefore calibrated on the
+    shape it was built for, not merely on a pure function.
+
+    That makes the comparison against the compiled artifact meaningful,
+    and it routes the outstanding defect: the artifact disagrees with both
+    this and the oracle, so the SSA carries the authored meaning and the
+    LLVM emission is what changes it.
+
+    Pinned because the calibration is what licenses every routing claim
+    made with this tool; if it ever breaks, no such claim should be
+    believed until it is restored.
+    """
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "tools"))
+    from differential_translation import build_python_reference
+
+    from src.compiler.ssa_reference_evaluator import (
+        SSAReferenceEvaluator, bind_program_abi_arguments,
+    )
+    from src.compiler.symbolic_fluid_dt import SymbolicFluidGridState
+
+    module, _outputs = lowered_advance
+    name = "symbolic_fluid_control__symbolic_fluid_advance"
+    function = module.functions[name]
+
+    state = SymbolicFluidGridState.initial(4, 4)
+    arguments, _unbound = bind_program_abi_arguments(
+        function,
+        record=state,
+        named={"dt": 0.2, "height_count": 4, "width_count": 4},
+        functions=module.functions,
+    )
+    next_height_id = next(
+        int(a.id) for a in function.args
+        if (a.accounting or {}).get("program_abi_field") == "next_height"
+    )
+    SSAReferenceEvaluator(module).run(name, arguments)
+    evaluated = np.asarray(arguments[next_height_id], dtype=float).reshape(4, 4)
+
+    reference_advance, _names, _outs = build_python_reference()
+    reference_state = SymbolicFluidGridState.initial(4, 4)
+    reference_advance(reference_state, 0.2)
+    expected = np.asarray(reference_state.next_height, dtype=float)
+
+    assert np.allclose(evaluated, expected, rtol=1e-9, atol=1e-12), (
+        "the SSA no longer reproduces the authored mathematics; every "
+        "routing conclusion drawn with this evaluator is suspect until "
+        f"this passes.\nevaluated=\n{evaluated}\nexpected=\n{expected}"
+    )

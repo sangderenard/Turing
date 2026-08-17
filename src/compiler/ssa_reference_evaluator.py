@@ -23,65 +23,32 @@ Unsupported instructions raise rather than guessing. A reference that
 silently invents a value for an op it does not know is worse than no
 reference at all -- that failure mode has already cost this tree a day.
 
-VALIDITY BOUNDARY -- what this may and may not be cited for
------------------------------------------------------------
-**Calibrated** (``tests/test_ssa_reference_evaluator.py``) on a pure,
-single-block function of 28 scalars: it reproduces both the authored SymPy
-equations and the compiled LLVM artifact to 1e-9. Three independent paths
-agree, so its scalar semantics, its vocabulary, and its Load/Store/GEP
-model are sound on that ground.
+CALIBRATED, and what it now routes
+----------------------------------
+Verified in ``tests/test_ssa_reference_evaluator.py``:
 
-**Not yet calibrated** on a function combining planner regions, linked
-calls and loop-carried state. On the fluid traversal it currently produces
-values matching neither the artifact nor the oracle, so a disagreement
-there is evidence about THIS FILE and must not be reported as a finding
-about the compiler.
+* on a pure single-block function it reproduces both the authored SymPy
+  equations and the compiled LLVM artifact to 1e-9;
+* on a synthetic traversal -- loop-carried phi, region call, aggregate
+  projection, neighbour address by wrapping arithmetic, array store -- it
+  produces the hand-computable answer;
+* on the REAL fluid traversal it reproduces the authored SymPy equations
+  EXACTLY (max absolute difference 0.0).
 
-Known remaining gap: this evaluator applies SCALAR semantics to every
-instruction, while ``ssa_llvm_backend`` carries a SECOND, tensor likeness
-table (``SSA tensor operation -> authored kernel symbol``). Instructions
-in the fluid module are tensor-attributed -- region_0 alone has 21
-``Cast`` plus ``Max``, ``Min`` and ``Log`` so marked. An op meaning
-"elementwise over an arena" evaluated as one scalar is exactly the silent
-disagreement this evaluator exists to catch, and it cannot yet catch it in
-itself.
+So it may now be cited for routing, and its first result is that the fluid
+traversal's SSA carries the authored meaning while the compiled LLVM
+artifact does not: ssa-vs-oracle is 0.0 and llvm-vs-oracle is 6.66e-03.
+The defect is in EMISSION, not in lowering or planning.
 
-Each gap closed here should arrive with a test that would have caught it.
-The last one did: linked callees publish through ``Ret`` positionally
-while regions keep the caller's numbering, and reading `output_ids` out of
-a linked callee's namespace succeeded on 10 of 11 ids while returning
-unrelated values.
-
-CURRENT LEAD, narrowed by measurement. Established so far:
-
-* Publication order is NOT the problem. The linked step's declared
-  outputs match its Ret order everywhere both exist, republished names
-  agree, and the aggregate unpack indices line up with the call's
-  ``output_ids`` (``height_next`` at index 2, ``wave_speed`` at 8). All
-  covered by tests.
-* CENTRE reads are correct. The traversal's mass accumulator comes out at
-  exactly ``16.017591076142676``, the true sum of the perturbed grid, so
-  the loop visits all 16 cells and reads each one's own height correctly.
-  Loop induction, modulo wrapping and address arithmetic are therefore
-  sound.
-* ``wave_speed`` evaluates exactly right (1.0042549047726228), matching
-  the artifact.
-* But ``next_mass`` equals the sum of the OLD heights rather than the new
-  ones, which can only happen if ``height_next == height_centre`` for
-  EVERY cell. That is the signature of the NEIGHBOUR contributions
-  vanishing: with all four neighbours equal to the centre, the fluxes
-  cancel and the update degenerates to the identity.
-
-So the question is why neighbour reads collapse inside the traversal when
-``planned_region_1`` reads them correctly in isolation, given explicit
-row/column. Final-iteration values cannot distinguish this, because the
-last cell [3,3] genuinely has a uniform neighbourhood.
-
-The next step is therefore per-iteration recording in the evaluator --
-cheap here, since it is ordinary Python, unlike the watch machinery the
-LLVM artifact needed -- compared against the artifact's history watch for
-the same iteration and a cell whose neighbourhood is NOT uniform, such as
-[1,1].
+The bug that had made this look like an evaluator failure is worth
+remembering, because it was silent and it was mine: ``dt`` carries no
+per-argument accounting, so a binder that matched it by dtype-and-rank
+found two float64 scalar candidates, correctly refused the ambiguity --
+and then let it fall through to a scratch fill that bound it to 0.0. Every
+other value stayed plausible while every timestep did nothing, which is
+indistinguishable from a compiler that drops its flux terms. It is now
+identified the way the compiled runtime binder identifies it, through the
+callee formal it feeds, by name.
 """
 from __future__ import annotations
 
@@ -235,6 +202,29 @@ if _INVENTED:
     )
 
 
+def _declared_formal_names(function: Any) -> dict[str, int]:
+    """Formal name -> position, from whichever record the function carries.
+
+    A callee states its own port names; which key it uses depends on how
+    it was produced, so all three spellings are read here rather than one
+    being assumed present.
+    """
+    metadata = getattr(function, "metadata", None) or {}
+    declared = tuple(metadata.get("argument_names") or ())
+    if declared:
+        return {str(name): index for index, name in enumerate(declared)}
+    formals = [int(argument.id) for argument in getattr(function, "args", ())]
+    by_id: dict[int, str] = {}
+    for key in ("parameter_names", "value_names"):
+        for name, value_id in (metadata.get(key) or ()):
+            by_id.setdefault(int(value_id), str(name))
+    return {
+        by_id[value_id]: position
+        for position, value_id in enumerate(formals)
+        if value_id in by_id
+    }
+
+
 def bind_program_abi_arguments(
     function: Any,
     *,
@@ -242,6 +232,7 @@ def bind_program_abi_arguments(
     record_parameter: str = "state",
     named: Mapping[str, Any] | None = None,
     scratch: bool = True,
+    functions: Mapping[str, Any] | None = None,
 ) -> tuple[dict[int, Any], tuple[int, ...]]:
     """Bind a function's formals the way the compiled ABI binder does.
 
@@ -288,37 +279,49 @@ def bind_program_abi_arguments(
             continue
         unbound.append(value_id)
 
-    # A declared scalar parameter (dt) reaches the frame through
-    # parameter_value_abi rather than through a record field, and carries no
-    # per-argument accounting to find it by. Match it by declared dtype and
-    # rank among what is still unbound, and only when exactly one candidate
-    # fits -- an ambiguous match is left unbound rather than guessed.
-    for parameter_name, declared in dict(
-        function.metadata.get("parameter_value_abi") or {}
-    ).items():
-        if parameter_name not in supplied:
-            continue
+    # A declared scalar parameter (dt is the standing example) reaches the
+    # frame through parameter_value_abi and may carry NO per-argument
+    # accounting of its own. It is still identifiable without guessing:
+    # the functions this one calls name their own formals, so the operand
+    # feeding a callee formal called "dt" IS this function's dt.
+    #
+    # This is the rule the compiled runtime binder already uses -- see
+    # `_named_stencil_operand` in symbolic_fluid_native_runtime, which
+    # reaches for exactly this when dt has no record accounting. Matching
+    # by dtype-and-rank instead was tried here and is actively dangerous:
+    # two float64 scalars were both candidates, the match was correctly
+    # refused as ambiguous, and dt then fell through to the scratch fill
+    # and was silently bound to 0.0 -- which does not crash, it simply
+    # makes every timestep do nothing while every other value stays
+    # plausible.
+    for parameter_name in supplied:
         if names.get(parameter_name) in arguments:
             continue
-        wanted_dtype = str(declared.get("dtype") or "float64")
-        candidates = [
-            value_id for value_id in unbound
-            if str(
-                next(
-                    (a.dtype for a in function.args if int(a.id) == value_id),
-                    None,
-                )
-            ) == wanted_dtype
-            and not tuple(
-                next(
-                    (a.shape for a in function.args if int(a.id) == value_id),
-                    (),
-                ) or ()
-            )
-        ]
-        if len(candidates) == 1:
-            arguments[candidates[0]] = supplied[parameter_name]
-            unbound.remove(candidates[0])
+        found: int | None = None
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if str(instruction.op) not in {"Call", "call"}:
+                    continue
+                callee = functions.get(
+                    str((instruction.attributes or {}).get("callee") or "")
+                ) if functions else None
+                if callee is None:
+                    continue
+                formal_names = _declared_formal_names(callee)
+                position = formal_names.get(str(parameter_name))
+                if position is None or position >= len(instruction.args):
+                    continue
+                candidate = int(instruction.args[position].id)
+                if candidate in arguments and candidate not in unbound:
+                    continue
+                found = candidate
+                break
+            if found is not None:
+                break
+        if found is not None:
+            arguments[found] = supplied[parameter_name]
+            if found in unbound:
+                unbound.remove(found)
 
     if scratch:
         for value_id in list(unbound):
