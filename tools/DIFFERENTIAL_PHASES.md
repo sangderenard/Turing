@@ -275,3 +275,55 @@ write-back the runtime wrapper's job. It is not — it is the last line of
 the authored `symbolic_fluid_advance`. The restriction is still right, but
 for a different reason: the evaluator mutates arrays through Store and
 cannot REBIND a Python attribute, so that assignment is invisible to it.
+
+---
+
+## Blocker for the native executable (found, not fixed)
+
+Two defects, in the order they must be fixed.
+
+### 1. ProcessGraph node ids are Python object addresses
+
+`ProcessGraph.ensure_node` (graph_express2.py:2614) does `nid = id(node)`.
+That address becomes the graph node key, flows into `value_id`, and then
+into SSA ids through `next_physical_id = 1 + max(node ids)`
+(fortran_c_shell.py:4053). Measured on the fluid lowering: 153 of
+`symbolic_fluid_frame`'s 167 value ids are above 1e9, consecutive from
+1457923920625 -- squarely in the CPython id() range.
+
+* **Non-deterministic.** Addresses vary per run, so the emitted Fortran
+  varies per run. This is an independent reason not to trust a cached
+  lowering.
+* **Non-monotonic.** Ids carry no program order, and the frame's space is
+  disjoint from every callee's -- the same seam the argument mismatch
+  below sits on.
+* **Address recycling is a correctness hazard.** CPython reuses an
+  address after a free. If a node is collected and another allocated at
+  that address, `if nid in self.G` is True for a DIFFERENT node and
+  silently aliases them.
+
+Fix without changing the dedup intent: keep an identity map keyed by
+`id(node)` for deduplication, but map it to a MONOTONIC counter that
+becomes the public nid, and retain a reference to the keyed object so its
+address cannot be recycled while the map is alive. Deduplicate by
+identity; do not let the address BE the identity.
+
+Do this first. While ids are non-deterministic, any conclusion about the
+call site below can shift between runs.
+
+### 2. Fortran call sites pass literals in the wrong type
+
+    tools/build_fluid_c_shell.py build/<lowering>/control_repository_ssa.pkl
+    Error: Type mismatch in argument 't419' at (1);
+           passed INTEGER(4) to REAL(8)
+
+Read out of the generated shell: the callee declares
+`real(c_double), intent(inout) :: t419`, and the call site passes integer
+literals positionally -- `..., t10, 256, t1457923920650, ...` and
+`..., t1457923920647, 0, ...`. gfortran is right to reject it. A constant
+argument is emitted in its own natural type rather than in the callee
+formal's declared type.
+
+Verified pre-existing: the identical error appears when building from a
+lowering made before this session's predicate/dtype work, so none of that
+caused or masked it.
