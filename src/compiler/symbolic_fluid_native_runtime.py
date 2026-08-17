@@ -234,23 +234,89 @@ class NativeSymbolicFluidAdvance:
                 "pass the second element of lower_ast_source_to_ssa's result"
             )
         self._ok_id = int(record[0].id)
-        import dataclasses as _dataclasses
-
-        metric_fields = [
-            field.name
-            for field in _dataclasses.fields(Metrics)
-            if field.name != "error_channels"
-        ]
-        components = record[1:]
-        if len(components) > len(metric_fields):
-            raise RuntimeError(
-                f"outputs record has {len(components)} Metrics components "
-                f"for {len(metric_fields)} contract fields"
-            )
-        by_kwarg = {
-            name: int(value.id)
-            for name, value in zip(metric_fields, components)
+        # Metrics(...) is expanded into this flat return record by an
+        # internal lowering pass whose component ORDER reflects compilation
+        # accidents (which fields ended up literals vs defaults vs
+        # region-call results), not the dataclass's declared field order and
+        # not the source's keyword order either -- zipping component
+        # position against `dataclasses.fields(Metrics)` silently mispaired
+        # them (e.g. dt_limit's real value landing under the "osc_flag"
+        # position). Each component instead carries its own true identity:
+        # a defaulted field names itself directly (`program_abi_default`), a
+        # literal keyword names itself directly
+        # (`program_abi_constructor_literal`), and a computed field traces
+        # to a region-call result (`ssa_call_result_from`). A planner region
+        # is carved out of this same function and keeps the caller's own
+        # identity for anything it CAPTURES (does not itself compute) --
+        # only its own internally-computed results (a loop reduction's own
+        # id) get region-local numbering with no outer name. So: try a
+        # direct id match against this function's own `value_names` first;
+        # if the region computed it internally, fall back to the region
+        # instruction's own captured operand names (e.g. a `max(carried,
+        # wave_speed)` reduction's second operand keeps its outer identity
+        # and name even though the Max's own result does not).
+        source_name_to_metrics_fields = {
+            "mass_error": ("mass_err",),
+            "dt_stable_limit": ("dt_limit",),
+            "wave_speed": ("max_vel", "max_flux"),
         }
+        module_functions = getattr(self, "_module_functions", None) or {}
+        outer_names: dict[int, str] = {
+            int(vid): str(name)
+            for name, vid in (self.function.metadata.get("value_names") or ())
+        }
+
+        def resolve_source_name(region_name: str, local_id: int) -> str | None:
+            local_id = int(local_id)
+            if local_id in outer_names:
+                return outer_names[local_id]
+            region = module_functions.get(str(region_name))
+            if region is None:
+                return None
+            producer = next((
+                instr
+                for block in region.blocks.values()
+                for instr in block.instrs
+                if instr.res is not None and int(instr.res.id) == local_id
+            ), None)
+            if producer is None:
+                return None
+            for argument in producer.args:
+                name = outer_names.get(int(argument.id))
+                if name is not None:
+                    return name
+            return None
+
+        components = record[1:]
+        by_kwarg: dict[str, int] = {}
+        for value in components:
+            accounting = value.accounting or {}
+            default_field = accounting.get("program_abi_default")
+            literal_field = accounting.get("program_abi_constructor_literal")
+            if default_field is not None:
+                by_kwarg[str(default_field)] = int(value.id)
+                continue
+            if literal_field is not None:
+                by_kwarg[str(literal_field)] = int(value.id)
+                continue
+            source = accounting.get("ssa_call_result_from")
+            if not source:
+                continue
+            region_name, local_id = source
+            local_name = resolve_source_name(str(region_name), int(local_id))
+            for field in source_name_to_metrics_fields.get(str(local_name), ()):
+                by_kwarg[field] = int(value.id)
+        required_fields = {
+            "max_vel", "max_flux", "div_inf", "mass_err", "dt_limit",
+        }
+        missing = required_fields - by_kwarg.keys()
+        if missing:
+            raise RuntimeError(
+                f"could not resolve Metrics field(s) {sorted(missing)} from "
+                "the advance function's output record -- accounting on the "
+                "returned components no longer matches what this binder "
+                "expects (see source_name_to_metrics_fields above)"
+            )
         names = dict(
             (str(name), int(value_id))
             for name, value_id in self.function.metadata.get(

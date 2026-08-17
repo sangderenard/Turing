@@ -167,20 +167,21 @@ def symbolic_fluid_advance(state, dt):
     state.momentum_y = state.next_momentum_y + 0.0
     state.tracer = state.next_tracer + 0.0
     mass_error = abs(next_mass - previous_mass) / max(abs(previous_mass), 1.0e-30)
-    state.last_wave_speed = max_wave_speed
-    state.last_height_violation = max_height_violation
-    state.last_tracer_violation = max_tracer_violation
+    dt_stable_limit = 0.45 * state.dx / max(max_wave_speed, 1.0e-30)
     metrics = Metrics(
         max_vel=max_wave_speed,
         max_flux=max_wave_speed,
         div_inf=0.0,
         mass_err=mass_error,
-        dt_limit=0.45 * state.dx / max(max_wave_speed, 1.0e-30),
+        dt_limit=dt_stable_limit,
         error_channels={
             "height_positivity": max_height_violation,
             "tracer_bounds": max_tracer_violation,
         },
     )
+    state.last_wave_speed = max_wave_speed + 0.0
+    state.last_height_violation = max_height_violation + 0.0
+    state.last_tracer_violation = max_tracer_violation + 0.0
     return max_height_violation == 0.0 and max_tracer_violation == 0.0, metrics
 
 
