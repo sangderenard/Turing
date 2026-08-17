@@ -402,15 +402,77 @@ pickle held a program lowered by a compiler that no longer existed.
 > 30-second recompile costs a coffee; a silently stale artifact costs a day
 > *and* produces confident wrong conclusions along the way.
 
-### 7. What all of these have in common
+### 7. Chasing a symptom that was correct behaviour
 
-Six of the seven were **the instrument lying, not the program**. The
-program under investigation was deterministic and consistent the entire
-time; what varied was the quality of the observation.
+`mass_err` read exactly `0.0` against an expected `1.68e-04`. I treated that
+as the defect and pursued it for a very long time — aliasing, CFG, phi
+propagation, influence topology, backend registers. Every one came back
+clean, which should itself have been the signal.
+
+The per-iteration watch showed the two accumulators taking *genuinely
+different* summands (`0.997309…` vs `1.0…`) and converging on the same
+total. That is a **mass-conserving scheme working correctly**. `mass_err =
+0.0` was the right answer all along.
+
+The real defect was one layer away and had never been examined: the
+whole-array copy `state.height = state.next_height + 0.0` updated **1 cell
+of 16**. My "expected" `1.68e-04` had been computed from `state.height`
+*after* the call — i.e. from the corrupted copy. **The number I was
+treating as ground truth was itself produced by the bug.**
+
+> When every hypothesis about a symptom clears, question the symptom.
+> And check where your reference value came from: a "truth" derived from
+> the same run as the observation is not independent of it.
+
+### 8. The check that would have taken seconds
+
+The four broken values carry `program_abi_rank: 2` and
+`program_abi_storage: "span"` in accounting, while their `.shape` is `()`.
+The emitter's `_value_element_count` reads `.shape`, gets 1, and emits a
+scalar load/store where a whole-array copy belongs.
+
+The instructive part is what makes this *hard to see*: rank-with-empty-shape
+is the **normal** representation for a dynamically-sized array here, and the
+Fortran backend handles it correctly through the extents vector. So the
+disagreement is not itself a defect — a naive check on it reports 35 values
+and buries the 4 that matter. The hazard is specifically a rank>0 value
+standing as a **region-call output**, where the return-copy sizes itself
+statically.
+
+Stage 2 now checks exactly that, and names them:
+
+```
+[FAIL] 4 region-call OUTPUT(s) declare rank>0 but carry an empty .shape
+       id 122 (field height, rank 2) out of planned_region_4
+       id 126 (field momentum_x, rank 2) out of planned_region_4
+       ...
+```
+
+> A check that fires on everything teaches nothing. Narrow it to the
+> configuration that actually causes harm, and say what the harm is.
+
+### 9. What all of these have in common
+
+Most were **the instrument lying, not the program**. The program under
+investigation was deterministic and consistent the entire time; what varied
+was the quality of the observation.
 
 When a result is baffling, suspect the measurement before the mechanism —
 and prefer an instrument that refuses to answer over one that answers
 plausibly.
+
+The compressed version, for anyone starting a hunt here:
+
+1. **Can I observe this at all?** (`observable()` — if not, `watch=`.)
+2. **Where did my reference value come from?** If the same run produced
+   both, it is not independent evidence.
+3. **Is the symptom actually wrong?** Correct-but-surprising behaviour has
+   eaten more time in this tree than any real bug.
+4. **Does a known-good value pass my new check?** If not, the check is
+   broken, not the value.
+5. **Same number or same object?** `is`, not `==`.
+6. **Is my artifact current?** A stale lowering makes a fix look like a
+   no-op.
 
 ---
 

@@ -181,6 +181,70 @@ def stage_2_ssa_wellformed(fn: Any) -> bool:
             f"(same object) -- expected and fast: {sorted(inplace_reuse)[:12]}"
         )
 
+    # 2d -- rank/shape disagreement.
+    # A value can carry TWO statements of its own dimensionality: its
+    # `.shape`, and its accounting (`program_abi_rank`, `program_abi_storage`).
+    # When those disagree, every size decision downstream silently believes
+    # the smaller one -- element counts, copy sizes, alloca sizes -- because
+    # they read `.shape`. A rank-2 span with an empty shape is therefore
+    # copied as ONE element, and a whole-array assignment quietly moves a
+    # single number. That is not hypothetical: it is exactly how
+    # `state.height = state.next_height + 0.0` came to update 1 cell of 16
+    # in this program while every structural check above passed.
+    # Rank>0 with an empty `.shape` is the NORMAL representation here: these
+    # arrays are dynamically sized, and the Fortran backend resolves them
+    # through the extents vector rather than a static shape. So the mere
+    # disagreement is not the defect and flagging it would drown the reader.
+    # The hazard is narrower: such a value standing as a REGION-CALL OUTPUT,
+    # because the return-copy sizes itself from the static shape and so
+    # moves exactly one element.
+    all_values = {int(v.id): v for v in formals.values()}
+    for block in fn.blocks.values():
+        for instr in block.instrs:
+            if instr.res is not None:
+                all_values.setdefault(int(instr.res.id), instr.res)
+
+    def declared_rank(value: Any) -> int:
+        accounting = getattr(value, "accounting", None) or {}
+        return max(
+            int(accounting.get("program_abi_rank", 0) or 0),
+            int(accounting.get("ssa_call_rank", 0) or 0),
+            1 if str(accounting.get("program_abi_storage")) == "span" else 0,
+        )
+
+    sized_as_scalar = {}
+    for block in fn.blocks.values():
+        for instr in block.instrs:
+            if str(instr.op) not in {"Call", "call"}:
+                continue
+            for out_id in map(int, instr.attributes.get("output_ids", ()) or ()):
+                value = all_values.get(out_id)
+                if value is None:
+                    continue
+                rank = declared_rank(value)
+                if rank > 0 and not tuple(getattr(value, "shape", ()) or ()):
+                    accounting = getattr(value, "accounting", None) or {}
+                    sized_as_scalar[out_id] = (
+                        str(accounting.get("program_abi_field") or "?"),
+                        rank,
+                        str(instr.attributes.get("callee", "?")).split("__")[-1],
+                    )
+    if sized_as_scalar:
+        healthy = False
+        _bad(
+            f"{len(sized_as_scalar)} region-call OUTPUT(s) declare rank>0 but "
+            "carry an empty .shape -- the return-copy sizes from .shape, so "
+            "each moves ONE element instead of the array"
+        )
+        for out_id, (field, rank, callee) in list(sized_as_scalar.items())[:10]:
+            _info(f"id {out_id} (field {field}, rank {rank}) out of {callee}")
+        _info(
+            "This is how a whole-array assignment silently updates a single "
+            "cell while every other structural check passes."
+        )
+    else:
+        _ok("no region-call output is a rank>0 value sized as a scalar")
+
     # 2b -- phi arity.
     bad_phis = []
     for block_name, block in fn.blocks.items():
