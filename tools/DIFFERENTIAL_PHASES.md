@@ -327,3 +327,55 @@ formal's declared type.
 Verified pre-existing: the identical error appears when building from a
 lowering made before this session's predicate/dtype work, so none of that
 caused or masked it.
+
+### Investigation notes: why monotonic ids collapse the program
+
+Branch `id-identity-sweep` holds the attempt. What is established:
+
+* the fix does what it is for -- two consecutive lowerings produce
+  IDENTICAL value ids in every function, where address-based ids differed
+  per run. Max SSA id falls from 1.45e12 to 27.
+* `ensure_node` deduplication is UNCHANGED: both builds log exactly 355
+  `already_defined=True` and 2488 `already_defined=False`. So the collapse
+  is not extra merging at graph construction.
+* the collapse is in "reducing source topology". Post-planning node counts
+  fall `step_with_dt_control_used` 578 -> 87, `symbolic_fluid_advance`
+  178 -> 57, `run_superstep` 70 -> 11, and `callee_ref` counts go to zero
+  with them -- so shells stop being attributed and every region lands in
+  one unnamed shell.
+* `shell ?` is NORMAL, not a symptom: the good build shows it too, for the
+  outermost shell. The real signal is that recursion into named callsite
+  shells (`run_superstep`, `step_with_dt_control_used`, ...) stops.
+
+**There are at least three numbering authorities**, which is the root of
+the whole class of problem:
+
+1. `ensure_node`/`new_identity` -- was `id(obj)`, now a monotonic mint;
+2. the SymPy ingester, which numbers its own nodes `0..N`;
+3. the reducer, which relabels every node to canonical `0..N` through
+   `nx.relabel_nodes`, ordered by
+   `(lineno, col_offset, type, int(node_id))` -- with the raw node id as
+   the final tiebreaker.
+
+Authority 1 colliding with authority 2 is already confirmed to cause real
+damage: minting from 1 gave a synthesised Store node the id of an
+expression node, the Store overwrote it, and a graph with no cycles
+acquired a Store->Store cycle. Basing the mint at 2**40 fixed that
+instance and is why the mint is based rather than starting at zero.
+
+Authority 3 is the open lead. Because the reducer canonicalises ids
+anyway, the ORIGINAL values should not matter downstream -- so the fact
+that changing them changes what survives means the reduction is ordering
+by raw node id, and the ordering decides the canonical mapping. Dense
+sequential ids sort differently from sparse addresses, and equal keys
+before the tiebreaker now resolve differently.
+
+Next: instrument node counts immediately before and after the relabel in
+`topological_reducer`, on both branches, and compare `ordered`. If the
+reduction is dropping nodes rather than merely renaming them, the drop
+site is between those two points.
+
+Also worth fixing regardless: the build reported `"completed": true` for a
+module that had fallen from 45 functions to 2. Nothing checks the
+structure of its own output, so a catastrophic regression reports success.
+That check would have caught this in one run instead of several.
