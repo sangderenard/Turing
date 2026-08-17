@@ -23,29 +23,34 @@ Unsupported instructions raise rather than guessing. A reference that
 silently invents a value for an op it does not know is worse than no
 reference at all -- that failure mode has already cost this tree a day.
 
-STATUS: NOT YET TRUSTWORTHY FOR ROUTING. Do not cite its numbers.
-----------------------------------------------------------------
-It executes the whole advance closure (~22k steps, no shortfall) and its
-vocabulary is derived from and audited against the compiler's own scalar
-likeness table. But on the fluid program it produces values that match
-NEITHER the artifact NOR the authored oracle, which means the remaining
-error is in this file, not a finding about the program.
+VALIDITY BOUNDARY -- what this may and may not be cited for
+-----------------------------------------------------------
+**Calibrated** (``tests/test_ssa_reference_evaluator.py``) on a pure,
+single-block function of 28 scalars: it reproduces both the authored SymPy
+equations and the compiled LLVM artifact to 1e-9. Three independent paths
+agree, so its scalar semantics, its vocabulary, and its Load/Store/GEP
+model are sound on that ground.
 
-The known gap, and the most likely cause: **this evaluator applies SCALAR
-semantics to every instruction.** `ssa_llvm_backend` carries TWO likeness
-tables -- the scalar one imported below, and a separate tensor table
-(``SSA tensor operation -> authored kernel symbol``). Instructions in this
-very module carry tensor attributes (``tensor_operation``, ``tensor``,
-``tensor_candidate``): region_0 alone has 21 ``Cast`` plus ``Max``,
-``Min`` and ``Log`` so marked. An op that means "elementwise over an
-arena" evaluated as though it meant "one scalar" is exactly the kind of
-silent disagreement this evaluator exists to detect, and it currently
-cannot detect it in itself.
+**Not yet calibrated** on a function combining planner regions, linked
+calls and loop-carried state. On the fluid traversal it currently produces
+values matching neither the artifact nor the oracle, so a disagreement
+there is evidence about THIS FILE and must not be reported as a finding
+about the compiler.
 
-Before this is used to route anything, wire in the tensor table and make a
-tensor-attributed instruction either evaluate with tensor semantics or
-raise. Until then its output is a work in progress, and the honest reading
-of a disagreement is "the evaluator is wrong", not "the compiler is wrong".
+Known remaining gap: this evaluator applies SCALAR semantics to every
+instruction, while ``ssa_llvm_backend`` carries a SECOND, tensor likeness
+table (``SSA tensor operation -> authored kernel symbol``). Instructions
+in the fluid module are tensor-attributed -- region_0 alone has 21
+``Cast`` plus ``Max``, ``Min`` and ``Log`` so marked. An op meaning
+"elementwise over an arena" evaluated as one scalar is exactly the silent
+disagreement this evaluator exists to catch, and it cannot yet catch it in
+itself.
+
+Each gap closed here should arrive with a test that would have caught it.
+The last one did: linked callees publish through ``Ret`` positionally
+while regions keep the caller's numbering, and reading `output_ids` out of
+a linked callee's namespace succeeded on 10 of 11 ids while returning
+unrelated values.
 """
 from __future__ import annotations
 
@@ -194,6 +199,110 @@ if _INVENTED:
         "in ssa_llvm_backend owns the vocabulary; this file may only supply "
         "meanings for what it already lists."
     )
+
+
+def bind_program_abi_arguments(
+    function: Any,
+    *,
+    record: Any = None,
+    record_parameter: str = "state",
+    named: Mapping[str, Any] | None = None,
+    scratch: bool = True,
+) -> tuple[dict[int, Any], tuple[int, ...]]:
+    """Bind a function's formals the way the compiled ABI binder does.
+
+    Returns ``(arguments, unbound)``. Binding is by DECLARED IDENTITY --
+    ``program_abi_parameter``/``program_abi_field`` accounting, then
+    ``value_names`` -- never by position, because a formal list's order is
+    an emission detail and pairing by position is how this tree has
+    repeatedly bound the wrong value to the right-looking slot.
+
+    ``scratch`` fills the remaining formals with zeros. Those are cells a
+    callee writes before anything reads them (a linked function's outputs
+    used as in-place storage). They are reported in ``unbound`` regardless,
+    so a caller can refuse rather than quietly accept a zero that was never
+    meant to be read -- an unbound formal is not the same claim as a zero.
+    """
+    arguments: dict[int, Any] = {}
+    unbound: list[int] = []
+    names = {
+        str(label): int(value)
+        for label, value in (function.metadata.get("value_names") or ())
+    }
+    by_name = {value: label for label, value in names.items()}
+    supplied = dict(named or {})
+
+    for argument in function.args:
+        value_id = int(argument.id)
+        accounting = argument.accounting or {}
+        field = accounting.get("program_abi_field")
+        parameter = accounting.get("program_abi_parameter")
+        if (
+            record is not None
+            and parameter == record_parameter
+            and field
+            and hasattr(record, str(field))
+        ):
+            held = getattr(record, str(field))
+            arguments[value_id] = (
+                np.asarray(held, dtype=float) if np.ndim(held) else float(held)
+            )
+            continue
+        label = by_name.get(value_id)
+        if label is not None and label in supplied:
+            arguments[value_id] = supplied[label]
+            continue
+        unbound.append(value_id)
+
+    # A declared scalar parameter (dt) reaches the frame through
+    # parameter_value_abi rather than through a record field, and carries no
+    # per-argument accounting to find it by. Match it by declared dtype and
+    # rank among what is still unbound, and only when exactly one candidate
+    # fits -- an ambiguous match is left unbound rather than guessed.
+    for parameter_name, declared in dict(
+        function.metadata.get("parameter_value_abi") or {}
+    ).items():
+        if parameter_name not in supplied:
+            continue
+        if names.get(parameter_name) in arguments:
+            continue
+        wanted_dtype = str(declared.get("dtype") or "float64")
+        candidates = [
+            value_id for value_id in unbound
+            if str(
+                next(
+                    (a.dtype for a in function.args if int(a.id) == value_id),
+                    None,
+                )
+            ) == wanted_dtype
+            and not tuple(
+                next(
+                    (a.shape for a in function.args if int(a.id) == value_id),
+                    (),
+                ) or ()
+            )
+        ]
+        if len(candidates) == 1:
+            arguments[candidates[0]] = supplied[parameter_name]
+            unbound.remove(candidates[0])
+
+    if scratch:
+        for value_id in list(unbound):
+            argument = next(
+                a for a in function.args if int(a.id) == value_id
+            )
+            shape = tuple(argument.shape or ())
+            dtype = str(argument.dtype or "float64")
+            if shape:
+                arguments[value_id] = np.zeros(
+                    int(np.prod(shape)),
+                    dtype=np.int64 if "int" in dtype else float,
+                )
+            elif dtype in {"unknown", "ptr"}:
+                arguments[value_id] = np.zeros(8, dtype=np.int64)
+            else:
+                arguments[value_id] = 0.0
+    return arguments, tuple(unbound)
 
 
 class SSAReferenceEvaluator:
@@ -381,20 +490,35 @@ class SSAReferenceEvaluator:
 
         output_ids = tuple(map(int, instruction.attributes.get("output_ids", ())))
         if output_ids:
-            # A region publishes its outputs as values in its OWN body that
-            # carry the caller's ids; the caller then projects them out of an
-            # aggregate. Reproduce that shape exactly.
-            aggregate = [inner.get(value_id) for value_id in output_ids]
+            # Two different callee shapes publish results, and confusing
+            # them silently reads the wrong values:
+            #
+            # * a planner REGION is carved out of the caller and keeps the
+            #   caller's numbering, so its outputs are values in its own
+            #   body carrying the caller's ids;
+            # * a linked FUNCTION has its own numbering entirely and
+            #   publishes through Ret. Its Ret args correspond to
+            #   `output_ids` POSITIONALLY.
+            #
+            # Reading `output_ids` out of a linked function's namespace is
+            # the classic same-number-different-space error: for the fluid
+            # step, 10 of its 11 caller ids happen to exist inside the
+            # callee as unrelated values, so the read succeeds and returns
+            # nonsense.
+            if returned and len(returned) == len(output_ids):
+                published = list(returned)
+            else:
+                published = [inner.get(value_id) for value_id in output_ids]
             if instruction.res is not None:
-                values[int(instruction.res.id)] = aggregate
-            for value_id in output_ids:
-                if value_id in inner:
-                    # OVERWRITE, never setdefault. A region's outputs carry
-                    # the caller's own ids, so on the second and later loop
-                    # iterations those ids are already present -- keeping the
-                    # first value would freeze every carried result at its
-                    # first-iteration value while the loop appeared to run.
-                    values[value_id] = inner[value_id]
+                values[int(instruction.res.id)] = list(published)
+            for position, value_id in enumerate(output_ids):
+                if published[position] is not None:
+                    # OVERWRITE, never setdefault. These carry the caller's
+                    # ids, so on the second and later loop iterations they
+                    # are already present -- keeping the first value would
+                    # freeze every carried result at its first-iteration
+                    # value while the loop appeared to run.
+                    values[value_id] = published[position]
             return
         if instruction.res is not None:
             values[int(instruction.res.id)] = (
