@@ -25,6 +25,12 @@ What this module refuses to do is as much the point as what it does.
   and raise when reached -- ``ULt``/``ULe``/``SExt``/``ZExt``/``FpToUi`` need a
   stated bit width that a Python ``int`` does not carry, and picking one
   silently is precisely the failure this tree keeps paying for.
+* **The region-call ABI is spelled, not encoded.** A region call publishes
+  its outputs as one aggregate that the caller projects with
+  ``GetElementPtr``/``Load``. Python's tuple *is* that aggregate, so the
+  projection is ordinary indexing and the ``Load`` is the identity. Emitting
+  both rather than folding them keeps the Python step-for-step with the SSA,
+  which is what makes a round trip usable as a diagnostic.
 * **Only straight-line bodies.** A multi-block function is a control-flow
   graph, and turning one back into ``if``/``while`` is structural
   reconstruction -- a separate piece of work with its own correctness
@@ -266,7 +272,33 @@ class _BodyMaterializer:
             operands = ", ".join(
                 self.operand(argument) for argument in instruction.args
             )
+            # A region call publishes its outputs as one aggregate, which the
+            # caller then projects with GetElementPtr/Load. Python's tuple is
+            # that aggregate exactly, so the convention needs no encoding --
+            # the projection below is ordinary indexing.
             self.assign(result, f"{callee}({operands})")
+            return
+
+        if operation in {"GetElementPtr", "getelementptr"}:
+            index = attributes.get("aggregate_index")
+            if index is None:
+                raise MaterializationError(
+                    f"{self.function.name}: GetElementPtr %t{int(result.id)} "
+                    "addresses by computed path rather than by aggregate "
+                    "index; only the region-call projection is spelled here"
+                )
+            base = self.operand(instruction.args[0])
+            self.assign(result, f"{base}[{int(index)}]")
+            return
+
+        if operation in {"Load", "load"}:
+            # The repository IR does not insert a Load before every use of an
+            # address -- backends dereference implicitly -- so a Load over an
+            # already-projected aggregate field is the identity here. Spelling
+            # it as an assignment rather than eliding it keeps the emitted
+            # Python step-for-step with the SSA it came from, which is the
+            # point of a round trip used as a diagnostic.
+            self.assign(result, self.operand(instruction.args[0]))
             return
 
         if operation in _BINARY_SPELLING:
@@ -594,6 +626,126 @@ def materialize_module(
     return ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
 
 
+def _region_output_contracts(module: Any) -> dict[str, Any]:
+    """Recover each region's published outputs from the calls that project them.
+
+    Returns ``name -> tuple_of_value_ids``, or ``name -> reason`` when two call
+    sites disagree. A disagreement is not resolvable by picking one: the region
+    would return a different aggregate depending on who asked, which is a real
+    defect in the convention rather than something to paper over.
+    """
+
+    contracts: dict[str, Any] = {}
+    for function in (getattr(module, "functions", {}) or {}).values():
+        for block in (getattr(function, "blocks", {}) or {}).values():
+            for instruction in block.instrs:
+                if str(instruction.op) not in {"Call", "call"}:
+                    continue
+                attributes = instruction.attributes or {}
+                callee = str(attributes.get("callee") or "")
+                declared = attributes.get("output_ids")
+                if not callee or declared is None:
+                    continue
+                outputs = tuple(int(each) for each in declared)
+                existing = contracts.get(callee)
+                if existing is None:
+                    contracts[callee] = outputs
+                elif isinstance(existing, tuple) and existing != outputs:
+                    contracts[callee] = (
+                        f"call sites disagree about what {callee!r} publishes: "
+                        f"{existing} and {outputs}"
+                    )
+    return contracts
+
+
+def materialize_ir_module(module: Any) -> tuple[ast.Module, dict[str, str]]:
+    """Every single-block function of an ``IRModule`` as one runnable module.
+
+    Returns the module and a mapping of the functions that could NOT be
+    materialized to the reason why. Skipping is reported rather than silent:
+    a Python module that quietly omits half a program is the same plausible
+    wrong answer this materializer exists to avoid, and the omissions are
+    exactly what a diagnostic round trip wants to look at.
+
+    Region calls resolve by name because the region's own function is emitted
+    into the same module, so the result executes rather than merely unparsing.
+    """
+
+    # A region function does not state what it returns. Its outputs are
+    # declared at the CALL SITE, as the ``output_ids`` tuple on the Call, and
+    # the callee's own metadata carries nothing about them. That is worth
+    # noticing rather than working around quietly: the region calling
+    # convention is only half-located, so the contract has to be recovered
+    # from every caller and checked for agreement.
+    published = _region_output_contracts(module)
+
+    emitted: list[ast.stmt] = []
+    skipped: dict[str, str] = {}
+    uses_math = False
+
+    for name, function in (getattr(module, "functions", {}) or {}).items():
+        formals = tuple(getattr(function, "args", ()))
+        declared = _declared_formal_names(function)
+        by_position = {position: label for label, position in declared.items()}
+        parameters = [
+            by_position.get(position, _local(formal.id))
+            for position, formal in enumerate(formals)
+        ]
+        try:
+            body, needed = materialize_function_body(
+                function, parameter_names=parameters
+            )
+        except MaterializationError as error:
+            skipped[str(name)] = str(error)
+            continue
+        contract = published.get(str(name))
+        if isinstance(contract, str):
+            skipped[str(name)] = contract
+            continue
+        if contract is not None and not any(
+            isinstance(statement, ast.Return) for statement in body
+        ):
+            # Publish the aggregate the callers project. Order is the call
+            # site's, not this function's instruction order.
+            body = body + [
+                ast.Return(
+                    value=_expression(
+                        "(" + "".join(f"{_local(each)}, " for each in contract) + ")"
+                    )
+                )
+            ]
+        uses_math = uses_math or needed
+        emitted.append(
+            ast.FunctionDef(
+                name=str(name),
+                args=ast.arguments(
+                    posonlyargs=[],
+                    args=[ast.arg(arg=label, annotation=None) for label in parameters],
+                    vararg=None,
+                    kwonlyargs=[],
+                    kw_defaults=[],
+                    kwarg=None,
+                    defaults=[],
+                ),
+                body=body,
+                decorator_list=[],
+                returns=None,
+                type_comment=None,
+                type_params=[],
+            )
+        )
+
+    prologue: list[ast.stmt] = []
+    if uses_math:
+        prologue.append(ast.Import(names=[ast.alias(name="math", asname=None)]))
+    return (
+        ast.fix_missing_locations(
+            ast.Module(body=prologue + emitted, type_ignores=[])
+        ),
+        skipped,
+    )
+
+
 def to_source(node: ast.AST) -> str:
     """The materialized definition as Python source."""
 
@@ -606,6 +758,7 @@ __all__ = [
     "MaterializationError",
     "materialize_class",
     "materialize_function_body",
+    "materialize_ir_module",
     "materialize_module",
     "to_source",
 ]

@@ -442,3 +442,148 @@ def test_materialized_python_agrees_with_the_ssa_reference_evaluator(fluid_step)
         assert float(materialized_value) == pytest.approx(
             float(reference_value), abs=1e-12
         )
+
+
+# -- the whole round trip: Python -> SSA -> Python, executed --------------
+#
+# This is the diagnostic the round trip exists for. A compiled program whose
+# IR can be handed back as runnable Python can be *read* and *diffed* against
+# what was authored, which matters in a pipeline whose failures are
+# characteristically silent and plausible rather than loud.
+
+def _lower(source: str, entrypoint: str, name: str):
+    import warnings
+
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return lower_ast_source_to_ssa(source, entrypoint, name=name)
+
+
+def _run_round_trip(source: str, entrypoint: str, name: str):
+    from src.compiler.ssa_python_materializer import materialize_ir_module
+
+    module, _outputs, _exports = _lower(source, entrypoint, name)
+    emitted, skipped = materialize_ir_module(module)
+    namespace: dict = {}
+    exec(compile(emitted, "<round-trip>", "exec"), namespace)
+    return namespace, skipped, emitted
+
+
+@pytest.mark.parametrize("probe", [1.0, 2.0, -3.5, 0.0])
+def test_a_lowered_program_round_trips_to_python_that_computes_the_same(probe):
+    source = """
+def scale(a):
+    return a * 0.5
+
+def update(a):
+    return a - 0.05 * scale(a)
+"""
+    namespace, _skipped, _emitted = _run_round_trip(source, "update", "rt")
+
+    produced = namespace["rt__update"](probe)
+    authored = probe - 0.05 * (probe * 0.5)
+    assert produced == pytest.approx(authored, abs=1e-15)
+
+
+def test_the_region_call_convention_survives_as_ordinary_python():
+    """Call publishes an aggregate; GetElementPtr/Load project it.
+
+    Python's tuple is that aggregate, so the convention needs no encoding.
+    Rendering it this way is what makes the calling convention inspectable --
+    it is otherwise only visible as GetElementPtr attributes.
+    """
+
+    source = """
+def scale(a):
+    return a * 0.5
+
+def update(a):
+    return a - 0.05 * scale(a)
+"""
+    _namespace, _skipped, emitted = _run_round_trip(source, "update", "rt2")
+    rendered = to_source(emitted)
+
+    assert "planned_region_0(" in rendered      # the region call
+    assert "[0]" in rendered                    # the aggregate projection
+    assert "return (" in rendered               # the published aggregate
+
+
+def test_a_region_publishes_what_its_callers_project():
+    """The contract is stated at the call site, not with the region.
+
+    A region function carries no output declaration in its own metadata; the
+    ``output_ids`` tuple lives on the Call. So the emitted return has to be
+    recovered from the callers, and the order is theirs.
+    """
+
+    source = """
+def scale(a):
+    return a * 0.5
+
+def update(a):
+    return a - 0.05 * scale(a)
+"""
+    module, _outputs, _exports = _lower(source, "update", "rt3")
+    regions = [
+        function
+        for name, function in module.functions.items()
+        if "planned_region" in name
+    ]
+    assert regions, "expected at least one planned region"
+    for region in regions:
+        ops = {
+            str(instruction.op)
+            for block in region.blocks.values()
+            for instruction in block.instrs
+        }
+        assert "Ret" not in ops, "a region states no return of its own"
+
+
+def test_functions_that_cannot_be_materialized_are_reported_not_dropped():
+    """A module quietly missing half a program is the failure to avoid."""
+
+    source = """
+def helper(a):
+    return a * 1.0
+
+def train(w, epochs):
+    total = helper(w)
+    for _ in range(epochs):
+        next_w = w - 0.05 * w
+        w = next_w
+        total = w
+    return total
+"""
+    _namespace, skipped, _emitted = _run_round_trip(source, "train", "rt4")
+
+    # The looping entrypoint is multi-block and must appear in the report.
+    assert any("train" in name for name in skipped), skipped
+    assert all(reason for reason in skipped.values())
+
+
+def test_disagreeing_call_sites_are_reported_rather_than_resolved():
+    """Two callers projecting different outputs is a defect, not a choice."""
+
+    from src.compiler.ssa_python_materializer import _region_output_contracts
+
+    class _Module:
+        def __init__(self, functions):
+            self.functions = functions
+
+    def call(callee, outputs, result_id):
+        return Instr(
+            "Call",
+            [SSAValue(0)],
+            SSAValue(result_id),
+            attributes={"callee": callee, "output_ids": outputs},
+        )
+
+    module = _Module({
+        "a": Function("a", [], {"entry": BasicBlock("entry", [call("r", (1, 2), 5)])}),
+        "b": Function("b", [], {"entry": BasicBlock("entry", [call("r", (2, 1), 6)])}),
+    })
+    contracts = _region_output_contracts(module)
+    assert isinstance(contracts["r"], str)
+    assert "disagree" in contracts["r"]
