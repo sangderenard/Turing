@@ -193,7 +193,7 @@ def lower_sequence_insert(
         descriptor.column_value_ids, row_values
     ))
     length_address = SSAValue(descriptor.length_address_id, dtype="ptr")
-    capacity = SSAValue(descriptor.capacity_value_id, dtype="int")
+    capacity = SSAValue(descriptor.capacity_value_id, dtype="int64")
     live_flags = (
         None
         if descriptor.live_flags_value_id is None
@@ -390,7 +390,7 @@ def lower_sequence_fill(
     one = builder.const(entry, 1)
     within_capacity = builder.fresh("bool")
     builder.emit(entry, "Le", [requested, SSAValue(
-        descriptor.capacity_value_id, dtype="int"
+        descriptor.capacity_value_id, dtype="int64"
     )], within_capacity)
     builder.cond(entry, within_capacity, header, full)
     index = builder.fresh("int")
@@ -411,7 +411,7 @@ def lower_sequence_fill(
     builder.branch(latch, header)
     length_slot = builder.fresh("ptr")
     builder.emit(complete, "GetElementPtr", [SSAValue(
-        descriptor.length_address_id, dtype="int", shape=(1,)
+        descriptor.length_address_id, dtype="int64", shape=(1,)
     ), zero], length_slot)
     builder.emit(complete, "Store", [requested, length_slot])
     status_ok = builder.const(complete, 1)
@@ -465,13 +465,13 @@ def lower_sequence_append_fill(
     old_length = builder.fresh("int")
     new_length = builder.fresh("int")
     builder.emit(entry, "GetElementPtr", [SSAValue(
-        descriptor.length_address_id, dtype="int", shape=(1,)
+        descriptor.length_address_id, dtype="int64", shape=(1,)
     ), zero], length_address)
     builder.emit(entry, "Load", [length_address], old_length)
     builder.emit(entry, "Add", [old_length, requested], new_length)
     within_capacity = builder.fresh("bool")
     builder.emit(entry, "Le", [new_length, SSAValue(
-        descriptor.capacity_value_id, dtype="int"
+        descriptor.capacity_value_id, dtype="int64"
     )], within_capacity)
     builder.cond(entry, within_capacity, header, full)
     index = builder.fresh("int")
@@ -581,11 +581,11 @@ def lower_sequence_append_slice(
     destination_length_slot = builder.fresh("ptr")
     old_length = builder.fresh("int")
     builder.emit(entry, "GetElementPtr", [SSAValue(
-        source.length_address_id, dtype="int", shape=(1,)
+        source.length_address_id, dtype="int64", shape=(1,)
     ), zero], source_length_slot)
     builder.emit(entry, "Load", [source_length_slot], source_length)
     builder.emit(entry, "GetElementPtr", [SSAValue(
-        destination.length_address_id, dtype="int", shape=(1,)
+        destination.length_address_id, dtype="int64", shape=(1,)
     ), zero], destination_length_slot)
     builder.emit(entry, "Load", [destination_length_slot], old_length)
     lower_is_negative = builder.fresh("bool")
@@ -685,7 +685,7 @@ def lower_sequence_append_slice(
     builder.emit(capacity, "Add", [old_length, requested], new_length)
     within_capacity = builder.fresh("bool")
     builder.emit(capacity, "Le", [new_length, SSAValue(
-        destination.capacity_value_id, dtype="int"
+        destination.capacity_value_id, dtype="int64"
     )], within_capacity)
     builder.cond(capacity, within_capacity, header, full)
     index = builder.fresh("int")
@@ -795,11 +795,11 @@ def lower_sequence_pack_bits(
     source_length = builder.fresh("int")
     destination_length_slot = builder.fresh("ptr")
     builder.emit(entry, "GetElementPtr", [SSAValue(
-        source.length_address_id, dtype="int", shape=(1,)
+        source.length_address_id, dtype="int64", shape=(1,)
     ), zero], source_length_slot)
     builder.emit(entry, "Load", [source_length_slot], source_length)
     builder.emit(entry, "GetElementPtr", [SSAValue(
-        destination.length_address_id, dtype="int", shape=(1,)
+        destination.length_address_id, dtype="int64", shape=(1,)
     ), zero], destination_length_slot)
     width_valid = builder.fresh("bool")
     builder.emit(entry, "Gt", [width, zero], width_valid)
@@ -813,7 +813,7 @@ def lower_sequence_pack_bits(
     builder.emit(capacity_check, "FloorDiv", [rounded_length, width], word_count)
     fits = builder.fresh("bool")
     builder.emit(capacity_check, "Le", [word_count, SSAValue(
-        destination.capacity_value_id, dtype="int"
+        destination.capacity_value_id, dtype="int64"
     )], fits)
     builder.cond(capacity_check, fits, outer_header, full)
 
@@ -929,13 +929,13 @@ def lower_sequence_prepend(
     old_length = builder.fresh("int")
     new_length = builder.fresh("int")
     builder.emit(entry, "GetElementPtr", [SSAValue(
-        descriptor.length_address_id, dtype="int", shape=(1,)
+        descriptor.length_address_id, dtype="int64", shape=(1,)
     ), zero], length_slot)
     builder.emit(entry, "Load", [length_slot], old_length)
     builder.emit(entry, "Add", [old_length, one], new_length)
     fits = builder.fresh("bool")
     builder.emit(entry, "Le", [new_length, SSAValue(
-        descriptor.capacity_value_id, dtype="int"
+        descriptor.capacity_value_id, dtype="int64"
     )], fits)
     builder.cond(entry, fits, header, full)
     index = builder.fresh("int")
@@ -1043,11 +1043,11 @@ def lower_sequence_prepend_packed_bytes(
     destination_length_slot = builder.fresh("ptr")
     old_length = builder.fresh("int")
     builder.emit(entry, "GetElementPtr", [SSAValue(
-        source.length_address_id, dtype="int", shape=(1,)
+        source.length_address_id, dtype="int64", shape=(1,)
     ), zero], source_length_slot)
     builder.emit(entry, "Load", [source_length_slot], source_length)
     builder.emit(entry, "GetElementPtr", [SSAValue(
-        destination.length_address_id, dtype="int", shape=(1,)
+        destination.length_address_id, dtype="int64", shape=(1,)
     ), zero], destination_length_slot)
     builder.emit(entry, "Load", [destination_length_slot], old_length)
     valid = builder.fresh("bool")
@@ -1069,7 +1069,7 @@ def lower_sequence_prepend_packed_bytes(
     builder.emit(capacity_check, "Add", [old_length, prefix_count], new_length)
     fits = builder.fresh("bool")
     builder.emit(capacity_check, "Le", [new_length, SSAValue(
-        destination.capacity_value_id, dtype="int"
+        destination.capacity_value_id, dtype="int64"
     )], fits)
     builder.cond(capacity_check, fits, shift_header, full)
 
@@ -1224,7 +1224,7 @@ def lower_sequence_contains(
     builder.emit(
         entry,
         "GetElementPtr",
-        [SSAValue(descriptor.length_address_id, dtype="int", shape=(1,)), zero],
+        [SSAValue(descriptor.length_address_id, dtype="int64", shape=(1,)), zero],
         length_slot,
     )
     builder.emit(entry, "Load", [length_slot], length)
@@ -1355,7 +1355,7 @@ def lower_table_lookup(
     length = builder.fresh("int")
     status_slot = builder.fresh("ptr")
     builder.emit(entry, "GetElementPtr", [
-        SSAValue(descriptor.length_address_id, dtype="int", shape=(1,)), zero
+        SSAValue(descriptor.length_address_id, dtype="int64", shape=(1,)), zero
     ], length_slot)
     builder.emit(entry, "Load", [length_slot], length)
     builder.emit(entry, "GetElementPtr", [status_arena, zero], status_slot)
@@ -1493,7 +1493,7 @@ def lower_table_store(
     length = builder.fresh("int")
     status_slot = builder.fresh("ptr")
     builder.emit(entry, "GetElementPtr", [
-        SSAValue(descriptor.length_address_id, dtype="int", shape=(1,)), zero
+        SSAValue(descriptor.length_address_id, dtype="int64", shape=(1,)), zero
     ], length_slot)
     builder.emit(entry, "Load", [length_slot], length)
     builder.emit(entry, "GetElementPtr", [status_arena, zero], status_slot)
@@ -1547,7 +1547,7 @@ def lower_table_store(
     builder.branch(update, complete)
     has_capacity = builder.fresh("bool")
     builder.emit(capacity_check, "Lt", [
-        length, SSAValue(descriptor.capacity_value_id, dtype="int")
+        length, SSAValue(descriptor.capacity_value_id, dtype="int64")
     ], has_capacity)
     builder.cond(capacity_check, has_capacity, insert, full)
     inserted_columns = tuple(
@@ -1642,7 +1642,7 @@ def lower_table_delete(
     length = builder.fresh("int")
     status_slot = builder.fresh("ptr")
     builder.emit(entry, "GetElementPtr", [
-        SSAValue(descriptor.length_address_id, dtype="int", shape=(1,)), zero
+        SSAValue(descriptor.length_address_id, dtype="int64", shape=(1,)), zero
     ], length_slot)
     builder.emit(entry, "Load", [length_slot], length)
     builder.emit(entry, "GetElementPtr", [status_arena, zero], status_slot)
@@ -1741,7 +1741,7 @@ def lower_table_delete_first(
     length = builder.fresh("int")
     status_slot = builder.fresh("ptr")
     builder.emit(entry, "GetElementPtr", [SSAValue(
-        descriptor.length_address_id, dtype="int", shape=(1,)
+        descriptor.length_address_id, dtype="int64", shape=(1,)
     ), zero], length_slot)
     builder.emit(entry, "Load", [length_slot], length)
     builder.emit(entry, "GetElementPtr", [status_arena, zero], status_slot)

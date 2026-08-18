@@ -54,6 +54,8 @@ program_abi:
         last_wave_speed: {storage: scalar, dtype: float64, mutable: true}
         last_height_violation: {storage: scalar, dtype: float64, mutable: true}
         last_tracer_violation: {storage: scalar, dtype: float64, mutable: true}
+        height_count: {storage: scalar, dtype: int64, mutable: false}
+        width_count: {storage: scalar, dtype: int64, mutable: false}
     Targets:
       identity: src.common.dt_system.dt_controller.Targets
       fields:
@@ -126,11 +128,11 @@ defaults:
     action: ingest_python
     parameters: {follow_reachable_calls: true}
   third_party_python:
-    action: python_host_call
-    parameters: {execution: existing_interpreter, callbacks: reject}
+    action: use_native
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject}
   stdlib_python:
-    action: python_host_call
-    parameters: {execution: existing_interpreter, callbacks: reject}
+    action: use_native
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject}
   builtin:
     action: intrinsic
     parameters: {lowering_namespace: cpython_semantics}
@@ -207,9 +209,10 @@ rules:
 
   - id: print-is-an-output-port
     match: {module: builtins, qualname: print}
-    action: python_host_call
+    action: use_native
     parameters:
-      execution: system_port
+      loader: existing_module
+      symbol_resolution: in_place
       port: stdout
       callbacks: reject
 
@@ -218,6 +221,19 @@ rules:
       module: [importlib*, _frozen_importlib*, inspect, ast, dis, types]
     action: reject
     parameters: {reason: interpreter_implementation}
+
+  # ``re``'s own compiler is real, ordinary Python source with a genuine
+  # multi-key cache table (``_cache[type(pattern), pattern, flags]``) --
+  # compile it natively instead of bailing out to a host call into the
+  # existing interpreter. ``_sre``/``sys``/``unicodedata`` are C-implemented
+  # (no ``.py`` source) and are intentionally excluded: they fall through to
+  # the native_extension/builtin defaults instead.
+  - id: stdlib-re-module-is-real-program
+    match:
+      module: [re, re._compiler, re._parser, re._constants, re._casefix]
+    action: ingest_python
+    parameters:
+      follow_reachable_calls: true
 
   # Machine decompilation is forbidden unless an exact rule opts in. Example:
   # - id: exact-vendor-kernel-decompile

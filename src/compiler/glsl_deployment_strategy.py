@@ -27,7 +27,7 @@ from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Mapping
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import networkx as nx
 import numpy as np
@@ -157,6 +157,57 @@ def _dependency_order(graph: Any) -> tuple[int, ...]:
         ))
     G.graph["_dependency_order_cache"] = (fingerprint, order)
     return order
+
+
+def _topological_region_order(shell: Any, candidate_regions: Any) -> tuple[int, ...]:
+    """Order dispatch region indices to respect data dependencies.
+
+    ``range(len(dispatch_subgraphs))`` -- discovery/creation order -- is
+    NOT execution order: nothing about it guarantees a region discovered
+    later doesn't produce a value a region discovered earlier reads (e.g.
+    a loop that fills an array vs. a later whole-array copy of it). Two
+    call sites here fed that naive numeric order straight into
+    ``overlay_scheduled_control`` as the flat scheduled region sequence,
+    which silently discarded any dependency edge between regions -- see
+    tools/HANDOFF_fluid_c_shell.md and tools/DIFFERENTIAL_PHASES.md.
+
+    ``shell.hierarchy_plan.items`` is already built by walking the
+    process graph's true dependency order (``_build_shell_hierarchy_plan``
+    via ``_dependency_order``): each ``region_N`` ``PlanClosure`` is
+    appended the first time any of its member nodes is reached in that
+    walk, so a region depending on another always appears after it.
+    Reuse that order here instead of re-deriving it.
+
+    Falls back to ``candidate_regions``' own order for anything not found
+    in the hierarchy plan (e.g. no plan yet, or a region the plan never
+    reached) -- this only reorders what it can positively place, it never
+    drops a region.
+    """
+
+    candidates = tuple(int(index) for index in candidate_regions)
+    plan = getattr(shell, "hierarchy_plan", None)
+    plan_items = getattr(plan, "items", None) if plan is not None else None
+    if not plan_items:
+        return candidates
+    candidate_set = set(candidates)
+    from_plan = (
+        int(item.name.split("_", 1)[1])
+        for item in plan_items
+        if isinstance(item, PlanClosure)
+        and item.name.startswith("region_")
+        and int(item.name.split("_", 1)[1]) in candidate_set
+    )
+    result = tuple(dict.fromkeys((*from_plan, *candidates)))
+    import os as _os, sys as _sys
+    if _os.environ.get("TURING_DEBUG_REGION_ORDER"):
+        _fn = getattr(getattr(shell, "process_graph", None), "G", None)
+        _fn = _fn.graph.get("function_name") if _fn is not None else None
+        print(
+            f"DEBUGTOPOORDER fn={_fn} plan_items_present={plan_items is not None} "
+            f"candidates={candidates} result={result}",
+            file=_sys.stderr,
+        )
+    return result
 
 
 _scheduled_capture_backend: ContextVar[str] = ContextVar(
@@ -1105,6 +1156,47 @@ def _identity_parameter_projection(graph) -> tuple[int, str] | None:
     return None
 
 
+def _synthetic_device_scalar_shell(graph: Any, predicate_id: int) -> Any:
+    """Add the node chain ``_identity_parameter_projection`` already
+    recognizes (``bool(param[item])``) so an ordinary, non-call predicate
+    passes the same device-scalar check a real callsite would.  Its own
+    node ids are throwaway: the caller only reads the projection's
+    verdict, then falls back to ``predicate_id`` itself.
+
+    UNVERIFIED: no passing test exercises this yet. It targets the
+    ``if predicate: raise`` guard condition only; re-running
+    ``tools/compile_re_probe.py`` after adding it showed no change in the
+    "no registered callee" shortfall list, because that failure is in the
+    raise *bodies* (constructing/raising the exception), a separate,
+    still-unaddressed gap this function does not touch.
+    """
+
+    next_id = (max(graph.nodes, default=0)) + 1
+    input_id, item_id, call_id = next_id, next_id + 1, next_id + 2
+    graph.add_node(
+        input_id, type="Input", op="Input", parents=[], children=[],
+        attributes={"binding_kind": "parameter"}, expr_obj=None,
+    )
+    graph.add_node(
+        item_id, type="Item", op="item", parents=[(input_id, "operand")],
+        children=[], attributes={}, expr_obj=None,
+    )
+    graph.add_edge(input_id, item_id, role="operand")
+    call_expr = ast.Call(func=ast.Name(id="bool", ctx=ast.Load()), args=[], keywords=[])
+    graph.add_node(
+        call_id, type="Call", op="Call", parents=[(item_id, "value")],
+        children=[], attributes={"static_python_reference": "builtins.bool"},
+        expr_obj=call_expr,
+    )
+    graph.add_edge(item_id, call_id, role="value")
+    wrapper = graph.__class__()
+    wrapper.add_nodes_from(graph.nodes(data=True))
+    wrapper.add_edges_from(graph.edges(data=True))
+    wrapper.graph["function_outputs"] = ("result",)
+    wrapper.graph["identity_table"] = {"result": (call_id,)}
+    return SimpleNamespace(process_graph=SimpleNamespace(G=wrapper))
+
+
 def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
     """Translate ordinary ``if predicate: raise`` guards into typed control."""
 
@@ -1133,6 +1225,9 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
         if predicate_id is None:
             continue
         child = shell.callsite_function_shells.get(predicate_id)
+        if child is None:
+            child = _synthetic_device_scalar_shell(graph, predicate_id)
+            shell.callsite_function_shells[predicate_id] = child
         if child is not None:
             projection = _identity_parameter_projection(
                 child.process_graph.G
@@ -1151,8 +1246,6 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
                 if str(role) in {"arg:0", "arg0", "operand", "value"}
             ), predicate_id)
         else:
-            # Static scalar/shape guards are resolved during planning; only a
-            # tensor scalar projection becomes runtime validation control.
             continue
         blocks.append(ValidationBlock(
             predicate_id,
@@ -1854,6 +1947,59 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     or getattr(domain, "dtype", None)
                     or "float64"
                 )
+                field_name = attributes.get("attribute")
+                if (
+                    not logical
+                    and field_name is not None
+                    and str(node.get("type")) in {"GetAttr", "Attribute"}
+                ):
+                    # A record field read through a mutable, non-array-typed
+                    # receiver (``state.next_height``) has no tensor/domain
+                    # shape of its own -- ``specialized_shape`` above only
+                    # covers a receiver bound *directly* to an array. By this
+                    # pass, ``expr_obj`` is gone (nodes created during SSA
+                    # normalization carry none), so the receiver is found via
+                    # the graph edge instead of the AST. The receiver's own
+                    # bound specialization (a real object, set by
+                    # ``propagate_bound_planner_specializations`` before this
+                    # pass runs) still has the real field on it; read it
+                    # structurally, the same safe, side-effect-free
+                    # ``getattr`` this module already uses for call-argument
+                    # specialization. Without this, every whole-array read of
+                    # a record field silently collapses to ``()`` and a
+                    # downstream array op is emitted as a scalar op on one
+                    # element (see tools/HANDOFF_fluid_c_shell.md, Defect 1).
+                    receiver_id = next((
+                        int(parent)
+                        for parent, role in (node.get("parents") or ())
+                        if str(role) in {"value", "base", "object"}
+                    ), None)
+                    receiver_binding = (
+                        (
+                            graph.G.nodes.get(receiver_id, {}).get(
+                                "attributes"
+                            ) or {}
+                        ).get("binding_name")
+                        if receiver_id is not None else None
+                    )
+                    receiver_value = (
+                        (graph.G.graph.get("planner_specializations") or {})
+                        .get(str(receiver_binding))
+                        if receiver_binding is not None else None
+                    )
+                    if receiver_value is not None:
+                        try:
+                            field_value = getattr(
+                                receiver_value, str(field_name)
+                            )
+                        except AttributeError:
+                            field_value = None
+                        field_shape = getattr(field_value, "shape", None)
+                        if field_shape:
+                            logical = tuple(int(dim) for dim in field_shape)
+                            field_dtype = getattr(field_value, "dtype", None)
+                            if field_dtype is not None:
+                                dtype = str(field_dtype)
                 operation = str(
                     attributes.get("tensor")
                     or attributes.get("tensor_operation")
@@ -2380,6 +2526,14 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                 return False
             control = ControlProgram(SequenceBlock(()), ())
         controls[closure_id] = control
+        import os as _os, sys as _sys
+        if _os.environ.get("TURING_DEBUG_REGION_ORDER"):
+            _fn = owner.process_graph.G.graph.get("function_name")
+            print(
+                f"DEBUGGATHER fn={_fn} closure_id={closure_id} "
+                f"region_indices={getattr(control, 'region_indices', None)}",
+                file=_sys.stderr,
+            )
         for item in closure.items:
             if not isinstance(item, PlanCall):
                 continue
@@ -12932,6 +13086,13 @@ def _fold_callsite_structural_values(graph: Any) -> None:
     invokes a retained Python callable or reads a runtime tensor payload.
     """
 
+    import os as _os, sys as _sys
+    if _os.environ.get("TURING_DEBUG_SHAPE_ATTR"):
+        print(
+            f"DEBUGFOLDENTRY fn={graph.G.graph.get('function_name')} "
+            f"nodes={graph.G.number_of_nodes()}",
+            file=_sys.stderr,
+        )
     unresolved = _UNRESOLVED_STRUCTURAL_VALUE
     known: dict[int, Any] = {}
     loop_carried_initial_ids = {
@@ -12958,8 +13119,79 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 indexed.append((position, int(parent)))
         return tuple(parent for _position, parent in sorted(indexed))
 
+    def _record_field_descriptor(node_id: int) -> dict[str, Any] | None:
+        """Real shape/dtype for a record-field read, from its bound value.
+
+        A record field (``state.height``) never gets a ``tensor`` fact of
+        its own -- that inference path is for tensor-typed values flowing
+        through tensor ops, and a mutable dataclass field is neither. Its
+        receiver's own bound specialization (a real object, set by
+        ``propagate_bound_planner_specializations`` before this pass runs)
+        still has the real field on it; read it structurally, the same
+        safe, side-effect-free ``getattr`` this module already uses
+        elsewhere for call-argument specialization and region-shape
+        inference (see ``declared()`` in ``_build_shell_hierarchy_plan``,
+        which fixed the analogous gap for whole-array region shapes).
+        Without this, ``state.height.shape[0]`` -- a loop bound -- silently
+        resolves to nothing and the per-cell loop it bounds never runs.
+        """
+
+        import os as _os, sys as _sys
+        _debug = _os.environ.get("TURING_DEBUG_SHAPE_ATTR")
+        node = graph.G.nodes.get(int(node_id), {})
+        if str(node.get("type")) not in {"GetAttr", "Attribute"}:
+            return None
+        field_name = (node.get("attributes") or {}).get("attribute")
+        if field_name is None:
+            return None
+        receiver_id = next((
+            int(candidate)
+            for candidate, role in (node.get("parents") or ())
+            if str(role) in {"value", "base", "object"}
+        ), None)
+        if _debug and field_name in {"height", "width"}:
+            print(
+                f"DEBUGSHAPEATTR node_id={node_id} field={field_name} "
+                f"receiver_id={receiver_id} "
+                f"receiver_attrs={graph.G.nodes.get(receiver_id, {}).get('attributes') if receiver_id is not None else None}",
+                file=_sys.stderr,
+            )
+        if receiver_id is None:
+            return None
+        receiver_binding = (
+            graph.G.nodes.get(receiver_id, {}).get("attributes") or {}
+        ).get("binding_name")
+        if receiver_binding is None:
+            return None
+        receiver_value = (
+            graph.G.graph.get("planner_specializations") or {}
+        ).get(str(receiver_binding))
+        if _debug and field_name in {"height", "width"}:
+            print(
+                f"DEBUGSHAPEATTR2 node_id={node_id} receiver_binding={receiver_binding} "
+                f"receiver_value_is_none={receiver_value is None} "
+                f"specializations_keys={tuple((graph.G.graph.get('planner_specializations') or {}).keys())}",
+                file=_sys.stderr,
+            )
+        if receiver_value is None:
+            return None
+        try:
+            field_value = getattr(receiver_value, str(field_name))
+        except AttributeError:
+            return None
+        field_shape = getattr(field_value, "shape", None)
+        if not field_shape:
+            return None
+        field_dtype = getattr(field_value, "dtype", None)
+        return {
+            "shape": tuple(int(dim) for dim in field_shape),
+            "dtype": "float64" if field_dtype is None else str(field_dtype),
+        }
+
     def descriptor_attribute(parent: int, attribute: str) -> Any:
         descriptor = _tensor_descriptor(graph, parent)
+        if descriptor is None:
+            descriptor = _record_field_descriptor(parent)
         if descriptor is None:
             return unresolved
         if attribute == "shape":
@@ -14637,8 +14869,21 @@ class ProcessGraphGLSLDeployment:
                 self, "prepare_complete_catalogue", False
             )),
         ):
+            # A callsite-specialized shell (below, in
+            # ``_specialized_shell_type``) already gets this fold; a
+            # top-level planned shell like the one this loop walks never
+            # did. That left ``state.height.shape[0]`` -- an ordinary
+            # record-field read feeding a loop bound -- structurally
+            # unresolved for exactly the whole-program compile path this
+            # loop drives, with no error: the loop bound silently reads as
+            # 0 and the loop it bounds never runs. Fold it here too, before
+            # the hierarchy plan (and the region shapes/order derived from
+            # it) gets built from this graph.
+            _fold_callsite_structural_values(target.process_graph)
             target.refresh_hierarchy_plan()
-            complete_regions = tuple(range(len(target.dispatch_subgraphs)))
+            complete_regions = _topological_region_order(
+                target, range(len(target.dispatch_subgraphs))
+            )
             retained_value_ids = {
                 int(value_id)
                 for item in target.hierarchy_plan.items
@@ -16391,10 +16636,13 @@ class ProcessGraphGLSLDeployment:
         # capture_fused_programs completeness audit below independently rejects
         # any omitted region that actually has a tensor output, so this cannot
         # hide failed numerical lowering.
-        complete_regions = tuple(
-            region_index
-            for region_index in range(len(self.dispatch_subgraphs))
-            if region_index in by_region
+        complete_regions = _topological_region_order(
+            self,
+            (
+                region_index
+                for region_index in range(len(self.dispatch_subgraphs))
+                if region_index in by_region
+            ),
         )
         self.compile_time_region_indices = (
             set(range(len(self.dispatch_subgraphs))) - set(complete_regions)

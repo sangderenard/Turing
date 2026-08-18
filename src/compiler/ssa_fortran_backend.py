@@ -34,7 +34,9 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -3560,6 +3562,7 @@ def emit_module(
     outputs: Mapping[str, Sequence[SSAValue]] | None = None,
     extra_roots: Sequence[str] = (),
     trig_solver: str = "lut",
+    progress: "Callable[[str], None] | None" = None,
 ) -> FortranModule:
     """Translate an SSA module into one Fortran module.
 
@@ -3568,7 +3571,24 @@ def emit_module(
     its own ``bind(C)`` entry) even when nothing reachable from the ordinary
     roots calls them -- a library exports its whole surface, not just the
     functions the entry happens to reach.
+
+    ``progress``, if given, is called with a short message at each major
+    phase boundary. Without it, this function runs silently end to end --
+    for a large whole-program module that can look identical to a hang
+    whether it is fast or slow, so the default here prints to stderr
+    (unbuffered) instead of staying silent; pass an explicit no-op to
+    suppress it.
     """
+
+    _emit_module_started = time.time()
+
+    def _phase(message: str) -> None:
+        elapsed = time.time() - _emit_module_started
+        report = f"emit_module: {message} (+{elapsed:0.1f}s)"
+        if progress is not None:
+            progress(report)
+        else:
+            print(report, file=sys.stderr, flush=True)
 
     if isinstance(module, IRModule):
         unresolved_calls = tuple(
@@ -3911,6 +3931,7 @@ def emit_module(
         for base_id in method_array_bases.get(str(function_name), set()):
             ranks[int(base_id)] = max(ranks.get(int(base_id), 0), 1)
         function_value_ranks[str(function_name)] = ranks
+    _phase(f"starting rank propagation over {len(functions)} function(s)")
     changed_ranks = True
 
     def is_scalar_extraction(instruction: Instr, operation: str) -> bool:
@@ -3948,7 +3969,55 @@ def emit_module(
             changed = True
         return changed
 
+    # Several independent fixpoint passes below (rank, scalar-control,
+    # array-contract, dtype, mutation propagation) each used to rescan an
+    # entire block's instructions twice for every aggregate-returning Call
+    # in it, on every pass of their own ``while changed_*`` loop --
+    # O(calls x block size), repeated per pass. That was never exercised at
+    # scale because a structurally unresolved loop bound (see the
+    # record-field ``.shape[i]`` fix in glsl_deployment_strategy.py) kept
+    # a real per-cell loop body -- and the calls in it -- from ever being
+    # reached, so no block here ever grew large enough for the O(N^2) scan
+    # to matter. Once real, it made this pass effectively hang. Block
+    # structure never changes across any of these fixpoint passes, so
+    # index each block's GetElementPtr/Load instructions once, by their
+    # source operand, and reuse the same index for every call and every
+    # pass of every one of these loops, instead of rescanning.
+    _aggregate_output_index_cache: dict[int, tuple[dict, dict]] = {}
+
+    def _aggregate_output_indices(block):
+        cached = _aggregate_output_index_cache.get(id(block))
+        if cached is not None:
+            return cached
+        gep_by_source: dict = {}
+        loads_by_source_id: dict = {}
+        for candidate in block.instrs:
+            op = candidate.op
+            if (
+                op in {"GetElementPtr", "getelementptr"}
+                and candidate.res is not None
+                and candidate.args
+                and candidate.attributes.get("aggregate_index") is not None
+            ):
+                gep_by_source.setdefault(
+                    id(candidate.args[0]), []
+                ).append(candidate)
+            elif (
+                op in {"Load", "load"}
+                and candidate.res is not None
+                and candidate.args
+            ):
+                loads_by_source_id.setdefault(
+                    int(candidate.args[0].id), []
+                ).append(candidate)
+        result = (gep_by_source, loads_by_source_id)
+        _aggregate_output_index_cache[id(block)] = result
+        return result
+
+    _rank_pass = 0
     while changed_ranks:
+        _rank_pass += 1
+        _phase(f"rank propagation pass {_rank_pass}")
         changed_ranks = False
         for caller_name, caller in functions.items():
             caller_ranks = function_value_ranks[str(caller_name)]
@@ -4021,30 +4090,22 @@ def emit_module(
                         and instruction.attributes.get("result_convention")
                         == "ssa.aggregate"
                     ):
+                        gep_by_source, loads_by_source_id = (
+                            _aggregate_output_indices(block)
+                        )
                         addresses = {
                             int(candidate.res.id): int(
                                 candidate.attributes["aggregate_index"]
                             )
-                            for candidate in block.instrs
-                            if (
-                                candidate.op in {"GetElementPtr", "getelementptr"}
-                                and candidate.res is not None
-                                and candidate.args
-                                and candidate.args[0] is instruction.res
-                                and candidate.attributes.get("aggregate_index")
-                                is not None
+                            for candidate in gep_by_source.get(
+                                id(instruction.res), ()
                             )
                         }
-                        caller_outputs = {
-                            addresses[int(candidate.args[0].id)]: candidate.res
-                            for candidate in block.instrs
-                            if (
-                                candidate.op in {"Load", "load"}
-                                and candidate.res is not None
-                                and candidate.args
-                                and int(candidate.args[0].id) in addresses
-                            )
-                        }
+                        for source_id, slot in addresses.items():
+                            for candidate in loads_by_source_id.get(
+                                source_id, ()
+                            ):
+                                caller_outputs[slot] = candidate.res
                     elif instruction.res is not None and len(callee_outputs) == 1:
                         caller_outputs[0] = instruction.res
                     for output_index, callee_output in enumerate(callee_outputs):
@@ -4106,12 +4167,19 @@ def emit_module(
         function_name: set(value_ids)
         for function_name, value_ids in scalar_control_ids.items()
     }
+    _phase("rank propagation done, starting scalar-control propagation")
     changed_scalars = True
+    _scalar_pass = 0
     while changed_scalars:
+        _scalar_pass += 1
+        _phase(f"scalar-control propagation pass {_scalar_pass}")
         changed_scalars = False
         for function_name, function in functions.items():
             scalar_ids = scalar_control_ids[function_name]
             for block in function.blocks.values():
+                gep_by_source, loads_by_source_id = _aggregate_output_indices(
+                    block
+                )
                 for instruction in block.instrs:
                     operation = str(
                         instruction.attributes.get("tensor_operation")
@@ -4173,25 +4241,12 @@ def emit_module(
                         continue
                     addresses = {
                         int(candidate.res.id): int(candidate.attributes["aggregate_index"])
-                        for candidate in block.instrs
-                        if (
-                            candidate.op in {"GetElementPtr", "getelementptr"}
-                            and candidate.res is not None
-                            and candidate.args
-                            and candidate.args[0] is instruction.res
-                            and candidate.attributes.get("aggregate_index") is not None
-                        )
+                        for candidate in gep_by_source.get(id(instruction.res), ())
                     }
-                    caller_outputs = {
-                        addresses[int(candidate.args[0].id)]: candidate.res
-                        for candidate in block.instrs
-                        if (
-                            candidate.op in {"Load", "load"}
-                            and candidate.res is not None
-                            and candidate.args
-                            and int(candidate.args[0].id) in addresses
-                        )
-                    }
+                    caller_outputs = {}
+                    for source_id, slot in addresses.items():
+                        for candidate in loads_by_source_id.get(source_id, ()):
+                            caller_outputs[slot] = candidate.res
                     for output_index, callee_output in enumerate(
                         named_outputs.get(callee_name, ())
                     ):
@@ -4222,12 +4277,19 @@ def emit_module(
         function_name: set(map(int, method_array_bases.get(function_name, set())))
         for function_name in functions
     }
+    _phase("scalar-control propagation done, starting array-contract propagation")
     changed_array_contracts = True
+    _array_contract_pass = 0
     while changed_array_contracts:
+        _array_contract_pass += 1
+        _phase(f"array-contract propagation pass {_array_contract_pass}")
         changed_array_contracts = False
         for caller_name, caller in functions.items():
             caller_arrays = array_contract_ids[caller_name]
             for block in caller.blocks.values():
+                gep_by_source, loads_by_source_id = _aggregate_output_indices(
+                    block
+                )
                 for instruction in block.instrs:
                     if instruction.op not in {"Call", "call"}:
                         continue
@@ -4249,25 +4311,12 @@ def emit_module(
                         continue
                     addresses = {
                         int(candidate.res.id): int(candidate.attributes["aggregate_index"])
-                        for candidate in block.instrs
-                        if (
-                            candidate.op in {"GetElementPtr", "getelementptr"}
-                            and candidate.res is not None
-                            and candidate.args
-                            and candidate.args[0] is instruction.res
-                            and candidate.attributes.get("aggregate_index") is not None
-                        )
+                        for candidate in gep_by_source.get(id(instruction.res), ())
                     }
-                    caller_outputs = {
-                        addresses[int(candidate.args[0].id)]: candidate.res
-                        for candidate in block.instrs
-                        if (
-                            candidate.op in {"Load", "load"}
-                            and candidate.res is not None
-                            and candidate.args
-                            and int(candidate.args[0].id) in addresses
-                        )
-                    }
+                    caller_outputs = {}
+                    for source_id, slot in addresses.items():
+                        for candidate in loads_by_source_id.get(source_id, ()):
+                            caller_outputs[slot] = candidate.res
                     for output_index, callee_output in enumerate(
                         named_outputs.get(callee_name, ())
                     ):
@@ -4355,13 +4404,20 @@ def emit_module(
         function_value_dtypes[str(function_name)] = dtypes
         logical_dtype_ids[str(function_name)] = logical_ids
 
+    _phase("array-contract propagation done, starting dtype propagation")
     changed_dtypes = True
+    _dtype_pass = 0
     while changed_dtypes:
+        _dtype_pass += 1
+        _phase(f"dtype propagation pass {_dtype_pass}")
         changed_dtypes = False
         for caller_name, caller in functions.items():
             caller_dtypes = function_value_dtypes[str(caller_name)]
             caller_logical = logical_dtype_ids[str(caller_name)]
             for block in caller.blocks.values():
+                gep_by_source, loads_by_source_id = _aggregate_output_indices(
+                    block
+                )
                 for instruction in block.instrs:
                     if instruction.op not in {"Call", "call"}:
                         continue
@@ -4373,7 +4429,30 @@ def emit_module(
                     callee_logical = logical_dtype_ids[callee_name]
                     for actual, formal in zip(instruction.args, callee.args):
                         actual_id, formal_id = int(actual.id), int(formal.id)
-                        if actual_id in caller_logical or formal_id in callee_logical:
+                        # A value can be "logical" on one call boundary
+                        # (e.g. it's the predicate of a comparison feeding
+                        # THIS callee) while carrying an unrelated, already
+                        # -settled, non-bool dtype from a DIFFERENT call
+                        # boundary that happens to share the same SSA id.
+                        # Unconditionally forcing "bool" onto that shared
+                        # id, then having the other relationship's own pass
+                        # sync it back to its real dtype, never converges --
+                        # this is why dtype propagation ran thousands of
+                        # passes instead of a handful. Only settle "bool"
+                        # here when neither side already holds a different,
+                        # concrete dtype; a genuine conflict is left
+                        # unresolved for this pass rather than fought over.
+                        actual_settled_conflict = caller_dtypes.get(
+                            actual_id
+                        ) not in (None, "bool")
+                        formal_settled_conflict = callee_dtypes.get(
+                            formal_id
+                        ) not in (None, "bool")
+                        if (
+                            (actual_id in caller_logical or formal_id in callee_logical)
+                            and not actual_settled_conflict
+                            and not formal_settled_conflict
+                        ):
                             settled = "bool"
                             caller_logical.add(actual_id)
                             callee_logical.add(formal_id)
@@ -4416,40 +4495,42 @@ def emit_module(
                     }
                     addresses = {
                         int(candidate.res.id): int(candidate.attributes["aggregate_index"])
-                        for candidate in block.instrs
-                        if (
-                            candidate.op in {"GetElementPtr", "getelementptr"}
-                            and candidate.res is not None
-                            and candidate.args
-                            and candidate.args[0] is instruction.res
-                            and candidate.attributes.get("aggregate_index") is not None
-                        )
+                        for candidate in gep_by_source.get(id(instruction.res), ())
                     }
-                    caller_outputs = {
-                        position_to_slot[addresses[int(candidate.args[0].id)]]: candidate.res
-                        for candidate in block.instrs
-                        if (
-                            candidate.op in {"Load", "load"}
-                            and candidate.res is not None
-                            and candidate.args
-                            and int(candidate.args[0].id) in addresses
-                            and addresses[int(candidate.args[0].id)] in position_to_slot
-                        )
-                    }
+                    caller_outputs = {}
+                    for source_id, slot in addresses.items():
+                        if slot not in position_to_slot:
+                            continue
+                        for candidate in loads_by_source_id.get(source_id, ()):
+                            caller_outputs[position_to_slot[slot]] = candidate.res
                     for output_index, callee_output in enumerate(callee_output_values):
                         caller_output = caller_outputs.get(output_index)
                         if caller_output is None:
                             continue
                         caller_id = int(caller_output.id)
                         callee_id = int(callee_output.id)
-                        if caller_id in caller_logical or callee_id in callee_logical:
+                        # Same conflict guard as the argument-side settling
+                        # above: don't force "bool" onto a shared SSA id
+                        # that already holds a different, concrete dtype
+                        # from an unrelated call relationship.
+                        caller_settled_conflict = caller_dtypes.get(
+                            caller_id
+                        ) not in (None, "bool")
+                        callee_settled_conflict = callee_dtypes.get(
+                            callee_id
+                        ) not in (None, "bool")
+                        if (
+                            (caller_id in caller_logical or callee_id in callee_logical)
+                            and not caller_settled_conflict
+                            and not callee_settled_conflict
+                        ):
                             settled = "bool"
                             caller_logical.add(caller_id)
                             callee_logical.add(callee_id)
                         else:
                             caller_dtype = caller_dtypes.get(caller_id)
                             callee_dtype = callee_dtypes.get(callee_id)
-                            if callee_dtype is not None and caller_dtype != callee_dtype:
+                            if callee_dtype is not None and caller_dtype is None:
                                 caller_dtypes[caller_id] = callee_dtype
                                 changed_dtypes = True
                             elif callee_dtype is None and caller_dtype is not None:
@@ -4485,8 +4566,12 @@ def emit_module(
         }
         for function_name, function in functions.items()
     }
+    _phase("dtype propagation done, starting mutation propagation")
     changed_mutation = True
+    _mutation_pass = 0
     while changed_mutation:
+        _mutation_pass += 1
+        _phase(f"mutation propagation pass {_mutation_pass}")
         changed_mutation = False
         for caller_name, caller in functions.items():
             caller_mutated = function_mutated_values[caller_name]
@@ -4509,6 +4594,7 @@ def emit_module(
                             caller_mutated.add(int(actual.id))
                             changed_mutation = True
     method_mutated_bases = function_mutated_values
+    _phase("mutation propagation done, generating Fortran source")
     callee_inout_pairs = {
         function_name: tuple(
             (input_index, output_index)
@@ -4660,7 +4746,12 @@ def emit_module(
 
     callee_formal_dtypes: dict[str, tuple[str, ...]] = {}
     callee_result_dtypes: dict[str, tuple[str, ...]] = {}
-    for _ in range(max(1, len(functions) + 2)):
+    _signature_pass_limit = max(1, len(functions) + 2)
+    for _signature_pass in range(_signature_pass_limit):
+        _phase(
+            f"emitting subroutine bodies, signature pass "
+            f"{_signature_pass + 1}/{_signature_pass_limit}"
+        )
         subroutines = emit_subroutines(
             callee_extents, callee_formal_dtypes, callee_result_dtypes
         )
@@ -4907,6 +4998,7 @@ def emit_module(
             },
         },
     )
+    _phase("Fortran source generation done")
     return FortranModule(name, "\n".join(lines) + "\n", subroutines, api=api)
 
 

@@ -15,7 +15,16 @@ except Exception:  # pragma: no cover - optional dependency
 
 from .dt_scaler import Metrics, coerce_metrics
 from .dt import SuperstepPlan, SuperstepResult
-from .debug import dbg, is_enabled, pretty_metrics
+
+# This module's debug-logging calls (``if is_enabled(): dbg(...).debug(...)``)
+# were removed entirely, not just guarded. Neither a runtime function-call
+# condition nor a folded-constant one gets dead-branch-eliminated by the
+# compiler -- it has no pass that drops an ``ast.If`` body once its test
+# resolves to a known-false literal -- so logger objects and f-strings
+# inside the branch still had no Fortran equivalent and left an
+# unregistered, uncompilable region in every function that reached one.
+# Deleting them was the actual fix; see tools/HANDOFF_2026-08-17_CRASH.md's
+# sibling investigation for the rest of this compile chain's fixes.
 
 
 def _restore_type(value, ref):
@@ -58,13 +67,6 @@ class STController:
         dx_t = dx if isinstance(dx, AbstractTensor) else AbstractTensor.tensor(dx)
         dt_max_t = dx_t / AbstractTensor.maximum(self.max_vel_ever, 1e-30)
         self.dt_max = _restore_type(dt_max_t, dx)
-        if is_enabled():
-            dbg("ctrl").debug(
-                f"update_dt_max: max_vel={float(max_vel_t.item() if isinstance(max_vel_t, AbstractTensor) else max_vel_t):.3e} "
-                f"-> max_vel_ever={float(self.max_vel_ever.item() if isinstance(self.max_vel_ever, AbstractTensor) else self.max_vel_ever):.3e} "
-                f"dt_max={float(self.dt_max.item() if isinstance(self.dt_max, AbstractTensor) else self.dt_max):.3e} "
-                f"dx={float(dx_t.item() if isinstance(dx_t, AbstractTensor) else dx_t):.3e}"
-            )
 
     def pi_update(self, dt_prev, dt_pen, osc: bool,
                   *, dt_min: float | AbstractTensor | None = None,
@@ -91,11 +93,6 @@ class STController:
             dt_new = dt_new * self.shrink
             if dt_min is not None:
                 dt_new = AbstractTensor.maximum(dt_new, dt_min_t)
-        if is_enabled():
-            dbg("ctrl").debug(
-                f"pi_update: dt_prev={float(dt_prev.item()):.6g} dt_pen={float(dt_pen.item()):.6g} osc={osc} -> dt_new={float(dt_new.item()):.6g}"
-                f" (bounds: dt_min={dt_min} dt_max={dt_max}) acc={float(self.acc.item()):.3f}"
-            )
         return _restore_type(dt_new, ref_prev)
 
 
@@ -119,10 +116,6 @@ def step_with_dt_control_used(state,
     dt_for_advance = _restore_type(dt_tensor, ref)
 
     saved = state.copy_shallow()
-    if is_enabled():
-        dbg("ctrl").debug(
-            f"advance try: dt={float(dt_for_advance):.6g} dx={float(dx.item() if isinstance(dx, AbstractTensor) else dx):.6g} retries={retries}"
-        )
     ok, metrics = advance(state, dt_for_advance)
     metrics = coerce_metrics(metrics)
     channel_failure = any(
@@ -199,18 +192,12 @@ def step_with_dt_control_used(state,
             )
         channels["dt_unresolved_report"] = 0.0
         metrics.unresolved_report = tuple(lines)
-        if is_enabled():
-            dbg("ctrl").warning(chr(10).join(lines))
         # Fall through to the ordinary accepted path so the proposal for the
         # next step is computed the same way it always is.
         rejected = False
     if rejected:
         state.restore(saved)
         failures.append((float(dt_for_advance), metrics, tuple(reasons)))
-        if is_enabled():
-            dbg("ctrl").warning(
-                f"advance failed: dt={float(dt.item() if isinstance(dt, AbstractTensor) else dt):.6g} metrics=({pretty_metrics(metrics)})"
-            )
         if retries >= max_retries:
             ctrl.clamp_events += 1
             lines = [f"timestep controller failed after {len(failures)} attempts:"]
@@ -245,10 +232,6 @@ def step_with_dt_control_used(state,
             and float(metrics.dt_limit) > 0.0
         ):
             dt_half = AbstractTensor.minimum(dt_half, metrics.dt_limit)
-        if is_enabled():
-            dbg("ctrl").debug(
-                f"retry with dt_half={float(dt_half.item() if isinstance(dt_half, AbstractTensor) else dt_half):.6g}"
-            )
         return step_with_dt_control_used(
             state,
             dt_half,
@@ -283,12 +266,6 @@ def step_with_dt_control_used(state,
     if metrics.dt_limit is not None:
         dt_next = AbstractTensor.minimum(dt_next, metrics.dt_limit)
     ctrl.update_dt_max(metrics.max_vel, dx)
-    if is_enabled():
-        dbg("ctrl").debug(
-            f"advance ok: used_dt={float(dt.item() if isinstance(dt, AbstractTensor) else dt):.6g} cfl_dt={dt_cfl:.6g} penalty={penalty:.3f}"
-            + (f" dt_limit={metrics.dt_limit:.6g}" if metrics.dt_limit is not None else "")
-            + f" -> dt_next={float(dt_next.item() if isinstance(dt_next, AbstractTensor) else dt_next):.6g} | {pretty_metrics(metrics)}"
-        )
     return metrics, _restore_type(dt_next, ref), _restore_type(dt_tensor, ref)
 
 
@@ -342,10 +319,6 @@ def run_superstep(state,
 
     unresolved: list[Metrics] = []
     iters = 0
-    if is_enabled():
-        dbg("ctrl").debug(
-            f"run_superstep: round_max={float(round_max_t.item()):.6g} dt_init={float(dt_cap.item()):.6g} dx={dx:.6g}"
-        )
     while (round_max_t - total).item() > eps and iters < max_iters:
         iters += 1
         remainder = round_max_t - total
@@ -389,10 +362,6 @@ def run_superstep(state,
             if ctrl.dt_max is not None:
                 dt_cap = AbstractTensor.minimum(ctrl.dt_max, dt_cap)
         last_dt_next = dt_next
-        if is_enabled():
-            dbg("ctrl").debug(
-                f"  iter={iters} used={float(dt_used.item() if isinstance(dt_used, AbstractTensor) else dt_used):.6g} total={float(total.item()):.6g}/{round_max:.6g} next_cap={float(dt_cap.item()):.6g}"
-            )
 
     if unresolved:
         first = unresolved[0]
@@ -508,10 +477,6 @@ def step_realtime_once(
     if not ok:
         # On failure, keep dt small (use dt_min if set, else tiny) to avoid explosion next frame
         dt_baseline = ctrl.dt_min if ctrl.dt_min is not None else 1e-6
-        if is_enabled():
-            dbg("ctrl").warning(
-                f"rt advance failed: dt={dt_val:.6g} -> next={float(dt_baseline if not isinstance(dt_baseline, AbstractTensor) else dt_baseline.item()):.6g} ({pretty_metrics(metrics)})"
-            )
         return metrics, _restore_type(dt_baseline, ref_dt), _restore_type(dt_val, ref_dt)
 
     # Base proposal from allocation (thumbnailing simulated time to budget)
@@ -520,14 +485,6 @@ def step_realtime_once(
 
     # Controller book-keeping still learns dt_max from velocities
     ctrl.update_dt_max(metrics.max_vel, dx)
-
-    if is_enabled():
-        dbg("ctrl").debug(
-            "rt: "
-            f"used_dt={dt_val:.6g} alloc={alloc_ms:.3f}ms cost={elapsed_ms:.3f}ms "
-            + (f"dt_limit={metrics.dt_limit:.6g} " if metrics.dt_limit is not None else "")
-            + f"-> dt_next={dt_next:.6g} | {pretty_metrics(metrics)}"
-        )
 
     return metrics, _restore_type(dt_next, ref_dt), _restore_type(dt_val, ref_dt)
 

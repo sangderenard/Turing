@@ -4,6 +4,8 @@ import ast
 import contextlib
 import io
 
+import networkx as nx
+
 from src.common.tensors.topological_reducer import (
     reduce_abstract_tensor_topology,
 )
@@ -1307,4 +1309,59 @@ def repro(xs, ys, flag):
         compile_ast_aot(
             source, "repro", {"xs": xs, "ys": ys, "flag": flag},
             precompile_only=True,
+        )
+
+
+def test_subscript_write_to_attribute_field_orders_before_later_bare_read():
+    """``obj.field[i, j] = ...`` must order before a later bare ``obj.field``
+    read of the same field -- see ``tools/HANDOFF_2026-08-17_CRASH.md``. The
+    read node used to depend only on the receiver (``state``), never on the
+    element-wise write, so nothing stopped the scheduler from placing the
+    read before the loop that produces the field's contents.
+    """
+    module = ast.parse(
+        """
+def kernel(state):
+    for row in range(2):
+        for col in range(2):
+            state.next_height[row, col] = 1.0
+    state.height = state.next_height + 0.0
+    return state
+"""
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("kernel").graph
+
+    indexed_store = next(
+        node_id
+        for node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "IndexedStore"
+    )
+    next_height_reads = [
+        node_id
+        for node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "GetAttr"
+        and (data.get("attributes") or {}).get("attribute") == "next_height"
+    ]
+    # One GetAttr resolves ``state.next_height`` as the IndexedStore's own
+    # ``base`` (inside the loop); the other is the post-loop bare read
+    # feeding ``state.next_height + 0.0``. Exclude the store's own base.
+    base_parents = {
+        parent
+        for parent, role in function_graph.G.nodes[indexed_store]["parents"]
+        if role == "base"
+    }
+    post_loop_reads = [
+        node_id for node_id in next_height_reads if node_id not in base_parents
+    ]
+    assert post_loop_reads, "expected a bare post-loop read of state.next_height"
+    for read_id in post_loop_reads:
+        assert nx.has_path(function_graph.G, indexed_store, read_id), (
+            "the post-loop read of state.next_height must be ordered after "
+            "the loop's element-wise write to it"
         )

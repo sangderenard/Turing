@@ -891,6 +891,12 @@ def _normalize_lexical_values(
     materialized_attribute_nodes: dict[int, int] = {}
     static_constant_nodes: dict[str, int] = {}
     static_attribute_values: dict[tuple[int, str], int] = {}
+    # The most recent node that mutated ``(receiver_node_id, attr)`` --
+    # a whole-attribute ``SetAttr`` or an element-wise ``obj.field[i, j] =``
+    # ``IndexedStore``.  A later bare read of the same field consults this so
+    # the read is ordered after the write instead of depending only on the
+    # unchanged receiver node (see the read side in ``resolve_expression``).
+    attribute_effect_nodes: dict[tuple[int, str], int] = {}
     parameter_names = set(function_parameter_names(statement))
     # A parameter annotated with a locally-defined class name gives a
     # receiver a real, known class identity at ingestion -- enough to
@@ -1624,10 +1630,28 @@ def _normalize_lexical_values(
                         },
                     )
                     materialized_attribute_nodes[expression_id] = attribute_id
+                read_inputs: list[tuple[int, str]] = [(receiver, "value")]
+                last_write = attribute_effect_nodes.get(
+                    (receiver, expression.attr)
+                )
+                # Order this read after the most recent recorded write to the
+                # same field -- a whole-attribute ``SetAttr`` or an
+                # element-wise ``obj.field[i, j] = ...`` ``IndexedStore`` --
+                # so the scheduler cannot place a stale read before the
+                # write that produced the field's current contents (see
+                # ``attribute_effect_nodes``/``bind_target``). This is a pure
+                # ordering edge, not a value producer: the read still reads
+                # through ``receiver``, an in-place mutation.
+                if (
+                    last_write is not None
+                    and last_write in graph.G
+                    and last_write != attribute_id
+                ):
+                    read_inputs.append((last_write, "after_write"))
                 _replace_inputs(
                     graph,
                     attribute_id,
-                    ((receiver, "value"),),
+                    tuple(read_inputs),
                 )
                 if isinstance(expression.value, ast.Name):
                     # Mirror ``SetAttr``'s ``attribute_slot`` (see
@@ -2301,6 +2325,7 @@ def _normalize_lexical_values(
                 static_attribute_values[
                     (id(static_receiver.value), target.attr)
                 ] = value
+            attribute_effect_nodes[(receiver, target.attr)] = node_id
             # A plain-named receiver (``counter.value = ...``) gets its own
             # identity binding the same way a bare ``ast.Name`` target does
             # above -- the field write is already a real, correctly wired
@@ -2415,6 +2440,21 @@ def _normalize_lexical_values(
             )
             if isinstance(target.value, ast.Name):
                 bind_target(target.value, node_id)
+            elif isinstance(target.value, ast.Attribute) and isinstance(
+                target.value.value, ast.Name
+            ):
+                # ``obj.field[i, j] = ...`` mutates ``obj.field`` in place
+                # without rebinding ``obj`` itself, so the ``ast.Name`` path
+                # above never fires here. Record the mutation the same way a
+                # whole-attribute ``SetAttr`` does, keyed by the resolved
+                # receiver of ``obj`` (not ``base``, which is the GetAttr
+                # node for ``obj.field`` and does not change), so a later
+                # bare read of ``obj.field`` can depend on this write.
+                outer_receiver = resolve_expression(target.value.value)
+                if isinstance(outer_receiver, int):
+                    attribute_effect_nodes[
+                        (outer_receiver, target.value.attr)
+                    ] = node_id
             return
         if isinstance(target, (ast.Tuple, ast.List)):
             if isinstance(value, _StaticPythonReference):

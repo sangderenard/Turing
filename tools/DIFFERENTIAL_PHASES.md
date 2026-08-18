@@ -739,3 +739,57 @@ this needs to handle it once, generally, for any mutable record field
 under this pattern -- not specifically for `height`/`next_height`, since
 `momentum_x`/`momentum_y`/`tracer` follow the identical authored pattern
 at lines 68-70 and would carry the identical missing edge.
+
+### Fix applied and verified against the real source (2026-08-17, later same day)
+
+Implemented the fix in `src/common/tensors/topological_reducer.py`
+(`_normalize_lexical_values`): a new `attribute_effect_nodes` table, keyed
+by `(receiver_node_id, attribute_name)`, records the most recent node that
+mutated a field -- either a whole-attribute `SetAttr` (`obj.field = ...`)
+or an element-wise `IndexedStore` (`obj.field[i, j] = ...`, previously
+untracked entirely: `bind_target`'s `ast.Subscript` branch only recursed
+into `bind_target` for a plain-`Name` target, silently skipping the
+`ast.Attribute` case). On the read side, `resolve_expression`'s
+`ast.Attribute` branch now looks up `attribute_effect_nodes` for the
+resolved receiver and, if a write is recorded, adds it as an extra
+`"after_write"` parent edge on the `GetAttr` node -- a pure ordering edge,
+verified against `reduce_scheduled_shader_regions`
+(`process_graph_fusion.py`), which topologically sorts on every edge in
+the planning graph regardless of role, so this is sufficient to constrain
+the scheduler.
+
+General fix, not field-specific, as required: it triggers on any
+`(receiver, attribute)` pair, keyed by the resolved receiver node, not by
+name string matching `"height"`.
+
+**Verified two ways, both read-only / safe-by-construction (no
+`extraction_contract=None`, no `resolve_unresolved_parents=True`, so
+`_expand_unresolved_ast_parents` / the x86 read-head decompiler is never
+reached):**
+
+1. A new regression test,
+   `tests/test_abstract_tensor_topological_reducer.py::test_subscript_write_to_attribute_field_orders_before_later_bare_read`,
+   on a minimal synthetic `obj.field[i, j] = ...` / `obj.field` repro.
+   Passes. Full file: 40 passed, 1 deselected (a pre-existing, unrelated
+   failure -- `test_method_resolution_follows_an_authored_function_returned_class`,
+   confirmed to fail identically on the pre-fix code via `git stash`, not
+   caused by this change).
+2. `tools/verify_fluid_field_ordering.py` (new, kept for reuse): parses
+   the real `SYMBOLIC_FLUID_DT_SOURCE`, builds its ProcessGraph exactly as
+   `lower_ast_source_to_ssa` does (`graph.build_from_ast` +
+   `reduce_abstract_tensor_topology`, confirmed at
+   `fortran_c_shell.py:9524` to be the same call the real compiler makes),
+   and checks all four fields. Result: `height`, `momentum_x`,
+   `momentum_y`, `tracer` each show exactly one `IndexedStore` write and
+   one post-loop `GetAttr` read, with a graph path from the write to the
+   read in all four cases (`ordered_ok=True`).
+
+**Not yet done:** the actual whole-program native build/run
+(`tools/build_fluid_c_shell.py`, via `symbolic_fluid_direct_control.py`,
+the contract-bearing path) has not been re-run to confirm the *emitted*
+region call order now matches and the simulator produces non-zero, sane
+`state.height`/momentum/tracer output at runtime -- only the ProcessGraph
+edge itself has been confirmed present. That is the real end-to-end
+check and the natural next step, using the ordinary default contract
+(never `None`), ideally run alone rather than alongside other heavy
+builds given host stability history this session.

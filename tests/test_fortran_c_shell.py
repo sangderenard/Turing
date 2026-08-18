@@ -914,74 +914,57 @@ def test_nested_if_threads_inner_phi_into_outer_phi():
 
 
 def test_pursued_re_compile_uses_one_external_multikey_table_contract():
-    import ast
-    import contextlib
-    import io
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
-    from src.common.tensors.topological_reducer import (
-        reduce_abstract_tensor_topology,
+    contract = (
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts"
+        / "program_extraction.yaml"
     )
-    from src.compiler.fortran_c_shell import _field_slot_ops
-    from src.transmogrifier.graph.graph_express2 import ProcessGraph
-
-    graph = ProcessGraph(materialize_memory=False)
-    graph.python_bindings = {"compile_re": re._compile}
-    with contextlib.redirect_stdout(io.StringIO()):
-        graph.build_from_ast(
-            ast.parse(
-                "def entry(pattern, flags):\n"
-                "    return compile_re(pattern, flags)\n"
-            ),
-            resolve_unresolved_parents=True,
-        )
-    reduce_abstract_tensor_topology(graph)
-    operations = _field_slot_ops(
-        graph.function_table.entry("_compile").graph.G
+    source = (
+        "def entry(pattern, flags):\n"
+        "    return compile_re(pattern, flags)\n"
     )
-
-    declarations = operations[8]
-    lookups = operations[10]
-    stores = operations[11]
-    deletions = operations[12]
-    compiled_cache = tuple(
-        declaration for declaration in declarations
-        if declaration[2] == 4
+    module, outputs, exports = lower_ast_source_to_ssa(
+        source,
+        "entry",
+        python_bindings={"compile_re": re._compile},
+        name="re_compile_probe",
+        extraction_contract=contract,
     )
-    assert len(compiled_cache) == 1
-    sequence_id, policy, column_count, writable = compiled_cache[0]
-    assert (policy, column_count, writable) == ("unique", 4, True)
-    assert len(lookups) == len(stores) == len(deletions) == 1
-    assert len(lookups[0][1]) == 3
-    assert len(stores[0][1]) == 3
-    assert lookups[0][2] == stores[0][3] == deletions[0][2] == sequence_id
-    assert deletions[0][3] == "external._cache"
+    compile_function = module.functions["re_compile_probe___compile"]
+    operations = [
+        instruction.attributes.get("ssa_sequence_operation")
+        for block in compile_function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("ssa_sequence_operation")
+    ]
+    assert "lookup" in operations
+    assert "table_store" in operations
+    assert "table_delete_first" in operations
 
 
 def test_pursued_networkx_remove_node_emits_complete_nested_table_ssa():
     import networkx as nx
 
-    from src.common.tensors.accelerator_backends.aot_compile import (
-        compile_ast_aot,
-    )
-    from src.compiler.fortran_c_shell import _class_surface_ssa_program
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.ssa_fortran_backend import emit_module
 
+    contract = (
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts"
+        / "program_extraction.yaml"
+    )
     source = (
         "def entry(graph, node):\n"
         "    return remove(graph, node)\n"
     )
-    compilation = compile_ast_aot(
+    module, outputs, exports = lower_ast_source_to_ssa(
         source,
         "entry",
-        {"graph": 1.0, "node": 1.0},
         python_bindings={"remove": nx.DiGraph.remove_node},
-        precompile_only=True,
-        bake_mode="whole_program",
-        require_planned_shells=True,
-        project_captured_hierarchy=False,
-    )
-    module, outputs, exports = _class_surface_ssa_program(
-        compilation, "networkx_remove_probe"
+        name="networkx_remove_probe",
+        extraction_contract=contract,
     )
     emitted = emit_module(
         module,
@@ -1035,28 +1018,24 @@ def test_pursued_networkx_remove_node_emits_complete_nested_table_ssa():
 
 
 def test_pursued_re_compile_closure_emits_complete_fortran_ssa():
-    from src.common.tensors.accelerator_backends.aot_compile import (
-        compile_ast_aot,
-    )
-    from src.compiler.fortran_c_shell import _class_surface_ssa_program
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.ssa_fortran_backend import emit_module
 
+    contract = (
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts"
+        / "program_extraction.yaml"
+    )
     source = (
         "def entry(pattern, flags):\n"
         "    return compile_re(pattern, flags)\n"
     )
-    compilation = compile_ast_aot(
+    module, outputs, exports = lower_ast_source_to_ssa(
         source,
         "entry",
-        {"pattern": 1.0, "flags": 0.0},
         python_bindings={"compile_re": re._compile},
-        precompile_only=True,
-        bake_mode="whole_program",
-        require_planned_shells=True,
-        project_captured_hierarchy=False,
-    )
-    module, outputs, exports = _class_surface_ssa_program(
-        compilation, "re_compile_probe"
+        name="re_compile_probe",
+        extraction_contract=contract,
     )
     emitted = emit_module(
         module,
@@ -1650,8 +1629,147 @@ def test_generated_c_shell_uses_win32_rgb_blit_from_shared_io_contract():
     assert "PeekMessageA(" in source
     assert "SDL" not in source
     assert "pygame" not in source
-    assert "turing_display_present(" in source
+    assert "turing_display_present_layered(" in source
     assert "#include <stdbool.h>" in source
+
+
+def test_generated_c_shell_uses_win32_rgba_blit_from_shared_io_contract():
+    """A single alpha-blended layer: one NULL-free entry in every array."""
+
+    parameters = (
+        Parameter(
+            "extent_4", "extent", "int32", "int32_t", "c_int32", "value",
+        ),
+        *(
+            Parameter(
+                channel, "output", "float64", "double", "c_double",
+                "reference", (4,), "extent_4", channel,
+            )
+            for channel in ("red", "green", "blue", "alpha")
+        ),
+    )
+    shell_io = {
+        "requirements": {
+            "requests": [{
+                "capability": "display_double_buffer",
+                "optional": False,
+                "attributes": {
+                    "pixel_format": "rgba_f64_planar",
+                    "width": 2,
+                    "height": 2,
+                    "title": "Generated RGBA",
+                },
+            }],
+            "bindings": [
+                {
+                    "resource": f"display.{channel}",
+                    "entry_point": "rgba",
+                    "parameter": channel,
+                }
+                for channel in ("red", "green", "blue", "alpha")
+            ],
+            "options": [],
+        },
+        "abi": {},
+    }
+    api = CompiledProgramAPI(
+        module="rgba_fortran",
+        language="fortran",
+        entry="rgba",
+        entry_points=(EntryPoint(
+            name="rgba", symbol="rgba", kind="numerical",
+            parameters=parameters,
+        ),),
+        metadata={"shell_io": shell_io},
+    )
+    module = FortranModule("rgba_fortran", "", api=api)
+
+    source = emit_fortran_c_shell_source(
+        module, extent_overrides={"extent_4": 4}
+    )
+
+    assert "turing_display_present_layered(" in source
+    assert "turing_display_alpha_layers[1] = {" in source
+    assert "NULL" not in re.search(
+        r"turing_display_alpha_layers\[1\] = \{ (.*?) \};", source
+    ).group(1)
+
+
+def test_generated_c_shell_uses_win32_layered_blit_from_shared_io_contract():
+    """Two layers: an opaque base (no alpha binding) under an alpha overlay."""
+
+    def _channel_parameter(name):
+        return Parameter(
+            name, "output", "float64", "double", "c_double",
+            "reference", (4,), "extent_4", name,
+        )
+
+    parameters = (
+        Parameter(
+            "extent_4", "extent", "int32", "int32_t", "c_int32", "value",
+        ),
+        _channel_parameter("base_r"), _channel_parameter("base_g"),
+        _channel_parameter("base_b"),
+        _channel_parameter("overlay_r"), _channel_parameter("overlay_g"),
+        _channel_parameter("overlay_b"), _channel_parameter("overlay_a"),
+    )
+    layer_bindings = {
+        0: {"red": "base_r", "green": "base_g", "blue": "base_b"},
+        1: {
+            "red": "overlay_r", "green": "overlay_g", "blue": "overlay_b",
+            "alpha": "overlay_a",
+        },
+    }
+    shell_io = {
+        "requirements": {
+            "requests": [{
+                "capability": "display_double_buffer",
+                "optional": False,
+                "attributes": {
+                    "pixel_format": "rgba_f64_planar_layered",
+                    "layer_count": 2,
+                    "width": 2,
+                    "height": 2,
+                    "title": "Generated layered",
+                },
+            }],
+            "bindings": [
+                {
+                    "resource": f"display.layer{layer}.{channel}",
+                    "entry_point": "layered",
+                    "parameter": parameter,
+                }
+                for layer, channels in layer_bindings.items()
+                for channel, parameter in channels.items()
+            ],
+            "options": [],
+        },
+        "abi": {},
+    }
+    api = CompiledProgramAPI(
+        module="layered_fortran",
+        language="fortran",
+        entry="layered",
+        entry_points=(EntryPoint(
+            name="layered", symbol="layered", kind="numerical",
+            parameters=parameters,
+        ),),
+        metadata={"shell_io": shell_io},
+    )
+    module = FortranModule("layered_fortran", "", api=api)
+
+    source = emit_fortran_c_shell_source(
+        module, extent_overrides={"extent_4": 4}
+    )
+
+    assert "turing_display_present_layered(" in source
+    assert "            2," in source
+    alpha_array = re.search(
+        r"turing_display_alpha_layers\[2\] = \{ (.*?) \};", source
+    ).group(1)
+    entries = [entry.strip() for entry in alpha_array.split(",")]
+    assert entries[0] == "NULL"
+    assert entries[1] != "NULL"
 
 
 def test_generated_c_shell_reads_declared_file_port_into_bound_abi_parameters():

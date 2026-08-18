@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import pickle
+import sys as _sys
 
 from src.compiler.ssa_fortran_backend import emit_module
 from src.compiler.fortran_c_shell import compile_fortran_module_c_shell
@@ -39,9 +40,90 @@ def _resolve(source: str, roots: dict) -> object:
     return value
 
 
+#: Source trees that feed the SSA lowering this pickle caches. Broader than
+#: ``symbolic_fluid_native_runtime.py``'s own ``_cache_is_stale`` (which only
+#: scans ``src/compiler``): a fix can land in ``src/common`` (the dt
+#: controller) or ``src/transmogrifier`` (AST ingestion) just as easily, and
+#: missing one of those was exactly the trap that made a real source fix look
+#: like it "didn't work" -- the pickle was silently reused unchanged.
+_LOWERING_SOURCE_ROOTS = ("src/compiler", "src/common", "src/transmogrifier")
+
+#: Non-Python inputs that also feed the lowering: the program ABI contract
+#: (declared record fields crossing the Python/native boundary) changes the
+#: compiled output just as much as a ``.py`` edit does. A field missing here
+#: is silently dropped during lowering with no error -- the same "fix looks
+#: like it didn't work" trap ``_LOWERING_SOURCE_ROOTS`` exists to avoid.
+_LOWERING_SOURCE_FILES = ("extraction_contracts/program_extraction.yaml",)
+
+
+def _pickle_is_stale(pkl_path: Path) -> tuple[bool, str | None]:
+    try:
+        stamp = pkl_path.stat().st_mtime
+    except OSError:
+        return True, None
+    newest = 0.0
+    newest_path: Path | None = None
+    for relative_root in _LOWERING_SOURCE_ROOTS:
+        root = ROOT / relative_root
+        if not root.is_dir():
+            continue
+        for source in root.rglob("*.py"):
+            if "__pycache__" in source.parts:
+                continue
+            try:
+                when = source.stat().st_mtime
+            except OSError:
+                continue
+            if when > newest:
+                newest, newest_path = when, source
+    for relative_file in _LOWERING_SOURCE_FILES:
+        source = ROOT / relative_file
+        try:
+            when = source.stat().st_mtime
+        except OSError:
+            continue
+        if when > newest:
+            newest, newest_path = when, source
+    if newest <= stamp:
+        return False, None
+    return True, (str(newest_path) if newest_path is not None else None)
+
+
+def _regenerate_pickle(pkl_path: Path, *, max_memory_gb: float = 6.0) -> None:
+    from src.compiler.symbolic_fluid_direct_control import bounded_compile
+
+    report = bounded_compile(pkl_path.parent, max_memory_gb=max_memory_gb)
+    print(
+        "[stale-cache] regenerated "
+        f"{pkl_path}: {report.get('function_count')} function(s), "
+        f"completed={report.get('completed')}",
+        file=_sys.stderr,
+    )
+    if not report.get("completed"):
+        raise SystemExit(
+            "auto-regeneration of the SSA pickle failed: "
+            f"{report!r}"
+        )
+
+
 def build(pkl_path: Path, directory: Path, *, grid: int = 32,
           frame_duration: float = 1.0 / 30.0, dt_initial: float = 1.0e-3,
-          trace: bool = False):
+          trace: bool = False, auto_regenerate: bool = True):
+    if auto_regenerate:
+        stale, newer_than = _pickle_is_stale(pkl_path)
+        if stale:
+            reason = (
+                f"predates {newer_than}" if newer_than is not None
+                else "is missing"
+            )
+            print(
+                f"[stale-cache] {pkl_path} {reason}; re-lowering before "
+                "compiling Fortran. A cached lowering is not trusted once "
+                "the compiler that produced it has changed.",
+                file=_sys.stderr,
+            )
+            _regenerate_pickle(pkl_path)
+
     with pkl_path.open("rb") as stream:
         module, outputs, exports = pickle.load(stream)
 

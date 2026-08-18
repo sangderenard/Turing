@@ -35,6 +35,16 @@ class SymbolicFluidGridState:
     linear_drag: float
     coriolis: float
     minimum_height: float
+    # Plain scalar record fields, not derived from ``height.shape`` inside
+    # the compiled program: ``X.shape[i]`` on a dynamically-sized array
+    # parameter has no lowering path to a local instruction in the AOT
+    # compiler (its loop-bound expression walker only recurses through
+    # literals/parameters/arithmetic -- see loop_composer.py's
+    # ``control_scalar_expression``), so it was hoisted as an unbound
+    # external parameter and arrived zero at runtime. A record field reads
+    # the same way ``dx``/``gravity`` already do correctly.
+    height_count: int
+    width_count: int
     last_wave_speed: float = 0.0
     last_height_violation: float = 0.0
     last_tracer_violation: float = 0.0
@@ -76,6 +86,8 @@ class SymbolicFluidGridState:
             linear_drag=linear_drag,
             coriolis=0.08,
             minimum_height=1.0e-4,
+            height_count=int(height),
+            width_count=int(width),
         )
 
     def copy_shallow(self):
@@ -103,8 +115,8 @@ def symbolic_fluid_advance(state, dt):
     max_wave_speed = 0.0
     max_height_violation = 0.0
     max_tracer_violation = 0.0
-    height_count = state.height.shape[0]
-    width_count = state.height.shape[1]
+    height_count = state.height_count
+    width_count = state.width_count
     for row in range(height_count):
         north = (row - 1) % height_count
         south = (row + 1) % height_count

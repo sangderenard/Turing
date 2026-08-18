@@ -1841,10 +1841,9 @@ class _ControlSSABuilder:
     def emit_region_call(self, region_index: int, *, location: str) -> None:
         if self.emit_table_region_operations(region_index):
             return
-        callee = self.region_callees.get(
-            region_index,
-            f"numerical_region_{region_index}",
-        )
+        if region_index not in self.region_callees:
+            return
+        callee = self.region_callees[region_index]
         feeds, outputs = self.region_signatures.get(
             region_index, ((), ())
         )

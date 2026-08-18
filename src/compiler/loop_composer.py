@@ -3262,6 +3262,17 @@ def analyze_shader_loop_reductions(
                     if producer in body_region_positions
                 ),
             ))
+        import os as _os, sys as _sys
+        if _os.environ.get("TURING_DEBUG_LOOP_ORDER"):
+            _fn = graph.G.graph.get("function_name")
+            print(
+                f"DEBUGLOOP fn={_fn} loop_node={int(loop.node_id)} "
+                f"body_region_indices={body_region_indices} "
+                f"body_region_positions={body_region_positions} "
+                f"region_dependencies_edges={list(region_dependencies.edges())} "
+                f"region_members={ {i: tuple(regions[i]) for i in body_region_indices} }",
+                file=_sys.stderr,
+            )
         condition = set(map(int, loop.condition_nodes))
         condition_region_indices = tuple(
             index

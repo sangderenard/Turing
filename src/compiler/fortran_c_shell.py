@@ -261,8 +261,32 @@ def _c_string(value: str) -> str:
     return json.dumps(str(value))
 
 
+# Pixel formats the native C shell's presenter understands, and whether each
+# carries a per-pixel alpha channel.  ``rgba_f64_planar_layered`` is the only
+# multi-layer format; its layer count comes from the request's own
+# ``layer_count`` attribute rather than the format name.
+_DISPLAY_PIXEL_FORMATS = {
+    "rgb_f64_planar": False,
+    "rgba_f64_planar": True,
+    "rgba_f64_planar_layered": True,
+}
+
+
 def _display_configuration(module: Any, entry: Any) -> dict[str, Any] | None:
-    """Resolve an optional declarative display request from the shared IO ABI."""
+    """Resolve an optional declarative display request from the shared IO ABI.
+
+    Three presenter shapes share one physical contract (a caller-owned
+    per-layer red/green/blue[/alpha] output array, resolved by name):
+    a plain opaque blit (``rgb_f64_planar``), an alpha-blended single-layer
+    blit (``rgba_f64_planar``), and an alpha-composited stack of layers
+    (``rgba_f64_planar_layered``, back-to-front "over" compositing, one
+    request attribute ``layer_count``).  ``prefers_compute``/
+    ``prefers_accelerator`` are declared deployment hints, not consumed by
+    this presenter (the only backend registered today is host-native GDI,
+    which has no compute/accelerator distinction to honor) -- they are
+    validated and carried through so a future GL/compute-capable wrapper can
+    read them without a second display-request format.
+    """
 
     metadata = dict(getattr(module.api, "metadata", {}) or {})
     shell_io = metadata.get("shell_io") or {}
@@ -277,11 +301,22 @@ def _display_configuration(module: Any, entry: Any) -> dict[str, Any] | None:
         raise ValueError("C shell requires one display_double_buffer request")
     attributes = dict(requests[0].get("attributes") or {})
     pixel_format = str(attributes.get("pixel_format", "rgb_f64_planar"))
-    if pixel_format != "rgb_f64_planar":
+    has_alpha = _DISPLAY_PIXEL_FORMATS.get(pixel_format)
+    if has_alpha is None:
         raise ValueError(
-            "native C shell currently supports display pixel format "
-            "'rgb_f64_planar'; got " + repr(pixel_format)
+            "native C shell currently supports display pixel formats "
+            + ", ".join(map(repr, sorted(_DISPLAY_PIXEL_FORMATS)))
+            + f"; got {pixel_format!r}"
         )
+    if pixel_format == "rgba_f64_planar_layered":
+        layer_count = int(attributes.get("layer_count", 0))
+        if layer_count < 1:
+            raise ValueError(
+                "rgba_f64_planar_layered display requires a positive "
+                "layer_count attribute"
+            )
+    else:
+        layer_count = 1
     width = int(attributes.get("width", 0))
     height = int(attributes.get("height", 0))
     if width < 1 or height < 1:
@@ -292,27 +327,62 @@ def _display_configuration(module: Any, entry: Any) -> dict[str, Any] | None:
         if str(binding.get("entry_point")) == str(entry.name)
         and str(binding.get("resource", "")).startswith("display.")
     }
-    missing = {f"display.{channel}" for channel in ("red", "green", "blue")} - set(bindings)
+    layered = pixel_format == "rgba_f64_planar_layered"
+    # Every layer needs red/green/blue.  Alpha is mandatory for the
+    # single-layer alpha format (that is the whole point of requesting it)
+    # but optional per layer within a layered stack -- a layer with no
+    # alpha binding is simply opaque, matching the presenter's own
+    # ``alpha_layers[layer] ? ... : 1.0`` fallback.
+    required_channels = ("red", "green", "blue", "alpha") if (
+        has_alpha and not layered
+    ) else ("red", "green", "blue")
+    optional_channels = ("alpha",) if layered else ()
+
+    def _resource(layer: int, channel: str) -> str:
+        return f"display.layer{layer}.{channel}" if layered else f"display.{channel}"
+
+    missing = {
+        _resource(layer, channel)
+        for layer in range(layer_count)
+        for channel in required_channels
+    } - set(bindings)
     if missing:
         raise ValueError(
-            "rgb_f64_planar display lacks bindings: "
-            + ", ".join(sorted(missing))
+            f"{pixel_format} display lacks bindings: " + ", ".join(sorted(missing))
         )
     parameters = {parameter.name: parameter for parameter in entry.parameters}
-    channels = []
-    for resource in ("display.red", "display.green", "display.blue"):
-        parameter = parameters.get(bindings[resource])
-        if parameter is None or parameter.role != "output":
-            raise ValueError(f"{resource} must bind an output ABI parameter")
-        if str(parameter.c_type) != "double":
-            raise ValueError(f"{resource} must bind a float64 output")
-        channels.append(parameter.name)
+    layers = []
+    for layer in range(layer_count):
+        channels = {}
+        for channel in (*required_channels, *optional_channels):
+            resource = _resource(layer, channel)
+            if resource not in bindings:
+                continue
+            parameter = parameters.get(bindings[resource])
+            if parameter is None or parameter.role != "output":
+                raise ValueError(f"{resource} must bind an output ABI parameter")
+            if str(parameter.c_type) != "double":
+                raise ValueError(f"{resource} must bind a float64 output")
+            channels[channel] = parameter.name
+        layers.append(channels)
     return {
         "width": width,
         "height": height,
         "title": str(attributes.get("title", "Turing native display")),
-        "channels": tuple(channels),
+        "pixel_format": pixel_format,
+        "has_alpha": has_alpha,
+        # One dict per layer, {"red": param_name, "green": ..., ...};
+        # opaque formats simply omit the "alpha" key per layer.
+        "layers": tuple(layers),
+        # Back-compat single-layer accessor: every existing caller reads
+        # ``display["channels"]`` for the (always exactly rgb) case.
+        "channels": (
+            tuple(layers[0][channel] for channel in ("red", "green", "blue"))
+            if layer_count == 1 else ()
+        ),
         "frame_delay_ms": max(0, int(attributes.get("frame_delay_ms", 0))),
+        "prefers_compute": bool(attributes.get("prefers_compute", False)),
+        "prefers_accelerator": bool(attributes.get("prefers_accelerator", False)),
     }
 
 
@@ -411,16 +481,17 @@ def emit_fortran_c_shell_source(
     }
     if display is not None:
         expected_pixels = int(display["width"]) * int(display["height"])
-        for parameter_name in display["channels"]:
-            parameter = next(
-                item for item in values if item.name == parameter_name
-            )
-            if _element_count(parameter, extents) != expected_pixels:
-                raise ValueError(
-                    f"display channel {parameter_name!r} has "
-                    f"{_element_count(parameter, extents)} elements; expected "
-                    f"{expected_pixels}"
+        for layer in display["layers"]:
+            for parameter_name in layer.values():
+                parameter = next(
+                    item for item in values if item.name == parameter_name
                 )
+                if _element_count(parameter, extents) != expected_pixels:
+                    raise ValueError(
+                        f"display channel {parameter_name!r} has "
+                        f"{_element_count(parameter, extents)} elements; expected "
+                        f"{expected_pixels}"
+                    )
     feedback = dict(state_feedback or {})
     missing_feedback = {
         name
@@ -585,9 +656,13 @@ def emit_fortran_c_shell_source(
     display_close_lines: list[str] = []
     default_frames = "1"
     if display is not None:
-        red_slot, green_slot, blue_slot = (
-            slot_by_parameter[name] for name in display["channels"]
-        )
+        layer_slots = [
+            {
+                channel: slot_by_parameter[name]
+                for channel, name in layer.items()
+            }
+            for layer in display["layers"]
+        ]
         width = int(display["width"])
         height = int(display["height"])
         title = _c_string(display["title"])
@@ -676,19 +751,38 @@ static unsigned int turing_display_channel(double value) {
     return (unsigned int)(value + 0.5);
 }
 
-static void turing_display_present(
-    const double *red, const double *green, const double *blue
+static void turing_display_present_layered(
+    int layer_count,
+    const double *const *red_layers,
+    const double *const *green_layers,
+    const double *const *blue_layers,
+    const double *const *alpha_layers
 ) {
     BITMAPINFO information = {0};
     RECT client;
     HDC device;
     size_t index;
+    int layer;
     size_t count = (size_t)turing_display_width * (size_t)turing_display_height;
+    // Back-to-front "over" compositing. A layer with no alpha binding
+    // (alpha_layers[layer] == NULL) is opaque -- the single-layer
+    // rgb_f64_planar/rgba_f64_planar cases are this loop with
+    // layer_count == 1, not a separate code path.
     for (index = 0; index < count; ++index) {
-        unsigned int r = turing_display_channel(red[index]);
-        unsigned int g = turing_display_channel(green[index]);
-        unsigned int b = turing_display_channel(blue[index]);
-        turing_display_pixels[index] = b | (g << 8) | (r << 16);
+        double out_r = 0.0, out_g = 0.0, out_b = 0.0;
+        for (layer = 0; layer < layer_count; ++layer) {
+            double a = alpha_layers[layer]
+                ? alpha_layers[layer][index] / 255.0 : 1.0;
+            if (a <= 0.0) continue;
+            if (a > 1.0) a = 1.0;
+            out_r = red_layers[layer][index]   * a + out_r * (1.0 - a);
+            out_g = green_layers[layer][index] * a + out_g * (1.0 - a);
+            out_b = blue_layers[layer][index]  * a + out_b * (1.0 - a);
+        }
+        turing_display_pixels[index] =
+            turing_display_channel(out_b)
+            | (turing_display_channel(out_g) << 8)
+            | (turing_display_channel(out_r) << 16);
     }
     information.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     information.bmiHeader.biWidth = turing_display_width;
@@ -723,11 +817,31 @@ static void turing_display_close(void) {
             "        turing_display_messages();",
             "        if (!turing_display_running) break;",
         ]
+        layer_count = len(layer_slots)
+
+        def _layer_array(channel: str, c_name: str) -> list[str]:
+            entries = ", ".join(
+                f"(const double *)slots[{slots[channel]}]" if channel in slots
+                else "NULL"
+                for slots in layer_slots
+            )
+            return [
+                f"        const double *{c_name}[{layer_count}] = {{ {entries} }};"
+            ]
+
         display_present_lines = [
-            "        turing_display_present(",
-            f"            (const double *)slots[{red_slot}],",
-            f"            (const double *)slots[{green_slot}],",
-            f"            (const double *)slots[{blue_slot}]);",
+            "        {",
+            *_layer_array("red", "turing_display_red_layers"),
+            *_layer_array("green", "turing_display_green_layers"),
+            *_layer_array("blue", "turing_display_blue_layers"),
+            *_layer_array("alpha", "turing_display_alpha_layers"),
+            "        turing_display_present_layered(",
+            f"            {layer_count},",
+            "            turing_display_red_layers,",
+            "            turing_display_green_layers,",
+            "            turing_display_blue_layers,",
+            "            turing_display_alpha_layers);",
+            "        }",
             "        turing_display_messages();",
         ]
         if int(display["frame_delay_ms"]) > 0:
@@ -2644,6 +2758,46 @@ def _class_surface_ssa_program(
             if selected_values:
                 graph_obj.graph["parameter_value_abi"] = selected_values
         control = getattr(shell, "shell_control_program", None)
+        import os as _os, sys as _sys
+        if _os.environ.get("TURING_DEBUG_REGION_ORDER"):
+            def _walk_markers(block, acc):
+                cls = type(block).__name__
+                if cls == "StatementBlock":
+                    for line in block.lines:
+                        if line.startswith("__scheduled_region_"):
+                            acc.append(line)
+                elif cls == "SequenceBlock":
+                    for child in block.blocks:
+                        _walk_markers(child, acc)
+                elif cls == "LoopBlock":
+                    acc.append(f"LOOP[{block.induction}](")
+                    _walk_markers(block.body, acc)
+                    acc.append(")")
+                elif cls == "WhileBlock":
+                    acc.append("WHILE(")
+                    _walk_markers(block.body, acc)
+                    acc.append(")")
+                elif cls == "ConditionalBlock":
+                    acc.append("IF(")
+                    _walk_markers(block.body, acc)
+                    if block.orelse is not None:
+                        acc.append("ELSE(")
+                        _walk_markers(block.orelse, acc)
+                        acc.append(")")
+                    acc.append(")")
+                elif cls == "CallBlock":
+                    acc.append("CALL(")
+                    _walk_markers(block.callee, acc)
+                    acc.append(")")
+                return acc
+            _markers = _walk_markers(control.root, []) if control is not None else None
+            print(
+                f"DEBUGCLASSSHELL fn={function_name} "
+                f"control_is_none={control is None} "
+                f"region_indices={getattr(control, 'region_indices', None)} "
+                f"root_markers={_markers}",
+                file=_sys.stderr,
+            )
         if control is None:
             continue
         # Some precompile-only shells retain the flat region schedule even
@@ -4003,6 +4157,19 @@ def _class_surface_ssa_program(
     record_parameter_specs: dict[tuple[str, str], Mapping[str, Any]] = {}
     record_parameter_by_value: dict[str, dict[int, tuple[str, str]]] = {}
     record_field_demands: dict[tuple[str, str], set[str]] = {}
+    # Which fields a function's OWN body writes locally (a direct SetAttr).
+    # ``record_field_demands`` (reads) is forwarded transitively below via
+    # ``record_forwarding_edges`` so a deep callee's need reaches every
+    # caller; writes need the identical treatment, or a caller several
+    # calls above the actual mutation sees its own post-call read of a
+    # mutable field as an ordinary, never-written value -- materializing a
+    # second, disconnected "input" copy that is permanently stuck at the
+    # field's pre-call snapshot while the real, correctly-threaded mutation
+    # flows through a separate value the caller's own read never resolves
+    # to (observed: ``last_wave_speed``/``last_height_violation``/
+    # ``last_tracer_violation``, each written only inside a deeply nested
+    # callee, stayed at their initial 0.0 in the compiled output).
+    record_field_writes: dict[tuple[str, str], set[str]] = {}
     for source_symbol, source_graph in source_graphs_by_symbol.items():
         identities = source_graph.graph.get("identity_table") or {}
         declared = dict(
@@ -4013,6 +4180,7 @@ def _class_surface_ssa_program(
             key = (str(source_symbol), str(parameter_name))
             record_parameter_specs[key] = record
             record_field_demands.setdefault(key, set())
+            record_field_writes.setdefault(key, set())
             parameter_ids = set(map(
                 int, identities.get(str(parameter_name), ())
             ))
@@ -4022,21 +4190,29 @@ def _class_surface_ssa_program(
                 str, dict(record.get("fields") or {})
             ))
             for node_id, data in source_graph.nodes(data=True):
-                if str(
+                operation = str(
                     data.get("type") or data.get("op") or ""
-                ).casefold() != "getattr":
+                ).casefold()
+                if operation not in {"getattr", "setattr"}:
                     continue
                 attribute = str(
                     (data.get("attributes") or {}).get("attribute") or ""
                 )
                 if attribute not in declared_fields:
                     continue
-                if any(
-                    int(parent) in parameter_ids
-                    and str(role) in {"value", "object", "base"}
+                roles = (
+                    {"value", "object", "base"} if operation == "getattr"
+                    else {"value", "object", "base", "receiver"}
+                )
+                if not any(
+                    int(parent) in parameter_ids and str(role) in roles
                     for parent, role in data.get("parents") or ()
                 ):
+                    continue
+                if operation == "getattr":
                     record_field_demands[key].add(attribute)
+                else:
+                    record_field_writes[key].add(attribute)
 
     record_forwarding_edges = []
     for caller_symbol, planned_call, caller_graph, _module, caller_shell in (
@@ -4092,6 +4268,15 @@ def _class_surface_ssa_program(
             if missing:
                 record_field_demands[caller_key].update(missing)
                 changed = True
+            missing_writes = (
+                record_field_writes.get(callee_key, set())
+                - record_field_writes.get(caller_key, set())
+            )
+            if missing_writes:
+                record_field_writes.setdefault(caller_key, set()).update(
+                    missing_writes
+                )
+                changed = True
 
     def materialize_parameter_record_abi(symbol: str, graph: Any) -> None:
         """Make contract-declared record fields ordinary physical SSA inputs.
@@ -4141,7 +4326,9 @@ def _class_surface_ssa_program(
                     and str(role) in {"value", "object", "base", "receiver"}
                     for parent, role in data.get("parents") or ()
                 )
-            }
+            } | record_field_writes.get(
+                (str(symbol), str(parameter_name)), set()
+            )
             write_source_ids_by_field: dict[str, tuple[int, ...]] = {}
             for _node_id, data in graph.nodes(data=True):
                 if (
@@ -6962,19 +7149,73 @@ def _class_surface_ssa_program(
                             argument_id = int(argument.id)
                             if argument_id in bound_frame_ids:
                                 continue
-                            caller_storage = clone_value(
-                                argument,
-                                next_value_id,
-                                accounting={
-                                    "linked_call_frame_storage": str(
-                                        record.callee_symbol
-                                    ),
-                                    "callsite_id": int(record.callsite_id),
-                                },
+                            # A callee argument that is a record field
+                            # (``program_abi_parameter``/``program_abi_field``
+                            # accounting) may already have its OWN physical
+                            # value in the caller -- e.g. the caller reads the
+                            # same mutable field directly elsewhere in its own
+                            # body (materialize_parameter_record_abi minted it
+                            # independently, before this call's frame was
+                            # known to need it too). Cloning a fresh value
+                            # here instead of reusing that one splits one
+                            # logical field into two disconnected physical
+                            # slots: only the freshly-cloned one is actually
+                            # threaded through the call and mutated, while
+                            # the caller's own pre-existing value (which may
+                            # be what the caller itself returns/reports)
+                            # stays frozen at its initial snapshot forever.
+                            # Observed exactly this way for
+                            # ``last_wave_speed``/``last_height_violation``/
+                            # ``last_tracer_violation``: written only inside a
+                            # deeply nested callee, each reported 0 in the
+                            # compiled output because the caller's own return
+                            # expression referenced the orphaned clone, not
+                            # the one the call chain actually mutated.
+                            field_key = None
+                            argument_accounting = dict(
+                                argument.accounting or {}
                             )
-                            next_value_id += 1
-                            caller.args.append(caller_storage)
-                            values[int(caller_storage.id)] = caller_storage
+                            parameter_name = argument_accounting.get(
+                                "program_abi_parameter"
+                            )
+                            field_name = argument_accounting.get(
+                                "program_abi_field"
+                            )
+                            if parameter_name is not None and field_name is not None:
+                                field_key = (str(parameter_name), str(field_name))
+                            existing_storage = None
+                            if field_key is not None:
+                                existing_storage = next((
+                                    caller_argument
+                                    for caller_argument in caller.args
+                                    if (
+                                        str(
+                                            (caller_argument.accounting or {})
+                                            .get("program_abi_parameter")
+                                        ),
+                                        str(
+                                            (caller_argument.accounting or {})
+                                            .get("program_abi_field")
+                                        ),
+                                    ) == field_key
+                                    and int(caller_argument.id) != argument_id
+                                ), None)
+                            if existing_storage is not None:
+                                caller_storage = existing_storage
+                            else:
+                                caller_storage = clone_value(
+                                    argument,
+                                    next_value_id,
+                                    accounting={
+                                        "linked_call_frame_storage": str(
+                                            record.callee_symbol
+                                        ),
+                                        "callsite_id": int(record.callsite_id),
+                                    },
+                                )
+                                next_value_id += 1
+                                caller.args.append(caller_storage)
+                                values[int(caller_storage.id)] = caller_storage
                             refreshed_frame_bindings.append((
                                 argument_id,
                                 "caller_storage",
