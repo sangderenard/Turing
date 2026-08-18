@@ -1,14 +1,22 @@
 """What may produce a loop-carried value, held as fact rather than folklore.
 
 ``aot_compile``'s docstring warns that simultaneous tuple assignment breaks
-the loop-carried binding analysis. That is one instance of a wider rule found
-by lowering one-variable-at-a-time cases through the canonical source
-compiler: the analysis cannot see across a CALL boundary either.
+the loop-carried binding analysis. Lowering one-variable-at-a-time cases
+through the canonical source compiler locates the wider rule, and it is not
+the obvious one. Calls are fine. What fails is the ROUND TRIP: when the
+carried value is a call's input and the call's result is bound back to that
+same carried name, the region's input and output fuse and the body publishes
+no distinct produced value.
 
-This matters for authoring, not just for the compiler. The natural spelling of
-a training loop -- ``w = adam_update(w, g, m, v)`` -- is precisely the form
-that does not lower, and the failure names an internal value id rather than
-the line that caused it, so it is hard to read backwards.
+The discriminator is that a call on some other value lowers, and a pure
+identity helper on the carried value fails -- there is nothing there to
+produce. One ordinary operation on the result restores it, because that
+forces a real instruction whose result is the carried value.
+
+This matters for authoring. ``w = adam_update(w, g, m, v)`` is the natural
+spelling of a training step and is exactly the round trip that does not
+lower, while the failure names an internal value id rather than the line
+that caused it.
 """
 from __future__ import annotations
 
@@ -68,7 +76,7 @@ def train(w, m, epochs):
     return total
 '''
 
-_CALL_RESULT = '''
+_CALL_ROUND_TRIP = '''
 def update(a):
     return a - 0.05 * a
 
@@ -81,6 +89,46 @@ def train(w, epochs):
     return total
 '''
 
+_CALL_ON_ANOTHER_VALUE = '''
+def update(a):
+    return a - 0.05 * a
+
+def train(w, seed, epochs):
+    total = update(w)
+    for _ in range(epochs):
+        next_w = update(seed)
+        w = next_w
+        total = w
+    return total
+'''
+
+_CALL_THEN_ONE_OPERATION = '''
+def update(a):
+    return a - 0.05 * a
+
+def train(w, epochs):
+    total = update(w)
+    for _ in range(epochs):
+        stepped = update(w)
+        next_w = stepped * 1.0
+        w = next_w
+        total = w
+    return total
+'''
+
+_IDENTITY_ROUND_TRIP = '''
+def passthrough(a):
+    return a
+
+def train(w, epochs):
+    total = passthrough(w)
+    for _ in range(epochs):
+        next_w = passthrough(w)
+        w = next_w
+        total = w
+    return total
+'''
+
 
 @pytest.mark.parametrize(
     ("label", "source"),
@@ -88,6 +136,12 @@ def train(w, epochs):
         ("inline-arithmetic", _INLINE),
         ("tensor-method", _TENSOR_METHOD),
         ("two-carried-values", _TWO_CARRIED),
+        # Calls are not the problem: this one consumes a value that is not
+        # the carried one, and lowers.
+        ("call-on-another-value", _CALL_ON_ANOTHER_VALUE),
+        # One ordinary operation on the result forces a real instruction whose
+        # result IS the carried value, which is enough.
+        ("call-then-one-operation", _CALL_THEN_ONE_OPERATION),
     ],
 )
 def test_a_carried_value_computed_in_the_body_lowers(label, source):
@@ -95,16 +149,25 @@ def test_a_carried_value_computed_in_the_body_lowers(label, source):
     assert module.functions
 
 
-def test_a_carried_value_produced_by_a_call_does_not_lower():
+@pytest.mark.parametrize(
+    ("label", "source"),
+    [
+        ("call-round-trip", _CALL_ROUND_TRIP),
+        # The clearest statement of the cause: a helper that returns its own
+        # argument produces nothing, so input and output fuse completely.
+        ("identity-round-trip", _IDENTITY_ROUND_TRIP),
+    ],
+)
+def test_a_carried_value_round_tripped_through_a_call_does_not_lower(label, source):
     """The restriction, pinned so it is a known limit and not a surprise.
 
-    If this ever starts passing, the analysis learned to see across a call
-    boundary -- delete the test and the docstring warning together, and the
-    natural spelling of a training loop becomes available.
+    If this ever starts passing, the analysis learned to see through the
+    input/output fusion -- delete the test and the docstring warning
+    together, and the natural spelling of a training loop is available.
     """
 
     with pytest.raises(Exception) as raised:
-        _lower(_CALL_RESULT, "carried_call_result")
+        _lower(source, f"carried_{label}")
     assert "loop_carried" in str(raised.value)
 
 

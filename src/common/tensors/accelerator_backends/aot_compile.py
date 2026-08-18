@@ -78,29 +78,45 @@ DO NOT USE SIMULTANEOUS TUPLE ASSIGNMENT FOR A LOOP-CARRIED VALUE.
         zx = next_zx.minimum(limit)
         zy = next_zy.minimum(limit)
 
-A CALL RESULT MAY NOT BE A LOOP-CARRIED VALUE EITHER.
+A CARRIED VALUE MAY NOT ROUND-TRIP THROUGH A CALL.
 
     for _ in range(n):
-        next_w = update(w, g)                                  # DOES NOT LOWER
+        next_w = update(w)                                     # DOES NOT LOWER
         w = next_w
 
     for _ in range(n):
-        next_w = w - 0.05 * g                                  # LOWERS
+        stepped = update(w)                                    # LOWERS
+        next_w = stepped * 1.0
         w = next_w
 
-Same diagnostic, same cause, different disguise: the call's result is
-produced in the callee's region, so from the loop body's point of view the
-carried update again has no producer.  A helper that RETURNS A TUPLE is the
-tuple case wearing a hat -- ``w = helper(...)`` binds the tuple temporary
-even though no tuple assignment is written at the call site.
+    for _ in range(n):
+        next_w = update(seed)                                  # LOWERS
+        w = next_w
 
-The cost is real and worth stating plainly, because it shapes how a training
-loop has to be authored: ``w = adam_update(w, g, m, v)`` is the natural
-spelling and is exactly the one that does not lower.  The update must be
-inlined into the loop body, one carried name per statement, each bound from
-body arithmetic or a tensor method.  Multiple carried values are fine
-(``m``, ``v`` and ``w`` together lower); it is the call boundary, not the
-count, that the analysis cannot see across.
+Calls are not the problem, and this is worth being exact about because the
+obvious reading -- "a call cannot produce a carried value" -- is wrong and
+would send someone inlining code that never needed it. A call on some OTHER
+value lowers fine. What fails is the round trip: when the carried value is
+the call's input AND the call's result is bound back to that same carried
+name, the region's input and output fuse, so the body publishes no distinct
+produced value and the carried update has no producer. A pure identity
+helper (``def passthrough(a): return a``) fails for the same reason, which
+is the clearest statement of it -- there is nothing there to produce.
+
+One ordinary operation on the result is enough to break the fusion, because
+it forces a real instruction in the body whose result IS the carried value.
+That is the cheap fix; inlining the whole helper is not required.
+
+A helper that RETURNS A TUPLE is the tuple case below wearing a hat:
+``w = helper(...)`` binds the tuple temporary even though no tuple
+assignment is written at the call site.
+
+This shapes how a training loop is authored. ``w = adam_update(w, g, m, v)``
+is the natural spelling and is exactly the round trip that does not lower.
+Either bind through one more operation, or inline the update with one
+carried name per statement. Multiple carried values are fine -- m, v and w
+together lower -- so it is the round trip, not the count, that the analysis
+cannot see through.
 
 A tuple assignment binds each name to a tuple temporary, so the loop's
 carried update names that temporary rather than a value any region
