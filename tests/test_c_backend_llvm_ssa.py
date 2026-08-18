@@ -20,6 +20,7 @@ from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
     translations_for_operation,
     validate_translation_table,
 )
+from src.common.tensors.abstraction import tensor_identity
 from src.common.tensors.autograd import autograd
 from src.common.tensors.numpy_backend import NumPyTensorOperations
 from src.common.tensors.operator_catalog import (
@@ -52,8 +53,16 @@ _REAL_TRANSLATED_SYMBOLS = {
     "count_true_double",
     "mask_select_double",
     "increment_mask_double",
+    # One kernel per value-precision cast, not one shared narrowing kernel:
+    # ``double`` is a copying identity under the double working type and
+    # ``bool`` is a zero test, neither of which is the float32 rounding
+    # ``float`` performs.  All four are real definitions in both languages --
+    # this list is the independent third party that says so, so it is written
+    # out rather than derived from TRANSLATIONS.
     "cast_double_to_int_values",
     "cast_double_to_float_values",
+    "cast_double_to_bool_values",
+    "cast_double_to_double_values",
     "sum_double",
     "create_arange",
 }
@@ -736,7 +745,10 @@ def test_abstract_tensor_tape_lowers_directly_to_real_c_kernel_llvm():
     lowered = lower_abstract_tensor_tape_to_llvm_ssa(tape, result)
 
     assert lowered.complete
-    assert lowered.feed_ids == (id(source),)
+    # The tape's own identity token, not a memory address: the lowering
+    # looks its nodes up in the tape and must report back in the same
+    # currency it looked them up with.
+    assert lowered.feed_ids == (tensor_identity(source),)
     assert "@abstract_tensor_tape" in lowered.llvm_ir
     assert "call void @binary_scalar_double" in lowered.llvm_ir
     assert "@tape.constant.0" in lowered.llvm_ir

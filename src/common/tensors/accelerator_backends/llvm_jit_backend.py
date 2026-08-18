@@ -14,6 +14,7 @@ from .artifact_cache import (
     RepositoryArtifactCache,
     implementation_digest,
 )
+from ..abstraction import tensor_identity
 from .c_backend_llvm_ssa import lower_abstract_tensor_tape_to_llvm_ssa
 from .profiled_c_shell import CLaunchProfile, profiled_c_shell
 from .tensor_torture import CapturedTortureCase
@@ -279,8 +280,10 @@ def compile_torture_case_to_llvm(
         raise LLVMJITShortfall(
             f"{captured.case.name} cannot lower completely to LLVM: {details}"
         )
+    # Keyed by the same token the lowering reports, which is the tape's own
+    # ``tensor_identity`` rather than a memory address.
     input_names_by_id = {
-        id(value): name for name, value in captured.inputs.items()
+        tensor_identity(value): name for name, value in captured.inputs.items()
     }
     try:
         feed_names = tuple(

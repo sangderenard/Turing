@@ -32,6 +32,14 @@ from functools import lru_cache
 from typing import Any, Iterable, Mapping
 
 
+# The tape keys its nodes by ``tensor_identity``, not by ``id``: a memory
+# address is reused once its object is freed, so an ``id`` used as a durable
+# key silently conflates two values that were never alive together. Anything
+# here that looks a value up in the tape, or hands an identity back to a
+# caller, has to use the same token the tape stores -- mixing the two is what
+# made this lowering find no nodes at all and still report itself complete.
+from ..abstraction import tensor_identity as _identity
+
 _C_BACKEND_DIR = Path(__file__).with_name("c_backend")
 _C_SOURCE_PATH = _C_BACKEND_DIR / "ctensor_ops.c"
 _C_HEADER_PATH = _C_BACKEND_DIR / "ctensor_ops.h"
@@ -2716,7 +2724,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
     required: set[int] = set()
 
     def require(value: Any) -> None:
-        identity = id(value)
+        identity = _identity(value)
         if identity in required:
             return
         node = nodes.get(identity)
@@ -2735,14 +2743,14 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
         if result_id in required
     ]
     produced_ids = {
-        id(node.ctx.get("result"))
+        _identity(node.ctx.get("result"))
         for node in live_nodes
     }
     feeds: list[Any] = []
     feed_seen: set[int] = set()
     for node in live_nodes:
         for operand in node.ctx.get("inputs", ()):
-            identity = id(operand)
+            identity = _identity(operand)
             if (
                 identity not in produced_ids
                 and identity not in feed_seen
@@ -2756,10 +2764,10 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
         *(f"ptr %output{index}" for index in range(len(outputs))),
     ]
     feed_pointer = {
-        id(value): f"%feed{index}" for index, value in enumerate(feeds)
+        _identity(value): f"%feed{index}" for index, value in enumerate(feeds)
     }
     output_pointer = {
-        id(value): f"%output{index}"
+        _identity(value): f"%output{index}"
         for index, value in enumerate(outputs.values())
     }
     globals_: list[str] = []
@@ -2772,7 +2780,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
         node for node in live_nodes if str(node.op) == "tensor_from_list"
     ):
         result = node.ctx["result"]
-        identity = id(result)
+        identity = _identity(result)
         values = tuple(_flatten_host_values(node.ctx["params"]["data"]))
         count = len(values)
         elements = ", ".join(
@@ -2790,7 +2798,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
     for node_index, node in enumerate(live_nodes):
         operation = ELEMENTWISE_ALIASES.get(str(node.op), str(node.op))
         result = node.ctx["result"]
-        result_id = id(result)
+        result_id = _identity(result)
         if operation == "tensor_from_list":
             continue
         if result_id in output_pointer:
@@ -2811,12 +2819,12 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
     for node_index, node in enumerate(live_nodes):
         operation = ELEMENTWISE_ALIASES.get(str(node.op), str(node.op))
         result = node.ctx["result"]
-        result_id = id(result)
+        result_id = _identity(result)
         if operation == "tensor_from_list":
             continue
         operands = tuple(node.ctx.get("inputs", ()))
         missing = [
-            id(operand) for operand in operands if id(operand) not in pointers
+            _identity(operand) for operand in operands if _identity(operand) not in pointers
         ]
         if missing:
             shortfalls.append(
@@ -2899,7 +2907,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
                 )
                 entry.append(
                     f"  call void @reduce_dim_double("
-                    f"ptr {pointers[id(source)]}, ptr {destination}, "
+                    f"ptr {pointers[_identity(source)]}, ptr {destination}, "
                     f"ptr {symbol}, i32 {len(shape)}, i32 {dim}, i32 0)"
                 )
                 continue
@@ -2915,7 +2923,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
             scalar = f"%sum{node_index}"
             entry.append(
                 f"  {scalar} = call double @sum_double("
-                f"ptr {pointers[id(operands[0])]}, "
+                f"ptr {pointers[_identity(operands[0])]}, "
                 f"i32 {_element_count(operands[0])})"
             )
             entry.append(
@@ -2933,7 +2941,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
                     )
                 )
                 continue
-            source_pointer = pointers[id(operands[0])]
+            source_pointer = pointers[_identity(operands[0])]
             if result_id in output_pointer:
                 entry.append(
                     f"  call void @llvm.memcpy.p0.p0.i64("
@@ -2980,7 +2988,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
             )
             entry.append(
                 f"  call void @transpose_double("
-                f"ptr {pointers[id(source)]}, ptr {destination}, "
+                f"ptr {pointers[_identity(source)]}, ptr {destination}, "
                 f"ptr {shape_symbol}, ptr {axes_symbol}, i32 {len(shape)})"
             )
             continue
@@ -3004,7 +3012,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
             )
             entry.append(
                 f"  call void @cumsum_dim_double("
-                f"ptr {pointers[id(source)]}, ptr {destination}, "
+                f"ptr {pointers[_identity(source)]}, ptr {destination}, "
                 f"ptr {shape_symbol}, i32 {len(shape)}, i32 {dim})"
             )
             continue
@@ -3038,7 +3046,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
                         f"  {slot} = getelementptr inbounds "
                         f"[{len(operands)} x ptr], ptr {array}, "
                         f"i64 0, i64 {input_index}",
-                        f"  store ptr {pointers[id(operand)]}, ptr {slot}, align 8",
+                        f"  store ptr {pointers[_identity(operand)]}, ptr {slot}, align 8",
                     )
                 )
             entry.append(
@@ -3082,7 +3090,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
                         f"  {slot} = getelementptr inbounds "
                         f"[{len(operands)} x ptr], ptr {array}, "
                         f"i64 0, i64 {input_index}",
-                        f"  store ptr {pointers[id(operand)]}, ptr {slot}, align 8",
+                        f"  store ptr {pointers[_identity(operand)]}, ptr {slot}, align 8",
                     )
                 )
             entry.append(
@@ -3108,9 +3116,9 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
             condition, if_true, if_false = operands
             entry.append(
                 f"  call void @where_double("
-                f"ptr {pointers[id(condition)]}, "
-                f"ptr {pointers[id(if_true)]}, "
-                f"ptr {pointers[id(if_false)]}, "
+                f"ptr {pointers[_identity(condition)]}, "
+                f"ptr {pointers[_identity(if_true)]}, "
+                f"ptr {pointers[_identity(if_false)]}, "
                 f"ptr {destination}, i32 {result_count})"
             )
             continue
@@ -3125,7 +3133,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
                 continue
             opcode = opcode_index[unary_codes[operation]]
             entry.append(
-                f"  call void @unary_double(ptr {pointers[id(operands[0])]}, "
+                f"  call void @unary_double(ptr {pointers[_identity(operands[0])]}, "
                 f"ptr {destination}, i32 {result_count}, i32 {opcode})"
             )
             continue
@@ -3148,27 +3156,27 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
             if left_count == result_count and right_count == result_count:
                 entry.append(
                     f"  call void @binary_double("
-                    f"ptr {pointers[id(left)]}, ptr {pointers[id(right)]}, "
+                    f"ptr {pointers[_identity(left)]}, ptr {pointers[_identity(right)]}, "
                     f"ptr {destination}, i32 {result_count}, i32 {opcode})"
                 )
             elif left_count == result_count and right_count == 1:
                 scalar = f"%scalar{node_index}"
                 entry.append(
-                    f"  {scalar} = load double, ptr {pointers[id(right)]}, align 8"
+                    f"  {scalar} = load double, ptr {pointers[_identity(right)]}, align 8"
                 )
                 entry.append(
                     f"  call void @binary_scalar_double("
-                    f"ptr {pointers[id(left)]}, double {scalar}, "
+                    f"ptr {pointers[_identity(left)]}, double {scalar}, "
                     f"ptr {destination}, i32 {result_count}, i32 {opcode}, i32 0)"
                 )
             elif left_count == 1 and right_count == result_count:
                 scalar = f"%scalar{node_index}"
                 entry.append(
-                    f"  {scalar} = load double, ptr {pointers[id(left)]}, align 8"
+                    f"  {scalar} = load double, ptr {pointers[_identity(left)]}, align 8"
                 )
                 entry.append(
                     f"  call void @binary_scalar_double("
-                    f"ptr {pointers[id(right)]}, double {scalar}, "
+                    f"ptr {pointers[_identity(right)]}, double {scalar}, "
                     f"ptr {destination}, i32 {result_count}, i32 {opcode}, i32 1)"
                 )
             else:
@@ -3216,7 +3224,7 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
                 continue
             entry.append(
                 f"  call void @matmul_double("
-                f"ptr {pointers[id(left)]}, ptr {pointers[id(right)]}, "
+                f"ptr {pointers[_identity(left)]}, ptr {pointers[_identity(right)]}, "
                 f"ptr {destination}, i32 {m}, i32 {n}, i32 {p})"
             )
             continue
@@ -3257,8 +3265,8 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
         module.verify()
     return TapeLLVMModule(
         llvm_ir=llvm_ir,
-        feed_ids=tuple(id(value) for value in feeds),
-        output_ids={name: id(value) for name, value in outputs.items()},
+        feed_ids=tuple(_identity(value) for value in feeds),
+        output_ids={name: _identity(value) for name, value in outputs.items()},
         workspace_sizes=tuple(workspace_sizes),
         shortfalls=tuple(shortfalls),
         trig_solver=str(trig_solver),
