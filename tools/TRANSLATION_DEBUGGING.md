@@ -32,8 +32,44 @@ value. Do not reason from it.
 | answer | go to |
 |---|---|
 | No — the compiler raises | **Q1** |
-| Yes, but a number is wrong | **Q4** |
+| Yes, but a number is wrong | **Q0b**, then **Q4** |
 | Yes, but it crashes at runtime | **Q3** then **Q4** |
+
+---
+
+## Q0b — Read the program back as Python
+
+Do this **before** Q4 when the compiler is happy and a number is wrong. It is
+cheap, it needs no ids, and it answers a question the other tools cannot:
+*what did the compiler actually build?*
+
+```python
+from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+from src.compiler.ssa_python_materializer import materialize_ir_module, to_source
+
+module, outputs, exports = lower_ast_source_to_ssa(SOURCE, "entry", name="probe")
+emitted, skipped = materialize_ir_module(module)
+print(skipped)          # functions that could NOT be rendered, and why
+print(to_source(emitted))
+```
+
+The emitted module is real Python: readable, runnable, and diffable against
+what you wrote. Run it on the same inputs and compare against the authored
+function directly — that comparison is the only check that catches the defect
+class below, because none of them raises.
+
+Two limits, stated so a clear result is not over-read:
+
+* Only single-block functions and the five-block counted loop are rendered.
+  Anything else appears in `skipped` with a reason. A `skipped` entry is not
+  evidence about correctness, only about coverage.
+* A lowering that RAISES returns no module, so the program you most want to
+  read is the one you cannot. That is the open prerequisite: the lowering
+  needs to hand back its IR alongside its shortfalls.
+
+`python tools/translation_scorecard.py` runs this over a graded corpus and
+prints how far each complexity level gets. Use it to place your program: if a
+level below yours already stops, that is your bug and it is already known.
 
 ---
 
@@ -425,6 +461,46 @@ function's own numbering. Region-local ids are a **different numbering
 space** — an id that means one thing in `advance` means something
 unrelated inside `planned_region_0`. `correlate_compile.py` shows both, and
 labels which is which, precisely because conflating them is easy.
+
+---
+
+## Silent miscompilations already paid for
+
+These compile with **no shortfall**, run, and return the wrong number. No
+stage of the compiler reports anything. Each one has a signature you can check
+directly rather than rediscovering it; all three were found by Q0b.
+
+**Only the first loop-carried value is carried.** A loop carrying two names
+freezes the second at its ENTRY value for every iteration.
+
+*Signature:* compute what the program WOULD return with the second value held
+constant, and compare. If it matches to the bit, this is your bug.
+`loop.carried_aliases` reaching `_ControlSSABuilder.lower_loop` has one entry
+for a source that carries two — check it there. The defect is upstream in
+control planning where `loop_composer` builds that tuple, not in the lowering,
+which is faithful to what it is handed.
+
+*Consequence:* a compiled Adam step is wrong, since Adam carries `w`, `m`
+and `v`.
+
+**A value can be both a formal and a region output.** A one-parameter source
+compiles to a two-parameter function whose extra formal is also an output of a
+planned region, consumed by a call scheduled BEFORE the one producing it. The
+use-before-def is invisible precisely because the value is also a formal, so
+it is never unbound.
+
+*Signature:* the emitted function has more parameters than the source, and the
+extra one is unnamed. Compare `len(function.args)` against
+`metadata["parameter_names"]`.
+
+**A loop body that only forwards a call result is elided entirely.** The body
+block emits nothing but `Br`, so the carried update has no producer and the
+lowering raises `loop_carried`.
+
+*Signature:* `next_w = update(w)` where `w` is the carried value. Binding
+through one more operation (`stepped = update(w); next_w = stepped * 1.0`)
+restores it. A call on some OTHER value is fine; it is the round trip that
+fails. See `tests/test_loop_carried_producers.py`.
 
 ---
 
