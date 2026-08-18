@@ -3669,6 +3669,15 @@ from .abstraction_methods.elementwise import (
     _v1_valuewise, _v2_valuewise, _v3_valuewise
 )
 
+# --- SSA structural mirrors (from abstraction_methods/ssa_structure.py) ---
+# One attribute deeper than the tensor methods on purpose: this is program
+# structure vocabulary (class/field/method/function definitions and the field
+# accessor pair), not a tensor operation, and it should not surface to someone
+# browsing tensor methods. See that module for why it exists at all.
+from .abstraction_methods.ssa_structure import SSA_STRUCTURE as _ssa_structure
+
+AbstractTensor.ssa = _ssa_structure
+
 # --- Elementwise operator assignments (from abstraction_methods/elementwise.py) ---
 AbstractTensor.sigmoid   = elementwise_sigmoid
 AbstractTensor.__eq__    = elementwise_eq
