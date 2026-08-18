@@ -544,23 +544,33 @@ def update(a):
 def test_functions_that_cannot_be_materialized_are_reported_not_dropped():
     """A module quietly missing half a program is the failure to avoid."""
 
-    source = """
-def helper(a):
-    return a * 1.0
+    from src.compiler.ssa_python_materializer import materialize_ir_module
 
-def train(w, epochs):
-    total = helper(w)
-    for _ in range(epochs):
-        next_w = w - 0.05 * w
-        w = next_w
-        total = w
-    return total
-"""
-    _namespace, skipped, _emitted = _run_round_trip(source, "train", "rt4")
+    class _Module:
+        def __init__(self, functions):
+            self.functions = functions
 
-    # The looping entrypoint is multi-block and must appear in the report.
-    assert any("train" in name for name in skipped), skipped
-    assert all(reason for reason in skipped.values())
+    fine = Function(
+        "fine",
+        [SSAValue(0)],
+        {"entry": BasicBlock("entry", [Instr("Ret", [SSAValue(0)], None)])},
+    )
+    broken = Function(
+        "broken",
+        [SSAValue(0)],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [Instr("NoSuchOperation", [SSAValue(0)], SSAValue(1))],
+            )
+        },
+    )
+
+    emitted, skipped = materialize_ir_module(_Module({"fine": fine, "broken": broken}))
+
+    assert [node.name for node in emitted.body if hasattr(node, "name")] == ["fine"]
+    assert "broken" in skipped
+    assert "no Python form" in skipped["broken"]
 
 
 def test_disagreeing_call_sites_are_reported_rather_than_resolved():
@@ -587,3 +597,91 @@ def test_disagreeing_call_sites_are_reported_rather_than_resolved():
     contracts = _region_output_contracts(module)
     assert isinstance(contracts["r"], str)
     assert "disagree" in contracts["r"]
+
+
+# -- the counted loop -----------------------------------------------------
+#
+# Deliberately narrow: this is not general control-flow reconstruction, which
+# remains unattempted. It recognises the five-block counted loop the lowering
+# actually emits -- preheader, header of phis and a condition, body, latch,
+# exit -- and refuses anything else by name.
+
+_LOOP_SOURCE = """
+def helper(a):
+    return a * 1.0
+
+def train(w, epochs):
+    total = helper(w)
+    for _ in range(epochs):
+        next_w = w - 0.05 * w
+        w = next_w
+        total = w
+    return total
+"""
+
+
+@pytest.mark.parametrize(
+    ("start", "epochs"),
+    [
+        (2.0, 3),
+        (1.0, 5),
+        (3.0, 1),
+        # Zero trips is the case that separates a correct translation from one
+        # that merely works: the exit reads the carried value under the id
+        # produced INSIDE the body, which never runs here.
+        (-4.0, 0),
+    ],
+)
+def test_a_counted_loop_round_trips_and_computes_the_authored_answer(start, epochs):
+    namespace, skipped, _emitted = _run_round_trip(_LOOP_SOURCE, "train", "lp")
+
+    assert skipped == {}, f"a function was not materialized: {skipped}"
+
+    produced = namespace["lp__train"](**{"w": start, "epochs": epochs})
+    authored = start
+    for _ in range(epochs):
+        authored = authored - 0.05 * authored
+    assert produced == pytest.approx(authored, abs=1e-12)
+
+
+def test_the_loop_is_translated_mechanically_rather_than_prettily():
+    """``while True`` with the condition inside, because the header may compute.
+
+    Hoisting the test into the ``while`` clause would have to duplicate or
+    reorder whatever the header does before it compares. Correctness of the
+    emitted Python matters more here than its shape.
+    """
+
+    _namespace, _skipped, emitted = _run_round_trip(_LOOP_SOURCE, "train", "lp2")
+    rendered = to_source(emitted)
+
+    assert "while True:" in rendered
+    assert "break" in rendered
+
+
+def test_parameter_names_follow_the_carried_value_back_to_the_argument():
+    """``parameter_names`` points a looped parameter at its phi, not its formal."""
+
+    import inspect as _inspect
+
+    namespace, _skipped, _emitted = _run_round_trip(_LOOP_SOURCE, "train", "lp3")
+    signature = _inspect.signature(namespace["lp3__train"])
+
+    # Both names recovered; the ORDER is the SSA's, which is the compiled ABI.
+    assert set(signature.parameters) == {"w", "epochs"}
+
+
+def test_a_control_shape_that_is_not_a_counted_loop_still_refuses():
+    from src.compiler.ssa_python_materializer import materialize_function_body
+
+    function = Function(
+        "branchy",
+        [],
+        {
+            "entry": BasicBlock("entry", []),
+            "then": BasicBlock("then", []),
+            "other": BasicBlock("other", []),
+        },
+    )
+    with pytest.raises(MaterializationError, match="counted loop"):
+        materialize_function_body(function)

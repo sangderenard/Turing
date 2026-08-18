@@ -47,7 +47,7 @@ plausible wrong answer this vocabulary exists to prevent.
 
 No pipeline stage moved. The boolean still works and still means what it meant.
 
-## Step 1 — next, and small: the region-call ABI in the materializer
+## Step 1 — DONE: the region-call ABI in the materializer
 
 `src/compiler/ssa_python_materializer.py` already turns single-block SSA back
 into runnable Python, verified against the symbolic fluid step to 2.1e-17. Run
@@ -66,7 +66,7 @@ Doing it is worth more than the round trip alone: it renders the region calling
 convention **as Python**, which is the most direct way to inspect an ABI that
 has not been pinned down.
 
-## Step 2 — bounded, not open-ended: counted-loop reconstruction
+## Step 2 — DONE: counted-loop reconstruction
 
 The handoff called CFG-to-structured-control an open seam, and in general it is.
 The shape this compiler emits is not general:
@@ -80,7 +80,19 @@ The shape this compiler emits is not general:
 The header is phi-phi-compare-branch, the latch is the increment, and the phi
 carries `incoming_blocks` and `source_name`. Recognising *that* pattern and
 emitting a `while` with carried names is a targeted reconstructor. It is not
-the general problem and should not be allowed to become it.
+the general problem and was not allowed to become it: anything that is not
+this five-block shape still refuses by name.
+
+Two things only showed up by running it. The exit block reads a carried value
+under the id produced INSIDE the body, so a zero-trip loop referenced an
+unbound local until the carried "port" ids were rebound to the phi after the
+loop. And `parameter_names` points a looped parameter at its PHI rather than
+its formal, so parameter naming has to follow `carried_port_values`'
+`source_value_id` back to the argument.
+
+A whole lowered program with a loop now round-trips and executes:
+`train(w=2.0, epochs=3)` returns `1.71475`, matching the authored Python
+exactly, and the zero-trip case returns its input unchanged.
 
 ## Step 3 — what the two halves buy together
 

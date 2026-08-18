@@ -339,6 +339,98 @@ class _BodyMaterializer:
         self.statements.append(ast.Return(value=value))
 
 
+_TERMINATORS = {
+    "Br", "br", "CondBr", "condbr", "Ret", "ret", "Return", "return",
+}
+
+
+def _straight_line(materializer: "_BodyMaterializer", block: Any) -> None:
+    """Lower one block's non-terminator, non-phi instructions in order."""
+
+    for instruction in block.instrs:
+        operation = str(instruction.op)
+        if operation in _TERMINATORS or operation in {"Phi", "phi"}:
+            continue
+        materializer.step(instruction)
+
+
+def _terminator(block: Any) -> Any | None:
+    for instruction in reversed(block.instrs):
+        if str(instruction.op) in _TERMINATORS:
+            return instruction
+    return None
+
+
+def _counted_loop_shape(function: Any) -> dict[str, Any]:
+    """Recognise the loop shape this compiler emits, or say what did not match.
+
+    Deliberately narrow. This is not general control-flow reconstruction --
+    that remains unattempted -- it recognises the five-block counted loop the
+    lowering actually produces: a preheader branching to a header of phis and a
+    condition, a body, a latch carrying the induction forward, and an exit.
+    Anything else raises rather than being approximated.
+    """
+
+    blocks = dict(getattr(function, "blocks", {}) or {})
+    if len(blocks) != 5:
+        raise MaterializationError(
+            f"{getattr(function, 'name', '<anonymous>')} has {len(blocks)} "
+            f"blocks ({sorted(blocks)}); only the five-block counted loop is "
+            "reconstructed here"
+        )
+    # Every block any terminator can reach -- a CondBr names two of them, and
+    # missing those makes the body and the exit look like entry blocks.
+    targeted: set[str] = set()
+    for block in blocks.values():
+        terminator = _terminator(block)
+        if terminator is None:
+            continue
+        attributes = terminator.attributes or {}
+        for key in ("target", "true_target", "false_target"):
+            if attributes.get(key) is not None:
+                targeted.add(str(attributes[key]))
+    entries = [name for name in blocks if name not in targeted]
+    conditional = [
+        (name, _terminator(block))
+        for name, block in blocks.items()
+        if _terminator(block) is not None
+        and str(_terminator(block).op) in {"CondBr", "condbr"}
+    ]
+    if len(entries) != 1 or len(conditional) != 1:
+        raise MaterializationError(
+            f"{getattr(function, 'name', '<anonymous>')}: expected one entry "
+            f"and one conditional branch, found {len(entries)} and "
+            f"{len(conditional)}"
+        )
+    entry_name = entries[0]
+    header_name, branch = conditional[0]
+    attributes = branch.attributes or {}
+    body_name = str(attributes.get("true_target"))
+    exit_name = str(attributes.get("false_target"))
+    body = blocks.get(body_name)
+    if body is None:
+        raise MaterializationError(
+            f"{getattr(function, 'name', '<anonymous>')}: the conditional "
+            f"branch names {body_name!r}, which is not a block here"
+        )
+    latch_name = str((_terminator(body).attributes or {}).get("target"))
+    if latch_name not in blocks:
+        raise MaterializationError(
+            f"{getattr(function, 'name', '<anonymous>')}: the body branches to "
+            f"{latch_name!r}, which is not a block here"
+        )
+    return {
+        "entry": blocks[entry_name],
+        "header": blocks[header_name],
+        "body": body,
+        "latch": blocks[latch_name],
+        "exit": blocks[exit_name],
+        "branch": branch,
+        "header_name": header_name,
+        "entry_name": entry_name,
+    }
+
+
 def _single_block(function: Any) -> Any:
     blocks = list(getattr(function, "blocks", {}).values())
     if len(blocks) != 1:
@@ -381,8 +473,12 @@ def materialize_function_body(
             for position, formal in enumerate(formals)
         }
 
-    block = _single_block(function)
     materializer = _BodyMaterializer(function, argument_names=names)
+    if len(getattr(function, "blocks", {}) or {}) != 1:
+        statements = _materialize_counted_loop(function, materializer)
+        return (statements or [ast.Pass()]), materializer.uses_math
+
+    block = _single_block(function)
     returned: tuple[Any, ...] = ()
     for instruction in block.instrs:
         operation = str(instruction.op)
@@ -399,6 +495,111 @@ def materialize_function_body(
 
     statements = materializer.statements or [ast.Pass()]
     return statements, materializer.uses_math
+
+
+def _materialize_counted_loop(
+    function: Any, materializer: "_BodyMaterializer",
+) -> list[ast.stmt]:
+    """The five-block counted loop as a ``while`` with explicit carried names.
+
+    Emitted as ``while True:`` with the header's condition tested inside and a
+    ``break``, rather than hoisting the condition into the ``while`` clause.
+    That is a mechanical, always-correct translation of the CFG: the header may
+    compute anything before it compares, and a hoisted condition would have to
+    duplicate that work or reorder it. Readability here is worth less than the
+    emitted Python meaning exactly what the SSA meant.
+
+    Each phi becomes an ordinary name: assigned before the loop from its
+    preheader operand, and reassigned at the end of each iteration from its
+    latch operand. That is what a phi *is*, once you are allowed to mutate.
+    """
+
+    shape = _counted_loop_shape(function)
+    phis = [
+        instruction
+        for instruction in shape["header"].instrs
+        if str(instruction.op) in {"Phi", "phi"}
+    ]
+
+    _straight_line(materializer, shape["entry"])
+
+    # Seed every carried name from the preheader edge.
+    incoming = [
+        tuple(instruction.attributes.get("incoming_blocks") or ())
+        for instruction in phis
+    ]
+    for instruction, blocks in zip(phis, incoming):
+        if len(blocks) != 2 or blocks[0] != shape["entry_name"]:
+            raise MaterializationError(
+                f"{function.name}: phi carries incoming blocks {blocks!r}; the "
+                f"first must be the preheader {shape['entry_name']!r}"
+            )
+        materializer.assign(instruction.res, materializer.operand(instruction.args[0]))
+
+    before = len(materializer.statements)
+    _straight_line(materializer, shape["header"])
+    condition = materializer.operand(shape["branch"].args[0])
+    header_statements = materializer.statements[before:]
+    del materializer.statements[before:]
+
+    body_start = len(materializer.statements)
+    _straight_line(materializer, shape["body"])
+    _straight_line(materializer, shape["latch"])
+    # The latch operand of each phi is only in scope once body AND latch have
+    # run, so the carried updates land after both.
+    for instruction in phis:
+        target = materializer.names[int(instruction.res.id)]
+        materializer.statements.append(
+            ast.Assign(
+                targets=[ast.Name(id=target, ctx=ast.Store())],
+                value=_expression(materializer.operand(instruction.args[1])),
+            )
+        )
+    loop_statements = materializer.statements[body_start:]
+    del materializer.statements[body_start:]
+
+    materializer.statements.append(
+        ast.While(
+            test=ast.Constant(value=True),
+            body=[
+                *header_statements,
+                ast.If(
+                    test=_expression(f"not {condition}"),
+                    body=[ast.Break()],
+                    orelse=[],
+                ),
+                *loop_statements,
+            ],
+            orelse=[],
+        )
+    )
+
+    # After the loop, a carried name means the loop's RESULT, and the exit
+    # block reads it under the *updated* value's id -- the one produced inside
+    # the body. That name only exists if the body ran, so a zero-iteration loop
+    # would reference an unbound local. Binding the updated id to the phi's
+    # name here is the same rebinding precompile_to_ssa performs with its
+    # carried ports, and it makes the zero-trip case correct rather than
+    # accidentally working.
+    for instruction in phis:
+        updated_id = (instruction.attributes or {}).get("updated_value_id")
+        if updated_id is None:
+            continue
+        carried_name = materializer.names[int(instruction.res.id)]
+        port_name = _local(int(updated_id))
+        materializer.statements.append(
+            ast.Assign(
+                targets=[ast.Name(id=port_name, ctx=ast.Store())],
+                value=_expression(carried_name),
+            )
+        )
+        materializer.names[int(updated_id)] = port_name
+
+    _straight_line(materializer, shape["exit"])
+    returned = _terminator(shape["exit"])
+    if returned is not None and str(returned.op) in {"Ret", "ret", "Return", "return"}:
+        materializer.finish(tuple(returned.args))
+    return materializer.statements
 
 
 def _annotation(type_name: str) -> ast.expr | None:
@@ -626,6 +827,41 @@ def materialize_module(
     return ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
 
 
+def _parameter_names(function: Any) -> list[str]:
+    """Names for a function's formals, in the SSA's own argument order.
+
+    ``parameter_names`` maps a source name to the value that name denotes, and
+    for a parameter carried through a loop that value is the PHI, not the
+    argument. So ``w`` points at the loop's carried value while the formal is
+    the entry value it was seeded from. The link back is on the carried port's
+    accounting (``source_value_id``), so it is followed rather than guessed.
+
+    The resulting order is the SSA's, not the authored signature's -- that is
+    the compiled ABI, and renaming would hide it rather than fix it.
+    """
+
+    formals = tuple(getattr(function, "args", ()))
+    metadata = getattr(function, "metadata", None) or {}
+    by_value: dict[int, str] = {}
+    for label, value_id in (metadata.get("parameter_names") or ()):
+        by_value.setdefault(int(value_id), str(label))
+    for carried in (metadata.get("carried_port_values") or {}).values():
+        accounting = getattr(carried, "accounting", None) or {}
+        source = accounting.get("source_value_id")
+        named = by_value.get(int(getattr(carried, "id", -1)))
+        if source is not None and named is not None:
+            by_value.setdefault(int(source), named)
+
+    declared = _declared_formal_names(function)
+    by_position = {position: label for label, position in declared.items()}
+    return [
+        by_value.get(int(formal.id))
+        or by_position.get(position)
+        or _local(formal.id)
+        for position, formal in enumerate(formals)
+    ]
+
+
 def _region_output_contracts(module: Any) -> dict[str, Any]:
     """Recover each region's published outputs from the calls that project them.
 
@@ -684,13 +920,7 @@ def materialize_ir_module(module: Any) -> tuple[ast.Module, dict[str, str]]:
     uses_math = False
 
     for name, function in (getattr(module, "functions", {}) or {}).items():
-        formals = tuple(getattr(function, "args", ()))
-        declared = _declared_formal_names(function)
-        by_position = {position: label for label, position in declared.items()}
-        parameters = [
-            by_position.get(position, _local(formal.id))
-            for position, formal in enumerate(formals)
-        ]
+        parameters = _parameter_names(function)
         try:
             body, needed = materialize_function_body(
                 function, parameter_names=parameters
