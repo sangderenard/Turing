@@ -991,7 +991,17 @@ class IRGraphedModel:
                     raise RuntimeError("Failed to apply strict whitelist labels")
             if params:
                 try:
-                    grads = autograd.grad(loss, params, retain_graph=True)
+                    # ``record_backward=True`` is what makes this a training
+                    # program rather than a forward with a frozen gradient
+                    # stapled on. Without it the backward runs under no_grad,
+                    # so the gradients never become steps -- they enter the
+                    # captured program as CONSTANT FEEDS. The result still has
+                    # a loss output, param*_new outputs and a plausible first
+                    # couple of steps, and then applies the capture-time
+                    # gradient forever while looking like it is training.
+                    grads = autograd.grad(
+                        loss, params, retain_graph=True, record_backward=True
+                    )
                 except Exception as e:
                     raise RuntimeError(f"autograd.grad failed during capture: {e}") from e
             else:
@@ -1007,10 +1017,26 @@ class IRGraphedModel:
                 self.opt_v = [p.zeros_like() for p in params]
             if self.opt_t is None:
                 self.opt_t = AT.get_tensor(0.0)
-            # Register state tensors on current tape as feeds
+            # Register state tensors on current tape as feeds.
+            #
+            # They also have to REQUIRE GRAD, which reads as wrong and is not:
+            # an operator only records when one of its operands requires grad,
+            # so ``t + 1.0`` on a plain scalar records nothing at all. The step
+            # counter's update then never enters the program, ``opt_t_new`` is
+            # declared as an output that no step produces, and a compiled loop
+            # either fails at replay or -- worse, if it feeds the same t back --
+            # applies the first step's bias correction forever while looking
+            # like it is training.
+            #
+            # ``mark_structural`` is the mechanism for exactly this: a tensor
+            # allowed to require grad without being treated as a trainable
+            # parameter. Optimizer state is state, not a parameter, and stays
+            # out of every parameter list and strict connectivity check.
             for s in self.opt_m + self.opt_v + [self.opt_t]:
                 try:
+                    s.requires_grad_(True)
                     autograd.tape.create_tensor_node(s)
+                    autograd.tape.mark_structural(s, label="optimizer_state")
                 except Exception:
                     raise RuntimeError("Failed to create tensor node for optimizer state")
             # Record adam updates per param
