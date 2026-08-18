@@ -156,6 +156,11 @@ class Handler(Enum):
     # Indexed forms are rewritten to GetElementPtr+Load/Store before target
     # emission; GetAttr is resolved against record/class descriptors.
     GetAttr       = "GetAttr"
+    # The storing half of the accessor pair. GetAttr already resolved a named
+    # field against the record/class descriptor; without its counterpart a
+    # field write had no opcode of its own and could only be spelled as a slot
+    # store, which loses the field's name and therefore its meaning.
+    SetAttr       = "SetAttr"
     Indexed       = "Indexed"
     IndexedStore  = "IndexedStore"
 
@@ -189,6 +194,25 @@ class Handler(Enum):
     Call          = "Call"
     Deploy        = "Deploy"
     Join          = "Join"
+
+    # Definitions.
+    #
+    # The SSA module already holds classes and functions as tables
+    # (SSAClassDefinition / SSAClassField / SSAClassMethod / SSAClassTable and
+    # the function table). Those are data carried alongside the program, so a
+    # definition could be transported but never *stated* in the instruction
+    # vocabulary itself. These opcodes mirror those objects one for one, so a
+    # complete program -- structure included -- can cross a suite boundary as
+    # operators rather than as an out-of-band attachment.
+    #
+    # Nothing written against AbstractTensor needs them: an author defines a
+    # class with `class`. They exist so a definition survives translation
+    # bit-exactly in both directions, which is what a custom epsilon or any
+    # other authored constant inside a method body depends on.
+    ClassDefine    = "ClassDefine"
+    FieldDefine    = "FieldDefine"
+    MethodDefine   = "MethodDefine"
+    FunctionDefine = "FunctionDefine"
 
     # Misc
     Select        = "Select"

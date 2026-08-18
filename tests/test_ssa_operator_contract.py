@@ -17,7 +17,7 @@ from src.transmogrifier.ssa_registry import Handler
 
 
 def test_contract_contains_every_repository_and_tensor_operator():
-    assert len(REPOSITORY_SSA_OPERATORS) == len(Handler) == 110
+    assert len(REPOSITORY_SSA_OPERATORS) == len(Handler) == 117
     assert {row.handler for row in REPOSITORY_SSA_OPERATORS} == set(Handler)
     assert len(TENSOR_SSA_OPERATORS) == len(CANONICAL_ABSTRACT_TENSOR_OPERATORS) == 223
     assert CANONICAL_TENSOR_SSA_OPERATORS == CANONICAL_ABSTRACT_TENSOR_OPERATORS
