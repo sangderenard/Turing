@@ -160,9 +160,30 @@ _INTENTIONALLY_NONDIFFERENTIABLE = {
     "lt", "le", "gt", "ge", "eq", "ne",
     "less", "less_equal", "greater", "greater_equal", "equal", "not_equal",
     "logical_and", "logical_or", "logical_xor",
+    # Piecewise constant: the derivative is zero wherever it exists, so a
+    # reverse would be a reverse that returns zero. ``sign`` reaches a tape
+    # through ``eigh``'s phase fixing, where it read as an unexplained hole.
+    "sign",
+    # These produce positions, not values. A gradient with respect to an index
+    # is not a small number, it is a category error, so they are stated here
+    # rather than left to report as a rule someone forgot to write.
+    "argmax", "argmin", "argwhere", "nonzero", "searchsorted",
+    # Narrowing to an integer is piecewise constant for the same reason
+    # ``trunc`` is. The widening direction (``sitofp``/``uitofp``) is a genuine
+    # identity on the value and gets a real reverse instead.
+    "long", "int", "fptosi", "fptoui", "int_trunc",
 }
 
-_AUTOGRAD_SOURCE_OPERATIONS = {"tensor_from_list"}
+# Operations that manufacture values rather than transform them. Their output
+# does not depend on any operand's *values* -- ``zeros_like`` reads only a
+# shape -- so a tape reaching one has arrived at a leaf, not at a rule someone
+# failed to write. ``zeros_like`` shows up inside ``pad``, where it read as
+# the last remaining hole in an otherwise fully covered program.
+_AUTOGRAD_SOURCE_OPERATIONS = {
+    "tensor_from_list",
+    "arange", "empty", "empty_like", "eye", "eye_like", "full", "full_like",
+    "linspace", "ones", "ones_like", "zeros", "zeros_like",
+}
 
 try:  # NumPy is an optional dependency for the repository
     import numpy as np

@@ -196,12 +196,59 @@ def test_a_non_positive_repeat_count_refuses(count):
 
 # -- the registry itself --------------------------------------------------
 
+def test_a_broad_program_leaves_no_unexplained_hole_on_the_tape():
+    """``missing_backward_ops`` is only a useful signal if it is normally empty.
+
+    Every recorded operation is classified as having a reverse, being a source
+    that manufactures values, or being deliberately nondifferentiable. Anything
+    else reports as "missing", so a report full of ops nobody intends to
+    differentiate hides the one that matters. This exercises the linear
+    algebra, the trig family, the structural moves and the index-producing
+    operations together and expects nothing left over.
+    """
+
+    def value(raw):
+        return T.tensor(np.asarray(raw, dtype=np.float64))
+
+    spd = [[4.0, 1.0], [1.0, 3.0]]
+    square = [[1.0, 2.0], [3.0, 5.0]]
+
+    with autograd.forward_capture() as tape:
+        T.eigh(value(spd))
+        T.cholesky(value(spd))
+        T.solve(value(square), value([1.0, 2.0]))
+        T.det(value(square))
+        T.norm(value([0.2, 0.5]))
+        T.outer(value([0.2, 0.5]), value([0.2, 0.5]))
+        T.einsum("ij,jk->ik", value(square), value(square))
+        value([1.5, 2.5, 3.5]).index_select(0, value([0.0, 2.0]).long())
+        value([0.2, 0.5]).asin().sinh().atanh().sech()
+        value([1.0, 2.0, 3.0]).pad((1, 1), value=0.0).repeat(2).repeat_interleave(2)
+        T.searchsorted(value([0.0, 1.0]), value([0.2, 0.9]))
+        value([0.2, -0.5]).sign()
+        value([0.2, 0.5]).softmax(dim=0).log()
+
+    assert tape.missing_backward_ops() == []
+
+
+def test_the_widening_and_narrowing_casts_are_deliberately_asymmetric():
+    """One is an identity on the value; the other is piecewise constant."""
+
+    from src.common.tensors.autograd import _INTENTIONALLY_NONDIFFERENTIABLE
+
+    assert {"sitofp", "uitofp"} <= set(BACKWARD_REGISTRY._methods)
+    assert {"long", "int", "fptosi", "fptoui", "int_trunc"} <= (
+        _INTENTIONALLY_NONDIFFERENTIABLE
+    )
+    assert not {"sitofp", "uitofp"} & _INTENTIONALLY_NONDIFFERENTIABLE
+
+
 def test_every_new_rule_registered_and_declares_its_domain():
     """A rule that registers but states no domain is a trap for the next reader."""
 
     added = {
         "asin", "acos", "atan", "sinh", "cosh", "asinh", "acosh", "atanh",
-        "pad", "repeat", "repeat_interleave",
+        "pad", "repeat", "repeat_interleave", "sitofp", "uitofp",
     }
     assert added <= set(BACKWARD_RULES)
     assert added <= set(BACKWARD_REGISTRY._methods)

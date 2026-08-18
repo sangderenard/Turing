@@ -577,6 +577,37 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "notes": "",
         "tags": ["elementwise", "unary", "smooth", "nn"],
     },
+    # Widening a value into a float changes its type, not its magnitude, so
+    # the reverse is the identity. The narrowing direction is piecewise
+    # constant and is declared nondifferentiable in ``autograd`` instead --
+    # the pair is deliberately asymmetric, and saying so here is what keeps
+    # someone from "fixing" the asymmetry later.
+    "sitofp": {
+        "arity": "unary",
+        "signature": "y = float(x)",
+        "latex": r"y = x, \quad \frac{\partial y}{\partial x} = 1",
+        "backward": {"x": "gx = unbroadcast(g, x.shape)"},
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g, x.shape)",
+        },
+        "domain": "x: any value representable in the wider type",
+        "notes": "A widening cast is an identity on the value.",
+        "tags": ["cast", "unary", "identity"],
+    },
+    "uitofp": {
+        "arity": "unary",
+        "signature": "y = float(x)",
+        "latex": r"y = x, \quad \frac{\partial y}{\partial x} = 1",
+        "backward": {"x": "gx = unbroadcast(g, x.shape)"},
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g, x.shape)",
+        },
+        "domain": "x >= 0",
+        "notes": "Unsigned widening; identical adjoint to sitofp.",
+        "tags": ["cast", "unary", "identity"],
+    },
     # Structural reverses. These move gradient between positions rather than
     # scaling it, so each one is a rearrangement whose adjoint is the exact
     # inverse rearrangement -- and each carries its forward's own metadata
