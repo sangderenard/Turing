@@ -78,6 +78,30 @@ DO NOT USE SIMULTANEOUS TUPLE ASSIGNMENT FOR A LOOP-CARRIED VALUE.
         zx = next_zx.minimum(limit)
         zy = next_zy.minimum(limit)
 
+A CALL RESULT MAY NOT BE A LOOP-CARRIED VALUE EITHER.
+
+    for _ in range(n):
+        next_w = update(w, g)                                  # DOES NOT LOWER
+        w = next_w
+
+    for _ in range(n):
+        next_w = w - 0.05 * g                                  # LOWERS
+        w = next_w
+
+Same diagnostic, same cause, different disguise: the call's result is
+produced in the callee's region, so from the loop body's point of view the
+carried update again has no producer.  A helper that RETURNS A TUPLE is the
+tuple case wearing a hat -- ``w = helper(...)`` binds the tuple temporary
+even though no tuple assignment is written at the call site.
+
+The cost is real and worth stating plainly, because it shapes how a training
+loop has to be authored: ``w = adam_update(w, g, m, v)`` is the natural
+spelling and is exactly the one that does not lower.  The update must be
+inlined into the loop body, one carried name per statement, each bound from
+body arithmetic or a tensor method.  Multiple carried values are fine
+(``m``, ``v`` and ``w`` together lower); it is the call boundary, not the
+count, that the analysis cannot see across.
+
 A tuple assignment binds each name to a tuple temporary, so the loop's
 carried update names that temporary rather than a value any region
 produces.  ``lower_precompile_and_control_to_ssa`` then reports
