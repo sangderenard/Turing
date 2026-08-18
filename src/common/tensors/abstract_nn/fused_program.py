@@ -19,7 +19,11 @@ import networkx as nx
 from ..abstraction import AbstractTensor as AT, tensor_identity
 from ..graph_translator import GraphTranslator
 from ....transmogrifier.ilpscheduler import ILPScheduler
-from ..autograd import autograd
+from ..autograd import (
+    _AUTOGRAD_SOURCE_OPERATIONS,
+    _INTENTIONALLY_NONDIFFERENTIABLE,
+    autograd,
+)
 from ..backward import BACKWARD_REGISTRY
 from .optimizer import Adam, adam_step
 from collections import deque
@@ -217,11 +221,24 @@ def capture_backward_program(
     if tensor_identity(loss) not in forward_tape.graph:
         raise ValueError("loss is not present on the active forward GradTape")
     override_names = set(backward_overrides or {})
+    # An operation that is deliberately nondifferentiable contributes no
+    # backward step and no gradient -- ``autograd.grad`` already walks past it
+    # -- and a source manufactures its value rather than transforming one.
+    # Neither is a rule someone failed to write, so neither may block a capture
+    # the tape is perfectly able to perform. Counting them here refused whole
+    # programs over a ``sign`` inside ``eigh`` or a ``zeros_like`` inside
+    # ``pad``, which is the same accounting the tape's own ``backward_status``
+    # gets right.
+    accounted = (
+        set(BACKWARD_REGISTRY._methods)
+        | override_names
+        | _INTENTIONALLY_NONDIFFERENTIABLE
+        | _AUTOGRAD_SOURCE_OPERATIONS
+    )
     missing = tuple(sorted({
         str(node.op)
         for _, node in forward_tape.traverse(loss)
-        if node.op not in override_names
-        and node.op not in BACKWARD_REGISTRY._methods
+        if node.op not in accounted
     }))
     if missing and not allow_missing:
         raise RuntimeError(
@@ -389,6 +406,16 @@ class ProgramRunner:
                 fn = getattr(args[0], "_apply_operator", None) if args else None
             elif step.op_name == "matmul" and args:
                 fn = getattr(args[0], "_apply_operator", None)
+            elif step.op_name == "slice" and args:
+                # ``slice`` is a real recorded operator -- ``__getitem__``
+                # publishes it, with the index in ``slices`` -- but it reaches
+                # a backend through the subscript protocol rather than through
+                # a method of that name, so ``getattr`` finds nothing and the
+                # step dies here. It is the same operator either way; only the
+                # call path differs, so route it to the protocol the forward
+                # itself used rather than requiring every backend to grow a
+                # second spelling of indexing.
+                fn = type(args[0]).__getitem__
             else:
                 fn = getattr(cls, step.op_name, None)
             if fn is None:
@@ -417,6 +444,14 @@ class ProgramRunner:
                 )
                 if permutation is not None:
                     positional_tail = tuple(permutation)
+            elif step.op_name == "slice":
+                # ``index_tensors`` is the recorded list of tensor-valued index
+                # operands, kept by the forward for dataflow. The subscript
+                # itself is ``slices``; passing the bookkeeping entry on would
+                # be an argument ``__getitem__`` has no name for.
+                call_kwargs.pop("index_tensors", None)
+                subscript = call_kwargs.pop("slices", None)
+                positional_tail = (subscript,)
             elif step.op_name in {"sum", "mean", "max", "min"}:
                 if "axis" in call_kwargs and "dim" not in call_kwargs:
                     call_kwargs["dim"] = call_kwargs.pop("axis")

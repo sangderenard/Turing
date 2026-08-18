@@ -626,7 +626,12 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "domain": "constant mode, non-negative widths",
         "notes": (
             "``pad`` runs (before, after) from the LAST dimension backwards. "
-            "reflect/replicate need a scatter-add adjoint and raise."
+            "reflect/replicate need a scatter-add adjoint and raise. "
+            "The crop records a ``slice`` step, which ``ProgramRunner`` reaches "
+            "through ``__getitem__`` -- see the dispatch note there. It is not "
+            "written with ``index_select`` because that forward is not "
+            "instrumented on the tape at all, so such a rule would silently "
+            "drop the step from a captured backward program."
         ),
         "tags": ["structural", "unary", "shape"],
     },

@@ -243,6 +243,116 @@ def test_the_widening_and_narrowing_casts_are_deliberately_asymmetric():
     assert not {"sitofp", "uitofp"} & _INTENTIONALLY_NONDIFFERENTIABLE
 
 
+def test_a_classified_operation_does_not_block_a_backward_capture():
+    """``sign`` in the forward must not refuse a capture the tape can perform.
+
+    ``capture_backward_program`` counted every op with no registered rule as
+    missing, including the ones deliberately classified as nondifferentiable or
+    as sources. That refused whole programs over a ``sign`` inside ``eigh`` or a
+    ``zeros_like`` inside ``pad`` -- operations that contribute no backward step
+    and that ``autograd.grad`` already walks straight past.
+    """
+
+    from src.common.tensors.abstraction import AbstractTensor as AT
+    from src.common.tensors.abstract_nn.fused_program import (
+        ProgramRunner,
+        capture_backward_program,
+    )
+    from src.common.tensors.autograd import GradTape
+
+    autograd.tape = GradTape()
+    values = AT.tensor((0.3, 0.6, 0.9))
+    values.requires_grad_(True)
+    loss = (values.asin() * values.sign()).sum()
+
+    captured = capture_backward_program(loss, (values,))
+    assert captured.missing_backward == ()
+
+    replayed = ProgramRunner(captured.program)(captured.feed_values)
+    produced = np.asarray(replayed["grad_0"].tolist(), dtype=np.float64)
+
+    autograd.tape = GradTape()
+    again = AT.tensor((0.3, 0.6, 0.9))
+    again.requires_grad_(True)
+    (eager,) = autograd.grad(
+        (again.asin() * again.sign()).sum(), [again], allow_unused=False
+    )
+    np.testing.assert_allclose(produced, np.asarray(eager.tolist()), atol=0)
+
+
+@pytest.mark.parametrize(
+    ("label", "build"),
+    [
+        ("pad", lambda x: x.pad((1, 1), value=0.0).sum()),
+        ("repeat", lambda x: x.repeat(2).sum()),
+        ("interleave", lambda x: x.repeat_interleave(3).sum()),
+        ("hyperbolic", lambda x: x.sinh().tanh().atanh().sum()),
+        ("reciprocal", lambda x: x.coth().sum()),
+    ],
+)
+def test_the_new_reverses_replay_as_programs_and_not_only_eagerly(label, build):
+    """A rule that only runs eagerly cannot reach the compiler.
+
+    ``capture_backward_program`` records the backward pass and hands back a
+    ``FusedProgram``, which is what a backend lowers. A reverse written out of
+    operations the runner cannot execute captures and then dies at replay, so
+    each rule is checked the whole way through rather than only under
+    ``autograd.grad``.
+    """
+
+    from src.common.tensors.abstraction import AbstractTensor as AT
+    from src.common.tensors.abstract_nn.fused_program import (
+        ProgramRunner,
+        capture_backward_program,
+    )
+    from src.common.tensors.autograd import GradTape
+
+    sample = (0.4, 0.9, 1.3)
+
+    autograd.tape = GradTape()
+    values = AT.tensor(sample)
+    values.requires_grad_(True)
+    captured = capture_backward_program(build(values), (values,))
+    assert captured.missing_backward == ()
+    replayed = ProgramRunner(captured.program)(captured.feed_values)
+    produced = np.asarray(replayed["grad_0"].tolist(), dtype=np.float64)
+
+    autograd.tape = GradTape()
+    again = AT.tensor(sample)
+    again.requires_grad_(True)
+    (eager,) = autograd.grad(build(again), [again], allow_unused=False)
+
+    np.testing.assert_allclose(
+        produced, np.asarray(eager.tolist(), dtype=np.float64), atol=0
+    )
+
+
+def test_a_genuinely_unknown_operator_still_refuses_a_capture():
+    """Widening the accounting must not turn the guard off."""
+
+    from src.common.tensors.abstraction import AbstractTensor as AT
+    from src.common.tensors.abstract_nn.fused_program import (
+        capture_backward_program,
+    )
+    from src.common.tensors.autograd import GradTape
+
+    autograd.tape = GradTape()
+    values = AT.tensor((1.0, 2.0, 3.0))
+    values.requires_grad_(True)
+    with autograd.no_grad():
+        opaque = values * 1.0
+    opaque.requires_grad_(True)
+    autograd.capture_all = True
+    try:
+        autograd.record("test_unknown_operator", (values,), opaque)
+    finally:
+        autograd.capture_all = False
+    loss = opaque.sum()
+
+    with pytest.raises(RuntimeError, match="test_unknown_operator"):
+        capture_backward_program(loss, (values,))
+
+
 def test_every_new_rule_registered_and_declares_its_domain():
     """A rule that registers but states no domain is a trap for the next reader."""
 
