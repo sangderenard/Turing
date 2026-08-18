@@ -44,7 +44,12 @@ explicit "iterative, not recursive" requirement this was built against.
 
 from __future__ import annotations
 
-from ..transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+from dataclasses import dataclass
+
+from ..transmogrifier.ssa import (
+    BasicBlock, Function, Instr, SSAValue,
+    SSARecordFieldStorage, SSARecordTable,
+)
 from ..transmogrifier.ssa_registry import Handler
 
 WORD_BYTES = 8
@@ -308,10 +313,99 @@ def build_deepcopy_function(
     )
 
 
+_POINTER_FIELD_STORAGE = (
+    SSARecordFieldStorage.RECORD, SSARecordFieldStorage.REFERENCE,
+)
+
+
+@dataclass(frozen=True)
+class TypeDescriptorEntry:
+    """One compile-time-derived ``TypeDescriptor``, ready to be laid out as
+    constant data: ``size`` in bytes, and one ``(byte_offset, child_index)``
+    pair per pointer-valued field -- ``child_index`` is this entry's own
+    index into the same table, not a second lookup structure.
+    """
+
+    record_id: int
+    size: int
+    pointer_fields: tuple[tuple[int, int], ...]
+
+
+def build_type_descriptor_table(
+    table: "SSARecordTable", root_record_id: int,
+) -> tuple[TypeDescriptorEntry, ...]:
+    """Enumerate every distinct record type reachable from one root record.
+
+    Iterative (explicit worklist, no recursion), same shape as the runtime
+    engine's own traversal: a record id already indexed is never re-walked,
+    so a type that is reachable more than once, or a directly or
+    indirectly self-referential type, still produces exactly one entry.
+
+    A field's byte offset is its own ``offset`` when the compiler already
+    assigned one; otherwise this assigns one word per field, in field
+    order, rather than inventing a second layout convention. ``size`` is
+    one word past the last field's own offset -- the smallest layout
+    consistent with the offsets actually used, not a guess.
+    """
+
+    order: list[int] = []
+    index_of: dict[int, int] = {}
+    worklist = [int(root_record_id)]
+    queued = {int(root_record_id)}
+    while worklist:
+        current_id = worklist.pop()
+        if current_id in index_of:
+            continue
+        index_of[current_id] = len(order)
+        order.append(current_id)
+        descriptor = table.records.get(current_id)
+        if descriptor is None:
+            continue
+        for record_field in descriptor.fields:
+            if (
+                record_field.storage in _POINTER_FIELD_STORAGE
+                and record_field.record_id is not None
+                and int(record_field.record_id) not in queued
+            ):
+                queued.add(int(record_field.record_id))
+                worklist.append(int(record_field.record_id))
+
+    entries: list[TypeDescriptorEntry] = []
+    for current_id in order:
+        descriptor = table.records.get(current_id)
+        if descriptor is None:
+            entries.append(TypeDescriptorEntry(current_id, WORD_BYTES, ()))
+            continue
+        pointer_fields: list[tuple[int, int]] = []
+        highest_offset_word = 0
+        for field_index, record_field in enumerate(descriptor.fields):
+            offset_words = (
+                record_field.offset if record_field.offset is not None
+                else field_index
+            )
+            highest_offset_word = max(highest_offset_word, offset_words)
+            if (
+                record_field.storage in _POINTER_FIELD_STORAGE
+                and record_field.record_id is not None
+            ):
+                child_index = index_of[int(record_field.record_id)]
+                pointer_fields.append((
+                    offset_words * WORD_BYTES, child_index,
+                ))
+        entries.append(TypeDescriptorEntry(
+            current_id,
+            (highest_offset_word + 1) * WORD_BYTES,
+            tuple(pointer_fields),
+        ))
+    return tuple(entries)
+
+
 __all__ = [
     "DEEPCOPY_FUNCTION_NAME",
     "MAX_SEEN_ENTRIES",
     "MAX_STACK_DEPTH",
     "WORD_BYTES",
+    "TypeDescriptorEntry",
     "build_deepcopy_function",
+    "build_type_descriptor_table",
 ]
