@@ -146,6 +146,10 @@ C_TENSOR_OPCODE_ORDER = (
     "SHR",
     "LOGICAL_AND",
     "LOGICAL_OR",
+    # Appended, not grouped with the transcendentals, because CTensorOp is
+    # appended the same way: ctensor_ops.c's is_unary_op classifies by enum
+    # range, so a mid-list insertion would renumber every opcode after it.
+    "SIGMOID",
 )
 
 C_SSA_EXTERNAL_PRIMITIVES = frozenset({
@@ -587,6 +591,7 @@ loop.body:
     i32 39, label %atanh
     i32 40, label %sign
     i32 41, label %invert
+    i32 49, label %sigmoid
   ]
 
 sqrt:
@@ -684,6 +689,18 @@ invert:
   %invert.flipped = xor i64 %invert.int, -1
   %invert.value = sitofp i64 %invert.flipped to double
   br label %store
+sigmoid:
+  ; Same branch-free stable form as ctensor_ops.c: exp() of a large positive
+  ; argument overflows, so exp is only ever given -|x| and the sign of the
+  ; input picks the numerator. Both arms are the same function.
+  %sigmoid.magnitude = call double @llvm.fabs.f64(double %value)
+  %sigmoid.exponent = fneg double %sigmoid.magnitude
+  %sigmoid.decay = call double @exp(double %sigmoid.exponent)
+  %sigmoid.denominator = fadd double 1.000000e+00, %sigmoid.decay
+  %sigmoid.negative = fcmp olt double %value, 0.000000e+00
+  %sigmoid.numerator = select i1 %sigmoid.negative, double %sigmoid.decay, double 1.000000e+00
+  %sigmoid.value = fdiv double %sigmoid.numerator, %sigmoid.denominator
+  br label %store
 identity:
   br label %store
 
@@ -716,6 +733,7 @@ store:
     [ %atanh.value, %atanh ],
     [ %sign.value, %sign ],
     [ %invert.value, %invert ],
+    [ %sigmoid.value, %sigmoid ],
     [ %value, %identity ]
   store double %result, ptr %out.ptr, align 8
   %i.next = add nsw i32 %i, 1

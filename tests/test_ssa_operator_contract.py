@@ -19,7 +19,11 @@ from src.transmogrifier.ssa_registry import Handler
 def test_contract_contains_every_repository_and_tensor_operator():
     assert len(REPOSITORY_SSA_OPERATORS) == len(Handler) == 117
     assert {row.handler for row in REPOSITORY_SSA_OPERATORS} == set(Handler)
-    assert len(TENSOR_SSA_OPERATORS) == len(CANONICAL_ABSTRACT_TENSOR_OPERATORS) == 223
+    # 225, not the 223 this line was born with: the assertion was written in
+    # the same commit that added ``cast_like`` and never counted it, and
+    # ``sigmoid`` joined ELEMENTWISE_UNARY afterwards.  Both are real
+    # vocabulary, so the number moved to meet them.
+    assert len(TENSOR_SSA_OPERATORS) == len(CANONICAL_ABSTRACT_TENSOR_OPERATORS) == 225
     assert CANONICAL_TENSOR_SSA_OPERATORS == CANONICAL_ABSTRACT_TENSOR_OPERATORS
 
 
@@ -38,7 +42,7 @@ def test_nonprimitive_tensor_operations_remain_named_repository_calls():
 
 def test_numeric_view_is_derived_from_the_complete_elementwise_catalogue():
     expected = ELEMENTWISE_UNARY | ELEMENTWISE_BINARY
-    assert len(NUMERIC_SSA_OPERATORS) == len(expected) == 56
+    assert len(NUMERIC_SSA_OPERATORS) == len(expected) == 57
     assert {row.name for row in NUMERIC_SSA_OPERATORS} == expected
     assert expected <= fortran_ops()
     assert expected <= llvm_ops()

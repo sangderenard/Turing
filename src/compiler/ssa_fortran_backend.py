@@ -206,6 +206,10 @@ _UNARY: dict[str, str] = {
     "sinh": "sinh({0})",
     "cosh": "cosh({0})",
     "tanh": "tanh({0})",
+    # Fortran has no sigmoid intrinsic. Written through tanh rather than as
+    # 1/(1+exp(-x)) because tanh is elemental, saturates instead of
+    # overflowing, and the identity is exact: sigmoid(x) = (1 + tanh(x/2))/2.
+    "sigmoid": "(0.5_c_double * (1.0_c_double + tanh(0.5_c_double * ({0}))))",
     "asinh": "asinh({0})",
     "acosh": "acosh({0})",
     "atanh": "atanh({0})",

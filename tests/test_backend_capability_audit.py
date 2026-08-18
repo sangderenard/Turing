@@ -13,7 +13,11 @@ def test_shared_catalog_audit_reports_each_target_without_hiding_gaps():
     rows = audit_catalog(catalog)
     by_name = {row["name"]: row for row in rows}
 
-    assert len(rows) == 66
+    # 93, up from the 66 this line was written against: the shared catalog
+    # gained the 26 structural ops that let a program state its own shape
+    # (9 control, 11 memory, 6 value) plus sigmoid.  None of them is a
+    # renaming of something already counted.
+    assert len(rows) == 93
     assert by_name["add"] == {
         "name": "add",
         "class": "binary",

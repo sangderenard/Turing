@@ -156,6 +156,7 @@ _TENSOR: dict[str, str] = {
     "isinf": "unary_double",
     "logical_not": "unary_double",
     "tanh": "unary_double",
+    "sigmoid": "unary_double",
     "sin": "unary_double",
     "cos": "unary_double",
     "tan": "unary_double",
