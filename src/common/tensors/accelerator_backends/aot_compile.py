@@ -95,17 +95,30 @@ A CARRIED VALUE MAY NOT ROUND-TRIP THROUGH A CALL.
 
 Calls are not the problem, and this is worth being exact about because the
 obvious reading -- "a call cannot produce a carried value" -- is wrong and
-would send someone inlining code that never needed it. A call on some OTHER
-value lowers fine. What fails is the round trip: when the carried value is
-the call's input AND the call's result is bound back to that same carried
-name, the region's input and output fuse, so the body publishes no distinct
-produced value and the carried update has no producer. A pure identity
-helper (``def passthrough(a): return a``) fails for the same reason, which
-is the clearest statement of it -- there is nothing there to produce.
+would send someone inlining code that never needed it. Both LOWERING forms
+above emit a ``Call`` in the loop body; calls there are ordinary.
 
-One ordinary operation on the result is enough to break the fusion, because
-it forces a real instruction in the body whose result IS the carried value.
-That is the cheap fix; inlining the whole helper is not required.
+The mechanism is region formation. A loop body's work is packaged into a
+region, and the body block gets ``Call`` (invoke the region) followed by
+``GetElementPtr``/``Load`` (read the region's published output back). That
+``Load`` is the instruction whose result IS the carried value, which is what
+the carried check looks for.
+
+When the body's only statement forwards another function's result --
+``next_w = update(w)``, then ``w = next_w`` -- there is no local computation
+to put in a body region, so no region is formed. The emitted body block is
+literally ``['Br']``: no Call, no Load, nothing. The placeholder SSAValue
+reserved for the carried update before the body was lowered is therefore
+never replaced, and the check reports it as having no producer. It is not a
+scope reset and nothing is aliased or collected; the body is simply empty.
+
+A pure identity helper (``def passthrough(a): return a``) is the clearest
+case -- there is genuinely nothing to compute -- and it produces the same
+empty body.
+
+One ordinary operation on the result is enough, because it gives the body
+local work, so a region IS formed and the Call/Load pair reappears. That is
+the cheap fix; inlining the whole helper is not required.
 
 A helper that RETURNS A TUPLE is the tuple case below wearing a hat:
 ``w = helper(...)`` binds the tuple temporary even though no tuple
