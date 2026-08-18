@@ -1,9 +1,13 @@
-# SSA structure vocabulary, and the two materializers still to build
+# SSA structure vocabulary, and the materializers
+
+*Updated 2026-08-18, later the same day: materializer 1 is built, and the
+drifted counts this document told you not to touch are now understood and
+corrected. See those two sections below.*
 
 Written 2026-08-18, continuing `MEMORY_MANAGER_AND_NODUS_INTEROP_HANDOFF_2026-08-18.md`.
 Read that one first for the memory-manager decision (nodus is the authority;
 `mem_backend.h` already *is* the unified allocator). This document covers the
-shared vocabulary work that followed, and names the two pieces not yet built.
+shared vocabulary work that followed, and the pieces built on top of it.
 
 ## The goal this serves
 
@@ -120,17 +124,37 @@ delegate to it.
     nodus   10053ef  register sigmoid + fix the parser that hid it
     turing  a290aed  SetAttr + 4 definition opcodes
     turing  9792198  AbstractTensor.ssa mirrors
+    turing  bc84ca9  sigmoid across the backend lanes, and the counts explained
+    turing  5a3dc2b  SSA definitions -> Python AST (materializer 1)
 
 ## What is NOT done -- the next work
 
-### 1. SSA objects -> Python AST
+### 1. SSA objects -> Python AST -- DONE, with one seam left open
 
-Take the definition objects (`SSAClassDefinition` and friends, now reachable
-from `AbstractTensor.ssa`) and manifest them as real `ast.ClassDef` /
-`ast.FunctionDef` nodes. This is the direction that makes a definition
-executable Python again after a round trip.
+`src/compiler/ssa_python_materializer.py` (commit `5a3dc2b`). Definitions in,
+real `ast.ClassDef`/`ast.FunctionDef` out, reached from the mirrors as
+`AbstractTensor.ssa.to_python`.
 
-The vocabulary and the mirrors both exist now, so this has a stable input.
+It is the Python *destination* in `oop_schema`'s sense rather than a new path:
+an `SSAClassDefinition` goes through `ClassSchema.from_ssa_class_definition`,
+so the SSA form's lossiness stays stated in one place. Its scalar spellings
+are audited against `ssa_llvm_backend`'s likeness tables at import, the same
+contract `ssa_reference_evaluator` holds -- an opcode spelled there but absent
+here fails the import.
+
+Calibrated against the symbolic fluid step, the case the reference evaluator
+is calibrated on: the 291-instruction body materializes, compiles, executes,
+and reproduces the authored SymPy equations to 2.1e-17, and agrees with the
+reference evaluator on a second sample.
+
+**The seam left open is structured control flow.** A multi-block function
+raises and names its blocks. Turning a CFG back into `if`/`while` is
+decompilation with its own correctness argument, and approximating it on the
+way past would emit Python that reads right and means something else. That is
+the next piece of this direction, and it is deliberately separate.
+
+Also declared rather than guessed: `ULt`/`ULe`/`SExt`/`ZExt`/`FpToUi` have no
+exact Python spelling without a stated bit width, so they raise.
 
 ### 2. C++ dynamic class/function building (nodus side)
 
@@ -144,19 +168,50 @@ shells use an abstract-tensor DLL. Expect roughly a week of iteration to make
 that reliable and to confirm turing compiles it correctly. Do not start this
 before 1 and 2 exist.
 
+## The drifted counts -- understood, then corrected (commit `bc84ca9`)
+
+`tests/test_ssa_operator_contract.py` had three failures, left alone here
+because the cause of the drift was not understood. It is now. Two causes,
+both real vocabulary:
+
+* `cast_like` was added to `TYPE_AND_DEVICE_OPERATORS` by the same commit
+  (`4abc962`) that wrote `== 223`, so the assertion was born stale by one;
+* `sigmoid` joined `ELEMENTWISE_UNARY` in `c967b1d` afterwards.
+
+Chasing the second surfaced a live breakage rather than a numbering question.
+`validate_c_opcode_alignment()` was raising: `ctensor_ops.h` carries
+`CT_OP_SIGMOID` at ordinal 49, but the handwritten LLVM lane's mirror tuple
+stopped at 48, so `opcode_index[unary_codes["sigmoid"]]` was a `KeyError` on
+any tape that reached it. Registering the op in the C header and the nodus
+catalog had left three of the four lanes behind.
+
+Sigmoid is now lowered everywhere it is advertised -- LLVM (the same
+branch-free stable form as `ctensor_ops.c`, verified by JIT-compiling the
+module and running it), Fortran (through `tanh`, which is elemental and
+saturates rather than overflowing), and WASM (one entry in
+`wasm_math_tables`, domain +/-16, 32 KB, measured 7.3e-7 against a 1e-6
+epsilon). `shared_implemented_tensor_operations()` now contains it.
+
+With the causes understood the counts moved to meet them: 223 -> 225 and
+56 -> 57 here, and 66 -> 93 in `test_backend_capability_audit.py`, that last
+being the 26 structural ops the shared catalog gained plus sigmoid. Each
+carries a comment naming what it counts, so the next drift is readable rather
+than mysterious.
+
 ## Known-failing, pre-existing, deliberately untouched
 
-`tests/test_ssa_operator_contract.py` has three failures. Confirmed
-pre-existing by stashing:
+Verified pre-existing by restoring the tree to HEAD and running the same
+files -- not by stashing, which in this nested repo discards the whole WIP:
 
-* the tensor catalogue count (`225` live vs an expected `223`)
-* two related backend-inventory assertions
+* `test_c_backend_llvm_ssa.py` -- the translation table's
+  `cast_double_to_bool_values`/`cast_double_to_double_values` drift, and four
+  tape-lowering cases;
+* `test_llvm_jit_backend.py` -- the torture baselines;
+* `test_fortran_fidelity.py` -- a `capture_feed_origins` `KeyError`.
 
-The `Handler` count assertion in that file **was** stale (asserted 110 against
-a live 112) and is now corrected to 117 and passing. The tensor-catalogue
-numbers were left alone on purpose: the cause of the drift is not understood,
-and renumbering them would make the suite green while hiding it. Find out why
-that catalogue grew before touching the number.
+The first of those is the same shape as the counts above: `c967b1d`'s cast
+work added symbols the table's expectation never learned about. Worth doing
+the same reading before anyone edits the set.
 
 ## Standing lesson from the prior arc
 
