@@ -360,6 +360,93 @@ def matmul_vjp(g, A, B):
     gB = unbroadcast(AbstractTensor.matmul(T(A2), g2), B2.shape)
     return gA.reshape(A.shape), gB.reshape(B.shape)
 
+def pad_vjp(g, source, pad, mode="constant"):
+    """Adjoint of a constant pad: crop the gradient back to the original region.
+
+    ``pad`` follows the forward's own convention -- ``(before, after)`` pairs
+    running from the LAST dimension backwards -- so this reads it the same way
+    rather than assuming a leading-axis order that would silently crop the
+    wrong side of a rank-2 gradient.
+
+    Only the constant mode is adjoint-by-cropping. ``reflect``/``replicate``
+    fold the padded values back onto interior positions, so their gradient is a
+    scatter-add and not a crop; they raise rather than return a plausible wrong
+    answer. Negative pads are a crop in the forward direction, whose adjoint is
+    a pad, and are refused here for the same reason.
+    """
+
+    if str(mode) != "constant":
+        raise NotImplementedError(
+            f"pad backward is defined for the constant mode; {mode!r} folds "
+            "padded positions back onto interior ones and needs a scatter-add "
+            "adjoint, not a crop"
+        )
+    widths = tuple(int(width) for width in (pad or ()))
+    if any(width < 0 for width in widths):
+        raise NotImplementedError(
+            "pad backward is defined for non-negative widths; a negative pad "
+            "is a forward crop whose adjoint is a pad"
+        )
+    rank = len(tuple(g.shape))
+    index = [slice(None)] * rank
+    for offset, position in enumerate(range(0, len(widths) - 1, 2)):
+        axis = rank - 1 - offset
+        if axis < 0:
+            break
+        before, after = widths[position], widths[position + 1]
+        index[axis] = slice(before, int(g.shape[axis]) - after)
+    return g[tuple(index)].reshape(tuple(source.shape))
+
+
+def repeat_vjp(g, source, repeats, dim=0):
+    """Adjoint of a tiling repeat: sum the tiles back onto one period.
+
+    ``repeat`` lays the whole operand down ``repeats`` times end to end along
+    ``dim``, so each source position receives gradient from ``repeats``
+    positions spaced one period apart. Splitting the axis into
+    ``(repeats, period)`` and summing the leading half is exactly that sum.
+    """
+
+    count = int(repeats)
+    if count <= 0:
+        raise ValueError(f"repeat backward needs a positive count, got {repeats!r}")
+    shape = tuple(int(extent) for extent in source.shape)
+    if dim is None:
+        flat = g.reshape((count, -1))
+        return flat.sum(dim=0).reshape(shape)
+    axis = int(dim)
+    axis = axis if axis >= 0 else len(shape) + axis
+    split = (*shape[:axis], count, shape[axis], *shape[axis + 1:])
+    return g.reshape(split).sum(dim=axis).reshape(shape)
+
+
+def repeat_interleave_vjp(g, source, repeats, dim=None):
+    """Adjoint of an interleaving repeat: sum each consecutive run.
+
+    Unlike ``repeat``, the copies of one source position are adjacent, so the
+    axis splits as ``(extent, repeats)`` and the *trailing* half is summed.
+    Getting these two the wrong way round produces a correctly-shaped and
+    entirely wrong gradient whenever the extent and the count differ, which is
+    why they are separate helpers rather than one with a flag.
+    """
+
+    count = int(repeats)
+    if count <= 0:
+        raise ValueError(
+            f"repeat_interleave backward needs a positive count, got {repeats!r}"
+        )
+    shape = tuple(int(extent) for extent in source.shape)
+    if dim is None:
+        total = 1
+        for extent in shape:
+            total *= extent
+        return g.reshape((total, count)).sum(dim=1).reshape(shape)
+    axis = int(dim)
+    axis = axis if axis >= 0 else len(shape) + axis
+    split = (*shape[:axis], shape[axis], count, *shape[axis + 1:])
+    return g.reshape(split).sum(dim=axis + 1).reshape(shape)
+
+
 BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
     # ----------------------------------------------------------------------
     # Elementwise unary
@@ -489,6 +576,184 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "domain": "x: any real",
         "notes": "",
         "tags": ["elementwise", "unary", "smooth", "nn"],
+    },
+    # Structural reverses. These move gradient between positions rather than
+    # scaling it, so each one is a rearrangement whose adjoint is the exact
+    # inverse rearrangement -- and each carries its forward's own metadata
+    # convention, which is where getting one wrong stays invisible.
+    "pad": {
+        "arity": "unary",
+        "signature": "y = pad(x, pad, value=0, mode='constant')",
+        "latex": r"y_{i+b} = x_i,\quad \frac{\partial L}{\partial x_i} = g_{i+b}",
+        "backward": {
+            "x": "gx = crop(g, pad)"
+        },
+        "python": {
+            "parameters": ["g", "x", "pad", "mode"],
+            "body": "return pad_vjp(g, x, pad, mode)",
+        },
+        "domain": "constant mode, non-negative widths",
+        "notes": (
+            "``pad`` runs (before, after) from the LAST dimension backwards. "
+            "reflect/replicate need a scatter-add adjoint and raise."
+        ),
+        "tags": ["structural", "unary", "shape"],
+    },
+    "repeat": {
+        "arity": "unary",
+        "signature": "y = repeat(x, repeats, dim=0)",
+        "latex": r"\frac{\partial L}{\partial x_i} = \sum_{k<r} g_{i + kn}",
+        "backward": {
+            "x": "gx = sum_over_tiles(g, repeats, dim)"
+        },
+        "python": {
+            "parameters": ["g", "x", "repeats", "dim"],
+            "body": "return repeat_vjp(g, x, repeats, dim)",
+        },
+        "domain": "repeats >= 1",
+        "notes": "Tiling: the copies are one period apart, so the split is (repeats, extent).",
+        "tags": ["structural", "unary", "shape"],
+    },
+    "repeat_interleave": {
+        "arity": "unary",
+        "signature": "y = repeat_interleave(x, repeats, dim=None)",
+        "latex": r"\frac{\partial L}{\partial x_i} = \sum_{k<r} g_{ir + k}",
+        "backward": {
+            "x": "gx = sum_over_runs(g, repeats, dim)"
+        },
+        "python": {
+            "parameters": ["g", "x", "repeats", "dim"],
+            "body": "return repeat_interleave_vjp(g, x, repeats, dim)",
+        },
+        "domain": "repeats >= 1",
+        "notes": "Interleaving: the copies are adjacent, so the split is (extent, repeats).",
+        "tags": ["structural", "unary", "shape"],
+    },
+    # The inverse-trigonometric and hyperbolic family. Every one of these was
+    # already a forward primitive -- ELEMENTWISE_UNARY carries them and the C,
+    # LLVM and Fortran lanes all lower them -- but none had a reverse, so any
+    # tape touching one simply had no gradient for it. Their derivatives are
+    # exact and elementary; the only care they need is at the domain edges,
+    # where the guard is stated per rule rather than left to chance.
+    "asin": {
+        "arity": "unary",
+        "signature": "y = asin(x)",
+        "latex": r"y = \arcsin x, \quad \frac{\partial y}{\partial x} = \frac{1}{\sqrt{1-x^2}}",
+        "backward": {
+            "x": "gx = unbroadcast(g / sqrt(1 - x*x), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g / (AbstractTensor.sqrt(1 - x*x) + eps()), x.shape)",
+        },
+        "domain": "|x| < 1; the derivative diverges at +/-1",
+        "notes": "eps guards the endpoints, where the true slope is unbounded.",
+        "tags": ["elementwise", "unary", "smooth", "trig", "domain"],
+    },
+    "acos": {
+        "arity": "unary",
+        "signature": "y = acos(x)",
+        "latex": r"y = \arccos x, \quad \frac{\partial y}{\partial x} = \frac{-1}{\sqrt{1-x^2}}",
+        "backward": {
+            "x": "gx = unbroadcast(-g / sqrt(1 - x*x), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(-g / (AbstractTensor.sqrt(1 - x*x) + eps()), x.shape)",
+        },
+        "domain": "|x| < 1; the derivative diverges at +/-1",
+        "notes": "Same magnitude as asin with the opposite sign.",
+        "tags": ["elementwise", "unary", "smooth", "trig", "domain"],
+    },
+    "atan": {
+        "arity": "unary",
+        "signature": "y = atan(x)",
+        "latex": r"y = \arctan x, \quad \frac{\partial y}{\partial x} = \frac{1}{1+x^2}",
+        "backward": {
+            "x": "gx = unbroadcast(g / (1 + x*x), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g / (1 + x*x), x.shape)",
+        },
+        "domain": "x: any real",
+        "notes": "No guard needed; the denominator is bounded below by 1.",
+        "tags": ["elementwise", "unary", "smooth", "trig"],
+    },
+    "sinh": {
+        "arity": "unary",
+        "signature": "y = sinh(x)",
+        "latex": r"y = \sinh x, \quad \frac{\partial y}{\partial x} = \cosh x",
+        "backward": {
+            "x": "gx = unbroadcast(g * cosh(x), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g * AbstractTensor.cosh(x), x.shape)",
+        },
+        "domain": "x: any real",
+        "notes": "The hyperbolic mirror of sin -> cos, without the sign flip.",
+        "tags": ["elementwise", "unary", "smooth", "hyperbolic"],
+    },
+    "cosh": {
+        "arity": "unary",
+        "signature": "y = cosh(x)",
+        "latex": r"y = \cosh x, \quad \frac{\partial y}{\partial x} = \sinh x",
+        "backward": {
+            "x": "gx = unbroadcast(g * sinh(x), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g * AbstractTensor.sinh(x), x.shape)",
+        },
+        "domain": "x: any real",
+        "notes": "Unlike cos -> -sin, this one carries no sign flip.",
+        "tags": ["elementwise", "unary", "smooth", "hyperbolic"],
+    },
+    "asinh": {
+        "arity": "unary",
+        "signature": "y = asinh(x)",
+        "latex": r"y = \operatorname{arcsinh} x, \quad \frac{\partial y}{\partial x} = \frac{1}{\sqrt{x^2+1}}",
+        "backward": {
+            "x": "gx = unbroadcast(g / sqrt(x*x + 1), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g / AbstractTensor.sqrt(x*x + 1), x.shape)",
+        },
+        "domain": "x: any real",
+        "notes": "No guard needed; the radicand is bounded below by 1.",
+        "tags": ["elementwise", "unary", "smooth", "hyperbolic"],
+    },
+    "acosh": {
+        "arity": "unary",
+        "signature": "y = acosh(x)",
+        "latex": r"y = \operatorname{arccosh} x, \quad \frac{\partial y}{\partial x} = \frac{1}{\sqrt{x^2-1}}",
+        "backward": {
+            "x": "gx = unbroadcast(g / sqrt(x*x - 1), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g / (AbstractTensor.sqrt(x*x - 1) + eps()), x.shape)",
+        },
+        "domain": "x > 1; the derivative diverges at 1",
+        "notes": "eps guards x -> 1+, where the true slope is unbounded.",
+        "tags": ["elementwise", "unary", "smooth", "hyperbolic", "domain"],
+    },
+    "atanh": {
+        "arity": "unary",
+        "signature": "y = atanh(x)",
+        "latex": r"y = \operatorname{arctanh} x, \quad \frac{\partial y}{\partial x} = \frac{1}{1-x^2}",
+        "backward": {
+            "x": "gx = unbroadcast(g / (1 - x*x), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g / (1 - x*x + eps()), x.shape)",
+        },
+        "domain": "|x| < 1; the derivative diverges at +/-1",
+        "notes": "eps guards the endpoints, where the true slope is unbounded.",
+        "tags": ["elementwise", "unary", "smooth", "hyperbolic", "domain"],
     },
     "sigmoid": {
         "arity": "unary",
