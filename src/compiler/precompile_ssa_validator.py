@@ -156,6 +156,8 @@ PRECOMPILE_TO_SSA: dict[str, Handler] = {
 def ssa_handler_for_precompile(operation_name: str) -> Handler | None:
     if operation_name == "tensor_from_list":
         return Handler.Const
+    if operation_name == "deepcopy":
+        return Handler.Deepcopy
     if translations_for_operation(operation_name):
         return Handler.Call
     mapped = PRECOMPILE_TO_SSA.get(operation_name)

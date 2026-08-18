@@ -141,6 +141,16 @@ class Handler(Enum):
     # destination addresses advance by the same explicit signed byte stride;
     # iteration order is observable when the regions overlap.
     StridedMemoryCopy = "StridedMemoryCopy"
+    # A source-level deep copy. Not Python object-graph duplication (there is
+    # no Python object graph at this stage) and not a single flat
+    # StridedMemoryCopy either -- a record field that is itself a reference
+    # points at separate storage that a flat byte-range copy would leave
+    # shared between original and copy, exactly the shallow-copy bug a deep
+    # copy exists to avoid. Lowering must walk the value's own record/field
+    # descriptor (storage kind: scalar/span/record/reference/keyed, already
+    # tracked elsewhere in this compiler) and recurse into every
+    # record/reference field's own storage, copying each independently.
+    Deepcopy      = "Deepcopy"
     GetElementPtr = "GetElementPtr"
     # Structured source operations retained until record/index legalization.
     # Indexed forms are rewritten to GetElementPtr+Load/Store before target
