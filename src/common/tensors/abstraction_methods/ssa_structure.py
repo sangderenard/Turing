@@ -150,6 +150,25 @@ class _SSAStructureNamespace:
         }
 
     @staticmethod
+    def to_python(definition, *, functions=None):
+        """Materialize a stated definition back into Python ``ast`` nodes.
+
+        The return direction: a class stated with ``define_class`` becomes a
+        real ``ast.ClassDef`` again, and a method whose SSA function is passed
+        in ``functions`` comes back with its body -- including any constant
+        authored inside it, which is what a bare method name cannot carry.
+
+        Deferred for the same reason as the rest of this module: the
+        materializer reaches the compiler's likeness tables, and importing
+        ``abstraction`` must not pay for them.
+        """
+
+        from ....compiler.ssa_python_materializer import materialize_class
+
+        node, _ = materialize_class(definition, functions=functions)
+        return node
+
+    @staticmethod
     def handler(name: str):
         """Resolve a structural operator name to its ``Handler`` member."""
 
