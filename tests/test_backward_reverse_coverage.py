@@ -366,3 +366,120 @@ def test_every_new_rule_registered_and_declares_its_domain():
         rule = BACKWARD_RULES[name]
         assert rule["domain"], f"{name} states no domain"
         assert rule["python"]["body"], f"{name} has no executable body"
+
+
+# -- do these actually train? ---------------------------------------------
+#
+# The concern these answer: were the domain-limited rules left unwritten on
+# purpose, to keep something differentiable? Git says no -- the commit adding
+# them is the only one that ever touched those keys, so they were never
+# removed. But absence of a removal is not evidence of safety, so the rules
+# are exercised through a real optimizer instead of argued about.
+
+def _xor_training_run(activation, *, steps=40, lr=5e-2, seed=0):
+    """Train one 2-8-1 net on XOR through ``activation`` with abstract Adam."""
+
+    from src.common.tensors.abstraction import AbstractTensor as AT
+    from src.common.tensors.abstract_nn.optimizer import Adam
+    from src.common.tensors.autograd import GradTape
+
+    rng = np.random.default_rng(seed)
+    inputs = [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
+    targets = [[0.0], [1.0], [1.0], [0.0]]
+
+    autograd.tape = GradTape()
+
+    def parameter(shape, scale):
+        made = AT.tensor((rng.normal(size=shape) * scale).tolist())
+        made.requires_grad_(True)
+        return made
+
+    params = [
+        parameter((2, 8), 0.8), parameter((8,), 0.0),
+        parameter((8, 1), 0.8), parameter((1,), 0.0),
+    ]
+    optimizer = Adam(params, lr=lr)
+
+    history = []
+    for _ in range(steps):
+        autograd.tape = GradTape()
+        for each in params:
+            each.requires_grad_(True)
+        hidden = activation(AT.tensor(inputs).matmul(params[0]) + params[1])
+        error = (hidden.matmul(params[2]) + params[3]) - AT.tensor(targets)
+        loss = (error * error).mean()
+        history.append(float(np.asarray(loss.tolist()).reshape(-1)[0]))
+        gradients = autograd.grad(loss, params, allow_unused=False)
+        for gradient in gradients:
+            assert np.all(np.isfinite(np.asarray(gradient.tolist()))), (
+                "a non-finite gradient reached the optimizer"
+            )
+        params = optimizer.step(params, gradients)
+    return history
+
+
+@pytest.mark.parametrize(
+    ("label", "activation"),
+    [
+        # Tanh is the control: its reverse predates this work, so if it
+        # converges and a new one does not, the new rule is what differs.
+        ("tanh-control", lambda h: h.tanh()),
+        ("asinh", lambda h: h.asinh()),
+        ("atan", lambda h: h.atan()),
+        # The eps-guarded, domain-limited rules, squashed into range first --
+        # which is the only way they are usable as activations at all.
+        ("asin-squashed", lambda h: (h.tanh() * 0.9).asin()),
+        ("atanh-squashed", lambda h: (h.tanh() * 0.9).atanh()),
+        # Reaches sinh and cosh, which is what unblocked this whole family.
+        ("sech", lambda h: h.tanh().sech()),
+    ],
+)
+def test_a_net_trains_through_each_new_reverse(label, activation):
+    history = _xor_training_run(activation)
+
+    assert all(np.isfinite(history)), f"{label} produced a non-finite loss"
+    assert min(history) < history[0] * 0.7, (
+        f"{label} did not reduce its loss: {history[0]:.4f} -> {min(history):.4f}"
+    )
+
+
+def test_the_domain_guard_keeps_the_gradient_finite_at_the_edge():
+    """At the boundary the true slope is unbounded; the guard caps it."""
+
+    from src.common.tensors.abstraction import AbstractTensor as AT
+    from src.common.tensors.autograd import GradTape
+
+    def slope(call, value):
+        autograd.tape = GradTape()
+        x = AT.tensor([value])
+        x.requires_grad_(True)
+        (gradient,) = autograd.grad(call(x).sum(), [x], allow_unused=False)
+        return float(np.asarray(gradient.tolist()).reshape(-1)[0])
+
+    for call in (lambda t: t.asin(), lambda t: t.atanh()):
+        interior = slope(call, 0.9)
+        edge = slope(call, 1.0)
+        assert np.isfinite(interior) and interior > 0
+        # Finite rather than inf, and large rather than clipped to something
+        # comfortable -- the steepness is real and is reported, not hidden.
+        assert np.isfinite(edge)
+        assert edge > interior * 1e3
+
+
+def test_leaving_the_domain_is_a_forward_failure_not_a_reverse_one():
+    """Worth stating, because the NaN looks like the new rule's fault.
+
+    Pushed past +/-1 the forward itself is undefined -- asin(1.0003) is NaN in
+    any library -- and the loss goes non-finite before the reverse is ever
+    consulted. Omitting the reverse would not prevent this; it would only
+    remove the gradient and leave the same forward NaN.
+    """
+
+    from src.common.tensors.abstraction import AbstractTensor as AT
+    from src.common.tensors.autograd import GradTape
+
+    autograd.tape = GradTape()
+    outside = AT.tensor([1.0003])
+    with autograd.no_grad():
+        produced = np.asarray(outside.asin().tolist(), dtype=np.float64)
+    assert not np.all(np.isfinite(produced))
