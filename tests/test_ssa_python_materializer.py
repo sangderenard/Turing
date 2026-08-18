@@ -685,3 +685,212 @@ def test_a_control_shape_that_is_not_a_counted_loop_still_refuses():
     )
     with pytest.raises(MaterializationError, match="counted loop"):
         materialize_function_body(function)
+
+
+# -- corpus equivalence ---------------------------------------------------
+#
+# One example proves the path exists; a corpus is what makes it a test. Each
+# case is authored Python, lowered, materialized back, executed, and compared
+# against running the authored version directly.
+
+_CORPUS = [
+    (
+        "arithmetic-chain",
+        """
+def helper(a):
+    return a * 1.0
+
+def train(x):
+    return helper(x) * 3.0 - 2.0
+""",
+        [(1.0,), (-2.5,), (0.0,)],
+        lambda x: x * 3.0 - 2.0,
+    ),
+    (
+        "two-parameters",
+        """
+def helper(a, b):
+    return a * b
+
+def train(x, y):
+    return helper(x, y) + x - y
+""",
+        [(2.0, 3.0), (-1.0, 4.0)],
+        lambda x, y: x * y + x - y,
+    ),
+    (
+        "loop-single-carried",
+        """
+def helper(a):
+    return a * 1.0
+
+def train(w, n):
+    total = helper(w)
+    for _ in range(n):
+        next_w = w * 0.9
+        w = next_w
+        total = w
+    return total
+""",
+        [(2.0, 3), (1.0, 0), (5.0, 7)],
+        None,
+    ),
+    (
+        "loop-nested-arithmetic",
+        """
+def helper(a):
+    return a * 1.0
+
+def train(w, n):
+    total = helper(w)
+    for _ in range(n):
+        next_w = (w * 2.0 - 1.0) * 0.5
+        w = next_w
+        total = w
+    return total
+""",
+        [(3.0, 2), (1.0, 5)],
+        None,
+    ),
+]
+
+_CORPUS_REFERENCE = {
+    "loop-single-carried": lambda w, n: (
+        [w := w * 0.9 for _ in range(n)] and w
+    ) if n else w,
+    "loop-nested-arithmetic": lambda w, n: (
+        [w := (w * 2.0 - 1.0) * 0.5 for _ in range(n)] and w
+    ) if n else w,
+}
+
+
+@pytest.mark.parametrize(
+    ("label", "source", "probes", "reference"),
+    _CORPUS,
+    ids=[case[0] for case in _CORPUS],
+)
+def test_the_round_trip_is_equivalent_across_a_corpus(
+    label, source, probes, reference
+):
+    import inspect as _inspect
+
+    prefix = label.replace("-", "_")
+    namespace, skipped, _emitted = _run_round_trip(source, "train", prefix)
+    assert skipped == {}, f"{label}: not everything materialized: {skipped}"
+
+    compiled = namespace[f"{prefix}__train"]
+    authored = reference or _CORPUS_REFERENCE[label]
+    authored_names = list(_inspect.signature(authored).parameters)
+    compiled_names = list(_inspect.signature(compiled).parameters)
+
+    # Bind by name where the IR carried one. Some shapes lose parameter names
+    # entirely (see the test below), and there the emitted formal is ``tN``;
+    # a single unnamed parameter is still bound unambiguously by position.
+    if set(compiled_names) == set(authored_names):
+        call = lambda probe: compiled(**dict(zip(authored_names, probe)))
+    else:
+        assert len(compiled_names) == len(probes[0]) == 1, (
+            f"{label}: names lost and arity > 1, so binding is ambiguous: "
+            f"{compiled_names}"
+        )
+        call = lambda probe: compiled(*probe)
+
+    for probe in probes:
+        assert call(probe) == pytest.approx(authored(*probe), abs=1e-12)
+
+
+def test_parameter_names_do_not_survive_every_shape():
+    """A gap in the IR, recorded rather than papered over.
+
+    ``def train(x): return helper(x) * 3.0 - 2.0`` lowers with an EMPTY
+    ``parameter_names`` -- the name ``x`` is not recorded anywhere in the
+    function's metadata -- while ``def train(x, y): return helper(x, y) + x - y``
+    records both. The materializer cannot invent what the IR does not carry, so
+    the formal comes back as ``t0``.
+
+    This matters for a round trip meant to be diffed against source: an emitted
+    program whose parameters are ``t0`` is still correct and still runnable, but
+    it is less readable than the IR could support. The fix belongs where the
+    metadata is written, not here.
+    """
+
+    module, _outputs, _exports = _lower(
+        """
+def helper(a):
+    return a * 1.0
+
+def train(x):
+    return helper(x) * 3.0 - 2.0
+""",
+        "train",
+        "unnamed",
+    )
+    metadata = module.functions["unnamed__train"].metadata or {}
+    assert tuple(metadata.get("parameter_names") or ()) == ()
+
+    module, _outputs, _exports = _lower(
+        """
+def helper(a, b):
+    return a * b
+
+def train(x, y):
+    return helper(x, y) + x - y
+""",
+        "train",
+        "named",
+    )
+    metadata = module.functions["named__train"].metadata or {}
+    assert {name for name, _value in metadata.get("parameter_names") or ()} == {"x", "y"}
+
+
+def test_a_value_can_be_both_a_formal_and_a_region_output():
+    """A defect the round trip surfaced, recorded rather than worked around.
+
+    ``def train(x): return helper(x) / 4.0 + x ** 2.0`` lowers to a function
+    whose formals are values 0 and 5 -- but 5 is also an OUTPUT of
+    ``planned_region_0``, and the call that consumes 5 is scheduled BEFORE the
+    call that produces it. The use-before-def is masked precisely because 5 is
+    also declared a formal, so it always has a value.
+
+    The visible symptom is a one-parameter source compiling to a two-parameter
+    program, where the extra formal has no name and no caller could know what
+    to pass. The materializer reports it faithfully instead of hiding it: this
+    is what the emitted IR says.
+    """
+
+    module, _outputs, _exports = _lower(
+        """
+def helper(a):
+    return a * 1.0
+
+def train(x):
+    return helper(x) / 4.0 + x ** 2.0
+""",
+        "train",
+        "collide",
+    )
+    function = module.functions["collide__train"]
+    formals = [int(argument.id) for argument in function.args]
+    metadata = function.metadata or {}
+    named = {int(value) for _name, value in metadata.get("parameter_names") or ()}
+
+    # One authored parameter, two formals; the extra one is unnamed.
+    assert len(formals) == 2
+    assert len(named) == 1
+    unnamed = [value for value in formals if value not in named]
+    assert len(unnamed) == 1
+
+    produced_by_a_region = set()
+    consumed_before_produced = False
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            attributes = instruction.attributes or {}
+            if unnamed[0] in [int(a.id) for a in instruction.args]:
+                if unnamed[0] not in produced_by_a_region:
+                    consumed_before_produced = True
+            for output in attributes.get("output_ids") or ():
+                produced_by_a_region.add(int(output))
+
+    # The unnamed formal is produced by a region, and consumed before that.
+    assert unnamed[0] in produced_by_a_region
+    assert consumed_before_produced

@@ -94,6 +94,36 @@ A whole lowered program with a loop now round-trips and executes:
 `train(w=2.0, epochs=3)` returns `1.71475`, matching the authored Python
 exactly, and the zero-trip case returns its input unchanged.
 
+## What the round trip found the moment it was pointed at a corpus
+
+Three defects, none of which raised. This is the payoff, arriving earlier than
+expected — the decompile path is a detector, not just a convenience.
+
+**Only the first loop-carried value is carried.** A source carrying two names
+lowers with no shortfall and computes the wrong answer: the second is passed as
+its ENTRY value every iteration, frozen. Confirmed by comparing the
+round-tripped program against both the authored function and a deliberately
+frozen variant — it matches the frozen one to the bit.
+`loop.carried_aliases` reaches the SSA builder with one entry for a source that
+carries two, so the defect is upstream in control planning where
+`loop_composer` builds that tuple. **This blocks a compiled Adam step
+directly**, since Adam carries `w`, `m` and `v`.
+
+It also corrects something written earlier the same day: "multiple carried
+values are fine — m, v and w together lower". They do lower. They are also
+wrong, and the phrasing invited exactly the wrong conclusion.
+
+**A value can be both a formal and a region output.** `train(x)` with
+`helper(x) / 4.0 + x ** 2.0` compiles to a TWO-parameter function whose second
+formal is also an output of `planned_region_0`, consumed by a call scheduled
+before the one that produces it. The use-before-def is masked precisely because
+the value is also a formal, so it always has something.
+
+**Parameter names do not survive every shape.** Some functions lower with an
+empty `parameter_names`, so the emitted formal is `t0`. Correct and runnable,
+but less readable than the IR could support — and it is the IR's gap, not the
+materializer's, which cannot invent a name that was never recorded.
+
 ## Step 3 — what the two halves buy together
 
 With `PRESERVE` and a round trip, the pair closes:

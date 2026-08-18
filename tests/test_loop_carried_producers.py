@@ -176,3 +176,78 @@ def test_the_count_of_carried_values_is_not_what_limits_it():
 
     module, _outputs, _exports = _lower(_TWO_CARRIED, "carried_pair")
     assert module.functions
+
+
+# -- a second carried value is silently dropped ---------------------------
+#
+# Found by round-tripping the lowered program back to Python and running it,
+# not by reading the IR. It lowers with no shortfall, executes, and returns
+# the wrong number -- the failure mode this pipeline keeps producing.
+
+_TWO_CARRIED_NUMERIC = """
+def helper(a):
+    return a * 1.0
+
+def train(w, m, n):
+    total = helper(w)
+    for _ in range(n):
+        next_m = m * 0.5 + w
+        next_w = w - 0.1 * next_m
+        m = next_m
+        w = next_w
+        total = w
+    return total
+"""
+
+
+def _authored(w, m, n):
+    for _ in range(n):
+        next_m = m * 0.5 + w
+        next_w = w - 0.1 * next_m
+        m, w = next_m, next_w
+    return w
+
+
+def _with_second_value_frozen(w, m, n):
+    """What the compiled program actually computes: ``m`` never updates."""
+
+    for _ in range(n):
+        w = w - 0.1 * (m * 0.5 + w)
+    return w
+
+
+@pytest.mark.parametrize(
+    ("start", "second", "epochs"),
+    [(1.0, 0.0, 4), (3.0, -1.0, 6), (2.0, 1.0, 3)],
+)
+def test_only_the_first_carried_value_is_actually_carried(start, second, epochs):
+    """A KNOWN MISCOMPILATION, pinned so it cannot be mistaken for working.
+
+    The source carries two names across the loop. The lowering creates one
+    carried phi, and passes the second value's ENTRY value on every iteration.
+    Nothing raises; the numbers are simply wrong.
+
+    When this is fixed the assertions below will fail loudly -- which is the
+    point. Flip them to ``_authored`` and delete this comment; do not relax
+    them.
+
+    ``loop.carried_aliases`` reaches the SSA builder with a single entry, so
+    the fix belongs upstream where ``loop_composer`` builds that tuple, not in
+    ``precompile_to_ssa``, which lowers faithfully what it is handed.
+    """
+
+    from src.compiler.ssa_python_materializer import materialize_ir_module
+
+    module, _outputs, _exports = _lower(_TWO_CARRIED_NUMERIC, "twocarry")
+    emitted, skipped = materialize_ir_module(module)
+    assert skipped == {}
+    namespace: dict = {}
+    exec(compile(emitted, "<round-trip>", "exec"), namespace)
+
+    produced = namespace["twocarry__train"](w=start, m=second, n=epochs)
+
+    assert produced == pytest.approx(
+        _with_second_value_frozen(start, second, epochs), abs=1e-12
+    )
+    if epochs:
+        assert produced != pytest.approx(_authored(start, second, epochs), abs=1e-9)

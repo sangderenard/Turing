@@ -127,9 +127,19 @@ assignment is written at the call site.
 This shapes how a training loop is authored. ``w = adam_update(w, g, m, v)``
 is the natural spelling and is exactly the round trip that does not lower.
 Either bind through one more operation, or inline the update with one
-carried name per statement. Multiple carried values are fine -- m, v and w
-together lower -- so it is the round trip, not the count, that the analysis
-cannot see through.
+carried name per statement.
+
+CARRYING MORE THAN ONE VALUE IS A SEPARATE, WORSE PROBLEM. Two carried names
+LOWER without a shortfall and then compute the wrong answer: only the first
+gets a carried phi, and the second is passed as its ENTRY value on every
+iteration -- frozen. Verified by round-tripping the lowered program back to
+Python and comparing: the compiled result matches "second value frozen" to the
+bit, for every probe (tests/test_loop_carried_producers.py). ``loop.carried_aliases``
+arrives at the SSA builder with one entry for a source that carries two, so
+the defect is upstream in control planning, where ``loop_composer`` builds
+that tuple -- not in the lowering, which faithfully lowers what it is told.
+
+This blocks a compiled Adam step directly, since Adam carries w, m and v.
 
 A tuple assignment binds each name to a tuple temporary, so the loop's
 carried update names that temporary rather than a value any region
