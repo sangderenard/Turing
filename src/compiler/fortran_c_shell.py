@@ -5145,6 +5145,17 @@ def _class_surface_ssa_program(
         for caller_symbol in caller_contexts:
             visit_constructor_context(str(caller_symbol))
 
+        # A class with a constructor is irreducible. The self-is-field-storage
+        # collapse below makes a constructor argument's id BE the resulting
+        # object's own storage identity, which is only sound when nothing
+        # else can ever construct that class again from an existing value --
+        # copy.deepcopy(n) does exactly that, re-running __init__ with n's
+        # own current field values, and the collapse then aliases the copy
+        # onto n's storage instead of giving it its own. Any class the
+        # program constructs therefore keeps a genuine, separate receiver
+        # identity rather than being flattened into a single shared scalar.
+        irreducible_classes = set(constructor_symbol_by_class)
+
         for caller_symbol, (caller_graph, caller_shell) in ordered_contexts:
             caller = all_functions.get(caller_symbol)
             if caller is None:
@@ -5172,6 +5183,41 @@ def _class_surface_ssa_program(
                 node_operation = str(
                     node_data.get("op") or node_data.get("type") or ""
                 ).casefold()
+                # copy.deepcopy(n) resolves (python_identity_programs.py) to
+                # a Handler.Deepcopy node, not a constructor Call -- it has
+                # no class_ref of its own. Its one argument (n) does: n was
+                # itself constructed earlier in this same caller, so its
+                # class identity and current field values are already
+                # registered in caller_records by this same loop (nodes are
+                # walked in source order). Re-running class construction
+                # with n's OWN current field values as the "constructor
+                # arguments" -- instead of fresh AST call arguments -- is
+                # the deep copy: it reuses the exact caller-owned-storage
+                # frame mechanism below, unchanged, rather than inventing a
+                # parallel copy mechanism this compiler's objects don't have
+                # a runtime address for.
+                deepcopy_source_record = None
+                if node_operation == "deepcopy":
+                    deepcopy_source_id = next((
+                        int(parent)
+                        for parent, role in (node_data.get("parents") or ())
+                        if str(role) not in {"callee", "func", "definition"}
+                    ), None)
+                    if deepcopy_source_id is None:
+                        continue
+                    deepcopy_source_record = caller_records.records.get(
+                        int(caller_graph.nodes[deepcopy_source_id].get(
+                            "value_id", deepcopy_source_id
+                        ))
+                    )
+                    # Not locally resolvable (the source instance was not
+                    # constructed in this same caller frame): do not
+                    # fabricate a correlation, matching every other
+                    # nested-record bail-out in this file.
+                    if deepcopy_source_record is None:
+                        continue
+                    class_identity = deepcopy_source_record.identity
+                    node_operation = "call"
                 if class_identity is None or node_operation != "call":
                     continue
                 class_definition = resolve_class_definition(class_identity)
@@ -5248,9 +5294,12 @@ def _class_surface_ssa_program(
                     continue
                 constructor_values = function_values(constructor)
                 constructor_self_id = int(template.record_id)
-                self_is_field_storage = any(
-                    constructor_self_id in tuple(map(int, field.value_ids))
-                    for field in template.fields
+                self_is_field_storage = (
+                    str(class_identity) not in irreducible_classes
+                    and any(
+                        constructor_self_id in tuple(map(int, field.value_ids))
+                        for field in template.fields
+                    )
                 )
                 remap: dict[int, int] = {}
                 if not self_is_field_storage:
@@ -5276,7 +5325,33 @@ def _class_surface_ssa_program(
                     ):
                         remap[int(callee_id)] = int(caller_id)
                         constructor_parameter_ids.add(int(callee_id))
-                if constructor_graph is not None:
+                if deepcopy_source_record is not None:
+                    # No AST call arguments exist for copy.deepcopy(n) --
+                    # bind each of the constructor's own scalar field
+                    # parameters directly to n's OWN current value for that
+                    # same-named field, instead of to a fresh call argument.
+                    # A field the source record does not have a value for
+                    # (e.g. a nested record -- its own construction is
+                    # handled when this same loop reaches ITS constructor
+                    # call, not here) is left unbound; unresolved bindings
+                    # are reported honestly below, not silently dropped.
+                    source_fields_by_name = {
+                        str(field.name): field
+                        for field in deepcopy_source_record.fields
+                    }
+                    for field in template.fields:
+                        if (
+                            field.storage is not SSARecordFieldStorage.SCALAR
+                            or not field.value_ids
+                        ):
+                            continue
+                        source_field = source_fields_by_name.get(str(field.name))
+                        if source_field is None or not source_field.value_ids:
+                            continue
+                        parameter_id = int(field.value_ids[0])
+                        remap[parameter_id] = int(source_field.value_ids[0])
+                        constructor_parameter_ids.add(parameter_id)
+                elif constructor_graph is not None:
                     identities = constructor_graph.graph.get(
                         "identity_table"
                     ) or {}

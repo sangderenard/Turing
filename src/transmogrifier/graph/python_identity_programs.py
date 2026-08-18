@@ -21,8 +21,8 @@ from ...common.tensors.operator_catalog import (
 
 
 _PROCESS_GRAPH_OPERATORS = frozenset({
-    "Call", "Constant", "Deploy", "GetAttr", "Indexed", "IndexedStore",
-    "Join", "SetAttr", "stream_publish",
+    "Call", "Constant", "Deploy", "Deepcopy", "GetAttr", "Indexed",
+    "IndexedStore", "Join", "SetAttr", "stream_publish",
 })
 _KNOWN_OPERATORS = CANONICAL_ABSTRACT_TENSOR_OPERATORS | _PROCESS_GRAPH_OPERATORS
 
@@ -165,6 +165,13 @@ PYTHON_IDENTITY_PROGRAMS: tuple[PythonIdentityProgram, ...] = (
     _operator(
         "builtins.print", operator="stream_publish", inputs=("$args",),
         attributes={"stream": "text"}, effects=("publish:stdout",),
+    ),
+    _operator(
+        "copy.deepcopy", operator="Deepcopy",
+        description=(
+            "Handler.Deepcopy, the SSA vocabulary's own deep copy -- CPython's "
+            "copy implementation is never ingested"
+        ),
     ),
     PythonIdentityProgram(
         identities=("builtins.len",), kind="program",
