@@ -712,6 +712,50 @@ def _emit_repository_call_module(
                     if value is not None:
                         typed[declared[position]] = value
 
+    # Which of a callee's OWN formal parameters does its body treat as a
+    # pointer TABLE (a `ptr[N]` of other buffers' addresses), rather than a
+    # single tensor/scalar buffer? A parameter is unpacked this way when the
+    # callee's own instructions GetElementPtr off it at a nonzero constant
+    # offset (offset 0 is indistinguishable from ordinary single-value
+    # indexing, so it is not by itself evidence of aggregate use). This is a
+    # purely structural, callee-local fact -- independent of any one call
+    # site -- used below to check that whoever calls in with that position
+    # actually built a table there.
+    callee_aggregate_parameter_positions: dict[str, set[int]] = {}
+    for callee_name in reachable:
+        callee_function = module.functions[callee_name]
+        parameter_ids = [int(parameter.id) for parameter in callee_function.args]
+        if not parameter_ids:
+            continue
+        callee_const_values: dict[int, _Any] = {}
+        for block in callee_function.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    instruction.op in {"Const", "const"}
+                    and instruction.res is not None
+                ):
+                    callee_const_values[int(instruction.res.id)] = (
+                        instruction.attributes.get("value")
+                    )
+        positions: set[int] = set()
+        for block in callee_function.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    instruction.op not in {"GetElementPtr", "getelementptr"}
+                    or not instruction.args
+                ):
+                    continue
+                base_id = int(instruction.args[0].id)
+                if base_id not in parameter_ids:
+                    continue
+                offset = instruction.attributes.get("aggregate_index")
+                if offset is None and len(instruction.args) > 1:
+                    offset = callee_const_values.get(int(instruction.args[1].id))
+                if offset is not None and int(offset) >= 1:
+                    positions.add(parameter_ids.index(base_id))
+        if positions:
+            callee_aggregate_parameter_positions[callee_name] = positions
+
     function_outputs: dict[str, tuple[_Any, ...]] = {}
     for name in reachable:
         function = module.functions[name]
@@ -2015,6 +2059,49 @@ def _emit_repository_call_module(
                             f"expected={expected_argument_count}",
                         ))
                         continue
+                    required_positions = callee_aggregate_parameter_positions.get(
+                        symbol, ()
+                    )
+                    if required_positions:
+                        # The callee will GetElementPtr past this argument's
+                        # first pointer-sized slot, so it must already be a
+                        # materialized `%aggregate.NN` table (built earlier
+                        # in THIS emission when its producer's aggregate
+                        # result escapes whole -- see above). Anything else
+                        # -- most dangerously, an ordinary scalar/tensor
+                        # buffer that merely happens to be the semantically
+                        # "right" argument -- has no second pointer-sized
+                        # slot to read: the callee loads whatever bytes
+                        # follow that one buffer's allocation, dereferences
+                        # them as a pointer, and writes through it. That is
+                        # heap corruption with no Python-visible cause, and
+                        # it is exactly what a native access violation deep
+                        # inside compiled code, with no informative
+                        # traceback, looks like from here.
+                        unresolved = [
+                            (position, int(argument.id))
+                            for position, argument in enumerate(semantic_arguments)
+                            if position in required_positions
+                            and not str(
+                                pointers.get(int(argument.id), "")
+                            ).startswith("%aggregate.")
+                        ]
+                        if unresolved:
+                            shortfalls.append(LLVMEmissionShortfall(
+                                name,
+                                symbol,
+                                "call argument position(s) "
+                                f"{[position for position, _ in unresolved]!r} "
+                                f"feed {symbol}, whose body unpacks that "
+                                "parameter as a pointer table, but the "
+                                "supplied value id(s) "
+                                f"{[value_id for _, value_id in unresolved]!r} "
+                                "were never materialized as one in this "
+                                "caller -- the producer that should have "
+                                "built this aggregate is missing or its "
+                                "result was not linked through",
+                            ))
+                            continue
                     call_args = [
                         pointer(argument) for argument in semantic_arguments
                     ]
