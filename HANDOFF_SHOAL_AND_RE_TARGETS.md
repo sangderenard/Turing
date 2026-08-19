@@ -153,7 +153,50 @@ family, not by any Python dependency.
    `result_convention == "ssa.aggregate"` only; statement-form region
    calls (res=None) are untouched by design.
 
-## 6. Working rules, re-earned this session
+## 6. Blocker isolation (second pass, all measured)
+
+Each open blocker was driven to an isolated, instrumented statement so it
+can be iterated on independently:
+
+* **Rank seam (re, the one emission refusal).** At the SSA level BOTH
+  sides declare 28/29 as `float64 ()` scalars; the array-ness comes from
+  the sequence table (`SSASequenceDescriptor(sequence_id=28,
+  column_value_ids=(28,), length_address_id=312, …)`) and the region
+  formal's own `sequence_arena` accounting. Region_5's body is
+  `Add(28, 29)` feeding `Eq(195, 256)` — it consumes sequence ARENAS as
+  scalar Add operands. The seam is therefore a region-carving
+  mis-lowering: a sequence-state read (plausibly a length) carved as a
+  direct arena read. Iterate at the carving/planning layer, not the
+  emitter.
+* **Fortran phi-rank family.** The well-formedness sweep found ZERO
+  phi-rank mismatches at the SSA level across all 31 functions — the
+  `t298/t299/t300 = t130` gfortran errors are purely an EMISSION-layer
+  declaration defect: the emitter's phi typing declares scalars while its
+  own extent inference declares `t130` an array. Iterate inside
+  `ssa_fortran_backend` phi/local declaration typing, in isolation from
+  the planner.
+* **Dangling operand.** Exactly one in the whole closure:
+  `_optimize_charset` `while_header.1`'s Phi consumes 153, produced
+  nowhere. Pre-existing (the Phi consumes it as a plain arg, which the
+  dead-region sweep counts as a consumer — the sweep cannot have removed
+  its producer).
+* **Raise-boundary audit.** Exactly two tagged callsites, both to the
+  same specialized error shell: `_compile@416` and `_compile_charset@52`.
+* **Shoal dt trajectory.** The oracle holds `dt = dt_initial = 0.001`
+  for all 34 intra-frame substeps (a final 0.000333 step lands the frame;
+  growth appears only in the post-frame `dt_next = 0.006518`); the exe's
+  `t14` equals `frame_duration/2` to 1e-12. The compiled controller
+  therefore GROWS dt within the frame where the Python controller holds
+  it — a control-flow/ordering divergence in `run_superstep`'s compiled
+  lowering (dt-update vs frame-remaining check), not numeric drift.
+* **LLVM whole-frame lane.** `tools/run_frame_native.py` (the repo's own
+  harness, its own feeds) also shows no advance: `last_wave_speed` reads
+  0.0 where uniform-height physics under gravity 9.81 writes ~3.13 in one
+  substep. Real lane defect, isolated to "the compiled frame's superstep
+  loop body never executes"; next instrument is `watch=` on the loop
+  iteration counter at `emit_ssa_function_to_llvm`.
+
+## 7. Working rules, re-earned this session
 
 * The soft-read trap is real and it recurs: an unobservable id read as
   0.0 cost the tracer_bounds divergence. `required=True` unless a
