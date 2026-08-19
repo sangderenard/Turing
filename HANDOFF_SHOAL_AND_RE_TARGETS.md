@@ -5,6 +5,11 @@ still governs). Written 2026-08-19. One session, two named targets: the
 fluid flagship — now named **Shoal** — and `re._compile`. Everything under
 "measured" was taken this session; nothing quotes a projection as a result.
 
+> **Delegable frontier subtasks live in `frontier_tasks/`** — five
+> self-contained briefs (README has the ground rules) carved for focused
+> single-session work: the constant-presence sweep, scorecard levels 14
+> and 18, the overlay scope refusal, and the dt_next wiring diagnosis.
+
 ---
 
 ## 1. State of the tree
