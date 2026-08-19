@@ -3878,6 +3878,20 @@ class _ControlSSABuilder:
             self.branch(latch)
 
         self.current = latch
+        # The latch evaluates the guard for the NEXT iteration, so every
+        # carried name must resolve to the body's UPDATED value there --
+        # not the header phi it is bound to for the rest of the loop.
+        # Testing the pre-update value lags the guard one iteration behind
+        # and runs the loop once too often (scorecard level 17: the
+        # compiled while halved 1.0 to 0.5 where the authored loop stops).
+        latch_restore = []
+        for updated_id, initial_id, _initial, updated, _current in carried:
+            latch_restore.append(
+                (initial_id, self.external_values.get(initial_id))
+            )
+            self.external_values[initial_id] = self.external_values.get(
+                updated_id, updated
+            )
         self.external_values[int(loop.predicate_value_id)] = next_predicate
         self.lower(loop.condition, path=f"{path}.condition.latch")
         if loop.predicate_expression is not None:
@@ -3885,6 +3899,13 @@ class _ControlSSABuilder:
                 loop.predicate_expression,
                 result_override=next_predicate,
             )
+        # Post-loop consumers read the converged header phi, not the last
+        # body update: restore the loop-wide binding before leaving.
+        for initial_id, previous in latch_restore:
+            if previous is None:
+                self.external_values.pop(initial_id, None)
+            else:
+                self.external_values[initial_id] = previous
         if not any(
             instruction.res is next_predicate
             for instruction in self.current.instrs

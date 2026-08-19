@@ -41,9 +41,10 @@ EXPECTED: dict[int, str] = {
     15: "PASSED",      # int literals + int parameter meeting float arithmetic
     16: "MATERIALIZE", # authored if: materializer CRASHES (NoneType .id) --
                        # a defect in its refusal path, not a designed refusal
-    17: "EQUIVALENT",  # while RUNS AND IS WRONG. Layer 1 (double-published
-                       # scalar) FIXED; layer 2 live: one EXTRA iteration --
-                       # 0.5 where the authored loop stops at 1.0
+    17: "PASSED",      # while: FIXED same-day, twice -- the double-published
+                       # scalar (stale pre-loop identity resurrected by the
+                       # recovery pass) and the latch guard testing the
+                       # pre-update carried value (one extra iteration)
     18: "MATERIALIZE", # any() over a generator: predicate region unrendered
 }
 
@@ -87,13 +88,14 @@ def test_the_original_corpus_frontier_stays_cleared():
 
 
 def test_the_silent_failure_class_is_named_where_it_lives():
-    """Runs-and-is-wrong is extinct in the original corpus and ALIVE at
-    level 17: the first while rung ever scored executes and returns its
-    scalar twice. That pin is the whole point of scoring equivalence --
-    when level 17 is fixed, move its expectation forward deliberately.
+    """Runs-and-is-wrong is extinct in the original corpus, and level 17
+    demonstrated the ladder's purpose the day it was added: the first
+    while rung ever scored executed and was wrong twice over (a
+    double-published scalar, then a latch guard lagging one iteration),
+    and both defects were found and fixed because equivalence was scored.
     """
 
     assert all(
         EXPECTED[level] == "PASSED" for level in ORIGINAL_FRONTIER
     )
-    assert EXPECTED[17] == "EQUIVALENT"
+    assert EXPECTED[17] == "PASSED"
