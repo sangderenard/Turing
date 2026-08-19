@@ -287,6 +287,18 @@ exit if the duplication is upstream of materialization.
   frame's return.
 * The LLVM whole-frame no-advance is NOT the latch guard (fresh
   post-fix lowering still static) — it stands as its own blocker.
+* **The ``dt_next`` remainder, refined to a proof (owner's determinism
+  check ran first: no PRNG anywhere in the dt system, the one
+  ``perf_counter`` is confined to the never-called realtime mode, and
+  the oracle is bit-identical across runs).** The true ``dt_next`` is
+  ``min(pi_proposal, metrics.dt_limit)`` with ``dt_limit = 0.013255``,
+  so it can NEVER be the exe's ``t14 = 0.0166667`` — t14 is not bound
+  to ``dt_next`` at all. The imposter is exactly
+  ``shrink * dt_max = 0.5 * (1/30)``: the controller's REJECTION-arm
+  dt, never taken in this run (all 34 substeps accept). The frame's
+  return binds the rejection branch's value instead of the accepted
+  PI proposal — conditional-arm output selection, the same family as
+  level 16's materializer crash. Not numerics, not non-determinism.
 * Scorecard: **16/19**, remaining stalls are the three MATERIALIZE rungs
   (rebound name, authored if crash, generator predicate).
 
