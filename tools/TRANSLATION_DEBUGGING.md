@@ -538,10 +538,30 @@ extra one is unnamed. Compare `len(function.args)` against
 block emits nothing but `Br`, so the carried update has no producer and the
 lowering raises `loop_carried`.
 
-*Signature:* `next_w = update(w)` where `w` is the carried value. Binding
-through one more operation (`stepped = update(w); next_w = stepped * 1.0`)
-restores it. A call on some OTHER value is fine; it is the round trip that
-fails. See `tests/test_loop_carried_producers.py`.
+*The rule behind it:* loop-body emission is REGION-DRIVEN. Scheduled regions
+are seeded from numeric operations only; an authored-function call is not a
+numeric op -- it is a linked call, and linked calls are emitted only as
+dependencies OF a region (their result feeding a region's inputs). A body
+whose only statement forwards a call result contains no numeric op, so no
+region forms, so nothing anchors the linked call, so the body is empty. There
+is no rule against calls in loop bodies; there is no rule FOR them either --
+they only ride along behind arithmetic.
+
+*Signature:* `next_w = update(w)` where `w` is the carried value. A call on
+some OTHER value is fine; it is the round trip that fails. See
+`tests/test_loop_carried_producers.py`.
+
+**And the one-extra-op workaround is itself miscompiled.** When arithmetic IS
+present (`stepped = update(w); next_w = stepped * 1.0`), the linked call gets
+anchored -- but its argument binds to the carried UPDATED id (the value this
+iteration has not produced yet) instead of the phi's current value. In slot
+semantics that reads the previous iteration's slot: garbage on iteration one.
+The materializer's dependency-order check refuses it ("value %tN is used
+before it is produced"), which is how it was found; the scorecard carries it
+as the anchored-call journey. Both this and the elision above live in the
+same subsystem: plan-call linking into lowered SSA (`source_linked` calls),
+the intentional aliasing-for-speed machinery that still needs its regulation
+completed.
 
 ---
 

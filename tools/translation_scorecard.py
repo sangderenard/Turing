@@ -149,7 +149,22 @@ JOURNEYS: tuple[Journey, ...] = (
         note="the optimizer update itself, compiled; the goal shape",
     ),
     Journey(
-        8, "loop, carried value through a call",
+        8, "loop, call anchored by one op",
+        "def update(a):\n    return a - 0.05 * a\n\n"
+        "def train(w, n):\n"
+        "    total = update(w)\n"
+        "    for _ in range(n):\n"
+        "        stepped = update(w)\n"
+        "        next_w = stepped * 1.0\n"
+        "        w = next_w\n"
+        "        total = w\n"
+        "    return total\n",
+        ((2.0, 3), (2.0, 1)),
+        lambda w, n: _repeat(w, n, lambda v: (v - 0.05 * v) * 1.0),
+        note="linked call binds the carried UPDATED id: use-before-def in the body",
+    ),
+    Journey(
+        9, "loop, carried value through a call",
         "def update(a):\n    return a - 0.05 * a\n\n"
         "def train(w, n):\n"
         "    total = update(w)\n"
