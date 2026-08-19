@@ -32,6 +32,14 @@ The per-cell kernel is 290 instructions -- 140 Mul, 91 Add, 24 Pow, 16 Max,
 
 The remaining ~480 ns is 266 scalar ops with no vectorization: no target
 triple, no noalias, no FMA (see catalogue sections 2.5 and P2).
+
+2026-08-19, after the slot-keyed register cache in the LLVM emitter
+(same-block register reuse; stores untouched; 817 -> 222 emitted loads):
+
+    exact set only (default):                ~280 ns/cell   -- 6x
+    TURING_POW_INEXACT=1:                    ~150-195 ns/cell -- ~10x
+    + TURING_FMA_CONTRACT=1:                 ~140-160 ns/cell; 17 vfmadd
+      now actually form (the register chains exist for LLVM to contract)
 """
 
 from __future__ import annotations

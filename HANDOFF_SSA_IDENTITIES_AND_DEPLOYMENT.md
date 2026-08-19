@@ -165,6 +165,42 @@ sat in `precompile_to_ssa`). Exact set default: 1683→~900 ns/cell, scorecard
 blocker is P2's `noalias`. `TURING_FMA_CONTRACT=1` switch is in
 `ssa_llvm_backend`, off by default, ready for P2.
 
+**ADDENDUM, same day — the slot-keyed register cache.** The memory-form IR
+(every value read through a pool slot) was the conservative
+equality-proving shape, not the intended hot path: the storage design
+composes operations IN PLACE over pre-allotted pool slots (there is no heap
+allocation in the hot path; the slots are entry allocas and the public
+buffers are bound once). `_emit_repository_call_module` now carries a
+same-block register cache KEYED BY SLOT NAME — the honest currency when two
+value ids may view one slot. Stores are untouched (ABI, watches, in-place
+discipline byte-identical); redundant loads evaporate (817 → 222 on the
+fluid kernel). Invalidation: every scheduled block label, every call, every
+scatter Store; only `%value.` / `%out.` / `%arg.` keys are cacheable —
+phi-selected pointers and span addresses always re-load. Result: ~280
+ns/cell default (6×), ~150–195 inexact (~10×), and with contraction the
+FMAs that formed zero now form 17. The register-based single-function
+emitter (`emit_ssa_function_to_llvm`) already held scalars in registers;
+this brings the whole-program artifact path to parity without touching
+`noalias`.
+
+**Fusion-mode note for whoever picks up the heuristic idea:** the
+faithful-vs-reducing choice already has a vocabulary (`fusion_levels.py`:
+PRESERVE / NO_FUSION / REGIONS / FUSED) but only REGIONS and FUSED are
+honored today (`precompile_only` True/False; the fluid path runs REGIONS),
+PRESERVE and NO_FUSION deliberately raise, and some levels are not yet wired
+to control-code isolation. The most collapsed level locks in too much (the
+no-final-fused-reduction doctrine). The next useful shape is a PER-REGION
+level chosen heuristically — keep faithful slots where a region's values
+are watched, carried, or cross the ABI; reduce freely where the memory
+program proves a region's interior is private — rather than one broad
+policy. The slot-name cache is exactly that heuristic executed at emission
+grain: it reduces precisely where the slot's visibility class says it may.
+
+Also recorded: `tests/test_llvm_repository_ssa.py` carries 8 failures
+confirmed pre-existing at af00599 in a clean worktree (Fortran-lane emission
+defects), now in `KNOWN_FAILING_AT_AF00599` — verified not
+ordering-dependent (two fail identically in isolation).
+
 **Why here and not per backend:** all seven `ssa_*` backends consume the same
 `IRModule`. Each has its own `Pow` handler, so a per-backend fix costs seven
 edits and seven chances to diverge; an SSA-level pass costs one and every

@@ -1098,12 +1098,39 @@ def _emit_repository_call_module(
             pointers[value_id] = register
             return register
 
+        # Same-block register reuse, keyed by SLOT NAME, not value id. The
+        # storage design composes operations in place over pre-allotted pool
+        # slots, so two value ids may legitimately view one slot (a carried
+        # value read under one id and rewritten under another); the slot name
+        # is the one honest currency for "same storage". A slot's key holds
+        # the register (or literal) known to be its current content; a store
+        # to that slot replaces its key, so an in-place write is coherent by
+        # construction and every OTHER key stays valid. The stores themselves
+        # always still happen -- slot contents, the ABI, watches and the
+        # in-place discipline are byte-identical; only redundant loads
+        # evaporate. Cacheable keys are the static scalar homes (%value.N,
+        # %out.N, %arg.N); loads through phi-selected pointers or span/array
+        # addresses are never cached (dynamic targets). All keys drop at
+        # every scheduled block label (no cross-block dominance question can
+        # arise), at every call (a callee may write caller storage through
+        # the pointer ABI), and at every scatter Store (array writes stay
+        # ordered against every read).
+        register_cache: dict[str, tuple[str, str]] = {}
+        _CACHEABLE_SLOT = ("%value.", "%out.", "%arg.")
+
         def load_as(value: _Any, wanted: str, tag: str) -> str:
-            source_type = _value_llvm_type(value)
-            loaded = f"%load.{tag}"
-            body.append(
-                f"  {loaded} = load {source_type}, ptr {pointer(value)}, align 8"
-            )
+            slot_home = pointer(value)
+            cached = register_cache.get(slot_home)
+            if cached is not None:
+                loaded, source_type = cached
+            else:
+                source_type = _value_llvm_type(value)
+                loaded = f"%load.{tag}"
+                body.append(
+                    f"  {loaded} = load {source_type}, ptr {slot_home}, align 8"
+                )
+                if slot_home.startswith(_CACHEABLE_SLOT):
+                    register_cache[slot_home] = (loaded, source_type)
             if source_type == wanted:
                 return loaded
             converted = f"%convert.{tag}"
@@ -1334,6 +1361,7 @@ def _emit_repository_call_module(
                 body.append(f"{block_name}:")
                 active_block = block_name
                 block_exit_label[block_name] = block_name
+                register_cache.clear()
             operation = str(instruction.op)
             if pending_shadow and operation not in {"Phi", "phi"}:
                 body.extend(pending_shadow)
@@ -1364,6 +1392,12 @@ def _emit_repository_call_module(
                     body.append(
                         f"  store {llvm_type} {literal(payload, llvm_type)}, ptr {target}, align 8"
                     )
+                    if target.startswith(_CACHEABLE_SLOT):
+                        register_cache[target] = (
+                            literal(payload, llvm_type), llvm_type,
+                        )
+                    else:
+                        register_cache.clear()
                 continue
 
             if operation in {"Phi", "phi"} and result is not None:
@@ -1691,6 +1725,10 @@ def _emit_repository_call_module(
 
             if operation in {"Store", "store"} and len(instruction.args) == 2:
                 source, address = instruction.args
+                # A scatter writes through a computed address; every cached
+                # register must yield to the ordering of real memory. The
+                # source's own read below may still be served from cache
+                # first -- reading precedes the write.
                 destination = address_slots.get(int(address.id), pointer(address))
                 source_type = _value_llvm_type(source)
                 loaded_value = f"%store.load.{tag}"
@@ -1700,10 +1738,15 @@ def _emit_repository_call_module(
                 body.append(
                     f"  store {source_type} {loaded_value}, ptr {destination}, align 8"
                 )
+                register_cache.clear()
                 continue
 
             callee = instruction.attributes.get("callee")
             if callee is not None:
+                # A callee may write caller storage through the pointer ABI
+                # (aliased IO is a design feature); registers read before the
+                # call must not serve reads after it.
+                register_cache.clear()
                 symbol = str(callee)
                 tensor_operation = instruction.attributes.get("tensor_operation")
                 if (
@@ -2055,9 +2098,14 @@ def _emit_repository_call_module(
                 rendered = load_as(
                     instruction.args[0], result_type, f"cast.{tag}"
                 )
+                cast_target = pointer(result)
                 body.append(
-                    f"  store {result_type} {rendered}, ptr {pointer(result)}, align 8"
+                    f"  store {result_type} {rendered}, ptr {cast_target}, align 8"
                 )
+                if cast_target.startswith(_CACHEABLE_SLOT):
+                    register_cache[cast_target] = (rendered, result_type)
+                else:
+                    register_cache.clear()
                 continue
 
             if (
@@ -2293,9 +2341,14 @@ def _emit_repository_call_module(
                             f"{register} to {declared_type}"
                         )
                         register, result_type = converted, declared_type
+                scalar_target = pointer(result)
                 body.append(
-                    f"  store {result_type} {register}, ptr {pointer(result)}, align 8"
+                    f"  store {result_type} {register}, ptr {scalar_target}, align 8"
                 )
+                if scalar_target.startswith(_CACHEABLE_SLOT):
+                    register_cache[scalar_target] = (register, result_type)
+                else:
+                    register_cache.clear()
                 continue
 
             if operation in {"Deploy", "Join"}:

@@ -179,7 +179,17 @@ cannot forward the slot stores to their loads across other stores, so
 multiply→add chains never form in registers and there is nothing to contract.
 The assembly shows 506 memory loads against ~250 float ops.
 
-**So the FMA dependency chain is: P2 `noalias` derivation → store-to-load
+**Superseded same day:** the register chains were recovered WITHOUT `noalias`,
+by construction instead of by analysis — a slot-keyed same-block register
+cache in `_emit_repository_call_module` (see the handoff addendum). Loads
+evaporate at emission (817 → 222 on the reference kernel); every store still
+happens, so pooled in-place slot semantics are untouched. With the chains in
+registers, `TURING_FMA_CONTRACT=1` now forms 17 `vfmadd` where it formed
+zero. Default policy: ~280 ns/cell (6×); inexact: ~150–195 (~10×); +contract:
+~140–160. The original analysis below stands as the record of why the
+memory-form IR blocked everything.
+
+**So the FMA dependency chain was: P2 `noalias` derivation → store-to-load
 forwarding → register chains → contraction.** The switch is correct, off by
 default (an fma rounds once where mul+add round twice, so contracted results
 differ bitwise from every other backend), and becomes valuable exactly when

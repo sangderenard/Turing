@@ -65,6 +65,19 @@ KNOWN_FAILING_AT_AF00599 = {
         "test_index_set_emits_a_complete_scatter_module",
         "test_index_set_scatter_runs_correctly",
     ),
+    # Confirmed identical in a clean af00599 worktree 2026-08-19 (Fortran-lane
+    # emission defects: rank-mismatched array references, non-LOGICAL merge
+    # masks). Nothing to do with the LLVM lane the file is named for.
+    "test_llvm_repository_ssa.py": (
+        "test_c_backend_is_one_complete_repository_ssa_code_reference",
+        "test_ssa_abstract_tensor_basis_is_emittable_as_a_runtime_module",
+        "test_tensor_instruction_materializes_real_repository_ssa_kernel_operands",
+        "test_unknown_tensor_extent_is_not_silently_compiled_as_one_element",
+        "test_process_graph_preserves_replaced_tensor_record_through_complete_ssa",
+        "test_process_graph_two_layer_tensor_network_compiles_and_executes",
+        "test_abstract_tensor_ssa_backend_source_compiles_and_executes",
+        "test_extended_softmax_composite_compiles_and_executes",
+    ),
 }
 
 
