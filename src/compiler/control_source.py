@@ -766,6 +766,87 @@ def _region_marker(block: StatementBlock) -> int | None:
     return int(marker[len(prefix):-2])
 
 
+def _marker_scope_paths(
+    block: "ControlBlock",
+    nested_regions: frozenset[int],
+    path: tuple[str, ...] = ("top",),
+) -> dict[int, tuple[str, ...]]:
+    """Map each marker in ``nested_regions`` found under ``block`` to the
+    scope-label path that owns it -- the granularity ``embed`` (inside
+    ``overlay_scheduled_control``) inserts a nested control at.
+
+    ``SequenceBlock`` is transparent: it does not open a new insertion
+    scope, matching ``embed``'s own single local ``inserted`` flag per
+    ``SequenceBlock``. Every composite construct's structural SLOT (a loop
+    body, a while condition or body, a conditional arm, a state-machine
+    case or default, a parallel lane) opens one, because ``embed`` recurses
+    into each such slot with its own separate insertion decision. Two
+    markers of the SAME nested control found at two different paths is
+    exactly the shape ``embed`` cannot honor with one insertion -- calling
+    this before ``embed`` runs turns that into a named refusal instead of
+    a downstream duplicate-region crash.
+    """
+
+    found: dict[int, tuple[str, ...]] = {}
+    if isinstance(block, StatementBlock):
+        marker = _region_marker(block)
+        if marker is not None and marker in nested_regions:
+            found[marker] = path
+        return found
+    if isinstance(block, SequenceBlock):
+        for child in block.blocks:
+            found.update(_marker_scope_paths(child, nested_regions, path))
+        return found
+    if isinstance(block, ConditionalBlock):
+        label = f"if(node={block.source_node_id})"
+        found.update(_marker_scope_paths(
+            block.body, nested_regions, path + (f"{label}.body",),
+        ))
+        if block.orelse is not None:
+            found.update(_marker_scope_paths(
+                block.orelse, nested_regions, path + (f"{label}.orelse",),
+            ))
+        return found
+    if isinstance(block, LoopBlock):
+        found.update(_marker_scope_paths(
+            block.body, nested_regions,
+            path + (f"loop({block.induction})",),
+        ))
+        return found
+    if isinstance(block, WhileBlock):
+        found.update(_marker_scope_paths(
+            block.condition, nested_regions, path + ("while.condition",),
+        ))
+        found.update(_marker_scope_paths(
+            block.body, nested_regions, path + ("while.body",),
+        ))
+        return found
+    if isinstance(block, StateMachineTick):
+        for value, body in block.cases:
+            found.update(_marker_scope_paths(
+                body, nested_regions, path + (f"case({value})",),
+            ))
+        if block.default is not None:
+            found.update(_marker_scope_paths(
+                block.default, nested_regions, path + ("default",),
+            ))
+        return found
+    if isinstance(block, ParallelDeployment):
+        for index, lane in enumerate(block.lanes):
+            found.update(_marker_scope_paths(
+                lane, nested_regions, path + (f"lane({index})",),
+            ))
+        return found
+    if isinstance(block, CallBlock):
+        # Lexical organization around nested control, not a runtime
+        # scope of its own -- it has exactly one child, so it cannot
+        # itself introduce a split the way a while's condition/body or a
+        # conditional's two arms can.
+        found.update(_marker_scope_paths(block.callee, nested_regions, path))
+        return found
+    return found
+
+
 def compose_region_code(
     program: ControlProgram,
     target: ControlTarget,
@@ -1478,6 +1559,27 @@ def overlay_scheduled_control(
                 positions[region] for region in controlled_sets[item]
             ),
         ):
+            child_regions = controlled_sets[child]
+            scope_paths = _marker_scope_paths(root, child_regions)
+            distinct_scopes = sorted(set(scope_paths.values()))
+            if len(distinct_scopes) > 1:
+                by_scope: dict[tuple[str, ...], list[int]] = {}
+                for region, scope in scope_paths.items():
+                    by_scope.setdefault(scope, []).append(region)
+                raise ValueError(
+                    "nested control's regions span "
+                    f"{len(distinct_scopes)} sequence scopes of the parent "
+                    f"(control index {child}, regions "
+                    f"{tuple(sorted(child_regions))}): "
+                    + "; ".join(
+                        f"{' > '.join(scope)}: regions {sorted(regions)}"
+                        for scope, regions in sorted(by_scope.items())
+                    )
+                    + ". The schedule and the conditional compartments "
+                    "disagree about where these regions live; embed "
+                    "cannot insert one planner-owned control body into "
+                    "more than one scope."
+                )
             root, consumed = embed(
                 root,
                 nested_root(child, visiting | {index}),

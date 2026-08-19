@@ -80,3 +80,57 @@ file and stop.
   `timeout 400 python tools/compile_re_probe.py 2>&1 | tail -5`
   once (takes ~2.5 min) and paste the new error text, confirming re now
   fails with the NAMED cause instead of the duplicate-count message.
+
+## FINDINGS 2026-08-19
+
+Done. `_marker_scope_paths` (module-level, mirrors `embed`'s exact
+per-block-type insertion granularity) walks a candidate nested control's
+region set through the parent's current `root` before `embed` runs, in
+`overlay_scheduled_control`'s `nested_root`. Raises a `ValueError` naming
+every distinct scope path and the region indices found there, instead of
+letting `embed` insert once per scope and failing downstream on an opaque
+duplicate-count mismatch.
+
+Tests: `tests/test_overlay_scope_refusal.py`, 4 cases — healthy
+loop-contained conditional (no error, exactly-once marker counts), the
+cross-scope defect (refuses, message matches `"sequence scopes"`), message
+content (both scope labels and both region-index lists present), and the
+pre-existing `known_nesting` equal-region-set shape (still composes,
+regression check against the existing `test_overlay_uses_known_nesting_...`
+test in `tests/test_control_source.py`). One trap hit while writing the
+defect-case test: giving `outer` and `conditional` IDENTICAL region sets
+degenerates into the pre-existing, unrelated "maximal control blocks
+overlap without containment" guard (equal sets aren't a strict subset, so
+neither is ever seen as nested in the other) — fixed by giving `outer` one
+extra exclusive region so containment is strict, which is also what real
+programs look like.
+
+Gate: 68 baseline + 4 new = **72 passed**
+(`test_precompile_to_ssa`, `test_symbolic_fluid_native_runtime`,
+`test_symbolic_fluid_direct_backends`, `test_abstract_tensor_indexing`,
+`test_ssa_fusion_regions`, `test_region_kernel_dedup`,
+`test_translation_scorecard`, `test_overlay_scope_refusal`). Also ran the
+full `tests/test_control_source.py` since the shared module changed:
+**18 passed**, no regressions.
+
+Confirmation run, `tools/compile_re_probe.py` (full traceback, tail):
+
+```
+ValueError: nested control's regions span 3 sequence scopes of the parent
+(control index 29, regions (3, 4, ..., 53)):
+  top: regions [3, 4, ..., 36, 38, ..., 52]
+  top > loop(iteration_317): regions [37]
+  top > loop(iteration_322): regions [53]
+```
+
+This is MORE precise than the task's two-scope example: three scopes, and
+it pinpoints exactly which two regions (37 and 53) are the strays sitting
+inside two DIFFERENT small loops while the other ~48 regions of the same
+cascade sit at top level — a strong lead for whoever picks up the `Raise`
+loop-composition blocker next (those two loops are almost certainly the
+`while.1`-shaped constructs the blocked main token loop should have
+absorbed had it composed).
+
+No unrelated files touched; the pre-existing untracked changes to
+`src/common/tensors/*` present at task start were left alone and had
+cleared by the time of the confirmation run (another session's).
