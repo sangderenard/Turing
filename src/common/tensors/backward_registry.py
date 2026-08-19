@@ -988,6 +988,123 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "notes": "At ties (x==y) split the gradient 0.5/0.5.",
         "tags": ["elementwise", "binary", "nonsmooth"],
     },
+    "atan2": {
+        "arity": "binary",
+        "signature": "z = atan2(y, x)  (angle of the point (x, y))",
+        "latex": r"z = \operatorname{atan2}(y,x),\quad \frac{\partial z}{\partial y} = \frac{x}{x^2+y^2},\ \frac{\partial z}{\partial x} = \frac{-y}{x^2+y^2}",
+        "backward": {
+            "y": "gy = unbroadcast(g * x / (x*x + y*y + eps), y.shape)",
+            "x": "gx = unbroadcast(g * (-y) / (x*x + y*y + eps), x.shape)",
+        },
+        "python": {
+            "parameters": ["g", "y", "x"],
+            "body": (
+                "denom = x*x + y*y + eps(); "
+                "return unbroadcast(g * x / denom, y.shape), unbroadcast(g * (-y) / denom, x.shape)"
+            ),
+        },
+        "domain": "x, y: any real; undefined gradient at the origin, guarded by eps",
+        "notes": "Standard atan2 derivative; needed for phase (angle-of-complex) work.",
+        "tags": ["elementwise", "binary", "smooth", "trig"],
+    },
+    "round": {
+        "arity": "unary",
+        "signature": "y = round(x)",
+        "latex": r"y = \operatorname{round}(x),\quad \frac{\partial y}{\partial x} = 0 \text{ a.e.}",
+        "backward": {
+            "x": "gx = zeros_like(x)",
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return AbstractTensor.zeros_like(x)",
+        },
+        "domain": "x: any real",
+        "notes": "Piecewise-constant; gradient is zero almost everywhere (straight-through is not assumed here).",
+        "tags": ["elementwise", "unary", "nonsmooth", "nondifferentiable"],
+    },
+    "floor": {
+        "arity": "unary",
+        "signature": "y = floor(x)",
+        "latex": r"y = \lfloor x \rfloor,\quad \frac{\partial y}{\partial x} = 0 \text{ a.e.}",
+        "backward": {
+            "x": "gx = zeros_like(x)",
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return AbstractTensor.zeros_like(x)",
+        },
+        "domain": "x: any real",
+        "notes": "Piecewise-constant; gradient is zero almost everywhere.",
+        "tags": ["elementwise", "unary", "nonsmooth", "nondifferentiable"],
+    },
+
+    # ----------------------------------------------------------------------
+    # Complex real/imag/assembly
+    #
+    # These follow the standard (non-Wirtinger) convention used by e.g.
+    # PyTorch: the gradient of ``real(x)`` w.r.t. a complex ``x`` is placed
+    # entirely in the real component, and likewise for ``imag``. This is
+    # sufficient for optimizing a real-valued loss through real/imag/complex,
+    # which is the case this fixes (fft -> real -> sum used to return no
+    # gradient at all). Full Wirtinger calculus for holomorphic/antiholomorphic
+    # complex objectives is a separate, harder problem -- see the manifesto's
+    # open questions.
+    # ----------------------------------------------------------------------
+    "real": {
+        "arity": "unary",
+        "signature": "y = real(x)",
+        "latex": r"y = \Re(x),\quad \frac{\partial y}{\partial x} = 1 \text{ (placed in the real component)}",
+        "backward": {
+            "x": "gx = complex(g, zeros_like(g)) if is_complex(x) else g",
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": (
+                "return AbstractTensor.complex(g, AbstractTensor.zeros_like(g)) "
+                "if 'complex' in str(getattr(x, 'dtype', '')) else g"
+            ),
+        },
+        "domain": "x: real or complex",
+        "notes": "Non-Wirtinger convention: gradient placed in the real part only.",
+        "tags": ["elementwise", "unary", "complex", "linear"],
+    },
+    "imag": {
+        "arity": "unary",
+        "signature": "y = imag(x)",
+        "latex": r"y = \Im(x),\quad \frac{\partial y}{\partial x} = 1 \text{ (placed in the imaginary component)}",
+        "backward": {
+            "x": "gx = complex(zeros_like(g), g) if is_complex(x) else zeros_like(g)",
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": (
+                "return AbstractTensor.complex(AbstractTensor.zeros_like(g), g) "
+                "if 'complex' in str(getattr(x, 'dtype', '')) else AbstractTensor.zeros_like(g)"
+            ),
+        },
+        "domain": "x: real or complex",
+        "notes": "Non-Wirtinger convention: gradient placed in the imaginary part only. Zero if x was never complex.",
+        "tags": ["elementwise", "unary", "complex", "linear"],
+    },
+    "complex": {
+        "arity": "binary",
+        "signature": "z = complex(re, im) = re + i*im",
+        "latex": r"z = \mathrm{re} + i\,\mathrm{im},\quad \frac{\partial z}{\partial \mathrm{re}} = 1,\ \frac{\partial z}{\partial \mathrm{im}} = 1",
+        "backward": {
+            "real": "g_re = unbroadcast(real(g), real.shape)",
+            "imag": "g_im = unbroadcast(imag(g), imag.shape)",
+        },
+        "python": {
+            "parameters": ["g", "real", "imag"],
+            "body": (
+                "return (unbroadcast(AbstractTensor.real(g), real.shape), "
+                "unbroadcast(AbstractTensor.imag(g), imag.shape))"
+            ),
+        },
+        "domain": "real, imag: real-valued",
+        "notes": "Inverse of real/imag; splits an upstream complex gradient back into its two real components.",
+        "tags": ["elementwise", "binary", "complex", "linear"],
+    },
 
     # ----------------------------------------------------------------------
     # Reductions

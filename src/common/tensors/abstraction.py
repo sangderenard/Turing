@@ -546,27 +546,54 @@ class AbstractTensor:
 
     @staticmethod
     def real(x) -> "AbstractTensor":
-        """Return the real part of a complex tensor."""
+        """Return the real part of a complex tensor.
+
+        Records an autograd node: without this, ``fft -> real -> sum`` silently
+        returned no gradient at all, because ``real`` was the only usable exit
+        from the spectral domain and it never joined the tape.
+        """
         if not isinstance(x, AbstractTensor):
             x = AbstractTensor.tensor(x)
+        finalize = AbstractTensor._pre_autograd("real", [x])
         result = type(x)(track_time=x.track_time, tape=getattr(x, "_tape", None))
         result.data = x.real_()
-        return result
+        return finalize(result)
 
     def real_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement real_()")
 
     @staticmethod
     def imag(x) -> "AbstractTensor":
-        """Return the imaginary part of a complex tensor."""
+        """Return the imaginary part of a complex tensor. Records an autograd node."""
         if not isinstance(x, AbstractTensor):
             x = AbstractTensor.tensor(x)
+        finalize = AbstractTensor._pre_autograd("imag", [x])
         result = type(x)(track_time=x.track_time, tape=getattr(x, "_tape", None))
         result.data = x.imag_()
-        return result
+        return finalize(result)
 
     def imag_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement imag_()")
+
+    @staticmethod
+    def complex(real, imag) -> "AbstractTensor":
+        """Assemble a complex tensor from real and imaginary parts.
+
+        The inverse of :meth:`real`/:meth:`imag`; exists mainly so their
+        backward rules have something to construct a complex-valued gradient
+        with (``d/dx real(x) = complex(g, 0)`` for complex ``x``).
+        """
+        if not isinstance(real, AbstractTensor):
+            real = AbstractTensor.tensor(real)
+        if not isinstance(imag, AbstractTensor):
+            imag = AbstractTensor.tensor(imag)
+        finalize = AbstractTensor._pre_autograd("complex", [real, imag])
+        result = type(real)(track_time=real.track_time, tape=getattr(real, "_tape", None))
+        result.data = real.complex_(imag.data)
+        return finalize(result)
+
+    def complex_(self, imag):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement complex_()")
 
     # --- Softmax utilities ---
     def softmax(self, dim: int = -1) -> "AbstractTensor":
@@ -3675,6 +3702,9 @@ from .abstraction_methods.elementwise import (
     sigmoid as elementwise_sigmoid,
     maximum as elementwise_maximum,
     minimum as elementwise_minimum,
+    atan2 as elementwise_atan2,
+    round as elementwise_round,
+    floor as elementwise_floor,
     _as_scalar, _scalar_kernel,
     _v1_valuewise, _v2_valuewise, _v3_valuewise
 )
@@ -3706,6 +3736,9 @@ AbstractTensor.where     = staticmethod(elementwise_where)
 AbstractTensor.sign      = elementwise_sign
 AbstractTensor.maximum   = elementwise_maximum
 AbstractTensor.minimum   = elementwise_minimum
+AbstractTensor.atan2     = elementwise_atan2
+AbstractTensor.round     = elementwise_round
+AbstractTensor.floor     = elementwise_floor
 
 AbstractTensor._as_scalar   = staticmethod(_as_scalar)
 AbstractTensor._scalar_kernel = staticmethod(_scalar_kernel)

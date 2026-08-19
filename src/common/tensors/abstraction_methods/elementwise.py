@@ -337,6 +337,49 @@ def minimum(self, other):
     result.data = self.minimum_(other_arg)
     return finalize(result)
 
+
+# ---------------------- atan2 / round / floor --------------------------
+# Needed for phase (magnitude/angle) work: atan2 converts a real/imaginary
+# pair to an angle, and round is required for principal-argument unwrapping
+# (``dp -= 2*pi*round(dp / (2*pi))``). Neither existed before; both follow the
+# maximum/minimum shape above rather than a base-operator derivation, because
+# they are genuinely transcendental (atan2) or backend-dependent in their
+# tie-breaking rule (round) -- honest per-backend hooks, not silent fallbacks.
+def atan2(self, other):
+    """Elementwise ``atan2(self, other)`` -- the angle of (other, self)."""
+    from ..abstraction import AbstractTensor
+    if not isinstance(self, AbstractTensor):
+        self = AbstractTensor.tensor(self)
+    if not isinstance(other, AbstractTensor):
+        other = AbstractTensor.tensor(other)
+    finalize = AbstractTensor._pre_autograd("atan2", [self, other])
+    other_arg = other.data
+    result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
+    result.data = self.atan2_(other_arg)
+    return finalize(result)
+
+
+def round(self):
+    """Elementwise round to the nearest integer."""
+    from ..abstraction import AbstractTensor
+    if not isinstance(self, AbstractTensor):
+        self = AbstractTensor.tensor(self)
+    finalize = AbstractTensor._pre_autograd("round", [self])
+    result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
+    result.data = self.round_()
+    return finalize(result)
+
+
+def floor(self):
+    """Elementwise floor."""
+    from ..abstraction import AbstractTensor
+    if not isinstance(self, AbstractTensor):
+        self = AbstractTensor.tensor(self)
+    finalize = AbstractTensor._pre_autograd("floor", [self])
+    result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
+    result.data = self.floor_()
+    return finalize(result)
+
 # ----------------- Tiny user-facing shims (preserve real op names) ----------
 def __eq__(self, other):         return self._v2_valuewise("equal", other, annotate={"op":"equal"})
 def __ne__(self, other):         return self._v2_valuewise("not_equal", other, annotate={"op":"not_equal"})
