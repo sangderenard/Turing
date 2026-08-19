@@ -551,17 +551,26 @@ they only ride along behind arithmetic.
 some OTHER value is fine; it is the round trip that fails. See
 `tests/test_loop_carried_producers.py`.
 
-**And the one-extra-op workaround is itself miscompiled.** When arithmetic IS
-present (`stepped = update(w); next_w = stepped * 1.0`), the linked call gets
-anchored -- but its argument binds to the carried UPDATED id (the value this
-iteration has not produced yet) instead of the phi's current value. In slot
-semantics that reads the previous iteration's slot: garbage on iteration one.
-The materializer's dependency-order check refuses it ("value %tN is used
-before it is produced"), which is how it was found; the scorecard carries it
-as the anchored-call journey. Both this and the elision above live in the
-same subsystem: plan-call linking into lowered SSA (`source_linked` calls),
-the intentional aliasing-for-speed machinery that still needs its regulation
-completed.
+**The anchored-call binding — FIXED, and it named the design.** When
+arithmetic IS present (`stepped = update(w); next_w = stepped * 1.0`), the
+linked call binds its argument to the carried UPDATED id — the slot this
+iteration has not written yet. That turned out to be the aliased-IO design,
+not a mistake: one slot per carried value, read at the top of an iteration,
+written before the latch, no copies inside the loop. It was correct on every
+iteration except the FIRST, where nothing had written the slot; the
+materializer's dependency-order check refused it ("value %tN is used before
+it is produced"), and a native backend would read garbage.
+
+The regulation: `lower_loop` now seeds every carried slot from its initial
+value in the PREHEADER (a `Cast` onto the same reserved SSAValue object —
+in-place reuse of one slot, stage-2a-clean), and the loop_carried
+no-producer check tightened to count producers in the BODY's blocks only, so
+the seed cannot stand in for a producer and mask a genuinely empty body.
+A shell trace now shows the seed as the slot's first entry.
+
+Still open in the same subsystem (`source_linked` plan-call linking): the
+body-elision above, and the dead frame-storage formal — the remaining
+regulation of the aliasing machinery.
 
 ---
 

@@ -253,6 +253,16 @@ class _BodyMaterializer:
             # ``returns: "void"`` for exactly this reason.
             return
 
+        if operation in {"Cast", "CastLike", "cast_like"} and instruction.args:
+            # Both backends render a cast as "produce the operand in the
+            # RESULT's type" (see ssa_reference_evaluator, which follows
+            # them). Under the double working type that is the identity, and
+            # the loop-carried slot seed is emitted as exactly this shape.
+            # Spelled as an assignment rather than elided so the emitted
+            # Python stays step-for-step with the SSA.
+            self.assign(result, self.operand(instruction.args[0]))
+            return
+
         if operation in {"Select", "select"} and len(instruction.args) == 3:
             mask, when_true, when_false = (
                 self.operand(argument) for argument in instruction.args

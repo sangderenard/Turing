@@ -161,7 +161,7 @@ JOURNEYS: tuple[Journey, ...] = (
         "    return total\n",
         ((2.0, 3), (2.0, 1)),
         lambda w, n: _repeat(w, n, lambda v: (v - 0.05 * v) * 1.0),
-        note="linked call binds the carried UPDATED id: use-before-def in the body",
+        note="fixed: carried slots seeded in the preheader",
     ),
     Journey(
         9, "loop, carried value through a call",

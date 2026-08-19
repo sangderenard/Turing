@@ -3152,6 +3152,28 @@ class _ControlSSABuilder:
         latch = self.new_block("loop_latch")
         exit_block = self.new_block("loop_exit")
         self.current = preheader
+        # Seed every carried SLOT from its initial value before entering the
+        # loop. The carried updated id is one storage slot: the body reads it
+        # at the top of an iteration (a linked call's argument binds there --
+        # that is the aliased-input/output design, one slot per carried value,
+        # no copies inside the loop) and writes it before the latch. Reading
+        # slot-then-writing-slot is correct on every iteration EXCEPT the
+        # first, where nothing has written the slot yet; without this seed the
+        # first iteration reads an uninitialized slot, which the materializer
+        # reports as use-before-def and a native backend reads as garbage.
+        # The seed is emitted onto the SAME reserved SSAValue object the body
+        # will later redefine -- in-place reuse of one slot, which the
+        # well-formedness rules accept for one object (diagnose stage 2a).
+        for _updated_id, _initial_id, initial_value, reserved, _current in carried:
+            self.emit(
+                Handler.Cast,
+                [initial_value],
+                reserved,
+                attributes={
+                    "binding": "loop_carried_seed",
+                    "target_dtype": str(initial_value.dtype or "float64"),
+                },
+            )
         if deployment_id is not None:
             self.emit_deployment_boundary(Handler.Deploy, record)
         self.branch(header)
@@ -3477,12 +3499,18 @@ class _ControlSSABuilder:
                     "induction": loop.induction,
                 },
             )
+        blocks_before_body = {id(existing) for existing in self.blocks.values()}
         try:
             self.lower(loop.body, path=f"{path}.body")
             for mutation in loop.sequence_mutations:
                 self.lower_sequence_mutation(mutation, path=path)
         finally:
             self.loop_targets.pop()
+        body_blocks = [
+            candidate
+            for candidate in self.blocks.values()
+            if id(candidate) not in blocks_before_body or candidate is body
+        ]
         # A nested retained loop may carry the same source state as this loop.
         # Its exit Phi is then the value produced by this iteration, but the
         # nested lowering necessarily replaced ``external_values[updated_id]``
@@ -3495,9 +3523,15 @@ class _ControlSSABuilder:
             carried_updates[updated_id] = published
             if published is not reserved:
                 carried_phis[updated_id].args[1] = published
+        # Producers are counted in the BODY's blocks only, as the shortfall
+        # message has always claimed. Scanning every block would let the
+        # preheader seed above stand in for a producer, silently accepting a
+        # loop whose body updates nothing -- the carried value would freeze at
+        # its seed, which is the exact miscompilation shape this check exists
+        # to refuse.
         produced_results = {
             id(instruction.res)
-            for basic_block in self.blocks.values()
+            for basic_block in body_blocks
             for instruction in basic_block.instrs
             if instruction.res is not None
         }

@@ -67,8 +67,11 @@ def test_the_trace_shows_every_iteration_of_a_carried_value(loop_shell):
         for entry in run.trace
         if entry.function == "ps__train" and entry.value_id == 7
     ]
-    # Three loop iterations plus the post-loop port rebinding.
-    assert carried[:3] == pytest.approx([1.9, 1.805, 1.71475], abs=1e-12)
+    # The preheader SEED first -- the carried slot is initialized from the
+    # entry value so a body reading the slot at the top of iteration one
+    # reads w, not garbage -- then one entry per iteration, then the
+    # post-loop port rebinding.
+    assert carried[:4] == pytest.approx([2.0, 1.9, 1.805, 1.71475], abs=1e-12)
 
 
 def test_identical_runs_produce_identical_traces(loop_shell):

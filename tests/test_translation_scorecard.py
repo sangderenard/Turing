@@ -30,7 +30,7 @@ EXPECTED: dict[int, str] = {
     5: "PASSED",       # loop, compound body
     6: "PASSED",       # two carried values, fixed in topological_reducer
     7: "PASSED",       # adam-shaped triple carry: the goal shape, compiled
-    8: "MATERIALIZE",  # linked call binds the updated id; use-before-def, refused
+    8: "PASSED",       # fixed: carried slots seeded in the preheader
     9: "LOWER",        # carried value round-tripped through a call
 }
 
