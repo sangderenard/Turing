@@ -17,14 +17,19 @@ is linear work for linear gain, and it multiplies against every backend.
 Adding a *dimension of dtype* means adding an axis. Adding a *dtype* means naming
 a point.
 
-And the way to make that pay is to stop hand-writing implementations per backend:
+And the way to make that pay:
 
-> **Declare the encoding once, in Python. Lower it through the compiler. Let LLVM
-> be the lowering authority, and let every other backend defer to the algorithm it
-> produces. Degrade only by the narrowest gap, and never silently.**
+> **Declare the encoding once, in Python. Compile the entire (operation × encoding
+> × backend) matrix to native code ahead of time. Ship the matrix, not the
+> translator. Degrade only by the narrowest gap, per cell, and never silently.**
 
 Get that right and the space of representable number systems flowers
-combinatorially while the code grows linearly.
+combinatorially while the runtime cost stays at zero.
+
+Get any one of the particulars wrong and it collapses into a boxed, tagged,
+dynamically-dispatched interpreter that is slower than what we have now. §6 is the
+list of ways that happens, and it is not a footnote — it is the load-bearing part
+of the document.
 
 ---
 
@@ -88,15 +93,15 @@ native types are.
 Three facts that decide the architecture:
 
 - **There is a JIT.** `llvm_jit_backend.py:129` and `llvm_optimizing_pipeline.py:350`
-  both call `create_mcjit_compiler`. No AOT-per-dtype distribution problem.
+  both call `create_mcjit_compiler`.
 - **The LLVM backend emits *textual* IR.** `_value_llvm_type`
   (`ssa_llvm_backend.py:450-471`) returns strings — `"i1"`, `"i32"`, `"i64"`,
   `"double"`, `"ptr"` — and already routes aggregates through `ptr` via
   `ssa_aggregate_outputs`. Emitting `{float, float}`, `<2 x float>`, or `i23` is
   *emitting a different string*.
-- **LLVM IR has arbitrary integer widths.** `i7`, `i23`, `i128` are legal types.
-  Posits, factoradic lanes, GF(2ⁿ), and custom sign/exponent/mantissa layouts get
-  machine representations with no emulation.
+- **LLVM IR has arbitrary integer widths.** `i7`, `i23`, `i128` are legal. Posits,
+  factoradic lanes, GF(2ⁿ), and custom sign/exponent/mantissa layouts get machine
+  representations with no emulation.
 
 ### 1.5 Two complete worlds exist, with no bridge
 
@@ -112,6 +117,13 @@ bitstrings as rank-1 tensors of 0/1, `nand = 1 - left*right`. Tested.
 This is not "limited" by design. It is limited by which lowering tools have been
 built, and the precedent for building the rest is established.
 
+`Hooks` is also the **operator-set-swap prototype**: a frozen dataclass of eight
+implementations, bound once by `Turing(hooks)`, after which every derived operator
+contains *zero* dispatch — it cannot, it only sees what it was handed. Three sets
+exist today (pure-Python, `abstract_tensor_hooks`, and `instrument_hooks`, which
+adds complete provenance tracing by swapping the set rather than branching inside
+anything). §5 generalizes this.
+
 **The gap.** `compiler/bitops.py:72-211` declares an extensive taxonomy —
 `BitStruct(integer_pieces, depths, encoding)` with `Integer`, `Rational`,
 `Float(mantissa, exponent)`, `Complex(real, imag)`, `Domain`, `Tensor`,
@@ -124,9 +136,6 @@ normalization, no NaN/Inf, and empty `float_add_table` / `float_mul_table` dicts
 marked "reserved for future".
 
 **The carrier taxonomy exists. The algebra does not. That is the hole.**
-
-When the minimal-operator world grows float and complex lowering, it will need
-*exactly this same object*. **One design, two realizations.**
 
 ---
 
@@ -225,11 +234,10 @@ runtime numbers.** §1.2 is the evidence for why that matters.
 
 ---
 
-## 4. The realization ladder
+## 4. The realization ladder — resolved per cell
 
-An encoding is *declared* once. How it is *realized* depends on what the target can
-accept. The dispatch rule is: **try the highest rung the target accepts on its own
-terms; degrade by the narrowest gap; announce every degradation.**
+An encoding is *declared* once. How it is *realized* is decided at compile time,
+**per cell of the matrix** — one (operation, encoding, backend) triple at a time.
 
 | rung | realization | when | cost |
 | --- | --- | --- | --- |
@@ -257,16 +265,26 @@ float arrays, dual numbers are two floats. The structure-constant contraction of
 §3 expands at compile time into a handful of native float operations.
 
 > **Not everything becomes an integer just because it needs a matrix.** The u32
-> shim is the *floor*, not the default. An encoding reaches it only when the
-> target genuinely cannot express the type in its own scalars.
+> shim is the *floor*, not the default.
 
-The corollary is that degradation is **per-operation, not per-type**. SPIR-V
-rejects bitwise ops on f32 — but `complex64` never asks for bitwise ops, so
-`complex64` stays on rung 2 at full speed. Only encodings that actually need bit
-manipulation (GF(2ⁿ) carry-less multiply, posit field extraction, software f64 on
-an f32-only target) touch the shim, and only for the operations that need it.
+### 4.2 The ladder is chosen per cell, never per region
 
-### 4.2 Rung 3: why u32 is the one true floor
+This is the caveat that decides whether §4.1 survives contact with real programs.
+
+If the rung were chosen per *region*, a region would have to pick a realization
+valid for every encoding inside it — which means the worst one wins. One `posit16`
+in the neighbourhood and your `complex64` gets integer arithmetic, at 30× the cost,
+for no reason.
+
+Because each cell is compiled separately, `(mul, complex64, SPIR-V)` lands on rung
+2 as native `vec2` ops while `(mul, posit16, SPIR-V)` lands on rung 3 as packed
+u32 — in the same program, in the same region, with no interaction between them.
+Degradation is also **per operation**, not per type: SPIR-V rejects bitwise ops on
+f32, but `complex64` never asks for bitwise ops, so `complex64` never leaves rung 2.
+
+**A cell is the unit of realization. Nothing coarser.**
+
+### 4.3 Why u32 is the one true floor
 
 Every backend has 32-bit integers. Not "mostly" — all of them: SPIR-V (`I32`/`U32`,
 two of its three types), WASM `i32`, LLVM `i32`, Fortran integer kind, Nodus arena
@@ -275,8 +293,8 @@ two of its three types), WASM `i32`, LLVM `i32`, Fortran integer kind, Nodus are
 A float-based fallback cannot serve this role: `kernel_spirv.cpp:330,400,430`
 rejects bitwise ops on f32, so exact bit manipulation is unavailable on the GPU
 path. A u32 substrate can express everything — software float, posits, GF(2ⁿ),
-factoradic lanes, bignum, arbitrary precision — and it is *exact*, so the fallback
-has no rounding behaviour the fast path lacks.
+factoradic lanes, bignum, arbitrary precision — and it is *exact*, so the floor has
+no rounding behaviour the fast path lacks.
 
 Two implementation notes:
 
@@ -290,10 +308,10 @@ Two implementation notes:
   approximations with *measured* error bounds (`MathFunction:50`, `build_table:213`,
   `build_series:325`) and should be the engine for the last tier.
 
-### 4.3 Rung 4 is the oracle
+### 4.4 Rung 4 is the oracle
 
-The NAND path is too slow to compute with and exactly right for proving. Every
-encoding realized on rungs 1–3 can be checked against its NAND-lowered twin, with
+The NAND path is too slow to compute with and exactly right for proving. Every cell
+realized on rungs 1–3 can be checked against its NAND-lowered twin, with
 `turing_provenance.py` demonstrating the derivation reduces to the primitive basis.
 The survival computer stops being an isolated curiosity and becomes the
 verification tier of the production stack.
@@ -301,24 +319,105 @@ verification tier of the production stack.
 The three lower rungs are *the same algorithm at three packing densities* — 1 bit
 per element, 32 bits per word, machine-native. Each validates the one above it.
 
-### 4.4 Degradation must be loud
-
-Software arithmetic over packed words is 10–50× native. That is fine as a
-correctness floor and unacceptable as a surprise. Every drop to rung 3 must emit a
-diagnostic naming the encoding, the operation, and the reason the target refused —
-*"`posit16.div` degraded to packed-u32: SPIR-V has no i16 division."*
-
-The recurring defect in this tree is silent degradation: `to_dtype_` defaulting to
-float32, `real()` dropping gradients, `eigh` returning the bare diagonal, complex
-`sum` succeeding while complex `add` raises. **The shim is the highest-stakes place
-yet to repeat that mistake.** A slow answer is acceptable; an unannounced slow
-answer is not.
-
 ---
 
-## 5. Declaration is primary; realizations are generated
+## 5. The matrix is the artifact
 
-The architecture is a single pipeline, not a set of parallel implementations:
+### 5.1 There is no runtime translator
+
+The universal translator is not a thing that runs. **It is a generator, and its
+output is native code.**
+
+Say it several ways, because every one of them rules out a different wrong
+implementation:
+
+- **The plate and the print run.** The declaration is a printing plate. The matrix
+  is the print run. The plate does not ride along with the newspapers.
+- **Crystallization, not solution.** Compilation freezes the declaration into a
+  fixed lattice of emitted cells. Nothing remains dissolved, and nothing is still
+  deciding anything when the program runs.
+- **The generic never exists.** There is no generic `complex_multiply` that gets
+  specialized at runtime. There are *only* specializations. The generic is a
+  fiction of the source language, discharged during lowering — the standard name
+  for this is monomorphization.
+- **A value does not know its type; the code knows.** A `complex64` at runtime is
+  two floats in registers. It carries no tag, no header, no descriptor, because
+  nothing downstream will ever ask it. Type information lives in the instruction
+  stream, not the data.
+- **At runtime there is nobody left to ask.** Every question the declaration could
+  answer was answered at build time. The declaration object is not loaded, not
+  consulted, not present.
+
+Concretely, what this buys: no boxing, no tagged unions, no marshalling at operator
+boundaries, no virtual calls in inner loops, no interpretive layer, and therefore
+nothing standing between adjacent operations that would prevent them fusing.
+**`complex64` on the GPU is bit-for-bit the machine code you would have hand-written
+in the shader** — not "close to," the same, because that cell was compiled for
+exactly that triple and there is no wrapper to pay for.
+
+The cost model moves entirely to build time: compile duration and emitted code
+size. Runtime overhead is zero by construction. That is what makes combinatorial
+flowering affordable — the explosion is in emitted cells, which is a build-time
+budget you can measure and bound, not a tax paid on every element forever.
+
+### 5.2 Resolution is declared, never inferred
+
+A region's dtypes are in exactly one of three states, and **which state must be
+stated, not discovered**:
+
+- **Resolved** — one encoding, known at compile time. One branch-free body, called
+  directly. No runtime logic whatsoever.
+- **Fanned** — a known *finite set*. Compile one specialized branch-free body per
+  member; select among them **once, at region entry**, by index into a table of
+  already-native functions. This is a selection, not a conversion. It is the
+  sensible default, because the set of possible encodings is always finite and
+  usually tiny.
+- **Dynamic** — genuinely opaque at compile time. Rare, legitimate occasionally,
+  and **must be explicitly declared and loudly reported.**
+
+The failure this guards against is the *implicit* third state. Nobody deliberately
+declares a dtype opaque; some conservative pass upstream merely fails to prove it
+static, quietly demotes the region, and the whole neighbourhood lands in a generic
+boxed body. **If a pass cannot prove staticness, that is a diagnostic, not a quiet
+demotion.**
+
+### 5.3 Fan width is the only budget knob
+
+Fan-out's cost is code size, and the worst case is combinatorial: a region with `k`
+operands over `d` encodings is `d^k` bodies. Two mitigations:
+
+- **Fan over reachable tuples, not the cartesian product.** Emit the operand
+  combinations the program actually produces, not the whole space.
+- **Unify cells that lower identically.** Several encodings frequently collapse to
+  the same emitted code — deduplicate *after* lowering, not before.
+
+When a fan would be too wide, the answer is **never** to put tests back inside the
+operators. It is to narrow the region until each piece resolves, or to accept a
+declared-dynamic region that announces itself. "Whichever is more efficient at the
+time" is a question about *which cells to emit* — it is never a question about what
+to do at runtime.
+
+### 5.4 Dispatch is a region contract, not an operator property
+
+Generalize `Hooks` (§1.5): a region binds a whole coherent operator set once, and
+every operation inside is branch-free because it can only see what it was bound.
+
+The reason to hoist dispatch out of operators is not the branch itself. It is that
+**a conditional inside an operator is a fusion barrier** — and this tree has an
+entire fused-program IR (`fused_ir.py`, `fused_program_wasm_backend.py`,
+`fused_program_python_backend.py`) that a dtype test would defeat. On the GPU path
+it is worse than a lost optimization: a branch is warp divergence, paid on every
+lane whether taken or not.
+
+Regions already exist. `deployment_classification.py` and
+`glsl_deployment_strategy.py` partition programs into graphics-output,
+shader-compute, thread-workers, and host-linear. **Math regions should ride on that
+existing partition rather than invent a parallel one** — ideally one boundary serves
+three purposes at once: deployment region, operator-set binding, and fusion body.
+Conversions and validity checks live at that single seam, and an operation the
+region's set does not support is a declaration-time error.
+
+### 5.5 Generation, and what "defer to LLVM" must mean
 
 ```
     Python declaration  (carrier + algebra + laws)
@@ -335,22 +434,14 @@ The architecture is a single pipeline, not a set of parallel implementations:
  (JIT)    (re-emit)  (re-emit)   (re-emit)
 ```
 
-Write the encoding in Python. Lower it through the compiler. **The LLVM backend
-takes over those modules**, and every other backend defers to it — which yields
-100% coverage of what is expressible in Python, because anything that reaches LLVM
-can, in the worst case, be expressed over 32-bit words that every target has.
+**A SPIR-V shader cannot call into an MCJIT'd function.** So "other backends defer
+to LLVM" must mean *defer to the lowering strategy LLVM used* — each backend
+re-emits the same algorithm in its own IR — and never *link against LLVM's compiled
+output*. The shim is a **portable algorithm description**; the JIT is one consumer
+of it, not its home. This is the difference between covering everything and
+covering everything with a CPU.
 
-### 5.1 Defer to the algorithm, not the artifact
-
-**A SPIR-V shader cannot call into an MCJIT'd function.** "Defer to LLVM" must
-therefore mean *defer to the lowering strategy LLVM used* — each backend re-emits
-the same algorithm in its own IR — not *link against LLVM's compiled output*.
-
-This is the difference between a design that covers everything and one that covers
-everything with a CPU. The shim must be a **portable algorithm description**; the
-JIT is one consumer of it, not its home.
-
-### 5.2 The lifting taxonomy
+### 5.6 The lifting taxonomy
 
 | bucket | operations | work required |
 | --- | --- | --- |
@@ -363,27 +454,91 @@ JIT is one consumer of it, not its home.
 matmul** — 3 for complex with Karatsuba. We call the fastest kernel the hardware
 has and never tell it what a complex number is.
 
-### 5.3 What happened to the wrapper question
+### 5.7 What happened to the wrapper question
 
 An earlier draft argued at length for a Python wrapper object holding `k` tensors,
 versus adding a component axis to the shape. **That question is largely dissolved.**
-It was about how Python glues components together — and if arithmetic is compiled,
+It was about how Python glues components together — and if the cell is compiled,
 Python holds a handle to a real type and glues nothing.
 
-The wrapper survives only as the concern of the interpreted fallback path, where it
-remains the right call for the reason originally given: a component axis lets every
-existing shape-touching operation silently corrupt (`sum()` adding real to
-imaginary and returning a plausible wrong number), whereas a wrapper makes the
-supported surface explicit and fails loudly on anything unlifted. §4.4 again.
+The wrapper survives only as the interpreted fallback's concern, where it remains
+the right call for the reason originally given: a component axis lets every existing
+shape-touching operation silently corrupt (`sum()` adding real to imaginary and
+returning a plausible wrong number), whereas a wrapper makes the supported surface
+explicit and fails loudly on anything unlifted.
 
 ---
 
-## 6. What must be fixed first
+## 6. How this dissolves into sludge
+
+Every item below turns the design back into a boxed, dynamically-dispatched
+interpreter — slower than what we have today, and harder to fix because it will
+look like it works. **The particulars are the design.** None of these is a nicety.
+
+**If resolution is inferred rather than declared.** A conservative pass fails to
+prove staticness, silently demotes a region to dynamic, and everything inside gets
+boxed. Nobody wrote that decision down; nobody can find it later.
+→ *Resolution state is declared. Unprovable staticness is a diagnostic.* (§5.2)
+
+**If the ladder is chosen per region instead of per cell.** The worst encoding in
+the neighbourhood sets the realization for all of them, and `complex64` silently
+gets shim arithmetic at 30× cost.
+→ *A cell is the unit of realization.* (§4.2)
+
+**If values carry runtime type tags.** Boxing means allocation, indirection, cache
+misses, and no vectorization — a `complex64` array stops being two float planes and
+becomes a pointer chase.
+→ *Type lives in the instruction stream, not the data.* (§5.1)
+
+**If any conversion layer survives into runtime.** Marshalling between operators
+costs more than the arithmetic and makes fusion impossible.
+→ *Adjacent cells share representation by construction; conversion happens only at
+declared region boundaries.* (§5.4)
+
+**If dispatch lives inside operators.** Each conditional is a fusion barrier on CPU
+and warp divergence on GPU, paid per lane whether taken or not.
+→ *Dispatch is hoisted to region entry, or absent entirely.* (§5.4)
+
+**If the declaration is consulted at runtime.** The moment any part of the encoding
+object is read during execution, you have built an interpreter and the entire
+compile-time argument evaporates.
+→ *The declaration is a build-time input. It is not loaded at runtime.* (§5.1)
+
+**If degradation is silent.** A region drops to the u32 shim, runs 30× slower, and
+nobody finds out for a month.
+→ *Every drop emits a diagnostic naming the encoding, the operation, and the reason
+the target refused:* `posit16.div degraded to packed-u32: SPIR-V has no i16
+division`.
+
+**If fan-out is unbounded.** Code size explodes, build times balloon, and
+instruction cache thrash gives back everything the specialization won.
+→ *Fan over reachable tuples; unify cells that lower identically.* (§5.3)
+
+**If backends link LLVM's artifact instead of re-emitting its algorithm.** The GPU
+path silently drops off the coverage claim, and "100%" quietly means "100% on CPU."
+→ *Defer to the algorithm, not the artifact.* (§5.5)
+
+**If capability requirements are unchecked.** `sort` on complex, Gaussian
+elimination over `ℤ/6ℤ`, an associativity-assuming solver on octonions — each
+produces confident wrong numbers.
+→ *Operations declare what they require; encodings declare what they satisfy;
+mismatches fail at declaration time.* (§3.3)
+
+The through-line: **this tree's recurring defect is silent degradation.**
+`to_dtype_` defaulting to float32, `real()` dropping gradients, `eigh` returning the
+bare diagonal, complex `sum` succeeding while complex `add` raises,
+`unravel_index_` discarding all but element 0, `ADDING_AN_OPERATOR.md`'s own warning
+that a missing table entry fails quietly. The matrix is the highest-stakes place yet
+to repeat it, because a silently-generic cell is invisible: correct, plausible, and
+thirty times slow.
+
+---
+
+## 7. What must be fixed first
 
 Independently correct, small, and load-bearing under every version of this design.
 
 1. **`AT.real` / `AT.imag` must record autograd nodes** (`abstraction.py:547-569`).
-   Today the only exit from the spectral domain drops gradients.
 2. **`atan2` and `round` must exist.** No phase operation can be written without
    them: magnitude/phase conversion needs `atan2`, principal-argument unwrapping
    needs `dp -= 2π·round(dp/2π)`. Also missing: `floor`, `pow`, `scatter_add`,
@@ -393,18 +548,22 @@ Independently correct, small, and load-bearing under every version of this desig
 4. **`.dtype` must give one coherent answer** rather than torch objects from a
    5-entry map and `None` outside it.
 
-Precedent for the approach exists in-tree and was reinforced twice this week:
-`AbstractTensor.searchsorted` (`abstraction.py:1919-1950`) is built from broadcast
-compares and a sum with no backend hook, and `unravel_index_` moved from a
-`NotImplementedError` with seven backend copies to a single base implementation
-using only `%` and `//` — after which every backend, including one with no
-implementation at all, worked immediately.
+Then, in order: the dtype descriptor (§2), generalizing `Hooks` into a region-bound
+operator set as a behaviour-preserving refactor (§5.4), complex as the first real
+cell set at rung 2 (§4.1), and the u32 shim with its diagnostics (§4.3).
+
+Precedent for the approach exists in-tree: `AbstractTensor.searchsorted`
+(`abstraction.py:1919-1950`) is built from broadcast compares and a sum with no
+backend hook, and `unravel_index_` moved from a `NotImplementedError` with seven
+backend copies to a single base implementation using only `%` and `//` — after
+which every backend, including one that had never implemented it, worked
+immediately.
 
 **Define once. Generate the lowerings. Never hand-write a type six times.**
 
 ---
 
-## 7. Non-goals and open questions
+## 8. Non-goals and open questions
 
 **Non-goals.** Replacing backend-native types where they exist — rung 1 is a
 feature. Making every encoding fast; rung 4 exists to be correct and slow. Bit-exact
@@ -417,7 +576,7 @@ target can express natively.**
   constraint system? It is the axis least like the others.
 - How do capability declarations interact with autograd? `conj` is antilinear;
   Wirtinger derivatives are the correct treatment for complex gradients, and the
-  existing `fft` backward rule does not address this. Compiled ops need registered
+  existing `fft` backward rule does not address this. Compiled cells need registered
   derivatives in `backward_registry` regardless.
 - Where do heterogeneous carriers (factoradic, posit) store per-lane metadata — in
   the descriptor, or the value?
@@ -427,26 +586,29 @@ target can express natively.**
   3.3 s on an 8×8.
 - What is the rung-2 synthesis rule for a target whose scalars *almost* fit — f16
   components on an f32-only ISA, say? Widen, or degrade?
+- What is the honest fan-width budget, in emitted bytes, before specialization
+  starts losing to instruction-cache pressure? This is measurable and unmeasured.
 
 ---
 
-## 8. The claim
+## 9. The claim
 
-The tree already contains a provenance-traced minimal-operator computer, a broad
-declared taxonomy of encodings, a working spectral operator, a metric-tensor
-Laplace–Beltrami solver, a metric-steered convolution architecture, an LLVM JIT,
-and a textual-IR backend one string away from emitting aggregate and arbitrary-width
-types.
+The tree already contains a provenance-traced minimal-operator computer, a working
+operator-set-swap prototype, a broad declared taxonomy of encodings, a working
+spectral operator, a metric-tensor Laplace–Beltrami solver, a metric-steered
+convolution architecture, an LLVM JIT, and a textual-IR backend one string away
+from emitting aggregate and arbitrary-width types.
 
 What it does not contain is the layer where **a number system declares its carrier,
-its algebra, and its laws once**, and is then *generated* into every backend —
-native where the type exists, composed from native scalars where the components
-exist, packed over 32-bit words where nothing else will land, and NAND-traced to
-prove all three.
+its algebra, and its laws once**, and every (operation × encoding × backend) cell is
+then *generated* as native code — delegated where the type exists, composed from
+native scalars where the components exist, packed over 32-bit words where nothing
+else will land, and NAND-traced to prove all three.
 
 That layer belongs in AbstractTensor, because it is the only place holding both the
 base operators to delegate to and the autograd tape and SSA vocabulary the lift must
 preserve.
 
-Build the axes, not the list. Generate the lowerings, don't write them. And keep the
-fast path fast — the floor is there to catch what falls, not to carry what flies.
+Build the axes, not the list. Generate the cells, don't dispatch them. Ship the
+matrix, not the translator. And hold the caveats in §6 — every one of them is the
+difference between native code and sludge.
