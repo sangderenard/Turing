@@ -423,7 +423,11 @@ functions — up from 45; the surviving arms are real):
   completions for the msvcrt/kernel32 surface the gfortran CRT touches
   at startup, and (b) the derived read-head accelerator for throughput —
   the faulting read is millions of transitions in. Probe:
-  scratchpad ``probe_machine_pe.py``.
+  scratchpad ``probe_machine_pe.py``. The full readiness/potential report —
+  the diagnostic decision tree, the bidirectional read head's tested state,
+  what the PE lane can answer that the round-trip Python cannot, and the
+  concrete gates before it can chase this OOB read — is
+  ``docs/DIAGNOSTIC_DECISION_TREE_AND_MACHINE_READINESS.md``.
 
 ## 6g. re's wall, named exactly (measured with a LoopShaderReduction spy)
 
