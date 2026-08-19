@@ -200,6 +200,12 @@ class _BodyMaterializer:
         return name
 
     def assign(self, result: Any, source: str) -> None:
+        if result is None:
+            raise MaterializationError(
+                f"{self.function.name}: an instruction publishing no result "
+                f"value reached assignment of {source!r}; a void instruction "
+                "has no Python spelling here"
+            )
         target = _local(result.id)
         self.names[int(result.id)] = target
         statement = ast.Assign(
@@ -282,6 +288,15 @@ class _BodyMaterializer:
             operands = ", ".join(
                 self.operand(argument) for argument in instruction.args
             )
+            if result is None:
+                # A statement-form call publishes no SSA value (res=None).
+                # ``assign`` cannot spell it, and reaching for ``result.id``
+                # crashed here instead of refusing; say what it is.
+                raise MaterializationError(
+                    f"{self.function.name}: statement-form call to "
+                    f"{callee!r} publishes no result value; only "
+                    "value-producing calls are spelled here"
+                )
             # A region call publishes its outputs as one aggregate, which the
             # caller then projects with GetElementPtr/Load. Python's tuple is
             # that aggregate exactly, so the convention needs no encoding --
@@ -441,6 +456,169 @@ def _counted_loop_shape(function: Any) -> dict[str, Any]:
     }
 
 
+def _conditional_diamond_shape(function: Any) -> dict[str, Any]:
+    """Recognise the four-block if/else diamond ``lower_conditional`` emits.
+
+    Deliberately narrow, like ``_counted_loop_shape``: an entry block ending
+    in a CondBr, two arm blocks that each branch to one shared merge block,
+    and the merge carrying the Phis and the return. Anything else raises
+    rather than being approximated.
+    """
+
+    blocks = dict(getattr(function, "blocks", {}) or {})
+    if len(blocks) != 4:
+        raise MaterializationError(
+            f"{getattr(function, 'name', '<anonymous>')} has {len(blocks)} "
+            f"blocks ({sorted(blocks)}); only the four-block conditional "
+            "diamond is reconstructed here"
+        )
+    targeted: set[str] = set()
+    for block in blocks.values():
+        terminator = _terminator(block)
+        if terminator is None:
+            continue
+        attributes = terminator.attributes or {}
+        for key in ("target", "true_target", "false_target"):
+            if attributes.get(key) is not None:
+                targeted.add(str(attributes[key]))
+    entries = [name for name in blocks if name not in targeted]
+    conditional = [
+        (name, _terminator(block))
+        for name, block in blocks.items()
+        if _terminator(block) is not None
+        and str(_terminator(block).op) in {"CondBr", "condbr"}
+    ]
+    if len(entries) != 1 or len(conditional) != 1:
+        raise MaterializationError(
+            f"{getattr(function, 'name', '<anonymous>')}: expected one entry "
+            f"and one conditional branch, found {len(entries)} and "
+            f"{len(conditional)}"
+        )
+    entry_name = entries[0]
+    branch_name, branch = conditional[0]
+    if branch_name != entry_name:
+        raise MaterializationError(
+            f"{getattr(function, 'name', '<anonymous>')}: the conditional "
+            f"branch lives in {branch_name!r}, not the entry {entry_name!r}; "
+            "that is not the single-diamond shape"
+        )
+    attributes = branch.attributes or {}
+    true_name = str(attributes.get("true_target"))
+    false_name = str(attributes.get("false_target"))
+    arm_exits = {}
+    for arm_name in (true_name, false_name):
+        arm = blocks.get(arm_name)
+        if arm is None:
+            raise MaterializationError(
+                f"{getattr(function, 'name', '<anonymous>')}: the branch "
+                f"names {arm_name!r}, which is not a block here"
+            )
+        terminator = _terminator(arm)
+        if terminator is None or str(terminator.op) not in {"Br", "br"}:
+            raise MaterializationError(
+                f"{getattr(function, 'name', '<anonymous>')}: arm "
+                f"{arm_name!r} does not end in an unconditional branch"
+            )
+        arm_exits[arm_name] = str((terminator.attributes or {}).get("target"))
+    merge_names = set(arm_exits.values())
+    if len(merge_names) != 1:
+        raise MaterializationError(
+            f"{getattr(function, 'name', '<anonymous>')}: the arms branch to "
+            f"{sorted(merge_names)}; a diamond has one merge block"
+        )
+    merge_name = merge_names.pop()
+    if merge_name not in blocks or merge_name in {
+        entry_name, true_name, false_name,
+    }:
+        raise MaterializationError(
+            f"{getattr(function, 'name', '<anonymous>')}: the merge "
+            f"{merge_name!r} is not a distinct block here"
+        )
+    return {
+        "entry": blocks[entry_name],
+        "true": blocks[true_name],
+        "false": blocks[false_name],
+        "merge": blocks[merge_name],
+        "branch": branch,
+        "true_name": true_name,
+        "false_name": false_name,
+    }
+
+
+def _materialize_conditional_diamond(
+    function: Any, materializer: "_BodyMaterializer",
+) -> list[ast.stmt]:
+    """The four-block diamond as a Python ``if``/``else``.
+
+    Each merge Phi becomes an ordinary name assigned at the end of the arm
+    its operand came from -- the same reading ``_materialize_counted_loop``
+    gives loop phis, once you are allowed to mutate. The Phi's own
+    ``incoming_blocks`` says which operand belongs to which arm; positional
+    guessing would silently swap the arms whenever ``expect_true`` flipped
+    the branch targets.
+    """
+
+    shape = _conditional_diamond_shape(function)
+    phis = [
+        instruction
+        for instruction in shape["merge"].instrs
+        if str(instruction.op) in {"Phi", "phi"}
+    ]
+
+    _straight_line(materializer, shape["entry"])
+    condition = materializer.operand(shape["branch"].args[0])
+
+    arm_statements: dict[str, list[ast.stmt]] = {}
+    for arm_key in ("true", "false"):
+        before = len(materializer.statements)
+        _straight_line(materializer, shape[arm_key])
+        arm_statements[arm_key] = materializer.statements[before:]
+        del materializer.statements[before:]
+
+    for instruction in phis:
+        incoming = tuple(
+            str(name)
+            for name in (instruction.attributes or {}).get(
+                "incoming_blocks"
+            ) or ()
+        )
+        if len(incoming) != 2 or len(instruction.args) != 2 or set(
+            incoming
+        ) != {shape["true_name"], shape["false_name"]}:
+            raise MaterializationError(
+                f"{function.name}: merge phi %t{int(instruction.res.id)} "
+                f"carries incoming blocks {incoming!r}; expected exactly "
+                f"the two arms {shape['true_name']!r} and "
+                f"{shape['false_name']!r}"
+            )
+        target = _local(instruction.res.id)
+        for block_name, operand in zip(incoming, instruction.args):
+            arm_key = "true" if block_name == shape["true_name"] else "false"
+            arm_statements[arm_key].append(
+                ast.Assign(
+                    targets=[ast.Name(id=target, ctx=ast.Store())],
+                    value=_expression(materializer.operand(operand)),
+                )
+            )
+        materializer.names[int(instruction.res.id)] = target
+
+    materializer.statements.append(
+        ast.If(
+            test=_expression(condition),
+            body=arm_statements["true"] or [ast.Pass()],
+            orelse=arm_statements["false"],
+        )
+    )
+
+    _straight_line(materializer, shape["merge"])
+    returned = _terminator(shape["merge"])
+    if returned is not None and str(returned.op) in {
+        "Ret", "ret", "Return", "return",
+    }:
+        materializer.finish(tuple(returned.args))
+    return materializer.statements
+
+
 def _single_block(function: Any) -> Any:
     blocks = list(getattr(function, "blocks", {}).values())
     if len(blocks) != 1:
@@ -484,7 +662,11 @@ def materialize_function_body(
         }
 
     materializer = _BodyMaterializer(function, argument_names=names)
-    if len(getattr(function, "blocks", {}) or {}) != 1:
+    block_count = len(getattr(function, "blocks", {}) or {})
+    if block_count == 4:
+        statements = _materialize_conditional_diamond(function, materializer)
+        return (statements or [ast.Pass()]), materializer.uses_math
+    if block_count != 1:
         statements = _materialize_counted_loop(function, materializer)
         return (statements or [ast.Pass()]), materializer.uses_math
 

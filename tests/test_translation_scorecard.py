@@ -39,8 +39,13 @@ EXPECTED: dict[int, str] = {
     13: "PASSED",      # transposed arguments stay distinct (anti-symmetric)
     14: "MATERIALIZE", # a thrice-rebound parameter name does not materialize
     15: "PASSED",      # int literals + int parameter meeting float arithmetic
-    16: "MATERIALIZE", # authored if: materializer CRASHES (NoneType .id) --
-                       # a defect in its refusal path, not a designed refusal
+    16: "PASSED",      # authored if: FIXED at the root -- every graph node
+                       # is born with constant=None, and _constant_value
+                       # read that as a literal, so the callsite prune
+                       # "proved" every live predicate False and deleted the
+                       # then-arm. With the discriminator honest, the if
+                       # lowers as a real CondBr diamond and the materializer
+                       # reconstructs it (the crash became a refusal first)
     17: "PASSED",      # while: FIXED same-day, twice -- the double-published
                        # scalar (stale pre-loop identity resurrected by the
                        # recovery pass) and the latch guard testing the
