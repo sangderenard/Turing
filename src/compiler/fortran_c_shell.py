@@ -3935,12 +3935,29 @@ def _class_surface_ssa_program(
         identities = graph.graph.get("identity_table") or {}
         record_table = all_record_tables.get(symbol)
         returned_record_layouts = []
+        named_output_ids = {
+            str(name): int(value_id)
+            for name, value_id in (
+                function.metadata.get("named_outputs") or ()
+            )
+        }
         for output_name in tuple(graph.graph.get("function_outputs") or ()):
             history = tuple(identities.get(str(output_name), ()))
             if not history:
                 continue
             output_id = int(history[-1])
             if output_id in published:
+                continue
+            named_id = named_output_ids.get(str(output_name))
+            if named_id is not None and named_id in published:
+                # The builder already resolved this authored output through
+                # its name history to the value standing in the Ret (a
+                # while loop's carried phi has an id the graph's identity
+                # table cannot know). Re-deriving it from the graph would
+                # resurrect a stale pre-loop identity and publish the same
+                # authored output twice -- scorecard level 17's
+                # (0.5, 0.5)-for-0.5.
+                published.add(output_id)
                 continue
             data = graph.nodes.get(output_id, {})
             record = (

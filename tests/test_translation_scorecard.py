@@ -41,8 +41,9 @@ EXPECTED: dict[int, str] = {
     15: "PASSED",      # int literals + int parameter meeting float arithmetic
     16: "MATERIALIZE", # authored if: materializer CRASHES (NoneType .id) --
                        # a defect in its refusal path, not a designed refusal
-    17: "EQUIVALENT",  # while RUNS AND IS WRONG: returns its scalar twice,
-                       # (0.5, 0.5) for 0.5 -- the silent-failure class, live
+    17: "EQUIVALENT",  # while RUNS AND IS WRONG. Layer 1 (double-published
+                       # scalar) FIXED; layer 2 live: one EXTRA iteration --
+                       # 0.5 where the authored loop stops at 1.0
     18: "MATERIALIZE", # any() over a generator: predicate region unrendered
 }
 

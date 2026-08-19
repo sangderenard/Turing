@@ -3962,6 +3962,13 @@ class _ControlSSABuilder:
         returned = []
         named_returns = []
         returned_ids = set()
+        # Every identity a RESOLVED named return has ever worn. An output
+        # id that is an earlier binding of such a name is the same authored
+        # output seen through a stale identity -- a while loop rebinding
+        # ``total`` leaves the return node's captured id pointing at the
+        # pre-loop value, and returning both publishes the scalar twice
+        # (scorecard level 17: (0.5, 0.5) for 0.5).
+        superseded: set[int] = set()
         carried_port_values = getattr(self, "_carried_port_values", {})
         for name, history in self.named_output_histories.items():
             value = next((
@@ -3976,6 +3983,7 @@ class _ControlSSABuilder:
             # whose cell nothing stores.
             value = carried_port_values.get(int(value.id), value)
             named_returns.append((name, int(value.id)))
+            superseded.update(map(int, history))
             if value.id not in returned_ids:
                 returned.append(value)
                 returned_ids.add(value.id)
@@ -3983,9 +3991,12 @@ class _ControlSSABuilder:
             value = self.external_values.get(value_id)
             if value is not None:
                 value = carried_port_values.get(int(value.id), value)
-            if value is not None and value.id not in returned_ids:
-                returned.append(value)
-                returned_ids.add(value.id)
+            if value is None or value.id in returned_ids:
+                continue
+            if int(value_id) in superseded or int(value.id) in superseded:
+                continue
+            returned.append(value)
+            returned_ids.add(value.id)
         value_names = []
         for name, history in self.value_name_histories.items():
             value = next((
