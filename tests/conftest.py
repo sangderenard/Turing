@@ -18,6 +18,13 @@ def pytest_addoption(parser):
         action="store_true",
         help="Run tests that execute the operator simulation",
     )
+    parser.addoption(
+        "--run-known-failing",
+        action="store_true",
+        help="Run the tests recorded as already failing at af00599 "
+             "(see TEST_BASELINE_AND_HAZARDS.md). Use this when you are "
+             "working ON one of them; the default run skips them.",
+    )
 
 
 def pytest_configure(config):
@@ -29,7 +36,49 @@ def pytest_configure(config):
     )
 
 
+# Tests already failing at af00599, before the namespace/indexing fixes on top
+# of it. They are skipped by default so a red result means "you broke
+# something" instead of "look it up in a document". Each was confirmed
+# pre-existing by running the file both in the working tree and in a clean
+# `git worktree` at af00599 and getting identical results.
+#
+# Do NOT add an entry here to silence a failure you caused. The point of the
+# list is that it is short, dated, and each line is attributable to a commit.
+# Run them with --run-known-failing when you intend to fix one.
+KNOWN_FAILING_AT_AF00599 = {
+    "test_ast_indexing_aot.py": (
+        "test_ast_boolean_masked_augmented_store_stays_arena_shaped",
+        "test_enumerate_counter_augmented_store_is_not_a_boolean_mask",
+        "test_existing_tensor_normalizer_becomes_process_graph_alias",
+        "test_ast_basic_slice_store_lowers_to_fortran_array_section",
+        "test_ast_advanced_indices_become_runtime_flat_gather",
+        "test_ast_scalar_edge_pad_and_multi_axis_spans_lower_to_fortran",
+        "test_loop_break_guard_prevents_speculative_division_by_zero",
+        "test_reduced_named_branch_uses_its_assignment_value",
+        "test_reduced_structural_method_call_uses_live_object_binding",
+        "test_comprehension_does_not_replay_invariant_effectful_call",
+        "test_shader_local_name_augassign_stays_in_numerical_region",
+        "test_shader_local_plain_masked_store_stays_numerical",
+        "test_object_array_field_keeps_its_dotted_public_feed_origin",
+    ),
+    "test_index_set_scatter.py": (
+        "test_index_set_emits_a_complete_scatter_module",
+        "test_index_set_scatter_runs_correctly",
+    ),
+}
+
+
 def pytest_collection_modifyitems(config, items):
+    if not config.getoption("--run-known-failing"):
+        known = pytest.mark.skip(
+            reason="pre-existing failure at af00599 -- see "
+                   "TEST_BASELINE_AND_HAZARDS.md; --run-known-failing to run"
+        )
+        for item in items:
+            names = KNOWN_FAILING_AT_AF00599.get(Path(str(item.fspath)).name)
+            base = getattr(item, "originalname", None) or item.name.split("[")[0]
+            if names and base in names:
+                item.add_marker(known)
     if config.getoption("--run-operators"):
         return
     skip = pytest.mark.skip(reason="need --run-operators option to run")

@@ -80,6 +80,24 @@ def main() -> int:
         help="cells either side of the cone that also release dye",
     )
     parser.add_argument(
+        "--max-iters", type=int, default=256,
+        help="floor on substeps per frame. A fine grid or a heavy viscosity "
+             "bounds dt well below the frame, and the first frame has no "
+             "measured dt to size itself from, so the floor is what it uses.",
+    )
+    parser.add_argument(
+        "--viscosity", type=float, default=None,
+        help="momentum diffusivity; overrides the authored default (2.0e-4). "
+             "Large values tighten the diffusion-number bound, so the "
+             "controller answers with a smaller dt, not with a rejection.",
+    )
+    parser.add_argument(
+        "--tracer-diffusivity", type=float, default=None,
+        help="dye diffusivity; overrides the authored default (1.0e-4). "
+             "Low values keep the dye a transported blob instead of a "
+             "spreading stain.",
+    )
+    parser.add_argument(
         "--build-directory", type=Path,
         default=Path("build/symbolic-fluid-live/llvm"),
     )
@@ -99,6 +117,13 @@ def main() -> int:
         "symbolic_fluid_advance"
     ]
     state = SymbolicFluidGridState.initial(args.grid, args.grid)
+    # The physical constants are record fields, so an override is an ordinary
+    # assignment -- the compiled step reads them through the same ABI formals
+    # either way and needs no rebuild.
+    if args.viscosity is not None:
+        state.viscosity = float(args.viscosity)
+    if args.tracer_diffusivity is not None:
+        state.tracer_diffusivity = float(args.tracer_diffusivity)
     targets = Targets(
         cfl=0.45,
         div_max=1.0,
@@ -290,7 +315,7 @@ def main() -> int:
                 # One iteration per substep. Under a pinned interior that is
                 # the pinned period, not whatever dt the controller last
                 # proposed -- the proposal is not what will be taken.
-                max_iters=max(256, 64 + int(
+                max_iters=max(args.max_iters, 64 + int(
                     args.frame_duration
                     / (sample_period if audio_rate_active else max(dt, 1e-12))
                 )),

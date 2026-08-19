@@ -195,3 +195,10 @@ Run targeted `pytest` suites for the modules you touch before committing; new co
 
 ### **Deliver this plan to any agent altering the repo. Deviation = total failure.**
 
+
+## Testing
+
+Before running tests, read [TEST_BASELINE_AND_HAZARDS.md](TEST_BASELINE_AND_HAZARDS.md).
+It lists the tests already failing at `af00599`, the ~40-second regression gate to
+prefer, and the measured hazards (the full suite does not finish; there is no
+per-test timeout; never baseline with stash or `checkout -- <path>`).

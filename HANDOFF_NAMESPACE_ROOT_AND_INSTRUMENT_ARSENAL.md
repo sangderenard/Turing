@@ -25,48 +25,68 @@ loudly on regression:
 | the control program gained a CALL STATEMENT (`__plan_callsite_N__`) | f07934d |
 | storage-formal ABI declared (LAPACK WORK-array style) and leased at entry | 362eeb5 |
 | region carver temporaries seeded above the caller watermark | a1aee9b |
+| address temporaries allocated module-wide; recovery refuses addresses | (this session) |
 
 The `test_precompile_to_ssa` suite is 34/34 (was 25/34 for the whole prior
 era). The aliased-IO design is now *regulated rather than trusted*: one slot
 per carried value, seeded before the loop, read-then-written through calls in
 place, declared in metadata where it crosses a signature.
 
-## The one named defect: hierarchy ids published as local ids
+## The one named defect: RESOLVED, and the diagnosis it corrected
 
 The whole-program fluid test (`test_symbolic_fluid_native_runtime.py` -- the
-dt system ingested whole by the AOT compiler) is **red**, and the root is
-named to one boundary:
+dt system ingested whole by the AOT compiler) is **green**, with attempts
+`[(0.2, False), (0.1, True), (0.1, True)]`, the exact sequence this document
+named as the finish line.
 
-A planner region's instruction list arrives on its PlanLines with value ids
-minted in the **hierarchy namespace**. The caller consumes the region's
-published `output_ids` as **local-namespace** integers. No translation is
-applied at the publication boundary, so one integer can mean a scalar
-parameter in the caller and a GetElementPtr address inside the region. In
-the fluid advance, caller ids 80/89 (`tracer_diffusivity`, `viscosity`)
-collide with region-internal address temporaries; the caller reads a height
-cell (~1.0) where its 1.0e-4 diffusivity belongs; the physics then
-*correctly* reports a bound violation (diffusion number 1.6 is genuinely
-unstable), and the controller *correctly* rejects every dt, because the
-mis-plumbed value is dt-invariant.
+The collision was real and located exactly where the previous session said it
+was -- caller ids 80/89 (`tracer_diffusivity`, `viscosity`) occupied by
+region-internal `GetElementPtr` addresses, so the caller read a height cell
+(~1.0) where its 1.0e-4 diffusivity belonged. **The named mechanism was
+wrong, and measuring it took one probe.** The ids are not PlanLine ids and
+were never in the hierarchy namespace:
 
-Read that chain again before touching anything: **every layer downstream of
-the collision behaves correctly.** The step's arithmetic matches the SymPy
-oracle for the inputs it received. The controller's same-reason-at-every-dt
-detector did exactly its job. The only defect is one untranslated integer.
+* region_2's PlanLines produce `40, 41, 47, 59, 69, 79` and nothing else;
+  region_1's stop at 88. Dumping every `PlanClosure` reaching
+  `plan_region_to_ssa_instrs` finds no line anywhere in the program that
+  outputs 80 or 89.
+* Both ids are minted later, by `lower_indexing_to_ssa_addressing`
+  (`ir_indexing.py`), which lowers `Indexed` to `GetElementPtr`+`Load` and
+  allocated its addresses from **each function's own** maximum id: region_2's
+  max is 79, so its first address is 80; region_1's max is 88, so its first
+  is 89. A planner region shares its caller's value space, so "one past this
+  function's max" is not free -- it is whatever the caller happens to hold.
+* The binding is made by the structural-output recovery in
+  `fortran_c_shell.py`, not by `region_signatures`/`output_ids` at all. For a
+  `desired_id` the caller lacks, it scans callees for any instruction whose
+  `res.id` equals that integer, appends it to the call's `output_ids`, and
+  materializes a `GetElementPtr`+`Load` unpack. It matched on the bare
+  integer, so it bound a caller scalar to an address.
 
-**The fix belongs where `region_signatures` / `output_ids` are derived**
-(`lower_control_sections_to_ssa` in `precompile_to_ssa.py`): translate
-region line ids through the hierarchy-to-local correlation before
-publishing. `assign_hierarchy_ids` / `reduce_hierarchy_identities`
-(`hierarchical_plan.py`) own that correlation. The carver-temporary variant
-of the same collision is already fixed by the watermark (a1aee9b) -- do not
-mistake that for the whole fix; it was measured insufficient (region_2's
-colliding ids survive it because they are PlanLine ids, not carver
-temporaries).
+Two fixes, each independently sufficient (verified by disabling the other):
 
-Verification, when fixed: the exact probe sequence in the decision tree's
-worked hunt, ending with `test_symbolic_fluid_native_runtime.py` green with
-attempts `[(0.2, False), (0.1, True), (0.1, True)]`.
+| fix | what it closes |
+|---|---|
+| `lower_indexing_to_ssa_addressing` allocates from one module-wide watermark | the collision itself -- an address can no longer take an id used anywhere in the module |
+| the recovery pass refuses a `GetElementPtr` result as a recovered output | the binding -- an address is a location in the callee's storage, never a value the caller asked for |
+
+Both are kept. The first makes the collision unrepresentable; the second is
+correct on its own terms regardless of numbering, and would have refused this
+defect even with the ids as they were.
+
+The sentence from the previous handoff still stands and is worth keeping:
+**every layer downstream of the collision behaved correctly.** The step's
+arithmetic matched the SymPy oracle for the inputs it received; the
+controller's same-reason-at-every-dt detector did exactly its job.
+
+*What the wrong diagnosis cost, and why it was still worth writing down:* the
+previous session named the boundary (region output publication), the two
+colliding integers, and the class of defect -- all correct, all load-bearing.
+It named the wrong minting site because it inferred it rather than dumping
+the PlanLines. The correction took one probe precisely because everything
+around it had been measured. **Record which parts of a diagnosis were
+measured and which were inferred**; the inferred parts are where the next
+session should aim its first probe.
 
 ## The doctrine, distilled
 
@@ -104,8 +124,8 @@ test), and the reference evaluator (independent execution, `result.values`).
 
 ## After the namespace fix
 
-1. **The fluid test green** is the immediate deliverable; it validates the
-   entire week against the flagship.
+1. **The fluid test is green** -- the immediate deliverable, and it validates
+   the entire week against the flagship.
 2. **The backward arc** is the finish line the direction note names:
    gradient computed inside the compiled loop, closing the stateful-network
    story. The optimizer loop already compiles exactly (scorecard level 7);

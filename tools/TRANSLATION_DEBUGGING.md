@@ -625,17 +625,41 @@ value than the metrics' chain -- a wiring split, not a computation error.
 Diff the two chains' value ids; the first id they disagree on names the
 defect.
 
-**Same number, different space (namespace edition).** A region's published
-value ids can be minted in the HIERARCHY namespace (on the PlanLines) while
-the caller consumes them as LOCAL-namespace integers. Where no translation
-is applied at the publication boundary, a caller scalar and a region-internal
-address can share one integer, and the read succeeds with the wrong value.
-Check: for a suspect published id, compare the region's internal producer of
-that id against what the caller believes the id means (`value_names` /
-`program_abi_field` accounting). The carver-temporary variant of this is
-fixed (watermark in `plan_region_to_ssa_instrs`); the PlanLine variant is
-open and lives where `region_signatures`/`output_ids` are derived --
-translate through the hierarchy-to-local correlation before publishing.
+**Same number, different space (namespace edition) -- FIXED, signature
+kept.** A region-internal temporary and a caller scalar can carry the same
+integer, and the read then succeeds with the wrong value. Two mints of that
+collision were found, both now closed:
+
+* `plan_region_to_ssa_instrs` seeded its fold/clamp temporaries from the
+  region's OWN max line id (fixed a1aee9b: it takes the caller's watermark).
+* `lower_indexing_to_ssa_addressing` minted every `GetElementPtr` address
+  from **that function's** max id. A planner region shares its caller's value
+  space, so region_2's first address landed on 80 and region_1's on 89 --
+  exactly the caller's `tracer_diffusivity` and `viscosity`. The allocator is
+  now module-wide, so no address can occupy an id used anywhere in the module.
+
+The binding that turned the collision into a wrong number is the
+whole-program structural-output recovery in `fortran_c_shell.py`: for a
+`desired_id` the caller lacks, it scans every callee for **any** instruction
+producing that id, appends it to that call's `output_ids`, and inserts a
+`GetElementPtr`+`Load` to unpack it. It matched on the raw integer alone, so
+it bound a caller scalar to a pointer into a height array. It now refuses a
+`GetElementPtr` result as a recovered output -- an address is a location in
+the callee's own storage, never a value the caller asked for.
+
+*Check, if this class recurs:* for a suspect id, find the caller's `Load`
+carrying `source_output_id = <id>`, read its `callee`, and look at what that
+callee's instruction with `res.id == <id>` actually IS. If it is an address,
+a cast, or anything the region minted rather than the shared graph named, the
+match is namespace noise. The plan is the arbiter of what a region may
+publish: compare against the region's PlanLine outputs
+(`region_output_value_ids`), not against what its SSA happens to produce
+after later lowering passes have minted ids inside it.
+
+*The rule underneath:* **every pass that mints an SSA id inside a region must
+mint above the whole shared value space, not above what it can see.** A pass
+handed one function cannot tell a caller id from a free integer. Three passes
+have now paid for learning that separately.
 
 ---
 

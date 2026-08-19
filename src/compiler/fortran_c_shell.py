@@ -3440,12 +3440,22 @@ def _class_surface_ssa_program(
                     callee = all_functions.get(callee_symbol)
                     if callee is None:
                         continue
+                    # A callee's ADDRESS temporaries are not values it can
+                    # publish: ``GetElementPtr`` names a location inside the
+                    # callee's own storage, and its id is minted by the
+                    # subscript lowering, not by the graph the caller shares.
+                    # Accepting one here binds a caller scalar to a pointer
+                    # into an array -- the defect that made the fluid advance
+                    # read a height cell as ``tracer_diffusivity``. The id
+                    # collision itself is now prevented upstream; this refuses
+                    # the binding on its own terms as well.
                     produced_value = next((
                         candidate.res
                         for callee_block in callee.blocks.values()
                         for candidate in callee_block.instrs
                         if candidate.res is not None
                         and int(candidate.res.id) == desired_id
+                        and str(candidate.op) != "GetElementPtr"
                     ), None)
                     if produced_value is not None:
                         producer = (
