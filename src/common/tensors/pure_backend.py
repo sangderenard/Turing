@@ -286,15 +286,6 @@ class PurePythonTensorOperations(AbstractTensor):
             return idx
         return reduce_dim(data, dim)
 
-    def unravel_index_(self, shape: Tuple[int, ...]):
-        idx = self.data
-        if isinstance(idx, list):
-            idx = idx[0]
-        coords = []
-        for dim in reversed(shape):
-            coords.append(idx % dim)
-            idx //= dim
-        return tuple(reversed(coords))
     """Educational tensor ops using nested Python lists."""
 
     def __init__(self, track_time: bool = False, tape=None, requires_grad: bool = False):
@@ -452,6 +443,10 @@ class PurePythonTensorOperations(AbstractTensor):
 
     # Creation ops
     def full_(self, size: Tuple[int, ...], fill_value: Any, dtype: Any, device: Any):
+        # ``zeros(8)`` is as valid as ``zeros((8,))`` on every other backend;
+        # accept the scalar spelling here too rather than indexing into an int.
+        if isinstance(size, int):
+            size = (size,)
         if not size:
             return fill_value
         return [self.full_(size[1:], fill_value, dtype, device) for _ in range(size[0])]

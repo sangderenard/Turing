@@ -2793,9 +2793,19 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement squeeze_()")
 
     def unravel_index_(self, shape):
-        raise NotImplementedError(
-            f"{self.__class__.__name__} must implement unravel_index_()"
-        )
+        """Row-major coordinate decomposition, built from base operators.
+
+        ``%`` and ``//`` are enough to unravel an index, so this needs no
+        backend support at all: every backend inherits a working version, and
+        it is correct for array indices as well as scalars.  Backends may still
+        override with a native call, but none has to.
+        """
+        remaining = self
+        coords = []
+        for extent in reversed(tuple(shape)):
+            coords.append(remaining % extent)
+            remaining = remaining // extent
+        return tuple(reversed(coords))
 
     def nbytes_(self) -> int:
         """Backend hook for nbytes query."""

@@ -105,7 +105,15 @@ def eigh(A, sweeps: int = 24, tol: float = 1e-12, sort: bool = True):
                 denom = (two * apq).abs() + tol
                 tau = (aqq - app) / (two * apq + (apq * 0 + tol))
 
-                t = tau.sign() / (tau.abs() + (one + tau * tau).sqrt())
+                # ``sign`` sends 0 -> 0, which cancels the rotation outright in
+                # the degenerate case app == aqq (tau == 0).  That case is not
+                # rare: it is every regular graph Laplacian, whose diagonal is
+                # constant, so the whole sweep would be a no-op and ``eigh``
+                # would hand back the untouched diagonal.  Fold 0 into the
+                # positive branch to keep the 45-degree rotation.
+                tau_sign = tau.sign()
+                tau_sign = tau_sign + (tau_sign == zero).to_dtype(tau_sign.get_dtype())
+                t = tau_sign / (tau.abs() + (one + tau * tau).sqrt())
                 t = t * (apq.abs() > tol).to_dtype(t.get_dtype())  # zero if apq≈0
                 c = one / (one + t * t).sqrt()
                 s = c * t
