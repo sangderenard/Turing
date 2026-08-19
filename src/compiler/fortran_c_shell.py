@@ -3868,7 +3868,23 @@ def _class_surface_ssa_program(
             if "value" in attributes:
                 return _copy_literal_payload(attributes["value"])
             if "constant" in data:
-                return _copy_literal_payload(data["constant"])
+                payload = data["constant"]
+                # Every graph-express node is born with constant=None (see
+                # ProcessGraph.add_node), so the key's presence alone proves
+                # nothing. Reading it unconditionally short-circuited BEFORE
+                # the ast.literal_eval / list-tuple recursion fallbacks
+                # below ever ran, for every node that is not itself typed
+                # Const/Constant -- a List/Tuple node whose own elements are
+                # all resolvable constants (the exact case those fallbacks
+                # exist for) was silently declared unresolvable instead of
+                # being recursed into. A None payload only counts as a
+                # literal on a node that declares itself constant.
+                if payload is not None or str(
+                    data.get("type")
+                ) in {"Constant", "Const", "const"} or str(
+                    data.get("op") or ""
+                ).casefold() == "const":
+                    return _copy_literal_payload(payload)
             expression = data.get("expr_obj")
             if expression is not None:
                 try:

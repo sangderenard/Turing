@@ -87,3 +87,72 @@ throwaway probe script; never leave a monkeypatch in repo code.
   passed + scorecard 17/19).
 * One commit per fixed site (or one commit for the audit if all safe),
   narrative message, plus the FINDINGS update in this file.
+
+## FINDINGS 2026-08-19
+
+All three named sites audited, plus one more of the same shape found by
+grep while auditing site 3 (`fortran_c_shell.py:4732`, not in the
+original list — the file has grown since the task was written).
+
+1. **`loop_composer._constant`, safe, unchanged.** Read every real
+   caller in the file (three: lines ~2116, ~2158, ~2800 in the current
+   file; `add_constant` matches from the grep are an unrelated function).
+   All three are structurally safe, not just coincidentally:
+   - 2116 (`start`/`stop`/`step` for `_trip_count`): `_trip_count`
+     requires `isinstance(value, int)` for all three, so a lying `None`
+     is filtered before use.
+   - 2158 (iterable constant): gated by
+     `isinstance(iterable, (tuple, list, range))`.
+   - 2800 (`structured_control_expression`): gated by
+     `isinstance(literal, (bool, int, float))`.
+   Deeper than the isinstance gates: `start`/`stop`/`step` are also
+   stored directly on `LoopDescriptor` and consumed downstream
+   (`loop_composer.py`'s `planned_root()`) as `None`-means-"unknown,
+   fall back to `bound_expressions`" — the exact same sentinel the birth
+   default produces. No authored loop bound is ever literally the
+   constant `None`, so the two meanings can never collide. Unchanged.
+
+2. **`fortran_c_shell.literal_value`, FIXED — this one was real.**
+   Unlike every other site in this sweep, there was NO type gate before
+   the birth-default read: `if "constant" in data: return
+   _copy_literal_payload(data["constant"])` returned unconditionally,
+   which meant it short-circuited BEFORE the function's own fallback
+   chain (`ast.literal_eval`, then recursing into `list`/`tuple`
+   elements) ever ran, for every node not itself typed
+   `Const`/`Constant`. A `List`/`Tuple` AST node whose own elements are
+   all resolvable constants — precisely the case those fallbacks exist
+   to handle — was declared unresolvable before ever being recursed
+   into. Its one external caller (`_tensor_from_list` Const-folding,
+   ~line 4084) already treats a `None` return identically to a caught
+   `ValueError` (`if literal is not None:`), so the fix is monotonic:
+   it can only resolve MORE literals correctly than before, never fewer,
+   since every currently-working case (declared-Const nodes,
+   `attributes["value"]`) is untouched. Applied the `d50ba56` pattern.
+   A live minimal repro through the full AST-source pipeline (needing a
+   bound `AT.tensor`-style constructor call over a literal list) wasn't
+   obtained within budget; the fix is proven by exhaustive control-flow
+   reading (the branch order is unambiguous, not probabilistic) and
+   verified safe by the full gate (72 passed, no regressions — 68
+   baseline + `test_overlay_scope_refusal`'s 4).
+
+3. **The two default-literal reads, both safe, unchanged.** Both now at
+   shifted line numbers (~6083, ~6509 in the current file — other
+   concurrent sessions have been editing this file today). Confirmed by
+   reading: both sit inside an `and`/`continue` chain that already
+   requires `str(node.get("type")) in {"Constant", "Const", "const"}`
+   BEFORE the `"constant" in node` check is ever reached. Exactly the
+   "loop already continues for non-constant node types" case the task
+   anticipated.
+
+   **Bonus, found while re-locating site 3**: a fourth instance of the
+   identical already-gated pattern at `fortran_c_shell.py:4732` (program
+   ABI default-literal binding). Same shape, same verdict: the type
+   check (`str(source.get("type") or source.get("op") or
+   "").casefold() in {"constant", "const"}`) runs first. Safe,
+   unchanged.
+
+`symbolic_equation_compiler.py` reconfirmed as already checked (still
+inside a type-gated block) — no new investigation needed there.
+
+Gate: 72 passed (68 baseline + 4 `test_overlay_scope_refusal`, Task D's
+suite). Committed as one commit for the single real fix.
