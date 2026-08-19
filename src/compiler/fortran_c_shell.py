@@ -2054,6 +2054,23 @@ def _sequence_append_slice_ops(
     """
 
     sequence_kinds = {"list", "bytes", "bytearray"}
+
+    def _sequence_like(node: Mapping[str, Any]) -> bool:
+        attributes = node.get("attributes") or {}
+        if attributes.get("aggregate_kind") in sequence_kinds:
+            return True
+        # A structurally specialized sequence presents as its captured
+        # initial value: a Constant whose payload is itself a sequence
+        # object (re's ``out``/``tail`` arrive as Constant [] with
+        # structural_specialization=True while their sequence descriptors
+        # live on under the same value ids).
+        return (
+            str(node.get("type") or node.get("op")) == "Constant"
+            and isinstance(
+                attributes.get("value"), (list, bytes, bytearray)
+            )
+        )
+
     operations = []
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
@@ -2073,11 +2090,25 @@ def _sequence_append_slice_ops(
             continue
         lhs = graph_obj.nodes.get(lhs_id, {})
         rhs = graph_obj.nodes.get(rhs_id, {})
+        if str(rhs.get("type") or rhs.get("op")) != "Indexed":
+            # Whole-sequence extend: ``resident += other_resident`` (re's
+            # ``out += tail``). Same helper, bounds spanning the whole
+            # source (the lowering clips into [0, source_length], so the
+            # emitter passes 0 and a beyond-length constant). No extra
+            # expression node exists to suppress, hence the None slice id.
+            if _sequence_like(lhs) and _sequence_like(rhs):
+                operations.append((
+                    int(data.get("value_id", node_id)),
+                    int(lhs.get("value_id", lhs_id)),
+                    int(rhs.get("value_id", rhs_id)),
+                    None,
+                    None,
+                    None,
+                ))
+            continue
         if (lhs.get("attributes") or {}).get(
             "aggregate_kind"
         ) not in sequence_kinds:
-            continue
-        if str(rhs.get("type") or rhs.get("op")) != "Indexed":
             continue
         indexed = {
             str(role): int(parent)

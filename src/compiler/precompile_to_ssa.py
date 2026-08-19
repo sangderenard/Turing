@@ -1342,7 +1342,7 @@ class _ControlSSABuilder:
 
     def _emit_sequence_append_slice(
         self, destination_id: int, source_id: int,
-        lower_id: int, upper_id: int,
+        lower_id: int | None, upper_id: int | None,
     ) -> None:
         destination = self.sequence_descriptors.get(int(destination_id))
         source = self.sequence_descriptors.get(int(source_id))
@@ -1381,13 +1381,31 @@ class _ControlSSABuilder:
                 *self.sequence_storage_values[int(source_id)],
             )
         }.values())
+        # A whole-sequence extend (``resident += other``) has no authored
+        # bounds: 0 and a beyond-any-length constant span the source, and
+        # the helper's Python-slice clipping does the rest.
+        if lower_id is None:
+            lower_value = self.fresh_value(dtype="int")
+            self.emit(
+                Handler.Const, [], lower_value, attributes={"value": 0}
+            )
+        else:
+            lower_value = self.external_value(int(lower_id), dtype="int")
+        if upper_id is None:
+            upper_value = self.fresh_value(dtype="int")
+            self.emit(
+                Handler.Const, [], upper_value,
+                attributes={"value": 2 ** 31 - 1},
+            )
+        else:
+            upper_value = self.external_value(int(upper_id), dtype="int")
         status = self.fresh_value(dtype="int")
         self.emit(
             Handler.Call,
             [
                 *storage,
-                self.external_value(int(lower_id), dtype="int"),
-                self.external_value(int(upper_id), dtype="int"),
+                lower_value,
+                upper_value,
             ],
             status,
             attributes={
@@ -5127,7 +5145,10 @@ def lower_control_sections_to_ssa(
     }
     sequence_append_slice_by_result = {
         int(result_id): (
-            int(destination_id), int(source_id), int(lower_id), int(upper_id)
+            int(destination_id),
+            int(source_id),
+            None if lower_id is None else int(lower_id),
+            None if upper_id is None else int(upper_id),
         )
         for (
             result_id, destination_id, source_id, lower_id, upper_id,
@@ -5140,6 +5161,7 @@ def lower_control_sections_to_ssa(
             _result_id, _destination_id, _source_id, _lower_id, _upper_id,
             source_result_id,
         ) in sequence_append_slices
+        if source_result_id is not None
     }
     for (
         _result_id, destination_id, source_id, _lower_id, _upper_id, _slice_id,
@@ -5156,8 +5178,11 @@ def lower_control_sections_to_ssa(
         # Slice bounds are address arithmetic.  State that contract before the
         # numerical region producing e.g. ``i + width`` is typed, so its result
         # and operands remain integer across the region/helper boundary.
-        region_value_meta[int(lower_id)] = Meta((), "int")
-        region_value_meta[int(upper_id)] = Meta((), "int")
+        # Whole-sequence extends carry no authored bounds (None).
+        if lower_id is not None:
+            region_value_meta[int(lower_id)] = Meta((), "int")
+        if upper_id is not None:
+            region_value_meta[int(upper_id)] = Meta((), "int")
     bit_pack_consumed_ids = {
         int(value_id)
         for _destination_id, _source_id, _width_id, consumed_ids
