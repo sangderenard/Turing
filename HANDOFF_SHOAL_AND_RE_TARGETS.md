@@ -263,6 +263,33 @@ materializer/lowering seam (`diagnose_translation` stages 1-2 generalized,
 defect — read the materialized Python directly, then `watch=` on the loop
 exit if the duplication is upstream of materialization.
 
+## 6d. Third iteration: level 17 fell twice, and the fix reached Shoal
+
+* **While double-publication FIXED** (`7d1fd43`'s predecessor + `3ee307b`):
+  the structural recovery pass re-published a named output under its
+  stale pre-loop identity because ``published`` was keyed by raw graph
+  id and could not see the carried phi. The recovery still runs in full
+  (its boolop chains and values-map entries feed later source-linked
+  calls — the first, skip-the-recovery version of this fix broke
+  Shoal's dt-control call resolution and was reworked); only the
+  duplicate Ret argument is filtered.
+* **While latch guard FIXED** (`7d1fd43`): the latch evaluated the
+  next-iteration guard on the header phi (pre-update value), lagging one
+  iteration. Carried names now rebind to their updated values around the
+  latch's condition lowering, restored to the phi after. **Level 17
+  PASSES — the first authored while to compile and compute correctly.**
+* **The fix propagated to Shoal**: a fresh exe's `last_wave_speed`
+  matches the oracle to all 16 digits (was off in the 4th) — the
+  compiled dt controller's intra-frame trajectory converged. The one
+  remaining divergence is the post-frame ``dt_next`` proposal
+  (`t14 = frame_duration/2` exactly, vs oracle 0.006518) — a narrow,
+  isolated path, plausibly another stale-identity binding on the
+  frame's return.
+* The LLVM whole-frame no-advance is NOT the latch guard (fresh
+  post-fix lowering still static) — it stands as its own blocker.
+* Scorecard: **16/19**, remaining stalls are the three MATERIALIZE rungs
+  (rebound name, authored if crash, generator predicate).
+
 ## 7. Working rules, re-earned this session
 
 * The soft-read trap is real and it recurs: an unobservable id read as
