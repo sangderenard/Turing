@@ -196,6 +196,32 @@ can be iterated on independently:
   loop body never executes"; next instrument is `watch=` on the loop
   iteration counter at `emit_ssa_function_to_llvm`.
 
+## 6b. Second iteration: three of the isolated blockers FELL (same day)
+
+* **Rank seam: FIXED at the root.** Structural specialization stamps
+  re's ``out``/``tail`` as ``Constant []`` nodes (their sequence
+  descriptors live on under the same value ids 28/29); the sequence
+  recognizers saw two constants and ``out += tail`` fell through to
+  arithmetic carving. ``_sequence_append_slice_ops`` now recognizes the
+  whole-sequence extend with a sequence-like test admitting a Constant
+  whose payload is itself a list/bytes/bytearray, lowered through the
+  existing ``append_slice`` helper with clipped whole-source bounds.
+  Emission complete WITH authored sequence semantics.
+* **Phi-rank family: FIXED.** ``_propagate_phi_dynamic_ranks`` carries
+  ``dynamic_array_ranks`` rank through Phi chains and aliases the SAME
+  extent symbols; the latch copies became legal whole-array
+  assignments. gfortran: 6 errors -> 1.
+* **Dangling operands: now a loud emission shortfall** (per function and
+  block), zero false positives across the fluid and journey programs.
+* **The single remaining re wall, precisely:** ``_optimize_charset``'s
+  ``while.1`` is the authored charmap-compress ``while True`` loop
+  lowered to a HUSK — empty body, condition ``Phi(True, True)``
+  (unconditionally true), and carried value 153 whose producer was never
+  materialized. This is the elided-loop-body family (commits
+  ``f07934d``/``a925a6e`` fought it in the fluid program); the body's
+  ``charmap.find``/conditional-``break``/``runs.append`` content never
+  lowered. Fix belongs at loop-body lowering, not emission.
+
 ## 7. Working rules, re-earned this session
 
 * The soft-read trap is real and it recurs: an unobservable id read as
