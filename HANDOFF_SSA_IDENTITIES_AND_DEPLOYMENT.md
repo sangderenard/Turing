@@ -183,6 +183,15 @@ emitter (`emit_ssa_function_to_llvm`) already held scalars in registers;
 this brings the whole-program artifact path to parity without touching
 `noalias`.
 
+**The switches are now one contract** (`src/compiler/work_contract.py`):
+`TURING_WORK_CONTRACT= prove | develop | deploy | fast`, four internally
+consistent presets over register reuse, identity exactness and multiply-add
+contraction; unknown names refuse rather than fall back; the legacy
+variables stay honored as overrides. `prove` measurably restores the
+817-load slot-faithful artifact; diagnostics work under every preset today
+because stores never evaporate — a future store-evaporating mode must
+consult the watch set through this contract, not a new flag.
+
 **Fusion-mode note for whoever picks up the heuristic idea:** the
 faithful-vs-reducing choice already has a vocabulary (`fusion_levels.py`:
 PRESERVE / NO_FUSION / REGIONS / FUSED) but only REGIONS and FUSED are

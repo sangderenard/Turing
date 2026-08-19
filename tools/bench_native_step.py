@@ -40,6 +40,12 @@ triple, no noalias, no FMA (see catalogue sections 2.5 and P2).
     TURING_POW_INEXACT=1:                    ~150-195 ns/cell -- ~10x
     + TURING_FMA_CONTRACT=1:                 ~140-160 ns/cell; 17 vfmadd
       now actually form (the register chains exist for LLVM to contract)
+
+These switch combinations are now named presets -- TURING_WORK_CONTRACT=
+prove | develop (default) | deploy | fast (src/compiler/work_contract.py);
+the two legacy variables remain honored as overrides. Verified same day:
+prove restores the 817-load slot-faithful artifact (~980 ns/cell), fast is
+the 222-load contracted one (~150-165 ns/cell).
 """
 
 from __future__ import annotations

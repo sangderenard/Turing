@@ -27,7 +27,6 @@ correctly rounded ``pow`` rounds once.
 from __future__ import annotations
 
 import dataclasses
-import os
 
 from ..transmogrifier.ssa import Instr, SSAValue
 
@@ -77,14 +76,17 @@ def reduce_constant_exponent_pow(functions, inexact: bool | None = None) -> dict
     """Rewrite ``Pow(x, Const c)`` to cheaper exact primitives, in place.
 
     ``functions`` is a mapping of name -> repository SSA ``Function``.
-    ``inexact=True`` additionally fires the bit-changing set; the default reads
-    ``TURING_POW_INEXACT`` from the environment so a measurement run can flip
-    the policy without threading a flag through every compile entry point.
-    Returns a count per rewrite kind, for logging and for tests.
+    ``inexact=True`` additionally fires the bit-changing set; the default asks
+    the active :mod:`work_contract` (which still honors the legacy
+    ``TURING_POW_INEXACT`` variable as an override), so no flag threads
+    through the compile entry points. Returns a count per rewrite kind, for
+    logging and for tests.
     """
 
     if inexact is None:
-        inexact = os.environ.get("TURING_POW_INEXACT", "") not in ("", "0")
+        from .work_contract import active_contract
+
+        inexact = active_contract().inexact_identities
     allowed = _EXACT_EXPONENTS + (_INEXACT_EXPONENTS if inexact else ())
 
     next_id = _module_watermark(functions)

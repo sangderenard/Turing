@@ -255,9 +255,9 @@ _CONTRACT_ELIGIBLE = frozenset({"Add", "Sub", "Mul"})
 
 
 def _fma_contract_enabled() -> bool:
-    import os as _os
+    from .work_contract import active_contract
 
-    return _os.environ.get("TURING_FMA_CONTRACT", "") not in ("", "0")
+    return active_contract().contract_multiply_add
 
 
 def scalar_likeness(operation: str) -> str | None:
@@ -1115,12 +1115,20 @@ def _emit_repository_call_module(
         # arise), at every call (a callee may write caller storage through
         # the pointer ABI), and at every scatter Store (array writes stay
         # ordered against every read).
+        # The "prove" work contract turns reuse off wholesale: every read
+        # comes from real storage, which is the shape two backends are
+        # diffed over value by value.
+        from .work_contract import active_contract
+
+        _reuse_registers = active_contract().register_reuse
         register_cache: dict[str, tuple[str, str]] = {}
         _CACHEABLE_SLOT = ("%value.", "%out.", "%arg.")
 
         def load_as(value: _Any, wanted: str, tag: str) -> str:
             slot_home = pointer(value)
-            cached = register_cache.get(slot_home)
+            cached = (
+                register_cache.get(slot_home) if _reuse_registers else None
+            )
             if cached is not None:
                 loaded, source_type = cached
             else:
@@ -1129,7 +1137,7 @@ def _emit_repository_call_module(
                 body.append(
                     f"  {loaded} = load {source_type}, ptr {slot_home}, align 8"
                 )
-                if slot_home.startswith(_CACHEABLE_SLOT):
+                if _reuse_registers and slot_home.startswith(_CACHEABLE_SLOT):
                     register_cache[slot_home] = (loaded, source_type)
             if source_type == wanted:
                 return loaded
@@ -1392,7 +1400,7 @@ def _emit_repository_call_module(
                     body.append(
                         f"  store {llvm_type} {literal(payload, llvm_type)}, ptr {target}, align 8"
                     )
-                    if target.startswith(_CACHEABLE_SLOT):
+                    if _reuse_registers and target.startswith(_CACHEABLE_SLOT):
                         register_cache[target] = (
                             literal(payload, llvm_type), llvm_type,
                         )
@@ -2102,7 +2110,7 @@ def _emit_repository_call_module(
                 body.append(
                     f"  store {result_type} {rendered}, ptr {cast_target}, align 8"
                 )
-                if cast_target.startswith(_CACHEABLE_SLOT):
+                if _reuse_registers and cast_target.startswith(_CACHEABLE_SLOT):
                     register_cache[cast_target] = (rendered, result_type)
                 else:
                     register_cache.clear()
@@ -2345,7 +2353,7 @@ def _emit_repository_call_module(
                 body.append(
                     f"  store {result_type} {register}, ptr {scalar_target}, align 8"
                 )
-                if scalar_target.startswith(_CACHEABLE_SLOT):
+                if _reuse_registers and scalar_target.startswith(_CACHEABLE_SLOT):
                     register_cache[scalar_target] = (register, result_type)
                 else:
                     register_cache.clear()
