@@ -302,6 +302,72 @@ exit if the duplication is upstream of materialization.
 * Scorecard: **16/19**, remaining stalls are the three MATERIALIZE rungs
   (rebound name, authored if crash, generator predicate).
 
+## 6e. Fourth iteration: ONE root defect owned items 1 AND 2 — and its fix
+## moves the whole frontier (2026-08-19, later session)
+
+* **Root cause, proven at the node level.** Every graph-express node is
+  born with ``constant=None`` (``ProcessGraph.add_node`` stamps the key
+  unconditionally), and ``_constant_value`` treated the KEY'S PRESENCE as
+  proof of a literal. So the callsite structural prune in
+  ``_fold_callsite_structural_values`` asked "is this if's predicate a
+  constant?" about a live ``greater(x, 0)`` node, got literal ``None``,
+  took ``bool(None)`` as a static proof of False, aliased the merge Phi
+  to the lexically-else arm, and DELETED the then-arm and the ``ast.If``
+  node. **Every dynamic conditional in every lowered program was
+  silently flattened this way.** Level 16's crash and Shoal's ``t14``
+  imposter were two faces of this one defect. (Old ``t14``'s exact path,
+  read from ``build/sfdc-shoal3/control_repository_ssa.txt``: frame's
+  dt_next <- run_superstep output 240 = ``_restore_type(130 = step_with_
+  dt_control_used output 445)`` — correct wiring; the imposter was
+  manufactured inside step_with_dt_control_used's flattened arms.)
+* **Fixes landed** (commits ``d50ba56``, ``63f0951``): the two
+  ``_constant_value`` discriminators (glsl_deployment_strategy,
+  shell_reference_tables) now count a ``None`` payload only on declared
+  constants; the materializer refuses statement-form calls (res=None) by
+  name instead of crashing on ``NoneType .id``; and the four-block
+  CondBr diamond is reconstructed as a Python if/else (arm ownership
+  decided by each Phi's ``incoming_blocks``, never positionally).
+  **Level 16 PASSES — the first authored if to reach EQUIVALENT; 17/19.**
+  The ~40s gate is green, including a fresh fluid advance lowering.
+* **The same presence-check trap survives, unmeasured, in:**
+  ``loop_composer._constant`` (trip counts — downstream isinstance
+  guards likely mask it), ``fortran_c_shell`` ``literal_value`` (~3870)
+  and default-literal reads (~6067), ``symbolic_equation_compiler``.
+  Fix on measurement, not in bulk.
+* **Consequence, faced honestly: the prior "almost-there" states of BOTH
+  flagships stood on silently deleted authored branches.** The fix
+  trades silent wrongness for loud, earlier refusals:
+  - **Shoal frame**: the pickle regenerates cleanly, but Fortran emission
+    now dies on ``cannot express literal [] in Fortran`` — the
+    ``unresolved = []`` seed in ``run_superstep`` (whose consuming arms
+    used to be deleted) now crosses the frame->run_superstep call as
+    feed argument 19 (value 2481869020677 in
+    ``build/sfdc-condfix/control_repository_ssa.txt`` line 5/6). An
+    empty-list seed needs SEQUENCE lowering at the feed boundary, not a
+    scalar Const. Repro: ``python tools/build_fluid_c_shell.py
+    build/sfdc-condfix/control_repository_ssa.pkl
+    build/shoal-c-shell-condfix``. The old baseline artifacts
+    (``build/sfdc-shoal3``, exe comparisons) remain but are now known to
+    describe a program with fabricated straight-line control — do not
+    chase dt_next numbers on that ground again.
+  - **re.compile**: lowering now refuses earlier — "conditional control
+    duplicated scheduled regions in '_compile'" (every region 3..53
+    counted 3x after ``overlay_scheduled_control``). Measured overlay
+    inputs: 29 conditional programs; the if/elif cascade produces
+    strict-subset TAIL programs (each level owns its arm plus the whole
+    remaining chain), and several authored ifs produce two IDENTICAL
+    programs (equal region sets) that ``known_nesting`` chains into each
+    other. Spy: scratchpad ``probe_re_overlay.py`` (monkeypatch of
+    ``overlay_scheduled_control`` in a throwaway script; nothing patched
+    in-repo).
+  The elided-loop-body husk (item 3) and the L14/L18 stalls remain, now
+  BEHIND these walls; L14's cause is newly isolated though — see below.
+* **Level 14, isolated at the SSA level**: ``sc14__train`` calls
+  ``t4 = Call(sc14__helper)(t5)`` where ``t5`` is only produced LATER by
+  the region-1 aggregate load — the helper is fed the not-yet-computed
+  rebound value; a scheduling/feed mis-bind at planning, and the
+  materializer's used-before-produced refusal is honest.
+
 ## 7. Working rules, re-earned this session
 
 * The soft-read trap is real and it recurs: an unobservable id read as
