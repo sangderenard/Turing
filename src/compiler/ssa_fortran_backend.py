@@ -905,6 +905,36 @@ class _FunctionEmitter:
         }
         self._propagate_phi_dynamic_ranks()
         self.shortfalls: list[FortranShortfall] = []
+        # Dangling operands (consumed, never produced, not a formal) emit as
+        # undeclared symbols gfortran rejects late and cryptically -- the
+        # observed shape is an elided loop body whose carried value survived
+        # in a Phi. Say it here, at the layer that knows, instead of letting
+        # a completeness claim stand over a program that cannot compile.
+        produced_ids = {int(argument.id) for argument in self.function.args}
+        for block in self.function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.res is not None:
+                    produced_ids.add(int(instruction.res.id))
+        for block in self.function.blocks.values():
+            for instruction in block.instrs:
+                operands = list(instruction.args)
+                operands.extend(
+                    value
+                    for _, value in (
+                        instruction.attributes.get("incoming") or ()
+                    )
+                    if hasattr(value, "id")
+                )
+                for operand in operands:
+                    if int(operand.id) not in produced_ids:
+                        self.shortfalls.append(FortranShortfall(
+                            str(instruction.op),
+                            str(block.name),
+                            f"operand {int(operand.id)} is consumed but "
+                            "never produced (dangling SSA identity; the "
+                            "observed cause is an elided loop body whose "
+                            "carried value survived in a Phi)",
+                        ))
         for descriptor in self.tensor_table.tensors.values():
             if descriptor.metadata_state == "unresolved":
                 self.shortfalls.append(FortranShortfall(
