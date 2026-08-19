@@ -28,7 +28,7 @@ EXPECTED: dict[int, str] = {
     3: "EXECUTE",      # same collision, different shape
     4: "PASSED",       # loop, one carried value
     5: "PASSED",       # loop, compound body
-    6: "EQUIVALENT",   # only the first carried value is carried
+    6: "PASSED",       # two carried values, fixed in topological_reducer
     7: "LOWER",        # carried value round-tripped through a call
 }
 
@@ -78,4 +78,4 @@ def test_the_recorded_failures_are_not_compilation_failures():
         for level, stage in EXPECTED.items()
         if stage in {"EXECUTE", "EQUIVALENT"}
     ]
-    assert len(reached_execution) >= 3
+    assert len(reached_execution) >= 2

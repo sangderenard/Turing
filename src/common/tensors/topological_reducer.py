@@ -2978,6 +2978,29 @@ def _normalize_lexical_values(
                     )
                 )
             )
+            # Parameter bindings are materialized lazily at their first
+            # lexical read, so a parameter first touched INSIDE the loop is
+            # absent from the pre-loop snapshot -- and a name missing from
+            # ``before_loop`` can never be discovered as loop-carried state.
+            # That silently dropped the second carried value of an Adam-shaped
+            # loop (``w`` was carried because a pre-loop statement had read
+            # it; ``m`` was frozen at its entry value with no shortfall).  In
+            # Python a parameter exists from function entry, so materializing
+            # every parameter the loop reads BEFORE the snapshot is strictly
+            # more faithful, and ``input_value`` is idempotent, so this mints
+            # exactly the Input node the body's own first read would have.
+            for read_name in {
+                member.id
+                for member in source_walk(body_statement)
+                if isinstance(member, ast.Name)
+                and isinstance(member.ctx, ast.Load)
+            }:
+                if (
+                    read_name in parameter_names
+                    and read_name not in environment
+                    and read_name not in static_environment
+                ):
+                    input_value(read_name, binding_kind="parameter")
             if isinstance(body_statement, ast.For):
                 resolve_expression(body_statement.iter)
                 # Parameter/external bindings are materialized lazily at

@@ -508,18 +508,21 @@ These compile with **no shortfall**, run, and return the wrong number. No
 stage of the compiler reports anything. Each one has a signature you can check
 directly rather than rediscovering it; all three were found by Q0b.
 
-**Only the first loop-carried value is carried.** A loop carrying two names
-freezes the second at its ENTRY value for every iteration.
+**Only the first loop-carried value is carried — FIXED, signature kept.** A
+loop carrying two names froze the second at its ENTRY value for every
+iteration. Root cause: the reducer's lexical environment materializes
+parameters lazily at first read, so a parameter first touched INSIDE the loop
+was absent from the pre-loop snapshot and could never be discovered as
+carried state. `topological_reducer` now materializes every parameter the
+loop reads before the snapshot.
 
-*Signature:* compute what the program WOULD return with the second value held
-constant, and compare. If it matches to the bit, this is your bug.
-`loop.carried_aliases` reaching `_ControlSSABuilder.lower_loop` has one entry
-for a source that carries two — check it there. The defect is upstream in
-control planning where `loop_composer` builds that tuple, not in the lowering,
-which is faithful to what it is handed.
-
-*Consequence:* a compiled Adam step is wrong, since Adam carries `w`, `m`
-and `v`.
+*Signature (if it recurs):* compute what the program WOULD return with the
+suspect value held constant, and compare. A bit-exact match convicts it. The
+chain to check, in order: `loop_carried_bindings` on the graph's loop node
+(the reducer's discovery), `loop.carried_aliases` reaching
+`_ControlSSABuilder.lower_loop` (the plan), the carried phis in the emitted
+header (the SSA). The stage whose count first disagrees with the source owns
+it — in the original defect the reducer's own discovery was already short.
 
 **A value can be both a formal and a region output.** A one-parameter source
 compiles to a two-parameter function whose extra formal is also an output of a

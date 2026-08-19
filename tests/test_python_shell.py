@@ -185,7 +185,40 @@ def test_disagreeing_output_contracts_are_a_finding():
 
 
 def test_loop_invariant_formals_are_candidates_not_convictions(loop_shell):
-    """The recorded gap: the SSA cannot say what the author meant to carry."""
+    """The recorded gap: the SSA cannot say what the author meant to carry.
+
+    ``rate`` here is a GENUINE loop-invariant input -- read every iteration,
+    never reassigned -- and it surfaces as a candidate, which is correct: the
+    reporter cannot distinguish it from a dropped carried value and says so.
+    (The originally-frozen ``m`` case no longer produces a candidate at all,
+    because the reducer fix carries it properly; that absence is itself the
+    regression signal for this defect class.)
+    """
+
+    module = _lower(
+        """
+def helper(a):
+    return a * 1.0
+
+def train(w, rate, n):
+    total = helper(w)
+    for _ in range(n):
+        next_w = w - rate * w
+        w = next_w
+        total = w
+    return total
+""",
+        "cand",
+    )
+    candidates = suspicious_loop_invariant_formals(module)
+    assert candidates, "the loop-invariant rate should surface as a candidate"
+    assert "cannot say which" in candidates[0].detail
+    # And deliberately NOT in run_all: candidates are not violations.
+    assert all(f.check != "loop_invariant_formal" for f in run_all(module))
+
+
+def test_a_properly_carried_second_value_is_no_longer_a_candidate():
+    """The fixed defect leaves no suspicious formal behind."""
 
     module = _lower(
         """
@@ -202,14 +235,11 @@ def train(w, m, n):
         total = w
     return total
 """,
-        "cand",
+        "fixedcand",
     )
-    candidates = suspicious_loop_invariant_formals(module)
-    assert candidates, "the frozen m should surface as a candidate"
-    assert "cannot say which" in candidates[0].detail
-    # And deliberately NOT in run_all: candidates are not violations.
-    clean_module, _shell = loop_shell
-    assert all(f.check != "loop_invariant_formal" for f in run_all(module))
+    # Both w and m are carried phis now and n is consumed by the header, so
+    # the body consumes no formals at all: the candidate list is empty.
+    assert suspicious_loop_invariant_formals(module) == []
 
 
 # -- hosted Python callables ----------------------------------------------

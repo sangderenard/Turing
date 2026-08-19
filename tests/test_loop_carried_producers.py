@@ -218,22 +218,21 @@ def _with_second_value_frozen(w, m, n):
 
 @pytest.mark.parametrize(
     ("start", "second", "epochs"),
-    [(1.0, 0.0, 4), (3.0, -1.0, 6), (2.0, 1.0, 3)],
+    [(1.0, 0.0, 4), (3.0, -1.0, 6), (2.0, 1.0, 3), (2.0, 1.0, 0)],
 )
-def test_only_the_first_carried_value_is_actually_carried(start, second, epochs):
-    """A KNOWN MISCOMPILATION, pinned so it cannot be mistaken for working.
+def test_both_carried_values_are_actually_carried(start, second, epochs):
+    """FIXED: both loop-carried values now carry across iterations.
 
-    The source carries two names across the loop. The lowering creates one
-    carried phi, and passes the second value's ENTRY value on every iteration.
-    Nothing raises; the numbers are simply wrong.
+    This was a pinned miscompilation: the reducer's lexical environment is
+    populated lazily at first read, so a parameter first touched INSIDE the
+    loop was absent from the pre-loop snapshot and could never be discovered
+    as carried state -- it was passed as its entry value every iteration,
+    silently. Parameters read by a loop are now materialized before the
+    snapshot (topological_reducer), which is strictly more faithful to
+    Python, where a parameter exists from function entry.
 
-    When this is fixed the assertions below will fail loudly -- which is the
-    point. Flip them to ``_authored`` and delete this comment; do not relax
-    them.
-
-    ``loop.carried_aliases`` reaches the SSA builder with a single entry, so
-    the fix belongs upstream where ``loop_composer`` builds that tuple, not in
-    ``precompile_to_ssa``, which lowers faithfully what it is handed.
+    The frozen-reference guard stays: matching the frozen variant again would
+    mean the regression returned.
     """
 
     from src.compiler.ssa_python_materializer import materialize_ir_module
@@ -246,8 +245,8 @@ def test_only_the_first_carried_value_is_actually_carried(start, second, epochs)
 
     produced = namespace["twocarry__train"](w=start, m=second, n=epochs)
 
-    assert produced == pytest.approx(
-        _with_second_value_frozen(start, second, epochs), abs=1e-12
-    )
+    assert produced == pytest.approx(_authored(start, second, epochs), abs=1e-12)
     if epochs:
-        assert produced != pytest.approx(_authored(start, second, epochs), abs=1e-9)
+        assert produced != pytest.approx(
+            _with_second_value_frozen(start, second, epochs), abs=1e-9
+        )
