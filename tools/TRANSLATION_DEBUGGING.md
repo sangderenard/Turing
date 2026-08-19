@@ -71,6 +71,44 @@ Two limits, stated so a clear result is not over-read:
 prints how far each complexity level gets. Use it to place your program: if a
 level below yours already stops, that is your bug and it is already known.
 
+**To see WHERE two runs part, not just whether:** the instrumented shell
+records every SSA value assignment as it executes, and the emitted local
+names ARE the value ids (`t7` is value 7) — no correlation table.
+
+```python
+from src.compiler.python_shell import compile_python_shell
+
+shell = compile_python_shell(module, "probe__train")
+run = shell.run(w=2.0, n=3)
+run.trace                          # every tN, in order, once per iteration
+run.last_value("probe__train", 7)  # refuses if never assigned — not a zero
+run.first_divergence(other_run)    # the first entry where two runs part
+```
+
+This is the honest version of the source-level probe the "Do not do this"
+section forbids: it records AFTER lowering, so the observed program is
+bit-for-bit the compiled one and observation cannot perturb it. It also hosts
+retained Python callables via `bindings=`, and `shell.write(path)` emits the
+whole thing as a standalone runnable `.py`.
+
+**Static checks over the same product, before running anything:**
+
+```python
+from src.compiler.ssa_self_check import run_all, suspicious_loop_invariant_formals
+
+run_all(module)                            # violations: formal parity,
+                                           # id()-scale ids, disagreeing
+                                           # region output contracts
+suspicious_loop_invariant_formals(module)  # CANDIDATES for the frozen-carried
+                                           # check — not convictions
+```
+
+The candidate list is separate on purpose: a formal consumed inside a loop
+body is either a legitimate loop-invariant input or a carried value the
+planner dropped, and the SSA does not record which the author meant. That gap
+is the thing to fix — stamping the authored carried set into
+`Function.metadata` would make the frozen-carried defect statically decidable.
+
 ---
 
 ## Q1 — Does the SSA claim to be complete?
