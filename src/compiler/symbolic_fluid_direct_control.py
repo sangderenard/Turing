@@ -95,6 +95,17 @@ def _worker(output: Path) -> int:
     )
     with (output / "control_repository_ssa.pkl").open("wb") as stream:
         pickle.dump((module, outputs, exports), stream, protocol=5)
+    from .work_contract import active_contract
+
+    # The identity policy is baked into the lowering itself; record it beside
+    # the pickle so a cache produced under one contract is never served under
+    # another. Mtime staleness cannot see an environment change.
+    (output / "control_repository_ssa.contract.json").write_text(
+        json.dumps(
+            {"inexact_identities": active_contract().inexact_identities}
+        ),
+        encoding="utf-8",
+    )
     lines = []
     for function_name, function in module.functions.items():
         lines.append(f"function {function_name}")

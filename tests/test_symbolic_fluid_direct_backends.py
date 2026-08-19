@@ -10,7 +10,24 @@ from src.compiler.ssa_fortran_backend import emit_module as emit_ssa_module_to_f
 from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
 from src.compiler.ssa_wasm_backend import emit_ssa_function_to_wasm
 from src.compiler.symbolic_fluid_model import compile_symbolic_fluid_step
+from src.compiler.work_contract import set_active_contract
 from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
+
+
+@pytest.fixture()
+def deploy_contract():
+    """The four-lane verification runs under ``deploy`` deliberately.
+
+    ``deploy`` is the preset whose documented meaning is "inexact identity
+    set, stable across hosts": the shared identity pass reduces every
+    constant-exponent Pow before emission, so all four lanes receive the
+    same SSA and none needs a private spelling. Under exact-only contracts
+    scalar WASM has no pow instruction and refuses honestly instead.
+    """
+
+    set_active_contract("deploy")
+    yield
+    set_active_contract(None)
 
 
 def _uniform_inputs(compiled):
@@ -60,7 +77,7 @@ def test_reference_directed_cast_is_repository_ssa_in_all_four_lanes():
     assert wasm_artifact.complete, wasm_artifact.shortfalls
 
 
-def test_sympy_fluid_emits_and_runs_direct_repository_ssa_c(tmp_path):
+def test_sympy_fluid_emits_and_runs_direct_repository_ssa_c(tmp_path, deploy_contract):
     compiled = compile_symbolic_fluid_step()
     artifact = emit_ssa_function_to_c(compiled.module, compiled.function.name)
 
@@ -77,7 +94,7 @@ def test_sympy_fluid_emits_and_runs_direct_repository_ssa_c(tmp_path):
     assert outputs["tracer_violation"] == pytest.approx(0.0)
 
 
-def test_sympy_fluid_emits_and_runs_direct_repository_ssa_wasm(tmp_path):
+def test_sympy_fluid_emits_and_runs_direct_repository_ssa_wasm(tmp_path, deploy_contract):
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is needed to execute the emitted WebAssembly")
@@ -122,7 +139,7 @@ const fs = require('fs');
     assert outputs["tracer_violation"] == pytest.approx(0.0)
 
 
-def test_fluid_semantic_outputs_are_identical_in_all_four_direct_lanes():
+def test_fluid_semantic_outputs_are_identical_in_all_four_direct_lanes(deploy_contract):
     compiled = compile_symbolic_fluid_step()
     outputs = compiled.function.blocks["entry"].instrs[-1].args
     c_artifact = emit_ssa_function_to_c(compiled.module, compiled.function.name)
@@ -171,3 +188,45 @@ def test_fluid_semantic_outputs_are_identical_in_all_four_direct_lanes():
         and surface["outputs"] == ("wave_speed",)
         for surface in web_surfaces["surfaces"]
     )
+
+
+def test_exact_contracts_forbid_the_private_sqrt_spellings():
+    """prove/develop promise exact-only emission, backends included.
+
+    C keeps a faithful ``pow()`` spelling; scalar WASM has nothing exact to
+    fall back on and must refuse rather than silently substitute sqrt.
+    """
+
+    base = SSAValue(0, "float64")
+    exponent = SSAValue(1, "float64")
+    result = SSAValue(2, "float64")
+    function = Function(
+        "half_power_kernel",
+        [base],
+        {"entry": BasicBlock("entry", [
+            Instr("Const", [], exponent, attributes={"constant": 0.5}),
+            Instr("Pow", [base, exponent], result),
+            Instr("Ret", [result], None),
+        ])},
+        metadata={"argument_names": ("base",), "output_names": ("result",)},
+    )
+    module = IRModule({function.name: function})
+    set_active_contract("develop")
+    try:
+        c_artifact = emit_ssa_function_to_c(module, function.name)
+        assert c_artifact.complete, c_artifact.shortfalls
+        assert "sqrt(" not in c_artifact.source
+        assert "pow(" in c_artifact.source
+        wasm_artifact = emit_ssa_function_to_wasm(module, function.name)
+        assert not wasm_artifact.complete
+        assert any(
+            "no exact scalar WASM spelling" in shortfall.reason
+            for shortfall in wasm_artifact.shortfalls
+        )
+        set_active_contract("deploy")
+        c_deploy = emit_ssa_function_to_c(module, function.name)
+        assert "sqrt(" in c_deploy.source
+        wasm_deploy = emit_ssa_function_to_wasm(module, function.name)
+        assert wasm_deploy.complete, wasm_deploy.shortfalls
+    finally:
+        set_active_contract(None)

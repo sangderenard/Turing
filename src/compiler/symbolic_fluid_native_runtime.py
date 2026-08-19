@@ -467,6 +467,29 @@ def _cache_is_stale(cached: Path, *, announce: bool = True) -> bool:
         stamp = cached.stat().st_mtime
     except OSError:
         return True
+    import json
+
+    from .work_contract import active_contract
+
+    # The identity policy is baked into the lowering, so a pickle produced
+    # under one contract must not be served under another. The sidecar is
+    # written next to the pickle by the same worker; absence reads as stale
+    # (erring toward re-lowering, per the policy above).
+    sidecar = cached.with_suffix(".contract.json")
+    try:
+        recorded = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        recorded = None
+    expected = {"inexact_identities": active_contract().inexact_identities}
+    if recorded != expected:
+        if announce:
+            print(
+                f"[stale-cache] re-lowering: {cached.name} was lowered under "
+                f"a different identity policy ({recorded!r}, active contract "
+                f"expects {expected!r}).",
+                file=sys.stderr,
+            )
+        return True
     compiler_dir = Path(__file__).resolve().parent
     newest = 0.0
     newest_path: Path | None = None

@@ -230,10 +230,17 @@ def compile_sympy_equations(
         },
     )
     module = IRModule({name: function})
+    # The same contract-governed identity pass the whole-program path runs at
+    # finalization; without it the direct scalar lanes would receive raw Pow
+    # and each backend's private spelling table would become a second,
+    # unaudited policy.
+    from .ir_identities import reduce_constant_exponent_pow
+
+    reduce_constant_exponent_pow(module.functions)
     return SymbolicEquationCompilation(
         equations=authored,
         process_graph=authored_graph,
-        instructions=tuple(body),
+        instructions=tuple(function.blocks["entry"].instrs),
         function=function,
         module=module,
         input_ids={row[0]: row[1] for row in input_rows},

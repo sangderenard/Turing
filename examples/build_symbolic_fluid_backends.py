@@ -31,6 +31,7 @@ from src.compiler.ssa_llvm_backend import (
 from src.compiler.ssa_wasm_backend import emit_ssa_function_to_wasm
 from src.compiler.symbolic_fluid_model import compile_symbolic_fluid_step
 from src.compiler.fortran_toolchain import stage_fortran_runtime_dependencies
+from src.compiler.work_contract import set_active_contract
 
 
 def _uniform_inputs(compiled) -> dict[str, float]:
@@ -116,6 +117,11 @@ def main() -> int:
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
 
+    # The four-lane agreement proof runs under ``deploy``: the shared
+    # identity pass reduces every constant-exponent Pow once, before
+    # emission, so all lanes receive identical SSA and none needs a private
+    # spelling (scalar WASM has no pow instruction to fall back on).
+    set_active_contract("deploy")
     compiled = compile_symbolic_fluid_step()
     function_name = compiled.function.name
     output_names = tuple(compiled.function.metadata["output_names"])

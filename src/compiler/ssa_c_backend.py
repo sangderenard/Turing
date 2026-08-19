@@ -162,8 +162,11 @@ def emit_ssa_function_to_c(
     module: IRModule, function_name: str, *, entry_name: str | None = None,
     trig_solver: str = "lut",
 ) -> CFunctionArtifact:
+    from .work_contract import active_contract
+
     function: Function = module.functions[function_name]
     name = str(entry_name or function_name)
+    inexact_spellings = active_contract().inexact_identities
     if set(function.blocks) != {"entry"}:
         return CFunctionArtifact(
             name, "", (), (),
@@ -280,12 +283,17 @@ def emit_ssa_function_to_c(
             rendered = f"{_UNARY_FOLDED[op.casefold()]}({args[0]})"
         elif op == "Pow" and len(args) == 2:
             exponent = constants.get(int(instruction.args[1].id))
-            rendered = {
+            # Exact spellings only; the sqrt-family reductions change bits and
+            # belong to ir_identities under the work contract, not to a
+            # private table here. pow() is the faithful fallback.
+            spellings = {
                 2.0: f"({args[0]} * {args[0]})",
                 -1.0: f"(1.0 / {args[0]})",
-                -2.0: f"(1.0 / ({args[0]} * {args[0]}))",
-                0.5: f"sqrt({args[0]})",
-            }.get(exponent, f"pow({args[0]}, {args[1]})")
+            }
+            if inexact_spellings:
+                spellings[-2.0] = f"(1.0 / ({args[0]} * {args[0]}))"
+                spellings[0.5] = f"sqrt({args[0]})"
+            rendered = spellings.get(exponent, f"pow({args[0]}, {args[1]})")
         if rendered is None:
             shortfalls.append(CEmissionShortfall(op, "no direct scalar C spelling"))
             continue

@@ -67,8 +67,11 @@ def emit_ssa_function_to_wasm(
     Both are available deliberately -- a table costs memory and an interpolation,
     a series costs multiplies, and which is cheaper depends on the target.
     """
+    from .work_contract import active_contract
+
     function: Function = module.functions[function_name]
     name = str(entry_name or function_name)
+    contract = active_contract()
     input_names = tuple(function.metadata.get("argument_names", ()))
     output_names = tuple(function.metadata.get("output_names", ()))
     if set(function.blocks) != {"entry"}:
@@ -269,16 +272,28 @@ def emit_ssa_function_to_wasm(
             elif exponent == -1.0:
                 builder.value_const(1.0); get(args[0]); builder.op("div")
                 wat_operation = f"f64.const 0x1.0000000000000p+0 local.get $t{args[0]} f64.div"
-            elif exponent == -2.0:
+            elif exponent == -2.0 and contract.inexact_identities:
                 builder.value_const(1.0); get(args[0]); get(args[0]); builder.op("mul"); builder.op("div")
                 wat_operation = (
                     "f64.const 0x1.0000000000000p+0 "
                     f"local.get $t{args[0]} local.get $t{args[0]} f64.mul f64.div"
                 )
-            elif exponent == 0.5:
+            elif exponent == 0.5 and contract.inexact_identities:
                 get(args[0])
                 builder.op("sqrt")
                 wat_operation = f"local.get $t{args[0]} f64.sqrt"
+            elif exponent in (0.5, -0.5, -2.0):
+                # These spellings change bits (the sqrt family); scalar WASM
+                # has no pow instruction to fall back on, so exact-only
+                # contracts get an honest shortfall instead of a silent
+                # policy violation.
+                shortfalls.append(WasmEmissionShortfall(
+                    op,
+                    f"no exact scalar WASM spelling for exponent {exponent!r} "
+                    f"under contract {contract.name!r}; deploy/fast permit "
+                    "the sqrt-family reduction",
+                ))
+                continue
             else:
                 shortfalls.append(WasmEmissionShortfall(
                     op, f"WebAssembly has no direct power for exponent {exponent!r}",

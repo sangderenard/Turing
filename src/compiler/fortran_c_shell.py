@@ -44,6 +44,36 @@ from .fortran_toolchain import (
 from .ssa_fortran_backend import FortranEmissionError, fortran_compiler
 
 
+_UNCOPYABLE_LITERAL_TYPES: set[str] = set()
+
+
+def _copy_literal_payload(payload: Any) -> Any:
+    """Deep-copy a literal payload captured off a graph node, if it can be.
+
+    Ingested stdlib source (``re._compiler`` and friends) puts objects behind
+    ``Constant`` nodes whose payloads are not always deep-copyable. Sharing
+    the original reference is the honest fallback: the payload already had
+    that identity everywhere upstream, so aliasing here adds no hazard a copy
+    would have removed.
+    """
+
+    try:
+        return copy.deepcopy(payload)
+    except Exception:
+        type_name = type(payload).__qualname__
+        if type_name not in _UNCOPYABLE_LITERAL_TYPES:
+            _UNCOPYABLE_LITERAL_TYPES.add(type_name)
+            import warnings
+
+            warnings.warn(
+                f"literal payload of type {type_name} is not deep-copyable; "
+                "sharing the original reference",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        return payload
+
+
 _NUMPY_DTYPES = {
     "uint8": np.dtype("uint8"),
     "u8": np.dtype("uint8"),
@@ -3805,9 +3835,9 @@ def _class_surface_ssa_program(
             data = graph.nodes.get(int(node_id), {})
             attributes = data.get("attributes") or {}
             if "value" in attributes:
-                return copy.deepcopy(attributes["value"])
+                return _copy_literal_payload(attributes["value"])
             if "constant" in data:
-                return copy.deepcopy(data["constant"])
+                return _copy_literal_payload(data["constant"])
             expression = data.get("expr_obj")
             if expression is not None:
                 try:
@@ -5969,11 +5999,11 @@ def _class_surface_ssa_program(
                     continue
                 node_attributes = node.get("attributes") or {}
                 if "value" in node_attributes:
-                    default_literals[value_id] = copy.deepcopy(
+                    default_literals[value_id] = _copy_literal_payload(
                         node_attributes["value"]
                     )
                 elif "constant" in node:
-                    default_literals[value_id] = copy.deepcopy(
+                    default_literals[value_id] = _copy_literal_payload(
                         node["constant"]
                     )
         if child_graph is not None and source_function_table is not None:
@@ -6404,7 +6434,7 @@ def _class_surface_ssa_program(
                     frame_bindings.append((
                         value_id,
                         "caller_literal",
-                        copy.deepcopy(
+                        _copy_literal_payload(
                             caller_attributes.get(
                                 "value", caller_node.get("constant")
                             )
