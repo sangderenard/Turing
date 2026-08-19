@@ -1228,7 +1228,15 @@ class _FunctionEmitter:
         # A shaped constant must remain an array designator.  Scalar
         # assignment can initialise it compactly, whereas substituting the
         # literal into a pointer/assumed-size call argument loses its rank.
-        if instr.op in ("Const", "const") and tuple(result.shape):
+        # The occurrence shape alone is not the authority: an empty-sequence
+        # seed (``x = []``) records shape () while the DECLARED view carries
+        # rank from the callee's sequence formal, so consult the typed view
+        # and the array-base table too.
+        if instr.op in ("Const", "const") and (
+            tuple(result.shape)
+            or tuple(self._typed(result).shape or ())
+            or int(result.id) in self.array_base_ids
+        ):
             return False
         if result.id in self._bound_ids:
             return False
@@ -1901,7 +1909,10 @@ class _FunctionEmitter:
                     else "0_c_int32_t" if source_dtype.endswith(("int32", "int"))
                     else "0.0_c_double"
                 )
-                return f"({expression} /= {zero})"
+                # A bare comparison is default LOGICAL(4); the native dummy
+                # is logical(c_bool) (LOGICAL(1)), and a VALUE dummy makes
+                # the kind mismatch a hard gfortran error, not a warning.
+                return f"logical({expression} /= {zero}, kind=c_bool)"
             numeric = _UNARY["bool_to_float64"].format(expression)
             return (
                 f"int({numeric}, c_int64_t)"
@@ -2940,9 +2951,33 @@ class _FunctionEmitter:
                 # "values" on purpose: an array constant carries both keys,
                 # with a vestigial "value" of None, so testing it first would
                 # discard the real elements.
+                payload = instr.attributes["value"]
+                if (
+                    isinstance(payload, (list, tuple))
+                    and not payload
+                    and instr.res is not None
+                    and (
+                        int(instr.res.id) in self.array_base_ids
+                        or tuple(self._typed(instr.res).shape or ())
+                    )
+                ):
+                    # An authored empty-sequence seed (``x = []``) feeding a
+                    # sequence arena.  The arena's emptiness is carried by its
+                    # separate length cell (seeded 0 through the workspace
+                    # chain); the arena content itself is a fresh buffer, so
+                    # a whole-array zero fill states exactly that.  Only the
+                    # EMPTY seed is spelled here -- a populated list literal
+                    # still refuses rather than being guessed at.  The fill's
+                    # kind follows the DECLARED type (the typed view), not the
+                    # SSA occurrence dtype: the declaration is the authority
+                    # the emitted call sites are checked against.
+                    return _literal(
+                        0,
+                        self._typed(instr.res).dtype or self.dtype,
+                    )
                 try:
                     return _literal(
-                        instr.attributes["value"],
+                        payload,
                         instr.res.dtype if instr.res is not None else None,
                     )
                 except FortranEmissionError as error:
