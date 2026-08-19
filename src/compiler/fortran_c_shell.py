@@ -3948,17 +3948,6 @@ def _class_surface_ssa_program(
             output_id = int(history[-1])
             if output_id in published:
                 continue
-            named_id = named_output_ids.get(str(output_name))
-            if named_id is not None and named_id in published:
-                # The builder already resolved this authored output through
-                # its name history to the value standing in the Ret (a
-                # while loop's carried phi has an id the graph's identity
-                # table cannot know). Re-deriving it from the graph would
-                # resurrect a stale pre-loop identity and publish the same
-                # authored output twice -- scorecard level 17's
-                # (0.5, 0.5)-for-0.5.
-                published.add(output_id)
-                continue
             data = graph.nodes.get(output_id, {})
             record = (
                 None if record_table is None
@@ -4218,6 +4207,31 @@ def _class_surface_ssa_program(
                 "notequal", "not_equal",
             }:
                 ensure_structural_value(int(required_id))
+        # A named output the builder already resolved through its name
+        # history stands in the Ret under the carried phi's id, which the
+        # graph's identity table cannot know -- so the recovery above may
+        # have re-published the same authored output under a STALE earlier
+        # identity (scorecard level 17: (0.5, 0.5) for 0.5). The recovery
+        # itself must run (its structural insertions and ``values`` entries
+        # feed later source-linked calls); only the duplicate Ret argument
+        # is dropped: any arg whose id is a non-final member of a named
+        # output's identity history while that output's resolved value is
+        # already present.
+        argument_ids = {int(argument.id) for argument in terminator.args}
+        stale_identities: set[int] = set()
+        for output_name, named_id in named_output_ids.items():
+            if named_id not in argument_ids:
+                continue
+            history = tuple(map(int, identities.get(str(output_name), ())))
+            stale_identities.update(
+                identity for identity in history if identity != named_id
+            )
+        stale_identities -= set(named_output_ids.values())
+        if stale_identities:
+            terminator.args = [
+                argument for argument in terminator.args
+                if int(argument.id) not in stale_identities
+            ]
         if insertions:
             for block in function.blocks.values():
                 if terminator in block.instrs:
