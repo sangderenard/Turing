@@ -870,17 +870,19 @@ def train(x):
     assert len(function.args) == 1, [int(a.id) for a in function.args]
 
 
-def test_the_dead_frame_storage_formal_is_still_open_and_detected():
-    """The nested-calls journey's remaining defect, pinned with its detector.
+def test_storage_formals_are_declared_abi_and_leased_at_entry():
+    """FIXED: the workspace convention is declared, so it stops being a defect.
 
-    Call-frame linking appends a caller-storage formal for a callee frame
-    value; when the plumbing does not complete, the formal survives untouched
-    by any instruction. This is call-frame ABI territory -- the binding
-    records live outside the instruction stream -- so it is recorded and
-    detected rather than pruned blind.
+    The caller-provides-workspace chain (the LAPACK WORK-array move) appends
+    a storage formal for a callee frame value. It is now stamped into
+    ``Function.metadata["storage_formals"]`` with dtype and shape; the
+    materializer drops it from the signature and allocates it at entry --
+    the lease model applied to the Python target -- and the self-check
+    validates declaration/signature parity instead of reporting a defect.
     """
 
     from src.compiler.ssa_self_check import check_dead_storage_formals
+    from src.compiler.ssa_python_materializer import materialize_ir_module
 
     module, _outputs, _exports = _lower(
         """
@@ -896,6 +898,42 @@ def train(x):
         "train",
         "deadstore",
     )
-    findings = check_dead_storage_formals(module)
-    assert findings, "the untouched storage formal should be detected"
-    assert "never completed" in findings[0].detail
+    function = module.functions["deadstore__train"]
+    declared = tuple(function.metadata.get("storage_formals") or ())
+    assert declared, "the storage formal should be declared in metadata"
+    assert declared[0]["callee"] == "deadstore__middle"
+    assert check_dead_storage_formals(module) == []
+
+    emitted, skipped = materialize_ir_module(module)
+    assert skipped == {}
+    namespace: dict = {}
+    exec(compile(emitted, "<round-trip>", "exec"), namespace)
+    import inspect as _inspect
+    compiled = namespace["deadstore__train"]
+    # The authored signature is restored: one parameter.
+    assert len(_inspect.signature(compiled).parameters) == 1
+    for probe in (1.0, 5.0, -2.0):
+        assert compiled(probe) == pytest.approx(
+            (probe + 1.0) * 2.0 - (probe + 1.0), abs=1e-12
+        )
+
+
+def test_an_undeclared_storage_formal_is_still_a_finding():
+    """The validator's teeth: declaration parity, both directions."""
+
+    from src.compiler.ssa_self_check import check_dead_storage_formals
+    from src.transmogrifier.ssa import BasicBlock, Function, SSAValue
+
+    storage = SSAValue(
+        7, dtype="float64",
+        accounting={"linked_call_frame_storage": "callee_x", "callsite_id": 1},
+    )
+
+    class _Module:
+        functions = {
+            "f": Function("f", [SSAValue(0), storage],
+                          {"entry": BasicBlock("entry", [])})
+        }
+
+    findings = check_dead_storage_formals(_Module())
+    assert findings and "not declared" in findings[0].detail

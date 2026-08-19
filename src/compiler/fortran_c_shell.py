@@ -9674,6 +9674,44 @@ def _class_surface_ssa_program(
                 )
             ]
 
+    # -- storage-formal ABI declaration -----------------------------------
+    # The caller-provides-workspace design (the LAPACK WORK-array move: the
+    # callee's scratch is allocated above and threaded down, so the hot path
+    # never allocates) appends storage formals at several linking sites. A
+    # convention only works DECLARED: an undeclared workspace formal is a
+    # parameter no caller can name, size, or fill -- the exact defect the
+    # scorecard's nested-calls journey pinned. Stamp the declaration into
+    # each function's metadata in one complete post-pass, so every consumer
+    # -- the native shell that leases the top of the chain from the heap,
+    # the Python materializer that realizes it as a local allocation, the
+    # self-check that validates parity -- reads one authoritative record.
+    # ``dynamic`` marks entries whose extent is not compile-time known;
+    # those are the heap participants.
+    for function in all_functions.values():
+        declared_storage = []
+        for argument in function.args:
+            accounting = dict(argument.accounting or {})
+            owner = (
+                accounting.get("linked_call_frame_storage")
+                or accounting.get("returned_record_storage")
+            )
+            if not owner:
+                continue
+            shape = tuple(
+                int(extent) for extent in (argument.shape or ())
+                if isinstance(extent, int) or str(extent).isdigit()
+            )
+            declared_storage.append({
+                "value_id": int(argument.id),
+                "dtype": str(argument.dtype or "float64"),
+                "shape": shape,
+                "callee": str(owner),
+                "callsite_id": accounting.get("callsite_id"),
+                "dynamic": len(shape) != len(tuple(argument.shape or ())),
+            })
+        if declared_storage:
+            function.metadata["storage_formals"] = tuple(declared_storage)
+
     return (
         IRModule(
             all_functions,

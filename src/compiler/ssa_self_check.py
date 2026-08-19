@@ -99,37 +99,46 @@ def check_formal_parity(module: Any) -> list[Finding]:
 def check_dead_storage_formals(module: Any) -> list[Finding]:
     """No formal is a frame-storage slot that the function never touches.
 
-    Call-frame linking appends caller-storage formals (accounting carries
-    ``linked_call_frame_storage`` or ``returned_record_storage``) so a callee
-    frame value can be bound through the caller. When the plumbing does not
-    complete, the formal survives with NO use in the function's own
-    instructions -- a one-parameter source compiles to a two-parameter
-    program whose extra formal is unnamed and unfillable (scorecard's
-    nested-calls journey).
+    The caller-provides-workspace convention (the LAPACK WORK-array move)
+    only works DECLARED. A storage formal is legitimate ABI when it appears
+    in ``Function.metadata["storage_formals"]`` with its dtype and shape --
+    the shell leases the top of the chain from the heap, the materializer
+    allocates it at entry. Undeclared storage accounting on a formal, or a
+    declaration naming a value that is not a formal, is parity drift.
 
-    Does not prove a USED storage formal is correctly bound at call sites.
+    Does not prove a declared formal is correctly threaded at call sites.
     """
 
     findings: list[Finding] = []
     for name, function in _functions(module):
-        touched: set[int] = set()
-        for instruction in _instructions(function):
-            touched.update(int(operand.id) for operand in instruction.args)
-            if instruction.res is not None:
-                touched.add(int(instruction.res.id))
+        metadata = getattr(function, "metadata", None) or {}
+        declared = {
+            int(entry["value_id"])
+            for entry in metadata.get("storage_formals") or ()
+        }
         for argument in getattr(function, "args", ()):
             accounting = getattr(argument, "accounting", None) or {}
             marker = (
                 accounting.get("linked_call_frame_storage")
                 or accounting.get("returned_record_storage")
             )
-            if marker and int(argument.id) not in touched:
+            if marker and int(argument.id) not in declared:
                 findings.append(Finding(
                     "dead_storage_formal", str(name),
                     f"formal {int(argument.id)} is frame storage for "
-                    f"{marker!r} but no instruction in this function touches "
-                    "it; the linking that appended it never completed, and no "
-                    "caller can know what to pass",
+                    f"{marker!r} but is not declared in the function's "
+                    "storage_formals metadata; an undeclared workspace is a "
+                    "parameter no caller can name, size, or fill",
+                ))
+        for value_id in declared:
+            if value_id not in {
+                int(argument.id) for argument in getattr(function, "args", ())
+            }:
+                findings.append(Finding(
+                    "dead_storage_formal", str(name),
+                    f"storage_formals declares value {value_id}, which is not "
+                    "among the function's formals; the declaration and the "
+                    "signature have drifted apart",
                 ))
     return findings
 

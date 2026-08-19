@@ -931,6 +931,18 @@ def materialize_ir_module(module: Any) -> tuple[ast.Module, dict[str, str]]:
 
     for name, function in (getattr(module, "functions", {}) or {}).items():
         parameters = _parameter_names(function)
+        # Declared workspace formals (the LAPACK-style storage ABI stamped in
+        # Function.metadata) are not parameters an author wrote and no caller
+        # could fill them -- they are the caller-provides-workspace chain
+        # reaching this function. In the Python realization the lease model
+        # applies directly: drop them from the signature and allocate them at
+        # entry. A ``dynamic`` entry is a heap participant; the Python target
+        # has no heap wiring yet, so it refuses by name rather than guessing
+        # an extent.
+        metadata = getattr(function, "metadata", None) or {}
+        storage_entries = tuple(metadata.get("storage_formals") or ())
+        storage_by_id = {int(entry["value_id"]): entry for entry in storage_entries}
+        formal_ids = [int(a.id) for a in getattr(function, "args", ())]
         try:
             body, needed = materialize_function_body(
                 function, parameter_names=parameters
@@ -938,6 +950,35 @@ def materialize_ir_module(module: Any) -> tuple[ast.Module, dict[str, str]]:
         except MaterializationError as error:
             skipped[str(name)] = str(error)
             continue
+        if storage_by_id:
+            dynamic = [e for e in storage_entries if e.get("dynamic")]
+            if dynamic:
+                skipped[str(name)] = (
+                    "storage formals with dynamic extent need heap "
+                    f"participation, which the Python target does not wire "
+                    f"yet: {[e['callee'] for e in dynamic]}"
+                )
+                continue
+            allocations: list[ast.stmt] = []
+            kept: list[str] = []
+            for position, label in enumerate(parameters):
+                value_id = formal_ids[position]
+                entry = storage_by_id.get(value_id)
+                if entry is None:
+                    kept.append(label)
+                    continue
+                count = 1
+                for extent in entry["shape"]:
+                    count *= int(extent)
+                source = (
+                    "0.0" if not entry["shape"] else f"[0.0] * {count}"
+                )
+                allocations.append(ast.Assign(
+                    targets=[ast.Name(id=label, ctx=ast.Store())],
+                    value=_expression(source),
+                ))
+            parameters = kept
+            body = allocations + body
         contract = published.get(str(name))
         if isinstance(contract, str):
             skipped[str(name)] = contract

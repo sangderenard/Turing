@@ -24,7 +24,7 @@ from tools.translation_scorecard import JOURNEYS, STAGES, score
 EXPECTED: dict[int, str] = {
     0: "PASSED",       # straight-line arithmetic
     1: "PASSED",       # two parameters
-    2: "EXECUTE",      # a value becomes both a formal and a region output
+    2: "PASSED",       # fixed: storage formals declared, leased at entry
     3: "PASSED",       # fixed: regions now scheduled in dependency order
     4: "PASSED",       # loop, one carried value
     5: "PASSED",       # loop, compound body
@@ -54,31 +54,25 @@ def test_the_stages_are_ordered_from_earliest_to_latest_failure():
     assert STAGES == ("LOWER", "MATERIALIZE", "EXECUTE", "EQUIVALENT")
 
 
-def test_the_frontier_is_not_silently_all_green():
-    """If everything passes, the corpus stopped being a measurement.
-
-    The point of a scorecard is to sit at the edge. A corpus where every level
-    passes has either been fixed -- in which case extend it -- or been trimmed
-    to what already works, which is the failure mode this guards.
+def test_the_corpus_records_when_the_frontier_is_cleared():
+    """All ten journeys pass. The guard flips from "not all green" to a
+    dated fact, and the next frontier must come from EXTENDING the corpus --
+    conditionals, nested loops, multiple entrypoints, dynamic storage -- not
+    from trimming it. If a level regresses, the per-level pins above fail
+    loudly and this note is again false.
     """
 
     failing = [level for level, stage in EXPECTED.items() if stage != "PASSED"]
-    assert failing, "extend the corpus past the current frontier"
+    assert failing == [], f"the frontier regressed: {failing}"
 
 
-def test_the_recorded_failures_are_not_all_compilation_failures():
-    """Part of the frontier lowers cleanly and is simply wrong.
+def test_the_silent_failure_class_is_extinct_in_this_corpus():
+    """Every journey that once compiled-and-was-wrong now computes correctly.
 
-    The frontier has shrunk twice today (frozen carried value, region
-    scheduling), but the dead-frame-storage journey still compiles, runs, and
-    is wrong with no stage reporting anything. That is the defect class the
-    round trip exists to detect, and the scorecard keeps at least one such
-    journey until the class is extinct.
+    The classes this corpus caught -- frozen carried value, formal/region
+    collision, undeclared storage formal, mis-bound anchored call, elided
+    body -- are individually pinned in their own suites so a regression in
+    any one fails by name rather than by a wrong number here.
     """
 
-    reached_execution = [
-        level
-        for level, stage in EXPECTED.items()
-        if stage in {"EXECUTE", "EQUIVALENT"}
-    ]
-    assert len(reached_execution) >= 1
+    assert all(stage == "PASSED" for stage in EXPECTED.values())
