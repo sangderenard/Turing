@@ -538,17 +538,32 @@ thirty times slow.
 
 Independently correct, small, and load-bearing under every version of this design.
 
-1. **`AT.real` / `AT.imag` must record autograd nodes** (`abstraction.py:547-569`).
-2. **`atan2` and `round` must exist.** No phase operation can be written without
-   them: magnitude/phase conversion needs `atan2`, principal-argument unwrapping
-   needs `dp -= 2π·round(dp/2π)`. Also missing: `floor`, `pow`, `scatter_add`,
-   `fold`.
-3. **`to_dtype_` must fail loudly** instead of defaulting to float32 — *before*
-   there are new dtype names to mistype.
-4. **`.dtype` must give one coherent answer** rather than torch objects from a
-   5-entry map and `None` outside it.
+1. ~~**`AT.real` / `AT.imag` must record autograd nodes**~~ **Done** (`aff20f1`).
+   Both now call `_pre_autograd`; `AbstractTensor.complex(re, im)` added as the
+   inverse constructor so their backward rules have something to build a
+   complex-valued gradient with. Non-Wirtinger convention: gradient of `real(x)`
+   lands entirely in the real component, and vice versa.
+2. ~~**`atan2` and `round` must exist.**~~ **Done** (`aff20f1`), plus `floor`.
+   Still missing: `pow`, `scatter_add`, `fold`. Fixing `round`'s wrapper exposed
+   a latent bug in the existing `round_(self, n=None)` hook — `np.round(data,
+   None)` crashes, and nothing had ever called it without an explicit `n`
+   before, because no public `.round()` existed to call it that way.
+3. ~~**`to_dtype_` must fail loudly**~~ **Done** (`aff20f1`). Tries the alias
+   table, then the existing torch/numpy normaliser (accepts torch dtype objects
+   and native spellings like `"complex64"`), then raises `ValueError`.
+4. ~~**`.dtype` must give one coherent answer**~~ **Done** (`aff20f1`).
+   `_numpy_dtype_to_torch` now falls back to the numpy dtype itself instead of
+   `None` for anything torch has no equivalent for — which is why `fft()`'s own
+   output could not report its dtype at all.
 
-Then, in order: the dtype descriptor (§2), generalizing `Hooks` into a region-bound
+Verified against numpy: `fft → real → sum` now yields a nonzero gradient
+matching `fft → ifft → sum`'s cross-check; `atan2` gradients match the analytic
+`x/(x²+y²)` form; `real`/`imag`/`complex` round-trip correctly through autograd.
+100 passed / 1 pre-existing xfail across the fft, DEC/Laplacian, canonical-
+backward, and backward-coverage suites (the one failure — a missing `sext`
+backward rule — predates this work and is unrelated).
+
+Next, in order: the dtype descriptor (§2), generalizing `Hooks` into a region-bound
 operator set as a behaviour-preserving refactor (§5.4), complex as the first real
 cell set at rung 2 (§4.1), and the u32 shim with its diagnostics (§4.3).
 
