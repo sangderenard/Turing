@@ -534,9 +534,14 @@ it is never unbound.
 extra one is unnamed. Compare `len(function.args)` against
 `metadata["parameter_names"]`.
 
-**A loop body that only forwards a call result is elided entirely.** The body
-block emits nothing but `Br`, so the carried update has no producer and the
-lowering raises `loop_carried`.
+**A loop body that only forwards a call result is elided entirely — FIXED.**
+The body emitted nothing but `Br`, so the carried update had no producer and
+the lowering raised `loop_carried`. The structural repair: the control
+program gained a CALL STATEMENT (`__plan_callsite_N__`), scheduled by
+`_schedule_loop_callsites` for a loop-enclosed callsite whose result is the
+loop's carried update; the builder lowers it at the plan's position and frame
+linking fills callee and bindings in place. `w = update(w)` — the natural
+spelling of a training step — compiles and computes correctly.
 
 *The rule behind it:* loop-body emission is REGION-DRIVEN. Scheduled regions
 are seeded from numeric operations only; an authored-function call is not a

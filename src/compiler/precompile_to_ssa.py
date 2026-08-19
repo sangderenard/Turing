@@ -70,6 +70,12 @@ from ..transmogrifier.ssa_registry import Handler
 
 
 _REGION_MARKER = re.compile(r"^__scheduled_region_(\d+)__$")
+# A CALL STATEMENT. Historically the control program had no vocabulary for an
+# authored call -- calls were an overlay stitched into the lowered SSA
+# afterwards by lexical anchors -- so a loop body whose only content is a call
+# was, in the plan's own language, empty. This marker makes a callsite a
+# schedulable statement exactly the way a region is one.
+_CALLSITE_MARKER = re.compile(r"^__plan_callsite_(\d+)__$")
 
 
 @dataclass(frozen=True, order=True)
@@ -578,6 +584,9 @@ class _ControlSSABuilder:
             int, tuple[tuple[int, ...], tuple[int, ...]]
         ] | None,
         region_value_meta: Mapping[int, Meta] | None = None,
+        plan_callsite_bindings: Mapping[
+            int, tuple[tuple[int, ...], tuple[int, ...]]
+        ] | None = None,
         value_aliases: Mapping[int, int] | None = None,
         inout_value_ids: tuple[int, ...] = (),
         output_value_ids: tuple[int, ...] = (),
@@ -659,6 +668,8 @@ class _ControlSSABuilder:
                 int(signature_index), f"numerical_region_{int(signature_index)}"
             )
         self.region_signatures = dict(region_signatures or {})
+        # callsite_id -> (caller argument value ids, caller result value ids).
+        self.plan_callsite_bindings = dict(plan_callsite_bindings or {})
         self.arguments: list[SSAValue] = []
         self.external_values: dict[int, SSAValue] = {}
         self.declared_parameter_only_ids: set[int] = set()
@@ -1853,6 +1864,48 @@ class _ControlSSABuilder:
             self.nested_child_rows[child_key] = child
         return child
 
+    def emit_plan_callsite(self, callsite_id: int, *, location: str) -> None:
+        """Lower a scheduled call statement to a placeholder Call.
+
+        Arguments resolve through ``external_value`` at THIS position, which
+        is the point of scheduling the call as a statement: inside a loop
+        body the carried machinery maps them to the current iteration's
+        values, instead of the post-hoc anchor insertion binding whatever id
+        the graph happened to record. The placeholder carries the callsite id
+        so frame linking can complete callee symbol and bindings in place --
+        position from the plan, bindings from the linker.
+        """
+
+        bindings = self.plan_callsite_bindings.get(int(callsite_id))
+        if bindings is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "plan_callsite", location,
+                f"scheduled callsite {callsite_id} has no recorded bindings",
+            ))
+            return
+        argument_ids, result_ids = bindings
+        arguments = [
+            self.external_value(int(value_id)) for value_id in argument_ids
+        ]
+        result = None
+        if result_ids:
+            primary = int(result_ids[0])
+            result = self.external_values.get(primary)
+            if result is None:
+                result = self._value_from_meta(primary)
+                self.external_values[primary] = result
+        self.emit(
+            Handler.Call,
+            arguments,
+            result,
+            attributes={
+                "callee": f"__plan_callsite_{int(callsite_id)}__",
+                "plan_callsite_marker": True,
+                "plan_callsite_id": int(callsite_id),
+                "output_ids": tuple(int(v) for v in result_ids),
+            },
+        )
+
     def emit_region_call(self, region_index: int, *, location: str) -> None:
         if self.emit_table_region_operations(region_index):
             return
@@ -2503,6 +2556,12 @@ class _ControlSSABuilder:
             for index, line in enumerate(block.lines):
                 match = _REGION_MARKER.fullmatch(str(line))
                 location = f"{path}.statement[{index}]"
+                callsite = _CALLSITE_MARKER.fullmatch(str(line))
+                if callsite is not None:
+                    self.emit_plan_callsite(
+                        int(callsite.group(1)), location=location
+                    )
+                    continue
                 if match is not None:
                     region_index = int(match.group(1))
                     memberships = self.declared_region_memberships.get(
@@ -4122,6 +4181,9 @@ def lower_control_program_to_ssa(
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] | None = None,
     region_value_meta: Mapping[int, Meta] | None = None,
+    plan_callsite_bindings: Mapping[
+        int, tuple[tuple[int, ...], tuple[int, ...]]
+    ] | None = None,
     value_aliases: Mapping[int, int] | None = None,
     inout_value_ids: tuple[int, ...] = (),
     output_value_ids: tuple[int, ...] = (),
@@ -4158,6 +4220,7 @@ def lower_control_program_to_ssa(
         region_callees=region_callees,
         region_signatures=region_signatures,
         region_value_meta=region_value_meta,
+        plan_callsite_bindings=plan_callsite_bindings,
         value_aliases=value_aliases,
         inout_value_ids=inout_value_ids,
         output_value_ids=output_value_ids,
@@ -4812,6 +4875,100 @@ def _inject_field_slot_access(
         new_blocks,
         metadata=dict(control_function.metadata),
     )
+
+
+def _schedule_loop_callsites(
+    control: ControlProgram,
+    hierarchy_plan: "PlanClosure | None",
+    region_signatures: Mapping[int, tuple[tuple[int, ...], tuple[int, ...]]],
+) -> tuple[ControlProgram, dict[int, tuple[tuple[int, ...], tuple[int, ...]]]]:
+    """Make in-loop callsites schedulable statements where nothing else is.
+
+    The control program historically had no vocabulary for an authored call:
+    calls were stitched into the lowered SSA afterwards by lexical anchors.
+    A loop body whose ONLY content is a call was therefore empty in the
+    plan's own language, and its carried update had no producer -- the
+    elided-body failure. This walks the hierarchy's PlanCalls and, for a
+    callsite enclosed in a loop whose result is that loop's carried update
+    and which no scheduled region publishes, appends a call STATEMENT to the
+    loop body. Position from the plan, bindings from the linker.
+
+    Deliberately narrow: only the case the old overlay could not express.
+    Calls whose results feed regions already ride behind those regions.
+    """
+
+    if hierarchy_plan is None:
+        return control, {}
+
+    bindings: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}
+    loop_enclosed: list[tuple[int, tuple[int, ...]]] = []
+
+    def collect(closure: "PlanClosure") -> None:
+        for item in closure.items:
+            if isinstance(item, PlanClosure):
+                collect(item)
+            elif isinstance(item, PlanCall):
+                argument_ids = tuple(
+                    int(caller_id)
+                    for caller_id, _callee_id in item.argument_bindings
+                ) or tuple(int(v) for v in item.argument_value_ids)
+                result_ids = tuple(
+                    int(caller_id)
+                    for _callee_id, caller_id in item.result_bindings
+                ) or tuple(int(v) for v in item.result_value_ids)
+                bindings[int(item.callsite_id)] = (argument_ids, result_ids)
+                if item.enclosing_loop_ids and result_ids:
+                    loop_enclosed.append(
+                        (int(item.callsite_id), result_ids)
+                    )
+
+    collect(hierarchy_plan)
+    if not loop_enclosed:
+        return control, bindings
+
+    region_published = {
+        int(output)
+        for _feeds, outputs in (region_signatures or {}).values()
+        for output in outputs
+    }
+
+    def rebuild(block: Any) -> Any:
+        if isinstance(block, SequenceBlock):
+            return SequenceBlock(tuple(rebuild(child) for child in block.blocks))
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            rebuilt_body = rebuild(block.body)
+            # Matched on the carried values themselves, not on a loop id:
+            # LoopBlock carries no source node id, and the semantic condition
+            # never needed one -- a loop-enclosed callsite belongs to the
+            # loop whose carried update its result IS.
+            carried_updates = {
+                int(updated) for updated, _initial in block.carried_aliases
+            }
+            markers: list[str] = []
+            for callsite_id, result_ids in loop_enclosed:
+                if any(
+                    int(result_id) in carried_updates
+                    and int(result_id) not in region_published
+                    for result_id in result_ids
+                ):
+                    markers.append(f"__plan_callsite_{callsite_id}__")
+            if markers:
+                rebuilt_body = SequenceBlock((
+                    rebuilt_body, StatementBlock(tuple(markers)),
+                ))
+            return replace(block, body=rebuilt_body)
+        if isinstance(block, ConditionalBlock):
+            return replace(
+                block,
+                body=rebuild(block.body),
+                orelse=(
+                    rebuild(block.orelse)
+                    if block.orelse is not None else None
+                ),
+            )
+        return block
+
+    return replace(control, root=rebuild(control.root)), bindings
 
 
 def lower_control_sections_to_ssa(
@@ -6043,6 +6200,9 @@ def lower_control_sections_to_ssa(
             str(value_dtype),
             existing.device if existing is not None else None,
         )
+    control, plan_callsite_bindings = _schedule_loop_callsites(
+        control, hierarchy_plan, region_signatures
+    )
     control_function, control_shortfalls = lower_control_program_to_ssa(
         control,
         function_name=control_name,
@@ -6050,6 +6210,7 @@ def lower_control_sections_to_ssa(
         region_callees=region_callees,
         region_signatures=region_signatures,
         region_value_meta=region_value_meta,
+        plan_callsite_bindings=plan_callsite_bindings,
         value_aliases=region_value_aliases,
         inout_value_ids=tuple(map(int, record_field_write_value_ids)),
         named_output_histories={

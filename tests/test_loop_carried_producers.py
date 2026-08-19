@@ -145,30 +145,52 @@ def train(w, epochs):
     ],
 )
 def test_a_carried_value_computed_in_the_body_lowers(label, source):
-    module, _outputs, _exports = _lower(source, f"carried_{label}")
+    prefix = f"carried_{label}".replace("-", "_")
+    module, _outputs, _exports = _lower(source, prefix)
     assert module.functions
 
 
 @pytest.mark.parametrize(
-    ("label", "source"),
+    ("label", "source", "authored_step"),
     [
-        ("call-round-trip", _CALL_ROUND_TRIP),
-        # The clearest statement of the cause: a helper that returns its own
-        # argument produces nothing, so input and output fuse completely.
-        ("identity-round-trip", _IDENTITY_ROUND_TRIP),
+        ("call-round-trip", _CALL_ROUND_TRIP, lambda v: v - 0.05 * v),
+        # The identity helper was the clearest statement of the OLD failure:
+        # a body forwarding its own argument scheduled nothing at all.
+        ("identity-round-trip", _IDENTITY_ROUND_TRIP, lambda v: v),
     ],
 )
-def test_a_carried_value_round_tripped_through_a_call_does_not_lower(label, source):
-    """The restriction, pinned so it is a known limit and not a surprise.
+def test_a_carried_value_round_tripped_through_a_call_lowers_and_computes(
+    label, source, authored_step
+):
+    """FIXED: the natural spelling of a training loop is available.
 
-    If this ever starts passing, the analysis learned to see through the
-    input/output fusion -- delete the test and the docstring warning
-    together, and the natural spelling of a training loop is available.
+    The control program historically had no vocabulary for an authored call
+    -- calls were an overlay stitched into the SSA afterwards by lexical
+    anchors -- so a loop body whose only content was a call was empty in the
+    plan's own language. ``_schedule_loop_callsites`` now makes such a
+    callsite a schedulable STATEMENT, the builder lowers it as a placeholder
+    at the plan's position, and frame linking fills the callee and bindings
+    in place. The emitted body is the aliased-slot form at its purest:
+    ``Call [slot] -> slot``, one in-place update through the call.
     """
 
-    with pytest.raises(Exception) as raised:
-        _lower(source, f"carried_{label}")
-    assert "loop_carried" in str(raised.value)
+    from src.compiler.ssa_python_materializer import materialize_ir_module
+
+    prefix = f"carried_{label}".replace("-", "_")
+    module, _outputs, _exports = _lower(source, prefix)
+    emitted, skipped = materialize_ir_module(module)
+    assert skipped == {}
+    namespace: dict = {}
+    exec(compile(emitted, "<round-trip>", "exec"), namespace)
+
+    compiled = namespace[f"{prefix}__train"]
+    for start, epochs in ((2.0, 3), (2.0, 1), (-1.5, 4), (2.0, 0)):
+        expected = start
+        for _ in range(epochs):
+            expected = authored_step(expected)
+        assert compiled(w=start, epochs=epochs) == pytest.approx(
+            expected, abs=1e-12
+        )
 
 
 def test_the_count_of_carried_values_is_not_what_limits_it():

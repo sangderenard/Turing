@@ -31,7 +31,7 @@ EXPECTED: dict[int, str] = {
     6: "PASSED",       # two carried values, fixed in topological_reducer
     7: "PASSED",       # adam-shaped triple carry: the goal shape, compiled
     8: "PASSED",       # fixed: carried slots seeded in the preheader
-    9: "LOWER",        # carried value round-tripped through a call
+    9: "PASSED",       # fixed: callsites are schedulable statements now
 }
 
 

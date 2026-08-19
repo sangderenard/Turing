@@ -78,20 +78,21 @@ DO NOT USE SIMULTANEOUS TUPLE ASSIGNMENT FOR A LOOP-CARRIED VALUE.
         zx = next_zx.minimum(limit)
         zy = next_zy.minimum(limit)
 
-A CARRIED VALUE MAY NOT ROUND-TRIP THROUGH A CALL.
+A CARRIED VALUE MAY ROUND-TRIP THROUGH A CALL (fixed; history below).
 
     for _ in range(n):
-        next_w = update(w)                                     # DOES NOT LOWER
+        next_w = update(w)                                     # LOWERS (now)
         w = next_w
 
-    for _ in range(n):
-        stepped = update(w)                                    # LOWERS
-        next_w = stepped * 1.0
-        w = next_w
-
-    for _ in range(n):
-        next_w = update(seed)                                  # LOWERS
-        w = next_w
+The restriction this section used to document is repaired at its root: the
+control program gained a CALL STATEMENT (``__plan_callsite_N__``), so a loop
+body whose only content is a call is no longer empty in the plan's own
+language. ``precompile_to_ssa._schedule_loop_callsites`` schedules the
+statement, the builder lowers it as a placeholder at the plan's position, and
+frame linking fills the callee and bindings in place -- position from the
+plan, bindings from the linker. The emitted body is the aliased-slot design
+at its purest: ``Call [slot] -> slot``, one in-place update through the call.
+What follows is kept as the account of WHY the restriction existed.
 
 Calls are not the problem, and this is worth being exact about because the
 obvious reading -- "a call cannot produce a carried value" -- is wrong and

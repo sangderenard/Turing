@@ -7144,6 +7144,62 @@ def _class_surface_ssa_program(
                     pending.extend(caller.blocks[block_name].successors)
                 return frozenset(owned)
 
+            def replace_at_callsite_marker(
+                record: SSACallRecord,
+                sequence: list[Instr],
+            ) -> bool:
+                """Fill a scheduled call STATEMENT in place.
+
+                When the control program scheduled this callsite as a
+                statement (the ``__plan_callsite_N__`` marker), position is
+                the plan's decision and linking only supplies the callee
+                symbol and frame bindings. The marker's result objects are
+                preserved by IDENTITY: downstream consumers -- a carried
+                phi's latch operand above all -- already hold those exact
+                SSAValue objects, so the spliced sequence's producers are
+                rebound onto them rather than minting replacements.
+                """
+
+                for block in caller.blocks.values():
+                    for index, instruction in enumerate(block.instrs):
+                        attributes = instruction.attributes or {}
+                        if not attributes.get("plan_callsite_marker"):
+                            continue
+                        if int(attributes.get("plan_callsite_id", -1)) != int(
+                            record.callsite_id
+                        ):
+                            continue
+                        marker_result = instruction.res
+                        marker_output_ids = tuple(
+                            int(v) for v in attributes.get("output_ids") or ()
+                        )
+                        block.instrs[index:index + 1] = sequence
+                        if marker_result is not None:
+                            rebound = False
+                            for spliced in reversed(sequence):
+                                if spliced.res is None:
+                                    continue
+                                if (
+                                    int(spliced.res.id) == int(marker_result.id)
+                                    or int(spliced.res.id) in marker_output_ids
+                                ):
+                                    spliced.res = marker_result
+                                    values[int(marker_result.id)] = marker_result
+                                    rebound = True
+                                    break
+                            if not rebound and sequence:
+                                # A scalar native call publishes through its
+                                # own result value; rebind the call itself.
+                                for spliced in reversed(sequence):
+                                    if spliced.op == "Call":
+                                        spliced.res = marker_result
+                                        values[int(marker_result.id)] = (
+                                            marker_result
+                                        )
+                                        break
+                        return True
+                return False
+
             def insert_at_loop_anchor(
                 record: SSACallRecord,
                 sequence: list[Instr],
@@ -8237,7 +8293,9 @@ def _class_surface_ssa_program(
                     # compartment.  Its eventual result consumer may live at
                     # loop exit or function Ret and is therefore not a valid
                     # execution anchor.
-                    inserted = insert_at_loop_anchor(
+                    inserted = replace_at_callsite_marker(
+                        record, native_sequence
+                    ) or insert_at_loop_anchor(
                         record, native_sequence
                     )
                     if returns_physical_result:
