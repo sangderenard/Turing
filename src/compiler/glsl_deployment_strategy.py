@@ -7145,7 +7145,20 @@ def _constant_value(data: dict[str, Any]) -> Any:
     if isinstance(expression, ast.Constant):
         return expression.value
     if "constant" in data:
-        return data["constant"]
+        payload = data["constant"]
+        # Every graph-express node is born with ``constant=None`` (see
+        # ProcessGraph.add_node), so the key's presence alone proves
+        # nothing: reading it unconditionally resolved arbitrary
+        # computations -- an ``if``'s live predicate included -- to the
+        # literal ``None``, and bool(None) then "proved" the branch
+        # statically false. A ``None`` payload only counts as a literal
+        # when the node itself is declared constant.
+        if payload is not None or str(
+            data.get("type")
+        ) in {"Constant", "Const", "const"} or str(
+            data.get("op") or ""
+        ).casefold() == "const":
+            return payload
     attributes = data.get("attributes") or {}
     if "value" in attributes:
         return attributes["value"]

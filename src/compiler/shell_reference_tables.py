@@ -467,7 +467,15 @@ def _constant_value(data: dict[str, Any]) -> tuple[bool, Any]:
     if isinstance(expression, ast.Constant):
         return True, expression.value
     if "constant" in data:
-        return True, data["constant"]
+        payload = data["constant"]
+        # Every graph-express node carries ``constant=None`` from birth
+        # (ProcessGraph.add_node), so the key's presence proves nothing;
+        # trusting it recorded every computation as a ``None`` literal.
+        # A ``None`` payload is a literal only on a declared constant.
+        if payload is not None or str(
+            data.get("type")
+        ) in {"Const", "const", "Constant"}:
+            return True, payload
     attributes = data.get("attributes") or {}
     if str(data.get("type")) in {"Const", "const", "Constant"}:
         return True, attributes.get("value")
