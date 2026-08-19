@@ -6040,9 +6040,19 @@ def _class_surface_ssa_program(
                 caller_symbol, SSASequenceTable()
             )
             caller_values = function_values(all_functions[caller_symbol])
+            # Only ids a node EXPLICITLY declares. The old fallback to
+            # ``node_id`` reached ProcessGraph's node keys, which are ``id()``
+            # values -- so ``max()`` was poisoned to a memory address and every
+            # storage slot allocated below it was id()-scale. Real value ids
+            # are monotonic (this file already relies on that to call
+            # id()-carrying arguments dead code); an id()-scale FORMAL is the
+            # same defect on the signature, where it displaces the positional
+            # correlation and hands the emitted function a parameter no caller
+            # could name or fill.
             caller_graph_ids = {
-                int(data.get("value_id", node_id))
-                for node_id, data in caller_graph.nodes(data=True)
+                int(data["value_id"])
+                for _node_id, data in caller_graph.nodes(data=True)
+                if "value_id" in data
             }
             next_result_storage_id = 1 + max(
                 (*caller_values, *caller_graph_ids), default=0
