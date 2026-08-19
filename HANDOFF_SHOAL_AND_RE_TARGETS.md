@@ -222,6 +222,47 @@ can be iterated on independently:
   ``charmap.find``/conditional-``break``/``runs.append`` content never
   lowered. Fix belongs at loop-body lowering, not emission.
 
+## 6c. The symbol-coordination ladder (scorecard levels 10-18), measured
+
+The diagnostic survey concluded three things: of ~12 diagnostic tools only
+the scorecard, `trace_fortran_alias.py`, and `diagnose_translation.py`'s
+five stage functions are generic (the rest are fluid-bound scripts around
+generic machinery — `watch=`/`history=`, `trace_manifest`, the trace ring,
+`SSAReferenceEvaluator` are all reusable); the materializer refuses
+multi-block control, so the equivalence ladder was architecturally blind
+to conditionals; and the coverage cliff falls exactly on SYMBOL
+COORDINATION — keyword/default/variadic arguments, parameter order,
+shadowing, closures — the constructs both debugging documents name as the
+recurring defect class.
+
+The scorecard corpus was extended accordingly (its own guard demands
+extension, not trimming). Levels 10-18, probes anti-symmetric wherever
+possible so any slot swap changes the value. Measured 2026-08-19 and
+pinned in `tests/test_translation_scorecard.py`:
+
+| L | rung | measured |
+|---|---|---|
+| 10 | keyword call, order swapped | **PASSED** |
+| 11 | default argument, used and overridden | **PASSED** |
+| 12 | parameter order against the alphabet | **PASSED** |
+| 13 | same helper, arguments transposed | **PASSED** |
+| 14 | a parameter name rebound three times | MATERIALIZE — does not render |
+| 15 | mixed int/float arithmetic | **PASSED** |
+| 16 | authored ``if`` | MATERIALIZE — the materializer CRASHES (`NoneType .id`), a defect in its refusal path |
+| 17 | ``while`` loop | **EQUIVALENT — runs and is wrong**: returns its scalar twice, `(0.5, 0.5)` for `0.5` |
+| 18 | ``any()`` over a generator predicate | MATERIALIZE — predicate region unrendered |
+
+Level 17 is the headline: the first `while` rung ever scored is a live
+member of the silent-failure class the scorecard exists to catch — it
+lowers with no shortfall, materializes, executes, and publishes its
+carried scalar twice.
+
+Tool pairing for the four stalls: L14/L16/L18 live at the
+materializer/lowering seam (`diagnose_translation` stages 1-2 generalized,
+`dump_comprehension_graph.py` for L18); L17 is a runs-wrong equivalence
+defect — read the materialized Python directly, then `watch=` on the loop
+exit if the duplication is upstream of materialization.
+
 ## 7. Working rules, re-earned this session
 
 * The soft-read trap is real and it recurs: an unobservable id read as

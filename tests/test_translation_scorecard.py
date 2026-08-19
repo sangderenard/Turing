@@ -32,7 +32,23 @@ EXPECTED: dict[int, str] = {
     7: "PASSED",       # adam-shaped triple carry: the goal shape, compiled
     8: "PASSED",       # fixed: carried slots seeded in the preheader
     9: "PASSED",       # fixed: callsites are schedulable statements now
+    # --- the symbol-coordination ladder, measured 2026-08-19 ---
+    10: "PASSED",      # keyword arguments bind by name, not call order
+    11: "PASSED",      # a default fills its slot; an override displaces it
+    12: "PASSED",      # declaration order survives against the alphabet
+    13: "PASSED",      # transposed arguments stay distinct (anti-symmetric)
+    14: "MATERIALIZE", # a thrice-rebound parameter name does not materialize
+    15: "PASSED",      # int literals + int parameter meeting float arithmetic
+    16: "MATERIALIZE", # authored if: materializer CRASHES (NoneType .id) --
+                       # a defect in its refusal path, not a designed refusal
+    17: "EQUIVALENT",  # while RUNS AND IS WRONG: returns its scalar twice,
+                       # (0.5, 0.5) for 0.5 -- the silent-failure class, live
+    18: "MATERIALIZE", # any() over a generator: predicate region unrendered
 }
+
+#: Levels 0-9 are the original corpus whose frontier was cleared; levels 10+
+#: are the symbol-coordination ladder whose stalls are the CURRENT frontier.
+ORIGINAL_FRONTIER = tuple(range(10))
 
 
 @pytest.mark.parametrize("journey", JOURNEYS, ids=[j.name for j in JOURNEYS])
@@ -54,25 +70,29 @@ def test_the_stages_are_ordered_from_earliest_to_latest_failure():
     assert STAGES == ("LOWER", "MATERIALIZE", "EXECUTE", "EQUIVALENT")
 
 
-def test_the_corpus_records_when_the_frontier_is_cleared():
-    """All ten journeys pass. The guard flips from "not all green" to a
-    dated fact, and the next frontier must come from EXTENDING the corpus --
-    conditionals, nested loops, multiple entrypoints, dynamic storage -- not
-    from trimming it. If a level regresses, the per-level pins above fail
-    loudly and this note is again false.
+def test_the_original_corpus_frontier_stays_cleared():
+    """All ten original journeys pass -- a dated fact (2026-08-19 still
+    true). The corpus was then EXTENDED, per this test's own doctrine, with
+    the symbol-coordination ladder (levels 10+), whose stalls are the
+    current frontier and are pinned per-level above. If an original level
+    regresses, the per-level pins fail loudly and this note is again false.
     """
 
-    failing = [level for level, stage in EXPECTED.items() if stage != "PASSED"]
-    assert failing == [], f"the frontier regressed: {failing}"
+    failing = [
+        level for level in ORIGINAL_FRONTIER
+        if EXPECTED[level] != "PASSED"
+    ]
+    assert failing == [], f"the original frontier regressed: {failing}"
 
 
-def test_the_silent_failure_class_is_extinct_in_this_corpus():
-    """Every journey that once compiled-and-was-wrong now computes correctly.
-
-    The classes this corpus caught -- frozen carried value, formal/region
-    collision, undeclared storage formal, mis-bound anchored call, elided
-    body -- are individually pinned in their own suites so a regression in
-    any one fails by name rather than by a wrong number here.
+def test_the_silent_failure_class_is_named_where_it_lives():
+    """Runs-and-is-wrong is extinct in the original corpus and ALIVE at
+    level 17: the first while rung ever scored executes and returns its
+    scalar twice. That pin is the whole point of scoring equivalence --
+    when level 17 is fixed, move its expectation forward deliberately.
     """
 
-    assert all(stage == "PASSED" for stage in EXPECTED.values())
+    assert all(
+        EXPECTED[level] == "PASSED" for level in ORIGINAL_FRONTIER
+    )
+    assert EXPECTED[17] == "EQUIVALENT"

@@ -177,6 +177,123 @@ JOURNEYS: tuple[Journey, ...] = (
         lambda w, n: _repeat(w, n, lambda v: v - 0.05 * v),
         note="round trip through a call: the body region is elided",
     ),
+    # ------------------------------------------------------------------
+    # Levels 10+ are the SYMBOL COORDINATION ladder: the same computation
+    # expressed through different name/slot topologies must agree. Both
+    # debugging documents independently name positional binding over an
+    # incidentally-ordered set as the recurring defect class across every
+    # backend, and it is the least-tested thing in tests/. Probes are
+    # anti-symmetric wherever possible so any slot swap changes the value.
+    Journey(
+        10, "keyword call, order swapped",
+        _helper_preamble(
+            "def blend(a, b):\n    return a * 2.0 - b\n\n"
+            "def train(x, y):\n"
+            "    return helper(x) + blend(b=y, a=x)\n"
+        ),
+        ((2.0, 3.0), (-1.0, 4.0)),
+        lambda x, y: x + (x * 2.0 - y),
+        note="keyword arguments bind by name, not call-site order",
+    ),
+    Journey(
+        11, "default argument, used and overridden",
+        _helper_preamble(
+            "def scale(a, factor=0.25):\n    return a * factor\n\n"
+            "def train(x):\n"
+            "    return helper(x) + scale(x) - scale(x, 2.0)\n"
+        ),
+        ((4.0,), (-2.0,)),
+        lambda x: x + x * 0.25 - x * 2.0,
+        note="a default fills the missing slot; an override displaces it",
+    ),
+    Journey(
+        12, "parameter order against the alphabet",
+        _helper_preamble(
+            "def train(z, a, m):\n"
+            "    return helper(z) - a / m\n"
+        ),
+        ((6.0, 4.0, 2.0), (1.0, 9.0, 3.0)),
+        lambda z, a, m: z - a / m,
+        note="declaration order is the contract; alphabetical rebinding is "
+             "the recorded live defect class (DIFFERENTIAL_PHASES.md)",
+    ),
+    Journey(
+        13, "same helper, arguments transposed",
+        _helper_preamble(
+            "def mix(a, b):\n    return a * 2.0 + b\n\n"
+            "def train(x, y):\n"
+            "    return mix(x, y) - mix(y, x) + helper(x)\n"
+        ),
+        ((3.0, 1.0), (2.0, 5.0)),
+        lambda x, y: (x * 2.0 + y) - (y * 2.0 + x) + x,
+        note="anti-symmetric probe: any slot swap changes the value",
+    ),
+    Journey(
+        14, "a parameter name rebound and shadowed",
+        _helper_preamble(
+            "def train(x, a):\n"
+            "    x = x * 2.0\n"
+            "    a = helper(a) + x\n"
+            "    x = a - x\n"
+            "    return x + a\n"
+        ),
+        ((1.5, 2.0), (-1.0, 3.0)),
+        lambda x, a: (
+            ((a * 1.0 + x * 2.0) - x * 2.0) + (a * 1.0 + x * 2.0)
+        ),
+        note="one authored name owns three values in sequence",
+    ),
+    Journey(
+        15, "mixed integer and float arithmetic",
+        _helper_preamble(
+            "def train(x, n):\n"
+            "    return helper(x) * 3 + n / 2.0 - n // 2\n"
+        ),
+        ((2.0, 5), (0.5, 4)),
+        lambda x, n: x * 3 + n / 2.0 - n // 2,
+        note="int literals and an int parameter meeting float arithmetic",
+    ),
+    Journey(
+        16, "conditional assignment of a comparison",
+        _helper_preamble(
+            "def train(x):\n"
+            "    if x > 0.0:\n"
+            "        result = helper(x) * 2.0\n"
+            "    else:\n"
+            "        result = helper(x) - 1.0\n"
+            "    return result\n"
+        ),
+        ((2.0,), (-3.0,)),
+        lambda x: x * 2.0 if x > 0.0 else x - 1.0,
+        note="the materializer refuses multi-block control by design; no "
+             "authored if has ever reached the equivalence stage",
+    ),
+    Journey(
+        17, "while loop, carried halving",
+        _helper_preamble(
+            "def train(w, limit):\n"
+            "    total = helper(w)\n"
+            "    while total > limit:\n"
+            "        total = total * 0.5\n"
+            "    return total\n"
+        ),
+        ((8.0, 1.0), (0.5, 1.0)),
+        lambda w, limit: _halve_until(w, limit),
+        note="while lowers structurally everywhere; no rung has ever run one",
+    ),
+    Journey(
+        18, "any() over a generator predicate",
+        _helper_preamble(
+            "def train(w, n):\n"
+            "    hit = any(w * 0.5 ** k < 0.1 for k in range(n))\n"
+            "    return helper(w) + hit\n"
+        ),
+        ((4.0, 8), (4.0, 1)),
+        lambda w, n: w + float(
+            any(w * 0.5 ** k < 0.1 for k in range(n))
+        ),
+        note="generator predicates: nothing in tests/ names any/all",
+    ),
 )
 
 
@@ -201,6 +318,12 @@ def _two_carried(w: float, m: float, n: int) -> float:
         next_w = w - 0.1 * next_m
         m, w = next_m, next_w
     return w
+
+
+def _halve_until(value: float, limit: float) -> float:
+    while value > limit:
+        value = value * 0.5
+    return value
 
 
 def score(journey: Journey) -> tuple[str, str]:
@@ -250,7 +373,17 @@ def score(journey: Journey) -> tuple[str, str]:
     worst = 0.0
     for probe, produced in zip(journey.probes, results):
         expected = journey.authored(*probe)
-        worst = max(worst, abs(float(produced) - float(expected)))
+        try:
+            delta = abs(float(produced) - float(expected))
+        except (TypeError, ValueError):
+            # A tuple (or other non-scalar) where the authored program
+            # returns one number is itself an equivalence failure -- report
+            # it as the shape mismatch it is instead of crashing the report.
+            return "EQUIVALENT", (
+                f"non-scalar result {type(produced).__name__}: "
+                f"{str(produced)[:48]}"
+            )
+        worst = max(worst, delta)
     if worst > 1e-9:
         return "EQUIVALENT", f"worst disagreement {worst:.3e}"
     return "PASSED", f"max disagreement {worst:.1e}"
