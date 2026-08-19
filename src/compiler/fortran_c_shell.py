@@ -7430,6 +7430,63 @@ def _class_surface_ssa_program(
                     ))
                     if len(callee_outputs) == 1 else ()
                 )
+                if (
+                    was_unresolved
+                    and callee is not None
+                    and record.result_bindings
+                    and not callee_outputs
+                ):
+                    # A raise-boundary call: the callee records its only
+                    # authored output as a structural shortfall (exception
+                    # construction has no operator yet), and the caller never
+                    # consumes the bound result -- the object exists only to
+                    # be raised, which has no repository-SSA representation.
+                    # Executing the call preserves authored execution (the
+                    # tokenizer's tell() and offset arithmetic still run);
+                    # fabricating a result would not. Dropping the dead
+                    # bindings lets the ordinary void-call machinery resolve
+                    # it. The abort semantics of raise itself remain a
+                    # declared gap, recorded on the caller so an artifact
+                    # audit sees exactly which callsites fall through.
+                    shortfall_ids = {
+                        int(item[0])
+                        for item in callee.metadata.get(
+                            "structural_output_shortfalls", ()
+                        )
+                    }
+                    bound_caller_ids = {
+                        int(caller_id)
+                        for _callee_id, caller_id in record.result_bindings
+                    }
+                    consumed = set(map(int, caller.metadata.get(
+                        "source_output_value_ids", ()
+                    )))
+                    for block in caller.blocks.values():
+                        for instruction in block.instrs:
+                            consumed.update(
+                                int(argument.id)
+                                for argument in instruction.args
+                            )
+                    if (
+                        {
+                            int(callee_id)
+                            for callee_id, _caller_id
+                            in record.result_bindings
+                        } <= shortfall_ids
+                        and not (bound_caller_ids & consumed)
+                    ):
+                        record = replace(record, result_bindings=())
+                        noted = tuple(caller.metadata.get(
+                            "raise_boundary_callsites", ()
+                        ))
+                        entry = (
+                            int(record.callsite_id),
+                            str(record.callee_symbol),
+                        )
+                        if entry not in noted:
+                            caller.metadata["raise_boundary_callsites"] = (
+                                noted + (entry,)
+                            )
                 callee_record_table = all_record_tables.get(
                     str(record.callee_symbol)
                 )
@@ -8452,6 +8509,45 @@ def _class_surface_ssa_program(
                                     block.instrs[-1:-1] = [
                                         *constants, native_call
                                     ]
+                                    inserted = True
+                                    break
+                        if (
+                            not inserted
+                            and not record.result_bindings
+                            and (
+                                int(record.callsite_id),
+                                str(record.callee_symbol),
+                            ) in tuple(caller.metadata.get(
+                                "raise_boundary_callsites", ()
+                            ))
+                        ):
+                            # A raise-boundary void call inside a loop: no
+                            # callsite marker, no loop anchor, and no result
+                            # consumer to anchor by -- the result is dead by
+                            # construction. The one dominance-correct anchor
+                            # left is its own argument's producer: place the
+                            # call immediately after the last instruction
+                            # producing one of its arguments (the error
+                            # message chain, in the same conditional arm).
+                            argument_ids = {
+                                int(argument.id)
+                                for argument in call_arguments
+                            }
+                            for block in caller.blocks.values():
+                                position = None
+                                for index, instruction in enumerate(
+                                    block.instrs
+                                ):
+                                    if (
+                                        instruction.res is not None
+                                        and int(instruction.res.id)
+                                        in argument_ids
+                                    ):
+                                        position = index
+                                if position is not None:
+                                    block.instrs[
+                                        position + 1:position + 1
+                                    ] = [*constants, native_call]
                                     inserted = True
                                     break
                     source_output_ids = tuple(map(
