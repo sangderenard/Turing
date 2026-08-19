@@ -579,6 +579,66 @@ regulation of the aliasing machinery.
 
 ---
 
+## A worked hunt, end to end: the fluid ok-flag
+
+Kept here because it exercised nearly every tool in this document in one
+sitting and added two signatures. The symptom: the whole-program dt-system
+test rejected every attempt at every dt. The route, each hop a measurement:
+
+1. **Attempt log first.** Same rejection reason at every dt, healthy
+   metrics (`mass_err` 1e-16, channels 0.0). A dt-independent rejection is
+   not stiffness -- physics responds to subdivision, plumbing does not.
+   This one observation separated "controller/physics problem" from
+   "compiler problem" before any IR was read.
+2. **Route with the evaluator (Q5c).** The reference evaluator reproduced
+   `ok=False` on the same SSA: two independent executors agreeing means
+   LOWERING owns it, not emission. One command, whole layers eliminated.
+3. **Split the value, not the theory.** `result.values` showed the failing
+   conjunct compared `0.728 == 0.0`. The magnitude itself testified: 0.728
+   is not a violation, it is a tracer FIELD value. Read the number as
+   evidence about which value arrived, not only whether it is right.
+4. **Exonerate layers one hop at a time.** Step's return record: clean.
+   Accumulator region (materialized to Python): correct. Call-site pairing,
+   all 28 positions: correct. Unpack loads audited against every
+   aggregate's contract: zero miswired. Every "obviously it's X" theory
+   died against a measurement before the next hop was taken. Never let two
+   theories stack -- each unverified theory in the chain multiplies the
+   ways the conclusion can be wrong.
+5. **Capture and replay at the oracle.** Instrument the callsite, capture
+   the offending cell's ACTUAL inputs, replay the callee in isolation, ask
+   SymPy. Verdict: the arithmetic was CORRECT for the inputs received --
+   the step had been handed `tracer_diffusivity = 1.0` instead of the
+   state's `1.0e-4`. The compiler's math was innocent; its plumbing had
+   swapped an input. Without this step the hunt would have "fixed" a
+   correct formula.
+6. **Audit the ABI boundary.** `bind_program_abi_arguments` over the
+   formals showed the two scalars were not ABI formals at all -- they were
+   read from a region's published output, and the region's value at that id
+   was a GetElementPtr ADDRESS into the height array. The caller read a
+   height cell (~1.0) where its diffusivity belonged.
+
+Two signatures out of it:
+
+**A flag disagrees with its own numbers.** `ok` false while every metric
+it summarizes is healthy means the flag's OPERAND chain reads a different
+value than the metrics' chain -- a wiring split, not a computation error.
+Diff the two chains' value ids; the first id they disagree on names the
+defect.
+
+**Same number, different space (namespace edition).** A region's published
+value ids can be minted in the HIERARCHY namespace (on the PlanLines) while
+the caller consumes them as LOCAL-namespace integers. Where no translation
+is applied at the publication boundary, a caller scalar and a region-internal
+address can share one integer, and the read succeeds with the wrong value.
+Check: for a suspect published id, compare the region's internal producer of
+that id against what the caller believes the id means (`value_names` /
+`program_abi_field` accounting). The carver-temporary variant of this is
+fixed (watermark in `plan_region_to_ssa_instrs`); the PlanLine variant is
+open and lives where `region_signatures`/`output_ids` are derived --
+translate through the hierarchy-to-local correlation before publishing.
+
+---
+
 ## Backend-specific traps already paid for
 
 **gfortran fails silently.** Invoked by absolute path with its own `bin`
