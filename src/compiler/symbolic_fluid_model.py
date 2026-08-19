@@ -1,8 +1,13 @@
-"""Pure-SymPy viscous shallow-water current and wave equations.
+"""Shoal: the pure-SymPy viscous shallow-water current and wave equations.
 
 This is a depth-averaged free-surface Navier--Stokes model.  Its executable
 finite-volume stencil is authored entirely as SymPy equations; callers may
 compile and invoke it, but there is no parallel Python numerical update.
+
+"Shoal" is this model's proper name -- the compiler's flagship benchmark
+program, distinct from the NumPy fluid engines under ``src/cells/bath`` and
+``src/common/dt_system/fluid_mechanics`` which share the ``Metrics``
+vocabulary but none of this machinery.
 """
 
 from __future__ import annotations

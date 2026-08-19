@@ -324,10 +324,39 @@ class NativeSymbolicFluidAdvance:
                 "value_names", ()
             )
         )
-        channels = {
-            "height_positivity": names.get("max_height_violation"),
-            "tracer_bounds": names.get("max_tracer_violation"),
+        # The channel accumulators' own ids are internal allocas with no
+        # public buffer; reading them through the soft path silently turned
+        # "cannot observe" into "observed 0.0" -- the exact trap _read's
+        # docstring records, and it cost a real divergence
+        # (error_channels['tracer_bounds'] native 0.0 vs oracle nonzero).
+        # The authored program writes the same accumulators back to state
+        # scalars (``state.last_* = value + 0.0``), and those write-back
+        # slots ARE public ABI: bind the channels there, and refuse loudly
+        # rather than zeroing when one cannot be observed.
+        written_by_field = {
+            field: value_id
+            for value_id, field, rank in self._written
+            if not rank
         }
+        buffers = self.execution.buffers if self.execution is not None else {}
+        channels: dict[str, int] = {}
+        for channel, state_field, accumulator in (
+            ("height_positivity", "last_height_violation",
+             "max_height_violation"),
+            ("tracer_bounds", "last_tracer_violation",
+             "max_tracer_violation"),
+        ):
+            value_id = written_by_field.get(state_field)
+            if value_id is None or int(value_id) not in buffers:
+                value_id = names.get(accumulator)
+            if value_id is None or int(value_id) not in buffers:
+                raise RuntimeError(
+                    f"error channel {channel!r} has no observable buffer: "
+                    f"state field {state_field!r} is not among the written "
+                    f"ABI slots and {accumulator!r} is not public. Reading "
+                    "it would silently report 0.0."
+                )
+            channels[channel] = int(value_id)
         self._metrics_parts = (by_kwarg, channels)
 
     def _named_stencil_operand(self, wanted: str) -> list[int]:
@@ -436,7 +465,7 @@ class NativeSymbolicFluidAdvance:
                     buffers[value_id]
                 ).reshape(np.asarray(target).shape)
             else:
-                setattr(state, field, self._read(value_id))
+                setattr(state, field, self._read(value_id, required=True))
         by_kwarg, channels = self._metrics_parts
         ok = bool(np.asarray(buffers.get(self._ok_id, 0)).reshape(-1)[0])
         metrics = Metrics(
@@ -446,7 +475,7 @@ class NativeSymbolicFluidAdvance:
             mass_err=self._read(by_kwarg.get("mass_err")),
             dt_limit=self._read(by_kwarg.get("dt_limit")),
             error_channels={
-                name: self._read(value_id)
+                name: self._read(value_id, required=True)
                 for name, value_id in channels.items()
             },
         )
