@@ -368,6 +368,75 @@ exit if the duplication is upstream of materialization.
   rebound value; a scheduling/feed mis-bind at planning, and the
   materializer's used-before-produced refusal is honest.
 
+## 6f. Fifth iteration: the consequences carried through — Shoal's frame
+## compiles WITH real conditionals and computes oracle physics
+
+Committing to the fold fix meant full rendering, not re-eliding what the
+old prune deleted. Three emitter defects stood between the honest frame
+program and a runnable exe; all three fell (commit ``6a7bc70``, which
+also carries the c_bool fix below):
+
+* **The empty-sequence seed**: ``unresolved = []`` crossing the frame
+  call into run_superstep's arena dummy — Const [] now materializes as
+  a zero-filled ARRAY local when the DECLARED view (typed view or
+  array-base table; the occurrence shape lies) says array; emptiness
+  rides the separate length cell. Populated list literals still refuse.
+* **The inline guard consulted the wrong authority**: ``_may_inline``
+  read only the occurrence shape, so the seed inlined as the bare
+  literal ``0`` — INTEGER(4) scalar against a REAL(8) intent(inout)
+  array dummy.
+* **The numeric->logical coercion had no kind**: ``(x /= 0)`` is default
+  LOGICAL(4) against a ``logical(c_bool)`` VALUE dummy; now spelled
+  ``logical(x /= 0, kind=c_bool)``.
+
+**Measured state of the new exe** (``build/shoal-c-shell-condfix``, 49
+functions — up from 45; the surviving arms are real):
+
+* It **builds clean** and, run under ``cdb`` (whose debug heap pads
+  allocations), completes one frame with **oracle-exact physics**:
+  ``state.height.sum = 1027.0883086729941`` — every printed digit the
+  oracle's (the old exe differed in the tail), ``last_wave_speed =
+  1.0609116970111032``, violations 0.
+* **The dt_next imposter is DEAD**: ``t14`` no longer reads the
+  rejection-arm ``shrink*dt_max``. It now reads **0.0** — an UNWRITTEN
+  output slot (the soft-read rule: unobservable is not zero). The frame's
+  dt_next publication has to be wired to the surviving conditional's
+  merge value; a binding gap, no longer a wrong-arm selection.
+* **A real runtime defect remains**: outside the debugger it dies with
+  an access violation — ``vcvtsi2sd`` (int64 load feeding an int->double
+  conversion) from just past a page boundary: a read past the end of a
+  heap INTEGER array, sequence length/key machinery indexing beyond its
+  extent. Repro: run the exe plainly (instant crash, before any output);
+  instrument: ``cdb -hd -g -G -c "k 20; q" symbolic_fluid_frame_shell.exe
+  1`` catches it, plain ``cdb`` (debug heap on) masks it and lets the
+  frame finish — which is itself the proof the compute is otherwise
+  sound.
+
+## 6g. re's wall, named exactly (measured with a LoopShaderReduction spy)
+
+* Every big loop in re's closure is blocked from control composition by
+  ONE cause: ``blockers=('Raise',)`` — ``_compile`` node 431 (51 body
+  regions), ``_parse`` 290/1000, ``dis_`` 440, ``_compile_charset`` 60,
+  ``getuntil`` 37, ``_parse_flags`` 65/136. The tuple destructuring
+  (``for op, av in p``) passed. A blocked loop gets
+  ``control_program=None``, its body regions schedule FLAT, and the
+  conditional overlay then finds the cascade's markers scattered across
+  THREE scopes (top level + two inner loops), inserts one cascade copy
+  per scope (``embed``'s insert-once flag is per-SequenceBlock), and the
+  duplication guard refuses — correctly fatal, since lowering must not
+  fabricate control.
+* The loop composer's validated-raise carve-out covers only ``if cond:
+  raise``-with-no-orelse; ``_compile``'s raises are cascade-terminal
+  ``else: raise`` arms whose effective predicate is a conjunction. The
+  principled path: compose raise-carrying loops and let the (now real)
+  conditional overlay own the arms, with the raise statement lowering
+  into the declared abort gap (Fortran ``error stop`` is the ledger's
+  named spelling, behind a contract axis). That is next-session design
+  work, not a filter tweak.
+* Secondary, real, and needed once loops compose: ``embed``'s
+  cross-scope duplication (thread ONE insert-once state through the
+  recursion, or refuse when a nested control's markers span scopes).
+
 ## 7. Working rules, re-earned this session
 
 * The soft-read trap is real and it recurs: an unobservable id read as
