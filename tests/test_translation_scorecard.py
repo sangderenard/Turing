@@ -29,7 +29,8 @@ EXPECTED: dict[int, str] = {
     4: "PASSED",       # loop, one carried value
     5: "PASSED",       # loop, compound body
     6: "PASSED",       # two carried values, fixed in topological_reducer
-    7: "LOWER",        # carried value round-tripped through a call
+    7: "PASSED",       # adam-shaped triple carry: the goal shape, compiled
+    8: "LOWER",        # carried value round-tripped through a call
 }
 
 

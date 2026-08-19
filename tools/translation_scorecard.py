@@ -129,7 +129,27 @@ JOURNEYS: tuple[Journey, ...] = (
         note="only the first is carried; the second is frozen at entry",
     ),
     Journey(
-        7, "loop, carried value through a call",
+        7, "adam-shaped loop, three carried values",
+        _helper_preamble(
+            "def train(w, m, v, g, n):\n"
+            "    total = helper(w)\n"
+            "    for _ in range(n):\n"
+            "        next_m = 0.9 * m + 0.1 * g\n"
+            "        next_v = 0.999 * v + 0.001 * (g * g)\n"
+            "        denominator = (next_v ** 0.5) + 1e-8\n"
+            "        next_w = w - 0.05 * next_m / denominator\n"
+            "        m = next_m\n"
+            "        v = next_v\n"
+            "        w = next_w\n"
+            "        total = w\n"
+            "    return total\n"
+        ),
+        ((1.0, 0.0, 0.0, 0.3, 5), (2.0, 0.1, 0.01, -0.2, 10), (0.5, 0.0, 0.0, 1.0, 0)),
+        lambda w, m, v, g, n: _adam(w, m, v, g, n),
+        note="the optimizer update itself, compiled; the goal shape",
+    ),
+    Journey(
+        8, "loop, carried value through a call",
         "def update(a):\n    return a - 0.05 * a\n\n"
         "def train(w, n):\n"
         "    total = update(w)\n"
@@ -149,6 +169,15 @@ def _repeat(value: float, count: int, step: Callable[[float], float]) -> float:
     for _ in range(int(count)):
         value = step(value)
     return value
+
+
+def _adam(w: float, m: float, v: float, g: float, n: int) -> float:
+    for _ in range(int(n)):
+        next_m = 0.9 * m + 0.1 * g
+        next_v = 0.999 * v + 0.001 * (g * g)
+        next_w = w - 0.05 * next_m / ((next_v ** 0.5) + 1e-8)
+        m, v, w = next_m, next_v, next_w
+    return w
 
 
 def _two_carried(w: float, m: float, n: int) -> float:
