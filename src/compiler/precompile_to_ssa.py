@@ -32,6 +32,7 @@ from .deployment_frame import DeploymentJoin
 from .hierarchical_plan import (
     PlanCall,
     PlanClosure,
+    PlanLine,
     plan_region_to_ssa_instrs,
 )
 from .precompile_ssa_validator import (
@@ -643,6 +644,20 @@ class _ControlSSABuilder:
         self.block_counts: dict[str, int] = {}
         self.shortfalls: list[SSALoweringShortfall] = []
         self.region_callees = dict(region_callees or {})
+        # A region with a recorded signature is schedulable by definition; its
+        # callee name follows the one convention every consumer already uses
+        # (autogenesis, backend_sources, the mandelbrot demo all look for
+        # ``numerical_region_N``). Defaulting here means a caller supplying
+        # signatures alone -- the unit-level entry point does -- gets calls
+        # emitted rather than a silently empty program.
+        declared_indices = (
+            *(region_signatures or {}),
+            *(getattr(program, "region_indices", ()) or ()),
+        )
+        for signature_index in declared_indices:
+            self.region_callees.setdefault(
+                int(signature_index), f"numerical_region_{int(signature_index)}"
+            )
         self.region_signatures = dict(region_signatures or {})
         self.arguments: list[SSAValue] = []
         self.external_values: dict[int, SSAValue] = {}
@@ -1842,6 +1857,17 @@ class _ControlSSABuilder:
         if self.emit_table_region_operations(region_index):
             return
         if region_index not in self.region_callees:
+            # A scheduled region the lowering cannot call is a hole in the
+            # program, not a no-op. Silently returning here produced exactly
+            # the failure shape this tree keeps paying for -- a plan that
+            # says N regions and an emitted function containing none of
+            # them, with nothing raised.
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "region_callee", location,
+                f"scheduled region {region_index} has no callee and no "
+                "signature to default one from; the region's work is absent "
+                "from the emitted function",
+            ))
             return
         callee = self.region_callees[region_index]
         feeds, outputs = self.region_signatures.get(
@@ -5264,12 +5290,17 @@ def lower_control_sections_to_ssa(
     }
     planned_region_instructions: dict[int, tuple[Instr, ...]] = {}
     resolved_plan_live_value_ids: set[int] = set()
+    plan_line_produced: set[int] = set()
+    plan_line_consumed: set[int] = set()
 
     def collect_resolved_plan_dependencies(closure: PlanClosure) -> None:
         """Collect the dependency boundary already resolved by the planner."""
 
         resolved_plan_live_value_ids.update(int(value_id) for value_id in closure.captures)
         for item in closure.items:
+            if isinstance(item, PlanLine):
+                plan_line_produced.update(int(v) for v in item.outputs)
+                plan_line_consumed.update(int(v) for v in item.inputs)
             if isinstance(item, PlanClosure):
                 collect_resolved_plan_dependencies(item)
             elif isinstance(item, PlanCall):
@@ -5288,6 +5319,27 @@ def lower_control_sections_to_ssa(
 
     if hierarchy_plan is not None:
         collect_resolved_plan_dependencies(hierarchy_plan)
+        # A value some plan line produces that nothing in the hierarchy
+        # consumes is either the plan's TERMINAL result or dead planner
+        # residue, and the difference is who else is speaking. When ANY
+        # output authority is declared -- identity-table function outputs,
+        # required ids, per-region output declarations -- declarations are
+        # exhaustive, and unconsumed undeclared values are residue to drop
+        # (test_cross_region_live_out holds a produced-and-unconsumed value
+        # OUT of the boundary for exactly this reason). Only when the plan
+        # declares nothing at all do terminals become the result by default:
+        # a program whose answer is exported by no one has computed nothing.
+        declared_authority = bool(
+            (identity_table or {})
+            or required_output_value_ids
+            or (region_output_value_ids or {})
+        )
+        if not declared_authority:
+            resolved_plan_live_value_ids.update(
+                plan_line_produced
+                - plan_line_consumed
+                - resolved_plan_live_value_ids
+            )
         for planned in hierarchy_plan.items:
             if not (
                 isinstance(planned, PlanClosure)
