@@ -108,7 +108,9 @@ PREDICATE_OPERATIONS: frozenset[str] = frozenset({
 })
 
 
-def plan_region_to_ssa_instrs(region: PlanClosure) -> tuple[Instr, ...]:
+def plan_region_to_ssa_instrs(
+    region: PlanClosure, *, first_free_value_id: int = 0,
+) -> tuple[Instr, ...]:
     """Lower one planner-owned flat region to repository SSA instructions.
 
     Each SSA value carries the shape and dtype recorded for it on the region
@@ -181,12 +183,23 @@ def plan_region_to_ssa_instrs(region: PlanClosure) -> tuple[Instr, ...]:
         return made
 
     values: dict[int, SSAValue] = {}
-    next_value_id = max((
+    # Temporaries minted here live in the CALLER's numbering: a planner
+    # region is carved out of the caller and shares its value space, so the
+    # caller reads a region's published values by id. Seeding the allocator
+    # from only this region's own line ids let temporaries collide with
+    # caller ids the region never mentions -- region-internal GEP addresses
+    # landed on the ids of the caller's scalar parameters, and the fluid
+    # advance read a height cell where tracer_diffusivity should have been
+    # (same-number-different-space, the class this tree keeps paying for).
+    # ``first_free_value_id`` is the caller's watermark; the region's own
+    # max stays in the seed so a caller that cannot supply one keeps the
+    # old behaviour.
+    next_value_id = max(int(first_free_value_id) - 1, max((
         int(value_id)
         for item in region.items
         if isinstance(item, PlanLine)
         for value_id in (*item.inputs, *item.outputs)
-    ), default=-1) + 1
+    ), default=-1)) + 1
 
     def fresh_like(result: SSAValue) -> SSAValue:
         nonlocal next_value_id

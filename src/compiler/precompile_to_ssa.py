@@ -5054,6 +5054,33 @@ def lower_control_sections_to_ssa(
     variant_projected_target_ids: set[int] = set()
     region_array_feed_ids: dict[int, set[int]] = {}
     section_outputs: dict[str, tuple[SSAValue, ...]] = {}
+    plan_value_watermark = 0
+
+    def _watermark(closure: "PlanClosure") -> None:
+        nonlocal plan_value_watermark
+        for _vid, _shape, _dtype in closure.value_shapes:
+            plan_value_watermark = max(plan_value_watermark, int(_vid) + 1)
+        for item in closure.items:
+            if isinstance(item, PlanLine):
+                for value_id in (*item.inputs, *item.outputs):
+                    plan_value_watermark = max(
+                        plan_value_watermark, int(value_id) + 1
+                    )
+            elif isinstance(item, PlanClosure):
+                _watermark(item)
+            elif isinstance(item, PlanCall):
+                for value_id in (
+                    *item.argument_value_ids, *item.result_value_ids,
+                    *(caller for caller, _callee in item.argument_bindings),
+                    *(caller for _callee, caller in item.result_bindings),
+                ):
+                    plan_value_watermark = max(
+                        plan_value_watermark, int(value_id) + 1
+                    )
+
+    if hierarchy_plan is not None:
+        _watermark(hierarchy_plan)
+
     shortfalls: list[SSALoweringShortfall] = []
     table_sequence_ids = {
         int(sequence_id)
@@ -5245,7 +5272,7 @@ def lower_control_sections_to_ssa(
                 and planned.name.startswith("region_")
             ):
                 continue
-            planned_instructions = plan_region_to_ssa_instrs(planned)
+            planned_instructions = plan_region_to_ssa_instrs(planned, first_free_value_id=plan_value_watermark)
             semantic_instructions.extend(planned_instructions)
             for instruction in planned_instructions:
                 for value in (
@@ -5315,7 +5342,7 @@ def lower_control_sections_to_ssa(
             ):
                 continue
             region_index = int(planned.name.rsplit("_", 1)[1])
-            instructions = plan_region_to_ssa_instrs(planned)
+            instructions = plan_region_to_ssa_instrs(planned, first_free_value_id=plan_value_watermark)
             region_array_feed_ids[region_index] = {
                 int(instruction.args[0].id)
                 for instruction in instructions
@@ -5388,7 +5415,7 @@ def lower_control_sections_to_ssa(
             for item in planned_items
             if isinstance(item, PlanClosure)
             and item.name.startswith("region_")
-            for instruction in plan_region_to_ssa_instrs(item)
+            for instruction in plan_region_to_ssa_instrs(item, first_free_value_id=plan_value_watermark)
             for argument in instruction.args
         }
         call_item_positions = {
@@ -5504,7 +5531,7 @@ def lower_control_sections_to_ssa(
             ):
                 continue
             planned_index = int(planned.name.rsplit("_", 1)[1])
-            planned_instructions = plan_region_to_ssa_instrs(planned)
+            planned_instructions = plan_region_to_ssa_instrs(planned, first_free_value_id=plan_value_watermark)
             planned_region_instructions[planned_index] = planned_instructions
 
     if hierarchy_plan is not None:
