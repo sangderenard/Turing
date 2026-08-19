@@ -264,6 +264,18 @@ def drop_dead_pure_region_calls(functions) -> int:
                 for argument in instruction.args:
                     identity = int(argument.id)
                     consumers[identity] = consumers.get(identity, 0) + 1
+                if instruction.op in ("Phi", "phi"):
+                    # Phi incoming values may live only in the attribute
+                    # record, not in args; the backends' latch copies are
+                    # generated from exactly that record, so it consumes.
+                    for _predecessor, value in (
+                        instruction.attributes.get("incoming") or ()
+                    ):
+                        try:
+                            identity = int(value.id)
+                        except (AttributeError, TypeError, ValueError):
+                            continue
+                        consumers[identity] = consumers.get(identity, 0) + 1
 
         for block in function.blocks.values():
             drop: set[int] = set()

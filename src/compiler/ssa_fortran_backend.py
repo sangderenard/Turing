@@ -2175,6 +2175,25 @@ class _FunctionEmitter:
                 target_value = self._typed(
                     output_binding_values[output_index]
                 )
+                def _declared_rank(value) -> int:
+                    identity = int(value.id)
+                    return max(
+                        len(tuple(value.shape or ())),
+                        int(self.dynamic_array_ranks.get(identity, 0)),
+                        1 if identity in self.array_base_ids else 0,
+                    )
+
+                if _declared_rank(seed_value) != _declared_rank(
+                    output_binding_values[output_index]
+                ):
+                    # The recorded seed id names a value of a different
+                    # rank in the caller's frame (regions share the
+                    # caller's value space, so an id can be a sequence
+                    # array outside and a scalar inside; the typed view
+                    # alone misses the declaration's dynamic extent).
+                    # Seeding across that mismatch compiles something the
+                    # author never wrote -- refuse loudly instead.
+                    return None
                 source_expression = _name(seed_value)
                 while len(input_arguments) <= input_index:
                     input_arguments.append(_MISSING_INOUT)
