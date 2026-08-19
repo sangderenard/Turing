@@ -412,6 +412,19 @@ functions — up from 45; the surviving arms are real):
   frame finish — which is itself the proof the compute is otherwise
   sound.
 
+* **Owner-suggested instrument for the OOB read, assessed by measurement:
+  the reversible machine executor.** ``BinaryMachineProgram.load_pe``
+  ingested the real 960 KB gfortran exe in 15 s — **805 functions raised
+  through the existing decompiler** — and executed the entry
+  transparently, pausing after 25 transitions at the external-target
+  base: the CRT startup's first import call, awaiting an external-call
+  completion. The instrument is real and would give the bad index full
+  provenance with rewind; what it needs first is (a) external-call
+  completions for the msvcrt/kernel32 surface the gfortran CRT touches
+  at startup, and (b) the derived read-head accelerator for throughput —
+  the faulting read is millions of transitions in. Probe:
+  scratchpad ``probe_machine_pe.py``.
+
 ## 6g. re's wall, named exactly (measured with a LoopShaderReduction spy)
 
 * Every big loop in re's closure is blocked from control composition by
