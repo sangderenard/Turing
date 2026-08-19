@@ -903,6 +903,7 @@ class _FunctionEmitter:
                 )
             )
         }
+        self._propagate_phi_dynamic_ranks()
         self.shortfalls: list[FortranShortfall] = []
         for descriptor in self.tensor_table.tensors.values():
             if descriptor.metadata_state == "unresolved":
@@ -941,6 +942,57 @@ class _FunctionEmitter:
         self._producers: dict[int, Instr] = {}
         # Collection value id -> the induction that indexes it.
         self._collections: dict[int, SSAValue] = {}
+
+    def _propagate_phi_dynamic_ranks(self) -> None:
+        """Carry dynamic-array rank through Phi chains, to a fixed point.
+
+        A dynamic-extent array carries rank in ``dynamic_array_ranks`` with
+        an EMPTY static shape, so the shape-tuple propagation in
+        ``_infer_control_value_types`` never sees it. A phi over such a
+        value is that array's loop-carried identity: give the phi the same
+        rank and alias the SAME extent symbols (the latch copy requires
+        equal extents anyway). Without this the phi declares scalar and
+        gfortran rejects the latch copy with "incompatible ranks".
+        """
+
+        changed = True
+        while changed:
+            changed = False
+            for block in self.function.blocks.values():
+                for instr in block.instrs:
+                    if instr.op not in ("Phi", "phi") or instr.res is None:
+                        continue
+                    result_id = int(instr.res.id)
+                    if result_id in self.dynamic_array_ranks:
+                        continue
+                    candidates = list(instr.args)
+                    candidates.extend(
+                        value
+                        for _, value in (
+                            instr.attributes.get("incoming") or ()
+                        )
+                        if hasattr(value, "id")
+                    )
+                    dynamic = next(
+                        (
+                            value for value in candidates
+                            if int(value.id) in self.dynamic_array_ranks
+                        ),
+                        None,
+                    )
+                    if dynamic is None:
+                        continue
+                    source_id = int(dynamic.id)
+                    self.dynamic_array_ranks[result_id] = (
+                        self.dynamic_array_ranks[source_id]
+                    )
+                    extents = self.dynamic_array_leading_extents.get(
+                        source_id
+                    )
+                    if extents is not None:
+                        self.dynamic_array_leading_extents[result_id] = extents
+                    self.array_base_ids.add(result_id)
+                    changed = True
 
     def _prefer_value_type(self, value: SSAValue) -> bool:
         """Retain the richest known type for one SSA identity."""
