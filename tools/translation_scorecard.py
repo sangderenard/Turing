@@ -93,14 +93,14 @@ JOURNEYS: tuple[Journey, ...] = (
         "def train(x):\n    return middle(x) - inner(x)\n",
         ((1.0,), (5.0,)),
         lambda x: (x + 1.0) * 2.0 - (x + 1.0),
-        note="a value becomes both a formal and a region output",
+        note="dead frame-storage formal; linking never completed",
     ),
     Journey(
         3, "division and power",
         _helper_preamble("def train(x):\n    return helper(x) / 4.0 + x ** 2.0\n"),
         ((2.0,), (3.0,)),
         lambda x: x / 4.0 + x ** 2.0,
-        note="same formal/region-output collision",
+        note="fixed: dependency-ordered region scheduling",
     ),
     Journey(
         4, "loop, one carried value",
@@ -126,7 +126,7 @@ JOURNEYS: tuple[Journey, ...] = (
         ),
         ((1.0, 4, 0.0), (3.0, 6, -1.0)),
         lambda w, n, m: _two_carried(w, m, n),
-        note="only the first is carried; the second is frozen at entry",
+        note="fixed: parameters a loop reads materialize pre-snapshot",
     ),
     Journey(
         7, "adam-shaped loop, three carried values",

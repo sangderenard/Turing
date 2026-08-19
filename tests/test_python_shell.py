@@ -134,7 +134,33 @@ def test_a_clean_program_raises_no_findings(loop_shell):
 
 
 def test_the_formal_collision_is_caught_statically():
-    """The level-3 scorecard journey, flagged without executing anything."""
+    """An unnamed extra formal is flagged without executing anything.
+
+    The live program that exhibited this (division-and-power) is FIXED by the
+    scheduler's dependency ordering, so the check is held on a constructed
+    module carrying the defect's exact shape: named parameter plus an
+    unnamed formal.
+    """
+
+    from src.transmogrifier.ssa import BasicBlock, Function, SSAValue
+
+    class _Module:
+        functions = {
+            "train": Function(
+                "train",
+                [SSAValue(0), SSAValue(5)],
+                {"entry": BasicBlock("entry", [])},
+                metadata={"parameter_names": (("x", 0),)},
+            )
+        }
+
+    findings = check_formal_parity(_Module())
+    assert findings, "the unnamed extra formal should be flagged"
+    assert "no caller can know" in findings[0].detail
+
+
+def test_the_previously_colliding_program_now_passes_the_check():
+    """The scheduler fix, held from the static side as well."""
 
     module = _lower(
         """
@@ -146,9 +172,7 @@ def train(x):
 """,
         "sc",
     )
-    findings = check_formal_parity(module)
-    assert findings, "the unnamed extra formal should be flagged"
-    assert "no caller can know" in findings[0].detail
+    assert check_formal_parity(module) == []
 
 
 def test_id_scale_findings_name_the_poisoned_allocator():

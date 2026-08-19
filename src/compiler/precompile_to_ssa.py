@@ -2363,9 +2363,114 @@ class _ControlSSABuilder:
         finally:
             self._evolution_source = previous
 
+    def _pure_region_index(self, child: "ControlBlock") -> int | None:
+        """The region a child emits, when reordering it is provably safe.
+
+        Safe means: the child is a single scheduled-region statement, the
+        region has a recorded signature to order by, and it carries no table
+        or sequence operations -- those are EFFECTS, whose relative order the
+        plan may be preserving for reasons dataflow over value ids cannot
+        see. An effectful or unrecognised child is a reordering barrier.
+        """
+
+        if not isinstance(child, StatementBlock) or len(child.lines) != 1:
+            return None
+        match = _REGION_MARKER.fullmatch(str(child.lines[0]))
+        if match is None:
+            return None
+        region_index = int(match.group(1))
+        if region_index not in self.region_signatures:
+            return None
+        if self.table_region_operations.get(region_index):
+            return None
+        if self.table_region_post_operations.get(region_index):
+            return None
+        return region_index
+
+    def _dependency_ordered(
+        self, children: "tuple[ControlBlock, ...]"
+    ) -> "list[ControlBlock]":
+        """Reorder contiguous runs of pure region statements by dataflow.
+
+        The planner's flat schedule can list a consumer region before its
+        producer.  The lowering then reaches the consumer's feed before any
+        instruction produces it, ``external_value`` mints the feed as a
+        FORMAL, and the emitted function silently grows a parameter that is
+        also a region output -- a one-parameter source becoming a
+        two-parameter program with an unnamed formal no caller could fill
+        (scorecard levels: nested calls, division-and-power).
+
+        The signatures needed to order correctly are already here, so order
+        by them: within each contiguous run of pure region statements, a
+        stable topological sort placing producers before the regions that
+        feed on them.  Stability preserves the plan's order wherever dataflow
+        does not force a change, and anything effectful or unrecognised is a
+        barrier that no region crosses.
+        """
+
+        ordered: list[ControlBlock] = []
+        run: list[tuple[int, ControlBlock]] = []
+
+        def flush() -> None:
+            if len(run) < 2:
+                ordered.extend(child for _index, child in run)
+                run.clear()
+                return
+            produced_by = {
+                int(output): position
+                for position, (region_index, _child) in enumerate(run)
+                for output in self.region_signatures[region_index][1]
+            }
+            remaining = list(range(len(run)))
+            placed: set[int] = set()
+            emitted_outputs: set[int] = set()
+            while remaining:
+                progressed = False
+                for position in tuple(remaining):
+                    region_index, _child = run[position]
+                    feeds = self.region_signatures[region_index][0]
+                    if all(
+                        int(feed) not in produced_by
+                        or produced_by[int(feed)] == position
+                        or produced_by[int(feed)] in placed
+                        for feed in feeds
+                    ):
+                        ordered.append(run[position][1])
+                        placed.add(position)
+                        remaining.remove(position)
+                        progressed = True
+                if not progressed:
+                    # A dependency cycle among regions is not resolvable by
+                    # ordering; emit the plan's own order for the remainder
+                    # rather than looping forever or guessing.
+                    ordered.extend(run[position][1] for position in remaining)
+                    remaining.clear()
+            run.clear()
+
+        for child in children:
+            region_index = self._pure_region_index(child)
+            if region_index is None:
+                flush()
+                ordered.append(child)
+            else:
+                run.append((region_index, child))
+        flush()
+        return ordered
+
     def _lower(self, block: ControlBlock, *, path: str = "root") -> None:
         if isinstance(block, SequenceBlock):
-            for index, child in enumerate(block.blocks):
+            # Reordering is confined to straight-line context. Inside a loop
+            # body the carried-value machinery is itself an ordering
+            # constraint -- the LAST publish of a carried id becomes the
+            # phi's latch operand via ``external_values`` rebinding -- and
+            # that dependency is invisible to feed/output signatures, so the
+            # sort must not run there.
+            children = (
+                tuple(block.blocks)
+                if self.loop_targets
+                else tuple(self._dependency_ordered(tuple(block.blocks)))
+            )
+            for index, child in enumerate(children):
                 self.lower(child, path=f"{path}.sequence[{index}]")
             return
         if isinstance(block, StatementBlock):

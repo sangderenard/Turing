@@ -843,19 +843,16 @@ def train(x, y):
     assert {name for name, _value in metadata.get("parameter_names") or ()} == {"x", "y"}
 
 
-def test_a_value_can_be_both_a_formal_and_a_region_output():
-    """A defect the round trip surfaced, recorded rather than worked around.
+def test_the_scheduler_orders_regions_by_dataflow_now():
+    """FIXED: a consumer region scheduled before its producer is reordered.
 
-    ``def train(x): return helper(x) / 4.0 + x ** 2.0`` lowers to a function
-    whose formals are values 0 and 5 -- but 5 is also an OUTPUT of
-    ``planned_region_0``, and the call that consumes 5 is scheduled BEFORE the
-    call that produces it. The use-before-def is masked precisely because 5 is
-    also declared a formal, so it always has a value.
-
-    The visible symptom is a one-parameter source compiling to a two-parameter
-    program, where the extra formal has no name and no caller could know what
-    to pass. The materializer reports it faithfully instead of hiding it: this
-    is what the emitted IR says.
+    The plan's flat order could list a consumer region first; the lowering
+    then reached its feed before anything produced it, and ``external_value``
+    minted the feed as a FORMAL -- a one-parameter source becoming a
+    two-parameter program. ``_dependency_ordered`` in precompile_to_ssa now
+    stable-sorts contiguous runs of pure region statements by their recorded
+    signatures, outside loop bodies only (carried-value rebinding is itself
+    an ordering constraint the signatures cannot see).
     """
 
     module, _outputs, _exports = _lower(
@@ -867,30 +864,38 @@ def train(x):
     return helper(x) / 4.0 + x ** 2.0
 """,
         "train",
-        "collide",
+        "ordered",
     )
-    function = module.functions["collide__train"]
-    formals = [int(argument.id) for argument in function.args]
-    metadata = function.metadata or {}
-    named = {int(value) for _name, value in metadata.get("parameter_names") or ()}
+    function = module.functions["ordered__train"]
+    assert len(function.args) == 1, [int(a.id) for a in function.args]
 
-    # One authored parameter, two formals; the extra one is unnamed.
-    assert len(formals) == 2
-    assert len(named) == 1
-    unnamed = [value for value in formals if value not in named]
-    assert len(unnamed) == 1
 
-    produced_by_a_region = set()
-    consumed_before_produced = False
-    for block in function.blocks.values():
-        for instruction in block.instrs:
-            attributes = instruction.attributes or {}
-            if unnamed[0] in [int(a.id) for a in instruction.args]:
-                if unnamed[0] not in produced_by_a_region:
-                    consumed_before_produced = True
-            for output in attributes.get("output_ids") or ():
-                produced_by_a_region.add(int(output))
+def test_the_dead_frame_storage_formal_is_still_open_and_detected():
+    """The nested-calls journey's remaining defect, pinned with its detector.
 
-    # The unnamed formal is produced by a region, and consumed before that.
-    assert unnamed[0] in produced_by_a_region
-    assert consumed_before_produced
+    Call-frame linking appends a caller-storage formal for a callee frame
+    value; when the plumbing does not complete, the formal survives untouched
+    by any instruction. This is call-frame ABI territory -- the binding
+    records live outside the instruction stream -- so it is recorded and
+    detected rather than pruned blind.
+    """
+
+    from src.compiler.ssa_self_check import check_dead_storage_formals
+
+    module, _outputs, _exports = _lower(
+        """
+def inner(a):
+    return a + 1.0
+
+def middle(a):
+    return inner(a) * 2.0
+
+def train(x):
+    return middle(x) - inner(x)
+""",
+        "train",
+        "deadstore",
+    )
+    findings = check_dead_storage_formals(module)
+    assert findings, "the untouched storage formal should be detected"
+    assert "never completed" in findings[0].detail

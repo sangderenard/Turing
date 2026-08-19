@@ -96,6 +96,44 @@ def check_formal_parity(module: Any) -> list[Finding]:
     return findings
 
 
+def check_dead_storage_formals(module: Any) -> list[Finding]:
+    """No formal is a frame-storage slot that the function never touches.
+
+    Call-frame linking appends caller-storage formals (accounting carries
+    ``linked_call_frame_storage`` or ``returned_record_storage``) so a callee
+    frame value can be bound through the caller. When the plumbing does not
+    complete, the formal survives with NO use in the function's own
+    instructions -- a one-parameter source compiles to a two-parameter
+    program whose extra formal is unnamed and unfillable (scorecard's
+    nested-calls journey).
+
+    Does not prove a USED storage formal is correctly bound at call sites.
+    """
+
+    findings: list[Finding] = []
+    for name, function in _functions(module):
+        touched: set[int] = set()
+        for instruction in _instructions(function):
+            touched.update(int(operand.id) for operand in instruction.args)
+            if instruction.res is not None:
+                touched.add(int(instruction.res.id))
+        for argument in getattr(function, "args", ()):
+            accounting = getattr(argument, "accounting", None) or {}
+            marker = (
+                accounting.get("linked_call_frame_storage")
+                or accounting.get("returned_record_storage")
+            )
+            if marker and int(argument.id) not in touched:
+                findings.append(Finding(
+                    "dead_storage_formal", str(name),
+                    f"formal {int(argument.id)} is frame storage for "
+                    f"{marker!r} but no instruction in this function touches "
+                    "it; the linking that appended it never completed, and no "
+                    "caller can know what to pass",
+                ))
+    return findings
+
+
 def check_id_scale(module: Any) -> list[Finding]:
     """No value id is a memory address.
 
@@ -218,6 +256,7 @@ def run_all(module: Any) -> list[Finding]:
 
     return [
         *check_formal_parity(module),
+        *check_dead_storage_formals(module),
         *check_id_scale(module),
         *check_output_contract_agreement(module),
     ]
@@ -226,6 +265,7 @@ def run_all(module: Any) -> list[Finding]:
 __all__ = [
     "ID_SCALE_THRESHOLD",
     "Finding",
+    "check_dead_storage_formals",
     "check_formal_parity",
     "check_id_scale",
     "check_output_contract_agreement",

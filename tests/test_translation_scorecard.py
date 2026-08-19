@@ -25,7 +25,7 @@ EXPECTED: dict[int, str] = {
     0: "PASSED",       # straight-line arithmetic
     1: "PASSED",       # two parameters
     2: "EXECUTE",      # a value becomes both a formal and a region output
-    3: "EXECUTE",      # same collision, different shape
+    3: "PASSED",       # fixed: regions now scheduled in dependency order
     4: "PASSED",       # loop, one carried value
     5: "PASSED",       # loop, compound body
     6: "PASSED",       # two carried values, fixed in topological_reducer
@@ -65,13 +65,14 @@ def test_the_frontier_is_not_silently_all_green():
     assert failing, "extend the corpus past the current frontier"
 
 
-def test_the_recorded_failures_are_not_compilation_failures():
-    """Most of the frontier lowers cleanly and is simply wrong.
+def test_the_recorded_failures_are_not_all_compilation_failures():
+    """Part of the frontier lowers cleanly and is simply wrong.
 
-    Three of the four failures reach EXECUTE or later: they compile, they run,
-    and no stage of the compiler reports anything. That is the defect class the
-    round trip exists to detect, and it is worth asserting so the scorecard
-    keeps measuring it.
+    The frontier has shrunk twice today (frozen carried value, region
+    scheduling), but the dead-frame-storage journey still compiles, runs, and
+    is wrong with no stage reporting anything. That is the defect class the
+    round trip exists to detect, and the scorecard keeps at least one such
+    journey until the class is extinct.
     """
 
     reached_execution = [
@@ -79,4 +80,4 @@ def test_the_recorded_failures_are_not_compilation_failures():
         for level, stage in EXPECTED.items()
         if stage in {"EXECUTE", "EQUIVALENT"}
     ]
-    assert len(reached_execution) >= 2
+    assert len(reached_execution) >= 1
