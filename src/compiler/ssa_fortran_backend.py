@@ -2140,18 +2140,48 @@ class _FunctionEmitter:
         output_arguments = list(output_binding_names)
         prelude = []
         aliased_output_indices = set()
+        _MISSING_INOUT = object()
         for input_index, output_index in self.callee_inout_pairs.get(
             str(callee), ()
         ):
-            if (
-                input_index >= len(input_arguments)
-                or output_index >= len(output_arguments)
-            ):
+            if output_index >= len(output_arguments):
                 return None
             output_argument = output_arguments[output_index]
-            source_value = self._typed(instr.args[input_index])
-            target_value = self._typed(output_binding_values[output_index])
-            source_expression = input_arguments[input_index]
+            if input_index >= len(instr.args):
+                # The call site under-supplies a carried inout feed: the
+                # caller's Call lists only the genuine data feeds, while the
+                # carried accumulators' current values never entered
+                # feed_ids. The aggregate projection records exactly which
+                # caller value seeds this slot (``source_value_id`` on its
+                # Load), so seed the inout dummy from that local instead of
+                # refusing the whole call.
+                binding_value = output_binding_values[output_index]
+                seed_id = (binding_value.accounting or {}).get(
+                    "source_value_id"
+                )
+                if seed_id is None:
+                    return None
+                seed_value = self._locals.get(int(seed_id)) or next(
+                    (
+                        argument
+                        for argument in self.function.args
+                        if int(argument.id) == int(seed_id)
+                    ),
+                    None,
+                )
+                if seed_value is None:
+                    return None
+                source_value = self._typed(seed_value)
+                target_value = self._typed(
+                    output_binding_values[output_index]
+                )
+                source_expression = _name(seed_value)
+                while len(input_arguments) <= input_index:
+                    input_arguments.append(_MISSING_INOUT)
+            else:
+                source_value = self._typed(instr.args[input_index])
+                target_value = self._typed(output_binding_values[output_index])
+                source_expression = input_arguments[input_index]
             source_logical = self._is_logical(source_value)
             target_logical = str(target_value.dtype or "") in _LOGICAL_DTYPES
             if target_logical and not source_logical:
@@ -2173,6 +2203,13 @@ class _FunctionEmitter:
             )
             input_arguments[input_index] = output_argument
             aliased_output_indices.add(int(output_index))
+        if any(
+            argument is _MISSING_INOUT for argument in input_arguments
+        ):
+            # A synthesized inout slot left a gap the pair list never
+            # filled; passing a placeholder would silently mis-bind the
+            # native call, so refuse loudly instead.
+            return None
         arguments = [
             *extents,
             *input_arguments,

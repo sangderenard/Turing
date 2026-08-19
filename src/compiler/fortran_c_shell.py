@@ -9856,9 +9856,16 @@ def _class_surface_ssa_program(
     # recovered output binding references a value that no longer exists.
     # Here the module is final, so a constant that lost its last arithmetic
     # consumer still materializes wherever an output ledger names it.
-    from .ir_identities import reduce_constant_exponent_pow
+    from .ir_identities import (
+        drop_dead_pure_region_calls,
+        reduce_constant_exponent_pow,
+    )
 
     reduce_constant_exponent_pow(all_functions)
+    # Catalogue 2.2, completeness-motivated: a pure region whose projected
+    # results nothing reads (the materialized comprehension ``range``) must
+    # not force a backend to spell code nothing runs.
+    drop_dead_pure_region_calls(all_functions)
 
     return (
         IRModule(

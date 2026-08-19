@@ -200,3 +200,173 @@ def reduce_constant_exponent_pow(functions, inexact: bool | None = None) -> dict
             )
 
     return counts
+
+
+# Operations a region may contain and still be removable when nothing reads
+# its results: value construction and arithmetic only -- no stores, no
+# calls, no table traffic.
+_PURE_REGION_OPS = frozenset({
+    "Const", "Neg", "Add", "Sub", "Mul", "Div", "Pow", "Sqrt", "Abs",
+    "Max", "Min", "Eq", "Ne", "Lt", "Le", "Gt", "Ge", "FloorDiv", "Mod",
+    "Shl", "Shr", "bitand", "bitor", "bitxor", "invert", "LAnd", "LOr",
+    "Cast", "range", "Ret",
+})
+
+
+def drop_dead_pure_region_calls(functions) -> int:
+    """Remove aggregate region-call groups whose projections nobody reads.
+
+    Catalogue section 2.2's first load-bearing inhabitant, motivated by
+    completeness rather than speed: the planner occasionally carves a
+    value's construction into its own region, and the caller's loop
+    machinery then never reads the projected results (the materialized
+    ``range`` of a comprehension is the observed case, in ``re``'s
+    ``_mk_bitmap``). The dead group still emits, so a backend without a
+    spelling for the region's payload reports a shortfall for code nothing
+    runs.
+
+    Removal is conservative: the callee body must be pure (every op in
+    ``_PURE_REGION_OPS``), the aggregate and every projection pointer must
+    be consumed only inside the group, and every projected ``Load`` result
+    must be unconsumed and absent from the caller's declared outputs.
+    Returns the number of removed call groups.
+    """
+
+    removed_total = 0
+    removed_callees: set[str] = set()
+    for function in functions.values():
+        protected: set[int] = set()
+        for key in ("source_output_value_ids",):
+            protected.update(
+                int(value_id)
+                for value_id in (function.metadata.get(key) or ())
+            )
+        for name_value in (function.metadata.get("named_outputs") or ()):
+            try:
+                protected.add(int(name_value[1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+        # Loop-carried ports are consumed through metadata, not necessarily
+        # as instruction operands; a projected value serving as a port must
+        # never be swept.
+        for port_id, port_value in dict(
+            function.metadata.get("carried_port_values") or {}
+        ).items():
+            protected.add(int(port_id))
+            try:
+                protected.add(int(port_value.id))
+            except (AttributeError, TypeError, ValueError):
+                continue
+
+        consumers: dict[int, int] = {}
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                for argument in instruction.args:
+                    identity = int(argument.id)
+                    consumers[identity] = consumers.get(identity, 0) + 1
+
+        for block in function.blocks.values():
+            drop: set[int] = set()
+            for index, instruction in enumerate(block.instrs):
+                if (
+                    instruction.op not in ("Call", "call")
+                    or instruction.attributes.get("result_convention")
+                    != "ssa.aggregate"
+                    or instruction.res is None
+                ):
+                    continue
+                callee = functions.get(
+                    str(instruction.attributes.get("callee") or "")
+                )
+                if callee is None or any(
+                    body_instruction.op not in _PURE_REGION_OPS
+                    for body_block in callee.blocks.values()
+                    for body_instruction in body_block.instrs
+                ):
+                    continue
+                aggregate_id = int(instruction.res.id)
+                group = [index]
+                pointer_ids: set[int] = set()
+                load_results: list = []
+                index_const_ids: set[int] = set()
+                for follow_index in range(index + 1, len(block.instrs)):
+                    follower = block.instrs[follow_index]
+                    if follower.res is None:
+                        continue
+                    if follower.op == "GetElementPtr" and follower.args and (
+                        int(follower.args[0].id) == aggregate_id
+                    ):
+                        group.append(follow_index)
+                        pointer_ids.add(int(follower.res.id))
+                        for operand in follower.args[1:]:
+                            index_const_ids.add(int(operand.id))
+                    elif follower.op == "Load" and follower.args and (
+                        int(follower.args[0].id) in pointer_ids
+                    ):
+                        group.append(follow_index)
+                        load_results.append(follower.res)
+                group_indices = set(group)
+                # Group-internal consumption of the aggregate and pointers.
+                internal: dict[int, int] = {}
+                for member_index in group:
+                    for operand in block.instrs[member_index].args:
+                        identity = int(operand.id)
+                        internal[identity] = internal.get(identity, 0) + 1
+                if consumers.get(aggregate_id, 0) != internal.get(
+                    aggregate_id, 0
+                ):
+                    continue
+                if any(
+                    consumers.get(pointer, 0) != internal.get(pointer, 0)
+                    for pointer in pointer_ids
+                ):
+                    continue
+                if any(
+                    consumers.get(int(value.id), 0) > 0
+                    or int(value.id) in protected
+                    for value in load_results
+                ):
+                    continue
+                drop.update(group_indices)
+                # An index constant consumed only by the removed GEPs goes
+                # with them; one shared elsewhere stays.
+                for const_index, candidate in enumerate(block.instrs):
+                    if (
+                        candidate.op == "Const"
+                        and candidate.res is not None
+                        and int(candidate.res.id) in index_const_ids
+                        and consumers.get(int(candidate.res.id), 0)
+                        == internal.get(int(candidate.res.id), 0)
+                    ):
+                        drop.add(const_index)
+                removed_total += 1
+                removed_callees.add(
+                    str(instruction.attributes.get("callee") or "")
+                )
+            if drop:
+                block.instrs = [
+                    instruction
+                    for index, instruction in enumerate(block.instrs)
+                    if index not in drop
+                ]
+    if removed_callees:
+        # A planned region whose last call site was just removed would
+        # still be emitted as an export root; drop it from the table so
+        # backend reachability (which filters roots by presence) lets it
+        # go. Only planner-minted regions are eligible -- authored
+        # functions stay whatever their call count.
+        still_called = {
+            str(instruction.attributes.get("callee") or "")
+            for function in functions.values()
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in ("Call", "call")
+        }
+        for callee_name in removed_callees:
+            if (
+                callee_name in functions
+                and callee_name not in still_called
+                and "__planned_region_" in callee_name
+            ):
+                del functions[callee_name]
+    return removed_total
