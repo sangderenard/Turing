@@ -93,7 +93,22 @@ other six will ever have.
 
 Ordered by measured value on the reference workload.
 
-### 2.1 Constant-exponent `Pow` strength reduction — **the whole cost**
+### 2.1 Constant-exponent `Pow` strength reduction — **LANDED 2026-08-19**
+
+`ir_identities.reduce_constant_exponent_pow`, wired at the single `IRModule`
+finalization point in `fortran_c_shell` (it must run AFTER region carving and
+value pruning — run earlier it orphans exponent constants that recovered
+output ledgers still name; journey 3 caught exactly that). Measured:
+
+| policy | ns/cell | gates |
+|---|---|---|
+| baseline | 1683 | — |
+| exact set (default): `2`, `-1` | ~900 (**1.85×**) | scorecard 10/10 at 0.0e+00 |
+| `TURING_POW_INEXACT=1` adds `0.5`, `-0.5`, `-2` | ~480 (**3.5×**) | scorecard 10/10 at 0.0e+00; fluid `mass_err <= 1e-15` held |
+
+The measured mass-error delta the numerics decision asked for: **within the
+flagship's own 1e-15 assertion, the inexact set is indistinguishable.** The
+original analysis follows.
 
 | exponent | count/cell | lowering | exactness |
 |---|---|---|---|
@@ -147,12 +162,31 @@ the loop, both reduce to a compare-and-wrap.
 *(projected: ~20–40 ns/cell — invisible today under 1683 ns, dominant once
 2.1 lands.)* Do not do this before 2.1; it would be unmeasurable.
 
-### 2.5 FMA formation
+### 2.5 FMA formation — audited 2026-08-19, blocked by aliasing, not permission
 
 140 Mul and 91 Add per cell, and the module names no target, so the backend
-emits baseline SSE2 with no FMA. This is not strictly an identity pass item —
-it needs P2's target triple — but it is the same missing-declaration failure and
-should land alongside.
+emits baseline SSE2 with no FMA.
+
+**Audit result (measured).** An opt-in switch now exists —
+`TURING_FMA_CONTRACT=1` puts the `contract` flag on every emitted
+`fadd`/`fsub`/`fmul` (254 sites on the reference kernel, single chokepoint
+`ssa_llvm_backend.scalar_likeness`) and adds `-march=native` to the zig cc
+invocation. With both granted: **zero `vfmadd` in the compiled assembly and a
+~2% perf delta.** The reason is structural: every float op in the emitted IR
+reads its operands from memory slots (`%load.*` — there is not one textual
+producer→consumer register chain in the kernel), and without `noalias` LLVM
+cannot forward the slot stores to their loads across other stores, so
+multiply→add chains never form in registers and there is nothing to contract.
+The assembly shows 506 memory loads against ~250 float ops.
+
+**So the FMA dependency chain is: P2 `noalias` derivation → store-to-load
+forwarding → register chains → contraction.** The switch is correct, off by
+default (an fma rounds once where mul+add round twice, so contracted results
+differ bitwise from every other backend), and becomes valuable exactly when
+P2 lands. Expressibility elsewhere, for an eventual SSA-level `MulAdd`:
+LLVM (`contract`/`llvm.fmuladd`), C (`fma()`), SPIR-V (GLSL.std.450 `Fma`)
+and WGSL (`fma()`) can all say it; WASM (scalar) and Fortran cannot except
+through toolchain contraction flags.
 
 ---
 
@@ -324,11 +358,11 @@ the class of silent miscompilation `TRANSLATION_DEBUGGING.md` catalogues.
 
 | item | § | value on the reference workload | implementation | exact |
 |---|---|---|---|---|
-| constant-exponent `Pow` | 2.1 | the entire 1683 ns/cell | small | 16 of 24 yes |
+| constant-exponent `Pow` | 2.1 | **landed**: 1683→900 exact, →480 opt-in | small | 16 of 24 yes |
 | dead aggregate unpack | 2.2 | 279 dead loads/cell | small | yes |
 | CSE | 2.3 | large, but only after 2.1 | medium (one exists) | yes |
 | index modulo → wrap | 2.4 | ~20–40 ns/cell, projected | small | yes |
-| FMA formation | 2.5 | up to 91 fused ops/cell | needs P2 target | yes |
+| FMA formation | 2.5 | **audited**: 0 fuse until P2 `noalias` | switch landed | no — opt-in |
 | trivial identities | 3 | ~none here; substrate for the rest | trivial | mostly |
 | associative reductions | 4.1 | unlocks all parallelism | medium | no — measure |
 | value facts | 5 | makes the inexact set exact | small, design-first | n/a |

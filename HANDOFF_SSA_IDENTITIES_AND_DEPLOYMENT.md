@@ -154,6 +154,17 @@ was not asked for.
 
 ### P1 — `ir_identities.py`: one backend-neutral identity pass
 
+**LANDED 2026-08-19 (first inhabitant):** `ir_identities.reduce_constant_exponent_pow`,
+called at the `IRModule` finalization point in `fortran_c_shell` — it must run
+after region carving and value pruning, or rewrites orphan exponent constants
+that recovered output ledgers still name (journey 3 caught this when the pass
+sat in `precompile_to_ssa`). Exact set default: 1683→~900 ns/cell, scorecard
+10/10 at 0.0e+00. `TURING_POW_INEXACT=1`: ~480 ns/cell, fluid `mass_err <=
+1e-15` held — the measured delta decision 1 below asked for. The FMA question
+(catalogue 2.5) is audited: contraction permission alone forms zero FMAs; the
+blocker is P2's `noalias`. `TURING_FMA_CONTRACT=1` switch is in
+`ssa_llvm_backend`, off by default, ready for P2.
+
 **Why here and not per backend:** all seven `ssa_*` backends consume the same
 `IRModule`. Each has its own `Pow` handler, so a per-backend fix costs seven
 edits and seven chances to diverge; an SSA-level pass costs one and every

@@ -241,8 +241,34 @@ def supported_tensor_operations() -> frozenset[str]:
     return frozenset(_TENSOR) | _SHAPE_ONLY | frozenset(direct)
 
 
+# Multiply-add contraction is opt-in and OFF by default: an fma rounds once
+# where fmul+fadd round twice, so contracted results differ bitwise from every
+# other backend's and from the reference evaluator's. `contract` alone only
+# PERMITS fusion; the emitted module names no target, so the toolchain also
+# needs `-march=native` (added under the same switch at the zig cc invocation)
+# before the host's FMA units are reachable. Audit 2026-08-19: every float op
+# in the emitted kernel reads its operands from memory slots (`%load.*`), so
+# there are no textual producer->consumer chains to fuse at emission time --
+# contraction is decided entirely inside LLVM after mem2reg, which is why the
+# switch is a flag on the instruction and not a rewrite of the SSA.
+_CONTRACT_ELIGIBLE = frozenset({"Add", "Sub", "Mul"})
+
+
+def _fma_contract_enabled() -> bool:
+    import os as _os
+
+    return _os.environ.get("TURING_FMA_CONTRACT", "") not in ("", "0")
+
+
 def scalar_likeness(operation: str) -> str | None:
-    return _BINARY.get(operation) or _UNARY.get(operation)
+    template = _BINARY.get(operation) or _UNARY.get(operation)
+    if (
+        template is not None
+        and operation in _CONTRACT_ELIGIBLE
+        and _fma_contract_enabled()
+    ):
+        template = template.replace(" double ", " contract double ", 1)
+    return template
 
 
 # Integer-domain scalar emission. The templates above are the double column of
@@ -3687,6 +3713,10 @@ def compile_artifact(
     import sys as _sys
     command = [_sys.executable, "-m", "ziglang", "cc", "-shared", "-O2",
                "-o", str(library), str(source)]
+    if _fma_contract_enabled():
+        # The module names no target, so contraction permission alone reaches
+        # no FMA unit; name the host. Same switch as the `contract` flag.
+        command.insert(command.index("-O2") + 1, "-march=native")
     if artifact.needs_text_sink:
         command.append(str(
             _Path(__file__).resolve().parents[1]

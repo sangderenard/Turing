@@ -9722,6 +9722,18 @@ def _class_surface_ssa_program(
         if declared_storage:
             function.metadata["storage_formals"] = tuple(declared_storage)
 
+    # Constant-exponent Pow becomes Mul/Div here, once, so every backend
+    # inherits the reduction -- six of the seven have no optimizer behind
+    # them. This must run AFTER region carving, structural-output recovery
+    # and value pruning: run earlier, the rewrite orphans the exponent
+    # constant, the region liveness pass then prunes it, and the caller's
+    # recovered output binding references a value that no longer exists.
+    # Here the module is final, so a constant that lost its last arithmetic
+    # consumer still materializes wherever an output ledger names it.
+    from .ir_identities import reduce_constant_exponent_pow
+
+    reduce_constant_exponent_pow(all_functions)
+
     return (
         IRModule(
             all_functions,

@@ -21,6 +21,17 @@ Flat ns/cell with zero marshalling: the cost is entirely inside the kernel.
 The per-cell kernel is 290 instructions -- 140 Mul, 91 Add, 24 Pow, 16 Max,
 10 Abs, 9 Const -- and every Pow exponent is a compile-time constant
 (10x 2, 6x -1, 6x 0.5, 2x -2) lowered to @llvm.pow.f64. That is the number.
+
+2026-08-19, after ir_identities.reduce_constant_exponent_pow:
+
+    exact set only (default: x**2 -> x*x, x**-1 -> 1/x, 16 of 24 Pow):
+        ~900 ns/cell across all grids            -- 1.85x
+    TURING_POW_INEXACT=1 (adds x**0.5 -> sqrt, x**-2 -> 1/(x*x)):
+        ~480 ns/cell across all grids            -- 3.5x
+        scorecard still 10/10 at 0.0e+00; fluid mass_err <= 1e-15 held
+
+The remaining ~480 ns is 266 scalar ops with no vectorization: no target
+triple, no noalias, no FMA (see catalogue sections 2.5 and P2).
 """
 
 from __future__ import annotations
