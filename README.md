@@ -31,6 +31,7 @@ This project simulates a cassette-driven "survival computer" using a compile and
 - [Modules & capabilities](#modules--capabilities)
 - [Tests](#tests)
 - [Full module index](MODULES.md)
+- [Dtype, algebra & spectral domain manifesto](DTYPE_AND_SPECTRAL_DOMAIN_MANIFESTO.md) — how new number systems are declared once and generated into every backend
 
 ## Managed scientific time
 

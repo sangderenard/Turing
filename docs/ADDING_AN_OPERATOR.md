@@ -14,6 +14,54 @@ source expression flows through them.
 
 ---
 
+## Stage 0 — First ask whether you need a new primitive at all
+
+**Read [`../DTYPE_AND_SPECTRAL_DOMAIN_MANIFESTO.md`](../DTYPE_AND_SPECTRAL_DOMAIN_MANIFESTO.md)
+before starting.** The ten-stage checklist below is the cost of adding a genuine
+new *primitive* — an operation no existing operator can express. It is ten
+hand-maintained tables per operator per backend, and, as noted above, omitting any
+one of them fails silently. That cost is worth paying exactly when it is
+unavoidable, and is pure waste otherwise.
+
+**The standard: define once in terms of base operators; let backends override for
+speed; never hand-write the same operation into six backend tables.**
+
+If the operation is derivable from operators that already exist, define it once in
+`abstraction.py` or `abstraction_methods/` and stop. Every backend then gets it
+immediately — including backends that have no implementation of it at all — and it
+inherits the autograd tape, the SSA vocabulary, and every lowering path for free.
+Backends may still override the hook with a native call purely as an optimisation.
+
+Two precedents in-tree:
+
+- **`AbstractTensor.searchsorted`** (`abstraction.py:1919-1950`) — built from
+  broadcast compares and a sum, with no backend hook at all.
+- **`unravel_index_`** (`abstraction.py:2795-2808`) — was a `NotImplementedError`
+  base with **seven** duplicated backend implementations, one of which silently
+  returned the coordinates of element 0 alone and discarded the rest of an array.
+  Replaced by a single base implementation using only `%` and `//`; every backend
+  worked immediately, including one that had never implemented it. The seven
+  native versions remain valid as overrides, but none is required.
+
+A useful test: *could this be written using operators the tree already has?* If
+yes, the ten stages below are the wrong tool. Reach for them when the answer is
+genuinely no — a new hardware-level primitive, a new instruction, a new
+irreducible elementwise kernel.
+
+### Silent failure is the through-line
+
+The warning at the top of this document — that a missing table entry fails silently
+rather than raising — is the same defect the manifesto catalogues elsewhere:
+`to_dtype_` silently defaulting unknown dtypes to float32, `AT.real` silently
+recording no autograd node, `eigh` silently returning the bare diagonal for any
+constant-diagonal matrix, complex `sum` succeeding while complex `add` raises.
+
+**Whatever you add, make its absence loud.** A missing lowering should raise; a
+degraded lowering should announce itself with the operator, the target, and the
+reason. A slow or unsupported answer is acceptable; an unannounced one is not.
+
+---
+
 ## Stage 1 — Source AST → ProcessGraph node
 
 **`src/compiler/ast_process_graph.py` — `_BINARY` / `_UNARY` / `_COMPARE`.**
