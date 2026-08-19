@@ -99,7 +99,14 @@ def materialize_pi(
             math.pi,
             math.ulp(math.pi) * 0.5,
         )
-    epsilon = 1.0e-12 if epsilon is None else float(epsilon)
+    if epsilon is None:
+        # The work contract is the stated home for resolver precision; its
+        # default is the historical 1e-12.
+        from .work_contract import active_contract
+
+        epsilon = float(active_contract().resolver_epsilon)
+    else:
+        epsilon = float(epsilon)
     if not math.isfinite(epsilon) or not 1.0e-15 <= epsilon <= 1.0e-2:
         raise ValueError("pi epsilon must be finite and between 1e-15 and 1e-2")
     terms_5, terms_239, bound = _machin_terms(epsilon)

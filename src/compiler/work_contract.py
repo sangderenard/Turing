@@ -42,6 +42,49 @@ cache only evaporates loads -- every store still lands in its slot, so
 that evaporates STORES must consult the watch set here first; that is a
 contract change, not a flag.
 
+The full surface, audited 2026-08-19
+------------------------------------
+
+Beyond the three performance switches, the contract carries or names every
+policy axis the pipeline already has a home for. Wired today (a field here
+reaches a real consumer):
+
+* ``compiler`` / ``compiler_flags`` — toolchain specification and flag
+  passthrough, consumed by both zig cc invocations (LLVM and C shells).
+* ``resolver_epsilon`` — precision bound for baked resolver tables
+  (``bounded_constants.materialize_pi`` and series terms).
+* ``extraction`` — the WHOLE ingestion/native-pursual policy, embedded: an
+  ``ExtractionContract`` (or path to one). That object already decides
+  python-call allowance (INGEST_PYTHON / PYTHON_HOST_CALL), native pursuit
+  (USE_NATIVE), binary decompilation (DECOMPILE_MACHINE) and refusal
+  (REJECT) per subject -- which is also where external-linking policy
+  lives. ``None`` preserves the historical default: the gate is DISABLED
+  (recorded hazard: an absent contract silently permits everything;
+  2026-08-17 crash). ``lower_ast_source_to_ssa`` consults this when its own
+  ``extraction_contract`` argument is None, so per-call still wins.
+
+Declared with a single honored value (asking for anything else refuses,
+same doctrine as ``fusion_levels`` -- these become real when their layer
+is wired):
+
+* ``deployment`` — threading/deployment policy. Only ``"serial"`` is
+  honored: ``turing_pool.c`` exists but no shell routes work through it
+  yet (P3).
+* ``destination`` — only ``"native"``; destination-language and shell
+  options (``source_language``, ``shell_language``) remain per-call
+  parameters until routed through here.
+* ``constant_arguments`` — the precise list of entry arguments that MAY be
+  baked to constants. Nothing bakes arguments yet, so a non-empty list
+  refuses rather than pretending.
+* ``symbolic_arguments`` — the precise list that MUST remain symbolic
+  (the fluid's runtime-extent loops are the canonical members). Recorded
+  and vacuously honored today -- no pass bakes arguments -- and every
+  future specializer must treat this list as a veto.
+
+Horizon, named so it has an address when it arrives: syscall routing --
+letting a native artifact's OS interactions be described and redirected
+through the contract rather than linked ambiently.
+
 Resolution order: an explicit ``set_active_contract`` wins; else the
 ``TURING_WORK_CONTRACT`` environment variable names a preset; else
 ``develop``. The two legacy variables ``TURING_POW_INEXACT`` and
@@ -53,6 +96,11 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from typing import Any
+
+_HONORED_DEPLOYMENT = ("serial",)
+_HONORED_COMPILER = ("zig-cc",)
+_HONORED_DESTINATION = ("native",)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -66,6 +114,44 @@ class WorkContract:
     inexact_identities: bool
     # Multiply-add contraction: `contract` flags + host target named.
     contract_multiply_add: bool
+    # --- wired policy axes (see module docstring) ---
+    compiler: str = "zig-cc"
+    compiler_flags: tuple[str, ...] = ()
+    resolver_epsilon: float = 1.0e-12
+    # ExtractionContract instance or path; None = historical no-gate default.
+    extraction: Any = None
+    # --- declared, single honored value until their layer is wired ---
+    deployment: str = "serial"
+    destination: str = "native"
+    constant_arguments: tuple[str, ...] = ()
+    symbolic_arguments: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Refuse, never fall back (fusion_levels doctrine): a contract
+        # naming behavior no layer honors must fail at construction, not
+        # quietly compile something else.
+        if self.deployment not in _HONORED_DEPLOYMENT:
+            raise ValueError(
+                f"deployment={self.deployment!r} is not honored yet; "
+                f"honored: {_HONORED_DEPLOYMENT} (pools exist, unwired -- P3)"
+            )
+        if self.compiler not in _HONORED_COMPILER:
+            raise ValueError(
+                f"compiler={self.compiler!r} is not honored yet; "
+                f"honored: {_HONORED_COMPILER}"
+            )
+        if self.destination not in _HONORED_DESTINATION:
+            raise ValueError(
+                f"destination={self.destination!r} is not honored yet; "
+                f"honored: {_HONORED_DESTINATION}"
+            )
+        if self.constant_arguments:
+            raise ValueError(
+                "constant_arguments is declared but nothing bakes arguments "
+                "yet; an accepted list would be a silent lie"
+            )
+        if not float(self.resolver_epsilon) > 0.0:
+            raise ValueError("resolver_epsilon must be positive")
 
     def describe(self) -> str:
         held = [

@@ -51,9 +51,12 @@ class CFunctionArtifact:
         source_path = destination / f"{self.name}.c"
         library_path = destination / f"{self.name}.dll"
         source_path.write_text(self.source, encoding="utf-8")
+        from .work_contract import active_contract
+
         completed = subprocess.run(
             [
                 sys.executable, "-m", "ziglang", "cc", "-shared", "-O2",
+                *map(str, active_contract().compiler_flags),
                 "-o", str(library_path), str(source_path),
             ],
             capture_output=True,

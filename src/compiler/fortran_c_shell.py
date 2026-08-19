@@ -9871,6 +9871,13 @@ def lower_ast_source_to_ssa(
 
     tree = ast.parse(source)
     extraction_policy = extraction_contract
+    if extraction_policy is None:
+        # The work contract may embed the whole extraction policy; a
+        # per-call argument still wins. None from both preserves the
+        # historical (gate-disabled) behavior.
+        from .work_contract import active_contract
+
+        extraction_policy = active_contract().extraction
     if extraction_policy is not None:
         from .extraction_contract import ExtractionContract
         if isinstance(extraction_policy, (str, os.PathLike)):

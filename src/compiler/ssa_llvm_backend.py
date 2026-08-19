@@ -3778,6 +3778,10 @@ def compile_artifact(
         # The module names no target, so contraction permission alone reaches
         # no FMA unit; name the host. Same switch as the `contract` flag.
         command.insert(command.index("-O2") + 1, "-march=native")
+    from .work_contract import active_contract as _active_work_contract
+
+    for extra_flag in _active_work_contract().compiler_flags:
+        command.insert(command.index("-O2") + 1, str(extra_flag))
     if artifact.needs_text_sink:
         command.append(str(
             _Path(__file__).resolve().parents[1]
