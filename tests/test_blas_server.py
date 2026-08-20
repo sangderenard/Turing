@@ -57,6 +57,15 @@ def test_blas_server_packages_and_dispatches_multiple_specializations(tmp_path):
         "scal", "axpy", "dot", "gemv", "rot",
     }
     assert all(matrix["webgpu_prebakes"].values())
+    for variant in matrix["variants"]:
+        for shader in variant["webgpu"].values():
+            assert shader["backend_intrinsic"]["location"] == (
+                "src.compiler.ssa_webgpu_backend:webgpublas_gemm"
+            )
+            assert shader["backend_identities"][0]["identity"] == (
+                "backend_intrinsic_location_swap"
+            )
+            assert shader["backend_identities"][0]["applied"]
     assert manifest["surfaces"]["native"]["python_runtime_dependency"] is False
     assert manifest["surfaces"]["web"]["python_runtime_dependency"] is False
     assert [item["shape"] for item in matrix["variants"]] == [

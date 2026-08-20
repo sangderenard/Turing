@@ -554,6 +554,8 @@ def build_blas_server(
                 "workgroup_size": list(module.launch_plan.workgroup_size),
                 "groups": list(module.launch_plan.groups),
                 "io_layout": module.io_layout.to_mapping(),
+                "backend_intrinsic": module.api.metadata["backend_intrinsic"],
+                "backend_identities": module.api.metadata["backend_identities"],
             }
         variants.append({
             "key": key,

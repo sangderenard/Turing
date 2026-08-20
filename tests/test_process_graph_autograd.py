@@ -126,6 +126,19 @@ def test_every_backward_request_returns_the_adjoint_binding_graph(packaging):
         assert product.graph is product.motion.graph
 
 
+def test_backward_compilation_obeys_the_execution_contract_source():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.graph["execution_contract"] = {
+        "backward_source": "authored_python",
+    }
+    _add(graph, 1, "input", label="x")
+    _add(graph, 2, "sin", (1,))
+    graph.roots = [2]
+
+    with pytest.raises(ProcessGraphAutogradError, match="authored_python"):
+        compile_process_graph_backward(graph)
+
+
 def test_backward_graph_inherits_python_host_opportunistic_dispatch_contract():
     graph = ProcessGraph(materialize_memory=False)
     graph.G.graph["execution_contract"] = {

@@ -156,6 +156,7 @@ def _backend_intrinsic_swaps(
     transformed = copy.deepcopy(module)
     applied = 0
     unavailable = []
+
     for function_name, block_name, index, family, candidate in candidates:
         target = resolve_backend_intrinsic(
             family,
@@ -181,6 +182,17 @@ def _backend_intrinsic_swaps(
             target_record["shader_variant"] = (
                 active_contract().shaders.blas_gemm
             )
+        elif str(backend) == "webgpu" and family == "blas.gemm":
+            from .work_contract import active_contract
+
+            selected = str(candidate.get("shader_variant") or "")
+            if not selected:
+                selected = (
+                    "source_algorithm"
+                    if active_contract().shaders.blas_gemm == "source_algorithm"
+                    else "webgpu_tiled_gemm"
+                )
+            target_record["shader_variant"] = selected
         instruction.attributes["backend_intrinsic"] = target_record
         instruction.attributes["backend_intrinsic_original"] = previous
         instruction.attributes["callee"] = target.symbol

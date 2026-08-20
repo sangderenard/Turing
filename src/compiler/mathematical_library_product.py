@@ -184,14 +184,61 @@ export class TuringMathematicalLibrary {{
   }}
   constructor(matrix,blas){{this.matrix=matrix;this.blas=blas;}}
   get libraries(){{return Object.keys(this.matrix.products);}}
+  install(target=globalThis,options={{}}){{const primary=options.name??"turingMath";target[primary]=this;target.tensorMath=this;target.turingBLAS=this.blas;return this;}}
 }}
 
 export default TuringMathematicalLibrary;
 '''
 
 
+def _browser_installer() -> str:
+    return '''(function installTuringMathematicalLibrary() {
+  "use strict";
+  const script = document.currentScript;
+  if (!script) throw new Error("Turing math installer must run as a classic script");
+  const configured = script.dataset.turingMathBase;
+  const base = configured
+    ? new URL(configured, document.baseURI)
+    : new URL("./", script.src);
+  const name = script.dataset.turingMathGlobal || "turingMath";
+  const ready = import(new URL("mathematical-library.js", base).href)
+    .then(({TuringMathematicalLibrary}) => TuringMathematicalLibrary.load(base))
+    .then((library) => {
+      library.install(globalThis, {name});
+      globalThis.dispatchEvent(new CustomEvent(
+        "turing-math-ready", {detail: {library, name, base: base.href}},
+      ));
+      return library;
+    });
+  globalThis.turingMathReady = ready;
+})();
+'''
+
+
+def _browser_template() -> str:
+    return '''<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Turing tensor math</title></head>
+<body>
+<pre id="result">Loading Turing tensor math…</pre>
+
+<!-- Set both paths relative to this HTML document. The product installs
+     window.turingMath, window.tensorMath, and window.turingBLAS page-wide. -->
+<script src="./install-turing-math.js" data-turing-math-base="./"></script>
+<script type="module">
+  const math = await window.turingMathReady;
+  const a = new Float32Array([1, 2, 3, 4]);
+  const b = new Float32Array([5, 6, 7, 8]);
+  const c = await math.blas.gemm(a, b, {m: 2, n: 2, k: 2});
+  document.querySelector("#result").textContent = JSON.stringify([...c]);
+</script>
+</body>
+</html>
+'''
+
+
 def _demo() -> str:
-    return '''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Turing mathematical library</title><style>body{background:#081019;color:#eaf2f8;font:15px ui-monospace,monospace;max-width:900px;margin:40px auto;padding:20px}button{padding:10px;background:#65d6e8;border:0;border-radius:6px;font-weight:bold}pre{background:#0d1924;padding:18px;border-radius:9px;white-space:pre-wrap}</style></head><body><h1>Turing mathematical library</h1><p>One semantic catalog, with BLAS packaged as a synchronized library subunit.</p><button id="run">Run first prebaked GEMM</button><pre id="out">loading…</pre><script type="module">import {TuringMathematicalLibrary} from './mathematical-library.js';const out=document.querySelector('#out'),library=await TuringMathematicalLibrary.load();globalThis.turingMath=library;out.textContent=JSON.stringify({libraries:library.libraries,blas_methods:library.blas.methods,deployed:library.blas.deployedMethods,shapes:library.blas.shapes},null,2);document.querySelector('#run').onclick=async()=>{const [m,n,k]=library.blas.shapes[0],a=new Float32Array(m*k).fill(.1),b=new Float32Array(k*n).fill(.2),t=performance.now(),c=await library.blas.gemm(a,b,{m,n,k}),ms=performance.now()-t;out.textContent=JSON.stringify({method:'blas.gemm',shape:[m,n,k],elapsed_ms:ms,first_value:c[0]},null,2);};</script></body></html>'''
+    return '''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Turing mathematical library</title><style>body{background:#081019;color:#eaf2f8;font:15px ui-monospace,monospace;max-width:900px;margin:40px auto;padding:20px}button{padding:10px;background:#65d6e8;border:0;border-radius:6px;font-weight:bold}pre{background:#0d1924;padding:18px;border-radius:9px;white-space:pre-wrap}</style></head><body><h1>Turing mathematical library</h1><p>One semantic catalog, with BLAS packaged as a synchronized library subunit.</p><button id="run">Run first prebaked GEMM</button><pre id="out">loading…</pre><script src="./install-turing-math.js" data-turing-math-base="./"></script><script type="module">const out=document.querySelector('#out'),library=await globalThis.turingMathReady;out.textContent=JSON.stringify({libraries:library.libraries,blas_methods:library.blas.methods,deployed:library.blas.deployedMethods,shapes:library.blas.shapes},null,2);document.querySelector('#run').onclick=async()=>{const [m,n,k]=library.blas.shapes[0],a=new Float32Array(m*k).fill(.1),b=new Float32Array(k*n).fill(.2),t=performance.now(),c=await library.blas.gemm(a,b,{m,n,k}),ms=performance.now()-t;out.textContent=JSON.stringify({method:'blas.gemm',shape:[m,n,k],elapsed_ms:ms,first_value:c[0]},null,2);};</script></body></html>'''
 
 
 def _readme(product_id: str, blas: BLASServerProduct) -> str:
@@ -244,6 +291,9 @@ subunit ABI; library binaries and target information are listed in
 Serve this product directory over HTTP and open `web/index.html`. The outer
 JavaScript object exposes `library.blas`, backed by the matrix-bearing outer
 WASM coordinator and the BLAS subunit's own verified WASM/shader assemblage.
+For embedding, copy `web/embed-template.html` and adjust the two relative paths
+on its installer script. The script immediately publishes `turingMathReady`;
+once resolved, `turingMath`, `tensorMath`, and `turingBLAS` are page-wide.
 """
 
 
@@ -265,6 +315,8 @@ def build_mathematical_library_product(
         contract=contract, cores=cores, candidate_sizes=candidate_sizes,
     )
     numpy_source, numpy_receipt = emit_numpy_mathematical_library()
+    browser_installer = _browser_installer()
+    browser_template = _browser_template()
     matrix = {
         "schema": MATRIX_SCHEMA,
         "catalog": TURING_MATHEMATICAL_LIBRARY.to_mapping(include_source=True),
@@ -282,6 +334,12 @@ def build_mathematical_library_product(
                 "provider": "libraries/blas/python/turing_blas_server.py",
                 "matrix_sha256": blas.manifest["server_matrix_sha256"],
             },
+        },
+        "browser_installation": {
+            "installer": "web/install-turing-math.js",
+            "template": "web/embed-template.html",
+            "source_sha256": _sha(browser_installer.encode("utf-8")),
+            "globals": ["turingMathReady", "turingMath", "tensorMath", "turingBLAS"],
         },
     }
     matrix_bytes = _canonical(matrix)
@@ -326,6 +384,10 @@ def build_mathematical_library_product(
         _javascript(len(matrix_bytes), matrix_sha),
         encoding="utf-8", newline="\n",
     )
+    installer_path = web_root / "install-turing-math.js"
+    installer_path.write_text(browser_installer, encoding="utf-8", newline="\n")
+    template_path = web_root / "embed-template.html"
+    template_path.write_text(browser_template, encoding="utf-8", newline="\n")
     demo_path = web_root / "index.html"
     demo_path.write_text(_demo(), encoding="utf-8", newline="\n")
     readme_path = root / "README.md"
@@ -394,6 +456,10 @@ def build_mathematical_library_product(
             "web": {
                 "wasm": wasm_path.relative_to(root).as_posix(),
                 "javascript": javascript_path.relative_to(root).as_posix(),
+                "installer": installer_path.relative_to(root).as_posix(),
+                "template": template_path.relative_to(root).as_posix(),
+                "ready": "globalThis.turingMathReady",
+                "globals": ["turingMath", "tensorMath", "turingBLAS"],
                 "demo": demo_path.relative_to(root).as_posix(),
             },
         },

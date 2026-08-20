@@ -62,6 +62,15 @@ _BUILTIN_TARGETS = {
         lowering_namespaces=("abstract_tensor",),
         operand_positions=(0, 1),
     ),
+    ("webgpu", "blas.gemm"): BackendIntrinsicTarget(
+        backend="webgpu",
+        semantic_family="blas.gemm",
+        location="src.compiler.ssa_webgpu_backend:webgpublas_gemm",
+        symbol="webgpublas_gemm",
+        consumption="shader_emission",
+        lowering_namespaces=("abstract_tensor",),
+        operand_positions=(0, 1),
+    ),
 }
 
 

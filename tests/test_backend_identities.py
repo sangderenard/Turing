@@ -184,6 +184,34 @@ def test_process_graph_intrinsic_flag_survives_tensor_lowering_and_swaps_for_gls
     assert lowered.op == "Call"  # backend swap never mutates universal SSA
 
 
+def test_process_graph_gemm_swaps_to_the_custom_webgpu_kernel_intrinsic():
+    module, result, lowered = _lower_flagged_matmul()
+
+    swapped = apply_backend_identities(
+        module, {"flagged": (result,)}, backend="webgpu",
+        licensed_inexact=False,
+    )
+    intrinsic = next(
+        instruction
+        for instruction in swapped.module.functions["flagged"].blocks[
+            "entry"
+        ].instrs
+        if instruction.op == "BackendIntrinsic"
+    )
+    record = intrinsic.attributes["backend_intrinsic"]
+    assert record["semantic_family"] == "blas.gemm"
+    assert record["location"] == (
+        "src.compiler.ssa_webgpu_backend:webgpublas_gemm"
+    )
+    assert record["symbol"] == "webgpublas_gemm"
+    assert record["consumption"] == "shader_emission"
+    assert record["operand_positions"] == [0, 1]
+    assert record["shader_variant"] == "webgpu_tiled_gemm"
+    assert swapped.decisions[0].identity == "backend_intrinsic_location_swap"
+    assert swapped.decisions[0].applied
+    assert lowered.op == "Call"  # universal repository SSA is unchanged
+
+
 def test_glsl_intrinsic_receipts_the_contract_selected_source_algorithm():
     module, result, _lowered = _lower_flagged_matmul()
     from src.compiler.work_contract import (

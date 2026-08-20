@@ -89,7 +89,24 @@ def test_outer_math_product_owns_a_synchronized_blas_subunit(tmp_path):
     javascript = product.javascript_path.read_text(encoding="utf-8")
     assert "class TuringMathematicalLibrary" in javascript
     assert "this.blas=blas" in javascript
+    assert "target.tensorMath=this" in javascript
+    assert "target.turingBLAS=this.blas" in javascript
     assert "../libraries/blas/web/blas-server.js" in javascript
+    installer = product.directory / manifest["surfaces"]["web"]["installer"]
+    installer_source = installer.read_text(encoding="utf-8")
+    assert "document.currentScript" in installer_source
+    assert "data-turing-math-base" not in installer_source
+    assert "script.dataset.turingMathBase" in installer_source
+    assert "globalThis.turingMathReady = ready" in installer_source
+    assert '"turing-math-ready"' in installer_source
+    template = product.directory / manifest["surfaces"]["web"]["template"]
+    template_source = template.read_text(encoding="utf-8")
+    assert 'src="./install-turing-math.js"' in template_source
+    assert 'data-turing-math-base="./"' in template_source
+    assert "await window.turingMathReady" in template_source
+    assert matrix["browser_installation"]["source_sha256"] == hashlib.sha256(
+        installer.read_bytes()
+    ).hexdigest()
     header = product.directory / manifest["surfaces"]["native"]["header"]
     assert "turing_blas_server.h" in header.read_text(encoding="utf-8")
     native_blas = manifest["surfaces"]["native"]["libraries"]["blas"]

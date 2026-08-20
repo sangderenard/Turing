@@ -52,6 +52,92 @@ class NativeTrainingSchedule:
         return selected
 
 
+@dataclass(frozen=True)
+class NativeGraphReverse:
+    """One fully compiled forward/VJP artifact with an explicit seed ABI.
+
+    This is the publication unit for a method reverse.  ``artifact`` is a
+    loaded-library-capable LLVM artifact, not a serialized ProcessGraph and
+    not a Python backward callback.  The value-id maps are retained so an
+    outer object bundle can expose a stable binding contract without learning
+    details of repository SSA or the LLVM emitter.
+    """
+
+    name: str
+    output_value_ids: tuple[int, ...]
+    gradient_value_ids: Mapping[int, int]
+    seed_value_ids: Mapping[int, int]
+    artifact: Any
+    saved_binding_count: int
+
+
+def compile_native_graph_reverse(
+    output: Any,
+    *,
+    bindings: Mapping[str, Any],
+    wrt_value_ids: Sequence[int],
+    name: str,
+    directory: Path,
+    unit_output_seed: bool = False,
+) -> NativeGraphReverse:
+    """Graph-invert and natively compile an AbstractTensor method.
+
+    By default each forward output receives a runtime upstream-gradient
+    parameter, making the product a genuine parametric VJP.  Scalar loss
+    callers may request ``unit_output_seed=True``; standard-object publication
+    should keep the default so the reverse ABI remains generally reusable.
+    """
+
+    from .process_graph_autograd import (
+        abstract_tensor_program_to_process_graph,
+        compile_process_graph_backward,
+        lower_training_motion_to_repository_ssa,
+    )
+    from .ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
+
+    wrt = tuple(map(int, wrt_value_ids))
+    if not wrt:
+        raise ValueError("compiled graph reverse requires at least one wrt value")
+    if len(set(wrt)) != len(wrt):
+        raise ValueError(f"compiled graph reverse repeats wrt values: {wrt!r}")
+
+    forward = abstract_tensor_program_to_process_graph(output, bindings=bindings)
+    product = compile_process_graph_backward(
+        forward,
+        wrt=wrt,
+        packaging="combined",
+        unit_loss_seed=bool(unit_output_seed),
+    )
+    if product.motion is None:
+        raise RuntimeError("combined graph-autograd request produced no motion")
+    lowering = lower_training_motion_to_repository_ssa(
+        product.motion,
+        function_name=str(name),
+    )
+    if lowering.shortfalls:
+        raise RuntimeError(
+            f"{name} repository-SSA shortfalls: {lowering.shortfalls!r}"
+        )
+    emitted = emit_ssa_function_to_llvm(
+        lowering.module,
+        lowering.function_name,
+        entry_name=lowering.function_name,
+    )
+    if emitted.shortfalls:
+        raise RuntimeError(f"{name} LLVM shortfalls: {emitted.shortfalls!r}")
+    artifact = compile_artifact(emitted, directory=Path(directory))
+    if artifact.library_path is None:
+        raise RuntimeError(f"{name} reverse compilation produced no native library")
+    return NativeGraphReverse(
+        name=str(name),
+        output_value_ids=tuple(map(int, product.adjoint.output_value_ids)),
+        gradient_value_ids=dict(product.motion.gradient_value_ids),
+        seed_value_ids=dict(product.motion.seed_value_ids),
+        artifact=artifact,
+        saved_binding_count=len(product.adjoint.saved_value_contracts),
+    )
+
+
 def compile_native_training_schedule(
     output: Any,
     *,
@@ -158,7 +244,7 @@ def run_parameter_group(
     return execution
 
 
-def _artifact_record(artifact: Any) -> dict[str, Any]:
+def native_artifact_record(artifact: Any) -> dict[str, Any]:
     if artifact.library_path is None:
         raise RuntimeError("cannot manifest an uncompiled LLVM artifact")
     return {
@@ -186,7 +272,7 @@ def save_training_schedule(schedule: NativeTrainingSchedule, path: Path) -> None
                 "name": group.name,
                 "parameter_ids": list(group.parameter_ids),
                 "learning_rate": group.learning_rate,
-                "artifact": _artifact_record(schedule.artifacts[group.name]),
+                "artifact": native_artifact_record(schedule.artifacts[group.name]),
             }
             for group in schedule.groups
         ],

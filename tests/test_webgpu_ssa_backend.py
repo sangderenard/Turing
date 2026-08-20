@@ -300,8 +300,19 @@ def test_webgpu_gemm_variants_share_the_role_and_abi_but_change_topology():
     assert "workgroupBarrier()" in tiled.source
     assert tiled.launch_plan.workgroup_size == (16, 16, 1)
     assert tiled.launch_plan.groups == (3, 5, 1)
-    assert not source_meta["backend_identities"][0]["applied"]
+    # Both implementations are selected WebGPU faux intrinsics.  The variant
+    # chooses which custom WGSL body that intrinsic emits; it does not bypass
+    # the backend-location swap for the source-shaped implementation.
+    assert source_meta["backend_identities"][0]["applied"]
     assert tiled_meta["backend_identities"][0]["applied"]
+    assert source_meta["variant"] == "source_algorithm"
+    assert tiled_meta["variant"] == "webgpu_tiled_gemm"
+    assert source_meta["backend_intrinsic"]["location"] == (
+        "src.compiler.ssa_webgpu_backend:webgpublas_gemm"
+    )
+    assert tiled_meta["backend_intrinsic"] == source_meta["backend_intrinsic"] | {
+        "shader_variant": "webgpu_tiled_gemm",
+    }
 
 
 def test_every_authored_blas_method_has_a_source_topology_wgsl_module():

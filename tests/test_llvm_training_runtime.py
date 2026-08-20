@@ -8,9 +8,47 @@ from src.common.tensors.accelerator_backends.ssa_backend import (
 )
 from src.compiler.llvm_training_runtime import (
     NativeParameterGroup,
+    compile_native_graph_reverse,
     compile_native_training_schedule,
     run_parameter_group,
 )
+from src.compiler.ssa_llvm_backend import prepare_artifact_execution
+
+
+def test_graph_reverse_is_a_compiled_parametric_vjp(tmp_path):
+    program = SSATensorProgram("compiled_parametric_vjp")
+    left, right = [
+        SSATensorOperations.input(program, (2,)) for _ in range(2)
+    ]
+    output = left * right
+
+    reverse = compile_native_graph_reverse(
+        output,
+        bindings={"left": left, "right": right},
+        wrt_value_ids=(0, 1),
+        name="compiled_parametric_vjp",
+        directory=tmp_path,
+    )
+
+    assert reverse.artifact.library_path.is_file()
+    assert reverse.artifact.shortfalls == ()
+    assert set(reverse.seed_value_ids) == set(reverse.output_value_ids)
+    assert set(reverse.gradient_value_ids) == {0, 1}
+
+    seed_id = next(iter(reverse.seed_value_ids.values()))
+    execution = prepare_artifact_execution(reverse.artifact, {
+        0: np.asarray([2.0, 3.0]),
+        1: np.asarray([5.0, 7.0]),
+        seed_id: np.asarray([11.0, 13.0]),
+    }).run()
+    np.testing.assert_allclose(
+        execution.buffers[reverse.gradient_value_ids[0]],
+        np.asarray([55.0, 91.0]),
+    )
+    np.testing.assert_allclose(
+        execution.buffers[reverse.gradient_value_ids[1]],
+        np.asarray([22.0, 39.0]),
+    )
 
 
 def test_native_parameter_groups_step_only_the_selected_state(tmp_path):

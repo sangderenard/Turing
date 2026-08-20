@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
@@ -566,6 +567,44 @@ def emit_module(
     )
     ir_module = identity_result.module
     named_outputs = identity_result.outputs
+    webgpu_intrinsics = [
+        instruction
+        for function in ir_module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if str(instruction.op) == "BackendIntrinsic"
+        and dict(instruction.attributes.get("backend_intrinsic") or {}).get(
+            "backend"
+        ) == "webgpu"
+    ]
+    if webgpu_intrinsics:
+        if len(webgpu_intrinsics) != 1:
+            raise WGSLEmissionError(
+                "one WebGPU module cannot consume multiple backend intrinsics yet"
+            )
+        intrinsic = webgpu_intrinsics[0]
+        record = dict(intrinsic.attributes["backend_intrinsic"])
+        if record.get("semantic_family") != "blas.gemm":
+            raise WGSLEmissionError(
+                "unsupported WebGPU backend intrinsic family "
+                f"{record.get('semantic_family')!r}"
+            )
+        positions = tuple(map(int, record.get("operand_positions") or ()))
+        if positions != (0, 1):
+            raise WGSLEmissionError("WebGPU GEMM intrinsic requires A,B operands")
+        left, right = (intrinsic.args[index] for index in positions)
+        if len(left.shape) != 2 or len(right.shape) != 2:
+            raise WGSLEmissionError("WebGPU GEMM intrinsic requires rank-two shapes")
+        m, k = map(int, left.shape)
+        right_k, n = map(int, right.shape)
+        if k != right_k:
+            raise WGSLEmissionError("WebGPU GEMM intrinsic inner dimensions disagree")
+        return webgpublas_gemm(
+            m, n, k,
+            variant=str(record.get("shader_variant") or "webgpu_tiled_gemm"),
+            identity_decisions=identity_result.decisions,
+            intrinsic_record=record,
+        )
     from .machine_dialect_ssa import (
         format_machine_dialect_occurrences,
         module_machine_dialect_occurrences,
@@ -751,19 +790,21 @@ def emit_module(
     )
 
 
-def emit_gemm_module(
+def webgpublas_gemm(
     m: int,
     n: int,
     k: int,
     *,
     variant: str = "webgpu_tiled_gemm",
     tile: int = 16,
+    identity_decisions: Sequence[Any] = (),
+    intrinsic_record: Mapping[str, Any] | None = None,
 ) -> WGSLModule:
-    """Emit one specialized WebGPU GEMM deployment from the BLAS role.
+    """Implement the backend-qualified faux intrinsic as custom WGSL.
 
-    Both variants retain the same humble ``blas.gemm`` source authority.  The
-    tiled form is a backend identity: it changes work/memory topology, not the
-    mathematical role or its parameter ABI.
+    This function is the intrinsic named by the WebGPU backend identity.  It
+    owns the custom WGSL kernel; it is not a second Python GEMM algorithm.
+    Ordinary callers enter through repository SSA and ``emit_module``.
     """
 
     m, n, k, tile = map(int, (m, n, k, tile))
@@ -889,7 +930,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         "role_source_sha256": hashlib.sha256(role.source.encode("utf-8")).hexdigest(),
         "variant": variant,
         "problem_shape": {"m": m, "n": n, "k": k},
-        "backend_identities": [identity],
+        "backend_identities": [
+            decision.as_record() for decision in identity_decisions
+        ],
+        "backend_intrinsic": dict(intrinsic_record or {}),
     }
     api = CompiledProgramAPI(
         module=name, language="wgsl", entry="main",
@@ -898,8 +942,84 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     )
     return WGSLModule(
         name, source, True, (), api, launch_plan,
-        io_layout, component_abi, (identity,),
+        io_layout, component_abi, tuple(identity_decisions),
     )
+
+
+def _gemm_semantic_ssa(
+    m: int, n: int, k: int, *, variant: str,
+) -> tuple[IRModule, dict[str, tuple[SSAValue, ...]]]:
+    """Build the same canonical matmul SSA seam AST ingestion produces."""
+
+    from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+    from ..transmogrifier.graph.python_special_cases import (
+        interpret_python_special_case,
+    )
+    from .tensor_ssa_lowering import lower_tensor_calls_to_repository_ssa
+
+    call_node = ast.parse("left.matmul(right)", mode="eval").body
+    call_node._extraction_contract = {
+        "identity": "src.common.tensors.abstraction.AbstractTensor.matmul",
+        "classification": "repository_python",
+        "action": "intrinsic",
+        "rule_id": "abstract-tensor-vocabulary-is-intrinsic",
+        "parameters": {"lowering_namespace": "abstract_tensor"},
+    }
+    special = interpret_python_special_case(call_node)
+    if special is None:
+        raise WGSLEmissionError("AbstractTensor.matmul has no semantic identity")
+    left = SSAValue(0, "float32", shape=(int(m), int(k)))
+    right = SSAValue(1, "float32", shape=(int(k), int(n)))
+    result = SSAValue(2, "float32", shape=(int(m), int(n)))
+    function = Function("blas_gemm", [left, right], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                str(special.type), [left, right], result,
+                attributes=dict(special.attributes),
+            ),
+            Instr("Ret", [result], None),
+        ]),
+    })
+    module = IRModule({function.name: function})
+    shortfalls = lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference(),
+    )
+    if shortfalls:
+        raise WGSLEmissionError(
+            "canonical GEMM tensor SSA lowering failed: "
+            + "; ".join(str(item) for item in shortfalls)
+        )
+    candidate = next(
+        instruction
+        for block in module.functions[function.name].blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("backend_intrinsic_family") == "blas.gemm"
+        and "backend_intrinsic_candidate" in instruction.attributes
+    )
+    receipt = dict(candidate.attributes["backend_intrinsic_candidate"])
+    receipt["shader_variant"] = str(variant)
+    candidate.attributes["backend_intrinsic_candidate"] = receipt
+    return module, {function.name: (result,)}
+
+
+def emit_gemm_module(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    variant: str = "webgpu_tiled_gemm",
+    tile: int = 16,
+) -> WGSLModule:
+    """Compile canonical GEMM SSA through the WebGPU intrinsic identity."""
+
+    if int(tile) != 16:
+        raise ValueError(
+            "the registered WebGPU GEMM intrinsic currently owns a 16x16 tile"
+        )
+    module, outputs = _gemm_semantic_ssa(m, n, k, variant=variant)
+    return emit_module(module, name="blas.gemm", outputs=outputs)
 
 
 def emit_blas_module(
@@ -1119,4 +1239,5 @@ __all__ = [
     "benchmarkable_tensor_operations", "emit_blas_module", "emit_gemm_module", "emit_module",
     "emit_operator_module", "plan_gemm_matrix_deployment", "plan_wgsl_launch",
     "supported_tensor_operations",
+    "webgpublas_gemm",
 ]

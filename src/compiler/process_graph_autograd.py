@@ -35,6 +35,22 @@ class ProcessGraphAutogradError(ValueError):
     """The semantic forward graph cannot yet be differentiated faithfully."""
 
 
+_GRAPH_ADJOINT_RULE_ALIASES = {
+    "truediv": "div",
+    "mm": "matmul",
+    "select": "where",
+    "flatten": "reshape",
+    "identity": "clone",
+}
+
+
+def graph_adjoint_rule_name(operation: str) -> str:
+    """Return the canonical graph-native backward-registry spelling."""
+
+    name = str(operation)
+    return _GRAPH_ADJOINT_RULE_ALIASES.get(name, name)
+
+
 @dataclass(frozen=True)
 class SavedValueContract:
     """Forward value or descriptor crossing into the backward graph."""
@@ -2007,13 +2023,7 @@ def differentiate_process_graph(
             # The exact predicate remains retained by the binding graph for
             # every backward rule that consumes it.
             continue
-        registry_op = {
-            "truediv": "div",
-            "mm": "matmul",
-            "select": "where",
-            "flatten": "reshape",
-            "identity": "clone",
-        }.get(op, op)
+        registry_op = graph_adjoint_rule_name(op)
         if registry_op not in BACKWARD_RULES:
             unsupported.append((int(node_id), op))
             continue
@@ -2314,6 +2324,16 @@ def compile_process_graph_backward(
     packaging does not introduce or pass through ``FusedProgram``.
     """
 
+    execution_contract = forward.G.graph.get("execution_contract")
+    if isinstance(execution_contract, Mapping):
+        backward_source = execution_contract.get("backward_source")
+        if backward_source not in {None, "process_graph"}:
+            raise ProcessGraphAutogradError(
+                "execution contract selects backward_source="
+                f"{backward_source!r}; refusing to replace it with graph "
+                "inversion"
+            )
+
     selected = str(packaging).strip().lower()
     if selected not in {"independent", "combined"}:
         raise ValueError(
@@ -2581,6 +2601,7 @@ __all__ = [
     "differentiate_control_program",
     "differentiate_process_program",
     "fuse_forward_loss_backward",
+    "graph_adjoint_rule_name",
     "isolate_process_program_adjoint_regions",
     "lower_training_motion_to_repository_ssa",
 ]
