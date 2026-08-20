@@ -1157,6 +1157,8 @@ def attach_to_metagraph(
     contract: InfluenceContract,
     *,
     classifier: Callable[[str, Mapping[str, Any]], str | None] = default_classifier,
+    profile_channel: "TelemetryChannel | None" = None,
+    phase_omega: float = 2.0 * math.pi,
 ) -> InfluenceField:
     """Subscribe a field to an ``EvolutionMetaGraph`` and return it.
 
@@ -1174,7 +1176,9 @@ def attach_to_metagraph(
     one place the topology changed meaningfully.
     """
 
-    field_view = InfluenceField(contract)
+    field_view = InfluenceField(
+        contract, profile_channel=profile_channel, phase_omega=phase_omega,
+    )
     if not contract.enabled:
         return field_view
 
@@ -1228,6 +1232,8 @@ def field_from_process_graph(
     contract: InfluenceContract,
     *,
     classifier: Callable[[str, Mapping[str, Any]], str | None] = default_classifier,
+    profile_channel: "TelemetryChannel | None" = None,
+    phase_omega: float = 2.0 * math.pi,
 ) -> InfluenceField:
     """Build a field directly from a ProcessGraph, without event replay.
 
@@ -1236,7 +1242,9 @@ def field_from_process_graph(
     which still produces a well-defined field but a less interpretable one.
     """
 
-    field_view = InfluenceField(contract)
+    field_view = InfluenceField(
+        contract, profile_channel=profile_channel, phase_omega=phase_omega,
+    )
     if not contract.enabled:
         return field_view
 
@@ -1277,6 +1285,8 @@ def field_from_dual_ir(
     regions: Mapping[int, Any] | None = None,
     classifier: Callable[[str, Mapping[str, Any]], str | None] = default_classifier,
     label: str = "dual-ir influence",
+    profile_channel: "TelemetryChannel | None" = None,
+    phase_omega: float = 2.0 * math.pi,
 ) -> InfluenceField:
     """Build a field over a ``DualIRShell``: numeric steps plus control shell.
 
@@ -1298,7 +1308,9 @@ def field_from_dual_ir(
     the one the rest of the compiler already trusts.
     """
 
-    field_view = InfluenceField(contract)
+    field_view = InfluenceField(
+        contract, profile_channel=profile_channel, phase_omega=phase_omega,
+    )
     if not contract.enabled:
         return field_view
 
@@ -1311,7 +1323,10 @@ def field_from_dual_ir(
     )
 
     metagraph = EvolutionMetaGraph()
-    field_view = attach_to_metagraph(metagraph, contract, classifier=classifier)
+    field_view = attach_to_metagraph(
+        metagraph, contract, classifier=classifier,
+        profile_channel=profile_channel, phase_omega=phase_omega,
+    )
 
     numeric = getattr(shell, "compiled_shell_program", None)
     control = getattr(shell, "shell_control_program", None)
@@ -1437,6 +1452,8 @@ def field_from_sympy(
     contract: InfluenceContract,
     *,
     classifier: Callable[[str, Mapping[str, Any]], str | None] = default_classifier,
+    profile_channel: "TelemetryChannel | None" = None,
+    phase_omega: float = 2.0 * math.pi,
 ) -> InfluenceField:
     """Build a field over authored SymPy equations: the stage before compiling.
 
@@ -1456,7 +1473,9 @@ def field_from_sympy(
     other builders use, where hue reads as depth-of-origin.
     """
 
-    field_view = InfluenceField(contract)
+    field_view = InfluenceField(
+        contract, profile_channel=profile_channel, phase_omega=phase_omega,
+    )
     if not contract.enabled:
         return field_view
 
@@ -1501,6 +1520,8 @@ def field_from_ssa(
     *,
     functions: Sequence[str] | None = None,
     classifier: Callable[[str, Mapping[str, Any]], str | None] = default_classifier,
+    profile_channel: "TelemetryChannel | None" = None,
+    phase_omega: float = 2.0 * math.pi,
 ) -> InfluenceField:
     """Build a field over lowered SSA: def-use plus real block control flow.
 
@@ -1515,7 +1536,9 @@ def field_from_ssa(
     phi merges by adding power sums exactly as any other confluence does.
     """
 
-    field_view = InfluenceField(contract)
+    field_view = InfluenceField(
+        contract, profile_channel=profile_channel, phase_omega=phase_omega,
+    )
     if not contract.enabled:
         return field_view
 
