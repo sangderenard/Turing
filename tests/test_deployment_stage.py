@@ -81,6 +81,17 @@ def test_manifest_record_is_json_shaped():
     assert "compute" in strategies["glsl"]
 
 
+def test_presentation_dispatch_does_not_cut_an_untranslatable_numeric_region():
+    program = _region()
+    program.outputs = {"red": 2}
+    plan = plan_region_deployments({0: program})
+
+    assert plan.decisions[0].classification.execution_class == "graphics-output"
+    assert plan.decisions[0].choice_for("glsl").strategy == "dispatch"
+    assert plan.decisions[0].classification.compute_shader_targets == ()
+    assert plan.shader_region_cuts == {}
+
+
 def test_gate_stays_open_without_any_calibration():
     plan = plan_region_deployments(
         {0: _region(), 1: _region()},

@@ -27,7 +27,7 @@ frames are the ones that probe, through ``calibrated_verdict``.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from .deployment_calibration import CalibrationStore, WorkloadSignature
@@ -123,6 +123,7 @@ class WaveDeploymentDecision:
 class RegionDeploymentPlan:
     decisions: tuple[RegionDeploymentDecision, ...]
     waves: tuple[WaveDeploymentDecision, ...] = ()
+    shader_region_cuts: Mapping[int, Any] = field(default_factory=dict)
 
     def decision_for(self, region_index: int) -> RegionDeploymentDecision | None:
         for decision in self.decisions:
@@ -155,6 +156,12 @@ class RegionDeploymentPlan:
         return {
             str(wave.deployment_region_id): wave.as_record()
             for wave in self.waves
+        }
+
+    def shader_regions_manifest(self) -> dict[str, dict[str, Any]]:
+        return {
+            str(index): cut.as_record()
+            for index, cut in sorted(self.shader_region_cuts.items())
         }
 
 
@@ -192,6 +199,7 @@ def plan_region_deployments(
     presentation_channels=None,
     calibration_store: CalibrationStore | None = None,
     cores: int | None = None,
+    control_program: Any | None = None,
 ) -> RegionDeploymentPlan:
     """Classify every region and choose a strategy per backend.
 
@@ -276,8 +284,32 @@ def plan_region_deployments(
             lanes=lanes,
             choices=choices,
         ))
+    selected_shader_regions = tuple(
+        decision.region_index
+        for decision in decisions
+        if (
+            (choice := decision.choice_for("glsl")) is not None
+            and choice.strategy == "dispatch"
+            and "glsl" in decision.classification.compute_shader_targets
+        )
+    )
+    if control_program is not None:
+        absent_holes = set(selected_shader_regions) - set(map(
+            int, getattr(control_program, "region_indices", ())
+        ))
+        if absent_holes:
+            raise ValueError(
+                "GLSL deployment selected regions absent from control holes: "
+                f"{sorted(absent_holes)}"
+            )
+    from .shader_region_pipeline import cut_shader_regions
+
+    shader_region_cuts = cut_shader_regions(
+        region_programs, selected_shader_regions,
+    )
     return RegionDeploymentPlan(
         decisions=tuple(decisions), waves=tuple(waves),
+        shader_region_cuts=shader_region_cuts,
     )
 
 

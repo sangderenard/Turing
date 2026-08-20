@@ -122,6 +122,9 @@ def test_installed_control_shell_executes_loop_in_one_dispatch(gl):
         {3: CapturedFusedProgram(program, {})},
         instrumentation=True,
     )
+    assert artifact.shader_region_links[3]["cut"]["hole"]["marker"] == (
+        "__scheduled_region_3__"
+    )
     installed = InstalledGLSLControlShell(artifact)
     try:
         from src.common.tensors.accelerator_backends.glsl_backend import (

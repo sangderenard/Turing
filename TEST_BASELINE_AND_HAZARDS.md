@@ -45,6 +45,7 @@ pre-existing and independent of the namespace/indexing fixes on top.
 | `tests/test_index_set_scatter.py` | **2 failed, 7 passed** | `test_index_set_emits_a_complete_scatter_module`, `test_index_set_scatter_runs_correctly` |
 | `tests/test_extraction_contract.py` | **2 failed, 14 passed** | `test_default_contract_draws_python_native_and_decompile_lines`, `test_print_host_boundary_uses_existing_stream_operator` — both assert `print` decides `python_host_call`; it now decides `use_native`. Verified 2026-08-20 in a clean worktree at `6cb148b`: identical there, so pre-existing. |
 | `tests/test_process_graph_autograd.py` | **1 failed, 16 passed, 3 xfailed** | `test_real_abstract_nn_xor_has_exact_native_adjoint_and_training_loop` — `NotImplementedError: SSATensorOperations must implement tolist_()` (`abstraction.py:752`). Verified 2026-08-19 in a clean worktree at `2ee2fd1`: identical there, so it is pre-existing and unrelated to the LLVM load/store work on top. |
+| `tests/test_site_bundle.py` (focused bundle pair) | **2 failed** | `test_program_bundle_owns_page_source_wasm_manifest_and_inventory`, `test_one_shot_bundle_packages_the_discovery_numeric_trace` — both reach WASM fidelity and fail with `ValueError: a compiled program needs at least one output`. Verified 2026-08-20 in a clean worktree at `735409d`; unrelated to the shader-region deployment stage. |
 
 ## The manifest — known-good at `af00599` plus the current working tree
 

@@ -2673,6 +2673,7 @@ def build_program_bundle(
                 if _stage_channels else None
             ),
             calibration_store=CalibrationStore(),
+            control_program=real_control,
         )
         channel.log(
             "deployment plan computed", path="regions",
@@ -3464,6 +3465,9 @@ def build_program_bundle(
                 # Region strategies above remain the authority for how each
                 # individual numerical body is served.
                 "native_deployment_frames": deployment_plan.waves_manifest(),
+                # Deployment-selected GLSL regions are cut behind deterministic
+                # typed holes before the backend-specific sealed second pass.
+                "shader_region_holes": deployment_plan.shader_regions_manifest(),
             },
             "artifacts": _artifact_inventory(temporary),
         }

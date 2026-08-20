@@ -58,7 +58,7 @@ import threading
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -1216,6 +1216,7 @@ class ComposedGLSLControlArtifact:
     value_aliases: Mapping[int, int]
     contiguous_plan: Any = None
     phase_sources: tuple[str, ...] = ()
+    shader_region_links: Mapping[int, Any] = field(default_factory=dict)
     specialized_values: Mapping[int, Any] = field(default_factory=dict)
     instrumentation: bool = False
     debug_capacity: int = 65536
@@ -1551,6 +1552,10 @@ def compose_control_shader(
             return False
         return False
 
+    captured_regions = {
+        int(index): getattr(value, "captured_program", value)
+        for index, value in captured_regions.items()
+    }
     stream_publications = _control_stream_publications(
         control_program.root
     )
@@ -2539,26 +2544,21 @@ def compose_control_shader(
                     body,
                 ))
                 stop = str(next(iter(source_counts)))
-            lowered_loop = LoopBlock(
-                block.induction,
-                block.start,
-                stop,
-                block.step,
-                body,
-                block.carried_aliases,
-                bool(
+            lowered_loop = replace(
+                block,
+                stop=stop,
+                body=body,
+                parallel_iterations=bool(
                     block.parallel_iterations
                     and str(block.induction)
                     == selected_workgroup_induction
                 ),
-                (
+                dispatch_shell=(
                     "c"
                     if str(block.induction)
                     == selected_c_dispatch_induction
                     else "glsl"
                 ),
-                block.recursion_region_id,
-                block.schedule_preference,
             )
             if (
                 device_resident
@@ -3040,8 +3040,44 @@ def build_control_shader_artifact(
     stream_outputs: Mapping[str, int] | None = None,
     specialized_values: Mapping[int, Any] | None = None,
     device_resident: bool = False,
+    shader_region_cuts: Mapping[int, Any] | None = None,
+    work_contract: Any | None = None,
 ) -> ComposedGLSLControlArtifact:
-    """Build source and the value-routing plan required to execute it."""
+    """Build and link the sealed shader interiors required by outer control."""
+
+    shader_region_artifacts = {}
+    from src.compiler.shader_region_pipeline import (
+        cut_shader_regions,
+        link_shader_regions,
+    )
+
+    if shader_region_cuts is None:
+        shader_region_cuts = cut_shader_regions(
+            captured_regions, control_program.region_indices,
+        )
+    if shader_region_cuts:
+
+        captured_regions, shader_region_artifacts = link_shader_regions(
+            control_program,
+            captured_regions,
+            shader_region_cuts,
+            contract=work_contract,
+            local_size=local_size,
+        )
+    else:
+        shader_region_artifacts = {
+            int(index): value
+            for index, value in captured_regions.items()
+            if hasattr(value, "artifact_digest") and hasattr(value, "cut")
+        }
+    shader_region_links = {
+        int(index): artifact.as_record()
+        for index, artifact in sorted(shader_region_artifacts.items())
+    }
+    captured_regions = {
+        int(index): getattr(value, "captured_program", value)
+        for index, value in captured_regions.items()
+    }
 
     source = compose_control_shader(
         control_program,
@@ -3743,6 +3779,13 @@ def build_control_shader_artifact(
         "workgroup_loop_bounds": workgroup_loop_bounds,
         "c_dispatch_loop_bounds": c_dispatch_loop_bounds,
         "private_value_capacities": private_value_capacities,
+        "shader_region_links": {
+            int(index): {
+                "capsule_digest": artifact.cut.capsule.capsule_digest,
+                "artifact_digest": artifact.artifact_digest,
+            }
+            for index, artifact in sorted(shader_region_artifacts.items())
+        },
     }
     semantic_base = _semantic_cache_digest(semantic_cache_record)
     phase_cache_identities = tuple(
@@ -3791,6 +3834,7 @@ def build_control_shader_artifact(
         value_aliases=aliases,
         contiguous_plan=contiguous_plan,
         phase_sources=phase_sources,
+        shader_region_links=shader_region_links,
         specialized_values={
             int(value_id): value
             for value_id, value in (specialized_values or {}).items()
@@ -9181,6 +9225,15 @@ def _emit_captured_fused_program_source(
         )
     if kind == "matmul":
         right_meta = metadata[step.input_ids[1]]
+        if step.attrs.get("shader_identity") == "source_algorithm":
+            return emit_source_matmul_source(
+                tuple(source_meta.shape or ()),
+                tuple(right_meta.shape or ()),
+                left_dtype=source_meta.dtype,
+                right_dtype=right_meta.dtype,
+                output_dtype=output_meta.dtype,
+                local_size=local_size,
+            )
         return emit_matmul_source(
             tuple(source_meta.shape or ()),
             tuple(right_meta.shape or ()),
@@ -9375,6 +9428,15 @@ def captured_program_snippet(
         )
     if kind == "matmul":
         right_meta = metadata[step.input_ids[1]]
+        if step.attrs.get("shader_identity") == "source_algorithm":
+            return source_matmul_snippet(
+                tuple(source_meta.shape or ()),
+                tuple(right_meta.shape or ()),
+                left_dtype=source_meta.dtype,
+                right_dtype=right_meta.dtype,
+                output_dtype=output_meta.dtype,
+                base=base,
+            )
         return matmul_snippet(
             tuple(source_meta.shape or ()),
             tuple(right_meta.shape or ()),
@@ -9455,14 +9517,25 @@ def captured_program_snippet(
     raise ValueError(f"unsupported captured GLSL kernel kind {kind!r}")
 
 
-def compile_captured_fused_program(captured) -> str:
-    """Compile and cache the shader for one captured numerical region."""
+def compile_captured_fused_program(captured, *, _sealed: bool = False) -> str:
+    """Compile one captured region through the sealed shader second pass."""
+
+    if not _sealed:
+        from src.compiler.shader_region_pipeline import (
+            compile_shader_region,
+            cut_shader_region,
+        )
+
+        artifact = compile_shader_region(cut_shader_region(-1, captured))
+        captured = artifact.captured_program
 
     stages = tuple(getattr(captured, "stages", ()) or ())
     if stages:
         return "\n".join(
             f"// captured stage {index}\n"
-            + compile_captured_fused_program(type(captured)(stage, {}))
+            + compile_captured_fused_program(
+                type(captured)(stage, {}), _sealed=True,
+            )
             for index, stage in enumerate(stages)
         )
     program = captured.program
