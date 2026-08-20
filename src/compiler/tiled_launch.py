@@ -98,44 +98,20 @@ class TiledGemm:
         ``a`` is (m, k) flattened, ``b`` (k, n), ``c`` (m, n). ``c`` is not
         mutated; the result is a fresh array, matching the bank kernels'
         own convention of returning the written output.
+
+        The decomposition is a deployment-vocabulary PLAN
+        (``tiling_strategy.build_gemm_tile_plan``) executed by the
+        deployment layer's serial-fallback executor -- this object supplies
+        only the two prebaked variants and the caller-facing signature, so
+        the worker pools thread the plan in one place when they land.
         """
 
-        tile = self.tile
-        a2 = np.asarray(a, dtype=float).reshape(m, k)
-        b2 = np.asarray(b, dtype=float).reshape(k, n)
-        out = np.array(np.asarray(c, dtype=float).reshape(m, n))
+        from .tiling_strategy import build_gemm_tile_plan, run_gemm_tile_plan
 
-        for i0 in range(0, m, tile):
-            mi = min(tile, m - i0)
-            for j0 in range(0, n, tile):
-                nj = min(tile, n - j0)
-                for index_p, p0 in enumerate(range(0, k, tile)):
-                    kp = min(tile, k - p0)
-                    block_beta = float(beta) if index_p == 0 else 1.0
-                    a_tile = np.ascontiguousarray(
-                        a2[i0:i0 + mi, p0:p0 + kp]
-                    ).reshape(-1)
-                    b_tile = np.ascontiguousarray(
-                        b2[p0:p0 + kp, j0:j0 + nj]
-                    ).reshape(-1)
-                    c_tile = np.ascontiguousarray(
-                        out[i0:i0 + mi, j0:j0 + nj]
-                    ).reshape(-1)
-                    if mi == tile and nj == tile and kp == tile:
-                        produced = self.core.run({
-                            "A": a_tile, "B": b_tile, "C": c_tile,
-                            "alpha": float(alpha), "beta": block_beta,
-                        })
-                    else:
-                        produced = self.edge.run({
-                            "A": a_tile, "B": b_tile, "C": c_tile,
-                            "alpha": float(alpha), "beta": block_beta,
-                            "m": mi, "n": nj, "k": kp,
-                        })
-                    out[i0:i0 + mi, j0:j0 + nj] = np.asarray(
-                        produced
-                    ).reshape(mi, nj)
-        return out.reshape(-1)
+        plan = build_gemm_tile_plan(m, n, k, self.tile)
+        return run_gemm_tile_plan(
+            plan, self.core, self.edge, a, b, c, float(alpha), float(beta),
+        )
 
 
 __all__ = ["TiledGemm", "TilePlan", "plan_gemm_tiling"]

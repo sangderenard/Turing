@@ -162,3 +162,72 @@ def test_run_does_not_capture_a_view_into_the_callers_memory(bank):
         "the second call's inputs were written through the first call's "
         "view into the caller's array"
     )
+
+
+# ---------------------------------------------------------------------------
+# The deployment layer's strategic recognition (tiling_strategy).
+# ---------------------------------------------------------------------------
+
+from src.compiler.tiling_strategy import (  # noqa: E402
+    build_gemm_tile_plan,
+    decide_tiling,
+)
+
+
+def test_recognition_declines_without_an_admitted_core(tmp_path):
+    empty = KernelBank(tmp_path / "empty_bank", blas_kernel_specs())
+    decision = decide_tiling(
+        empty, "gemm", {"m": 100, "n": 100, "k": 100}
+    )
+    assert not decision.tiled
+    assert any("no admitted" in reason for reason in decision.reasons)
+
+
+def test_recognition_chooses_a_core_and_explains_it(bank, tiled):
+    # ``tiled`` fixture ensured the TILE-sized core is admitted.
+    decision = decide_tiling(
+        bank, "gemm", {"m": 5 * TILE, "n": 5 * TILE, "k": 5 * TILE}
+    )
+    assert decision.tiled and decision.tile == TILE
+    assert decision.candidates  # the evidence set survives the decision
+
+
+def test_recognition_declines_the_cores_own_exact_size(bank, tiled):
+    decision = decide_tiling(
+        bank, "gemm", {"m": TILE, "n": TILE, "k": TILE}
+    )
+    assert not decision.tiled
+    assert any("exact" in reason for reason in decision.reasons)
+
+
+def test_nested_parallelism_tempers_the_worker_budget(bank, tiled):
+    flat = decide_tiling(
+        bank, "gemm", {"m": 4 * TILE, "n": 4 * TILE, "k": 4 * TILE},
+        cores=8, nested_parallelism=0,
+    )
+    nested = decide_tiling(
+        bank, "gemm", {"m": 4 * TILE, "n": 4 * TILE, "k": 4 * TILE},
+        cores=8, nested_parallelism=3,
+    )
+    assert flat.worker_budget == 8
+    assert nested.worker_budget == 2
+    assert any("tempered" in reason for reason in nested.reasons)
+    # Tempering changes the budget, never correctness of the decision.
+    assert flat.tiled and nested.tiled and flat.tile == nested.tile
+
+
+def test_the_plan_is_lanes_of_disjoint_c_blocks_with_ordered_k_steps():
+    plan = build_gemm_tile_plan(2 * TILE + 3, TILE, 3 * TILE + 1, TILE)
+    blocks = {(lane.i0, lane.j0) for lane in plan.lanes}
+    assert len(blocks) == len(plan.lanes)  # disjoint outputs = independence
+    for lane in plan.lanes:
+        assert [step.p0 for step in lane.steps] == sorted(
+            step.p0 for step in lane.steps
+        )
+        # Only the first k-step carries the caller's beta (spelled nan);
+        # every later step accumulates with 1.0.
+        first, *rest = lane.steps
+        assert np.isnan(first.beta)
+        assert all(step.beta == 1.0 for step in rest)
+    assert plan.join_mode == "barrier"
+    assert plan.schedule == "independent_lanes"

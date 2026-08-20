@@ -520,7 +520,9 @@ class LaunchCoordinator:
                  compile_missing: bool = True,
                  specialize_missing: bool = False,
                  fallback_to_reference: bool = True,
-                 tile: int | None = None):
+                 tile: int | str | None = "auto",
+                 cores: int | None = None,
+                 nested_parallelism: int = 0):
         self.bank = bank
         self.contract = contract
         self.prefer_specialized = prefer_specialized
@@ -530,19 +532,26 @@ class LaunchCoordinator:
         #: NEXT launch at these sizes routes to it.
         self.specialize_missing = specialize_missing
         self.fallback_to_reference = fallback_to_reference
-        #: When set, a gemm launch whose sizes exceed the tile on every
-        #: axis routes through the TILED composition -- the custom size is
-        #: covered by calls on the prebaked (tile, tile, tile) core plus
-        #: parametric edge tiles (``tiled_launch.TiledGemm``). Tiling is a
-        #: ROUTE of this coordinator, not a separate orchestrator: the
-        #: routing ladder is exact-size specialized > tiled > parametric >
-        #: reference, and the decision lands in routing_log.jsonl like any
-        #: other. Cross-call scheduling (threads, placement) remains the
-        #: deployment machinery's job; when deployment learns to lower a
-        #:  tile plan natively, it replaces this route's host loop, not
-        #: this coordinator.
-        self.tile = int(tile) if tile else None
-        self._tiled_gemm = None
+        #: Tiling is a ROUTE of this coordinator, not a separate
+        #: orchestrator: the ladder is exact-size specialized > tiled >
+        #: parametric > reference, every decision logged. The route's
+        #: mechanics live in the DEPLOYMENT layer (``tiling_strategy``):
+        #: ``"auto"`` (default) asks ``decide_tiling`` per launch --
+        #: strategic recognition from the bank's admitted cores, their
+        #: admission-probe throughput, the task's sizes, and the worker
+        #: budget tempered by ``nested_parallelism`` (a coordinator running
+        #: inside an already-parallel deployment must say so, so nested
+        #: recognition does not multiply worlds). An int forces that tile;
+        #: None disables the route. When deployment learns to lower a tile
+        #: plan natively it replaces the plan EXECUTOR, not this ladder.
+        self.tile: int | str | None
+        if tile == "auto":
+            self.tile = "auto"
+        else:
+            self.tile = int(tile) if tile else None
+        self.cores = cores
+        self.nested_parallelism = int(nested_parallelism)
+        self._tiled_cache: dict[int, Any] = {}
         self.log_path = bank.root / "routing_log.jsonl"
 
     def _log(self, record: dict) -> None:
@@ -583,8 +592,27 @@ class LaunchCoordinator:
                 return result
             except BankRefusal as refusal:
                 attempts.append(f"specialized: {refusal}")
-        if (
-            self.tile is not None
+        chosen_tile: int | None = None
+        tiling_reasons: tuple[str, ...] = ()
+        worker_budget = 1
+        if self.tile == "auto" and name == "gemm" and sizes:
+            from .tiling_strategy import decide_tiling
+
+            decision = decide_tiling(
+                self.bank, name, sizes, contract=self.contract,
+                cores=self.cores,
+                nested_parallelism=self.nested_parallelism,
+            )
+            tiling_reasons = decision.reasons
+            worker_budget = decision.worker_budget
+            if decision.tiled:
+                chosen_tile = decision.tile
+            else:
+                attempts.append(
+                    "tiling declined: " + "; ".join(decision.reasons)
+                )
+        elif (
+            isinstance(self.tile, int)
             and name == "gemm"
             and sizes
             and all(
@@ -594,20 +622,27 @@ class LaunchCoordinator:
             and tuple(sizes.get(axis) for axis in ("m", "n", "k"))
             != (self.tile,) * 3
         ):
+            chosen_tile = self.tile
+            tiling_reasons = (f"tile {self.tile} forced by configuration",)
+        if chosen_tile is not None:
             try:
-                if self._tiled_gemm is None:
+                composer = self._tiled_cache.get(chosen_tile)
+                if composer is None:
                     from .tiled_launch import TiledGemm
 
-                    self._tiled_gemm = TiledGemm(
-                        self.bank, tile=self.tile, contract=self.contract,
+                    composer = TiledGemm(
+                        self.bank, tile=chosen_tile, contract=self.contract,
                     )
-                result = self._tiled_gemm(
+                    self._tiled_cache[chosen_tile] = composer
+                result = composer(
                     arguments["A"], arguments["B"], arguments["C"],
                     float(arguments["alpha"]), float(arguments["beta"]),
                     sizes["m"], sizes["n"], sizes["k"],
                 )
                 self._log({"kernel": name, "route": "tiled",
-                           "tile": self.tile, "sizes": sizes})
+                           "tile": chosen_tile, "sizes": sizes,
+                           "worker_budget": worker_budget,
+                           "reasons": list(tiling_reasons)})
                 return result
             except BankRefusal as refusal:
                 attempts.append(f"tiled: {refusal}")
