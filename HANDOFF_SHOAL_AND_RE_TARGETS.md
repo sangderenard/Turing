@@ -648,6 +648,90 @@ assumed). Not attempted further this pass. The orphaned-loop refusal
 from §6i still stands as the safety net regardless of when this is
 tackled.
 
+## 6k. A cleaner design than 6h/6j's — tried, gets further, reverted with
+## the insight kept and pinned
+
+The owner's suggestion: instead of threading a new "this arm aborts"
+representation through region-scheduling/`ConditionalBlock`/lowering
+(6j's finding), make `raise` produce an ORDINARY VALUE — an error code
+— so it rides the merge/carry machinery every authored name already
+gets, with no new representation anywhere.
+
+**Root cause confirmed one layer deeper than 6h/6j assumed.**
+`reduce_statement` (`topological_reducer.py`) has explicit cases for
+`Return`/`If`/`Try`/`For`/`Assign`/etc. — **no case for `ast.Raise` at
+all**. It falls through to the generic tail, which reduces the
+exception-constructor's argument expression as dead-end dataflow and
+returns `None` for the statement itself: no graph node, no value,
+nothing for ANY downstream layer to see. This is the actual origin of
+6j's `orelse=None` conflation — region-scheduling has nothing to
+conflate `None` with in the first place, because the reducer already
+threw the raise away.
+
+**The fix is real and the merge machinery is exactly as generic as
+hoped, confirmed by reading, not assumed:**
+* `ast.If`'s merge (~2798) iterates `set(before) | set(body_environment)
+  | set(else_environment)` — genuinely any name, not an authored
+  allowlist.
+* The loop-carried-bindings computation (~3117) is `{name: (before, now)
+  for name in before.keys() & environment.keys() if before[name] !=
+  environment[name] and ...}` — also genuinely generic.
+
+  A synthetic name (`__turing_raise_error_code__`) seeded to `Const(0)`
+  once per function — gated behind "this function's body contains a
+  raise somewhere," so a function that never raises is byte-identical
+  to before the mechanism existed — rides BOTH of these for free once a
+  new `ast.Raise` case in `reduce_statement` creates a `Const` carrying
+  a small per-site error value and binds it to that name exactly the
+  way `bind_target` binds an ordinary assignment.
+
+**Implemented, measured, and reverted.** The minimal probe from §6i no
+longer hit the orphaned-loop refusal — the loop composed and reached
+Fortran EMISSION, further than either wall this arc has hit before —
+but failed there instead: `FortranEmissionError: ... carried update
+value 9 has no producer inside the loop body`. Real progress (the
+barrier moved from "loop-composer blocks" to "emission can't find a
+producer for a specific carried value"), but two things stopped this
+from being committed:
+
+1. **It silently defeats the §6i safety net as a side effect.** The
+   loop-composer's blocker (`loop_composer.py` ~3429) scans
+   `loop.body_nodes` for a node whose `expr_obj` `isinstance(...,
+   ast.Raise)`. The new reducer case never creates a node with that
+   `expr_obj` — it creates a `Const` instead and removes the raise's own
+   AST-tagged node — so the blocker finds nothing and never fires,
+   REGARDLESS of whether the rest of the pipeline can actually finish
+   the job. The clean, named §6i refusal was silently replaced by
+   whatever cryptic error emission happens to produce.
+2. **No test exercises this path, so "the gate stayed green" is not
+   evidence of safety here.** 74 passed, unchanged — because nothing in
+   it compiles a raise-in-loop program. A fix that reaches emission for
+   THIS ONE probe is not proof the new emission-level failure fires
+   cleanly (rather than silently) across the FULL SPACE of raise
+   shapes measured in §6h (`_compile`'s 12-deep single terminal else,
+   `_parse`'s four raises at varying depths, `_compile_charset`'s
+   5-deep case). Committing without that proof would risk reopening
+   exactly the silent-wrongness class this whole arc has fought,
+   through a NEW mechanism instead of the old one.
+
+Reverted cleanly (`git checkout --` on the one file this touched,
+confirmed via `git status` that nothing else was discarded). **Pinned
+instead**: `tests/test_orphaned_loop_refusal.py` (commit `afe3b8a`)
+locks in the current, verified-safe refusal as an explicit regression
+detector, so a future attempt at this exact design gets an automatic
+signal the moment it defeats the blocker's detection, rather than
+having to notice by hand the way this pass did.
+
+**What the next attempt needs that this one didn't have going in**:
+finish the emission-side diagnosis (what specifically produces "value 9
+has no producer" — likely the merge Phi for the loop's carried `total`,
+now more complex because the else arm is no longer trivially empty;
+confirm before assuming), and land the loop-composer blocker exemption
+(§6j piece 1) TOGETHER with the reducer change in the same verified
+step, so the safety net's detection is only ever removed at the exact
+moment something else has taken over its job — never as a side effect
+landed on its own.
+
 ## 7. Working rules, re-earned this session
 
 * The soft-read trap is real and it recurs: an unobservable id read as
