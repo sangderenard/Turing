@@ -44,18 +44,24 @@ sequence of steps and not itself split. Executing a lane on a worker is
 therefore safe by construction; executing steps of one lane concurrently
 is not, and the plan's shape makes that distinction unrepresentable.
 
-The serial executor here is the deployment layer's usual serial fallback.
-When the host worker pools (``turing_pool.c``) are wired, they thread
-PLANS -- one lane per job -- in one place, for this and every other
-independent-lane region alike.
+There is deliberately NO executor in this module and no runtime path
+anywhere else: tiling is a COMPILER choice made by the deployment layer.
+The decision and the plan are compile-time data for the deployment pass to
+consume when it lowers a recognized region -- emitting the tile loop, the
+packing, and the prebaked-core calls natively, with the plan's
+worker-budget bound feeding the same pool machinery (``turing_pool.c``)
+every other independent-lane region uses. Host-side composition of kernel
+calls at runtime was tried, measured, and REMOVED (owner's direction:
+this is not outer-code work); the numbers it produced survive in
+``docs/KERNEL_BANK_DESIGN.md`` as evidence that the lowering is worth
+building -- serial tiled composition alone was 1.34x over a single
+parametric call at 256^3.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping
-
-import numpy as np
 
 TILE_COMPOSITION_KIND = "tile_composition"
 
@@ -289,56 +295,6 @@ def build_gemm_tile_plan(
     )
 
 
-def run_gemm_tile_plan(
-    plan: TiledDeploymentPlan,
-    core: Any,
-    edge: Any,
-    a, b, c,
-    alpha: float,
-    beta: float,
-) -> np.ndarray:
-    """Execute a tile plan lane by lane -- the deployment serial fallback.
-
-    Lane order is free (disjoint C-blocks); step order within a lane is
-    not (accumulation). A worker pool threads this by handing LANES to
-    workers, bounded by ``plan.worker_budget`` -- never by splitting a
-    lane's steps.
-    """
-
-    tile = plan.tile
-    a2 = np.asarray(a, dtype=float).reshape(plan.m, plan.k)
-    b2 = np.asarray(b, dtype=float).reshape(plan.k, plan.n)
-    out = np.array(np.asarray(c, dtype=float).reshape(plan.m, plan.n))
-    for lane in plan.lanes:
-        c_tile = np.ascontiguousarray(
-            out[lane.i0:lane.i0 + lane.mi, lane.j0:lane.j0 + lane.nj]
-        ).reshape(-1)
-        for step in lane.steps:
-            block_beta = float(beta) if np.isnan(step.beta) else step.beta
-            a_tile = np.ascontiguousarray(
-                a2[lane.i0:lane.i0 + lane.mi, step.p0:step.p0 + step.kp]
-            ).reshape(-1)
-            b_tile = np.ascontiguousarray(
-                b2[step.p0:step.p0 + step.kp, lane.j0:lane.j0 + lane.nj]
-            ).reshape(-1)
-            if step.uses_core:
-                produced = core.run({
-                    "A": a_tile, "B": b_tile, "C": c_tile,
-                    "alpha": float(alpha), "beta": block_beta,
-                })
-            else:
-                produced = edge.run({
-                    "A": a_tile, "B": b_tile, "C": c_tile,
-                    "alpha": float(alpha), "beta": block_beta,
-                    "m": lane.mi, "n": lane.nj, "k": step.kp,
-                })
-            c_tile = np.asarray(produced).reshape(-1)
-        out[lane.i0:lane.i0 + lane.mi, lane.j0:lane.j0 + lane.nj] = (
-            c_tile.reshape(lane.mi, lane.nj)
-        )
-    return out.reshape(-1)
-
-
 __all__ = [
     "TILE_COMPOSITION_KIND",
     "TileStep",
@@ -347,5 +303,4 @@ __all__ = [
     "TilingDecision",
     "decide_tiling",
     "build_gemm_tile_plan",
-    "run_gemm_tile_plan",
 ]

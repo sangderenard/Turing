@@ -118,41 +118,41 @@ untouched, and the native build access-violates). The admission gate
 catches this for bank users; do not specialize below the unroll limit
 until the evaporator is fixed.
 
-## 4.5 The tiled route (2026-08-20)
+## 4.5 Strategic tiling is a compiler choice by the deployment layer
 
 The aim it serves (owner's): the compiler takes a CUSTOM size and exploits
 a tiling algorithm that uses only the PREBAKED operators at peak
-efficiency.
+efficiency -- as a COMPILER choice made by the deployment layer, not as
+outer host code composing kernel calls at runtime.
 
-`src/compiler/tiled_launch.py` (`TiledGemm`, `plan_gemm_tiling`) covers an
-arbitrary gemm with calls on the bank's size-specialized (T,T,T) core plus
-parametric edge tiles, reusing the kernel's own alpha/beta form (beta on
-the first k-tile, 1.0 after). It is HOST-side orchestration on purpose:
-the readable spec of the decomposition the deployment layer will
-eventually schedule natively (threads, its own packing).
+`src/compiler/tiling_strategy.py` is the deployment layer's recognition
+half, live now: `decide_tiling` (evidence-based, deployment_classification
+style -- every choice and veto carries a reason) consults the bank's
+admitted CURRENT cores, their admission-probe throughput, the task's
+shape, and a worker budget TEMPERED by nested deployment depth
+(`cores // (1 + nesting)`) so nested recognition does not multiply
+worlds. `build_gemm_tile_plan` states the full decomposition as
+compile-time data mirroring `ControlDeploymentRegion` (independent lanes =
+disjoint C-blocks, barrier join; a lane's k-steps are ordered
+accumulation, so splitting a lane is unrepresentable).
 
-**Labor division, explicitly**: the bank owns variants + admission; the
-LaunchCoordinator owns per-call routing, where tiled is one rung of ONE
-ladder — exact-size specialized > tiled > parametric > reference
-(`LaunchCoordinator(bank, tile=64)`; decisions land in routing_log.jsonl
-with `route: "tiled"`); the deployment machinery keeps cross-call
-scheduling and, when it learns to lower a tile plan natively, replaces
-the composer's host loop — never the coordinator. There is no second
-orchestrator.
+The lowering half is NOT built: the deployment pass must consume a
+`TiledDeploymentPlan` when it lowers a recognized region -- emitting the
+tile loop, packing, and prebaked-core calls natively, with the plan's
+worker budget feeding the same pool machinery (`turing_pool.c`) as every
+other independent-lane region. A host-side runtime composer was tried,
+measured, and REMOVED on the owner's direction. Its measurements survive
+as the evidence the lowering is worth building: serial tiled composition
+was exact on awkward sizes (65x130x64, 200x65x130) and 1.34x over one
+parametric call at 256^3 from cache locality alone, with the scalar tile
+core (~1.15 GF/s vs numpy ~34) the known bottleneck the vectorization
+levers multiply.
 
-Measured at 256³: tiled 1.34x over one parametric call (0.96 vs 0.72
-GF/s), correctness exact on awkward sizes (65×130×64, 200×65×130). The
-tile core itself is still scalar (~1.15 GF/s vs numpy's ~34) — the
-vectorization levers (noalias, datalayout) multiply THIS number and are
-the next work.
-
-**Defect found by composition, fixed in `CompiledVariant.run`**: the
-execution-creation path bound caller arrays by REFERENCE while the reuse
-path copied — a caller passing a numpy VIEW (what a tiling composer
-naturally passes) had its memory overwritten by the next same-signature
-call's inputs. Every tile call was individually exact while the assembled
-result was wrong. Creation now copies every feed;
-`tests/test_tiled_launch.py` pins the caller's memory directly.
+That composition experiment also caught a real defect no single-call test
+could see, and the FIX remains: `CompiledVariant.run`'s execution-creation
+path bound caller arrays by REFERENCE while the reuse path copied, so a
+caller passing a numpy view had its memory overwritten by the next
+same-signature call's inputs. Creation now copies every feed.
 
 ## 5. Interface for progressive region replacement
 
