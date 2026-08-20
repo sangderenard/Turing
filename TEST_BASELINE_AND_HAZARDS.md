@@ -43,6 +43,7 @@ pre-existing and independent of the namespace/indexing fixes on top.
 |---|---|---|
 | `tests/test_ast_indexing_aot.py` | **13 failed, 10 passed** | progress string `FF.F.FFFF.F.F.....F.FFF`, byte-identical in both trees. Individual test names NOT captured — collecting them costs a full run of an expensive file, which rule 3 forbids doing for its own sake. If you run this file for your own reasons, paste the `-rf` names here. |
 | `tests/test_index_set_scatter.py` | **2 failed, 7 passed** | `test_index_set_emits_a_complete_scatter_module`, `test_index_set_scatter_runs_correctly` |
+| `tests/test_process_graph_autograd.py` | **1 failed, 16 passed, 3 xfailed** | `test_real_abstract_nn_xor_has_exact_native_adjoint_and_training_loop` — `NotImplementedError: SSATensorOperations must implement tolist_()` (`abstraction.py:752`). Verified 2026-08-19 in a clean worktree at `2ee2fd1`: identical there, so it is pre-existing and unrelated to the LLVM load/store work on top. |
 
 ## The manifest — known-good at `af00599` plus the current working tree
 

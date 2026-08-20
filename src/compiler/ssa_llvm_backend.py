@@ -1751,6 +1751,37 @@ def _emit_repository_call_module(
             if operation in {"Load", "load"} and result is not None and instruction.args:
                 addressed = span_addresses.get(int(instruction.args[0].id))
                 if addressed is not None:
+                    loaded_type = _value_llvm_type(result)
+                    if loaded_type in {"double", "i32", "i1"}:
+                        # Pin the loaded scalar to its own slot.
+                        #
+                        # Aliasing the result to the ADDRESS instead (what
+                        # this did) makes the value mean "whatever that
+                        # element holds when a use is reached" rather than
+                        # "what it held here". Array addresses are
+                        # deliberately never register-cached, so every use
+                        # re-emitted its own load; with an intervening store
+                        # to the same element, later uses read the NEW
+                        # contents. Reading a pair, combining them, and
+                        # writing both back -- every plane rotation, every
+                        # in-place swap -- then silently computed with the
+                        # already-overwritten operand, while emitting
+                        # cleanly. See tests/test_llvm_inplace_store_aliasing.
+                        #
+                        # Restricted to scalars on purpose: an i64 may be a
+                        # reference and a wider load may be an aggregate
+                        # base that later addressing still needs to reach
+                        # through, and both are handled below.
+                        pinned = f"%pinned.load.{tag}"
+                        body.append(
+                            f"  {pinned} = load {loaded_type}, ptr "
+                            f"{addressed}, align 8"
+                        )
+                        body.append(
+                            f"  store {loaded_type} {pinned}, ptr "
+                            f"{pointer(result)}, align 8"
+                        )
+                        continue
                     pointers[result_id] = addressed
                     continue
                 member = address_members.get(int(instruction.args[0].id))

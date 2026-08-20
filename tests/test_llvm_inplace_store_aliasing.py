@@ -159,33 +159,54 @@ def pair_update_native():
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "known defect: a value loaded before an in-place store is re-read "
-        "after it, so the second store sees the overwritten element instead "
-        "of the local it was bound to"
-    ),
-    strict=True,
-)
 def test_a_value_read_before_an_inplace_store_survives_it(pair_update_native):
     assert np.allclose(
         pair_update_native, _pair_update_reference(VALUES, N)
     )
 
 
-def test_the_defect_has_exactly_the_shape_this_file_claims(pair_update_native):
-    """Not merely 'wrong': wrong in the one specific way described above.
+def test_the_second_store_uses_the_operand_it_was_written_with(pair_update_native):
+    """Not merely 'right': right in the one specific way that was wrong.
 
-    Pinning the actual wrong value is what makes this a diagnosis rather than
-    an observation, and it is what will tell a future fix whether it addressed
-    this defect or merely perturbed it.
+    The defect produced ``2x + y``, which is ``(2x - 3y) + 4y`` -- the
+    already-stored ``a[k]`` substituted for ``x``. Asserting against that
+    exact value, rather than only against the correct one, is what keeps this
+    a regression test for THIS defect instead of a general smoke test that
+    some future unrelated change could satisfy by accident.
     """
 
     x = VALUES[:N]
     y = VALUES[N:]
-    # The first store is correct.
     assert np.allclose(pair_update_native[:N], 2.0 * x - 3.0 * y)
-    # The second reads the just-written a[k] in place of x: (2x - 3y) + 4y.
-    assert np.allclose(pair_update_native[N:], 2.0 * x + y)
-    # Which is emphatically not what was written.
-    assert not np.allclose(pair_update_native[N:], x + 4.0 * y)
+    assert np.allclose(pair_update_native[N:], x + 4.0 * y)
+    # The old wrong answer, named so it cannot come back unnoticed.
+    assert not np.allclose(pair_update_native[N:], 2.0 * x + y)
+
+
+def test_the_loaded_value_is_pinned_rather_than_re_read(pair_update_native):
+    """The emitted IR must load each element once, not once per use.
+
+    The behavioural tests above would also pass if a later pass happened to
+    hide the duplicate load; this asserts the actual shape of the emission, so
+    the fix is checked where it was made.
+    """
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        module, _outputs, _exports = lower_ast_source_to_ssa(
+            PAIR_UPDATE, "pair_update", name="ir"
+        )
+    ir = emit_ssa_function_to_llvm(module, "ir__pair_update").llvm_ir
+    region = ir.split("define void @__ssa_ir__pair_update__planned_region_0")[1]
+    region = region.split("\n}")[0]
+
+    # Two elements are read (a[k] and a[n+k]); each is loaded from its array
+    # address exactly once, and both loads precede the first store.
+    array_loads = [
+        line for line in region.splitlines()
+        if "load double, ptr %address." in line
+    ]
+    assert len(array_loads) == 2, (
+        "expected one load per element read; a third means a use re-read the "
+        f"element instead of using the pinned value:\n{region}"
+    )
