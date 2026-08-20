@@ -46,6 +46,7 @@ def test_outer_math_product_owns_a_synchronized_blas_subunit(tmp_path):
     assert coverage["gemm"]["realizations"]["webgpu"]["status"] == "packaged"
     assert coverage["axpy"]["realizations"]["native"]["status"] == "packaged"
     assert coverage["axpy"]["realizations"]["python"]["status"] == "packaged"
+    assert coverage["axpy"]["realizations"]["python_numpy"]["status"] == "packaged"
     assert coverage["axpy"]["realizations"]["webgpu"]["status"] == "packaged"
 
     generated = _load_generated(product.python_loader)
@@ -59,17 +60,24 @@ def test_outer_math_product_owns_a_synchronized_blas_subunit(tmp_path):
         a = rng.standard_normal((17, 17))
         b = rng.standard_normal((17, 17))
         assert np.max(np.abs(math.blas.gemm(a, b) - a @ b)) < 1.0e-10
+        assert math.numpy.libraries == ("blas",)
+        assert np.max(np.abs(math.numpy.blas.gemm(a, b) - a @ b)) < 1.0e-10
         class Host:
             pass
 
-        assert math.install(Host) is math
-        assert Host.math is math
+        assert math.install(Host) is math.numpy
+        assert Host.math is math.numpy
+        class NativeHost:
+            pass
+
+        assert math.install(NativeHost, implementation="native") is math
+        assert NativeHost.math is math
         from src.common.tensors.abstraction import AbstractTensor
 
         semantic = AbstractTensor.math
-        assert math.install(AbstractTensor) is math
-        assert AbstractTensor.compiled_math is math
-        assert AbstractTensor.math.product is math
+        assert math.install(AbstractTensor) is math.numpy
+        assert AbstractTensor.compiled_math is math.numpy
+        assert AbstractTensor.math.product is math.numpy
         tensor = AbstractTensor.get_tensor([1.0, 2.0, 3.0])
         assert AbstractTensor.blas.scal(tensor, 2.0).tolist() == [2.0, 4.0, 6.0]
         assert AbstractTensor.use_semantic_mathematical_library() is semantic
@@ -85,6 +93,13 @@ def test_outer_math_product_owns_a_synchronized_blas_subunit(tmp_path):
     header = product.directory / manifest["surfaces"]["native"]["header"]
     assert "turing_blas_server.h" in header.read_text(encoding="utf-8")
     native_blas = manifest["surfaces"]["native"]["libraries"]["blas"]
+    assert manifest["surfaces"]["python"]["default_installation"] == "numpy"
+    assert "load as load_numpy" in (
+        product.directory / "python" / "__init__.py"
+    ).read_text(encoding="utf-8")
+    assert manifest["surfaces"]["python"]["numpy"]["source_sha256"] == hashlib.sha256(
+        product.numpy_loader.read_bytes()
+    ).hexdigest()
     assert (product.directory / native_blas["library"]).is_file()
     assert (product.directory / native_blas["header"]).is_file()
     for relative, record in manifest["artifacts"].items():

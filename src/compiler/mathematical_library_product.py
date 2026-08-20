@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping
 
 from ..common.tensors.mathematical_library import TURING_MATHEMATICAL_LIBRARY
 from .blas_server import BLASServerProduct, build_blas_server
+from .numpy_mathematical_library import emit_numpy_mathematical_library
 from .wasm_binary import CodeBuilder, build_module
 
 
@@ -28,6 +29,7 @@ class MathematicalLibraryProduct:
     manifest_path: Path
     matrix_path: Path
     python_loader: Path
+    numpy_loader: Path
     javascript_path: Path
     wasm_path: Path
     demo_path: Path
@@ -74,6 +76,10 @@ def _coverage(blas: BLASServerProduct) -> list[dict[str, Any]]:
         surface: frozenset(roles)
         for surface, roles in blas.manifest["surface_roles"].items()
     }
+    deployed["python_numpy"] = frozenset(
+        method.identity
+        for method in TURING_MATHEMATICAL_LIBRARY.library("blas").methods
+    )
     records = []
     for method in TURING_MATHEMATICAL_LIBRARY.library("blas").methods:
         realizations = {
@@ -88,7 +94,7 @@ def _coverage(blas: BLASServerProduct) -> list[dict[str, Any]]:
                     "reason": "no durable deployment product is registered yet",
                 } if method.identity not in deployed[surface] else {}),
             }
-            for surface in ("native", "python", "webgpu")
+            for surface in ("native", "python", "python_numpy", "webgpu")
         }
         records.append({
             "method": method.name,
@@ -124,17 +130,31 @@ class TuringMathematicalLibrary:
             raise RuntimeError("generated BLAS loader cannot be imported")
         spec.loader.exec_module(module)
         self.blas = module.load(self.root / product["path"])
+        numpy_loader = self.root / self.manifest["surfaces"]["python"]["numpy"]["module"]
+        numpy_spec = importlib.util.spec_from_file_location(
+            "packaged_turing_numpy_math", numpy_loader,
+        )
+        numpy_module = importlib.util.module_from_spec(numpy_spec)
+        if numpy_spec.loader is None:
+            raise RuntimeError("generated NumPy mathematical library cannot be imported")
+        numpy_spec.loader.exec_module(numpy_module)
+        self.numpy = numpy_module.load()
 
     @property
     def libraries(self):
         return tuple(self.matrix["products"])
 
-    def install(self, host, attribute="math"):
+    def install(self, host, attribute="math", implementation="numpy"):
+        providers = {"numpy": self.numpy, "native": self}
+        try:
+            provider = providers[str(implementation)]
+        except KeyError as error:
+            raise ValueError("implementation must be 'numpy' or 'native'") from error
         hook = getattr(host, "install_mathematical_library", None)
         if hook is not None:
-            return hook(self)
-        setattr(host, str(attribute), self)
-        return self
+            return hook(provider)
+        setattr(host, str(attribute), provider)
+        return provider
 
     def close(self):
         self.blas.close()
@@ -190,15 +210,22 @@ is recorded per method rather than inferred from which files happen to exist.
 from python import load
 math = load()
 result = math.blas.gemm(a, b)
-math.install(MyNumericalHost)  # host hook, or attach the product as .math
+numpy_math = math.install(MyNumericalHost)  # standalone NumPy is the default
+native_math = math.install(AnotherHost, implementation="native")
 math.close()
 ```
 
-The Python subunit accepts NumPy-compatible arrays and calls the packaged
-native library.  In a Turing checkout it can also bootstrap `AbstractTensor`
-explicitly while preserving the default graph-building implementation:
+`math.numpy` is a standalone NumPy class whose numerical bodies were manifested
+from the canonical AbstractTensor graphs by the compiler. `math.blas` is the
+separate native-DLL realization. In a Turing checkout the NumPy class can
+bootstrap `AbstractTensor` while preserving the default graph-building
+implementation:
 
 ```python
+from python import load_numpy
+
+numpy_math = load_numpy()  # this file needs only NumPy at runtime
+
 from src.common.tensors.abstraction import AbstractTensor
 
 math.install(AbstractTensor)
@@ -237,6 +264,7 @@ def build_mathematical_library_product(
         bank, gemm_shapes, root / "libraries" / "blas",
         contract=contract, cores=cores, candidate_sizes=candidate_sizes,
     )
+    numpy_source, numpy_receipt = emit_numpy_mathematical_library()
     matrix = {
         "schema": MATRIX_SCHEMA,
         "catalog": TURING_MATHEMATICAL_LIBRARY.to_mapping(include_source=True),
@@ -246,6 +274,13 @@ def build_mathematical_library_product(
                 "product_id": blas.manifest["product_id"],
                 "matrix_sha256": blas.manifest["server_matrix_sha256"],
                 "coverage": _coverage(blas),
+            },
+        },
+        "python_realizations": {
+            "numpy": numpy_receipt,
+            "native": {
+                "provider": "libraries/blas/python/turing_blas_server.py",
+                "matrix_sha256": blas.manifest["server_matrix_sha256"],
             },
         },
     }
@@ -261,8 +296,13 @@ def build_mathematical_library_product(
         path.mkdir(parents=True, exist_ok=True)
     python_loader = python_root / "turing_mathematical_library.py"
     python_loader.write_text(_python_loader(), encoding="utf-8", newline="\n")
+    numpy_loader = python_root / "turing_numpy_mathematical_library.py"
+    numpy_loader.write_text(numpy_source, encoding="utf-8", newline="\n")
     (python_root / "__init__.py").write_text(
-        "from .turing_mathematical_library import TuringMathematicalLibrary, load\n",
+        "from .turing_mathematical_library import TuringMathematicalLibrary, load\n"
+        "from .turing_numpy_mathematical_library import (\n"
+        "    NumPyBLAS, NumPyMathematicalLibrary, load as load_numpy,\n"
+        ")\n",
         encoding="utf-8", newline="\n",
     )
     native_header = native_root / "turing_mathematical_library.h"
@@ -338,6 +378,18 @@ def build_mathematical_library_product(
                 "loader": python_loader.relative_to(root).as_posix(),
                 "entry": "load",
                 "installation_entry": "TuringMathematicalLibrary.install",
+                "default_installation": "numpy",
+                "numpy": {
+                    "module": numpy_loader.relative_to(root).as_posix(),
+                    "entry": "load",
+                    "class": "NumPyMathematicalLibrary",
+                    "compiler": numpy_receipt["compiler"],
+                    "source_sha256": numpy_receipt["module_source_sha256"],
+                },
+                "native": {
+                    "selector": "native",
+                    "provider": "TuringMathematicalLibrary.blas",
+                },
             },
             "web": {
                 "wasm": wasm_path.relative_to(root).as_posix(),
@@ -352,7 +404,7 @@ def build_mathematical_library_product(
         json.dumps(manifest, indent=2), encoding="utf-8", newline="\n",
     )
     return MathematicalLibraryProduct(
-        root, manifest_path, matrix_path, python_loader, javascript_path,
+        root, manifest_path, matrix_path, python_loader, numpy_loader, javascript_path,
         wasm_path, demo_path, blas, manifest,
     )
 

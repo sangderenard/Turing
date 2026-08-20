@@ -75,6 +75,32 @@ def _verify(product) -> None:
             "verified math.blas methods: "
             + ", ".join(f"{name}={error:.1e}" for name, error in checks.items())
         )
+        numpy_checks = {
+            "scal": float(np.max(np.abs(library.numpy.blas.scal(x, 1.25) - 1.25 * x))),
+            "axpy": float(np.max(np.abs(
+                library.numpy.blas.axpy(x, y, 1.25) - (1.25 * x + y)
+            ))),
+            "dot": abs(library.numpy.blas.dot(x, y) - float(x @ y)),
+            "gemv": float(np.max(np.abs(
+                library.numpy.blas.gemv(a_vector, x) - a_vector @ x
+            ))),
+            "gemm": float(np.max(np.abs(library.numpy.blas.gemm(a, b) - a @ b))),
+        }
+        nrx, nry = library.numpy.blas.rot(x, y, 0.8, 0.6)
+        numpy_checks["rot"] = max(
+            float(np.max(np.abs(nrx - (0.8 * x + 0.6 * y)))),
+            float(np.max(np.abs(nry - (0.8 * y - 0.6 * x)))),
+        )
+        if max(numpy_checks.values()) >= 1.0e-9:
+            raise RuntimeError(
+                f"standalone NumPy mathematical library diverged: {numpy_checks!r}"
+            )
+        print(
+            "verified math.numpy.blas methods: "
+            + ", ".join(
+                f"{name}={error:.1e}" for name, error in numpy_checks.items()
+            )
+        )
     finally:
         if "library" in locals():
             library.close()
@@ -108,6 +134,7 @@ def main() -> int:
     print(f"Mathematical library: {product.directory}")
     print(f"  manifest : {product.manifest_path}")
     print(f"  Python   : {product.python_loader}")
+    print(f"  NumPy    : {product.numpy_loader}")
     print(f"  Web      : {product.demo_path}")
     print(f"  product  : {product.manifest['product_id']}")
     if not args.serve:
