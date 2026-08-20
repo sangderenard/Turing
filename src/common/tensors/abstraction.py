@@ -1865,9 +1865,18 @@ class AbstractTensor:
         )
 
     def index_select(self, dim: int = 0, indices: Any = None) -> "AbstractTensor":
+        # Was missing entirely: this built its result directly with no
+        # _pre_autograd call, so any gradient reaching an index_select in
+        # the forward graph silently stopped here -- found while building
+        # AbstractTensor.interp, which genuinely needs to backprop through
+        # the gathers that pick each query point's bracketing samples.
+        indices_tensor = indices if isinstance(indices, AbstractTensor) else self.ensure_tensor(indices)
+        finalize = AbstractTensor._pre_autograd(
+            "index_select", [self, indices_tensor], params={"dim": dim}
+        )
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.index_select_(dim, indices)
-        return result
+        return finalize(result)
 
     def argmin(self, dim: Optional[int] = None) -> "AbstractTensor":
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
@@ -1982,6 +1991,61 @@ class AbstractTensor:
 
         finalize = AbstractTensor._pre_autograd("searchsorted", [seq, vals], params={"side": side})
         return finalize(counts)
+    @staticmethod
+    def interp(x_new: Any, x: Any, y: Any) -> "AbstractTensor":
+        """1-D linear interpolation, base-operator only.
+
+        Built from ``searchsorted`` (itself compare+sum, no backend hook)
+        plus ``index_select`` and ordinary arithmetic -- no backend hook
+        here either, so every backend inherits it, and it stays on the
+        autograd tape (differentiable in both ``x_new`` and ``y``). This is
+        the same "define once in base operators" pattern as
+        ``unravel_index_``/``searchsorted`` themselves: written for a real
+        need (porting a CWT inverse-transform's upsampling step, which used
+        ``torch.nn.functional.interpolate``, an eager, non-lowerable escape
+        hatch unsuitable for compilation) rather than as a general
+        image-resize facility -- see ``AbstractTensor.F.interpolate`` for
+        that different, torch/PIL/scipy-backed job.
+
+        ``x`` are known sample points (ascending, 1-D), ``y`` their values,
+        ``x_new`` the query points. Outside ``[x[0], x[-1]]`` the boundary
+        value is held constant, matching ``numpy.interp``'s default.
+        """
+        x = AbstractTensor.get_tensor(x)
+        y = AbstractTensor.get_tensor(y)
+        x_new = AbstractTensor.get_tensor(x_new)
+
+        n = x.get_shape()[0]
+        # Right-side insertion index, clamped to [1, n-1]: lo = idx-1 and
+        # hi = idx are then always valid neighbours, including exactly at a
+        # sample point and outside either boundary (where the clamp holds
+        # the nearest edge segment, giving the constant-extrapolation
+        # boundary behaviour numpy.interp has by default).
+        idx = AbstractTensor.searchsorted(x, x_new, side="right")
+        idx = idx.clip(1, n - 1)
+        lo = idx - 1
+
+        x_lo = x.index_select(0, lo)
+        x_hi = x.index_select(0, idx)
+        y_lo = y.index_select(0, lo)
+        y_hi = y.index_select(0, idx)
+
+        span = x_hi - x_lo
+        # A repeated sample point makes span exactly 0; the weight is
+        # irrelevant there since y_lo == y_hi for that segment, so guard the
+        # division rather than let a NaN reach an otherwise-exact result.
+        safe_span = AbstractTensor.where(
+            span == 0, AbstractTensor.ones_like(span), span
+        )
+        t = (x_new - x_lo) / safe_span
+        # Outside [x[0], x[-1]] the segment picked by the index clamp above
+        # is the nearest edge one, but t itself still linearly extrapolates
+        # past it unless also clamped -- clamping t to [0, 1] is exactly
+        # "hold the boundary value constant" (numpy.interp's default) while
+        # leaving every interior t (already naturally in [0, 1]) untouched.
+        t = t.clip(0.0, 1.0)
+        return y_lo + t * (y_hi - y_lo)
+
     @staticmethod
     def concat(*args, **kwargs):
         return AbstractTensor.cat(*args, **kwargs)

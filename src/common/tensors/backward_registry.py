@@ -1454,6 +1454,34 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "notes": "Backward of gather: scatter gradient back to x; no gradient w.r.t index.",
         "tags": ["indexing"],
     },
+    "index_select": {
+        "arity": "unary",
+        "signature": "y = index_select(x, dim, indices)",
+        "latex": r"y_i = x_{\text{indices}_i} \text{ along axis } \mathrm{dim}",
+        "backward": {
+            "x": "gx = swapaxes(index_adjoint(swapaxes(g, 0, dim), swapaxes(x, 0, dim), indices), 0, dim)",
+        },
+        "python": {
+            "parameters": ["g", "x", "indices", "dim"],
+            "body": (
+                "xt = x.swapaxes(0, dim); gt = g.swapaxes(0, dim); "
+                "adj = index_adjoint(gt, xt, indices); return adj.swapaxes(0, dim)"
+            ),
+        },
+        "domain": "indices valid for x.shape[dim]; repeated indices accumulate (correct for a many-to-one gather).",
+        "notes": (
+            "Was entirely missing: index_select() never called _pre_autograd, so "
+            "gradients silently stopped at any index_select in the forward graph "
+            "-- discovered while building AbstractTensor.interp (a real linear-"
+            "interpolation primitive genuinely needs to backprop through the "
+            "gathers that pick each query point's bracketing samples). Reuses "
+            "index_adjoint, the same repeated-index-accumulating adjoint "
+            "__getitem__'s own fancy-indexing backward already uses, rather than "
+            "gather's backward above, which overwrites on repeated indices "
+            "instead of accumulating."
+        ),
+        "tags": ["indexing"],
+    },
     "scatter": {
         "arity": "ternary",
         "signature": "y = scatter(x, index, src, dim)",
