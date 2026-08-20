@@ -23,7 +23,7 @@ to read all of it; each task file quotes what it needs.
 |---|---|---|---|---|
 | `TASK_A_constant_presence_sweep.md` | audit 3 remaining sites of the constant-presence trap | measure, then mechanical fix | low | **done** — 1 real fix (`literal_value`), 3 sites confirmed safe |
 | `TASK_B_scorecard_level14_rebound_name.md` | level 14: call argument binds a later version of a rebound name | diagnose to a named seam; fix if small | medium | **done (findings only)** — seam named exactly; a fix attempt regressed levels 8/9 and was reverted; two concrete directions recorded for the real fix |
-| `TASK_C_scorecard_level18_any_generator.md` | level 18: `any()` over a generator never renders | diagnose to a named seam; fix if small | medium | open |
+| `TASK_C_scorecard_level18_any_generator.md` | level 18: `any()` over a generator never renders | diagnose to a named seam; fix if small | medium | **done (findings only)** — task's own hypothesis disproven: the generator loop already decomposes correctly; the real gap is the materializer having zero sequence/tensor support, not a compiler defect |
 | `TASK_D_overlay_embed_scope_refusal.md` | make the control-overlay's cross-scope failure name itself | unit-level, pure data structures | low | **done** — named refusal + 4 tests; confirmed against re.compile |
 | `TASK_E_shoal_dt_next_wiring.md` | the frame's dt_next output reads 0.0 — find the missing binding link | diagnosis-first, expensive builds budgeted | medium-high | open |
 
