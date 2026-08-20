@@ -91,6 +91,9 @@ import heapq
 import math
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from .shell_telemetry import TelemetryChannel
+from ..common.tensors.abstract_convolution.node_profile_phase import NodePhaseClock
+
 SCHEMA = "turing-influence-field-v1"
 
 # Source categories. These are binding-time classes, not node kinds.
@@ -690,7 +693,13 @@ class InfluenceField:
     inspects an IR type.
     """
 
-    def __init__(self, contract: InfluenceContract | None = None) -> None:
+    def __init__(
+        self,
+        contract: InfluenceContract | None = None,
+        *,
+        profile_channel: "TelemetryChannel | None" = None,
+        phase_omega: float = 2.0 * math.pi,
+    ) -> None:
         self.contract = contract or InfluenceContract.disabled()
         self._sources: dict[Any, InfluenceSource] = {}
         self._staged: list[tuple[Any, str, int, str, str]] = []
@@ -709,6 +718,18 @@ class InfluenceField:
         # Empty unless a producer knows it -- a dependency graph carries no
         # such order, but a lowered region does: its steps are linearised.
         self.activation_order: tuple[Any, ...] = ()
+
+        # Opt-in, real-profiled per-node phase (node_profile_phase.py). Off
+        # by default -- nothing about propagate()'s existing behaviour or
+        # cost changes unless a caller supplies a channel. When enabled,
+        # every node's relaxation step (see propagate()) is timed for real
+        # via NodePhaseClock, on the SAME shell_telemetry.TelemetryChannel
+        # the compiler's own trace/profile instrumentation already flows
+        # through -- not a private clock and not a synthetic increment.
+        self._phase_channel = profile_channel
+        self._phase_omega = float(phase_omega)
+        self._phase_clocks: dict[Any, "NodePhaseClock"] = {}
+        self._phase_node_ids: dict[Any, int] = {}
 
     # -- topology intake -------------------------------------------------
 
@@ -873,69 +894,110 @@ class InfluenceField:
             _, _, node = heapq.heappop(heap)
             bundle = pending.pop(node, None)
             iteration = depth.pop(node, 0)
-            if not bundle:
-                # A stale heap entry: this slot was already drained by an
-                # earlier pop that collected everything waiting there.
-                continue
-            if sum(item.s0 for item in bundle.values()) < contract.epsilon:
-                continue
-            edges = self._outgoing.get(node, ())
-            if not edges:
-                continue
-            forks = sum(1 for _, role in edges if role in FORK_ROLES)
-            dividing = contract.fan_out == "divide"
-            # Under ``divide`` the split across all successors already accounts
-            # for branch arms; applying the fork rule as well would halve them
-            # twice.
-            share = 1.0 / len(edges) if dividing else 1.0
 
-            for target, role in edges:
-                factor = contract.attenuation * share
-                arrival = iteration
-                if role in BACK_EDGE_ROLES:
-                    factor *= contract.decay
-                    arrival += 1
-                if role in FORK_ROLES and forks and not dividing:
-                    # Alternatives, not parallel successors: the arms divide
-                    # the weight between them rather than each taking all.
-                    factor /= forks
+            def relax_one_node() -> None:
+                # Exactly the per-pop relaxation work; `step`/`node`/`bundle`/
+                # `iteration` are the enclosing loop's own locals, closed over
+                # (nonlocal `step` since it accumulates). Extracted to a
+                # callable so it can be run either directly or through a real
+                # NodePhaseClock.tick() -- see below -- without duplicating
+                # this logic or changing what it computes either way.
+                nonlocal step
+                if not bundle:
+                    # A stale heap entry: this slot was already drained by an
+                    # earlier pop that collected everything waiting there.
+                    return
+                if sum(item.s0 for item in bundle.values()) < contract.epsilon:
+                    return
+                edges = self._outgoing.get(node, ())
+                if not edges:
+                    return
+                forks = sum(1 for _, role in edges if role in FORK_ROLES)
+                dividing = contract.fan_out == "divide"
+                # Under ``divide`` the split across all successors already
+                # accounts for branch arms; applying the fork rule as well
+                # would halve them twice.
+                share = 1.0 / len(edges) if dividing else 1.0
 
-                if role in BACK_EDGE_ROLES and RECURRENT in contract.categories:
-                    # Influence that crossed a back edge is loop-carried from
-                    # here on, whatever binding time it started with.
-                    carried = self._accumulator()
-                    for moments in bundle.values():
-                        carried = carried + moments
-                    moved = {RECURRENT: carried.scaled(factor)}
-                else:
+                for target, role in edges:
+                    factor = contract.attenuation * share
+                    arrival = iteration
+                    if role in BACK_EDGE_ROLES:
+                        factor *= contract.decay
+                        arrival += 1
+                    if role in FORK_ROLES and forks and not dividing:
+                        # Alternatives, not parallel successors: the arms
+                        # divide the weight between them rather than each
+                        # taking all.
+                        factor /= forks
+
+                    if role in BACK_EDGE_ROLES and RECURRENT in contract.categories:
+                        # Influence that crossed a back edge is loop-carried
+                        # from here on, whatever binding time it started with.
+                        carried = self._accumulator()
+                        for moments in bundle.values():
+                            carried = carried + moments
+                        moved = {RECURRENT: carried.scaled(factor)}
+                    else:
+                        moved = {
+                            category: moments.scaled(factor)
+                            for category, moments in bundle.items()
+                        }
                     moved = {
-                        category: moments.scaled(factor)
-                        for category, moments in bundle.items()
+                        category: moments for category, moments in moved.items()
+                        if moments.s0 > 0.0
                     }
-                moved = {
-                    category: moments for category, moments in moved.items()
-                    if moments.s0 > 0.0
-                }
-                delivered = sum(item.s0 for item in moved.values())
-                if delivered < contract.epsilon:
-                    continue
+                    delivered = sum(item.s0 for item in moved.values())
+                    if delivered < contract.epsilon:
+                        continue
 
-                for category, moments in moved.items():
-                    per_category = self._moments.setdefault(target, {})
-                    per_category[category] = (
-                        per_category.get(category, self._accumulator()) + moments
+                    for category, moments in moved.items():
+                        per_category = self._moments.setdefault(target, {})
+                        per_category[category] = (
+                            per_category.get(category, self._accumulator())
+                            + moments
+                        )
+                        self._transports.append(Transport(
+                            step=step, source_key=node, target_key=target,
+                            category=category, hue=moments.mean,
+                            weight=moments.s0, iteration=arrival, role=role,
+                        ))
+                        step += 1
+                    hold(target, arrival, moved)
+                    enqueue(target, delivered)
+
+            if self._phase_channel is None:
+                relax_one_node()
+            else:
+                # Real profiled time, node by node: each pop is one real
+                # relaxation operation, timed by wrapping it exactly as it
+                # runs -- not a synthetic per-step increment and not a
+                # separately-reported duration. See node_profile_phase.py's
+                # own module docstring for why the operation is timed by
+                # wrapping rather than reported after the fact.
+                clock = self._phase_clocks.get(node)
+                if clock is None:
+                    node_id = self._phase_node_ids.setdefault(
+                        node, len(self._phase_node_ids)
                     )
-                    self._transports.append(Transport(
-                        step=step, source_key=node, target_key=target,
-                        category=category, hue=moments.mean,
-                        weight=moments.s0, iteration=arrival, role=role,
-                    ))
-                    step += 1
-                hold(target, arrival, moved)
-                enqueue(target, delivered)
+                    clock = NodePhaseClock(
+                        node=node_id, omega=self._phase_omega,
+                        channel=self._phase_channel,
+                    )
+                    self._phase_clocks[node] = clock
+                clock.tick(relax_one_node)
 
         self._converged = True
         return len(self._transports)
+
+    def node_phase_clock(self, key: Any) -> "NodePhaseClock | None":
+        """This node's real-profiled phase clock, if profiling was enabled
+        (``profile_channel=`` at construction) and the node was actually
+        visited by ``propagate()``. ``None`` otherwise -- a node propagate()
+        never popped has no real operation to have timed, and a field built
+        without a channel was never asked to measure anything."""
+
+        return self._phase_clocks.get(key)
 
     def _deposit(
         self, key: Any, category: str, hue: float, weight: float
