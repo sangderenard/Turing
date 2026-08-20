@@ -828,3 +828,50 @@ others compose too, but that is an expectation, not a measurement.
 * gfortran is a measurement instrument: emitting "complete" source and
   compiling it are different claims (13 → 8 → behind-the-wall errors,
   each round naming the next defect class precisely).
+
+## 8. New track (2026-08-20): AbstractTensor.blas, the missing GEMM-shaped case
+
+`docs/FUNCTION_TO_DEPLOYMENT_HANDOFF.md` section 6 ("Should we write a BLAS?
+Not now", 2026-08-19) named a real gap: nothing GEMM-shaped had been run
+through this pipeline yet, only Jacobi eigh (BLAS-1/2-shaped). This is that
+missing case, filled in the style that document itself proved: plain,
+deliberately unoptimized source -- flat 1D buffers, computed row-major
+indices (`a[i*n+j]`), parameterized loop bounds (never literal, sidestepping
+the still-open section-4.2 dead-store defect), distinct loop-variable names
+(sidestepping section 4.1b) -- with no threading/blocking/SIMD in the source
+by design: that work belongs to the compiler's own deployment/vectorization
+machinery, not to hand-tuned library code, per direct instruction.
+
+New: `src/common/tensors/blas.py` (five kernels, escalating: `scal`, `axpy`,
+`dot`, `gemv`, `gemm` -- each a source string plus a callable Python oracle)
+and `tools/compile_blas_probe.py` (the same `lower_ast_source_to_ssa` ->
+`emit_ssa_function_to_llvm` -> `compile_artifact` ->
+`prepare_artifact_execution` convention section 2 of the eigh handoff
+proved, with binding done through the function's own `parameter_names`/
+`named_outputs` metadata -- never a positional guess against `fn.args`,
+which measurably disagrees with authored order for every kernel here).
+
+**Measured, first attempt at every rung: all five kernels compile with zero
+shortfalls and match their Python oracle bit-exact (`max disagreement
+0.0e+00`)**, including `gemm` -- the real triple-nested BLAS-3 target. The
+first nested loop (`gemv`) and the triple-nested one (`gemm`) both cleared
+on the first try; the memory-recorded "nested-loop region-ownership wall"
+from the `re.compile` raise-composition work did not reach a plain
+arithmetic nested loop with no conditionals -- consistent with that wall's
+own description (a schedule/conditional-compartment disagreement specific
+to raise-guarded sibling loops).
+
+One flake observed and confirmed transient (reproduced clean on a solo
+rerun immediately after): a zig sub-compilation cache error on `axpy` when
+run back-to-back with other kernels via `--all`. Not chased further; note
+it if it recurs.
+
+Next, if this track continues: verify at larger/non-square shapes and
+non-trivial strides; measure ns/flop against the eigh-handoff's own
+1.21 GF/s scalar baseline to see whether the work-contract's existing
+`fast` preset (FMA contraction) already moves the needle on `gemm`'s inner
+product before any new backend work is attempted; only after that, revisit
+whether the compiler's deployment/vectorization gaps named in that handoff
+(`noalias`, target datalayout, loop blocking, the P3 thread pools) are the
+actual next lever, per the document's own "leveraged move is in the
+backend, not a library" argument.
