@@ -6568,6 +6568,7 @@ class GLLaunchPlan:
     local_size: int
     groups: tuple[int, int, int]
     limits: GLComputeLimits
+    deployment: Any = None
 
     @property
     def skipped(self) -> bool:
@@ -6628,12 +6629,6 @@ def _compute_limits() -> GLComputeLimits:
     return limits
 
 
-def _power_of_two_at_most(value: int) -> int:
-    if value < 1:
-        raise ValueError("value must be positive")
-    return 1 << (int(value).bit_length() - 1)
-
-
 def plan_launch(
     count: int,
     *,
@@ -6656,8 +6651,6 @@ def plan_launch(
             "launch count exceeds the uint u_count contract; use a tiled "
             "base-offset launch"
         )
-    if preferred_local_size <= 0:
-        raise ValueError("preferred local size must be positive")
     if binding_count < 0:
         raise ValueError("binding count cannot be negative")
 
@@ -6669,42 +6662,29 @@ def plan_launch(
             f"{limits.max_dispatch_ssbo_blocks}"
         )
 
-    local_cap = min(
-        int(preferred_local_size),
-        limits.max_group_size[0],
-        limits.max_invocations,
+    from src.compiler.deployment_lowering import (
+        ComputeDispatchLimits,
+        select_deployment_strategy,
     )
-    local_size = _power_of_two_at_most(local_cap)
-    if count:
-        small_target = max(1, 1 << (count - 1).bit_length())
-        minimum_group = min(32, local_size)
-        local_size = min(local_size, max(minimum_group, small_target))
-
-    if count == 0:
-        return GLLaunchPlan(count, local_size, (0, 0, 0), limits)
-
-    groups_needed = (count + local_size - 1) // local_size
-    group_x = min(groups_needed, limits.max_group_count[0])
-    remaining = (groups_needed + group_x - 1) // group_x
-    group_y = min(remaining, limits.max_group_count[1])
-    remaining = (remaining + group_y - 1) // group_y
-    group_z = remaining
-    if group_z > limits.max_group_count[2]:
-        capacity = (
-            limits.max_group_count[0]
-            * limits.max_group_count[1]
-            * limits.max_group_count[2]
-            * local_size
-        )
-        raise ValueError(
-            f"launch count {count} exceeds one-dispatch capacity {capacity}; "
-            "the caller must use a base-offset tiled launch"
-        )
+    choice = select_deployment_strategy(
+        backend="glsl",
+        execution_class="shader-compute",
+        work=count,
+        preferred_local_size=preferred_local_size,
+        compute_limits=ComputeDispatchLimits(
+            max_group_count=limits.max_group_count,
+            max_group_size=limits.max_group_size,
+            max_invocations=limits.max_invocations,
+        ),
+    )
+    if choice.compute is None:  # profile regression, never a silent fallback
+        raise RuntimeError("GLSL deployment did not produce compute geometry")
     return GLLaunchPlan(
-        count,
-        local_size,
-        (int(group_x), int(group_y), int(group_z)),
+        choice.compute.count,
+        choice.compute.workgroup_size[0],
+        choice.compute.groups,
         limits,
+        choice,
     )
 
 

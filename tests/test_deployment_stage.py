@@ -65,7 +65,7 @@ def test_plan_covers_every_region_and_backend():
     for decision in plan.decisions:
         assert decision.classification.execution_class == "thread-workers"
         backends = {choice.backend for choice in decision.choices}
-        assert {"wasm", "webgpu", "c", "llvm", "fortran"} <= backends
+        assert {"wasm", "webgpu", "glsl", "c", "llvm", "fortran"} <= backends
         assert decision.choice_for("wasm").strategy == "pool"
         assert decision.choice_for("fortran").strategy == "serial"
 
@@ -77,6 +77,8 @@ def test_manifest_record_is_json_shaped():
     strategies = record["0"]["strategies"]
     assert strategies["wasm"]["strategy"] in ("serial", "pool", "dispatch")
     assert isinstance(strategies["wasm"]["reasons"], list)
+    assert "compute" in strategies["webgpu"]
+    assert "compute" in strategies["glsl"]
 
 
 def test_gate_stays_open_without_any_calibration():

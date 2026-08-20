@@ -42,7 +42,9 @@ from .deployment_lowering import (
 
 # The backends a bundle build plans for by default: the shells that read
 # the manifest today plus the native tier the pool runtime serves.
-DEFAULT_PLANNED_BACKENDS = ("wasm", "webgpu", "c", "llvm", "fortran")
+DEFAULT_PLANNED_BACKENDS = (
+    "wasm", "webgpu", "glsl", "c", "llvm", "fortran",
+)
 
 
 def region_workload_signature(
@@ -87,13 +89,7 @@ class RegionDeploymentDecision:
         return {
             "execution_class": self.classification.execution_class,
             "strategies": {
-                choice.backend: {
-                    "strategy": choice.strategy,
-                    "workers": choice.workers,
-                    "chunk": choice.chunk,
-                    "calibration_demoted": choice.calibration_demoted,
-                    "reasons": list(choice.reasons),
-                }
+                choice.backend: choice.as_record()
                 for choice in self.choices
             },
         }
@@ -117,13 +113,7 @@ class WaveDeploymentDecision:
         return {
             "lanes": [list(lane) for lane in self.lanes],
             "strategies": {
-                choice.backend: {
-                    "strategy": choice.strategy,
-                    "workers": choice.workers,
-                    "chunk": choice.chunk,
-                    "calibration_demoted": choice.calibration_demoted,
-                    "reasons": list(choice.reasons),
-                }
+                choice.backend: choice.as_record()
                 for choice in self.choices
             },
         }

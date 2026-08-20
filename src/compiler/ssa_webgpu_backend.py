@@ -91,6 +91,7 @@ class WGSLLaunchPlan:
     workgroup_size: tuple[int, int, int]
     groups: tuple[int, int, int]
     limits: WGSLComputeLimits = WGSLComputeLimits()
+    deployment: Any = None
 
     @property
     def skipped(self) -> bool:
@@ -100,33 +101,31 @@ class WGSLLaunchPlan:
 def plan_wgsl_launch(
     count: int, *, preferred_local_size: int = 256,
 ) -> WGSLLaunchPlan:
-    count = int(count)
-    if count < 0:
-        raise ValueError("launch count cannot be negative")
-    if preferred_local_size <= 0:
-        raise ValueError("preferred local size must be positive")
     limits = WGSLComputeLimits()
-    cap = min(
-        preferred_local_size,
-        limits.max_workgroup_size[0],
-        limits.max_invocations_per_workgroup,
+    from .deployment_lowering import (
+        ComputeDispatchLimits,
+        select_deployment_strategy,
     )
-    local = 1 << (int(cap).bit_length() - 1)
-    if count:
-        local = min(local, max(min(32, local), 1 << (count - 1).bit_length()))
-    if count == 0:
-        return WGSLLaunchPlan(0, (local, 1, 1), (0, 0, 0), limits)
-    needed = (count + local - 1) // local
-    group_x = min(needed, limits.max_workgroups_per_dimension)
-    remaining = (needed + group_x - 1) // group_x
-    group_y = min(remaining, limits.max_workgroups_per_dimension)
-    group_z = (remaining + group_y - 1) // group_y
-    if group_z > limits.max_workgroups_per_dimension:
-        capacity = limits.max_workgroups_per_dimension ** 3 * local
-        raise ValueError(
-            f"launch count {count} exceeds one-dispatch capacity {capacity}"
-        )
-    return WGSLLaunchPlan(count, (local, 1, 1), (group_x, group_y, group_z), limits)
+    choice = select_deployment_strategy(
+        backend="webgpu",
+        execution_class="shader-compute",
+        work=int(count),
+        preferred_local_size=preferred_local_size,
+        compute_limits=ComputeDispatchLimits(
+            max_group_count=(limits.max_workgroups_per_dimension,) * 3,
+            max_group_size=limits.max_workgroup_size,
+            max_invocations=limits.max_invocations_per_workgroup,
+        ),
+    )
+    if choice.compute is None:  # profile regression, never a silent fallback
+        raise RuntimeError("WebGPU deployment did not produce compute geometry")
+    return WGSLLaunchPlan(
+        choice.compute.count,
+        choice.compute.workgroup_size,
+        choice.compute.groups,
+        limits,
+        choice,
+    )
 
 
 @dataclass(frozen=True)
@@ -693,6 +692,7 @@ def emit_module(
             "storage": "WebGPU storage buffers",
             "workgroup_size": launch_plan.workgroup_size,
             "dispatch_workgroups": launch_plan.groups,
+            "deployment": launch_plan.deployment.as_record(),
             "count": launch_plan.count,
             "stage": COMPUTE.name,
             "io_layout": io_layout.to_mapping(),

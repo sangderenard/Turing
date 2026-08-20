@@ -1059,6 +1059,8 @@ def test_launch_planner_auto_sizes_and_folds_flat_work(monkeypatch):
     assert folded.local_size == 128
     assert folded.groups == (4, 2, 1)
     assert np.prod(folded.groups) * folded.local_size >= folded.count
+    assert folded.deployment.backend == "glsl"
+    assert folded.deployment.compute.groups == folded.groups
 
     empty = plan_launch(0, binding_count=2)
     assert empty.skipped and empty.groups == (0, 0, 0)

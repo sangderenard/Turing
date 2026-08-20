@@ -40,6 +40,126 @@ DEPLOYMENT_STRATEGIES = (SERIAL, POOL, DISPATCH, SIMD)
 
 
 @dataclass(frozen=True)
+class ComputeDispatchLimits:
+    """Backend-supplied limits used to make one compute launch decision."""
+
+    max_group_count: tuple[int, int, int]
+    max_group_size: tuple[int, int, int]
+    max_invocations: int
+
+    def __post_init__(self) -> None:
+        if len(self.max_group_count) != 3 or len(self.max_group_size) != 3:
+            raise ValueError("compute limits must describe exactly x/y/z")
+        if any(int(value) < 1 for value in self.max_group_count):
+            raise ValueError("compute group-count limits must be positive")
+        if any(int(value) < 1 for value in self.max_group_size):
+            raise ValueError("compute group-size limits must be positive")
+        if int(self.max_invocations) < 1:
+            raise ValueError("compute invocation limit must be positive")
+
+
+@dataclass(frozen=True)
+class ComputeDispatchPlan:
+    """A deterministic one-dimensional compute mapping into an x/y/z grid."""
+
+    count: int
+    workgroup_size: tuple[int, int, int]
+    groups: tuple[int, int, int]
+
+    def __post_init__(self) -> None:
+        if self.count < 0:
+            raise ValueError("compute dispatch count cannot be negative")
+        if len(self.workgroup_size) != 3 or len(self.groups) != 3:
+            raise ValueError("compute geometry must describe exactly x/y/z")
+        if any(value < 1 for value in self.workgroup_size):
+            raise ValueError("compute workgroup dimensions must be positive")
+        if self.count == 0:
+            if self.groups != (0, 0, 0):
+                raise ValueError("zero-work compute geometry must skip dispatch")
+        elif any(value < 1 for value in self.groups):
+            raise ValueError("nonempty compute grid dimensions must be positive")
+        if self.count > self.capacity:
+            raise ValueError("compute geometry does not cover its logical work")
+
+    @property
+    def capacity(self) -> int:
+        return (
+            self.workgroup_size[0] * self.workgroup_size[1]
+            * self.workgroup_size[2] * self.groups[0]
+            * self.groups[1] * self.groups[2]
+        )
+
+    @property
+    def skipped(self) -> bool:
+        return self.count == 0
+
+    def as_record(self) -> dict[str, object]:
+        return {
+            "count": self.count,
+            "workgroup_size": list(self.workgroup_size),
+            "groups": list(self.groups),
+            "capacity": self.capacity,
+        }
+
+
+def plan_compute_dispatch(
+    count: int,
+    *,
+    limits: ComputeDispatchLimits,
+    preferred_local_size: int = 256,
+    minimum_local_size: int = 32,
+) -> ComputeDispatchPlan:
+    """Map flat work to a legal compute grid shared by GLSL and WebGPU.
+
+    The mathematical work remains a flat, stable identity space.  Only its
+    deployment is folded through x, y, and z, so emitters can use the same
+    linear-index formula and obtain identical coverage on either shader API.
+    """
+
+    count = int(count)
+    preferred_local_size = int(preferred_local_size)
+    minimum_local_size = int(minimum_local_size)
+    if count < 0:
+        raise ValueError("launch count cannot be negative")
+    if preferred_local_size < 1:
+        raise ValueError("preferred local size must be positive")
+    if minimum_local_size < 1:
+        raise ValueError("minimum local size must be positive")
+    local_cap = min(
+        preferred_local_size,
+        int(limits.max_group_size[0]),
+        int(limits.max_invocations),
+    )
+    local = 1 << (local_cap.bit_length() - 1)
+    if count:
+        small_target = 1 << (count - 1).bit_length()
+        local = min(local, max(min(minimum_local_size, local), small_target))
+    if count == 0:
+        return ComputeDispatchPlan(0, (local, 1, 1), (0, 0, 0))
+
+    needed = (count + local - 1) // local
+    group_x = min(needed, int(limits.max_group_count[0]))
+    remaining = (needed + group_x - 1) // group_x
+    group_y = min(remaining, int(limits.max_group_count[1]))
+    group_z = (remaining + group_y - 1) // group_y
+    if group_z > int(limits.max_group_count[2]):
+        capacity = (
+            int(limits.max_group_count[0])
+            * int(limits.max_group_count[1])
+            * int(limits.max_group_count[2])
+            * local
+        )
+        raise ValueError(
+            f"launch count {count} exceeds one-dispatch capacity {capacity}"
+        )
+    return ComputeDispatchPlan(
+        count,
+        (local, 1, 1),
+        (int(group_x), int(group_y), int(group_z)),
+    )
+
+
+@dataclass(frozen=True)
 class DeploymentLoweringProfile:
     """What one backend can actually do with a deployment frame.
 
@@ -199,6 +319,7 @@ class DeploymentStrategyChoice:
     reasons: tuple[str, ...]
     workers: int | None = None
     chunk: int | None = None
+    compute: ComputeDispatchPlan | None = None
     # True when a measured verdict, not a capability gap, demoted a legal
     # pool to serial -- the typed signal downstream gating keys on.
     calibration_demoted: bool = False
@@ -206,6 +327,22 @@ class DeploymentStrategyChoice:
     @property
     def parallel(self) -> bool:
         return self.strategy != SERIAL
+
+    def as_record(self) -> dict[str, object]:
+        """JSON-shaped decision evidence for manifests and backend APIs."""
+
+        return {
+            "strategy": self.strategy,
+            "join_mode": self.join_mode,
+            "execution_class": self.execution_class,
+            "workers": self.workers,
+            "chunk": self.chunk,
+            "compute": (
+                None if self.compute is None else self.compute.as_record()
+            ),
+            "calibration_demoted": self.calibration_demoted,
+            "reasons": list(self.reasons),
+        }
 
 
 # One worker claim should not be the whole lane range: pools balance load
@@ -241,6 +378,8 @@ def select_deployment_strategy(
     work: int | None = None,
     cores: int | None = None,
     nesting_depth: int = 0,
+    compute_limits: ComputeDispatchLimits | None = None,
+    preferred_local_size: int = 256,
 ) -> DeploymentStrategyChoice:
     """Choose how ``backend`` should lower a frame of the given class.
 
@@ -362,6 +501,24 @@ def select_deployment_strategy(
                         "serial for this frame"
                     )
                     continue
+        compute = None
+        if strategy == DISPATCH and work is not None:
+            if compute_limits is None:
+                reasons.append(
+                    "dispatch geometry deferred: backend limits were not "
+                    "supplied"
+                )
+            else:
+                compute = plan_compute_dispatch(
+                    work,
+                    limits=compute_limits,
+                    preferred_local_size=preferred_local_size,
+                )
+                reasons.append(
+                    "compute geometry chosen: workgroup "
+                    f"{compute.workgroup_size}, grid {compute.groups}, "
+                    f"covering {compute.count} item(s)"
+                )
         reasons.append(
             f"{strategy} selected via {profile.executor or 'declared profile'}"
         )
@@ -377,6 +534,7 @@ def select_deployment_strategy(
             reasons=tuple(reasons),
             workers=workers,
             chunk=chunk,
+            compute=compute,
         )
     return DeploymentStrategyChoice(
         backend=profile.backend,
@@ -424,6 +582,8 @@ def legalize_deployments_serial(function) -> SerialLegalizationReport:
 
 
 __all__ = [
+    "ComputeDispatchLimits",
+    "ComputeDispatchPlan",
     "DEPLOYMENT_STRATEGIES",
     "DISPATCH",
     "POOL",
@@ -435,6 +595,7 @@ __all__ = [
     "deployment_profile",
     "deployment_profiles",
     "legalize_deployments_serial",
+    "plan_compute_dispatch",
     "register_deployment_profile",
     "select_deployment_strategy",
 ]

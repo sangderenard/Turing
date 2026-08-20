@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from src.compiler.deployment_lowering import (
+    ComputeDispatchLimits,
     DISPATCH,
     POOL,
     SERIAL,
@@ -39,6 +40,42 @@ def test_shader_class_selects_dispatch_on_gpu_backends():
         backend="webgpu", execution_class="shader-compute",
     )
     assert choice.strategy == DISPATCH
+
+
+def test_shader_choice_owns_device_valid_compute_geometry():
+    limits = ComputeDispatchLimits(
+        max_group_count=(4, 3, 2),
+        max_group_size=(128, 8, 4),
+        max_invocations=128,
+    )
+    for backend in ("glsl", "webgpu"):
+        choice = select_deployment_strategy(
+            backend=backend,
+            execution_class="shader-compute",
+            work=1000,
+            preferred_local_size=128,
+            compute_limits=limits,
+        )
+        assert choice.strategy == DISPATCH
+        assert choice.compute is not None
+        assert choice.compute.workgroup_size == (128, 1, 1)
+        assert choice.compute.groups == (4, 2, 1)
+        assert any("compute geometry chosen" in item for item in choice.reasons)
+
+
+def test_shader_geometry_preserves_flat_identity_when_grid_folds():
+    limits = ComputeDispatchLimits(
+        max_group_count=(2, 2, 2),
+        max_group_size=(64, 1, 1),
+        max_invocations=64,
+    )
+    choice = select_deployment_strategy(
+        backend="webgpu", execution_class="shader-compute", work=500,
+        compute_limits=limits, preferred_local_size=64,
+    )
+    assert choice.compute is not None
+    assert choice.compute.groups == (2, 2, 2)
+    assert 500 <= 2 * 2 * 2 * 64
 
 
 def test_capability_gap_degrades_to_serial_with_reasons():

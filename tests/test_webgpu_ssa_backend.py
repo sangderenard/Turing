@@ -206,3 +206,5 @@ def test_launch_planning_obeys_webgpu_minimum_limits():
     assert launch.groups == (65535, 2, 1)
     assert launch.limits.max_invocations_per_workgroup == 256
     assert launch.limits.max_workgroups_per_dimension == 65535
+    assert launch.deployment.backend == "webgpu"
+    assert launch.deployment.compute.groups == launch.groups
