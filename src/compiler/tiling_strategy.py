@@ -247,8 +247,9 @@ def decide_tiling(
     best_size, best_probe = max(fitting, key=rank)
     reasons.append(
         f"core {best_size}^3 chosen from admitted candidates "
-        f"{[s for s, _ in fitting]} by admission-probe throughput "
-        "(cold-call timing: biased low but uniformly so)"
+        f"{[s for s, _ in fitting]} by measured compute throughput from "
+        "the build-time charts (cold admission probe only for "
+        "pre-profile manifests)"
     )
 
     if (m, n, k) == (best_size,) * 3:
