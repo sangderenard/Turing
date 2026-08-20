@@ -46,7 +46,7 @@ def test_outer_math_product_owns_a_synchronized_blas_subunit(tmp_path):
     assert coverage["gemm"]["realizations"]["webgpu"]["status"] == "packaged"
     assert coverage["axpy"]["realizations"]["native"]["status"] == "packaged"
     assert coverage["axpy"]["realizations"]["python"]["status"] == "packaged"
-    assert coverage["axpy"]["realizations"]["webgpu"]["status"] == "semantic-only"
+    assert coverage["axpy"]["realizations"]["webgpu"]["status"] == "packaged"
 
     generated = _load_generated(product.python_loader)
     math = generated.load(product.directory)
@@ -59,6 +59,21 @@ def test_outer_math_product_owns_a_synchronized_blas_subunit(tmp_path):
         a = rng.standard_normal((17, 17))
         b = rng.standard_normal((17, 17))
         assert np.max(np.abs(math.blas.gemm(a, b) - a @ b)) < 1.0e-10
+        class Host:
+            pass
+
+        assert math.install(Host) is math
+        assert Host.math is math
+        from src.common.tensors.abstraction import AbstractTensor
+
+        semantic = AbstractTensor.math
+        assert math.install(AbstractTensor) is math
+        assert AbstractTensor.compiled_math is math
+        assert AbstractTensor.math.product is math
+        tensor = AbstractTensor.get_tensor([1.0, 2.0, 3.0])
+        assert AbstractTensor.blas.scal(tensor, 2.0).tolist() == [2.0, 4.0, 6.0]
+        assert AbstractTensor.use_semantic_mathematical_library() is semantic
+        assert AbstractTensor.math is semantic
     finally:
         math.close()
 

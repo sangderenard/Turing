@@ -302,3 +302,21 @@ def test_webgpu_gemm_variants_share_the_role_and_abi_but_change_topology():
     assert tiled.launch_plan.groups == (3, 5, 1)
     assert not source_meta["backend_identities"][0]["applied"]
     assert tiled_meta["backend_identities"][0]["applied"]
+
+
+def test_every_authored_blas_method_has_a_source_topology_wgsl_module():
+    from src.compiler.ssa_webgpu_backend import emit_blas_module
+
+    modules = {
+        name: emit_blas_module(name, m=13, n=17, k=19)
+        for name in ("scal", "axpy", "dot", "gemv", "gemm", "rot")
+    }
+    assert all(module.complete for module in modules.values())
+    assert "scalars.alpha * input_x[index]" in modules["scal"].source
+    assert "+ output_y[index]" in modules["axpy"].source
+    assert "for (var i = 0u; i < 17u" in modules["dot"].source
+    assert "input_A[index * 17u + column]" in modules["gemv"].source
+    assert "var<workgroup> tile_A" in modules["gemm"].source
+    assert "let xi = output_x[index]" in modules["rot"].source
+    for name, module in modules.items():
+        assert module.api.metadata["role"] == f"blas.{name}"

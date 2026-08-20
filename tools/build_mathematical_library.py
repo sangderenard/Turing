@@ -33,14 +33,16 @@ def _shape(text: str) -> tuple[int, int, int]:
 
 
 def _verify(product) -> None:
-    spec = importlib.util.spec_from_file_location(
-        "built_turing_math", product.python_loader,
-    )
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    library = module.load(product.directory)
+    previous_bytecode_policy = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     try:
+        spec = importlib.util.spec_from_file_location(
+            "built_turing_math", product.python_loader,
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        library = module.load(product.directory)
         checks = {}
         x = np.random.default_rng(113).standard_normal(23)
         y = np.random.default_rng(114).standard_normal(23)
@@ -74,7 +76,9 @@ def _verify(product) -> None:
             + ", ".join(f"{name}={error:.1e}" for name, error in checks.items())
         )
     finally:
-        library.close()
+        if "library" in locals():
+            library.close()
+        sys.dont_write_bytecode = previous_bytecode_policy
 
 
 def main() -> int:

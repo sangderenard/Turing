@@ -902,6 +902,187 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     )
 
 
+def emit_blas_module(
+    method: str,
+    *,
+    n: int,
+    m: int | None = None,
+    k: int | None = None,
+) -> WGSLModule:
+    """Emit a directly translated, size-prebaked WGSL BLAS method.
+
+    GEMM retains its separate optimized/source identity pair.  The other
+    methods deliberately mirror their humble authored loop topology: one
+    invocation per independent output element, except ``dot`` whose carried
+    reduction remains one invocation.  Faster forms belong to later backend
+    identities, not to a fork of the mathematical role.
+    """
+
+    method = str(method)
+    n = int(n)
+    m = n if m is None else int(m)
+    k = n if k is None else int(k)
+    if min(n, m, k) <= 0:
+        raise ValueError("WebGPU BLAS dimensions must be positive")
+    if method == "gemm":
+        return emit_gemm_module(m, n, k)
+    if method not in {"scal", "axpy", "dot", "gemv", "rot"}:
+        raise ValueError(f"unsupported WebGPU BLAS method {method!r}")
+
+    from ..common.tensors.blas import blas_role
+    from .compiled_program_api import CompiledProgramAPI, EntryPoint
+    from .shader_component_abi import component_abi_from_layout
+    from .shader_stages import COMPUTE, BufferBinding, ShaderIOLayout
+
+    role = blas_role(method)
+    if method == "scal":
+        count = n
+        bindings = """struct Scalars { alpha: f32 };
+@group(0) @binding(0) var<storage, read> input_x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output_y: array<f32>;
+@group(0) @binding(2) var<uniform> scalars: Scalars;"""
+        body = "output_y[index] = scalars.alpha * input_x[index];"
+        layout = ShaderIOLayout(
+            COMPUTE.name,
+            feeds=(BufferBinding("input_x", "feed", "f32", 0),),
+            outputs=(BufferBinding("output_y", "output", "f32", 1),),
+            uniforms=(BufferBinding("scalars", "uniform", "f32", 2),),
+        )
+        parameters = {"x": 0, "y": 1, "alpha": 2}
+    elif method == "axpy":
+        count = n
+        bindings = """struct Scalars { alpha: f32 };
+@group(0) @binding(0) var<storage, read> input_x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output_y: array<f32>;
+@group(0) @binding(2) var<uniform> scalars: Scalars;"""
+        body = "output_y[index] = scalars.alpha * input_x[index] + output_y[index];"
+        layout = ShaderIOLayout(
+            COMPUTE.name,
+            feeds=(BufferBinding("input_x", "feed", "f32", 0),),
+            outputs=(BufferBinding("output_y", "output", "f32", 1),),
+            uniforms=(BufferBinding("scalars", "uniform", "f32", 2),),
+        )
+        parameters = {"x": 0, "y": 1, "alpha": 2}
+    elif method == "dot":
+        count = 1
+        bindings = """@group(0) @binding(0) var<storage, read> input_x: array<f32>;
+@group(0) @binding(1) var<storage, read> input_y: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output_result: array<f32>;"""
+        body = f"""var total = 0.0f;
+  for (var i = 0u; i < {n}u; i += 1u) {{
+    total += input_x[i] * input_y[i];
+  }}
+  output_result[0] = total;"""
+        layout = ShaderIOLayout(
+            COMPUTE.name,
+            feeds=(
+                BufferBinding("input_x", "feed", "f32", 0),
+                BufferBinding("input_y", "feed", "f32", 1),
+            ),
+            outputs=(BufferBinding("output_result", "output", "f32", 2),),
+        )
+        parameters = {"x": 0, "y": 1, "return": 2}
+    elif method == "gemv":
+        count = m
+        bindings = """struct Scalars { alpha: f32, beta: f32 };
+@group(0) @binding(0) var<storage, read> input_A: array<f32>;
+@group(0) @binding(1) var<storage, read> input_x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output_y: array<f32>;
+@group(0) @binding(3) var<uniform> scalars: Scalars;"""
+        body = f"""var total = 0.0f;
+  for (var column = 0u; column < {n}u; column += 1u) {{
+    total += input_A[index * {n}u + column] * input_x[column];
+  }}
+  output_y[index] = scalars.alpha * total + scalars.beta * output_y[index];"""
+        layout = ShaderIOLayout(
+            COMPUTE.name,
+            feeds=(
+                BufferBinding("input_A", "feed", "f32", 0),
+                BufferBinding("input_x", "feed", "f32", 1),
+            ),
+            outputs=(BufferBinding("output_y", "output", "f32", 2),),
+            uniforms=(BufferBinding("scalars", "uniform", "f32x2", 3),),
+        )
+        parameters = {"A": 0, "x": 1, "y": 2, "alpha_beta": 3}
+    else:  # rot
+        count = n
+        bindings = """struct Scalars { c: f32, s: f32 };
+@group(0) @binding(0) var<storage, read_write> output_x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output_y: array<f32>;
+@group(0) @binding(2) var<uniform> scalars: Scalars;"""
+        body = """let xi = output_x[index];
+  let yi = output_y[index];
+  output_x[index] = scalars.c * xi + scalars.s * yi;
+  output_y[index] = scalars.c * yi - scalars.s * xi;"""
+        layout = ShaderIOLayout(
+            COMPUTE.name,
+            outputs=(
+                BufferBinding("output_x", "output", "f32", 0),
+                BufferBinding("output_y", "output", "f32", 1),
+            ),
+            uniforms=(BufferBinding("scalars", "uniform", "f32x2", 2),),
+        )
+        parameters = {"x": 0, "y": 1, "c_s": 2}
+
+    launch_plan = plan_wgsl_launch(count)
+    local = launch_plan.workgroup_size[0]
+    source = f"""{bindings}
+
+@compute @workgroup_size({local}, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) grid: vec3<u32>) {{
+  let index = gid.x + gid.y * grid.x * {local}u;
+  if (index >= {count}u) {{ return; }}
+  {body}
+}}
+"""
+    dimensions = {"n": n}
+    if method == "gemv":
+        dimensions = {"m": m, "n": n}
+    name = "blas_" + method + "_source_" + "_".join(
+        str(value) for value in dimensions.values()
+    )
+    component_abi = component_abi_from_layout(
+        name, "wgsl", layout,
+        decorations={
+            "execution_model": "compute",
+            "workgroup_size": launch_plan.workgroup_size,
+            "sentinel_policy": "validate-before-dispatch/publish-after-dispatch",
+        },
+    )
+    identity = {
+        "identity": "webgpu_source_blas",
+        "applied": True,
+        "role": role.identity,
+        "mapping": "authored loop topology with independent outputs preserved",
+    }
+    metadata = {
+        "execution_model": "compute",
+        "storage": "WebGPU storage buffers",
+        "workgroup_size": launch_plan.workgroup_size,
+        "dispatch_workgroups": launch_plan.groups,
+        "count": count,
+        "stage": COMPUTE.name,
+        "io_layout": layout.to_mapping(),
+        "component_abi": component_abi.to_mapping(),
+        "role": role.identity,
+        "role_source_sha256": hashlib.sha256(role.source.encode("utf-8")).hexdigest(),
+        "variant": "source_algorithm",
+        "problem_shape": dimensions,
+        "parameter_bindings": parameters,
+        "backend_identities": [identity],
+    }
+    api = CompiledProgramAPI(
+        module=name, language="wgsl", entry="main",
+        entry_points=(EntryPoint("main", "main", "numerical"),),
+        metadata=metadata,
+    )
+    return WGSLModule(
+        name, source, True, (), api, launch_plan,
+        layout, component_abi, (identity,),
+    )
+
+
 def emit_operator_module(operation: str, count: int) -> WGSLModule:
     """Emit one benchmarkable AbstractTensor operation through shared SSA."""
 
@@ -935,7 +1116,7 @@ def emit_operator_module(operation: str, count: int) -> WGSLModule:
 
 __all__ = [
     "WGSLComputeLimits", "WGSLEmissionError", "WGSLLaunchPlan", "WGSLModule", "WGSLShortfall",
-    "benchmarkable_tensor_operations", "emit_gemm_module", "emit_module",
+    "benchmarkable_tensor_operations", "emit_blas_module", "emit_gemm_module", "emit_module",
     "emit_operator_module", "plan_gemm_matrix_deployment", "plan_wgsl_launch",
     "supported_tensor_operations",
 ]

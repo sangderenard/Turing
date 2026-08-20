@@ -22,7 +22,7 @@ import sys
 from typing import Any, Iterable, Mapping
 
 from .native_gemm_product import compile_native_gemm_product
-from .ssa_webgpu_backend import emit_gemm_module
+from .ssa_webgpu_backend import emit_blas_module, emit_gemm_module
 from .wasm_binary import CodeBuilder, build_module
 
 
@@ -481,7 +481,14 @@ export class TuringBLASServer {{
   get deployedMethods(){{return [...this.matrix.surface_methods.webgpu];}}
   supports(method){{return this.matrix.surface_methods.webgpu.includes(String(method));}}
   variant(m,n,k,kind="fast"){{const item=this.matrix.variants.find(v=>v.shape[0]===m&&v.shape[1]===n&&v.shape[2]===k);if(!item)throw new Error(`shape ${{m}}x${{n}}x${{k}} is not prebaked`);return item.webgpu[kind==="source"?"source":"fast"];}}
+  prebake(method,dimensions){{const records=this.matrix.webgpu_prebakes[String(method)]??[];const record=records.find(item=>Object.entries(dimensions).every(([name,value])=>item.problem_shape[name]===value));if(!record)throw new Error(`${{method}} specialization ${{JSON.stringify(dimensions)}} is not prebaked`);return record;}}
   async pipeline(record){{if(this.pipelines.has(record.source_sha256))return this.pipelines.get(record.source_sha256);const source=await(await fetch(new URL(record.path,this.base))).text();const digest=hex(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(source)));if(digest!==record.source_sha256)throw new Error(`shader identity mismatch: ${{record.path}}`);const module=this.device.createShaderModule({{code:source}});const info=await module.getCompilationInfo();const errors=info.messages.filter(m=>m.type==="error");if(errors.length)throw new Error(errors.map(e=>e.message).join("\\n"));const pipeline=this.device.createComputePipeline({{layout:"auto",compute:{{module,entryPoint:"main"}}}});this.pipelines.set(record.source_sha256,pipeline);return pipeline;}}
+  async dispatch(record,resources,outputs){{const pipeline=await this.pipeline(record),device=this.device,buffers=resources.map((resource,index)=>storage(device,resource.data,(resource.uniform?GPUBufferUsage.UNIFORM:GPUBufferUsage.STORAGE)|(outputs.includes(index)?GPUBufferUsage.COPY_SRC:0))),reads=outputs.map(index=>device.createBuffer({{size:resources[index].data.byteLength,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}})),bind=device.createBindGroup({{layout:pipeline.getBindGroupLayout(0),entries:buffers.map((buffer,binding)=>({{binding,resource:{{buffer}}}}))}}),encoder=device.createCommandEncoder(),pass=encoder.beginComputePass();pass.setPipeline(pipeline);pass.setBindGroup(0,bind);pass.dispatchWorkgroups(...record.groups);pass.end();outputs.forEach((index,slot)=>encoder.copyBufferToBuffer(buffers[index],0,reads[slot],0,resources[index].data.byteLength));device.queue.submit([encoder.finish()]);await Promise.all(reads.map(read=>read.mapAsync(GPUMapMode.READ)));const result=reads.map(read=>new Float32Array(read.getMappedRange().slice(0)));reads.forEach(read=>read.unmap());[...buffers,...reads].forEach(value=>value.destroy());return result;}}
+  async scal(x,alpha,options={{}}){{x=x instanceof Float32Array?x:new Float32Array(x);const y=options.y?(options.y instanceof Float32Array?options.y:new Float32Array(options.y)):new Float32Array(x.length);if(y.length!==x.length)throw new Error("scal x and y lengths differ");return (await this.dispatch(this.prebake("scal",{{n:x.length}}),[{{data:x}},{{data:y}},{{data:new Float32Array([alpha]),uniform:true}}],[1]))[0];}}
+  async axpy(x,y,alpha){{x=x instanceof Float32Array?x:new Float32Array(x);y=y instanceof Float32Array?y:new Float32Array(y);if(y.length!==x.length)throw new Error("axpy x and y lengths differ");return (await this.dispatch(this.prebake("axpy",{{n:x.length}}),[{{data:x}},{{data:y}},{{data:new Float32Array([alpha]),uniform:true}}],[1]))[0];}}
+  async dot(x,y){{x=x instanceof Float32Array?x:new Float32Array(x);y=y instanceof Float32Array?y:new Float32Array(y);if(y.length!==x.length)throw new Error("dot x and y lengths differ");return (await this.dispatch(this.prebake("dot",{{n:x.length}}),[{{data:x}},{{data:y}},{{data:new Float32Array(1)}}],[2]))[0][0];}}
+  async gemv(a,x,options={{}}){{a=a instanceof Float32Array?a:new Float32Array(a);x=x instanceof Float32Array?x:new Float32Array(x);const n=options.n??x.length,m=options.m??Math.round(a.length/n),alpha=options.alpha??1,beta=options.beta??0,y=options.y?(options.y instanceof Float32Array?options.y:new Float32Array(options.y)):new Float32Array(m);if(a.length!==m*n||x.length!==n||y.length!==m)throw new Error("GEMV buffer lengths disagree with M,N");return (await this.dispatch(this.prebake("gemv",{{m,n}}),[{{data:a}},{{data:x}},{{data:y}},{{data:new Float32Array([alpha,beta]),uniform:true}}],[2]))[0];}}
+  async rot(x,y,c,s){{x=x instanceof Float32Array?x:new Float32Array(x);y=y instanceof Float32Array?y:new Float32Array(y);if(y.length!==x.length)throw new Error("rot x and y lengths differ");return this.dispatch(this.prebake("rot",{{n:x.length}}),[{{data:x}},{{data:y}},{{data:new Float32Array([c,s]),uniform:true}}],[0,1]);}}
   async gemm(a,b,options={{}}){{const m=options.m??Math.round(Math.sqrt(a.length)),k=options.k??Math.round(a.length/m),n=options.n??Math.round(b.length/k),alpha=options.alpha??1,beta=options.beta??0,kind=options.variant??"fast";a=a instanceof Float32Array?a:new Float32Array(a);b=b instanceof Float32Array?b:new Float32Array(b);const c=options.c?(options.c instanceof Float32Array?options.c:new Float32Array(options.c)):new Float32Array(m*n);if(a.length!==m*k||b.length!==k*n||c.length!==m*n)throw new Error("GEMM buffer lengths disagree with M,N,K");const record=this.variant(m,n,k,kind),pipeline=await this.pipeline(record),device=this.device;const ab=storage(device,a,GPUBufferUsage.STORAGE),bb=storage(device,b,GPUBufferUsage.STORAGE),cb=storage(device,c,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC),scalars=storage(device,new Float32Array([alpha,beta]),GPUBufferUsage.UNIFORM),read=device.createBuffer({{size:c.byteLength,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}});const bind=device.createBindGroup({{layout:pipeline.getBindGroupLayout(0),entries:[{{binding:0,resource:{{buffer:ab}}}},{{binding:1,resource:{{buffer:bb}}}},{{binding:2,resource:{{buffer:cb}}}},{{binding:3,resource:{{buffer:scalars}}}}]}});const encoder=device.createCommandEncoder(),pass=encoder.beginComputePass();pass.setPipeline(pipeline);pass.setBindGroup(0,bind);pass.dispatchWorkgroups(...record.groups);pass.end();encoder.copyBufferToBuffer(cb,0,read,0,c.byteLength);device.queue.submit([encoder.finish()]);await read.mapAsync(GPUMapMode.READ);const result=new Float32Array(read.getMappedRange().slice(0));read.unmap();[ab,bb,cb,scalars,read].forEach(value=>value.destroy());return result;}}
 }}
 
@@ -606,10 +613,46 @@ def build_blas_server(
             "buffer_bindings": bindings,
             "llvm_path": str(llvm_path),
         }
+    webgpu_prebakes: dict[str, list[dict[str, Any]]] = {
+        name: [] for name in ("scal", "axpy", "dot", "gemv", "rot")
+    }
+    vector_sizes = sorted({axis for shape in shapes for axis in shape})
+    method_shapes = {
+        name: ({"n": size} for size in vector_sizes)
+        for name in ("scal", "axpy", "dot", "rot")
+    }
+    method_shapes["gemv"] = (
+        {"m": m, "n": k} for m, _n, k in shapes
+    )
+    for method, specializations in method_shapes.items():
+        seen = set()
+        for dimensions in specializations:
+            key = tuple(sorted(dimensions.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            module = emit_blas_module(method, **dimensions)
+            suffix = "-".join(str(value) for value in dimensions.values())
+            relative = Path("shaders") / method / f"{method}-{suffix}.wgsl"
+            target = web_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(module.source, encoding="utf-8", newline="\n")
+            metadata = module.api.metadata
+            webgpu_prebakes[method].append({
+                "path": relative.as_posix(),
+                "source_sha256": _sha(module.source.encode("utf-8")),
+                "problem_shape": metadata["problem_shape"],
+                "workgroup_size": list(module.launch_plan.workgroup_size),
+                "groups": list(module.launch_plan.groups),
+                "io_layout": module.io_layout.to_mapping(),
+                "parameter_bindings": metadata["parameter_bindings"],
+                "role_source_sha256": metadata["role_source_sha256"],
+                "variant": metadata["variant"],
+            })
     surface_methods = {
         "native": [method.name for method in BLAS_LIBRARY.methods],
         "python": [method.name for method in BLAS_LIBRARY.methods],
-        "webgpu": ["gemm"],
+        "webgpu": [method.name for method in BLAS_LIBRARY.methods],
     }
     matrix = {
         "schema": MATRIX_SCHEMA,
@@ -625,6 +668,7 @@ def build_blas_server(
             }
             for name, record in generic_products.items()
         },
+        "webgpu_prebakes": webgpu_prebakes,
         "variants": variants,
     }
     matrix_bytes = _canonical(matrix)

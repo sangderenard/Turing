@@ -47,12 +47,16 @@ def test_blas_server_packages_and_dispatches_multiple_specializations(tmp_path):
     assert manifest["deployed_roles"] == [
         "blas.scal", "blas.axpy", "blas.dot", "blas.gemv", "blas.gemm", "blas.rot",
     ]
-    assert manifest["surface_roles"]["webgpu"] == ["blas.gemm"]
+    assert manifest["surface_roles"]["webgpu"] == manifest["deployed_roles"]
     assert [item["name"] for item in matrix["library"]["methods"]] == manifest[
         "methods"
     ]
     assert matrix["surface_methods"]["python"] == manifest["methods"]
-    assert matrix["surface_methods"]["webgpu"] == ["gemm"]
+    assert matrix["surface_methods"]["webgpu"] == manifest["methods"]
+    assert set(matrix["webgpu_prebakes"]) == {
+        "scal", "axpy", "dot", "gemv", "rot",
+    }
+    assert all(matrix["webgpu_prebakes"].values())
     assert manifest["surfaces"]["native"]["python_runtime_dependency"] is False
     assert manifest["surfaces"]["web"]["python_runtime_dependency"] is False
     assert [item["shape"] for item in matrix["variants"]] == [
@@ -103,6 +107,11 @@ def test_blas_server_packages_and_dispatches_multiple_specializations(tmp_path):
     assert 'join("\\n")' in javascript
     assert "get methods()" in javascript
     assert "deployedMethods" in javascript
+    assert "async scal(" in javascript
+    assert "async axpy(" in javascript
+    assert "async dot(" in javascript
+    assert "async gemv(" in javascript
+    assert "async rot(" in javascript
     assert (product.directory / "native" / "turing_blas_server.h").is_file()
     assert (product.directory / "README.md").is_file()
     assert not (product.directory / ".build").exists()

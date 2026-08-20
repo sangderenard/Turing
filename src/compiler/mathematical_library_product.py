@@ -129,6 +129,13 @@ class TuringMathematicalLibrary:
     def libraries(self):
         return tuple(self.matrix["products"])
 
+    def install(self, host, attribute="math"):
+        hook = getattr(host, "install_mathematical_library", None)
+        if hook is not None:
+            return hook(self)
+        setattr(host, str(attribute), self)
+        return self
+
     def close(self):
         self.blas.close()
 
@@ -183,7 +190,20 @@ is recorded per method rather than inferred from which files happen to exist.
 from python import load
 math = load()
 result = math.blas.gemm(a, b)
+math.install(MyNumericalHost)  # host hook, or attach the product as .math
 math.close()
+```
+
+The Python subunit accepts NumPy-compatible arrays and calls the packaged
+native library.  In a Turing checkout it can also bootstrap `AbstractTensor`
+explicitly while preserving the default graph-building implementation:
+
+```python
+from src.common.tensors.abstraction import AbstractTensor
+
+math.install(AbstractTensor)
+result = AbstractTensor.blas.gemm(a, b)
+AbstractTensor.use_semantic_mathematical_library()
 ```
 
 ## Native
@@ -317,6 +337,7 @@ def build_mathematical_library_product(
             "python": {
                 "loader": python_loader.relative_to(root).as_posix(),
                 "entry": "load",
+                "installation_entry": "TuringMathematicalLibrary.install",
             },
             "web": {
                 "wasm": wasm_path.relative_to(root).as_posix(),

@@ -55,3 +55,30 @@ def test_catalog_mapping_is_self_contained_and_canonicalizable():
         separators=(",", ":"),
     )
     assert first == second
+
+
+def test_abstract_tensor_receives_the_same_outer_blas_hierarchy():
+    from src.common.tensors.abstraction import AbstractTensor
+
+    assert AbstractTensor.math.libraries == ("blas",)
+    assert AbstractTensor.math.blas is AbstractTensor.blas
+    assert AbstractTensor.blas.methods == tuple(BLAS_ROLES)
+    x = AbstractTensor.get_tensor([1.0, 2.0, 3.0])
+    y = AbstractTensor.get_tensor([4.0, 5.0, 6.0])
+    assert AbstractTensor.blas.scal(x, 2.0).tolist() == [2.0, 4.0, 6.0]
+    assert AbstractTensor.blas.axpy(x, y, 2.0).tolist() == [6.0, 9.0, 12.0]
+    assert AbstractTensor.blas.dot(x, y).item() == 32.0
+    rx, ry = AbstractTensor.blas.rot(x, y, 0.8, 0.6)
+    assert rx.tolist() == [3.2, 4.6, 6.0]
+    assert all(abs(a - b) < 1.0e-12 for a, b in zip(
+        ry.tolist(), [2.6, 2.8, 3.0],
+    ))
+
+
+def test_abstract_tensor_semantic_namespace_can_be_restored():
+    from src.common.tensors.abstraction import AbstractTensor
+
+    semantic = AbstractTensor.math
+    assert AbstractTensor.use_semantic_mathematical_library() is semantic
+    assert AbstractTensor.math is semantic
+    assert AbstractTensor.blas is semantic.blas

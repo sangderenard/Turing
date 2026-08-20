@@ -3817,3 +3817,10 @@ AbstractTensor._scalar_kernel = staticmethod(_scalar_kernel)
 AbstractTensor._v1_valuewise  = _v1_valuewise
 AbstractTensor._v2_valuewise  = _v2_valuewise
 AbstractTensor._v3_valuewise  = _v3_valuewise
+
+# Install the semantic mathematical-library hierarchy only after the class and
+# its public operators are complete.  The namespace composes those operators;
+# it never materializes through the optional native Python product.
+from .mathematical_library import install_abstract_tensor_mathematical_library
+
+install_abstract_tensor_mathematical_library(AbstractTensor)
