@@ -144,9 +144,8 @@ def compile_native_graph_reverse(
     """
 
     from .process_graph_autograd import (
-        abstract_tensor_program_to_process_graph,
-        compile_process_graph_backward,
         lower_training_motion_to_repository_ssa,
+        obtain_graph_reverse,
     )
     from .ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
 
@@ -156,12 +155,12 @@ def compile_native_graph_reverse(
     if len(set(wrt)) != len(wrt):
         raise ValueError(f"compiled graph reverse repeats wrt values: {wrt!r}")
 
-    forward = abstract_tensor_program_to_process_graph(output, bindings=bindings)
-    product = compile_process_graph_backward(
-        forward,
+    product = obtain_graph_reverse(
+        output,
+        bindings=bindings,
         wrt=wrt,
         packaging="combined",
-        unit_loss_seed=bool(unit_output_seed),
+        unit_output_seed=bool(unit_output_seed),
     )
     if product.motion is None:
         raise RuntimeError("combined graph-autograd request produced no motion")
@@ -211,9 +210,8 @@ def compile_native_training_schedule(
     """Compile one complete motion and one native stepping entry per group."""
 
     from .process_graph_autograd import (
-        abstract_tensor_program_to_process_graph,
-        compile_process_graph_backward,
         lower_training_motion_to_repository_ssa,
+        obtain_graph_reverse,
     )
     from .ssa_llvm_backend import (
         compile_artifact,
@@ -230,9 +228,8 @@ def compile_native_training_schedule(
         for group in groups
         for parameter_id in group.parameter_ids
     ))
-    forward = abstract_tensor_program_to_process_graph(output, bindings=bindings)
-    product = compile_process_graph_backward(
-        forward, wrt=parameter_ids, packaging="combined",
+    product = obtain_graph_reverse(
+        output, bindings=bindings, wrt=parameter_ids, packaging="combined",
     )
     if product.motion is None:
         raise RuntimeError("combined graph-autograd request produced no motion")

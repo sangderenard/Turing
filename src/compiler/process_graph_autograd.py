@@ -2371,6 +2371,52 @@ def compile_process_graph_backward(
     )
 
 
+def obtain_graph_reverse(
+    source: Any,
+    *,
+    bindings: Mapping[str, Any] | None = None,
+    outputs: Iterable[int] | None = None,
+    wrt: Iterable[int] | None = None,
+    packaging: str = "independent",
+    unit_output_seed: bool = True,
+) -> ProcessGraphBackwardProduct:
+    """Obtain the canonical graph reverse without selecting a backend.
+
+    ``source`` may already be a :class:`ProcessGraph`, or it may be one or
+    more outputs from an ``SSATensorProgram`` AbstractTensor run.  In the
+    latter case ``bindings`` supplies the authored names of caller-owned
+    inputs.  The result contains only semantic ProcessGraphs and their
+    binding ledger; LLVM, WebAssembly, WebGPU, native packaging, and runtime
+    dispatch are deliberately outside this boundary.
+
+    ``unit_output_seed=False`` exposes an explicit upstream value for every
+    output and is therefore the ordinary VJP form used by published objects.
+    """
+
+    if isinstance(source, ProcessGraph):
+        if bindings is not None:
+            raise ValueError(
+                "bindings belong to AbstractTensor ingestion, not an existing "
+                "ProcessGraph"
+            )
+        forward = source
+    else:
+        if bindings is None:
+            raise TypeError(
+                "AbstractTensor graph-reverse acquisition requires bindings"
+            )
+        forward = abstract_tensor_program_to_process_graph(
+            source, bindings=bindings,
+        )
+    return compile_process_graph_backward(
+        forward,
+        outputs=outputs,
+        wrt=wrt,
+        packaging=packaging,
+        unit_loss_seed=bool(unit_output_seed),
+    )
+
+
 def lower_training_motion_to_repository_ssa(
     motion: ForwardLossBackwardMotion,
     *,
@@ -2620,4 +2666,5 @@ __all__ = [
     "graph_adjoint_rule_name",
     "isolate_process_program_adjoint_regions",
     "lower_training_motion_to_repository_ssa",
+    "obtain_graph_reverse",
 ]

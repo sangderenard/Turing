@@ -19,6 +19,7 @@ from src.compiler.process_graph_autograd import (
     fuse_forward_loss_backward,
     isolate_process_program_adjoint_regions,
     lower_training_motion_to_repository_ssa,
+    obtain_graph_reverse,
 )
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
@@ -124,6 +125,49 @@ def test_every_backward_request_returns_the_adjoint_binding_graph(packaging):
         assert product.motion is not None
         assert product.binding_graph is product.motion.binding_graph
         assert product.graph is product.motion.graph
+
+
+def test_general_graph_reverse_obtainer_accepts_an_existing_process_graph():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "input", label="left", shape=(2,))
+    _add(graph, 2, "input", label="right", shape=(2,))
+    _add(graph, 3, "mul", (1, 2), shape=(2,))
+    graph.roots = [3]
+
+    product = obtain_graph_reverse(
+        graph, wrt=(1, 2), unit_output_seed=False,
+    )
+
+    assert product.adjoint.forward is graph
+    assert product.motion is None
+    assert product.graph is product.adjoint.backward
+    assert set(product.adjoint.seed_value_ids) == {3}
+
+
+def test_general_graph_reverse_obtainer_ingests_abstract_tensor_outputs():
+    from src.common.tensors.accelerator_backends.ssa_backend import (
+        SSATensorOperations,
+        SSATensorProgram,
+    )
+
+    program = SSATensorProgram("general_reverse")
+    left = SSATensorOperations.input(program, (2,))
+    right = SSATensorOperations.input(program, (2,))
+    output = left * right
+
+    product = obtain_graph_reverse(
+        output,
+        bindings={"left": left, "right": right},
+        wrt=(left.data.value.id, right.data.value.id),
+        packaging="combined",
+        unit_output_seed=False,
+    )
+
+    assert product.motion is not None
+    assert product.adjoint.output_value_ids == (output.data.value.id,)
+    assert set(product.motion.gradient_value_ids) == {
+        left.data.value.id, right.data.value.id,
+    }
 
 
 def test_abstract_tensor_ingestion_retains_a_complete_multi_output_surface():
