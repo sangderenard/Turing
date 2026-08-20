@@ -186,12 +186,23 @@ class ProgramABIField:
     mutable: bool = False
     default: Any = None
     has_default: bool = False
+    #: Concrete extents, when the boundary can state them.
+    #:
+    #: ``rank`` says how many axes a span has; ``shape`` says how long they
+    #: are. The distinction is load-bearing rather than cosmetic: the
+    #: scalar-versus-tensor decision (``hierarchical_plan`` -- an operation is
+    #: spelled with its SCALAR opcode when the result and every operand have
+    #: an EMPTY shape) reads extents, not rank. A parameter that never states
+    #: its extents is therefore indistinguishable from a rank-0 scalar and its
+    #: arithmetic is compiled as scalar arithmetic, which is the wrong program
+    #: for a tensor and reports no shortfall while being so.
+    shape: tuple[int, ...] | None = None
 
     @classmethod
     def from_mapping(cls, location: str, raw: Any) -> "ProgramABIField":
         if not isinstance(raw, Mapping):
             raise ExtractionContractError(f"{location} must be a mapping")
-        allowed = {"storage", "dtype", "rank", "mutable", "default"}
+        allowed = {"storage", "dtype", "rank", "mutable", "default", "shape"}
         extra = sorted(set(raw) - allowed)
         if extra:
             raise ExtractionContractError(
@@ -235,6 +246,33 @@ class ProgramABIField:
             raise ExtractionContractError(
                 f"{location}.mutable must be boolean"
             )
+        raw_shape = raw.get("shape")
+        shape: tuple[int, ...] | None = None
+        if raw_shape is not None:
+            if not isinstance(raw_shape, (list, tuple)):
+                raise ExtractionContractError(
+                    f"{location}.shape must be a list of extents"
+                )
+            extents = []
+            for position, extent in enumerate(raw_shape):
+                if not isinstance(extent, int) or isinstance(extent, bool):
+                    raise ExtractionContractError(
+                        f"{location}.shape[{position}] must be an integer"
+                    )
+                if extent <= 0:
+                    raise ExtractionContractError(
+                        f"{location}.shape[{position}] must be positive"
+                    )
+                extents.append(int(extent))
+            shape = tuple(extents)
+            # rank and shape are two statements about the same axes; letting
+            # them disagree would leave the boundary describing two different
+            # values, so the disagreement is the diagnostic.
+            if len(shape) != rank:
+                raise ExtractionContractError(
+                    f"{location}.shape has {len(shape)} extents but rank is "
+                    f"{rank}"
+                )
         return cls(
             storage,
             None if dtype is None else str(dtype),
@@ -242,6 +280,7 @@ class ProgramABIField:
             mutable,
             raw.get("default"),
             "default" in raw,
+            shape,
         )
 
     def receipt(self) -> dict[str, Any]:
@@ -251,6 +290,8 @@ class ProgramABIField:
             "rank": self.rank,
             "mutable": self.mutable,
         }
+        if self.shape is not None:
+            result["shape"] = list(self.shape)
         if self.has_default:
             result["default"] = self.default
         return result

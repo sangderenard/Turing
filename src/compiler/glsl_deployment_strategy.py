@@ -1930,14 +1930,36 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                         getattr(specialization, "shape", ()) or ()
                     )
                 )
+                # Extents the source-program boundary states for this
+                # parameter. Rank alone cannot serve here: the scalar-versus-
+                # tensor decision reads EXTENTS (an operation is spelled with
+                # its scalar opcode when result and operands all have empty
+                # shape), so a parameter that declares `storage: span,
+                # rank: 1` and nothing else still arrives shapeless and its
+                # arithmetic is compiled as scalar arithmetic. A declared
+                # shape is authoritative the same way a planner
+                # specialization is -- it is a statement by the boundary, not
+                # an inference from a default domain.
+                abi_shape: tuple[int, ...] = ()
+                if binding_name is not None:
+                    abi_entry = (
+                        graph.G.graph.get("parameter_value_abi") or {}
+                    ).get(str(binding_name))
+                    if isinstance(abi_entry, Mapping):
+                        abi_shape = tuple(
+                            int(extent)
+                            for extent in (abi_entry.get("shape") or ())
+                        )
                 shape = tuple(
-                    tensor.get("shape") or specialized_shape or ()
+                    tensor.get("shape") or specialized_shape or abi_shape or ()
                 )
                 if not shape:
                     shape = tuple(getattr(domain, "shape", ()) or ())
                 logical = (
                     tuple(map(int, shape))
-                    if tensor.get("shape") is not None or specialized_shape
+                    if tensor.get("shape") is not None
+                    or specialized_shape
+                    or abi_shape
                     else tuple(int(dim) for dim in shape if int(dim) != 1)
                 )
                 dtype = str(
