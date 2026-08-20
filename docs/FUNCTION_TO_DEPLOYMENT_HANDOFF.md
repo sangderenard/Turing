@@ -213,8 +213,14 @@ kernel library in `c_backend_llvm_ssa.py`.
   `binary_double` only if `c_tensor_opcode(op)` exists *and* a count can be
   formed. So real tensor emission is gated on **shape propagation**, not on
   the operator tables.
-* `sign` HAS an opcode (`unary`, 40) and still fails — no count. `clone`,
-  `copy`, `matmul`, `to_dtype`, `zeros_like` have **no opcode**.
+* **Wrong reading #3, and the one that produced the other two: the source path
+  does not run the tensor lowering pass.** `lower_ast_source_to_ssa` leaves
+  tensor calls *semantic*. `lower_tensor_calls_to_repository_ssa`
+  (`tensor_ssa_lowering.py:633`) is what turns them into calls on the authored
+  kernels, and it must be applied by the caller —
+  `tests/test_cast_value_semantics.py:80` does exactly that. Every "this
+  operation cannot be compiled" conclusion above and below was measured with
+  that stage missing. **Run it before concluding anything.**
 * **Ellipsis indexing is the structural blocker.** `S[..., p, q]` lowers to
   index tuples as first-class constants combined with `Add` (tuple
   concatenation): `Const(())` for the ellipsis, `Const((0, 0))` for the
@@ -227,13 +233,68 @@ kernel library in `c_backend_llvm_ssa.py`.
   came out declared **scalar** (`real(c_double), intent(in), value`) and the
   region holding the mutating loop emitted an **empty body**.
 
-**Order of work, if someone takes this on:** shape/rank propagation for tensor
-parameters first (it unblocks the kernel path wholesale), then the ellipsis
-index folding, then the individual operators — and `clone` must emit a real
-copy. `cast_double_to_double_values(a, out, n)` is exactly that kernel and is
-already in the library. Do **not** alias it to its operand the way the shape-
-only set is aliased: `eigh` opens with `S = A.clone()` precisely so the
-in-place rotations that follow do not reach `A`.
+### 4.5b The three levers, measured
+
+Same five operations, run through four combinations. `+shape` is a declared
+`shape` on each parameter (§4.5c); `+pass` is
+`lower_tensor_calls_to_repository_ssa`; `+refs` is passing
+`pure_python_tensor_code_references()` as `tensor_code_references`.
+
+| op | bare | +shape | +shape+pass | +shape+pass+refs |
+|---|---|---|---|---|
+| `clone` | 2 | 2 | 2 | **CLEAN** |
+| `sign` | 2 | 2 | **CLEAN** | CLEAN |
+| `matmul` | 2 | 2 | **CLEAN** | CLEAN |
+| `transpose` | 2 | 2 | **CLEAN** | **3 shortfalls** |
+| `sum` | 2 | 2 | **CLEAN** | **LOWER ValueError** |
+
+Three conclusions, and the third is a trap worth naming:
+
+1. **The tensor pass is the big lever.** `sign` and `matmul` — recorded above
+   as backend gaps — were never gaps. They were unreachable without it.
+2. **pure_backend references fix exactly what the pass cannot.** `clone` has no
+   `c_tensor_opcode`, so no kernel exists to call; ingesting its pure-Python
+   body compiles it. This is the mechanism `HANDOFF_tensor_op_ssa_modules.md`
+   describes, and it works.
+3. **A supplied reference OVERRIDES a working kernel path.** A backend source
+   reference is authoritative for op identity (`graph_express2.py:2918`), so
+   wiring `pure_python_tensor_code_references()` in wholesale *regresses*
+   `transpose` and `sum`. That is a second, independent reason it was never
+   connected, on top of the loop-engine blocker that handoff's §6 cites.
+   **The correct policy is a fallback, not an override**: supply a reference
+   only where `c_tensor_opcode(op) is None` and no dedicated kernel exists.
+   Not yet implemented; it is a precedence decision, not a mechanical one.
+
+### 4.5c Declaring extents (landed, `4ec796c`)
+
+`program_abi` could already say `storage: span` and `rank: N` and neither
+reached the planner. Rank could not have fixed it in any case: rank says how
+many axes exist, and the scalar/tensor gate asks how *long* they are. A field
+may now state `shape`, validated as positive integers agreeing with `rank`,
+consulted by the planner's `declared()` as authoritative alongside a planner
+specialization. `tests/test_declared_parameter_shape.py` pins it, including
+the negative: a rank-only declaration still leaves the value shapeless.
+
+This is what makes *arithmetic* (`x * y`, `x.sqrt()`) tensor rather than
+scalar. It does nothing on its own for method calls — those need the pass.
+
+**Order of work, if someone takes this on**, revised by §4.5b:
+
+1. **Run the tensor pass.** Free, and it is most of the answer.
+2. **Declare extents** on tensor parameters (§4.5c, landed) so arithmetic is
+   not silently compiled as scalar arithmetic.
+3. **Selective pure_backend fallback** for the ops with no kernel — `clone`
+   above all. Keyed on `c_tensor_opcode(op) is None`, never blanket.
+4. **Ellipsis index folding** — still the structural blocker for the real
+   `eigh`, and untouched by any of the above.
+
+On `clone` specifically: if it is ever given a kernel rather than an ingested
+body, it must emit a **real copy**. `cast_double_to_double_values(a, out, n)`
+is exactly that and is already in the library. Do **not** alias it to its
+operand the way the shape-only set is aliased — `eigh` opens with
+`S = A.clone()` precisely so the in-place rotations that follow cannot reach
+`A`. (The pure_backend route gets this right for free: `clone_` is a genuine
+recursive copy.)
 
 ## 5. Is Jacobi still the right algorithm?
 
