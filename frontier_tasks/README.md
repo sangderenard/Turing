@@ -25,10 +25,19 @@ to read all of it; each task file quotes what it needs.
 | `TASK_B_scorecard_level14_rebound_name.md` | level 14: call argument binds a later version of a rebound name | diagnose to a named seam; fix if small | medium | **done (findings only)** — seam named exactly; a fix attempt regressed levels 8/9 and was reverted; two concrete directions recorded for the real fix |
 | `TASK_C_scorecard_level18_any_generator.md` | level 18: `any()` over a generator never renders | diagnose to a named seam; fix if small | medium | **done (findings only)** — task's own hypothesis disproven: the generator loop already decomposes correctly; the real gap is the materializer having zero sequence/tensor support, not a compiler defect |
 | `TASK_D_overlay_embed_scope_refusal.md` | make the control-overlay's cross-scope failure name itself | unit-level, pure data structures | low | **done** — named refusal + 4 tests; confirmed against re.compile |
-| `TASK_E_shoal_dt_next_wiring.md` | the frame's dt_next output reads 0.0 — find the missing binding link | diagnosis-first, expensive builds budgeted | medium-high | open |
+| `TASK_E_shoal_dt_next_wiring.md` | the frame's dt_next output reads 0.0 — find the missing binding link | diagnosis-first, expensive builds budgeted | medium-high | **done (findings only)** — real cause found (an SSA identity collision, none of the file's own 3 candidates), no rebuild spent, all 3 remain available |
 
 Scorecard is 17/19 (levels 14 and 16 both closed this arc; 18 and the
 non-scorecard walls in the main handoff remain).
+
+**All five original tasks are now closed** (2026-08-19). Three real
+fixes landed (Task A's `literal_value`, Task D's overlay refusal, plus
+level 16 from earlier this arc); two closed as precise findings-only
+diagnoses after a fix attempt (B) or scope assessment (C, E) concluded
+a small fix wasn't safe/appropriate. Each task file's `## FINDINGS`
+section names concrete next steps for whoever picks the remaining work
+back up — this pack is exhausted as delegable units, not as remaining
+work.
 
 Do not start work outside these files. The remaining frontier (re's
 `Raise` loop-blockers, the Shoal out-of-bounds sequence read, the reversible
