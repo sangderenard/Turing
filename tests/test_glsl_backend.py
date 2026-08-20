@@ -1070,6 +1070,31 @@ def test_launch_planner_auto_sizes_and_folds_flat_work(monkeypatch):
         plan_launch(0x100000000)
 
 
+def test_glsl_reads_the_prebaked_matrix_without_rewriting_it(monkeypatch):
+    from src.common.tensors.accelerator_backends import glsl_backend
+    from src.compiler.tiling_strategy import (
+        build_gemm_tile_plan,
+        prebake_gemm_launch_matrix,
+    )
+
+    limits = GLComputeLimits(
+        max_group_count=(65535, 65535, 65535),
+        max_group_size=(256, 256, 64), max_invocations=256,
+        max_ssbo_bindings=8, max_compute_ssbo_blocks=8,
+    )
+    monkeypatch.setattr(glsl_backend, "_compute_limits", lambda: limits)
+    matrix = prebake_gemm_launch_matrix(
+        build_gemm_tile_plan(192, 128, 64, 64, worker_budget=7),
+        variant_key="one-universal-gemm", parameter_ids={},
+        total_layout={}, core_layout={}, chunk_size=1,
+    )
+    interpreted = glsl_backend.plan_gemm_matrix_deployment(matrix)
+    assert interpreted.module_key == "one-universal-gemm"
+    assert interpreted.lane_count == 6
+    assert interpreted.calls_per_lane == (1,) * 6
+    assert interpreted.choice.compute.count == 6
+
+
 @pytest.mark.parametrize(
     "start,end,step,dtype",
     [

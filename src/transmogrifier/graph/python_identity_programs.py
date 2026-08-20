@@ -114,6 +114,21 @@ def _operator(
 
 PYTHON_IDENTITY_PROGRAMS: tuple[PythonIdentityProgram, ...] = (
     _operator(
+        "src.common.tensors.abstraction.AbstractTensor.matmul",
+        "src.common.tensors.abstraction.AbstractTensor.__matmul__",
+        "src.common.tensors.abstraction.AbstractTensor.__rmatmul__",
+        "src.common.tensors.abstraction.AbstractTensor.__imatmul__",
+        operator="matmul", inputs=("$receiver", "$arg0"),
+        attributes={
+            "semantic_library": "abstract_tensor_blas",
+            "backend_intrinsic_family": "blas.gemm",
+        },
+        description=(
+            "backend-neutral matrix product; matching backends may replace "
+            "it through their receipted BLAS intrinsic identity library"
+        ),
+    ),
+    _operator(
         "src.common.dt_system.dt_controller._restore_type",
         operator="cast_like", inputs=("$arg0", "$arg1"),
         attributes={"target_from_operand": 1},

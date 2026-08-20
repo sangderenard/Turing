@@ -6,6 +6,7 @@ from src.compiler.kernel_bank import BankRefusal
 from src.compiler.tiling_strategy import (
     build_gemm_tile_plan,
     decide_tiling,
+    interpret_gemm_compute_matrix,
     prebake_gemm_launch_matrix,
 )
 
@@ -126,6 +127,15 @@ def test_prebaked_matrix_contains_source_strides_and_launch_spans():
         "join": "barrier", "workers": 4, "chunk_size": 2,
         "lane_count": 4, "spans": [[0, 2], [2, 4]],
     }
+    assert matrix["logical_launch"] == {
+        "kind": "tile_composition",
+        "schedule": "independent_lanes",
+        "join": "barrier",
+        "lane_count": 4,
+        "call_count": 8,
+        "calls_per_lane": [2, 2, 2, 2],
+        "call_order": "sequential_within_lane",
+    }
     first = matrix["lanes"][0]["calls"][0]["parameters_by_name"]
     assert first["A"]["source_strides"] == [256, 1]
     assert first["A"]["packed_strides"] == [128, 1]
@@ -149,3 +159,50 @@ def test_prebaked_matrix_zero_pads_arbitrary_edges_on_the_square_core():
     assert all(
         edge[name]["zero_fill_packed_margin"] for name in ("A", "B", "C")
     )
+
+
+def test_glsl_and_webgpu_interpret_the_exact_same_logical_matrix():
+    from src.compiler.deployment_lowering import ComputeDispatchLimits
+
+    plan = build_gemm_tile_plan(256, 192, 128, 64, worker_budget=7)
+    matrix = prebake_gemm_launch_matrix(
+        plan, variant_key="universal-gemm-fast-64", parameter_ids={},
+        total_layout={}, core_layout={}, chunk_size=2,
+    )
+    limits = ComputeDispatchLimits(
+        max_group_count=(65535, 65535, 65535),
+        max_group_size=(256, 256, 64),
+        max_invocations=256,
+    )
+    glsl = interpret_gemm_compute_matrix(
+        matrix, backend="glsl", limits=limits,
+    )
+    webgpu = interpret_gemm_compute_matrix(
+        matrix, backend="webgpu", limits=limits,
+    )
+
+    assert glsl.matrix_sha256 == webgpu.matrix_sha256
+    assert glsl.module_key == webgpu.module_key == "universal-gemm-fast-64"
+    assert glsl.calls_per_lane == webgpu.calls_per_lane == (2,) * 12
+    assert glsl.choice.compute == webgpu.choice.compute
+    assert glsl.as_record()["logical"] == webgpu.as_record()["logical"]
+
+
+def test_compute_interpreter_refuses_a_backend_rewritten_topology():
+    from src.compiler.deployment_lowering import ComputeDispatchLimits
+
+    plan = build_gemm_tile_plan(128, 128, 128, 64, worker_budget=3)
+    matrix = prebake_gemm_launch_matrix(
+        plan, variant_key="universal", parameter_ids={}, total_layout={},
+        core_layout={}, chunk_size=1,
+    )
+    matrix["logical_launch"]["call_order"] = "backend_may_reorder"
+    limits = ComputeDispatchLimits(
+        max_group_count=(65535, 65535, 65535),
+        max_group_size=(256, 256, 64), max_invocations=256,
+    )
+    import pytest
+    with pytest.raises(ValueError, match="call_order"):
+        interpret_gemm_compute_matrix(
+            matrix, backend="glsl", limits=limits,
+        )

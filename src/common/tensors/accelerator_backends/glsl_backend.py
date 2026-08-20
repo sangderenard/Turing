@@ -85,6 +85,7 @@ __all__ = [
     "GLSLUnsupportedOp",
     "GLComputeLimits",
     "GLLaunchPlan",
+    "plan_gemm_matrix_deployment",
     "require_gl_context",
     "gl_context_info",
     "register_context_provider",
@@ -109,6 +110,7 @@ __all__ = [
     "emit_index_select_source",
     "emit_slice_axis_source",
     "emit_matmul_source",
+    "glslblas_gemm",
     "emit_permute_source",
     "emit_repeat_source",
     "emit_reduce_source",
@@ -6688,6 +6690,27 @@ def plan_launch(
     )
 
 
+def plan_gemm_matrix_deployment(
+    matrix: Mapping[str, Any], *, preferred_local_size: int = _LOCAL_SIZE,
+):
+    """Read the universal GEMM matrix through active GLSL device limits."""
+
+    from src.compiler.deployment_lowering import ComputeDispatchLimits
+    from src.compiler.tiling_strategy import interpret_gemm_compute_matrix
+
+    limits = _compute_limits()
+    return interpret_gemm_compute_matrix(
+        matrix,
+        backend="glsl",
+        preferred_local_size=preferred_local_size,
+        limits=ComputeDispatchLimits(
+            max_group_count=limits.max_group_count,
+            max_group_size=limits.max_group_size,
+            max_invocations=limits.max_invocations,
+        ),
+    )
+
+
 def _dispatch(
     program_id: int,
     chunks: Sequence[GLChunk],
@@ -8371,6 +8394,18 @@ def matmul_chunks(
     )
     _dispatch(_compile(source), [left, right], out, plan)
     return out
+
+
+def glslblas_gemm(left: Any, right: Any, *, reverse: bool = False) -> GLChunk:
+    """GLSL intrinsic candidate for canonical ``blas.gemm`` semantics.
+
+    The name is intentionally explicit: ingestion and repository SSA retain
+    canonical ``matmul``; the GLSL backend identity library may swap that
+    semantic operation to this implementation.  It is not a second GEMM and
+    does not participate in universal identity decisions.
+    """
+
+    return matmul_chunks(left, right, reverse=reverse)
 
 
 def repeat_chunk(

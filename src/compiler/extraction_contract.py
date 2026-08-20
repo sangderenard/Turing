@@ -154,7 +154,11 @@ class ExtractionDecision:
         return self.action in {
             ExtractionAction.INGEST_PYTHON,
             ExtractionAction.DECOMPILE_MACHINE,
-        }
+        } or (
+            self.action is ExtractionAction.INTRINSIC
+            and self.subject.source_available
+            and bool(self.parameters.get("ingest_fallback_source", False))
+        )
 
     def receipt(self) -> dict[str, Any]:
         return {
@@ -589,6 +593,11 @@ class ExtractionContract:
         if action is ExtractionAction.DECOMPILE_MACHINE and not parameters.get("explicit_opt_in"):
             raise ExtractionContractError(
                 f"choice {rule_id} enables decompilation without explicit_opt_in"
+            )
+        fallback_source = parameters.get("ingest_fallback_source", False)
+        if not isinstance(fallback_source, bool):
+            raise ExtractionContractError(
+                f"choice {rule_id} parameter ingest_fallback_source must be boolean"
             )
         required = {
             ExtractionAction.INGEST_PYTHON: {"follow_reachable_calls"},

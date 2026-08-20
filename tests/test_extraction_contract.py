@@ -178,7 +178,32 @@ def test_python_adapter_materializes_intrinsic_receipt_on_canonical_node():
     assert call["type"] == "float"
     assert call["attributes"]["extraction_action"] == "intrinsic"
     assert call["attributes"]["extraction_identity"] == "builtins.float"
+    assert call["attributes"]["backend_intrinsic_candidate"] == {
+        "semantic_identity": "builtins.float",
+        "lowering_namespace": "python_language",
+        "ingested_fallback": False,
+    }
     assert call["extraction_contract"]["rule_id"] == "control-and-scalar-builtins"
+
+
+def test_intrinsic_candidate_can_retain_an_ingested_semantic_fallback(tmp_path):
+    raw = yaml.safe_load(CONTRACT.read_text(encoding="utf-8"))
+    raw["rules"].insert(0, {
+        "id": "test-fallback-intrinsic",
+        "match": {"identity": "*._contract_inner"},
+        "action": "intrinsic",
+        "parameters": {
+            "lowering_namespace": "test-native",
+            "ingest_fallback_source": True,
+        },
+    })
+    path = tmp_path / "fallback-intrinsic.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    decision = ExtractionContract(path).decide(_contract_inner)
+
+    assert decision.action is ExtractionAction.INTRINSIC
+    assert decision.ingest_parent
+    assert decision.parameters["lowering_namespace"] == "test-native"
 
 
 @pytest.mark.parametrize(

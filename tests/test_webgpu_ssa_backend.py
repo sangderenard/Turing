@@ -9,7 +9,11 @@ from src.compiler.precompile_to_ssa import (
     lower_fused_program_to_ssa,
     lower_precompile_and_control_to_ssa,
 )
-from src.compiler.ssa_webgpu_backend import emit_module, plan_wgsl_launch
+from src.compiler.ssa_webgpu_backend import (
+    emit_module,
+    plan_gemm_matrix_deployment,
+    plan_wgsl_launch,
+)
 from src.transmogrifier.ssa import BasicBlock, Function, Instr, IRModule, SSAValue
 
 
@@ -155,6 +159,39 @@ def kernel(x):
     )
 
 
+def test_fast_contract_legalizes_float64_through_a_backend_identity():
+    from src.compiler.work_contract import set_active_contract
+
+    left = SSAValue(700, "float64")
+    right = SSAValue(701, "float64")
+    result = SSAValue(702, "float64")
+    function = Function("add", [left, right], {
+        "entry": BasicBlock("entry", [
+            Instr("Add", [left, right], result),
+            Instr("Ret", [result], None),
+        ]),
+    })
+    set_active_contract("fast")
+    try:
+        artifact = emit_module(
+            IRModule({"add": function}),
+            name="add",
+            outputs={"add": (result,)},
+            count=8,
+        )
+    finally:
+        set_active_contract(None)
+
+    assert artifact.complete
+    assert "array<f32>" in artifact.source
+    decision = artifact.backend_identity_decisions[0]
+    assert decision.identity == "shader_float64_storage_to_float32"
+    assert decision.applied
+    assert artifact.api.to_mapping()["metadata"]["backend_identities"][0][
+        "applied"
+    ]
+
+
 def test_canonical_ssa_diamond_emits_structured_if_else():
     condition = SSAValue(0, "bool")
     left = SSAValue(1, "float32")
@@ -208,3 +245,21 @@ def test_launch_planning_obeys_webgpu_minimum_limits():
     assert launch.limits.max_workgroups_per_dimension == 65535
     assert launch.deployment.backend == "webgpu"
     assert launch.deployment.compute.groups == launch.groups
+
+
+def test_webgpu_reads_the_prebaked_matrix_without_rewriting_it():
+    from src.compiler.tiling_strategy import (
+        build_gemm_tile_plan,
+        prebake_gemm_launch_matrix,
+    )
+
+    matrix = prebake_gemm_launch_matrix(
+        build_gemm_tile_plan(192, 128, 64, 64, worker_budget=7),
+        variant_key="one-universal-gemm", parameter_ids={},
+        total_layout={}, core_layout={}, chunk_size=1,
+    )
+    interpreted = plan_gemm_matrix_deployment(matrix)
+    assert interpreted.module_key == "one-universal-gemm"
+    assert interpreted.lane_count == 6
+    assert interpreted.calls_per_lane == (1,) * 6
+    assert interpreted.choice.compute.count == 6

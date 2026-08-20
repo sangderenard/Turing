@@ -49,6 +49,8 @@ measurement instrument and comparison baseline, not a product dependency.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -111,6 +113,40 @@ class TilingDecision:
     worker_budget: int
     candidates: tuple[tuple[int, float | None], ...]  # (size, probe_seconds)
     reasons: tuple[str, ...] = field(default=())
+
+
+@dataclass(frozen=True)
+class ComputeMatrixInterpretation:
+    """One shader backend's physical reading of one logical matrix.
+
+    This contains no GEMM expression and cannot alter call order.  Every
+    backend sees the same matrix digest, lanes, and ordered calls; only the
+    device-valid dispatch geometry is interpreted per backend.
+    """
+
+    backend: str
+    matrix_sha256: str
+    module_key: str
+    lane_count: int
+    call_count: int
+    calls_per_lane: tuple[int, ...]
+    choice: Any
+
+    def as_record(self) -> dict[str, Any]:
+        return {
+            "backend": self.backend,
+            "matrix_sha256": self.matrix_sha256,
+            "module_key": self.module_key,
+            "logical": {
+                "schedule": "independent_lanes",
+                "join": "barrier",
+                "lane_count": self.lane_count,
+                "call_count": self.call_count,
+                "calls_per_lane": list(self.calls_per_lane),
+                "call_order": "sequential_within_lane",
+            },
+            "physical": self.choice.as_record(),
+        }
 
 
 def _admitted_square_core_sizes(
@@ -421,6 +457,18 @@ def prebake_gemm_launch_matrix(
         "tile_shape": [tile, tile, tile],
         "total_parameter_layout": dict(total_layout),
         "core_parameter_layout": dict(core_layout),
+        # This is the one backend-neutral topology.  CPU pools and shader
+        # dispatches interpret it; neither is allowed to replace or reorder
+        # it.  ``launch`` below remains the native pool's physical reading.
+        "logical_launch": {
+            "kind": TILE_COMPOSITION_KIND,
+            "schedule": plan.schedule,
+            "join": plan.join_mode,
+            "lane_count": len(plan.lanes),
+            "call_count": sum(len(lane.steps) for lane in plan.lanes),
+            "calls_per_lane": [len(lane.steps) for lane in plan.lanes],
+            "call_order": "sequential_within_lane",
+        },
         "launch": {
             "join": plan.join_mode,
             "workers": plan.worker_budget,
@@ -435,13 +483,84 @@ def prebake_gemm_launch_matrix(
     }
 
 
+def interpret_gemm_compute_matrix(
+    matrix: Mapping[str, Any],
+    *,
+    backend: str,
+    limits: Any,
+    preferred_local_size: int = 256,
+) -> ComputeMatrixInterpretation:
+    """Interpret the single prebaked matrix as GLSL or WebGPU compute.
+
+    One invocation owns one independent output-tile lane; its k-step calls
+    remain sequential.  Future identities may refine the topology recorded in
+    the matrix, but a backend interpreter may never silently invent a second
+    GEMM or reorder the existing dependency chain.
+    """
+
+    if str(matrix.get("schema")) != "turing.prebaked-gemm-launch-matrix.v1":
+        raise ValueError("unsupported prebaked GEMM launch-matrix schema")
+    backend = str(backend)
+    if backend not in {"glsl", "webgpu"}:
+        raise ValueError("compute matrix interpreter supports glsl/webgpu")
+    lanes = tuple(matrix.get("lanes") or ())
+    lane_indices = tuple(int(lane.get("lane", -1)) for lane in lanes)
+    if lane_indices != tuple(range(len(lanes))):
+        raise ValueError("matrix lanes must be unique, contiguous, and ordered")
+    calls_per_lane = tuple(
+        len(tuple(lane.get("calls") or ())) for lane in lanes
+    )
+    logical = dict(matrix.get("logical_launch") or {})
+    expected = {
+        "schedule": "independent_lanes",
+        "join": "barrier",
+        "lane_count": len(lanes),
+        "call_count": sum(calls_per_lane),
+        "calls_per_lane": list(calls_per_lane),
+        "call_order": "sequential_within_lane",
+    }
+    for name, value in expected.items():
+        if logical.get(name) != value:
+            raise ValueError(
+                f"logical launch {name!r} disagrees with matrix lanes: "
+                f"{logical.get(name)!r} != {value!r}"
+            )
+
+    from .deployment_lowering import select_deployment_strategy
+
+    choice = select_deployment_strategy(
+        backend=backend,
+        execution_class="shader-compute",
+        join_mode="barrier",
+        work=len(lanes),
+        compute_limits=limits,
+        preferred_local_size=preferred_local_size,
+    )
+    if choice.compute is None:
+        raise ValueError(f"{backend} did not produce compute deployment geometry")
+    canonical = json.dumps(
+        dict(matrix), sort_keys=True, separators=(",", ":"), allow_nan=True,
+    ).encode("utf-8")
+    return ComputeMatrixInterpretation(
+        backend=backend,
+        matrix_sha256=hashlib.sha256(canonical).hexdigest(),
+        module_key=str(matrix.get("module_key") or ""),
+        lane_count=len(lanes),
+        call_count=sum(calls_per_lane),
+        calls_per_lane=calls_per_lane,
+        choice=choice,
+    )
+
+
 __all__ = [
+    "ComputeMatrixInterpretation",
     "TILE_COMPOSITION_KIND",
     "TileStep",
     "TileLane",
     "TiledDeploymentPlan",
     "TilingDecision",
     "decide_tiling",
+    "interpret_gemm_compute_matrix",
     "build_gemm_tile_plan",
     "prebake_gemm_launch_matrix",
 ]

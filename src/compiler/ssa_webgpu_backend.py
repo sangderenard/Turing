@@ -128,6 +128,27 @@ def plan_wgsl_launch(
     )
 
 
+def plan_gemm_matrix_deployment(
+    matrix: Mapping[str, Any], *, preferred_local_size: int = 256,
+):
+    """Read the universal GEMM matrix through WebGPU's device contract."""
+
+    from .deployment_lowering import ComputeDispatchLimits
+    from .tiling_strategy import interpret_gemm_compute_matrix
+
+    limits = WGSLComputeLimits()
+    return interpret_gemm_compute_matrix(
+        matrix,
+        backend="webgpu",
+        preferred_local_size=preferred_local_size,
+        limits=ComputeDispatchLimits(
+            max_group_count=(limits.max_workgroups_per_dimension,) * 3,
+            max_group_size=limits.max_workgroup_size,
+            max_invocations=limits.max_invocations_per_workgroup,
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class WGSLShortfall:
     function: str
@@ -152,6 +173,7 @@ class WGSLModule:
     launch_plan: WGSLLaunchPlan
     io_layout: Any = None
     component_abi: Any = None
+    backend_identity_decisions: tuple[Any, ...] = ()
 
     def write(self, directory: str | Path) -> Path:
         path = Path(directory) / f"{self.name}.wgsl"
@@ -525,6 +547,13 @@ def emit_module(
     preferred_local_size: int = 256,
 ) -> WGSLModule:
     ir_module = module if isinstance(module, IRModule) else IRModule(dict(module))
+    named_outputs = dict(outputs or {})
+    from .backend_identities import apply_backend_identities
+    identity_result = apply_backend_identities(
+        ir_module, named_outputs, backend="webgpu",
+    )
+    ir_module = identity_result.module
+    named_outputs = identity_result.outputs
     from .machine_dialect_ssa import (
         format_machine_dialect_occurrences,
         module_machine_dialect_occurrences,
@@ -537,7 +566,6 @@ def emit_module(
             + format_machine_dialect_occurrences(machine_residuals)
         )
     functions = ir_module.functions
-    named_outputs = dict(outputs or {})
     launch_plan = plan_wgsl_launch(count, preferred_local_size=preferred_local_size)
     shortfalls: list[WGSLShortfall] = []
     requested_entries = [key for key in named_outputs if key in functions]
@@ -693,6 +721,10 @@ def emit_module(
             "workgroup_size": launch_plan.workgroup_size,
             "dispatch_workgroups": launch_plan.groups,
             "deployment": launch_plan.deployment.as_record(),
+            "backend_identities": [
+                decision.as_record()
+                for decision in identity_result.decisions
+            ],
             "count": launch_plan.count,
             "stage": COMPUTE.name,
             "io_layout": io_layout.to_mapping(),
@@ -703,11 +735,12 @@ def emit_module(
     )
     return WGSLModule(
         name, source, not shortfalls, tuple(shortfalls), api, launch_plan,
-        io_layout, component_abi,
+        io_layout, component_abi, identity_result.decisions,
     )
 
 
 __all__ = [
     "WGSLComputeLimits", "WGSLEmissionError", "WGSLLaunchPlan", "WGSLModule", "WGSLShortfall",
-    "emit_module", "plan_wgsl_launch", "supported_tensor_operations",
+    "emit_module", "plan_gemm_matrix_deployment", "plan_wgsl_launch",
+    "supported_tensor_operations",
 ]

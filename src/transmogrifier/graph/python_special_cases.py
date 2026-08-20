@@ -41,13 +41,23 @@ def extraction_receipt(node: Any) -> dict[str, Any] | None:
 
 
 def _receipt_attributes(receipt: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    attributes = {
         "extraction_contract": dict(receipt),
         "extraction_action": receipt["action"],
         "extraction_rule": receipt.get("rule_id"),
         "extraction_identity": receipt.get("identity"),
         "extraction_classification": receipt.get("classification"),
     }
+    if receipt["action"] == "intrinsic":
+        parameters = dict(receipt.get("parameters") or {})
+        attributes["backend_intrinsic_candidate"] = {
+            "semantic_identity": receipt.get("identity"),
+            "lowering_namespace": parameters.get("lowering_namespace"),
+            "ingested_fallback": bool(
+                parameters.get("ingest_fallback_source", False)
+            ),
+        }
+    return attributes
 
 
 def _call_spelling(node: ast.Call) -> str | None:
