@@ -717,10 +717,56 @@ def _emit_repository_call_module(
     # single tensor/scalar buffer? A parameter is unpacked this way when the
     # callee's own instructions GetElementPtr off it at a nonzero constant
     # offset (offset 0 is indistinguishable from ordinary single-value
-    # indexing, so it is not by itself evidence of aggregate use). This is a
-    # purely structural, callee-local fact -- independent of any one call
-    # site -- used below to check that whoever calls in with that position
-    # actually built a table there.
+    # indexing, so it is not by itself evidence of aggregate use) AND the
+    # loaded slot is then used as an ADDRESS. Both halves matter: a flat
+    # array indexed at a compile-time-constant offset -- the shape every
+    # size-specialized kernel takes once its strides are baked -- produces
+    # the same GEP+Const, but what it loads is a NUMBER that flows into
+    # arithmetic, never a pointer that gets dereferenced. This is a purely
+    # structural, callee-local fact -- independent of any one call site --
+    # used below to check that whoever calls in with that position actually
+    # built a table there.
+    def _gep_result_is_dereferenced(
+        callee_function: _Any, gep_result_id: int
+    ) -> bool:
+        loaded = [
+            instruction.res
+            for block in callee_function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in {"Load", "load"}
+            and instruction.args
+            and int(instruction.args[0].id) == gep_result_id
+            and instruction.res is not None
+        ]
+        if not loaded:
+            return False
+        # A table slot holds another buffer's ADDRESS, so loading it yields
+        # a whole tensor -- a NON-scalar value whose storage is the loaded
+        # pointer (measured: the MSE-family unpacks load (2,2)/(2,)/(3,2)
+        # values). A flat array indexed at a constant offset loads a single
+        # NUMBER (shape ()) that flows into arithmetic.
+        if any(tuple(value.shape or ()) != () for value in loaded):
+            return True
+        loaded_ids = {int(value.id) for value in loaded}
+        for block in callee_function.blocks.values():
+            for instruction in block.instrs:
+                if not instruction.args:
+                    continue
+                if (
+                    instruction.op in {
+                        "GetElementPtr", "getelementptr", "Load", "load",
+                    }
+                    and int(instruction.args[0].id) in loaded_ids
+                ):
+                    return True
+                if (
+                    instruction.op in {"Store", "store"}
+                    and len(instruction.args) == 2
+                    and int(instruction.args[1].id) in loaded_ids
+                ):
+                    return True
+        return False
+
     callee_aggregate_parameter_positions: dict[str, set[int]] = {}
     for callee_name in reachable:
         callee_function = module.functions[callee_name]
@@ -750,7 +796,30 @@ def _emit_repository_call_module(
                     continue
                 offset = instruction.attributes.get("aggregate_index")
                 if offset is None and len(instruction.args) > 1:
-                    offset = callee_const_values.get(int(instruction.args[1].id))
+                    # No explicit aggregate_index: a constant index operand
+                    # is only evidence of TABLE unpacking when the loaded
+                    # slot is itself dereferenced as an address (the memcpy
+                    # -through-loaded-pointer shape this guard was built
+                    # for).  A flat array indexed at a compile-time-constant
+                    # offset -- which is what every size-specialized kernel
+                    # produces once its strides are baked to literals --
+                    # emits the same GEP+Const shape but LOADS A NUMBER,
+                    # not a pointer, so it must not be classified as an
+                    # aggregate parameter (that misclassification refused
+                    # every size-baked nested-loop kernel).
+                    constant_offset = callee_const_values.get(
+                        int(instruction.args[1].id)
+                    )
+                    if (
+                        constant_offset is not None
+                        and int(constant_offset) >= 1
+                        and instruction.res is not None
+                        and _gep_result_is_dereferenced(
+                            callee_function, int(instruction.res.id)
+                        )
+                    ):
+                        positions.add(parameter_ids.index(base_id))
+                    continue
                 if offset is not None and int(offset) >= 1:
                     positions.add(parameter_ids.index(base_id))
         if positions:

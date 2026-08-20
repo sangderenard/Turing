@@ -259,6 +259,104 @@ def test_sequential_stores_to_one_array_both_land():
 
 
 # ---------------------------------------------------------------------------
+# Size-baked (specialized) kernels: correct at real sizes, pinned-broken at
+# tiny trip counts.
+# ---------------------------------------------------------------------------
+
+BAKED_GEMM_TEMPLATE = """
+def gemm(A, B, C, alpha, beta):
+    m = {size}
+    n = {size}
+    k = {size}
+    for i in range(m):
+        for j in range(n):
+            total = 0.0
+            for p in range(k):
+                total = total + A[i * k + p] * B[p * n + j]
+            C[i * n + j] = alpha * total + beta * C[i * n + j]
+    return C
+"""
+
+
+def _baked_gemm_expected(a, b, c, alpha, beta, size):
+    return (
+        alpha * (a.reshape(size, size) @ b.reshape(size, size)).reshape(-1)
+        + beta * c
+    )
+
+
+def test_fully_size_baked_gemm_is_exact_above_the_unroll_limit():
+    """All three sizes baked to literals -- the kernel bank's specialization
+    shape -- computes exactly, natively, at any size whose trip count
+    exceeds the loop unroll limit (8). This is the variant the bank's
+    admission gate previously refused; the refusal traced to store-version
+    alias chains resolving one level instead of to their root
+    (ir_indexing.py), fixed alongside this test."""
+
+    size = 16
+    rng = np.random.default_rng(5)
+    a0 = rng.standard_normal(size * size)
+    b0 = rng.standard_normal(size * size)
+    c0 = rng.standard_normal(size * size)
+    produced = _run_native(
+        BAKED_GEMM_TEMPLATE.format(size=size), "gemm", "linbake",
+        {"A": a0, "B": b0, "C": c0},
+        {"alpha": 1.7, "beta": 0.3}, ("C",), size * size,
+    )
+    assert np.allclose(
+        produced["C"],
+        _baked_gemm_expected(a0, b0, c0, 1.7, 0.3, size),
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "at trip counts within the unroll limit the loop evaporator "
+        "unrolls the inner loops but drops the OUTER loop's iteration: its "
+        "induction variable leaks out as a free formal and only the "
+        "iteration where it equals the scratch-fill value computes "
+        "(measured 2026-08-20: 2x2 baked gemm computes row 0 exactly and "
+        "leaves row 1 untouched). The kernel bank's admission gate catches "
+        "this for bank users; this pin covers everyone else. Checked via "
+        "the SSA reference evaluator, NOT natively: the native build of "
+        "this shape hard-crashes (access violation), which no xfail can "
+        "contain -- the evaluator reproduces the same wrong values safely "
+        "and pins the defect at the layer it lives, lowering."
+    ),
+)
+def test_fully_size_baked_gemm_is_exact_within_the_unroll_limit():
+    from src.compiler.ssa_reference_evaluator import SSAReferenceEvaluator
+
+    size = 2
+    a0 = np.array([1.0, 2.0, 3.0, 4.0])
+    b0 = np.array([10.0, 20.0, 30.0, 40.0])
+    c0 = np.zeros(4)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        module, _outputs, _exports = lower_ast_source_to_ssa(
+            BAKED_GEMM_TEMPLATE.format(size=size), "gemm", name="lintiny"
+        )
+    function = module.functions["lintiny__gemm"]
+    parameters = dict(function.metadata["parameter_names"])
+    feed = {
+        parameters["A"]: a0.copy(),
+        parameters["B"]: b0.copy(),
+        parameters["C"]: c0.copy(),
+        parameters["alpha"]: 1.0,
+        parameters["beta"]: 0.0,
+    }
+    for formal in function.args:
+        if int(formal.id) not in feed:
+            feed[int(formal.id)] = 0.0
+    result = SSAReferenceEvaluator(module).run("lintiny__gemm", feed)
+    produced = np.asarray(result.values[parameters["C"]]).reshape(-1)
+    assert np.allclose(
+        produced, _baked_gemm_expected(a0, b0, c0, 1.0, 0.0, size)
+    )
+
+
+# ---------------------------------------------------------------------------
 # The goal this suite exists for: the full compiled eigh, xfail until the
 # sequential-store defect is fixed.  When the pin above flips, this is the
 # test that promotes the handoff's 2030x eigh precedent into a permanent,

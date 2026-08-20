@@ -96,11 +96,28 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
 
         if not aliases:
             continue
-        # A store's result is its mutated base: point every later use at base.
+
+        # A store's result is its mutated base: point every later use at
+        # base. Bases CHAIN: when stores to one array are sequential in a
+        # block -- which is what every unrolled loop and every size-baked
+        # kernel produces -- store #2's base is store #1's result, so the
+        # map holds 189 -> 146 -> 2. Resolving one level leaves a use
+        # pointing at 146, a version id no instruction defines: the SSA is
+        # then use-before-def and the evaluator (honestly) refuses while
+        # some emitters (dishonestly) emitted it. Resolve every alias to
+        # its ROOT storage.
+        def root(value: SSAValue) -> SSAValue:
+            seen: set[int] = set()
+            while int(value.id) in aliases and int(value.id) not in seen:
+                seen.add(int(value.id))
+                value = aliases[int(value.id)]
+            return value
+
         for block in function.blocks.values():
             for index, instruction in enumerate(block.instrs):
                 if any(int(a.id) in aliases for a in instruction.args):
                     block.instrs[index] = dataclasses.replace(
                         instruction,
-                        args=[aliases.get(int(a.id), a) for a in instruction.args],
+                        args=[root(a) if int(a.id) in aliases else a
+                              for a in instruction.args],
                     )

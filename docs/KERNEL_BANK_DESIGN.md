@@ -78,24 +78,45 @@ specialization dict, and a **compiler fingerprint** (newest mtime over
   source-level specializer should migrate onto it and this document
   updated.
 
-## 4. Defect pinned by the admission gate (open)
+## 4. Defect pinned by the admission gate — FIXED above the unroll limit
+## (2026-08-20), residual pinned below it
 
 Specializing `gemm` to literal sizes (`m=8, n=8, k=8` via
-signature-drop + prologue assignment) produces a LOUD emission shortfall:
+signature-drop + prologue assignment) produced a LOUD emission shortfall
+("call argument position(s) [3] feed ... whose body unpacks that
+parameter as a pointer table ...").
 
-    call argument position(s) [3] feed
-    kb_gemm_<key>__gemm__planned_region_0, whose body unpacks that
-    parameter ...
+**Diagnosed and fixed** (see `tests/test_compiled_linalg.py` and the
+commit carrying this edit). Two independent defects were stacked:
 
-i.e. with sizes baked, a planner region's call feeds a parameter its body
-then unpacks — the literal-bound defect family
-(`FUNCTION_TO_DEPLOYMENT_HANDOFF.md` section 4.2's neighborhood), but as a
-loud refusal rather than 4.2's silent dead-store. `dot` specializes and
-admits cleanly, so the trigger involves the nested-loop shape. Repro is
-one line: `open_blas_bank(...).get("gemm", specialized={"m": 8, "n": 8,
-"k": 8})`. Until fixed, the bank behaves exactly as designed: refusal
-recorded, launches route to the parametric build, nobody gets a wrong
-number.
+1. **Store-version alias chains resolved one level, not to their root**
+   (`ir_indexing.py`). A store's result aliases its mutated base; when
+   stores to one array are SEQUENTIAL in a block — what every unrolled or
+   size-baked loop produces — the aliases chain (189 → 146 → 2), and
+   one-level resolution left uses pointing at version ids nothing defines.
+   The reference evaluator refused these honestly (use-before-def); some
+   emitters emitted them. Fixed: aliases resolve to the root storage.
+2. **Flat-array constant-offset GEPs were misclassified as pointer-table
+   unpacks** (`ssa_llvm_backend.py`'s aggregate-parameter classifier, the
+   MSELoss heap-corruption guard). Baked strides fold indices to
+   constants, which matched the guard's "GEP at constant offset ≥ 1"
+   evidence. Tightened: a table slot's Load yields a NON-scalar value
+   (measured on the genuine MSE unpacks: (2,2)/(2,)/(3,2)) or is itself
+   dereferenced; a scalar load into arithmetic is array indexing. The
+   guard still fires on the genuine MSE-family unpacks (verified: the
+   three `test_process_graph_autograd.py` xfails still xfail).
+
+**Result**: `gemm` specialized to any size above the loop unroll limit
+(8) now ADMITS — verified 0.0e+00 against its oracle at 16³ and 64³,
+evaluator and native both exact.
+
+**Residual, pinned strict-xfail** (`test_compiled_linalg.py`): at trip
+counts WITHIN the unroll limit, the loop evaporator unrolls inner loops
+but drops the outer loop's iteration (its induction variable leaks out as
+a free formal; a 2×2 baked gemm computes row 0 and leaves row 1
+untouched, and the native build access-violates). The admission gate
+catches this for bank users; do not specialize below the unroll limit
+until the evaporator is fixed.
 
 ## 5. Interface for progressive region replacement
 
