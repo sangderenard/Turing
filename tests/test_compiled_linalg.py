@@ -238,17 +238,16 @@ def twice(a, n):
 """
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "two sequential loops storing to the same array lose the FIRST "
-        "loop's stores: native computes a+1 instead of 2a+1, with zero "
-        "shortfalls and distinct loop variables (measured 2026-08-20). "
-        "This is the defect that blocks a full in-place Jacobi (row-rotate "
-        "then column-rotate). A fix must flip this test."
-    ),
-)
 def test_sequential_stores_to_one_array_both_land():
+    """Was the sequential same-array store defect, strict-xfail until
+    2026-08-20: the second loop's consumers materialized the array's
+    post-first-loop LOOPRESULT identity as a fresh unconnected formal, so
+    the first loop's stores vanished. Fixed by graph-derived storage
+    aliasing (loopresult/IndexedStore chains resolve to their base arena
+    before formals are created -- _loop_carried_storage_aliases in
+    fortran_c_shell, threaded into the control-SSA builder's alias
+    chase). Now a permanent guard."""
+
     n = 4
     a0 = np.arange(1.0, n + 1.0)
     produced = _run_native(
@@ -438,16 +437,12 @@ def test_the_jacobi_kernel_is_correct_in_plain_python():
     ).max() < 1e-12
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "blocked by the sequential same-array store defect: the row-rotate "
-        "and column-rotate loops both store into `a`, so the compiled "
-        "kernel loses the row rotations and returns a wrong decomposition "
-        "(V comes back identity). Flips when the defect pin above flips."
-    ),
-)
 def test_the_compiled_eigh_matches_numpy():
+    """The suite's goal test, xfail until 2026-08-20: the row-rotate and
+    column-rotate loops both store into `a`, which the sequential-store
+    defect silently dropped. With that fixed, the full compiled Jacobi
+    eigh -- the 2030x precedent -- is a permanent, CI-checked claim."""
+
     n = 8
     rng = np.random.default_rng(7)
     m = rng.standard_normal((n, n))

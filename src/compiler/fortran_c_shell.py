@@ -129,6 +129,79 @@ class FortranCShellExecutable:
         )
 
 
+def _loop_carried_storage_aliases(graph_obj) -> dict[int, int]:
+    """Graph-derived storage aliases for loop-carried in-place mutation.
+
+    A loop that mutates an array through ``IndexedStore`` leaves a
+    LOOPRESULT node as the array's post-loop identity. That identity is
+    the SAME STORAGE as the array it mutated -- in-place is the point --
+    but the planner schedules later consumers against the loopresult id,
+    and a lowering that cannot link it materializes a fresh, unconnected
+    FORMAL: the second of two sequential loops over one array then reads
+    the original buffer and the first loop's stores silently vanish (the
+    sequential same-array store defect, pinned in
+    ``test_compiled_linalg.py``).
+
+    The chase is deliberately narrow, one level per node, composed by the
+    builder's existing alias-chain walk (``external_value``):
+
+    * a ``loopresult``/``loopexit`` node aliases its preferred-role parent
+      ONLY when that parent is itself an ``IndexedStore`` version or
+      another loop identity -- scalar carried results (a ``total``) are
+      genuine values with carried-port machinery of their own and are
+      never touched;
+    * an ``IndexedStore`` node aliases its ``base`` -- the store versions
+      resident memory, it does not mint storage (the same rule
+      ``ir_indexing`` applies inside a function, extended to the graph
+      so it holds ACROSS loops).
+    """
+
+    aliases: dict[int, int] = {}
+    chainable = {"indexedstore", "loopresult", "loopexit"}
+
+    def node_kind(node_id) -> str:
+        data = graph_obj.nodes.get(node_id) or {}
+        return str(data.get("op") or data.get("type") or "").casefold()
+
+    def value_id_of(node_id) -> int:
+        data = graph_obj.nodes.get(node_id) or {}
+        return int(data.get("value_id", node_id))
+
+    for node_id, data in graph_obj.nodes(data=True):
+        kind = str(data.get("op") or data.get("type") or "").casefold()
+        parents = tuple(data.get("parents") or ())
+        if kind == "indexedstore":
+            base = next(
+                (parent for parent, role in parents
+                 if str(role) == "base" and parent in graph_obj),
+                None,
+            )
+            if base is not None:
+                aliases[value_id_of(node_id)] = value_id_of(base)
+            continue
+        if kind in {"loopresult", "loopexit"}:
+            for preferred_role in (
+                "updated", "value", "body", "initial", "orelse"
+            ):
+                parent = next(
+                    (parent for parent, role in parents
+                     if str(role) == preferred_role
+                     and parent in graph_obj),
+                    None,
+                )
+                if parent is None:
+                    continue
+                if node_kind(parent) in chainable:
+                    aliases[value_id_of(node_id)] = value_id_of(parent)
+                break
+    # Never allow a cycle to reach the builder's chase (it guards with a
+    # seen-set, but a self-alias is meaningless regardless).
+    return {
+        source: target for source, target in aliases.items()
+        if source != target
+    }
+
+
 def _identifier(value: str) -> str:
     result = re.sub(r"[^A-Za-z0-9_]", "_", str(value))
     if not result or result[0].isdigit():
@@ -3200,6 +3273,9 @@ def _class_surface_ssa_program(
             lower_control_sections_to_ssa(
                 control,
                 hierarchy_plan=getattr(shell, "hierarchy_plan", None),
+                preloaded_value_aliases=_loop_carried_storage_aliases(
+                    graph_obj
+                ),
                 control_name=symbol,
                 identity_table=dict(graph_obj.graph.get("identity_table") or {}),
                 function_outputs=tuple(
@@ -10286,6 +10362,7 @@ def compile_ast_fortran_c_shell(
     tensor_code_references: Mapping[str, Callable[..., Any]] | None = None,
     tensor_ssa_reference: Any = None,
     runtime_closure_only: bool = False,
+    trace: bool = False,
 ) -> FortranCShellExecutable:
     """Compile Python AST through the registered Fortran target and C shell.
 
@@ -10327,6 +10404,7 @@ def compile_ast_fortran_c_shell(
         source,
         entrypoint,
         dict(feeds),
+        trace=trace,
         backend="c",
         precompile_only=True,
         bake_mode="whole_program",
@@ -10876,6 +10954,7 @@ def compile_ast_fortran_c_shell(
         name=artifact_name,
         standalone=standalone,
         library=library,
+        trace=trace,
     )
 
 

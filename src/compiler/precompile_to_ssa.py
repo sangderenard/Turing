@@ -5025,6 +5025,7 @@ def lower_control_sections_to_ssa(
     control: ControlProgram,
     *,
     hierarchy_plan: PlanClosure | None = None,
+    preloaded_value_aliases: Mapping[int, int] | None = None,
     control_name: str = "planned_control",
     identity_table: Mapping[str, tuple[int, ...]] | None = None,
     function_outputs: tuple[str, ...] = (),
@@ -5459,7 +5460,15 @@ def lower_control_sections_to_ssa(
     table_region_post_operations: dict[
         int, list[tuple[str, tuple[Any, ...]]]
     ] = {}
-    region_value_aliases: dict[int, int] = {}
+    # Seeded with the caller's graph-derived storage aliases (loop-carried
+    # versions of in-place mutated arenas chasing to their base storage),
+    # so a later loop's reads of "a after loop 1" resolve to a's own
+    # buffer instead of materializing a fresh, unconnected formal -- the
+    # defect that silently dropped the first of two sequential loops
+    # storing to one array (pinned in test_compiled_linalg.py).
+    region_value_aliases: dict[int, int] = dict(
+        preloaded_value_aliases or {}
+    )
     # An in-place pursued call can publish a result identity that is never an
     # operand of a later numerical region: the resident arena itself carries
     # the effect.  Such calls still execute at their authored position.  Use
