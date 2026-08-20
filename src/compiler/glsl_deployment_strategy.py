@@ -14911,6 +14911,42 @@ class ProcessGraphGLSLDeployment:
                 for reduction in target.loop_shader_reductions
                 if reduction.control_program is not None
             )
+            # A blocked loop (real blockers, e.g. an authored ``raise``) has
+            # no control_program and is silently excluded above. Its BODY
+            # REGIONS were still compiled as ordinary numerical work and
+            # remain in complete_regions -- unless something refuses here,
+            # they get scheduled FLAT with no loop wrapping them at all,
+            # which does not fail: it silently runs the loop's body exactly
+            # once, dropping both the iteration count and the raise
+            # statement itself. Measured: a two-line authored program with
+            # `if cond: ... else: raise` inside a `for` loop compiled with
+            # `complete: True`, no shortfall, no materializer refusal, and
+            # ran to a plausible but wrong answer. Refuse instead: a region
+            # scheduled without its owning loop is exactly the "lowering
+            # must not fabricate control" case the conditional overlay's own
+            # duplicate-region guard already refuses for a different cause.
+            complete_region_set = frozenset(int(index) for index in complete_regions)
+            orphaned = tuple(
+                reduction
+                for reduction in target.loop_shader_reductions
+                if reduction.control_program is None
+                and complete_region_set.intersection(
+                    map(int, reduction.region_indices)
+                )
+            )
+            if orphaned:
+                raise ValueError(
+                    "a loop's body regions are scheduled but the loop "
+                    "itself could not compile, which would otherwise "
+                    "silently run the body once with no iteration and no "
+                    "effect from its blockers: "
+                    + "; ".join(
+                        f"loop_node={reduction.loop_node_id} "
+                        f"regions={tuple(sorted(reduction.region_indices))} "
+                        f"blockers={reduction.blockers}"
+                        for reduction in orphaned
+                    )
+                )
             controls = tuple(
                 project_control_regions(
                     reduction.control_program,
