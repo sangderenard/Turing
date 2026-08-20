@@ -587,15 +587,33 @@ class KernelBank:
             profile = manifest.get("profile")
             if not profile:
                 continue
+            compute = float(profile.get("compute_avg_seconds") or 0.0)
+            first_launch = profile.get("first_launch_seconds")
+            if first_launch is None:
+                # Manifest written before the launch split: derive it the
+                # same way _profile now does -- the admission probe's
+                # timing IS the variant's one first call ever.
+                probe = (manifest.get("verification") or {}).get(
+                    "probe_call_seconds"
+                )
+                first_launch = (
+                    max(0.0, float(probe) - compute)
+                    if probe is not None else 0.0
+                )
+            relaunch = profile.get("relaunch_avg_seconds")
+            if relaunch is None:
+                relaunch = float(profile.get("launch_avg_seconds") or 0.0)
             rows.append({
                 "key": manifest.get("key"),
                 "contract": manifest.get("contract"),
                 "specialized": manifest.get("specialized") or {},
                 "sizes": profile.get("sizes") or {},
-                "first_launch_seconds": profile.get("first_launch_seconds"),
-                "relaunch_avg_seconds": profile.get("relaunch_avg_seconds"),
-                "compute_avg_seconds": profile.get("compute_avg_seconds"),
-                "cold_avg_seconds": profile.get("cold_avg_seconds"),
+                "first_launch_seconds": float(first_launch),
+                "relaunch_avg_seconds": float(relaunch),
+                "compute_avg_seconds": compute,
+                "cold_avg_seconds": float(
+                    profile.get("cold_avg_seconds") or 0.0
+                ),
                 "built_unix": manifest.get("built_unix"),
             })
         rows.sort(key=lambda row: row.get("built_unix") or 0)
