@@ -260,6 +260,198 @@ def _fma_contract_enabled() -> bool:
     return active_contract().contract_multiply_add
 
 
+_HOST_TARGET_LINES: tuple[str, ...] | None = None
+
+
+def _host_target_lines() -> tuple[str, ...]:
+    """``target datalayout`` + ``target triple`` for the host, asked of the
+    toolchain itself.
+
+    Emitted modules previously named no target at all, so LLVM optimized
+    with a generic cost model -- vector widths, alignments and addressing
+    costs all guessed. The lines are read from what the SAME bundled
+    clang produces for a trivial C file (dynamic reference, no
+    hand-mirrored platform strings), probed once per process and cached.
+    An unavailable toolchain degrades to the previous behavior: no target
+    lines, generic model.
+    """
+
+    global _HOST_TARGET_LINES
+    if _HOST_TARGET_LINES is not None:
+        return _HOST_TARGET_LINES
+    import subprocess as _probe_subprocess
+    import sys as _probe_sys
+    import tempfile as _probe_tempfile
+    from pathlib import Path as _ProbePath
+
+    lines: tuple[str, ...] = ()
+    try:
+        with _probe_tempfile.TemporaryDirectory() as scratch:
+            probe_source = _ProbePath(scratch) / "probe.c"
+            probe_source.write_text("int turing_target_probe;\n")
+            probe_output = _ProbePath(scratch) / "probe.ll"
+            completed = _probe_subprocess.run(
+                [_probe_sys.executable, "-m", "ziglang", "cc",
+                 "-S", "-emit-llvm",
+                 "-o", str(probe_output), str(probe_source)],
+                capture_output=True, text=True, timeout=180, check=False,
+            )
+            if completed.returncode == 0 and probe_output.is_file():
+                lines = tuple(
+                    line
+                    for line in probe_output.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                    if line.startswith("target datalayout")
+                    or line.startswith("target triple")
+                )
+    except Exception:
+        lines = ()
+    _HOST_TARGET_LINES = lines
+    return lines
+
+
+import re as _noalias_re
+
+_FORMAL_ACTUAL = _noalias_re.compile(r"^%(arg|out)\.(\d+)$")
+_WRAPPER_STORAGE = _noalias_re.compile(r"^%(public|root\.frame)\.\d+$")
+_DEFINE_LINE = _noalias_re.compile(
+    r"^define void @(?P<symbol>[\w$.]+)\((?P<params>[^)]*)\)"
+)
+
+
+def _annotate_noalias(
+    emitted_functions: list[str],
+    internal_call_records: list[tuple[str | None, str, tuple[str, ...]]],
+) -> list[str]:
+    """Add ``noalias`` to parameter positions proven distinct BY STORAGE.
+
+    The authority is the EMITTED POINTER STRING at every internal call
+    site, never the SSA value id: aliased IO through the pointer ABI is a
+    design feature here (a carried value's initial and updated ids share
+    one buffer across a call boundary), so distinct ids do not imply
+    distinct storage -- an id-based version of this pass miscompiled a
+    five-element accumulation to its last element. Strings are judged
+    conservatively, whitelist only:
+
+    * the wrapper's actuals (``%public.N`` per public value id,
+      ``%root.frame.N`` allocas) are terminal storage -- distinct names
+      are distinct allocations, so a position is safe there when its
+      string is unique in the call. Externally, authored array parameters
+      follow the BLAS restrict convention (a caller may alias two
+      READ-ONLY arrays; in-place input/output overlap arrives as the same
+      ``%public.N`` on both positions and is caught by the dup check);
+    * a caller's own formal (``%arg.K`` / ``%out.K``) inherits that
+      caller position's verdict, to a fixed point over the call graph;
+    * anything else -- derived addresses, aggregate tables, locals whose
+      provenance this pass has not proven -- disqualifies its position.
+
+    A position must be safe at EVERY call site to earn the attribute; a
+    function nobody calls (dead but emitted) earns nothing.
+    """
+
+    position_count: dict[str, int] = {}
+    sites: dict[str, list[tuple[str | None, tuple[str, ...]]]] = {}
+    for caller, callee, actuals in internal_call_records:
+        sites.setdefault(callee, []).append((caller, actuals))
+        count = position_count.get(callee)
+        if count is None or len(actuals) < count:
+            position_count[callee] = len(actuals)
+
+    safe: dict[str, set[int]] = {
+        symbol: set(range(count))
+        for symbol, count in position_count.items()
+    }
+    changed = True
+    while changed:
+        changed = False
+        for symbol, call_sites in sites.items():
+            for caller, actuals in call_sites:
+                for position in tuple(safe[symbol]):
+                    if position >= len(actuals):
+                        safe[symbol].discard(position)
+                        changed = True
+                        continue
+                    actual = actuals[position]
+                    if actuals.count(actual) > 1:
+                        safe[symbol].discard(position)
+                        changed = True
+                        continue
+                    if _FORMAL_ACTUAL.match(actual) is not None:
+                        # A caller formal: verdict inherited in the second
+                        # fixed point below, once direct disqualifiers are
+                        # settled everywhere.
+                        continue
+                    if caller is None and _WRAPPER_STORAGE.match(actual):
+                        continue
+                    safe[symbol].discard(position)
+                    changed = True
+
+    # Second fixed point for formal inheritance, now that direct
+    # disqualifiers are settled: a caller formal's flat position is its
+    # index among (args..., outs...), which is exactly how the actual
+    # strings %arg.K / %out.K were numbered at emission -- but %out.K's
+    # flat position needs the caller's arg count, recovered from its own
+    # define line.
+    argument_counts: dict[str, int] = {}
+    for text in emitted_functions:
+        match = _DEFINE_LINE.match(text.splitlines()[0])
+        if match is None:
+            continue
+        params = match.group("params").split(", ") if match.group("params") else []
+        argument_counts[match.group("symbol")] = sum(
+            1 for parameter in params if "%arg." in parameter
+        )
+    changed = True
+    while changed:
+        changed = False
+        for symbol, call_sites in sites.items():
+            for caller, actuals in call_sites:
+                if caller is None:
+                    continue
+                for position in tuple(safe[symbol]):
+                    if position >= len(actuals):
+                        continue
+                    formal = _FORMAL_ACTUAL.match(actuals[position])
+                    if formal is None:
+                        continue
+                    flat = int(formal.group(2)) + (
+                        argument_counts.get(caller, 0)
+                        if formal.group(1) == "out" else 0
+                    )
+                    if flat not in safe.get(caller, set()):
+                        safe[symbol].discard(position)
+                        changed = True
+
+    annotated: list[str] = []
+    for text in emitted_functions:
+        lines = text.splitlines()
+        match = _DEFINE_LINE.match(lines[0])
+        if match is None or match.group("symbol") not in safe:
+            annotated.append(text)
+            continue
+        symbol = match.group("symbol")
+        parameters = (
+            match.group("params").split(", ")
+            if match.group("params") else []
+        )
+        rewritten = []
+        for position, parameter in enumerate(parameters):
+            if (
+                position in safe[symbol]
+                and parameter.startswith("ptr %")
+                and "%extents" not in parameter
+            ):
+                parameter = parameter.replace("ptr %", "ptr noalias %", 1)
+            rewritten.append(parameter)
+        lines[0] = (
+            f"define void @{symbol}({', '.join(rewritten)})"
+            + lines[0][match.end():]
+        )
+        annotated.append("\n".join(lines))
+    return annotated
+
+
 def scalar_likeness(operation: str) -> str | None:
     template = _BINARY.get(operation) or _UNARY.get(operation)
     if (
@@ -1118,6 +1310,14 @@ def _emit_repository_call_module(
             module_extent_slots[key] = slot
         return slot
 
+    # (caller internal symbol or None for the wrapper, callee internal
+    # symbol, actual pointer strings in position order). Collected at
+    # every internal call emission; consumed by _annotate_noalias after
+    # all bodies exist -- pointer STRINGS are the storage authority here,
+    # value ids are not (a carried value's initial and updated ids share
+    # one buffer across a call boundary; marking on ids miscompiled a
+    # five-element accumulation to its last element).
+    internal_call_records: list[tuple[str | None, str, tuple[str, ...]]] = []
     emitted_functions: list[str] = []
     for name in reachable:
         function = module.functions[name]
@@ -2214,6 +2414,11 @@ def _emit_repository_call_module(
                             f"selected={selected!r}, declared={declared_ids!r}",
                         ))
                         continue
+                    internal_call_records.append((
+                        internal_symbols.get(name),
+                        internal_symbols[symbol],
+                        (*call_args, *result_ptrs),
+                    ))
                     body.append(
                         f"  call void @{internal_symbols[symbol]}("
                         + ", ".join(f"ptr {value}" for value in (
@@ -2623,6 +2828,14 @@ def _emit_repository_call_module(
             f"  {local} = alloca {llvm_type}, i64 {count}, align 8"
         )
         public_pointer[int(value.id)] = local
+    internal_call_records.append((
+        None,
+        internal_symbols[function_name],
+        tuple(
+            public_pointer[int(value.id)]
+            for value in (*root.args, *root_outputs)
+        ),
+    ))
     wrapper.append(
         f"  call void @{internal_symbols[function_name]}("
         + ", ".join((
@@ -2677,9 +2890,12 @@ def _emit_repository_call_module(
 
     llvm_ir = "\n\n".join(part for part in (
         f'source_filename = "turing.ssa-llvm.{entry_name}"',
+        "\n".join(_host_target_lines()),
         "\n".join(declarations[symbol] for symbol in sorted(declarations)),
         "\n\n".join(definitions[symbol] for symbol in sorted(definitions)),
-        "\n\n".join(emitted_functions),
+        "\n\n".join(_annotate_noalias(
+            emitted_functions, internal_call_records,
+        )),
         "\n".join((
             f"define void @{entry_name}(ptr %buffers, ptr %extents) {{",
             *wrapper,

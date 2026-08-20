@@ -174,10 +174,20 @@ PRESETS: dict[str, WorkContract] = {
     "deploy": WorkContract(
         "deploy", register_reuse=True, inexact_identities=True,
         contract_multiply_add=False,
+        # -O3 raises the optimizer's effort without changing semantics.
+        # Deliberately NO -march=native here: deploy's documented meaning
+        # is "inexact set, STABLE ACROSS HOSTS", and native tuning is the
+        # opposite of host-stable.
+        compiler_flags=("-O3",),
     ),
     "fast": WorkContract(
         "fast", register_reuse=True, inexact_identities=True,
         contract_multiply_add=True,
+        # -ffast-math is the toolchain spelling of what this preset
+        # already licenses (inexact identities + FMA contraction);
+        # -march=native arrives via the contraction switch itself in
+        # compile_artifact, so it is not restated here.
+        compiler_flags=("-O3", "-ffast-math"),
     ),
 }
 
