@@ -25,7 +25,9 @@ from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.ssa_python_materializer import materialize_ir_module
 
 
-def _auto_port(source: str, entrypoint: str, name: str):
+def _auto_port(
+    source: str, entrypoint: str, name: str, *, tensor_vocabulary: bool = False
+):
     """Compile ``source`` and return (emitted_python, namespace, skipped)."""
 
     with warnings.catch_warnings():
@@ -37,7 +39,9 @@ def _auto_port(source: str, entrypoint: str, name: str):
         f"{entrypoint} lowered to no outputs at all -- the statement was "
         "dropped rather than compiled"
     )
-    emitted, skipped = materialize_ir_module(module)
+    emitted, skipped = materialize_ir_module(
+        module, tensor_vocabulary=tensor_vocabulary
+    )
     code = ast.unparse(emitted)
     namespace = {"AbstractTensor": AbstractTensor}
     exec(compile(code, f"<auto-ported {name}>", "exec"), namespace)
@@ -109,27 +113,87 @@ def test_tensor_call_forms_are_read_from_the_class_not_invented():
     assert TENSOR_CALL_FORMS["index_select"] is False
 
 
-def test_array_indexing_is_still_refused_loudly_not_guessed():
-    """The honest current edge, recorded so it cannot regress into a guess.
-
-    ``_relative_bandwidth``'s real body indexes and slices (``logf[1]``,
-    ``logf[2:]``).  That lowers to a ``GetElementPtr`` addressing by computed
-    path, which this materializer deliberately does not spell -- it refuses by
-    name instead of emitting something that reads like Python and means
-    something else.
-    """
-
-    source = """
+ELEMENT_INDEX = """
 import numpy as np
-def relative_bandwidth(freqs):
+def logf_step(freqs):
     logf = np.log(freqs)
     return logf[1] - logf[0]
 """
+
+SLICED_BANDWIDTH = """
+import numpy as np
+def interior_bandwidth(logf):
+    return 2.0 / (logf[2:] - logf[:-2])
+"""
+
+
+def test_unary_math_is_emitted_as_a_tensor_method_under_tensor_vocabulary():
+    """``np.log`` on an array must not come back as ``math.log``.
+
+    The elementwise unary opcodes are shared between scalar and tensor
+    programs -- both spell ``Log`` -- and the SSA carries nothing that
+    separates them (a real array arrives with ``shape=()`` exactly like a
+    scalar). So the caller declares which vocabulary it wants.
+    """
+
+    code, _namespace, skipped = _auto_port(
+        ELEMENT_INDEX, "logf_step", "tv", tensor_vocabulary=True
+    )
+    assert skipped == {}
+    assert ".log()" in code
+    assert "math.log(" not in code
+
+
+def test_element_indexing_round_trips_and_matches_numpy():
+    _code, namespace, skipped = _auto_port(
+        ELEMENT_INDEX, "logf_step", "ei", tensor_vocabulary=True
+    )
+    assert skipped == {}
+    values = np.array([1.0, 4.0, 9.0])
+    got = namespace["ei__logf_step"](AbstractTensor.get_tensor(values))
+    expected = np.log(values)[1] - np.log(values)[0]
+    assert np.isclose(float(_np(got)), expected)
+
+
+def test_a_slice_becomes_a_real_parameter_of_the_emitted_program():
+    """A slice is parameterised, not lost.
+
+    ``logf[2:]`` does not fold away at lowering: its bound arrives as a value
+    the block does not compute, so the emitted function takes the slice as an
+    argument and its signature is wider than the authored one.  That is the
+    program *parameterised*, and the assertions below are what make that a
+    finding rather than an assumption -- the slice is passed in, the result
+    matches numpy on irregularly-spaced input (uniform input would agree even
+    if the slices were wrong), and a different slice provably changes the
+    answer, so the parameter is load-bearing.
+    """
+
+    _code, namespace, skipped = _auto_port(
+        SLICED_BANDWIDTH, "interior_bandwidth", "sl", tensor_vocabulary=True
+    )
+    assert skipped == {}
+
+    logf = np.array([0.0, 1.0, 3.0, 7.0, 8.5, 12.0])   # deliberately irregular
+    tensor = AbstractTensor.get_tensor(logf)
+    expected = 2.0 / (logf[2:] - logf[:-2])
+
+    entry = namespace["sl__interior_bandwidth"]
+    got = entry(tensor, slice(2, None), slice(None, -2))
+    assert np.allclose(_np(got), expected)
+
+    different = entry(tensor, slice(1, -1), slice(None, -2))
+    assert not np.allclose(_np(different), expected)
+
+
+def test_the_authored_parameter_list_is_still_recoverable():
+    """The widened signature does not hide which parameters were authored."""
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         module, _outputs, _exports = lower_ast_source_to_ssa(
-            source, "relative_bandwidth", name="rb"
+            SLICED_BANDWIDTH, "interior_bandwidth", name="pn"
         )
-    _emitted, skipped = materialize_ir_module(module)
-    assert skipped, "indexing should be refused, not silently emitted"
-    assert any("computed path" in reason for reason in skipped.values())
+    function = module.functions["pn__interior_bandwidth"]
+    authored = dict(function.metadata["parameter_names"])
+    assert list(authored) == ["logf"]
+    assert len(function.args) > len(authored)

@@ -227,11 +227,26 @@ def _constant(literal: Any) -> str:
 class _BodyMaterializer:
     """One SSA function's single block, as Python statements."""
 
-    def __init__(self, function: Any, *, argument_names: Mapping[int, str]):
+    def __init__(
+        self,
+        function: Any,
+        *,
+        argument_names: Mapping[int, str],
+        tensor_vocabulary: bool = False,
+    ):
         self.function = function
         self.names: dict[int, str] = dict(argument_names)
         self.statements: list[ast.stmt] = []
         self.uses_math = False
+        # Elementwise unary opcodes are shared between scalar and tensor
+        # programs -- ``Log`` is what both ``math.log(x)`` and ``x.log()``
+        # lower to, and the SSA carries nothing that separates them (a
+        # genuine array arrives with ``shape=()`` like a scalar). So the
+        # choice is declared by the caller rather than guessed from the IR:
+        # a caller translating tensor material asks for the tensor
+        # vocabulary, exactly as this module asks callers to add spellings
+        # deliberately rather than let it invent one.
+        self.tensor_vocabulary = bool(tensor_vocabulary)
 
     def operand(self, value: Any) -> str:
         value_id = int(value.id)
@@ -350,15 +365,40 @@ class _BodyMaterializer:
 
         if operation in {"GetElementPtr", "getelementptr"}:
             index = attributes.get("aggregate_index")
-            if index is None:
-                raise MaterializationError(
-                    f"{self.function.name}: GetElementPtr %t{int(result.id)} "
-                    "addresses by computed path rather than by aggregate "
-                    "index; only the region-call projection is spelled here"
-                )
-            base = self.operand(instruction.args[0])
-            self.assign(result, f"{base}[{int(index)}]")
-            return
+            if index is not None:
+                base = self.operand(instruction.args[0])
+                self.assign(result, f"{base}[{int(index)}]")
+                return
+            if len(instruction.args) == 2:
+                # Ordinary element indexing, as opposed to the region-call
+                # aggregate projection above: the address is (base, offset)
+                # with no aggregate index, which is what an authored ``a[i]``
+                # lowers to. Python spells that with the same subscript the
+                # source used, so this reproduces the read rather than
+                # guessing a layout -- the Load over it stays the identity,
+                # exactly as it is for the projection case.
+                #
+                # This covers an authored SLICE as well as an element read. A
+                # slice is not folded away at lowering: its bound arrives as a
+                # value the block does not compute and is promoted to a formal,
+                # so the emitted function takes the slice as a parameter. That
+                # is the program parameterised, not the program damaged --
+                # verified by executing it, where passing ``slice(2, None)``
+                # reproduces the numpy original exactly on irregularly-spaced
+                # input, and passing a different slice provably changes the
+                # result. The subscript is spelled the same way either way;
+                # what varies is only whether the offset is a constant the
+                # block builds or an argument it receives.
+                base = self.operand(instruction.args[0])
+                offset = self.operand(instruction.args[1])
+                self.assign(result, f"{base}[{offset}]")
+                return
+            raise MaterializationError(
+                f"{self.function.name}: GetElementPtr %t{int(result.id)} "
+                f"addresses by computed path over {len(instruction.args)} "
+                "operands; only the region-call projection and single-offset "
+                "element indexing are spelled here"
+            )
 
         if operation in {"Load", "load"}:
             # The repository IR does not insert a Load before every use of an
@@ -377,9 +417,22 @@ class _BodyMaterializer:
             return
 
         if operation in _UNARY_SPELLING:
+            operand = self.operand(instruction.args[0])
+            tensor_name = operation.lower()
+            if (
+                self.tensor_vocabulary
+                and operation in _NEEDS_MATH
+                and TENSOR_CALL_FORMS.get(tensor_name) is False
+            ):
+                # Only the ``math.*`` spellings need redirecting: they are the
+                # ones that genuinely fail on a tensor. The operator and
+                # builtin forms (``-x``, ``abs(x)``) already mean the right
+                # thing for both, so they are left exactly as they are rather
+                # than rewritten for the sake of uniformity.
+                self.assign(result, f"{operand}.{tensor_name}()")
+                return
             if operation in _NEEDS_MATH:
                 self.uses_math = True
-            operand = self.operand(instruction.args[0])
             self.assign(result, _UNARY_SPELLING[operation].format(operand))
             return
 
@@ -707,9 +760,17 @@ def _single_block(function: Any) -> Any:
 
 
 def materialize_function_body(
-    function: Any, *, parameter_names: Sequence[str] | None = None,
+    function: Any,
+    *,
+    parameter_names: Sequence[str] | None = None,
+    tensor_vocabulary: bool = False,
 ) -> tuple[list[ast.stmt], bool]:
     """One SSA function's body as statements, plus whether it needs ``math``.
+
+    ``tensor_vocabulary`` emits the AbstractTensor form of the elementwise
+    unary operations (``x.log()``) instead of the scalar one
+    (``math.log(x)``). See :class:`_BodyMaterializer` for why that is a
+    caller's declaration rather than something inferred from the SSA.
 
     ``parameter_names`` binds positionally to the function's formals when the
     caller has better names than the function states -- a ``MethodSchema``'s
@@ -736,7 +797,9 @@ def materialize_function_body(
             for position, formal in enumerate(formals)
         }
 
-    materializer = _BodyMaterializer(function, argument_names=names)
+    materializer = _BodyMaterializer(
+        function, argument_names=names, tensor_vocabulary=tensor_vocabulary,
+    )
     block_count = len(getattr(function, "blocks", {}) or {})
     if block_count == 4:
         statements = _materialize_conditional_diamond(function, materializer)
@@ -1161,8 +1224,13 @@ def _region_output_contracts(module: Any) -> dict[str, Any]:
     return contracts
 
 
-def materialize_ir_module(module: Any) -> tuple[ast.Module, dict[str, str]]:
+def materialize_ir_module(
+    module: Any, *, tensor_vocabulary: bool = False,
+) -> tuple[ast.Module, dict[str, str]]:
     """Every single-block function of an ``IRModule`` as one runnable module.
+
+    ``tensor_vocabulary`` translates the program into AbstractTensor Python
+    rather than scalar Python -- see :func:`materialize_function_body`.
 
     Returns the module and a mapping of the functions that could NOT be
     materialized to the reason why. Skipping is reported rather than silent:
@@ -1202,7 +1270,9 @@ def materialize_ir_module(module: Any) -> tuple[ast.Module, dict[str, str]]:
         formal_ids = [int(a.id) for a in getattr(function, "args", ())]
         try:
             body, needed = materialize_function_body(
-                function, parameter_names=parameters
+                function,
+                parameter_names=parameters,
+                tensor_vocabulary=tensor_vocabulary,
             )
         except MaterializationError as error:
             skipped[str(name)] = str(error)
