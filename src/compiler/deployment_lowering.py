@@ -180,6 +180,16 @@ class DeploymentStrategyChoice:
     ``workers`` is the measured best pool size when a calibration verdict
     contributed to the decision; ``None`` means "no measurement -- use the
     executor's own default sizing".
+
+    ``chunk`` is the strategic tiling geometry for the pool executors --
+    how many elements one worker claims per grab (turing_pool.c's atomic
+    chunk claiming, the wasm tile workers' batches). ``None`` means "no
+    evidence -- the executor's own default chunking", which is exactly
+    today's behavior. A chunk is CHOSEN, at build time, from the same
+    evidence chain as everything else here: the measured verdict's best
+    worker count, the task's work extent, and the cores stated for the
+    deploy target -- never probed at runtime, because no mechanism exists
+    to supply a runtime choice and none is being invented.
     """
 
     backend: str
@@ -188,6 +198,7 @@ class DeploymentStrategyChoice:
     execution_class: str
     reasons: tuple[str, ...]
     workers: int | None = None
+    chunk: int | None = None
     # True when a measured verdict, not a capability gap, demoted a legal
     # pool to serial -- the typed signal downstream gating keys on.
     calibration_demoted: bool = False
@@ -197,12 +208,39 @@ class DeploymentStrategyChoice:
         return self.strategy != SERIAL
 
 
+# One worker claim should not be the whole lane range: pools balance load
+# by letting fast workers claim more chunks, which needs several claims
+# per worker to exist. Four is turing_pool.c's own working ratio.
+_CHUNK_CLAIMS_PER_WORKER = 4
+
+
+def _strategic_chunk(
+    work: int | None, workers: int | None, reasons: list[str],
+) -> int | None:
+    """Chunk size from evidence, or ``None`` (executor default) without it."""
+
+    if work is None or not workers:
+        return None
+    work = int(work)
+    if work <= 0:
+        return None
+    chunk = max(1, work // (int(workers) * _CHUNK_CLAIMS_PER_WORKER))
+    reasons.append(
+        f"chunk {chunk} chosen: {work} work over {workers} worker(s) at "
+        f"{_CHUNK_CLAIMS_PER_WORKER} claims each for load balance"
+    )
+    return chunk
+
+
 def select_deployment_strategy(
     *,
     backend: str,
     execution_class: str,
     join_mode: str = "barrier",
     calibration=None,
+    work: int | None = None,
+    cores: int | None = None,
+    nesting_depth: int = 0,
 ) -> DeploymentStrategyChoice:
     """Choose how ``backend`` should lower a frame of the given class.
 
@@ -215,6 +253,24 @@ def select_deployment_strategy(
     legality -- a measured-slower pool degrades to serial with the measured
     ratio recorded, and a measured winner carries its best worker count.
     Calibration never overrides a legality veto in the other direction.
+
+    The strategic-tiling evidence, every piece optional and inert when
+    absent (absence of evidence changes nothing -- the deployment stage's
+    own law):
+
+    * ``work`` -- the task at hand: the frame's work extent (elements /
+      steps its lanes cover). With a worker count it yields the CHUNK the
+      pool executors claim by -- the tiling geometry, chosen here at build
+      time and recorded on the choice.
+    * ``cores`` -- cores stated for the deploy target. Used as the worker
+      count only when no calibration verdict measured one (measurement
+      outranks a core count).
+    * ``nesting_depth`` -- how many enclosing parallel deployments contain
+      this frame. Nested recognition is TEMPERED, not forbidden: the
+      worker budget divides by ``1 + depth`` so an inner pool cannot
+      multiply against the pools above it; a budget tempered to one worker
+      demotes to serial with the tempering recorded (running a one-worker
+      pool inside another pool's lane is pure overhead).
     """
 
     profile = deployment_profile(backend)
@@ -223,6 +279,7 @@ def select_deployment_strategy(
     )
     reasons: list[str] = []
     demoted_by_measurement = False
+    nesting_depth = max(0, int(nesting_depth))
     if str(execution_class) not in _CLASS_PREFERENCES:
         reasons.append(
             f"unknown execution class {execution_class!r}; treating as "
@@ -257,16 +314,42 @@ def select_deployment_strategy(
                 f"{calibration.machine}"
             )
             continue
+        workers = None
+        if strategy == POOL:
+            if calibration is not None:
+                workers = int(calibration.best_workers)
+                reasons.append(
+                    f"calibration measured {calibration.speedup:.2f}x at "
+                    f"{workers} worker(s)"
+                )
+            elif cores:
+                workers = int(cores)
+                reasons.append(
+                    f"no calibration verdict; worker budget from the "
+                    f"stated {workers} core(s)"
+                )
+            if workers is not None and nesting_depth:
+                tempered = max(1, workers // (1 + nesting_depth))
+                reasons.append(
+                    f"nested inside {nesting_depth} parallel "
+                    f"deployment(s): worker budget tempered "
+                    f"{workers} -> {tempered}"
+                )
+                workers = tempered
+                if workers <= 1:
+                    reasons.append(
+                        "tempered budget is one worker; a one-worker pool "
+                        "inside another pool's lane is pure overhead -- "
+                        "serial for this frame"
+                    )
+                    continue
         reasons.append(
             f"{strategy} selected via {profile.executor or 'declared profile'}"
         )
-        workers = None
-        if strategy == POOL and calibration is not None:
-            workers = int(calibration.best_workers)
-            reasons.append(
-                f"calibration measured {calibration.speedup:.2f}x at "
-                f"{workers} worker(s)"
-            )
+        chunk = (
+            _strategic_chunk(work, workers, reasons)
+            if strategy == POOL else None
+        )
         return DeploymentStrategyChoice(
             backend=profile.backend,
             strategy=strategy,
@@ -274,6 +357,7 @@ def select_deployment_strategy(
             execution_class=str(execution_class),
             reasons=tuple(reasons),
             workers=workers,
+            chunk=chunk,
         )
     return DeploymentStrategyChoice(
         backend=profile.backend,

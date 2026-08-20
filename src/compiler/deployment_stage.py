@@ -90,6 +90,7 @@ class RegionDeploymentDecision:
                 choice.backend: {
                     "strategy": choice.strategy,
                     "workers": choice.workers,
+                    "chunk": choice.chunk,
                     "calibration_demoted": choice.calibration_demoted,
                     "reasons": list(choice.reasons),
                 }
@@ -121,6 +122,32 @@ class RegionDeploymentPlan:
         }
 
 
+def region_nesting_depths(
+    deployment_regions: Sequence[Any],
+) -> dict[int, int]:
+    """Structural nesting depth per scheduled region index.
+
+    A region claimed as a lane by exactly one deployment is depth 0 -- an
+    ordinary parallel lane. A region claimed by MORE than one deployment
+    is a lane of a deployment that is itself inside another deployment's
+    lane, and its pool budget must be tempered accordingly:
+    ``depth = claims - 1``. Purely structural, from the same lane records
+    ``_barrier_lane_memberships`` reads -- no new bookkeeping.
+    """
+
+    claims: dict[int, int] = {}
+    for deployment in deployment_regions:
+        for lane in tuple(getattr(deployment, "lanes", ()) or ()):
+            for region_index in getattr(lane, "region_indices", ()) or ():
+                claims[int(region_index)] = claims.get(
+                    int(region_index), 0
+                ) + 1
+    return {
+        region_index: max(0, count - 1)
+        for region_index, count in claims.items()
+    }
+
+
 def plan_region_deployments(
     region_programs: Mapping[int, Any],
     *,
@@ -128,6 +155,7 @@ def plan_region_deployments(
     backends: Sequence[str] = DEFAULT_PLANNED_BACKENDS,
     presentation_channels=None,
     calibration_store: CalibrationStore | None = None,
+    cores: int | None = None,
 ) -> RegionDeploymentPlan:
     """Classify every region and choose a strategy per backend.
 
@@ -135,6 +163,16 @@ def plan_region_deployments(
     (lookups only -- see module docstring).  A store read that fails for
     any environmental reason degrades to no-verdict rather than failing
     the build.
+
+    ``cores`` states the deploy target's core count when the builder knows
+    it (a bundle built for the local machine passes ``os.cpu_count()``); it
+    is deliberately NOT probed here, because the build machine's cores are
+    not the deployed machine's. Absent, worker budgets come only from
+    measured verdicts -- exactly the prior behavior. Each region's WORK
+    (its step count, the same figure its calibration signature hashes) and
+    its structural NESTING DEPTH always accompany the selection, so pool
+    choices carry a strategic chunk and nested frames are tempered; with
+    no verdict and no ``cores`` both remain inert.
     """
 
     classifications = classify_region_executions(
@@ -142,9 +180,12 @@ def plan_region_deployments(
         deployment_regions=deployment_regions,
         presentation_channels=presentation_channels,
     )
+    nesting = region_nesting_depths(deployment_regions)
     decisions: list[RegionDeploymentDecision] = []
     for region_index, classification in sorted(classifications.items()):
         region_program = region_programs[region_index]
+        program = getattr(region_program, "program", region_program)
+        work = len(list(program.steps))
         choices: list[DeploymentStrategyChoice] = []
         for backend in backends:
             verdict = None
@@ -160,6 +201,9 @@ def plan_region_deployments(
                 execution_class=classification.execution_class,
                 join_mode="barrier",
                 calibration=verdict,
+                work=work,
+                cores=cores,
+                nesting_depth=nesting.get(int(region_index), 0),
             ))
         decisions.append(RegionDeploymentDecision(
             region_index=int(region_index),
@@ -207,5 +251,6 @@ __all__ = [
     "RegionDeploymentPlan",
     "browser_threading_veto",
     "plan_region_deployments",
+    "region_nesting_depths",
     "region_workload_signature",
 ]

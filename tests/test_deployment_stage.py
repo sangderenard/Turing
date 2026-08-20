@@ -124,3 +124,21 @@ def test_signature_is_stable_under_region_renumbering():
     assert region_workload_signature(
         "c", _region("mul")
     ).identity != first.identity
+
+
+def test_region_nesting_depths_count_multiple_lane_claims():
+    from src.compiler.deployment_stage import region_nesting_depths
+
+    class Lane:
+        def __init__(self, region_indices):
+            self.region_indices = tuple(region_indices)
+
+    class Deployment:
+        def __init__(self, lanes):
+            self.lanes = tuple(lanes)
+
+    outer = Deployment([Lane([1, 2]), Lane([3])])
+    inner = Deployment([Lane([2])])   # region 2 is a lane of BOTH
+    depths = region_nesting_depths((outer, inner))
+    assert depths[1] == 0 and depths[3] == 0
+    assert depths[2] == 1
