@@ -132,7 +132,17 @@ class CompiledVariant:
             for parameter in sorted(live)
         )
         execution = self._executions.get(signature)
-        feeds = {self.id_by_name[p]: live[p] for p in live}
+        # The creation path COPIES every feed. prepare_artifact_execution
+        # binds arrays by reference, so without the copy a caller's array
+        # (or worse, a VIEW into a larger array -- what a tiling composer
+        # passes) becomes the cached execution's own buffer: the next
+        # same-signature call then writes its inputs THROUGH that view into
+        # the caller's memory, silently corrupting whatever lived there.
+        # The reuse path below already copies by construction.
+        feeds = {
+            self.id_by_name[p]: np.array(live[p], dtype=float, copy=True)
+            for p in live
+        }
         if execution is None:
             execution = prepare_artifact_execution(self.native, feeds)
             self._executions[signature] = execution
@@ -509,7 +519,8 @@ class LaunchCoordinator:
                  prefer_specialized: bool = True,
                  compile_missing: bool = True,
                  specialize_missing: bool = False,
-                 fallback_to_reference: bool = True):
+                 fallback_to_reference: bool = True,
+                 tile: int | None = None):
         self.bank = bank
         self.contract = contract
         self.prefer_specialized = prefer_specialized
@@ -519,6 +530,19 @@ class LaunchCoordinator:
         #: NEXT launch at these sizes routes to it.
         self.specialize_missing = specialize_missing
         self.fallback_to_reference = fallback_to_reference
+        #: When set, a gemm launch whose sizes exceed the tile on every
+        #: axis routes through the TILED composition -- the custom size is
+        #: covered by calls on the prebaked (tile, tile, tile) core plus
+        #: parametric edge tiles (``tiled_launch.TiledGemm``). Tiling is a
+        #: ROUTE of this coordinator, not a separate orchestrator: the
+        #: routing ladder is exact-size specialized > tiled > parametric >
+        #: reference, and the decision lands in routing_log.jsonl like any
+        #: other. Cross-call scheduling (threads, placement) remains the
+        #: deployment machinery's job; when deployment learns to lower a
+        #:  tile plan natively, it replaces this route's host loop, not
+        #: this coordinator.
+        self.tile = int(tile) if tile else None
+        self._tiled_gemm = None
         self.log_path = bank.root / "routing_log.jsonl"
 
     def _log(self, record: dict) -> None:
@@ -541,10 +565,56 @@ class LaunchCoordinator:
                 )
             except BankRefusal as refusal:
                 attempts.append(f"specialize: {refusal}")
+        # The routing ladder: exact-size specialized > tiled composition of
+        # the prebaked core > parametric > reference. Tiled sits ABOVE
+        # parametric because its inner calls run the size-specialized core
+        # at the core's own admitted peak; it sits below an exact-size
+        # specialized build because that build has no composition overhead
+        # at all.
+        if self.prefer_specialized and sizes:
+            try:
+                variant = self.bank.get(
+                    name, contract=self.contract, specialized=sizes,
+                    compile_missing=False,
+                )
+                result = variant.run(arguments)
+                self._log({"kernel": name, "route": "specialized",
+                           "key": variant.key, "sizes": sizes})
+                return result
+            except BankRefusal as refusal:
+                attempts.append(f"specialized: {refusal}")
+        if (
+            self.tile is not None
+            and name == "gemm"
+            and sizes
+            and all(
+                int(sizes.get(axis, 0)) >= self.tile
+                for axis in ("m", "n", "k")
+            )
+            and tuple(sizes.get(axis) for axis in ("m", "n", "k"))
+            != (self.tile,) * 3
+        ):
+            try:
+                if self._tiled_gemm is None:
+                    from .tiled_launch import TiledGemm
+
+                    self._tiled_gemm = TiledGemm(
+                        self.bank, tile=self.tile, contract=self.contract,
+                    )
+                result = self._tiled_gemm(
+                    arguments["A"], arguments["B"], arguments["C"],
+                    float(arguments["alpha"]), float(arguments["beta"]),
+                    sizes["m"], sizes["n"], sizes["k"],
+                )
+                self._log({"kernel": name, "route": "tiled",
+                           "tile": self.tile, "sizes": sizes})
+                return result
+            except BankRefusal as refusal:
+                attempts.append(f"tiled: {refusal}")
         try:
             variant, kind = self.bank.select(
                 name, sizes=sizes, contract=self.contract,
-                allow_specialized=self.prefer_specialized,
+                allow_specialized=False,
                 compile_missing=self.compile_missing,
             )
             result = variant.run(arguments)

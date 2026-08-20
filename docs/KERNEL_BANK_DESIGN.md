@@ -118,6 +118,42 @@ untouched, and the native build access-violates). The admission gate
 catches this for bank users; do not specialize below the unroll limit
 until the evaporator is fixed.
 
+## 4.5 The tiled route (2026-08-20)
+
+The aim it serves (owner's): the compiler takes a CUSTOM size and exploits
+a tiling algorithm that uses only the PREBAKED operators at peak
+efficiency.
+
+`src/compiler/tiled_launch.py` (`TiledGemm`, `plan_gemm_tiling`) covers an
+arbitrary gemm with calls on the bank's size-specialized (T,T,T) core plus
+parametric edge tiles, reusing the kernel's own alpha/beta form (beta on
+the first k-tile, 1.0 after). It is HOST-side orchestration on purpose:
+the readable spec of the decomposition the deployment layer will
+eventually schedule natively (threads, its own packing).
+
+**Labor division, explicitly**: the bank owns variants + admission; the
+LaunchCoordinator owns per-call routing, where tiled is one rung of ONE
+ladder — exact-size specialized > tiled > parametric > reference
+(`LaunchCoordinator(bank, tile=64)`; decisions land in routing_log.jsonl
+with `route: "tiled"`); the deployment machinery keeps cross-call
+scheduling and, when it learns to lower a tile plan natively, replaces
+the composer's host loop — never the coordinator. There is no second
+orchestrator.
+
+Measured at 256³: tiled 1.34x over one parametric call (0.96 vs 0.72
+GF/s), correctness exact on awkward sizes (65×130×64, 200×65×130). The
+tile core itself is still scalar (~1.15 GF/s vs numpy's ~34) — the
+vectorization levers (noalias, datalayout) multiply THIS number and are
+the next work.
+
+**Defect found by composition, fixed in `CompiledVariant.run`**: the
+execution-creation path bound caller arrays by REFERENCE while the reuse
+path copied — a caller passing a numpy VIEW (what a tiling composer
+naturally passes) had its memory overwritten by the next same-signature
+call's inputs. Every tile call was individually exact while the assembled
+result was wrong. Creation now copies every feed;
+`tests/test_tiled_launch.py` pins the caller's memory directly.
+
 ## 5. Interface for progressive region replacement
 
 The bank was shaped so that effort plugs in rather than rebuilding:
