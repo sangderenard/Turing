@@ -10,6 +10,7 @@ WASM data segment; the Python loader verifies them before calling the DLL.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import dataclasses
 import hashlib
 import json
 import os
@@ -25,8 +26,8 @@ from .ssa_webgpu_backend import emit_gemm_module
 from .wasm_binary import CodeBuilder, build_module
 
 
-SERVER_SCHEMA = "turing.blas-server.v1"
-MATRIX_SCHEMA = "turing.blas-server-matrix.v1"
+SERVER_SCHEMA = "turing.blas-server.v2"
+MATRIX_SCHEMA = "turing.blas-server-matrix.v2"
 
 
 class BLASServerError(RuntimeError):
@@ -81,9 +82,10 @@ def _prepare_product_root(root: Path) -> Path:
         manifest_path = root / "manifest.json"
         if manifest_path.is_file():
             try:
-                owned = json.loads(
+                existing_schema = json.loads(
                     manifest_path.read_text(encoding="utf-8")
-                ).get("schema") == SERVER_SCHEMA
+                ).get("schema")
+                owned = existing_schema in {SERVER_SCHEMA, "turing.blas-server.v1"}
             except (OSError, ValueError):
                 owned = False
         if not owned:
@@ -114,7 +116,57 @@ def _c_string(data: bytes) -> str:
     return "\n".join(chunks)
 
 
-def _server_c(matrix: bytes, digest: str, variants: list[Mapping[str, Any]]) -> str:
+def _generic_native_c(variants: Mapping[str, Any]) -> str:
+    signatures = {
+        "scal": (
+            "int turing_blas_scal(const double *x, double *y, double alpha, int n)",
+            "return 0;",
+        ),
+        "axpy": (
+            "int turing_blas_axpy(const double *x, double *y, double alpha, int n)",
+            "return 0;",
+        ),
+        "dot": (
+            "double turing_blas_dot(const double *x, const double *y, int n)",
+            "return result;",
+        ),
+        "gemv": (
+            "int turing_blas_gemv(const double *A, const double *x, double *y, double alpha, double beta, int m, int n)",
+            "return 0;",
+        ),
+        "rot": (
+            "int turing_blas_rot(double *x, double *y, double c, double s, int n)",
+            "return 0;",
+        ),
+    }
+    blocks = []
+    for name, record in variants.items():
+        symbol = record["compiler_entry"]
+        signature, result = signatures[name]
+        slots = []
+        for binding in record["buffer_bindings"]:
+            bound = str(binding["name"])
+            slots.append(
+                "&result" if bound == "return"
+                else f"(void *){bound}" if binding["kind"] == "buffer"
+                else f"(void *)&{bound}"
+            )
+        local = "    double result = 0.0;\n" if name == "dot" else ""
+        blocks.append(f"""void {symbol}(void **, int32_t *);
+TURING_EXPORT {signature} {{
+{local}    void *buffers[] = {{{', '.join(slots)}}};
+    {symbol}(buffers, NULL);
+    {result}
+}}""")
+    return "\n\n".join(blocks)
+
+
+def _server_c(
+    matrix: bytes,
+    digest: str,
+    variants: list[Mapping[str, Any]],
+    generic_variants: Mapping[str, Any],
+) -> str:
     declarations = []
     branches = []
     for variant in variants:
@@ -166,6 +218,8 @@ TURING_EXPORT int turing_blas_server_gemm(
 TURING_EXPORT void turing_blas_server_shutdown(void) {{
 {shutdown}
 }}
+
+{_generic_native_c(generic_variants)}
 """
 
 
@@ -201,11 +255,96 @@ class BLASServer:
                                pointer, pointer, pointer,
                                ctypes.c_double, ctypes.c_double]
         self._gemm.restype = ctypes.c_int
+        p = ctypes.POINTER(ctypes.c_double)
+        self._scal = self.library.turing_blas_scal
+        self._scal.argtypes = [p, p, ctypes.c_double, ctypes.c_int]
+        self._scal.restype = ctypes.c_int
+        self._axpy = self.library.turing_blas_axpy
+        self._axpy.argtypes = [p, p, ctypes.c_double, ctypes.c_int]
+        self._axpy.restype = ctypes.c_int
+        self._dot = self.library.turing_blas_dot
+        self._dot.argtypes = [p, p, ctypes.c_int]
+        self._dot.restype = ctypes.c_double
+        self._gemv = self.library.turing_blas_gemv
+        self._gemv.argtypes = [p, p, p, ctypes.c_double, ctypes.c_double,
+                               ctypes.c_int, ctypes.c_int]
+        self._gemv.restype = ctypes.c_int
+        self._rot = self.library.turing_blas_rot
+        self._rot.argtypes = [p, p, ctypes.c_double, ctypes.c_double, ctypes.c_int]
+        self._rot.restype = ctypes.c_int
         self.library.turing_blas_server_shutdown.restype = None
 
     @property
     def shapes(self):
         return tuple(tuple(item["shape"]) for item in self.matrix["variants"])
+
+    @property
+    def methods(self):
+        return tuple(item["name"] for item in self.matrix["library"]["methods"])
+
+    @property
+    def deployed_methods(self):
+        return tuple(self.matrix["surface_methods"]["python"])
+
+    def supports(self, method):
+        return str(method) in self.deployed_methods
+
+    @staticmethod
+    def _vector(value):
+        value = np.ascontiguousarray(value, dtype=np.float64)
+        if value.ndim != 1:
+            raise ValueError("BLAS vector input must have rank one")
+        return value
+
+    def scal(self, x, alpha, *, y=None):
+        x = self._vector(x)
+        y = np.zeros_like(x) if y is None else self._vector(y).copy()
+        if y.shape != x.shape:
+            raise ValueError("scal x and y lengths differ")
+        pointer = ctypes.POINTER(ctypes.c_double)
+        self._scal(x.ctypes.data_as(pointer), y.ctypes.data_as(pointer),
+                   float(alpha), x.size)
+        return y
+
+    def axpy(self, x, y, alpha):
+        x, y = self._vector(x), self._vector(y).copy()
+        if y.shape != x.shape:
+            raise ValueError("axpy x and y lengths differ")
+        pointer = ctypes.POINTER(ctypes.c_double)
+        self._axpy(x.ctypes.data_as(pointer), y.ctypes.data_as(pointer),
+                   float(alpha), x.size)
+        return y
+
+    def dot(self, x, y):
+        x, y = self._vector(x), self._vector(y)
+        if y.shape != x.shape:
+            raise ValueError("dot x and y lengths differ")
+        pointer = ctypes.POINTER(ctypes.c_double)
+        return float(self._dot(x.ctypes.data_as(pointer),
+                               y.ctypes.data_as(pointer), x.size))
+
+    def gemv(self, a, x, *, y=None, alpha=1.0, beta=0.0):
+        a = np.ascontiguousarray(a, dtype=np.float64)
+        x = self._vector(x)
+        if a.ndim != 2 or a.shape[1] != x.size:
+            raise ValueError("gemv expects matrix A and compatible vector x")
+        y = np.zeros(a.shape[0], dtype=np.float64) if y is None else self._vector(y).copy()
+        if y.size != a.shape[0]:
+            raise ValueError("gemv y length does not match A rows")
+        pointer = ctypes.POINTER(ctypes.c_double)
+        self._gemv(a.ctypes.data_as(pointer), x.ctypes.data_as(pointer),
+                   y.ctypes.data_as(pointer), float(alpha), float(beta),
+                   a.shape[0], a.shape[1])
+        return y
+
+    def rot(self, x, y, c, s):
+        x, y = self._vector(x).copy(), self._vector(y).copy()
+        if y.shape != x.shape:
+            raise ValueError("rot x and y lengths differ")
+        pointer = ctypes.POINTER(ctypes.c_double)
+        self._rot(x.ctypes.data_as(pointer), y.ctypes.data_as(pointer),
+                  float(c), float(s), x.size)
+        return x, y
 
     def gemm(self, a, b, *, c=None, alpha=1.0, beta=0.0):
         a = np.ascontiguousarray(a, dtype=np.float64)
@@ -258,6 +397,13 @@ int turing_blas_server_gemm(
     int m, int n, int k,
     const double *a, const double *b, double *c,
     double alpha, double beta);
+int turing_blas_scal(const double *x, double *y, double alpha, int n);
+int turing_blas_axpy(const double *x, double *y, double alpha, int n);
+double turing_blas_dot(const double *x, const double *y, int n);
+int turing_blas_gemv(
+    const double *A, const double *x, double *y,
+    double alpha, double beta, int m, int n);
+int turing_blas_rot(double *x, double *y, double c, double s, int n);
 void turing_blas_server_shutdown(void);
 
 #ifdef __cplusplus
@@ -331,6 +477,9 @@ export class TuringBLASServer {{
   }}
   constructor(base,matrix,adapter,device){{this.base=base;this.matrix=matrix;this.adapter=adapter;this.device=device;this.pipelines=new Map();}}
   get shapes(){{return this.matrix.variants.map(v=>v.shape);}}
+  get methods(){{return this.matrix.library.methods.map(v=>v.name);}}
+  get deployedMethods(){{return [...this.matrix.surface_methods.webgpu];}}
+  supports(method){{return this.matrix.surface_methods.webgpu.includes(String(method));}}
   variant(m,n,k,kind="fast"){{const item=this.matrix.variants.find(v=>v.shape[0]===m&&v.shape[1]===n&&v.shape[2]===k);if(!item)throw new Error(`shape ${{m}}x${{n}}x${{k}} is not prebaked`);return item.webgpu[kind==="source"?"source":"fast"];}}
   async pipeline(record){{if(this.pipelines.has(record.source_sha256))return this.pipelines.get(record.source_sha256);const source=await(await fetch(new URL(record.path,this.base))).text();const digest=hex(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(source)));if(digest!==record.source_sha256)throw new Error(`shader identity mismatch: ${{record.path}}`);const module=this.device.createShaderModule({{code:source}});const info=await module.getCompilationInfo();const errors=info.messages.filter(m=>m.type==="error");if(errors.length)throw new Error(errors.map(e=>e.message).join("\\n"));const pipeline=this.device.createComputePipeline({{layout:"auto",compute:{{module,entryPoint:"main"}}}});this.pipelines.set(record.source_sha256,pipeline);return pipeline;}}
   async gemm(a,b,options={{}}){{const m=options.m??Math.round(Math.sqrt(a.length)),k=options.k??Math.round(a.length/m),n=options.n??Math.round(b.length/k),alpha=options.alpha??1,beta=options.beta??0,kind=options.variant??"fast";a=a instanceof Float32Array?a:new Float32Array(a);b=b instanceof Float32Array?b:new Float32Array(b);const c=options.c?(options.c instanceof Float32Array?options.c:new Float32Array(options.c)):new Float32Array(m*n);if(a.length!==m*k||b.length!==k*n||c.length!==m*n)throw new Error("GEMM buffer lengths disagree with M,N,K");const record=this.variant(m,n,k,kind),pipeline=await this.pipeline(record),device=this.device;const ab=storage(device,a,GPUBufferUsage.STORAGE),bb=storage(device,b,GPUBufferUsage.STORAGE),cb=storage(device,c,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC),scalars=storage(device,new Float32Array([alpha,beta]),GPUBufferUsage.UNIFORM),read=device.createBuffer({{size:c.byteLength,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}});const bind=device.createBindGroup({{layout:pipeline.getBindGroupLayout(0),entries:[{{binding:0,resource:{{buffer:ab}}}},{{binding:1,resource:{{buffer:bb}}}},{{binding:2,resource:{{buffer:cb}}}},{{binding:3,resource:{{buffer:scalars}}}}]}});const encoder=device.createCommandEncoder(),pass=encoder.beginComputePass();pass.setPipeline(pipeline);pass.setBindGroup(0,bind);pass.dispatchWorkgroups(...record.groups);pass.end();encoder.copyBufferToBuffer(cb,0,read,0,c.byteLength);device.queue.submit([encoder.finish()]);await read.mapAsync(GPUMapMode.READ);const result=new Float32Array(read.getMappedRange().slice(0));read.unmap();[ab,bb,cb,scalars,read].forEach(value=>value.destroy());return result;}}
@@ -366,6 +515,9 @@ def build_blas_server(
 
     variants: list[dict[str, Any]] = []
     products = []
+    from ..common.tensors.blas import blas_role
+    from ..common.tensors.mathematical_library import BLAS_LIBRARY
+
     for m, n, k in shapes:
         key = f"gemm-{m}-{n}-{k}"
         function = f"turing_blas_gemm_{m}_{n}_{k}"
@@ -410,14 +562,69 @@ def build_blas_server(
             "webgpu": webgpu,
         })
 
-    from ..common.tensors.blas import blas_role
-
     role = blas_role("gemm")
+    from .work_contract import PRESETS
+
+    contract_name = contract or "develop"
+    try:
+        contract_record = dataclasses.asdict(PRESETS[contract_name])
+    except KeyError as error:
+        raise BLASServerError(
+            f"unknown BLAS product contract {contract_name!r}; expected one of "
+            f"{tuple(PRESETS)!r}"
+        ) from error
+    generic_products = {}
+    for method in BLAS_LIBRARY.methods:
+        if method.name == "gemm":
+            continue
+        product = bank.get(method.name, contract=contract)
+        by_id = {identifier: name for name, identifier in product.id_by_name.items()}
+        parameter_kind = {item.name: item.kind for item in method.parameters}
+        bindings = []
+        for slot, identifier in enumerate(product.native.buffer_order):
+            name = by_id.get(int(identifier))
+            if name is None and int(identifier) in product.ret_ids:
+                name = "return"
+            if name is None:
+                raise BLASServerError(
+                    f"{method.identity}: native ABI slot {slot} value "
+                    f"{identifier} has no semantic binding"
+                )
+            bindings.append({
+                "slot": slot,
+                "value_id": int(identifier),
+                "name": name,
+                "kind": "scalar" if name == "return" else parameter_kind[name],
+                "dtype": product.native.buffer_dtypes[slot],
+            })
+        llvm_path = Path(product.native.library_path).with_suffix(".ll")
+        generic_products[method.name] = {
+            "variant_key": product.key,
+            "compiler_entry": product.native.name,
+            "source_sha256": method.source_sha256,
+            "llvm_sha256": _sha(llvm_path.read_bytes()),
+            "buffer_bindings": bindings,
+            "llvm_path": str(llvm_path),
+        }
+    surface_methods = {
+        "native": [method.name for method in BLAS_LIBRARY.methods],
+        "python": [method.name for method in BLAS_LIBRARY.methods],
+        "webgpu": ["gemm"],
+    }
     matrix = {
         "schema": MATRIX_SCHEMA,
         "role": role.identity,
         "role_source_sha256": _sha(role.source.encode("utf-8")),
-        "contract": contract or "develop",
+        "contract": contract_name,
+        "work_contract": contract_record,
+        "library": BLAS_LIBRARY.to_mapping(include_source=True),
+        "surface_methods": surface_methods,
+        "generic_native": {
+            name: {
+                key: value for key, value in record.items() if key != "llvm_path"
+            }
+            for name, record in generic_products.items()
+        },
         "variants": variants,
     }
     matrix_bytes = _canonical(matrix)
@@ -427,7 +634,8 @@ def build_blas_server(
 
     index_source = native_root / "turing_blas_server.c"
     index_source.write_text(
-        _server_c(matrix_bytes, matrix_sha, variants), encoding="utf-8",
+        _server_c(matrix_bytes, matrix_sha, variants, generic_products),
+        encoding="utf-8",
     )
     pool_source = (
         Path(__file__).resolve().parents[1]
@@ -439,6 +647,8 @@ def build_blas_server(
     core_sources = sorted({
         str(Path(product.manifest["build"]["core_llvm"]))
         for product in products
+    } | {
+        str(record["llvm_path"]) for record in generic_products.values()
     })
     command = [
         sys.executable, "-m", "ziglang", "cc", "-shared", "-O3", "-march=native",
@@ -496,7 +706,15 @@ def build_blas_server(
         "product_id": matrix_sha,
         "server_matrix": matrix_path.relative_to(root).as_posix(),
         "server_matrix_sha256": matrix_sha,
-        "roles": ["blas.gemm"],
+        "contract": contract_name,
+        "library": "blas",
+        "methods": [method.name for method in BLAS_LIBRARY.methods],
+        "roles": [method.identity for method in BLAS_LIBRARY.methods],
+        "deployed_roles": [method.identity for method in BLAS_LIBRARY.methods],
+        "surface_roles": {
+            surface: [f"blas.{name}" for name in names]
+            for surface, names in surface_methods.items()
+        },
         "shapes": [list(shape) for shape in shapes],
         "surfaces": {
             "native": {

@@ -43,6 +43,16 @@ def test_blas_server_packages_and_dispatches_multiple_specializations(tmp_path):
     assert matrix["schema"] == MATRIX_SCHEMA
     assert manifest["product_id"] == digest
     assert manifest["server_matrix_sha256"] == digest
+    assert manifest["methods"] == ["scal", "axpy", "dot", "gemv", "gemm", "rot"]
+    assert manifest["deployed_roles"] == [
+        "blas.scal", "blas.axpy", "blas.dot", "blas.gemv", "blas.gemm", "blas.rot",
+    ]
+    assert manifest["surface_roles"]["webgpu"] == ["blas.gemm"]
+    assert [item["name"] for item in matrix["library"]["methods"]] == manifest[
+        "methods"
+    ]
+    assert matrix["surface_methods"]["python"] == manifest["methods"]
+    assert matrix["surface_methods"]["webgpu"] == ["gemm"]
     assert manifest["surfaces"]["native"]["python_runtime_dependency"] is False
     assert manifest["surfaces"]["web"]["python_runtime_dependency"] is False
     assert [item["shape"] for item in matrix["variants"]] == [
@@ -54,6 +64,23 @@ def test_blas_server_packages_and_dispatches_multiple_specializations(tmp_path):
     rng = np.random.default_rng(811)
     try:
         assert server.shapes == ((17, 17, 17), (25, 25, 25))
+        assert server.methods == ("scal", "axpy", "dot", "gemv", "gemm", "rot")
+        assert server.deployed_methods == server.methods
+        assert server.supports("gemm") and server.supports("axpy")
+        x = rng.standard_normal(19)
+        y = rng.standard_normal(19)
+        assert np.allclose(server.scal(x, 1.25), 1.25 * x)
+        assert np.allclose(server.axpy(x, y, 1.25), 1.25 * x + y)
+        assert abs(server.dot(x, y) - float(x @ y)) < 1.0e-10
+        a = rng.standard_normal((13, 19))
+        initial = rng.standard_normal(13)
+        assert np.allclose(
+            server.gemv(a, x, y=initial, alpha=1.25, beta=0.5),
+            1.25 * (a @ x) + 0.5 * initial,
+        )
+        rx, ry = server.rot(x, y, 0.8, 0.6)
+        assert np.allclose(rx, 0.8 * x + 0.6 * y)
+        assert np.allclose(ry, 0.8 * y - 0.6 * x)
         for size in (17, 25):
             a = rng.standard_normal((size, size))
             b = rng.standard_normal((size, size))
@@ -74,6 +101,8 @@ def test_blas_server_packages_and_dispatches_multiple_specializations(tmp_path):
     assert "binding:3" in javascript
     assert "alpha,beta" in javascript
     assert 'join("\\n")' in javascript
+    assert "get methods()" in javascript
+    assert "deployedMethods" in javascript
     assert (product.directory / "native" / "turing_blas_server.h").is_file()
     assert (product.directory / "README.md").is_file()
     assert not (product.directory / ".build").exists()
