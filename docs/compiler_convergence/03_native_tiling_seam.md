@@ -44,7 +44,7 @@
 - The finished executable has no Python runtime or `HostDeploymentPool`
   dependency.
 
-## Result and remaining adoption seam — 2026-08-20
+## Result and GEMM product adoption — 2026-08-20
 
 Implemented and verified:
 
@@ -57,13 +57,27 @@ Implemented and verified:
   records, deterministic bindings, every tile parameter permutation, and
   every launch span. Arbitrary edges use zero-filled margins on one verified
   square module.
-- The 256-cubed instrument consumed that artifact and measured 8.68 ms pooled
-  versus 28.49 ms single-call, with 1.56e-13 error.
+- `compile_native_gemm_product()` is now the canonical GEMM product seam. From
+  the ordinary bank source and a problem shape it builds/adopts candidate
+  cores, performs the composed-path tile decision, chooses workers/chunk,
+  prebakes the complete launch matrix, and links the selected LLVM core and
+  `turing_pool.c` into one shared library.
+- The product deduplicates and parallel-packs each A/B window once per call,
+  executes context-bearing lane spans, publishes only valid edge windows, and
+  embeds no Python dependency. It exports a serial control using the identical
+  packing and lane spans; a failed pool takes that same fallback.
+- A 65-cubed integration test proves padded edge tiles for both pooled and
+  serial entries against NumPy.
 
-Six native-emission tests compile and execute the span ABI and prove planned
-worker/chunk literals. The remaining product task is narrow and explicit:
-`fortran_c_shell`/`profiled_c_shell` still use their established serial
-control renderer. They must select `render_pooled_control_c` and link
-`turing_pool.c` when a consumed C frame chooses pooling. Until then the native
-renderer is proven but not falsely advertised as the canonical product path;
-the Python host pool remains a measurement instrument only.
+The 256-cubed product selects tile 64 and seven background workers plus the
+caller. It measures 4.71 ms / 7.12 GF/s, 6.34x over its native serial control,
+5.92x over the original parametric kernel, and 0.27x NumPy, with 1.56e-13
+error. At 1024 cubed it selects tile 128 and measures 221.13 ms / 9.71 GF/s,
+7.16x over native serial, 8.89x over the original kernel, and 0.31x NumPy,
+with 4.69e-13 error.
+
+The generic `fortran_c_shell`/`profiled_c_shell` control renderer remains a
+separate adoption seam: it still handles nullary scheduled-region waves, not
+GEMM's context-bearing calls. The GEMM product is real and canonical for this
+BLAS path; this result does not falsely advertise every native product as
+pooled.

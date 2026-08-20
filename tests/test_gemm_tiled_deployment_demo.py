@@ -10,9 +10,9 @@ three claims that make it a proof rather than a printout:
   every lane executes, and the lane count follows the measured winner;
 * the result is exact against the oracle at every worker count (the demo
   itself hard-asserts worst |err| < 1e-9 before printing it);
-* the gain is COMMENSURATE: the pooled run beats the identical serial
-  code path by a real margin, and the tiled serial run beats the single
-  parametric call (the cache-locality half, independent of threads).
+* the gain is COMMENSURATE: the native pooled product beats its identical
+  native serial control by a real margin, while the host-pool instrument
+  independently checks the plan's lane semantics.
 
 Subprocess on purpose: the demo's own entry point is what users run, so
 the test proves that artifact, not a reimplementation that could drift.
@@ -81,3 +81,13 @@ def test_the_demo_proves_tiling_shape_correctness_and_gain(tmp_path):
         call["module_key"] == plan["module_key"]
         for lane in plan["lanes"] for call in lane["calls"]
     )
+    assert "built native pooled product" in output
+    assert "Python=false" in output
+    native_error = re.search(
+        r"native product: .*worst \|err\| ([\d.e+-]+)", output,
+    )
+    assert native_error and float(native_error.group(1)) < 1e-9, output
+    native_ratio = re.search(
+        r"native pool vs native serial:\s*([\d.]+)x", output,
+    )
+    assert native_ratio and float(native_ratio.group(1)) > 1.3, output

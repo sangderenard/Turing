@@ -56,6 +56,32 @@ def test_chooser_uses_best_live_profile_and_is_deterministic():
     assert first.candidates == ((32, 0.001), (64, 0.002))
 
 
+class _CompositionBank(_MeasuredBank):
+    def inventory(self):
+        return [
+            self._row(32, 0.000101),
+            self._row(64, 0.000459),
+            self._row(128, 0.003361),
+        ]
+
+    def get(self, _name, **_kwargs):
+        return object()
+
+
+def test_chooser_ranks_composed_critical_path_not_isolated_core_gflops():
+    decision = decide_tiling(
+        _CompositionBank(), "gemm", {"m": 256, "n": 256, "k": 256},
+        contract="fast", cores=8,
+    )
+
+    assert decision.tiled and decision.tile == 64
+    reason = " ".join(decision.reasons)
+    assert "projected composed critical path" in reason
+    assert "7 background worker(s) plus caller" in reason
+    assert "64:3.672ms" in reason
+    assert "128:6.722ms" in reason
+
+
 def test_must_divide_refuses_fitting_cores_that_leave_edges():
     decision = decide_tiling(
         _MeasuredBank(), "gemm", {"m": 100, "n": 100, "k": 100},
@@ -82,7 +108,7 @@ def test_one_worker_refuses_unsubstantiated_serial_composition():
         contract="fast", cores=1, must_divide=True,
     )
     assert not decision.tiled
-    assert "worker budget 1" in " ".join(decision.reasons)
+    assert "no background workers" in " ".join(decision.reasons)
 
 
 def test_prebaked_matrix_contains_source_strides_and_launch_spans():

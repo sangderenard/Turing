@@ -123,8 +123,12 @@ def test_stated_cores_supply_a_budget_only_without_measurement():
         cores=8, work=64_000,
     )
     assert unmeasured.strategy == POOL
-    assert unmeasured.workers == 8
-    assert unmeasured.chunk == 64_000 // 32
+    assert unmeasured.workers == 7
+    assert unmeasured.chunk == 64_000 // 28
+    assert any(
+        "caller as one execution slot" in reason
+        for reason in unmeasured.reasons
+    )
     measured = select_deployment_strategy(
         backend="c", execution_class="thread-workers",
         calibration=_pool_verdict(workers=2), cores=8, work=64_000,
@@ -133,13 +137,24 @@ def test_stated_cores_supply_a_budget_only_without_measurement():
     assert measured.workers == 2
 
 
+def test_browser_pool_workers_do_not_use_cpu_caller_accounting():
+    choice = select_deployment_strategy(
+        backend="wasm", execution_class="thread-workers",
+        cores=4, work=64_000,
+    )
+    assert choice.strategy == POOL
+    assert choice.workers == 4
+    assert not any("caller as one execution slot" in reason
+                   for reason in choice.reasons)
+
+
 def test_nesting_tempers_the_worker_budget_with_a_reason():
     choice = select_deployment_strategy(
         backend="c", execution_class="thread-workers",
         cores=8, work=64_000, nesting_depth=1,
     )
     assert choice.strategy == POOL
-    assert choice.workers == 4
+    assert choice.workers == 3
     assert any("tempered" in reason for reason in choice.reasons)
 
 

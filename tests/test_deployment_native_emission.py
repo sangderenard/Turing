@@ -212,8 +212,9 @@ def test_frame_plan_workers_and_chunk_are_literal_in_native_source():
     program, plan = _planned_wave(40, cores=2)
     rendered = render_pooled_control_c(program, deployment_plan=plan)
 
-    # 40 lanes / (2 workers * 4 claims each) => five lanes per claim.
-    assert "turing_pool_start(2)" in rendered.source
-    assert "turing_deploy_wave_0_span, 0, 40, 5" in rendered.source
-    assert rendered.deployment_record[0]["workers"] == 2
-    assert rendered.deployment_record[0]["chunk_size"] == 5
+    # Two stated cores become one parked worker plus the participating caller;
+    # chunk geometry is expressed over the one background worker.
+    assert "turing_pool_start(1)" in rendered.source
+    assert "turing_deploy_wave_0_span, 0, 40, 10" in rendered.source
+    assert rendered.deployment_record[0]["workers"] == 1
+    assert rendered.deployment_record[0]["chunk_size"] == 10

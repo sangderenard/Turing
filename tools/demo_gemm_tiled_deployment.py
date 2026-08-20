@@ -20,16 +20,16 @@ shim:
    PRIVATE prepared execution of the admitted core artifact (the native
    call releases the GIL across ctypes, so lanes overlap); ``workers=0``
    runs the identical code path serially -- the pool's own design -- so
-   the serial baseline cannot drift from the parallel one.
+   the instrumentation baseline cannot drift from the parallel one.
+5. The NATIVE GEMM PRODUCT embeds the admitted LLVM core, every packing
+   permutation, and the chosen pool launch in one shared library. Its
+   exported serial control runs the identical native packing and lane spans
+   without the pool, isolating the value of the deployment decision.
 
-MEASUREMENT INSTRUMENT, NOT A PRODUCT PATTERN. The host pool here stands
-in for the native pool with the same frame semantics (turing_pool.c:
-persistent workers, atomic chunk claiming, barrier join) so the
-strategy's workers/chunk numbers can be validated today. A compiled
-finished product does NOT acquire HostDeploymentPool -- or Python -- as
-a dependency: the strategy's choices belong inside the emitted artifact,
-lowered onto the native pool runtime, and this demo is the evidence that
-the numbers the plan bakes in are worth baking.
+The host pool is retained as a diagnostic instrument. The finished product
+does not acquire HostDeploymentPool -- or Python -- as a dependency: the
+strategy's choices are embedded in the artifact and lowered onto
+``turing_pool.c`` (persistent workers, atomic chunk claiming, barrier join).
 
 Run:
 
@@ -39,6 +39,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import sys
@@ -55,6 +56,10 @@ from src.compiler.deployment_lowering import select_deployment_strategy
 from src.compiler.kernel_bank import (
     open_blas_bank,
     parameter_layout_permutation,
+)
+from src.compiler.native_gemm_product import (
+    compile_native_gemm_product,
+    compile_prebaked_gemm_product,
 )
 from src.compiler.ssa_llvm_backend import prepare_artifact_execution
 
@@ -201,6 +206,11 @@ def main() -> int:
         help="work contract for the parametric kernel, tile cores, and "
              "chooser (use 'develop' for the exact default contract)",
     )
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="0 consumes the deployment strategy's worker choice; a positive "
+             "value is an explicit measurement override",
+    )
     args = parser.parse_args()
     size = args.size
     contract = (
@@ -232,7 +242,7 @@ def main() -> int:
 
         decision = decide_tiling(
             bank, "gemm", {"m": size, "n": size, "k": size},
-            contract=contract, cores=os.cpu_count(), must_divide=True,
+            contract=contract, cores=os.cpu_count(), must_divide=False,
         )
         print("  tile decision (the system's, not the demo's):")
         for reason in decision.reasons:
@@ -263,7 +273,10 @@ def main() -> int:
     )
     for reason in choice.reasons:
         print("  -", reason)
-    print(f"  => strategy={choice.strategy} workers={choice.workers} "
+    selected_workers = args.workers or choice.workers or 1
+    if args.workers:
+        print(f"  workers {selected_workers} FORCED by --workers")
+    print(f"  => strategy={choice.strategy} workers={selected_workers} "
           f"chunk={choice.chunk}")
 
     from src.compiler.tiling_strategy import (
@@ -272,7 +285,7 @@ def main() -> int:
     )
     tile_plan = build_gemm_tile_plan(
         size, size, size, tile,
-        worker_budget=choice.workers or 1,
+        worker_budget=selected_workers,
         reasons=tuple(choice.reasons),
     )
     prebaked = prebake_gemm_launch_matrix(
@@ -297,6 +310,21 @@ def main() -> int:
             json.dumps(prebaked, indent=2), encoding="utf-8",
         )
         print(f"  wrote prebake matrix {args.plan_output}")
+
+    if args.tile or args.workers:
+        product = compile_prebaked_gemm_product(
+            core, prebaked,
+            args.root / "products"
+            / f"gemm_{size}_{tile}_{selected_workers}_{core.key}",
+        )
+    else:
+        product = compile_native_gemm_product(
+            bank, {"m": size, "n": size, "k": size},
+            args.root / "products", contract=contract,
+            cores=os.cpu_count(), candidate_sizes=tuple(candidate_sizes),
+        )
+    print(f"  built native pooled product {product.library_path}")
+    print("  product dependencies: embedded LLVM core + turing_pool.c; Python=false")
 
     print("\n== 3. the source says how data partitions per m-item ==")
     partition = core.spec.item_data(
@@ -341,8 +369,57 @@ def main() -> int:
         return elapsed, out
 
     serial_seconds, _ = timed(0)
-    workers = choice.workers or max(1, (os.cpu_count() or 2) - 1)
+    workers = selected_workers
     pool_seconds, _ = timed(workers)
+
+    native_library = ctypes.CDLL(str(product.library_path))
+    native_function = getattr(native_library, product.function_name)
+    double_pointer = ctypes.POINTER(ctypes.c_double)
+    native_function.argtypes = [
+        double_pointer, double_pointer, double_pointer,
+        ctypes.c_double, ctypes.c_double,
+    ]
+    native_function.restype = ctypes.c_int
+    native_serial = getattr(
+        native_library, product.function_name + "_serial",
+    )
+    native_serial.argtypes = native_function.argtypes
+    native_serial.restype = ctypes.c_int
+    native_shutdown = getattr(
+        native_library, product.function_name + "_shutdown",
+    )
+    native_shutdown.restype = None
+
+    def native_call(entry=native_function) -> np.ndarray:
+        out = c2.copy()
+        status = entry(
+            a2.ctypes.data_as(double_pointer),
+            b2.ctypes.data_as(double_pointer),
+            out.ctypes.data_as(double_pointer),
+            alpha,
+            beta,
+        )
+        if status not in {0, 1}:
+            raise RuntimeError(f"native GEMM product returned {status}")
+        return out
+
+    native_call()  # start the persistent pool before steady-state timing
+    native_samples = []
+    native_out = None
+    try:
+        for _ in range(5):
+            started = time.perf_counter()
+            native_out = native_call()
+            native_samples.append(time.perf_counter() - started)
+        native_seconds = float(np.median(native_samples))
+    finally:
+        native_shutdown()
+    native_error = float(np.max(np.abs(native_out - expected)))
+    print(
+        f"  native product: {native_seconds*1000:8.2f} ms, "
+        f"worst |err| {native_error:.2e}"
+    )
+    assert native_error < 1e-9, "native product diverged from the oracle"
 
     # Steady-state medians for the reference rows, matching
     # docs/BLAS_VS_NUMPY_PROFILE.md's methodology -- a cold single shot
@@ -357,6 +434,17 @@ def main() -> int:
             samples.append(time.perf_counter() - started)
         return float(np.median(samples))
 
+    native_serial_out = native_call(native_serial)
+    native_serial_seconds = steady(
+        lambda: native_call(native_serial), repeats=3,
+    )
+    native_serial_error = float(
+        np.max(np.abs(native_serial_out - expected))
+    )
+    assert native_serial_error < 1e-9, (
+        "native serial control diverged from the oracle"
+    )
+
     parametric_seconds = steady(lambda: parametric.run({
         "A": a2.reshape(-1), "B": b2.reshape(-1), "C": c2.reshape(-1),
         "alpha": alpha, "beta": beta, "m": size, "n": size, "k": size,
@@ -369,12 +457,20 @@ def main() -> int:
         ("parametric single call", parametric_seconds),
         ("tiled serial (workers=0)", serial_seconds),
         (f"tiled pool  (workers={workers})", pool_seconds),
+        ("native serial control", native_serial_seconds),
+        ("native pooled product", native_seconds),
         ("numpy", numpy_seconds),
     ):
         print(f"  {label:<26} {seconds*1000:8.2f} ms  "
               f"{flops/seconds/1e9:6.2f} GF/s")
     print(f"  pool vs serial : {serial_seconds/pool_seconds:5.2f}x")
     print(f"  pool vs single : {parametric_seconds/pool_seconds:5.2f}x")
+    print(f"  native vs single: {parametric_seconds/native_seconds:5.2f}x")
+    print(
+        f"  native pool vs native serial: "
+        f"{native_serial_seconds/native_seconds:5.2f}x"
+    )
+    print(f"  native vs numpy : {numpy_seconds/native_seconds:5.2f}x")
     return 0
 
 

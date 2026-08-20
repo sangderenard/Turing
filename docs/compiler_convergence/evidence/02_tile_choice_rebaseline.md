@@ -28,8 +28,9 @@ the NumPy-backed reference.
 
 ## Live chooser checks
 
-The chart ranks 128 cubed highest by `2 * tile**3 / compute_median`.  Against
-the live bank, repeated calls produced the same complete decision:
+The isolated chart ranks 128 cubed highest by
+`2 * tile**3 / compute_median`. Against the original live-bank rule, repeated
+calls produced the same complete decision:
 
 - 256 cubed, `must_divide=True`: tile 128;
 - 384 cubed, `must_divide=True`: tile 128;
@@ -54,3 +55,21 @@ Focused checks include six chooser/prebake tests and the unforced end-to-end
 demo test. A one-worker budget now refuses composition absent positive serial
 calibration; arbitrary edges remain prebakable through zero-filled square-core
 packing and valid-window publication.
+
+## Composed-product correction
+
+Native execution proved that isolated-core throughput was insufficient as a
+chooser: it omitted K-step count, output-lane count, and execution-slot waves.
+The corrected chooser uses measured core time to estimate that complete
+critical path. It selects 64 for 256 cubed (sixteen lanes across eight slots)
+and 128 for 1024 cubed (64 lanes, eight K steps). The native measurements are:
+
+| shape | chosen tile | native serial | native pool | pool GF/s | NumPy | error |
+|---:|---:|---:|---:|---:|---:|---:|
+| 256³ | 64 | 29.89 ms | 4.71 ms | 7.12 | 1.27 ms | 1.56e-13 |
+| 1024³ | 128 | 1582.40 ms | 221.13 ms | 9.71 | 68.90 ms | 4.69e-13 |
+
+A forced 256 tile at 1024 cubed measured 227.02 ms, confirming the selected
+128 tile's advantage. Generated assembly contains AVX `vmulpd` and
+`vfmaddpd`; the remaining gap is not a failure to vectorize the unit-stride
+inner loop.

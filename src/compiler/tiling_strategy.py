@@ -17,12 +17,11 @@ Evidence consulted, in order:
 * **The bank's admitted variants** (existence + admission are the only
   proof a core runs correctly at a size; a refused or stale variant is
   never a candidate).
-* **Profiling numbers** from admission manifests
-  (``verification.probe_call_seconds``). These are COLD-call timings --
-  they include first-call preparation, so their absolute GF/s understates
-  steady state badly -- but the bias applies to every candidate alike, so
-  they rank candidates fairly. When steady-state numbers exist (a future
-  routing-log aggregation), they should replace this ranking.
+* **Profiling numbers** from admission manifests. Steady-state compute time
+  is projected through the candidate's number of k-steps, independent output
+  lanes, and available worker slots. This ranks the composed critical path,
+  rather than blindly selecting the fastest isolated square core and then
+  discovering that it produced too few lanes to occupy the machine.
 * **The task's shape**: a core larger than the task on any axis cannot
   tile it; a task not meaningfully larger than the best core gains nothing
   from composition overhead.
@@ -42,17 +41,11 @@ sequence of steps and not itself split. Executing a lane on a worker is
 therefore safe by construction; executing steps of one lane concurrently
 is not, and the plan's shape makes that distinction unrepresentable.
 
-There is deliberately NO executor in this module: tiling is a COMPILER choice
-made by the deployment layer.
-The decision and the plan are compile-time data for the deployment pass to
-consume when it lowers a recognized region -- emitting the tile loop, the
-packing, and the prebaked-core calls natively, with the plan's
-worker-budget bound feeding the same pool machinery (``turing_pool.c``)
-every other independent-lane region uses.
-``tools/demo_gemm_tiled_deployment.py`` is a measurement instrument that
-consumes the prebaked parameter/launch matrix through the host pool while the
-finished-product adoption seam is completed. It is not a Python dependency of
-emitted products.
+There is deliberately no executor in this decision module. The product
+consumer is ``native_gemm_product``: it compiles the plan's packing, admitted
+core calls and worker budget into one native artifact over ``turing_pool.c``.
+The host-pool path in ``tools/demo_gemm_tiled_deployment.py`` remains a
+measurement instrument and comparison baseline, not a product dependency.
 """
 from __future__ import annotations
 
@@ -189,12 +182,17 @@ def decide_tiling(
 
     reasons: list[str] = []
     cores = int(cores) if cores else (os.cpu_count() or 1)
-    worker_budget = max(1, cores // (1 + max(0, int(nested_parallelism))))
+    execution_slots = max(
+        1, cores // (1 + max(0, int(nested_parallelism)))
+    )
+    # Both CPU pools enlist the caller. Plans state parked background
+    # workers; projected critical paths use all active execution slots.
+    worker_budget = max(0, execution_slots - 1)
     if nested_parallelism > 0:
         reasons.append(
             f"nested inside {nested_parallelism} parallel deployment "
-            f"level(s): worker budget tempered to {worker_budget} of "
-            f"{cores} cores"
+            f"level(s): execution slots tempered to {execution_slots} of "
+            f"{cores} cores ({worker_budget} background worker(s) plus caller)"
         )
 
     if not all(axis in sizes for axis in ("m", "n", "k")):
@@ -245,18 +243,31 @@ def decide_tiling(
             False, None, worker_budget, tuple(candidates), tuple(reasons)
         )
 
-    def rank(entry: tuple[int, float | None]) -> float:
+    def composed_seconds(entry: tuple[int, float | None]) -> float:
         size, probe = entry
         if probe is None or probe <= 0:
-            return 0.0
-        return 2.0 * size ** 3 / probe  # cold-call GF/s: fair RANKING only
+            return float("inf")
+        lanes = ((m + size - 1) // size) * ((n + size - 1) // size)
+        steps_per_lane = (k + size - 1) // size
+        active_slots = max(1, min(lanes, worker_budget + 1))
+        lane_waves = (lanes + active_slots - 1) // active_slots
+        return float(probe) * steps_per_lane * lane_waves
 
-    best_size, best_probe = max(fitting, key=rank)
+    measured = [entry for entry in fitting if composed_seconds(entry) < float("inf")]
+    best_size, best_probe = (
+        min(measured, key=lambda entry: (composed_seconds(entry), -entry[0]))
+        if measured else max(fitting, key=lambda entry: entry[0])
+    )
+    estimates = ", ".join(
+        f"{size}:{composed_seconds((size, probe)) * 1e3:.3f}ms"
+        for size, probe in fitting if probe is not None and probe > 0
+    )
     reasons.append(
         f"core {best_size}^3 chosen from admitted candidates "
-        f"{[s for s, _ in fitting]} by measured compute throughput from "
-        "the build-time charts (cold admission probe only for "
-        "pre-profile manifests)"
+        f"{[s for s, _ in fitting]} by projected composed critical path "
+        f"over {worker_budget + 1} execution slot(s) "
+        f"({worker_budget} background worker(s) plus caller; "
+        f"{estimates or 'no timings'})"
     )
 
     if (m, n, k) == (best_size,) * 3:
@@ -269,10 +280,10 @@ def decide_tiling(
             False, None, worker_budget, tuple(candidates), tuple(reasons)
         )
 
-    if worker_budget < 2:
+    if worker_budget < 1:
         reasons.append(
-            "tiled composition refused at worker budget 1: current packed "
-            "serial composition has no positive calibration evidence"
+            "tiled composition refused with no background workers: current "
+            "packed serial composition has no positive calibration evidence"
         )
         return TilingDecision(
             False, None, worker_budget, tuple(candidates), tuple(reasons)

@@ -323,11 +323,30 @@ def select_deployment_strategy(
                     f"{workers} worker(s)"
                 )
             elif cores:
-                workers = int(cores)
+                stated_cores = max(1, int(cores))
+                if profile.backend in {"python", "llvm", "c"}:
+                    # These CPU pools enlist the caller in frame draining.
+                    # ``workers`` is parked background threads, not total
+                    # active execution slots. Browser workers do not share
+                    # this execution model.
+                    workers = max(0, stated_cores - 1)
+                    reasons.append(
+                        f"no calibration verdict; {workers} background "
+                        f"worker(s) from {stated_cores} stated core(s), with "
+                        "the caller as one execution slot"
+                    )
+                else:
+                    workers = stated_cores
+                    reasons.append(
+                        f"no calibration verdict; {workers} worker(s) from "
+                        f"{stated_cores} stated core(s)"
+                    )
+            if workers is not None and workers < 1:
                 reasons.append(
-                    f"no calibration verdict; worker budget from the "
-                    f"stated {workers} core(s)"
+                    "no background worker remains after caller participation; "
+                    "serial for this frame"
                 )
+                continue
             if workers is not None and nesting_depth:
                 tempered = max(1, workers // (1 + nesting_depth))
                 reasons.append(

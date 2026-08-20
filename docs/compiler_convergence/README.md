@@ -87,10 +87,12 @@ stage changes the measurement floor.
 
 ## Convergence checkpoint — 2026-08-20
 
-Tasks 1, 2, 4, 5, and 6 have executable evidence. Task 3 has a proven native
-span ABI, consumed prebake matrix, manifest propagation, and an explicit
-remaining product-renderer adoption seam. Tasks 7–10 remain bounded by their
-documents; no speculative fixes were mixed into this checkpoint.
+Tasks 1, 2, 4, 5, and 6 have executable evidence. Task 3 now also has a
+canonical Python-free native GEMM product: composed-path tile selection,
+prebaked packing and launch records, native pooled execution, edge handling,
+and an identical native serial control. The generic Fortran/C-shell adoption
+seam remains separately bounded. Tasks 7–10 remain bounded by their documents;
+no speculative fixes were mixed into this checkpoint.
 
 The touched-feature gate passed 73 tests plus the end-to-end prebake demo. The
 regression floor remains 17/19 scorecard journeys, 34 precompile tests, native
