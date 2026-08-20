@@ -157,15 +157,49 @@ class TiledGemmLanes:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--size", type=int, default=256)
-    parser.add_argument("--tile", type=int, default=64)
+    parser.add_argument(
+        "--tile", type=int, default=0,
+        help="0 (default) lets the deployment decision choose the tile "
+             "from the bank's admitted cores and their measured compute "
+             "averages; an explicit value forces it",
+    )
     parser.add_argument("--root", type=Path,
                         default=ROOT / "build" / "kernel_bank")
     args = parser.parse_args()
-    size, tile = args.size, args.tile
+    size = args.size
 
     bank = open_blas_bank(args.root)
     print("== 1. bank: build + auto-profile ==")
     parametric = bank.get("gemm")
+    # A ladder of candidate cores, every divisor of the task within the
+    # buildable range -- the DECISION picks among them; the demo does not.
+    candidate_sizes = [
+        candidate for candidate in (32, 64, 128, 256)
+        if size % candidate == 0
+    ]
+    for candidate in candidate_sizes:
+        bank.get(
+            "gemm",
+            specialized={"m": candidate, "n": candidate, "k": candidate},
+        )
+
+    if args.tile:
+        tile = args.tile
+        print(f"  tile {tile} FORCED by --tile")
+    else:
+        from src.compiler.tiling_strategy import decide_tiling
+
+        decision = decide_tiling(
+            bank, "gemm", {"m": size, "n": size, "k": size},
+            cores=os.cpu_count(), must_divide=True,
+        )
+        print("  tile decision (the system's, not the demo's):")
+        for reason in decision.reasons:
+            print("   -", reason)
+        if not decision.tiled:
+            print("  decision: do not tile; nothing further to prove here")
+            return 1
+        tile = decision.tile
     core = bank.get(
         "gemm", specialized={"m": tile, "n": tile, "k": tile},
     )

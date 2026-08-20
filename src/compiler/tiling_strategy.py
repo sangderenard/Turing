@@ -145,7 +145,15 @@ def _admitted_square_core_sizes(
         if not verification.get("admitted"):
             continue
         size = sizes.pop()
-        probe = verification.get("probe_call_seconds")
+        # The build-time profile's steady-state compute average is the
+        # honest throughput evidence; the admission probe's cold single
+        # call (launch conflated with compute) is only the fallback for
+        # manifests written before profiling existed.
+        profile = row.get("profile") or {}
+        probe = (
+            profile.get("compute_avg_seconds")
+            or verification.get("probe_call_seconds")
+        )
         if size not in seen or (
             probe is not None
             and (seen[size] is None or probe < seen[size])
@@ -173,6 +181,7 @@ def decide_tiling(
     contract: str | None = None,
     cores: int | None = None,
     nested_parallelism: int = 0,
+    must_divide: bool = False,
 ) -> TilingDecision:
     """Should this call be tiled, with which core, under how many workers?
 
@@ -210,7 +219,16 @@ def decide_tiling(
     fitting = [
         (size, probe) for size, probe in candidates
         if size <= min(m, n, k)
+        and (
+            not must_divide
+            or (m % size == 0 and n % size == 0 and k % size == 0)
+        )
     ]
+    if must_divide:
+        reasons.append(
+            "must_divide: only cores dividing every axis are candidates "
+            "(the executor at hand has no parametric edge path)"
+        )
     if not fitting:
         reasons.append(
             f"every admitted core ({[s for s, _ in candidates]}) exceeds "
