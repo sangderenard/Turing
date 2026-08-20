@@ -242,29 +242,63 @@ def normalize_aot_schedule_preference(value: str) -> str:
 def _source_dependency_is_not_tensor_primitive(value: Any) -> bool:
     """Keep the source linker above the established tensor-op boundary.
 
-    ``AbstractTensor`` methods are the compiler's numerical vocabulary.  If
-    dependency discovery recursively ingests their Python dispatch wrappers,
-    an ordinary ``AT.tensor`` call expands into backend selection, autograd,
-    and tape object construction instead of remaining the tensor operation
-    the reducer already knows how to lower.
+    ``AbstractTensor``'s *catalogued* operations are the compiler's numerical
+    vocabulary.  If dependency discovery recursively ingests their Python
+    dispatch wrappers, an ordinary ``AT.tensor`` call expands into backend
+    selection, autograd, and tape object construction instead of remaining the
+    tensor operation the reducer already knows how to lower.
+
+    The boundary is the operator catalogue, not the class.  A method written
+    purely in terms of operations already in the catalogue is not a primitive
+    and owns no lowering: ``interp`` is the worked example -- ``searchsorted``
+    + ``index_select`` + ``clip`` + arithmetic, no backend hook anywhere, so
+    every backend is meant to inherit it for free.  Refusing pursuit for every
+    attribute of the class put such a method in a gap: pursuit was declined on
+    the grounds that the reducer knew the operation, the reducer then failed to
+    find it in the catalogue, and the call was dropped with no shortfall.  What
+    should be compiled is its *composition*, so it is pursued like any other
+    authored source.  ``NON_OPERATOR_PUBLIC_API`` stays blocked because it is
+    exactly the dispatch/tape orchestration this boundary exists to keep out.
     """
+
+    from ..operator_catalog import (
+        NON_OPERATOR_PUBLIC_API,
+        PUBLIC_ABSTRACT_TENSOR_OPERATOR_NAMES,
+    )
+
+    def established_vocabulary(name: str) -> bool:
+        return (
+            name in PUBLIC_ABSTRACT_TENSOR_OPERATOR_NAMES
+            or name in NON_OPERATOR_PUBLIC_API
+        )
 
     target = value.__func__ if inspect.ismethod(value) else value
     module = str(getattr(target, "__module__", ""))
     if module.startswith("src.") and module.endswith(".debug"):
         return False
+    # One function object can be published under several names (the catalogue
+    # carries real aliases).  Any catalogued name is enough to establish it as
+    # vocabulary, so every match is considered rather than the first one.
+    bound_names = []
     for name in dir(AbstractTensor):
         candidate = getattr(AbstractTensor, name, None)
         candidate = (
             candidate.__func__ if inspect.ismethod(candidate) else candidate
         )
         if target is candidate:
-            return False
-    return not (
-        str(getattr(target, "__qualname__", "")).split(".", 1)[0]
-        == "AbstractTensor"
+            bound_names.append(name)
+    if bound_names:
+        return not any(map(established_vocabulary, bound_names))
+    qualname = str(getattr(target, "__qualname__", ""))
+    if (
+        qualname.split(".", 1)[0] == "AbstractTensor"
         and module == "src.common.tensors.abstraction"
-    )
+    ):
+        # Declared on the class but not identity-reachable through it (a
+        # wrapped or re-bound definition).  Classified by the same catalogue
+        # rule rather than by the class it happens to be declared in.
+        return not established_vocabulary(qualname.rsplit(".", 1)[-1])
+    return True
 
 
 def _expand_python_static_bindings(
