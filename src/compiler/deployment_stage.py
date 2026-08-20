@@ -100,8 +100,39 @@ class RegionDeploymentDecision:
 
 
 @dataclass(frozen=True)
+class WaveDeploymentDecision:
+    """One backend-neutral deployment frame and its backend choices."""
+
+    deployment_region_id: int
+    lanes: tuple[tuple[int, ...], ...]
+    choices: tuple[DeploymentStrategyChoice, ...]
+
+    def choice_for(self, backend: str) -> DeploymentStrategyChoice | None:
+        for choice in self.choices:
+            if choice.backend == backend:
+                return choice
+        return None
+
+    def as_record(self) -> dict[str, Any]:
+        return {
+            "lanes": [list(lane) for lane in self.lanes],
+            "strategies": {
+                choice.backend: {
+                    "strategy": choice.strategy,
+                    "workers": choice.workers,
+                    "chunk": choice.chunk,
+                    "calibration_demoted": choice.calibration_demoted,
+                    "reasons": list(choice.reasons),
+                }
+                for choice in self.choices
+            },
+        }
+
+
+@dataclass(frozen=True)
 class RegionDeploymentPlan:
     decisions: tuple[RegionDeploymentDecision, ...]
+    waves: tuple[WaveDeploymentDecision, ...] = ()
 
     def decision_for(self, region_index: int) -> RegionDeploymentDecision | None:
         for decision in self.decisions:
@@ -119,6 +150,21 @@ class RegionDeploymentPlan:
         return {
             str(decision.region_index): decision.as_record()
             for decision in self.decisions
+        }
+
+    def wave_for_lanes(
+        self, lanes: Sequence[Sequence[int]],
+    ) -> WaveDeploymentDecision | None:
+        wanted = tuple(tuple(map(int, lane)) for lane in lanes)
+        for wave in self.waves:
+            if wave.lanes == wanted:
+                return wave
+        return None
+
+    def waves_manifest(self) -> dict[str, dict[str, Any]]:
+        return {
+            str(wave.deployment_region_id): wave.as_record()
+            for wave in self.waves
         }
 
 
@@ -210,7 +256,39 @@ def plan_region_deployments(
             classification=classification,
             choices=tuple(choices),
         ))
-    return RegionDeploymentPlan(decisions=tuple(decisions))
+    waves: list[WaveDeploymentDecision] = []
+    for deployment in deployment_regions:
+        lanes = tuple(
+            tuple(map(int, getattr(lane, "region_indices", ()) or ()))
+            for lane in tuple(getattr(deployment, "lanes", ()) or ())
+        )
+        if not lanes:
+            continue
+        member_depth = max(
+            (
+                nesting.get(region_index, 0)
+                for lane in lanes for region_index in lane
+            ),
+            default=0,
+        )
+        join = getattr(getattr(deployment, "join", None), "mode", None)
+        join_mode = str(getattr(join, "value", join or "barrier"))
+        choices = tuple(select_deployment_strategy(
+            backend=backend,
+            execution_class="thread-workers",
+            join_mode=join_mode,
+            work=len(lanes),
+            cores=cores,
+            nesting_depth=member_depth,
+        ) for backend in backends)
+        waves.append(WaveDeploymentDecision(
+            deployment_region_id=int(getattr(deployment, "region_id", len(waves))),
+            lanes=lanes,
+            choices=choices,
+        ))
+    return RegionDeploymentPlan(
+        decisions=tuple(decisions), waves=tuple(waves),
+    )
 
 
 def browser_threading_veto(plan: RegionDeploymentPlan) -> str | None:
@@ -249,6 +327,7 @@ __all__ = [
     "DEFAULT_PLANNED_BACKENDS",
     "RegionDeploymentDecision",
     "RegionDeploymentPlan",
+    "WaveDeploymentDecision",
     "browser_threading_veto",
     "plan_region_deployments",
     "region_nesting_depths",

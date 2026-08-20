@@ -64,8 +64,10 @@ the admission rule are the interface; see docs/KERNEL_BANK_DESIGN.md.
 Binding rules (each one paid for, see tools/compile_blas_probe.py and
 docs/FUNCTION_TO_DEPLOYMENT_HANDOFF.md section 2.1): SSA value ids are
 derived fresh from the loaded module's ``parameter_names``/``named_outputs``
-metadata at materialization time, NEVER stored numbers (ids are unstable
-across lowerings); a positional zip against ``fn.args`` is measurably wrong.
+metadata at materialization time.  Deterministic identity requires those
+bindings to equal the build record for unchanged source/context/compiler; a
+mismatch refuses the artifact.  A positional zip against ``fn.args`` remains
+measurably wrong because parameter order is semantic, not alphabetical.
 """
 from __future__ import annotations
 
@@ -77,7 +79,7 @@ import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 
@@ -113,6 +115,9 @@ class KernelSpec:
     #: byte ranges. ``None`` means undeclared: partitioning machinery must
     #: refuse rather than guess.
     extents: Mapping[str, tuple[str, ...]] | None = None
+    #: Source-derived flat-index strides for every array access. This is the
+    #: structural half of tile evidence; profile timings are the measured half.
+    access_signature: tuple[dict[str, Any], ...] = ()
 
     def item_data(
         self, axis: str, sizes: Mapping[str, int],
@@ -173,7 +178,7 @@ class CompiledVariant:
     ret_ids: tuple[int, ...]
     _executions: dict = field(default_factory=dict)
 
-    def run(self, arguments: Mapping[str, Any]):
+    def _execute(self, arguments: Mapping[str, Any]):
         from src.compiler.ssa_llvm_backend import prepare_artifact_execution
 
         live = {
@@ -208,6 +213,13 @@ class CompiledVariant:
                 else:
                     buffer[...] = array
         execution.run()
+        return execution
+
+    def run(self, arguments: Mapping[str, Any]):
+        """The kernel's primary result: its first named output, or its
+        scalar return when it has none."""
+
+        execution = self._execute(arguments)
         inout = next(
             (p for p in self.output_names if p in self.id_by_name), None,
         )
@@ -220,12 +232,68 @@ class CompiledVariant:
         value = execution.buffers[self.ret_ids[0]]
         return float(np.asarray(value).reshape(-1)[0])
 
+    def run_all(self, arguments: Mapping[str, Any],
+                names: Iterable[str] | None = None) -> dict[str, Any]:
+        """EVERY observable result of one call, keyed by parameter name.
+
+        ``run`` returns the first named output only, which is the right
+        thing for a caller that wants the value back but the wrong thing
+        for verification: a kernel may mutate more buffers than it
+        returns. ``rot`` is the case that forced this -- it rotates a
+        PAIR of vectors in place, can only return one of them, and the
+        compiler records only that returned one in ``named_outputs``, so
+        checking ``run`` alone reported a clean 0.0 error without ever
+        looking at the second vector. Pass ``names`` to read back an
+        explicit set of buffers (verification passes every array
+        parameter, inputs included: a read-only input must come back
+        exactly as fed). Scalar-returning kernels come back under the
+        ``"return"`` key.
+        """
+
+        execution = self._execute(arguments)
+        wanted = (
+            sorted(self.output_names) if names is None
+            else [str(name) for name in names]
+        )
+        produced = {
+            name: np.array(execution.buffers[self.id_by_name[name]])
+            for name in wanted
+            if name in self.id_by_name
+        }
+        # A named output that is not a PARAMETER is a local, not a mutated
+        # buffer: dot records ``total``, its accumulator. Only a named
+        # output that is also a bound parameter means "publishes by
+        # mutation"; without that distinction dot looks like an in-place
+        # kernel and its scalar result goes unchecked.
+        mutated = {name for name in self.output_names if name in self.id_by_name}
+        if mutated:
+            if produced:
+                return produced
+        elif self.ret_ids:
+            # No named output: the scalar Ret IS the result, and it must be
+            # included even when array buffers were also requested. dot is
+            # the case -- asking for its read-only x/y made ``produced``
+            # non-empty and silently dropped the only number it computes.
+            produced["return"] = float(
+                np.asarray(execution.buffers[self.ret_ids[0]]).reshape(-1)[0]
+            )
+            return produced
+        if produced:
+            return produced
+        raise BankRefusal(
+            f"{self.spec.name}: no named output and no Ret record"
+        )
+
 
 def _specialize_source(spec: KernelSpec, sizes: Mapping[str, int]) -> str:
-    """Bake size parameters as constants: drop from the signature, assign
-    in a prologue. The admission check decides whether the result is
-    actually correct (section 4.2's dead-store defect makes that a live
-    question); the bank never trusts a specialized build unverified."""
+    """Bake size parameters as literal constants and drop them from the ABI.
+
+    Literal substitution matters for layout specialization: ``i * k + p``
+    becomes ``i * 64 + p`` rather than depending on a runtime size slot.
+    Backends can therefore fold row-major strides directly from the source
+    artifact. Admission still decides whether the result is correct; the
+    bank never trusts an unverified build.
+    """
 
     tree = ast.parse(spec.source)
     target = next(
@@ -238,12 +306,80 @@ def _specialize_source(spec: KernelSpec, sizes: Mapping[str, int]) -> str:
         argument for argument in target.args.args
         if argument.arg not in baked
     ]
-    prologue = [
-        ast.parse(f"{name} = {value}").body[0]
-        for name, value in baked.items()
-    ]
-    target.body = prologue + target.body
+    class BakeConstants(ast.NodeTransformer):
+        def visit_Name(self, node: ast.Name):  # noqa: N802 - AST API name
+            if isinstance(node.ctx, ast.Load) and node.id in baked:
+                return ast.copy_location(ast.Constant(baked[node.id]), node)
+            return node
+
+    BakeConstants().visit(target)
+    ast.fix_missing_locations(tree)
     return ast.unparse(tree) + "\n"
+
+
+def parameter_layout_permutation(
+    spec: KernelSpec, sizes: Mapping[str, int],
+) -> dict[str, Any]:
+    """Concrete flat-buffer layout for a fully specialized kernel.
+
+    The parameter order is the ABI permutation. Each array carries its
+    concrete logical shape and C-order axis strides, allowing deployment
+    and backend selection to reason about the same layout that was compiled.
+    This artifact is derived from authored indexing and the specialization
+    key, so it does not become a second layout authority.
+    """
+
+    if spec.extents is None:
+        raise BankRefusal(
+            f"{spec.name}: no extents declared; layout cannot be encoded"
+        )
+    abi_order = tuple(
+        parameter for parameter in spec.parameter_order
+        if parameter not in spec.size_parameters
+    )
+    parameters = []
+    flat_offset = 0
+    for ordinal, parameter in enumerate(abi_order):
+        dimensions = tuple(spec.extents.get(parameter, ()))
+        if not dimensions:
+            parameters.append({
+                "parameter": parameter,
+                "ordinal": ordinal,
+                "kind": "scalar",
+            })
+            continue
+        missing = [dim for dim in dimensions if dim not in sizes]
+        if missing:
+            raise BankRefusal(
+                f"{spec.name}: layout for {parameter!r} needs specialized "
+                f"dimensions {missing!r}"
+            )
+        shape = [int(sizes[dim]) for dim in dimensions]
+        strides = [1] * len(shape)
+        for axis in range(len(shape) - 2, -1, -1):
+            strides[axis] = strides[axis + 1] * shape[axis + 1]
+        elements = int(np.prod(shape, dtype=np.int64))
+        parameters.append({
+            "parameter": parameter,
+            "ordinal": ordinal,
+            "kind": "array",
+            "extent_symbols": list(dimensions),
+            "shape": shape,
+            "row_major_strides": strides,
+            "flat_offset": flat_offset,
+            "elements": elements,
+        })
+        flat_offset += elements
+    return {
+        "parameter_order": list(abi_order),
+        "specialized_parameters": {
+            parameter: int(sizes[parameter])
+            for parameter in spec.size_parameters
+        },
+        "arrays_concatenated_in_parameter_order": True,
+        "total_array_elements": flat_offset,
+        "parameters": parameters,
+    }
 
 
 class KernelBank:
@@ -446,6 +582,19 @@ class KernelBank:
          ret_ids) = self._lower_and_emit(
             spec, key, contract, specialized, directory,
         )
+        recorded_ids = (manifest.get("binding") or {}).get(
+            "parameter_ids_at_build"
+        )
+        if recorded_ids is not None:
+            recorded_ids = {
+                str(name): int(identifier)
+                for name, identifier in recorded_ids.items()
+            }
+            if recorded_ids != id_by_name:
+                raise BankRefusal(
+                    f"{spec.name}[{key}] deterministic parameter identity "
+                    f"drifted: built={recorded_ids}, live={id_by_name}"
+                )
         return CompiledVariant(
             spec, key, directory, contract, dict(specialized),
             module, outputs, native, id_by_name, output_names, ret_ids,
@@ -464,6 +613,7 @@ class KernelBank:
             "source_sha256": hashlib.sha256(
                 spec.source.encode("utf-8")
             ).hexdigest(),
+            "access_signature": list(spec.access_signature),
             "built_unix": time.time(),
         }
         try:
@@ -482,8 +632,9 @@ class KernelBank:
         manifest["verification"] = verification
         manifest["binding"] = {
             "parameter_ids_at_build": variant.id_by_name,
-            "note": "informational only; ids are re-derived at load "
-                    "(unstable across lowerings)",
+            "note": "ids are deterministically re-derived at load and "
+                    "must equal this build record for unchanged identity "
+                    "inputs; drift refuses the artifact",
         }
         if spec.extents is not None:
             manifest["data_layout"] = {
@@ -494,6 +645,19 @@ class KernelBank:
                 "note": "element counts as products of size parameters; "
                         "the declaration item_data() partitions by",
             }
+            required_dimensions = {
+                dimension
+                for dimensions in spec.extents.values()
+                for dimension in dimensions
+            }
+            if required_dimensions <= set(specialized):
+                manifest["data_layout"]["parameter_permutation"] = (
+                    parameter_layout_permutation(spec, specialized)
+                )
+                manifest["data_layout"]["specialization_note"] = (
+                    "shape and row-major strides are concrete compile-time "
+                    "facts; the specialized source contains literal extents"
+                )
         if verification["admitted"]:
             manifest["profile"] = self._profile(variant, verification)
         (directory / "manifest.json").write_text(
@@ -615,6 +779,7 @@ class KernelBank:
                     profile.get("cold_avg_seconds") or 0.0
                 ),
                 "built_unix": manifest.get("built_unix"),
+                "access_signature": manifest.get("access_signature") or [],
             })
         rows.sort(key=lambda row: row.get("built_unix") or 0)
         return rows
@@ -636,26 +801,55 @@ class KernelBank:
              if isinstance(sample[p], np.ndarray) else sample[p])
             for p in spec.parameter_order
         ]
-        expected = spec.reference(*reference_args)
+        returned = spec.reference(*reference_args)
+        # The reference mutates its (copied) arguments in place exactly as
+        # the compiled kernel mutates its buffers, so the post-call state of
+        # reference_args IS the oracle for every named output -- including
+        # the ones the kernel does not return. Reading them here is what
+        # makes a two-output kernel like rot verifiable at all.
+        expected_by_name = {
+            parameter: reference_args[index]
+            for index, parameter in enumerate(spec.parameter_order)
+        }
         started = time.perf_counter()
-        produced = variant.run(sample)
+        produced = variant.run_all(
+            sample,
+            names=[
+                parameter for parameter in spec.parameter_order
+                if isinstance(sample[parameter], np.ndarray)
+            ],
+        )
         elapsed = time.perf_counter() - started
-        try:
-            worst = float(np.max(np.abs(
-                np.asarray(produced, dtype=np.float64)
-                - np.asarray(expected, dtype=np.float64)
-            )))
-        except Exception as error:
-            return {
-                "admitted": False,
-                "reason": f"result shape mismatch: {error}",
-                "probe_sizes": sizes,
-            }
+        errors: dict[str, float] = {}
+        for name, value in produced.items():
+            oracle = returned if name == "return" else expected_by_name.get(name)
+            if oracle is None:
+                return {
+                    "admitted": False,
+                    "reason": f"output {name!r} has no reference counterpart",
+                    "probe_sizes": sizes,
+                }
+            try:
+                errors[name] = float(np.max(np.abs(
+                    np.asarray(value, dtype=np.float64)
+                    - np.asarray(oracle, dtype=np.float64)
+                )))
+            except Exception as error:
+                return {
+                    "admitted": False,
+                    "reason": f"result shape mismatch on {name!r}: {error}",
+                    "probe_sizes": sizes,
+                }
+        worst = max(errors.values()) if errors else float("inf")
         admitted = bool(worst <= 1e-9)
+        culprit = max(errors, key=errors.__getitem__) if errors else None
         return {
             "admitted": admitted,
-            "reason": None if admitted else f"worst |err| {worst:.3e}",
+            "reason": None if admitted else (
+                f"worst |err| {worst:.3e} on output {culprit!r}"
+            ),
             "worst_abs_error": worst,
+            "output_abs_errors": errors,
             "probe_sizes": sizes,
             "probe_call_seconds": elapsed,
         }
@@ -742,7 +936,67 @@ class LaunchCoordinator:
         with self.log_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
 
+    def resolve(self, name: str, sizes: Mapping[str, int] | None = None):
+        """Make the routing decision ONCE and hand back the variant.
+
+        ``launch`` re-decides on every call: it re-runs ``select`` (which
+        reads manifests off disk) and appends a routing record. That is
+        the right shape for a call site that issues one kernel call, and
+        the wrong shape for one that issues thousands of the same call at
+        the same size -- eigh's Jacobi sweep is three rot launches per
+        (p, q) pair per sweep. Measured at n=6: 528 us/call through
+        ``launch`` against 45.6 us/call on the resolved variant, so the
+        coordination cost was 11x the kernel.
+
+        This is NOT batching, which stays out of this class deliberately:
+        no call is queued, grouped, or deferred, and each ``run`` still
+        executes immediately and alone. Only the ROUTING DECISION is
+        hoisted, and it is logged here exactly once so the audit trail
+        still says what was chosen and why.
+        """
+
+        sizes = dict(sizes or {})
+        attempts = []
+        if self.specialize_missing and sizes:
+            try:
+                self.bank.get(
+                    name, contract=self.contract, specialized=sizes,
+                    compile_missing=True,
+                )
+            except BankRefusal as refusal:
+                # The parametric route remains a correct fallback. Keep the
+                # failed prebake in the routing evidence rather than making
+                # a resolvable call unavailable.
+                attempts.append(f"specialize: {refusal}")
+        variant, kind = self.bank.select(
+            name, sizes=dict(sizes or {}), contract=self.contract,
+            allow_specialized=self.prefer_specialized,
+            compile_missing=self.compile_missing,
+        )
+        self._log({"kernel": name, "route": kind, "key": variant.key,
+                   "sizes": sizes, "resolved": "hoisted",
+                   "attempts": attempts})
+        return variant
+
     def launch(self, name: str, **arguments):
+        """One routed call, returning the kernel's primary result."""
+
+        return self._launch(name, arguments, outputs=None)
+
+    def launch_outputs(self, name: str, outputs, /, **arguments) -> dict:
+        """One routed call, returning a NAMED SET of result buffers.
+
+        ``launch`` hands back the primary result only, which is all a
+        single-output kernel has. ``rot`` rotates a pair of vectors and a
+        caller needs both back, so it asks for both by name here rather
+        than issuing the rotation twice. On the reference-fallback route
+        the buffers are read out of the mutated arguments, which is the
+        same observable contract.
+        """
+
+        return self._launch(name, arguments, outputs=tuple(outputs))
+
+    def _launch(self, name: str, arguments: Mapping[str, Any], *, outputs):
         spec = self.bank.specs[name]
         sizes = {
             p: int(arguments[p]) for p in spec.size_parameters
@@ -763,7 +1017,10 @@ class LaunchCoordinator:
                 allow_specialized=self.prefer_specialized,
                 compile_missing=self.compile_missing,
             )
-            result = variant.run(arguments)
+            result = (
+                variant.run(arguments) if outputs is None
+                else variant.run_all(arguments, names=outputs)
+            )
             self._log({"kernel": name, "route": kind,
                        "key": variant.key, "sizes": sizes})
             return result
@@ -772,8 +1029,19 @@ class LaunchCoordinator:
         if self.fallback_to_reference:
             self._log({"kernel": name, "route": "reference",
                        "sizes": sizes, "attempts": attempts})
-            ordered = [arguments[p] for p in spec.parameter_order]
-            return spec.reference(*ordered)
+            ordered = [
+                np.array(arguments[p], dtype=float, copy=True)
+                if isinstance(arguments[p], np.ndarray) else arguments[p]
+                for p in spec.parameter_order
+            ]
+            returned = spec.reference(*ordered)
+            if outputs is None:
+                return returned
+            by_name = dict(zip(spec.parameter_order, ordered))
+            return {
+                key: (returned if key == "return" else by_name[key])
+                for key in outputs
+            }
         raise BankRefusal(
             f"{name}: no route available; attempts: {attempts}"
         )
@@ -796,6 +1064,15 @@ def _blas_example_inputs(arity: tuple[str, ...]):
                 values[parameter] = 1.5
             elif parameter == "beta":
                 values[parameter] = 0.5
+            elif parameter == "c":
+                # A real rotation: c = cos(t), s = sin(t) for one fixed t,
+                # so c*c + s*s == 1 and the probe checks an ORTHOGONAL
+                # transform. Two unrelated constants would still verify
+                # arithmetic, but would not exercise the norm-preserving
+                # case every caller of rot actually issues.
+                values[parameter] = 0.8
+            elif parameter == "s":
+                values[parameter] = 0.6
             elif parameter == "A":
                 rows = m if "m" in arity else n
                 cols = k if "k" in arity else n
@@ -945,6 +1222,49 @@ def derive_extents_from_source(
     return extents
 
 
+def derive_access_signature_from_source(
+    source: str, function_name: str,
+) -> tuple[dict[str, Any], ...]:
+    """Deterministic read/write and flat-index stride records from source."""
+
+    from .loop_interchange import linear_index_stride
+
+    tree = ast.parse(source)
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+    loop_variables = tuple(
+        node.target.id for node in ast.walk(function)
+        if isinstance(node, ast.For) and isinstance(node.target, ast.Name)
+    )
+    records = []
+    for node in ast.walk(function):
+        if not (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+        ):
+            continue
+        strides = []
+        for variable in loop_variables:
+            stride = linear_index_stride(node.slice, variable)
+            if stride is None:
+                stride = "unknown"
+            strides.append((variable, str(stride)))
+        records.append({
+            "parameter": node.value.id,
+            "mode": "write" if isinstance(node.ctx, ast.Store) else "read",
+            "index": ast.unparse(node.slice),
+            "loop_strides": [list(item) for item in strides],
+            "line": int(getattr(node, "lineno", 0)),
+            "column": int(getattr(node, "col_offset", 0)),
+        })
+    records.sort(key=lambda item: (
+        item["line"], item["column"], item["parameter"], item["mode"],
+    ))
+    return tuple(records)
+
+
 def blas_kernel_specs() -> dict[str, KernelSpec]:
     from src.common.tensors.blas import KERNELS
 
@@ -959,6 +1279,7 @@ def blas_kernel_specs() -> dict[str, KernelSpec]:
             size_parameters=derive_size_parameters_from_source(source, name),
             example_inputs=_blas_example_inputs(tuple(arity)),
             extents=derive_extents_from_source(source, name),
+            access_signature=derive_access_signature_from_source(source, name),
         )
     return specs
 

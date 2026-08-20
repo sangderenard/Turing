@@ -17,8 +17,19 @@ from src.common.tensors.abstract_nn.training_data_store import (
     CompilerTrainingDatabase,
     put_reduced_graph_view,
 )
+from src.common.tensors.abstract_nn.compiler_teacher_worker import (
+    CompilerTeacherWorker,
+)
 from src.common.tensors.topological_reducer import reduce_abstract_tensor_topology
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
+
+
+def _failing_teacher(_program, _arguments):
+    raise RuntimeError("teacher exploded")
+
+
+def _recovering_teacher(_program, _arguments):
+    return {"schema": "recovered", "verified": True}
 
 
 def test_training_database_retains_views_tokens_lineage_and_commands(tmp_path):
@@ -119,3 +130,69 @@ def test_reduced_graph_capture_retains_dense_tokens_without_object_addresses():
         assert database.connection.execute(
             "SELECT count(*) FROM token_events WHERE view_id=?", (view.id,),
         ).fetchone()[0] == len(view.tokens)
+
+
+def test_compiler_teacher_fulfils_process_graph_to_ssa_idempotently():
+    source = "def kernel(x):\n    value = x + 1\n    return value\n"
+    with CompilerTrainingDatabase() as database:
+        program_id = database.put_program(source, "kernel")
+        graph = database.put_view(
+            program_id, "process_graph", {"nodes": []}, ("graph",),
+            token_ids=(1,), generator="test",
+        )
+        request = database.request_compiler_view(
+            program_id, "process_graph", "ssa", "lower_repository_ssa",
+            {"entry": "kernel"},
+        )
+        result = CompilerTeacherWorker(database).run(request)
+
+        assert result.form == "ssa"
+        assert database.pending_commands() == ()
+        row = database.connection.execute(
+            "SELECT status, attempt_count, result_view_id FROM compiler_commands"
+        ).fetchone()
+        assert tuple(row) == ("complete", 1, result.id)
+        linked = database.connection.execute(
+            """SELECT source_view_id, target_view_id, metadata_json
+               FROM transformations WHERE transform_name='lower_repository_ssa'"""
+        ).fetchone()
+        assert linked[0:2] == (graph.id, result.id)
+        assert '"verified":true' in linked[2]
+        payload = database.connection.execute(
+            "SELECT payload_json FROM views WHERE id=?", (result.id,),
+        ).fetchone()[0]
+        assert "turing-training-repository-ssa-v1" in payload
+        assert "parameter_names" in payload
+
+
+def test_compiler_teacher_failure_and_retry_keep_provenance():
+    with CompilerTrainingDatabase() as database:
+        program_id = database.put_program("x = 1\n", "module")
+        database.put_view(
+            program_id, "process_graph", {}, (), generator="test",
+        )
+        request = database.request_compiler_view(
+            program_id, "process_graph", "ssa", "test_teacher",
+        )
+        with pytest.raises(RuntimeError, match="teacher exploded"):
+            CompilerTeacherWorker(
+                database, {"test_teacher": _failing_teacher},
+            ).run(request)
+        failed = database.connection.execute(
+            """SELECT status, attempt_count, last_error_json
+               FROM compiler_commands WHERE id=?""", (request.id,),
+        ).fetchone()
+        assert failed[0:2] == ("failed", 1)
+        assert "teacher exploded" in failed[2]
+
+        database.retry_command(request.id)
+        retried = database.pending_commands()[0]
+        result = CompilerTeacherWorker(
+            database, {"test_teacher": _recovering_teacher},
+        ).run(retried)
+        completed = database.connection.execute(
+            "SELECT status, attempt_count FROM compiler_commands WHERE id=?",
+            (request.id,),
+        ).fetchone()
+        assert completed[0:2] == ("complete", 2)
+        assert result.form == "ssa"

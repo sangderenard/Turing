@@ -32,3 +32,24 @@
 - Results state algorithm, sweeps, tolerance, contract, and matrix spectrum.
 - Repeated/near-repeated eigenvalues have an explicit backward policy; no
   silent unstable gradient is installed.
+
+## Result — 2026-08-20
+
+EIGH offers the definitional AbstractTensor Jacobi path and an explicit
+`method="blas"` path using the repository's compiled, admission-verified
+`rot` kernel. Small matrices zero-pad to a specialized width-nine module to
+stay above the standing tiny-trip gate; only the valid prefix is published.
+The report carries the actual module key and deterministic name-to-ID binding.
+The default remains Jacobi.
+
+| n | compiled whole Jacobi | AbstractTensor Jacobi | bank-backed native rot |
+|---:|---:|---:|---:|
+| 3 | 0.009 ms | 88.349 ms | 2.035 ms |
+| 4 | 0.012 ms | 175.641 ms | 3.404 ms |
+| 6 | 0.024 ms | 431.680 ms | 9.673 ms |
+
+All eigenvalue, orthogonality, and residual errors are at or below 4.0e-15.
+The rot path is much faster than eager operator dispatch, while compiling the
+whole Jacobi program remains the performance frontier. No opaque EIGH backward
+override is installed; the report states that boundary rather than providing
+an unstable repeated-eigenvalue gradient.

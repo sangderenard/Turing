@@ -71,7 +71,7 @@ class InterchangeResult:
     decisions: tuple[InterchangeDecision, ...]
 
 
-def _stride_of(index: ast.AST, variable: str) -> object:
+def linear_index_stride(index: ast.AST, variable: str) -> object:
     """The coefficient of ``variable`` in a linear index, or None.
 
     Recognizes the flat row-major forms this tree compiles: ``v``,
@@ -81,8 +81,8 @@ def _stride_of(index: ast.AST, variable: str) -> object:
     if isinstance(index, ast.Name):
         return 1 if index.id == variable else 0
     if isinstance(index, ast.BinOp) and isinstance(index.op, ast.Add):
-        left = _stride_of(index.left, variable)
-        right = _stride_of(index.right, variable)
+        left = linear_index_stride(index.left, variable)
+        right = linear_index_stride(index.right, variable)
         if left is None or right is None:
             return None
         if left == 0:
@@ -287,15 +287,15 @@ def interchange_reduction_loops(
 
                 term = reduction.body[0].value.right
                 store_index = store.targets[0].slice
-                store_stride = _stride_of(store_index, parallel_var)
-                reduction_store_stride = _stride_of(
+                store_stride = linear_index_stride(store_index, parallel_var)
+                reduction_store_stride = linear_index_stride(
                     store_index, reduction_var
                 )
                 term_strides = [
                     (
                         ast.unparse(load.value),
-                        _stride_of(load.slice, parallel_var),
-                        _stride_of(load.slice, reduction_var),
+                        linear_index_stride(load.slice, parallel_var),
+                        linear_index_stride(load.slice, reduction_var),
                     )
                     for load in ast.walk(term)
                     if isinstance(load, ast.Subscript)

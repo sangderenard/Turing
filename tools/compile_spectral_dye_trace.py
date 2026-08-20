@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
 import sys
 from pathlib import Path
 
@@ -64,8 +65,11 @@ def main() -> int:
         parser.error(str(error))
 
     from src.common.tensors.accelerator_backends.aot_compile import compile_ast_aot
-    from src.compiler.fortran_c_shell import compile_ast_fortran_c_shell
-    from src.compiler.influence_field import InfluenceContract, field_from_process_graph
+    from src.compiler.fortran_c_shell import (
+        compile_ast_fortran_c_shell,
+        lower_ast_source_to_ssa,
+    )
+    from src.compiler.influence_field import InfluenceContract, field_from_ssa
     from src.compiler.shell_telemetry import TelemetryChannel
     from src.compiler.spectral_trace_dye import analyse_trace_dye
     from spectral_dye_trace import _render_timeline
@@ -99,7 +103,18 @@ def main() -> int:
     trace_path = output / "native_trace.json"
     trace_path.write_text(json.dumps(native_trace, indent=2) + "\n", encoding="utf-8")
 
-    field = field_from_process_graph(compilation.deployment.process_graph, InfluenceContract(enabled=True))
+    # The trace manifest's ``ssa`` level names repository-SSA values. A
+    # ProcessGraph field has a different node namespace (historically these
+    # were accidentally assumed interchangeable), so lower the SAME authored
+    # source and persist the matching analysis artifact for later replays.
+    with channel.timed("spectral SSA lower", path=str(args.source), entry=args.entry):
+        ssa_module, ssa_outputs, ssa_exports = lower_ast_source_to_ssa(
+            source, args.entry, name=f"spectral_{args.source.stem}_{args.entry}",
+        )
+    ssa_path = output / "control_repository_ssa.pkl"
+    with ssa_path.open("wb") as stream:
+        pickle.dump((ssa_module, ssa_outputs, ssa_exports), stream, protocol=5)
+    field = field_from_ssa(ssa_module, InfluenceContract(enabled=True))
     field.propagate()
     report = analyse_trace_dye(
         native_trace, manifest, field, level="ssa", target_names=_names(args.target),
@@ -143,6 +158,10 @@ def main() -> int:
             ("fortran", output / f"{args.entry}.f90", None),
             ("c_shell", output / f"{args.entry}.c", None),
             ("trace_manifest", manifest_path, manifest),
+            ("repository_ssa", ssa_path, {
+                "functions": sorted(ssa_module.functions),
+                "module_metadata": dict(ssa_module.metadata),
+            }),
             ("native_trace", trace_path, native_trace),
             ("shell_telemetry", telemetry_path, json.loads(channel.to_json())),
             ("spectral_dye", report_path, report),
@@ -167,7 +186,10 @@ def main() -> int:
                 compiler_command={"command": f"produce_{form}", "entry": args.entry},
             )
             previous_view = view
-    print(f"wrote {manifest_path}\nwrote {telemetry_path}\nwrote {trace_path}")
+    print(
+        f"wrote {manifest_path}\nwrote {ssa_path}\n"
+        f"wrote {telemetry_path}\nwrote {trace_path}"
+    )
     print(f"wrote {report_path}\nwrote {image_path}")
     print(f"training corpus -> {args.training_db}")
     return 0

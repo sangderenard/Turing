@@ -101,6 +101,19 @@ def build_trace_manifest(
             str(name): tuple(int(value) for value in ids)
             for name, ids in identity_table.items()
         }
+        # A row form is easier to persist, version, and join than inverting
+        # the mapping later. ``occurrence`` disambiguates repeated authored
+        # spellings without making the runtime carry strings; ``value`` is
+        # the deterministic SSA integer for this compilation.
+        manifest["name_correlations"] = tuple(
+            {
+                "name": str(name),
+                "occurrence": occurrence,
+                "value": int(value),
+            }
+            for name, ids in sorted(identity_table.items())
+            for occurrence, value in enumerate(ids)
+        )
     return manifest
 
 

@@ -20,7 +20,7 @@ import ast
 from .token_encoder import encode_identity_tokens
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _canonical(value: Any) -> str:
@@ -156,6 +156,20 @@ class CompilerTrainingDatabase:
         ).fetchone()
         if current is not None and int(current[0]) > SCHEMA_VERSION:
             raise ValueError(f"training database schema {current[0]} is newer than {SCHEMA_VERSION}")
+        command_columns = {
+            row[1] for row in self.connection.execute(
+                "PRAGMA table_info(compiler_commands)"
+            )
+        }
+        for column, declaration in (
+            ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("started_at", "TEXT"),
+            ("last_error_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ):
+            if column not in command_columns:
+                self.connection.execute(
+                    f"ALTER TABLE compiler_commands ADD COLUMN {column} {declaration}"
+                )
         self.connection.execute(
             "INSERT OR REPLACE INTO corpus_meta(key, value) VALUES('schema_version', ?)",
             (str(SCHEMA_VERSION),),
@@ -322,6 +336,72 @@ class CompilerTrainingDatabase:
             (int(result_view_id), int(command_id)),
         )
         self.connection.commit()
+
+    def claim_command(self, command_id: int) -> CompilerCommandRequest:
+        """Atomically move one pending command to running."""
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        cursor = self.connection.execute(
+            """UPDATE compiler_commands SET status='running',
+               attempt_count=attempt_count+1, started_at=CURRENT_TIMESTAMP
+               WHERE id=? AND status='pending'""",
+            (int(command_id),),
+        )
+        if cursor.rowcount != 1:
+            self.connection.rollback()
+            raise ValueError(f"compiler command {command_id} is not pending")
+        row = self.connection.execute(
+            "SELECT * FROM compiler_commands WHERE id=?", (int(command_id),),
+        ).fetchone()
+        self.connection.commit()
+        return CompilerCommandRequest(
+            int(row["id"]), int(row["program_id"]), row["source_form"],
+            row["target_form"], row["command_name"],
+            json.loads(row["arguments_json"]), row["status"],
+        )
+
+    def fail_command(self, command_id: int, error: Mapping[str, Any]) -> None:
+        self.connection.execute(
+            """UPDATE compiler_commands SET status='failed',
+               last_error_json=?, completed_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (_canonical(dict(error)), int(command_id)),
+        )
+        self.connection.commit()
+
+    def retry_command(self, command_id: int) -> None:
+        self.connection.execute(
+            """UPDATE compiler_commands SET status='pending', started_at=NULL,
+               completed_at=NULL WHERE id=? AND status='failed'""",
+            (int(command_id),),
+        )
+        self.connection.commit()
+
+    def program_record(self, program_id: int) -> Mapping[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM programs WHERE id=?", (int(program_id),),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown training program {program_id}")
+        return {
+            "id": int(row["id"]), "source_language": row["source_language"],
+            "entrypoint": row["entrypoint"], "source_text": row["source_text"],
+            "source_sha256": row["source_sha256"],
+            "metadata": json.loads(row["metadata_json"]),
+        }
+
+    def latest_view(self, program_id: int, form: str) -> TrainingView:
+        row = self.connection.execute(
+            """SELECT * FROM views WHERE program_id=? AND form=?
+               ORDER BY id DESC LIMIT 1""",
+            (int(program_id), str(form)),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"program {program_id} has no {form!r} view")
+        return TrainingView(
+            int(row["id"]), int(row["program_id"]), row["form"],
+            row["payload_sha256"], tuple(json.loads(row["tokens_json"])),
+            tuple(map(int, json.loads(row["token_ids_json"]))),
+        )
 
     def put_weight_set(
         self,

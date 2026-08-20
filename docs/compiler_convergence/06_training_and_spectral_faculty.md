@@ -39,3 +39,28 @@
 - No untrained cell can emit a compiler result.
 - Spectral reports resolve targets by persisted structural identity rather than
   process-local IDs.
+
+## Result — 2026-08-20
+
+`CompilerTeacherWorker` implements the first exact `process_graph -> ssa`
+route. It atomically claims a queued command, lowers canonical stored source
+through repository SSA, writes a lossless structural view and token sequence,
+links verified/timing/source/compiler provenance, and completes the command.
+Failures retain type, message, elapsed time, and attempt count; explicit retry
+advances the same record. Unsupported teachers stay pending. All 110 learned
+cells remain honest stubs.
+
+The spectral compiler CLI now performs the complete join itself:
+
+```powershell
+python tools/compile_spectral_dye_trace.py examples/live_compile/spectral_route.py spectral_route --feeds '{"left":1.0,"right":0.25,"phase":0.5}' --frames 4 --target energy,result_0
+```
+
+It compiles and profiles the native shell, emits a trace manifest, lowers and
+persists the matching repository SSA, measures emissions, resolves authored
+`name + occurrence -> deterministic SSA integer` correlations, computes dye
+and heaviest paths from the SSA field, renders phase/frequency timing, and
+writes all forms to SQLite. The verified demo resolved four emissions to one
+target, 16 SSA field keys and four paths; its report and PNG are in the
+evidence directory. The prior ProcessGraph-field/SSA-ID namespace conflation
+is removed.

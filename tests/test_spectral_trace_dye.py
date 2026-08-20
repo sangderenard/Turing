@@ -65,10 +65,17 @@ def test_authored_target_selection_keeps_only_its_manifest_producing_site():
         "sites": [{"site": 0}, {"site": 1}],
         "levels": {"ssa": {"0": [2], "1": [9]}},
         "names": {"loss": [9]},
+        "name_correlations": [
+            {"name": "loss", "occurrence": 0, "value": 9},
+        ],
     }
     report = analyse_trace_dye(payload, manifest, _field(), target_names=("loss", "missing"))
     assert [target["site"] for target in report["targets"]] == [1]
     assert report["unmatched_target_names"] == ["missing"]
+    assert report["targets"][0]["authored_names"] == ["loss"]
+    assert report["targets"][0]["name_correlations"] == [
+        {"name": "loss", "occurrence": 0, "value": 9},
+    ]
 
 
 def test_paired_trace_names_the_first_control_split_before_any_value_claim():

@@ -30,6 +30,8 @@ real code, no restated expectations.
 """
 from __future__ import annotations
 
+import json
+import shutil
 import warnings
 
 import numpy as np
@@ -41,7 +43,9 @@ from src.compiler.kernel_bank import (
     KernelSpec,
     blas_kernel_specs,
     derive_extents_from_source,
+    derive_access_signature_from_source,
     derive_size_parameters_from_source,
+    parameter_layout_permutation,
 )
 
 
@@ -99,6 +103,38 @@ def test_item_data_splits_owned_rows_and_shares_the_rest(specs):
     assert partition["shared"] == {"B": 63}
 
 
+def test_gemm_access_signature_exposes_the_profitable_unit_strides(specs):
+    signature = derive_access_signature_from_source(
+        specs["gemm"].source, "gemm",
+    )
+    by_parameter = {}
+    for access in signature:
+        by_parameter.setdefault(access["parameter"], []).append(
+            dict(access["loop_strides"])
+        )
+
+    assert any(strides["p"] == "1" for strides in by_parameter["A"])
+    assert any(strides["j"] == "1" for strides in by_parameter["B"])
+    assert any(strides["j"] == "1" for strides in by_parameter["C"])
+
+
+def test_specialized_gemm_prebakes_parameter_shapes_and_strides(specs):
+    layout = parameter_layout_permutation(
+        specs["gemm"], {"m": 6, "n": 7, "k": 9},
+    )
+    arrays = {
+        row["parameter"]: row
+        for row in layout["parameters"] if row["kind"] == "array"
+    }
+    assert layout["parameter_order"] == ["A", "B", "C", "alpha", "beta"]
+    assert arrays["A"]["shape"] == [6, 9]
+    assert arrays["A"]["row_major_strides"] == [9, 1]
+    assert arrays["B"]["row_major_strides"] == [7, 1]
+    assert arrays["C"]["row_major_strides"] == [7, 1]
+    assert arrays["B"]["flat_offset"] == 54
+    assert layout["total_array_elements"] == 54 + 63 + 42
+
+
 def test_underivable_indexing_refuses_instead_of_guessing():
     with pytest.raises(BankRefusal) as excinfo:
         derive_extents_from_source(
@@ -151,3 +187,20 @@ def test_a_refused_variant_has_no_profile_row(bank):
         for row in bank.performance_chart("gemm")
     }
     assert (("k", 4), ("m", 4), ("n", 4)) not in charted
+
+
+def test_a_loaded_variant_refuses_parameter_identity_drift(
+    bank, specs, tmp_path,
+):
+    copied_root = tmp_path / "tampered_bank"
+    shutil.copytree(bank.root, copied_root)
+    manifest_path = next(copied_root.glob("dot/*/manifest.json"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    identifiers = manifest["binding"]["parameter_ids_at_build"]
+    first_name = next(iter(identifiers))
+    identifiers[first_name] = int(identifiers[first_name]) + 1
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    reloaded = KernelBank(copied_root, specs)
+    with pytest.raises(BankRefusal, match="deterministic parameter identity"):
+        reloaded.get("dot", compile_missing=False)

@@ -174,6 +174,13 @@ def analyse_trace_dye(
         by_site[emission.site].append(emission)
 
     names = dict((manifest or {}).get("names") or {})
+    correlations = tuple((manifest or {}).get("name_correlations") or ())
+    if not correlations:
+        correlations = tuple(
+            {"name": str(name), "occurrence": occurrence, "value": int(value)}
+            for name, values in sorted(names.items())
+            for occurrence, value in enumerate(values)
+        )
     requested_names = tuple(dict.fromkeys(str(name) for name in target_names))
     resolved_names = {
         name: tuple(int(value) for value in (names.get(name) or ()))
@@ -199,6 +206,11 @@ def analyse_trace_dye(
     for site in ranked:
         samples = sorted(by_site[site], key=lambda item: (item.at_ns, item.sequence))
         values = _manifest_values(manifest, site, level) if manifest else ()
+        value_set = set(values)
+        target_correlations = [
+            dict(row) for row in correlations
+            if int(row["value"]) in value_set
+        ]
         keys = _field_keys_for_values(field, values) if field is not None else ()
         starts = [item.at_ns for item in samples]
         span = starts[-1] - starts[0] if len(starts) > 1 else 0
@@ -228,6 +240,10 @@ def analyse_trace_dye(
         targets.append({
             "site": site, "dye_hue": hue_by_site.get(site, 0.0),
             "ssa_values": list(values), "field_keys": [repr(key) for key in keys],
+            "authored_names": list(dict.fromkeys(
+                str(row["name"]) for row in target_correlations
+            )),
+            "name_correlations": target_correlations,
             "emission_count": len(samples), "total_duration_ns": sum(item.duration_ns for item in samples),
             "frequency_hz": frequency, "timings": timings, "dye": readings,
             "paths": _heaviest_paths(field, keys, limit=paths_per_target)
@@ -240,6 +256,7 @@ def analyse_trace_dye(
         "schema": "turing-spectral-dye-trace-v1", "level": level,
         "emission_count": len(emissions), "target_count": len(targets), "targets": targets,
         "target_names": list(requested_names),
+        "identity_resolution": "authored name + occurrence -> deterministic SSA value",
         "unmatched_target_names": sorted(set(requested_names) - set(resolved_names)),
         "unmatched_target_values": sorted(requested - {
             value for target in targets for value in target["ssa_values"]

@@ -84,3 +84,15 @@ python -m pytest tests\test_compiled_linalg.py -q --tb=short
 Task documents add narrower tests.  A stage ends with `git diff --check`, a
 clean or fully explained `git status`, and a checkpoint commit before the next
 stage changes the measurement floor.
+
+## Convergence checkpoint — 2026-08-20
+
+Tasks 1, 2, 4, 5, and 6 have executable evidence. Task 3 has a proven native
+span ABI, consumed prebake matrix, manifest propagation, and an explicit
+remaining product-renderer adoption seam. Tasks 7–10 remain bounded by their
+documents; no speculative fixes were mixed into this checkpoint.
+
+The touched-feature gate passed 73 tests plus the end-to-end prebake demo. The
+regression floor remains 17/19 scorecard journeys, 34 precompile tests, native
+fluid runtime, indexing, fusion, dedup, and compiled linear algebra at 6
+passed / 1 strict xfail.

@@ -233,6 +233,43 @@ int turing_pool_deploy(turing_lane_fn fn, void* context, long lane_count,
     return 0;
 }
 
+typedef struct {
+    turing_span_fn fn;
+    void* context;
+    long item_count;
+    long chunk_size;
+} turing_span_context;
+
+static void turing_span_lane(void* raw, long lane, long chunk,
+                             long chunks_per_lane) {
+    turing_span_context* span = (turing_span_context*)raw;
+    long start = lane * span->chunk_size;
+    long stop = start + span->chunk_size;
+    (void)chunk;
+    (void)chunks_per_lane;
+    if (stop > span->item_count) {
+        stop = span->item_count;
+    }
+    if (start < stop) {
+        span->fn(span->context, start, stop);
+    }
+}
+
+int turing_pool_deploy_span(turing_span_fn fn, void* context, long item_count,
+                            long chunk_size) {
+    turing_span_context span;
+    long claims;
+    if (fn == NULL || item_count < 1 || chunk_size < 1) {
+        return -1;
+    }
+    claims = (item_count + chunk_size - 1) / chunk_size;
+    span.fn = fn;
+    span.context = context;
+    span.item_count = item_count;
+    span.chunk_size = chunk_size;
+    return turing_pool_deploy(turing_span_lane, &span, claims, 1);
+}
+
 void turing_pool_stop(void) {
     int count;
     int index;

@@ -43,3 +43,27 @@
 - A missing/failed pool still executes the serial SSA fallback.
 - The finished executable has no Python runtime or `HostDeploymentPool`
   dependency.
+
+## Result and remaining adoption seam — 2026-08-20
+
+Implemented and verified:
+
+- `turing_pool_deploy_span(context, item_count, chunk_size)` partitions a
+  finite span with persistent native workers and executes every item once.
+- Deployment planning emits frame-level C choices; the native renderer
+  consumes literal workers/chunk values and retains serial fallback reasons.
+- Site manifests carry `native_deployment_frames`.
+- GEMM artifacts prebake runtime ABI order, concrete shape/stride/offset
+  records, deterministic bindings, every tile parameter permutation, and
+  every launch span. Arbitrary edges use zero-filled margins on one verified
+  square module.
+- The 256-cubed instrument consumed that artifact and measured 8.68 ms pooled
+  versus 28.49 ms single-call, with 1.56e-13 error.
+
+Six native-emission tests compile and execute the span ABI and prove planned
+worker/chunk literals. The remaining product task is narrow and explicit:
+`fortran_c_shell`/`profiled_c_shell` still use their established serial
+control renderer. They must select `render_pooled_control_c` and link
+`turing_pool.c` when a consumed C frame chooses pooling. Until then the native
+renderer is proven but not falsely advertised as the canonical product path;
+the Python host pool remains a measurement instrument only.

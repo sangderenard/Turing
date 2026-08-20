@@ -68,8 +68,12 @@ Escalation ladder, smallest first, matching the philosophy of
 ``tools/translation_scorecard.py``'s journeys: BLAS-1 no-reduction
 (``scal``), BLAS-1 in-place update (``axpy``), BLAS-1 single-loop reduction
 (``dot`` -- the proven scorecard level-4 shape with a real accumulator),
-BLAS-2 first nested loop (``gemv``), BLAS-3 triple-nested loop (``gemm``).
-Compile and verify in this order; do not jump to ``gemm`` first.
+BLAS-2 first nested loop (``gemv``), BLAS-3 triple-nested loop (``gemm``),
+and finally BLAS-1 ``rot``, the Givens plane rotation. ``rot`` is last
+despite being a level-1 kernel because it is the only one whose defining
+difficulty is not loop nesting: it writes back to elements it has already
+read, which is a live compiler defect, not a ladder rung. Compile and
+verify in this order; do not jump to ``gemm`` first.
 
 To compile and run one kernel, see ``tools/compile_blas_probe.py`` --
 same calling convention as
@@ -212,6 +216,69 @@ def gemm_reference(A, B, C, alpha, beta, m, n, k):
     return C
 
 
+# ---------------------------------------------------------------------------
+# Level 5: rot  --  the Givens plane rotation, BLAS-1
+#
+#   x[i] <- c * x[i] + s * y[i]
+#   y[i] <- c * y[i] - s * x[i]        (both from the PRE-rotation values)
+#
+# Why this rung exists at all, out of ladder order: it is the only kernel in
+# this file that ``AbstractTensor.eigh`` actually contains. The Jacobi sweep
+# in ``abstraction_methods/eigen.py`` has no GEMM and no GEMV anywhere in it
+# -- its entire inner loop is four blocks of exactly the shape above (two
+# row updates of S, two column updates of S, two column updates of V). A
+# BLAS whose smallest member is ``scal`` cannot serve eigh; one with ``rot``
+# can serve all of it.
+#
+# SIGN CONVENTION: standard BLAS ``drot`` as written above. The Jacobi
+# convention in ``eigen.py`` is the transpose,
+#     p <- c*p - s*q,  q <- s*p + c*q,
+# which is this kernel called with ``s`` negated -- ``rot(p, q, c, -s, n)``.
+# Do not fork the kernel to carry the other sign; negate at the call site,
+# where the rotation angle is chosen anyway.
+#
+# WHY IT IS A REAL TEST AND NOT JUST A CONVENIENCE: rot reads a pair of
+# elements, combines them, and writes both back -- the shape of the native
+# codegen defect pinned in ``tests/test_llvm_inplace_store_aliasing.py``,
+# where a value loaded before an in-place store was re-read after it and
+# every plane rotation silently computed the wrong thing with ZERO emission
+# shortfalls. That defect was fixed (commit ``3406310``, "Pin the loaded
+# scalar so an in-place store cannot change it retroactively") and this
+# kernel now compiles and runs bit-exact on BOTH buffers, measured. It is
+# kept in the ladder as a second, independent guard on that fix: rot is the
+# smallest kernel whose correctness depends on it.
+#
+# Note the scope of that fix as this kernel exercises it: ``x`` and ``y``
+# here are DISTINCT buffers. The pinned repro aliased two computed indices
+# of a SINGLE array. A future rot variant that rotates two rows of one
+# matrix in place -- which is superficially what eigh wants -- is the
+# same-buffer case and must be re-verified on its own, not assumed from
+# this rung.
+#
+# The two temporaries ``xi``/``yi`` are load-before-store, not a manual
+# optimization: the rotation is simultaneous by definition, and without
+# them the kernel would be a different (wrong) function.
+# ---------------------------------------------------------------------------
+
+ROT_SOURCE = """
+def rot(x, y, c, s, n):
+    for i in range(n):
+        xi = x[i]
+        yi = y[i]
+        x[i] = c * xi + s * yi
+        y[i] = c * yi - s * xi
+    return x
+"""
+
+
+def rot_reference(x, y, c, s, n):
+    for i in range(n):
+        xi = x[i]
+        yi = y[i]
+        x[i] = c * xi + s * yi
+        y[i] = c * yi - s * xi
+    return x
+
 #: The escalation ladder, in the order to compile and verify them.
 #: Each entry: (level, name, source text, reference callable, arity).
 #: ``arity`` is the plain positional-argument order the reference and the
@@ -226,6 +293,7 @@ KERNELS = (
      ("A", "x", "y", "alpha", "beta", "m", "n")),
     (4, "gemm", GEMM_SOURCE, gemm_reference,
      ("A", "B", "C", "alpha", "beta", "m", "n", "k")),
+    (5, "rot", ROT_SOURCE, rot_reference, ("x", "y", "c", "s", "n")),
 )
 
 __all__ = [
@@ -234,5 +302,6 @@ __all__ = [
     "DOT_SOURCE", "dot_reference",
     "GEMV_SOURCE", "gemv_reference",
     "GEMM_SOURCE", "gemm_reference",
+    "ROT_SOURCE", "rot_reference",
     "KERNELS",
 ]

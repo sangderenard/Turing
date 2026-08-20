@@ -1,0 +1,805 @@
+{
+  "schema": "turing.prebaked-gemm-launch-matrix.v1",
+  "module_key": "97ec940a554faec4",
+  "module_binding_by_name": {
+    "A": 0,
+    "B": 1,
+    "C": 2,
+    "alpha": 3,
+    "beta": 4
+  },
+  "problem_shape": [
+    256,
+    256,
+    256
+  ],
+  "tile_shape": [
+    128,
+    128,
+    128
+  ],
+  "total_parameter_layout": {
+    "parameter_order": [
+      "A",
+      "B",
+      "C",
+      "alpha",
+      "beta"
+    ],
+    "specialized_parameters": {
+      "m": 256,
+      "n": 256,
+      "k": 256
+    },
+    "arrays_concatenated_in_parameter_order": true,
+    "total_array_elements": 196608,
+    "parameters": [
+      {
+        "parameter": "A",
+        "ordinal": 0,
+        "kind": "array",
+        "extent_symbols": [
+          "m",
+          "k"
+        ],
+        "shape": [
+          256,
+          256
+        ],
+        "row_major_strides": [
+          256,
+          1
+        ],
+        "flat_offset": 0,
+        "elements": 65536
+      },
+      {
+        "parameter": "B",
+        "ordinal": 1,
+        "kind": "array",
+        "extent_symbols": [
+          "k",
+          "n"
+        ],
+        "shape": [
+          256,
+          256
+        ],
+        "row_major_strides": [
+          256,
+          1
+        ],
+        "flat_offset": 65536,
+        "elements": 65536
+      },
+      {
+        "parameter": "C",
+        "ordinal": 2,
+        "kind": "array",
+        "extent_symbols": [
+          "m",
+          "n"
+        ],
+        "shape": [
+          256,
+          256
+        ],
+        "row_major_strides": [
+          256,
+          1
+        ],
+        "flat_offset": 131072,
+        "elements": 65536
+      },
+      {
+        "parameter": "alpha",
+        "ordinal": 3,
+        "kind": "scalar"
+      },
+      {
+        "parameter": "beta",
+        "ordinal": 4,
+        "kind": "scalar"
+      }
+    ]
+  },
+  "core_parameter_layout": {
+    "parameter_order": [
+      "A",
+      "B",
+      "C",
+      "alpha",
+      "beta"
+    ],
+    "specialized_parameters": {
+      "m": 128,
+      "n": 128,
+      "k": 128
+    },
+    "arrays_concatenated_in_parameter_order": true,
+    "total_array_elements": 49152,
+    "parameters": [
+      {
+        "parameter": "A",
+        "ordinal": 0,
+        "kind": "array",
+        "extent_symbols": [
+          "m",
+          "k"
+        ],
+        "shape": [
+          128,
+          128
+        ],
+        "row_major_strides": [
+          128,
+          1
+        ],
+        "flat_offset": 0,
+        "elements": 16384
+      },
+      {
+        "parameter": "B",
+        "ordinal": 1,
+        "kind": "array",
+        "extent_symbols": [
+          "k",
+          "n"
+        ],
+        "shape": [
+          128,
+          128
+        ],
+        "row_major_strides": [
+          128,
+          1
+        ],
+        "flat_offset": 16384,
+        "elements": 16384
+      },
+      {
+        "parameter": "C",
+        "ordinal": 2,
+        "kind": "array",
+        "extent_symbols": [
+          "m",
+          "n"
+        ],
+        "shape": [
+          128,
+          128
+        ],
+        "row_major_strides": [
+          128,
+          1
+        ],
+        "flat_offset": 32768,
+        "elements": 16384
+      },
+      {
+        "parameter": "alpha",
+        "ordinal": 3,
+        "kind": "scalar"
+      },
+      {
+        "parameter": "beta",
+        "ordinal": 4,
+        "kind": "scalar"
+      }
+    ]
+  },
+  "launch": {
+    "join": "barrier",
+    "workers": 8,
+    "chunk_size": 1,
+    "lane_count": 4,
+    "spans": [
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        2
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        3,
+        4
+      ]
+    ]
+  },
+  "lanes": [
+    {
+      "lane": 0,
+      "output_origin": [
+        0,
+        0
+      ],
+      "calls": [
+        {
+          "step": 0,
+          "module_key": "97ec940a554faec4",
+          "parameters_by_name": {
+            "A": {
+              "source_offset": 0,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "B": {
+              "source_offset": 0,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "C": {
+              "source_offset": 0,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false,
+              "publish_after_last_step": true
+            },
+            "alpha": "caller_alpha",
+            "beta": "caller_beta"
+          }
+        },
+        {
+          "step": 1,
+          "module_key": "97ec940a554faec4",
+          "parameters_by_name": {
+            "A": {
+              "source_offset": 128,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "B": {
+              "source_offset": 32768,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "C": {
+              "source_offset": 0,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false,
+              "publish_after_last_step": true
+            },
+            "alpha": "caller_alpha",
+            "beta": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "lane": 1,
+      "output_origin": [
+        0,
+        128
+      ],
+      "calls": [
+        {
+          "step": 0,
+          "module_key": "97ec940a554faec4",
+          "parameters_by_name": {
+            "A": {
+              "source_offset": 0,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "B": {
+              "source_offset": 128,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "C": {
+              "source_offset": 128,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false,
+              "publish_after_last_step": true
+            },
+            "alpha": "caller_alpha",
+            "beta": "caller_beta"
+          }
+        },
+        {
+          "step": 1,
+          "module_key": "97ec940a554faec4",
+          "parameters_by_name": {
+            "A": {
+              "source_offset": 128,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "B": {
+              "source_offset": 32896,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "C": {
+              "source_offset": 128,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false,
+              "publish_after_last_step": true
+            },
+            "alpha": "caller_alpha",
+            "beta": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "lane": 2,
+      "output_origin": [
+        128,
+        0
+      ],
+      "calls": [
+        {
+          "step": 0,
+          "module_key": "97ec940a554faec4",
+          "parameters_by_name": {
+            "A": {
+              "source_offset": 32768,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "B": {
+              "source_offset": 0,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "C": {
+              "source_offset": 32768,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false,
+              "publish_after_last_step": true
+            },
+            "alpha": "caller_alpha",
+            "beta": "caller_beta"
+          }
+        },
+        {
+          "step": 1,
+          "module_key": "97ec940a554faec4",
+          "parameters_by_name": {
+            "A": {
+              "source_offset": 32896,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "B": {
+              "source_offset": 32768,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "C": {
+              "source_offset": 32768,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false,
+              "publish_after_last_step": true
+            },
+            "alpha": "caller_alpha",
+            "beta": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "lane": 3,
+      "output_origin": [
+        128,
+        128
+      ],
+      "calls": [
+        {
+          "step": 0,
+          "module_key": "97ec940a554faec4",
+          "parameters_by_name": {
+            "A": {
+              "source_offset": 32768,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "B": {
+              "source_offset": 128,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "C": {
+              "source_offset": 32896,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false,
+              "publish_after_last_step": true
+            },
+            "alpha": "caller_alpha",
+            "beta": "caller_beta"
+          }
+        },
+        {
+          "step": 1,
+          "module_key": "97ec940a554faec4",
+          "parameters_by_name": {
+            "A": {
+              "source_offset": 32896,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "B": {
+              "source_offset": 32896,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false
+            },
+            "C": {
+              "source_offset": 32896,
+              "source_shape": [
+                128,
+                128
+              ],
+              "source_strides": [
+                256,
+                1
+              ],
+              "packed_shape": [
+                128,
+                128
+              ],
+              "packed_strides": [
+                128,
+                1
+              ],
+              "zero_fill_packed_margin": false,
+              "publish_after_last_step": true
+            },
+            "alpha": "caller_alpha",
+            "beta": 1.0
+          }
+        }
+      ]
+    }
+  ]
+}

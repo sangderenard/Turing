@@ -47,6 +47,10 @@ def main() -> int:
     parser.add_argument("--vocabulary-size", type=int, default=65536)
     parser.add_argument("--program-id", type=int)
     parser.add_argument("--densify", action="store_true")
+    parser.add_argument(
+        "--work", action="store_true",
+        help="execute registered pending compiler-teacher commands",
+    )
     args = parser.parse_args()
     if args.vocabulary_size < 1:
         parser.error("--vocabulary-size must be positive")
@@ -62,6 +66,12 @@ def main() -> int:
             network.densify(args.program_id)
             if args.densify else ()
         )
+        completed = ()
+        if args.work:
+            from src.common.tensors.abstract_nn.compiler_teacher_worker import (
+                CompilerTeacherWorker,
+            )
+            completed = CompilerTeacherWorker(database).run_pending()
         counts = {
             table: database.connection.execute(
                 f"SELECT count(*) FROM {table}"
@@ -76,6 +86,10 @@ def main() -> int:
         print("queued " + ", ".join(
             f"{request.source_form}->{request.target_form}:{request.command_name}"
             for request in requests
+        ))
+    if completed:
+        print("completed " + ", ".join(
+            f"{view.form}:{view.id}" for view in completed
         ))
     return 0
 

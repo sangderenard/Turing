@@ -1,0 +1,910 @@
+[
+  {
+    "schema": "turing.kernel-bank-ladder.v1",
+    "kernel": "gemm",
+    "key": "15604d75a7fbc2ce",
+    "contract": "fast",
+    "specialized": {
+      "m": 32,
+      "n": 32,
+      "k": 32
+    },
+    "status": "ADMITTED",
+    "reason": null,
+    "compiler_fingerprint": "1787240278",
+    "source_sha256": "ac7333ea79d700cb7f3590ed26e397a57908008aac0a1bdfd6ecd49a4bb3cd5a",
+    "access_signature": [
+      {
+        "parameter": "A",
+        "mode": "read",
+        "index": "i * k + p",
+        "loop_strides": [
+          [
+            "i",
+            "k"
+          ],
+          [
+            "j",
+            "0"
+          ],
+          [
+            "p",
+            "1"
+          ]
+        ],
+        "line": 7,
+        "column": 32
+      },
+      {
+        "parameter": "B",
+        "mode": "read",
+        "index": "p * n + j",
+        "loop_strides": [
+          [
+            "i",
+            "0"
+          ],
+          [
+            "j",
+            "1"
+          ],
+          [
+            "p",
+            "n"
+          ]
+        ],
+        "line": 7,
+        "column": 47
+      },
+      {
+        "parameter": "C",
+        "mode": "write",
+        "index": "i * n + j",
+        "loop_strides": [
+          [
+            "i",
+            "n"
+          ],
+          [
+            "j",
+            "1"
+          ],
+          [
+            "p",
+            "0"
+          ]
+        ],
+        "line": 8,
+        "column": 12
+      },
+      {
+        "parameter": "C",
+        "mode": "read",
+        "index": "i * n + j",
+        "loop_strides": [
+          [
+            "i",
+            "n"
+          ],
+          [
+            "j",
+            "1"
+          ],
+          [
+            "p",
+            "0"
+          ]
+        ],
+        "line": 8,
+        "column": 50
+      }
+    ],
+    "built_unix": 1787240301.1768491,
+    "worst_abs_error": 2.1316282072803006e-14,
+    "first_launch_seconds": 0.004114200011827052,
+    "relaunch_median_seconds": 2.5900022592395544e-05,
+    "compute_median_seconds": 0.00011679998715408146,
+    "warm_samples": 5,
+    "cold_samples": 3,
+    "gflops": 0.5610959521215144,
+    "binding": {
+      "parameter_ids_at_build": {
+        "alpha": 3,
+        "B": 1,
+        "C": 2,
+        "beta": 4,
+        "A": 0
+      },
+      "note": "ids are deterministically re-derived at load and must equal this build record for unchanged identity inputs; drift refuses the artifact"
+    },
+    "data_layout": {
+      "extents": {
+        "C": [
+          "m",
+          "n"
+        ],
+        "A": [
+          "m",
+          "k"
+        ],
+        "B": [
+          "k",
+          "n"
+        ],
+        "alpha": [],
+        "beta": [],
+        "m": [],
+        "n": [],
+        "k": []
+      },
+      "note": "element counts as products of size parameters; the declaration item_data() partitions by",
+      "parameter_permutation": {
+        "parameter_order": [
+          "A",
+          "B",
+          "C",
+          "alpha",
+          "beta"
+        ],
+        "specialized_parameters": {
+          "m": 32,
+          "n": 32,
+          "k": 32
+        },
+        "arrays_concatenated_in_parameter_order": true,
+        "total_array_elements": 3072,
+        "parameters": [
+          {
+            "parameter": "A",
+            "ordinal": 0,
+            "kind": "array",
+            "extent_symbols": [
+              "m",
+              "k"
+            ],
+            "shape": [
+              32,
+              32
+            ],
+            "row_major_strides": [
+              32,
+              1
+            ],
+            "flat_offset": 0,
+            "elements": 1024
+          },
+          {
+            "parameter": "B",
+            "ordinal": 1,
+            "kind": "array",
+            "extent_symbols": [
+              "k",
+              "n"
+            ],
+            "shape": [
+              32,
+              32
+            ],
+            "row_major_strides": [
+              32,
+              1
+            ],
+            "flat_offset": 1024,
+            "elements": 1024
+          },
+          {
+            "parameter": "C",
+            "ordinal": 2,
+            "kind": "array",
+            "extent_symbols": [
+              "m",
+              "n"
+            ],
+            "shape": [
+              32,
+              32
+            ],
+            "row_major_strides": [
+              32,
+              1
+            ],
+            "flat_offset": 2048,
+            "elements": 1024
+          },
+          {
+            "parameter": "alpha",
+            "ordinal": 3,
+            "kind": "scalar"
+          },
+          {
+            "parameter": "beta",
+            "ordinal": 4,
+            "kind": "scalar"
+          }
+        ]
+      },
+      "specialization_note": "shape and row-major strides are concrete compile-time facts; the specialized source contains literal extents"
+    }
+  },
+  {
+    "schema": "turing.kernel-bank-ladder.v1",
+    "kernel": "gemm",
+    "key": "b54b1c34e6196564",
+    "contract": "fast",
+    "specialized": {
+      "m": 64,
+      "n": 64,
+      "k": 64
+    },
+    "status": "ADMITTED",
+    "reason": null,
+    "compiler_fingerprint": "1787240278",
+    "source_sha256": "ac7333ea79d700cb7f3590ed26e397a57908008aac0a1bdfd6ecd49a4bb3cd5a",
+    "access_signature": [
+      {
+        "parameter": "A",
+        "mode": "read",
+        "index": "i * k + p",
+        "loop_strides": [
+          [
+            "i",
+            "k"
+          ],
+          [
+            "j",
+            "0"
+          ],
+          [
+            "p",
+            "1"
+          ]
+        ],
+        "line": 7,
+        "column": 32
+      },
+      {
+        "parameter": "B",
+        "mode": "read",
+        "index": "p * n + j",
+        "loop_strides": [
+          [
+            "i",
+            "0"
+          ],
+          [
+            "j",
+            "1"
+          ],
+          [
+            "p",
+            "n"
+          ]
+        ],
+        "line": 7,
+        "column": 47
+      },
+      {
+        "parameter": "C",
+        "mode": "write",
+        "index": "i * n + j",
+        "loop_strides": [
+          [
+            "i",
+            "n"
+          ],
+          [
+            "j",
+            "1"
+          ],
+          [
+            "p",
+            "0"
+          ]
+        ],
+        "line": 8,
+        "column": 12
+      },
+      {
+        "parameter": "C",
+        "mode": "read",
+        "index": "i * n + j",
+        "loop_strides": [
+          [
+            "i",
+            "n"
+          ],
+          [
+            "j",
+            "1"
+          ],
+          [
+            "p",
+            "0"
+          ]
+        ],
+        "line": 8,
+        "column": 50
+      }
+    ],
+    "built_unix": 1787240302.59788,
+    "worst_abs_error": 3.907985046680551e-14,
+    "first_launch_seconds": 0.004531399987172335,
+    "relaunch_median_seconds": 6.25999819021672e-05,
+    "compute_median_seconds": 0.0004723000165540725,
+    "warm_samples": 5,
+    "cold_samples": 3,
+    "gflops": 1.1100740665334605,
+    "binding": {
+      "parameter_ids_at_build": {
+        "alpha": 3,
+        "B": 1,
+        "C": 2,
+        "beta": 4,
+        "A": 0
+      },
+      "note": "ids are deterministically re-derived at load and must equal this build record for unchanged identity inputs; drift refuses the artifact"
+    },
+    "data_layout": {
+      "extents": {
+        "C": [
+          "m",
+          "n"
+        ],
+        "A": [
+          "m",
+          "k"
+        ],
+        "B": [
+          "k",
+          "n"
+        ],
+        "alpha": [],
+        "beta": [],
+        "m": [],
+        "n": [],
+        "k": []
+      },
+      "note": "element counts as products of size parameters; the declaration item_data() partitions by",
+      "parameter_permutation": {
+        "parameter_order": [
+          "A",
+          "B",
+          "C",
+          "alpha",
+          "beta"
+        ],
+        "specialized_parameters": {
+          "m": 64,
+          "n": 64,
+          "k": 64
+        },
+        "arrays_concatenated_in_parameter_order": true,
+        "total_array_elements": 12288,
+        "parameters": [
+          {
+            "parameter": "A",
+            "ordinal": 0,
+            "kind": "array",
+            "extent_symbols": [
+              "m",
+              "k"
+            ],
+            "shape": [
+              64,
+              64
+            ],
+            "row_major_strides": [
+              64,
+              1
+            ],
+            "flat_offset": 0,
+            "elements": 4096
+          },
+          {
+            "parameter": "B",
+            "ordinal": 1,
+            "kind": "array",
+            "extent_symbols": [
+              "k",
+              "n"
+            ],
+            "shape": [
+              64,
+              64
+            ],
+            "row_major_strides": [
+              64,
+              1
+            ],
+            "flat_offset": 4096,
+            "elements": 4096
+          },
+          {
+            "parameter": "C",
+            "ordinal": 2,
+            "kind": "array",
+            "extent_symbols": [
+              "m",
+              "n"
+            ],
+            "shape": [
+              64,
+              64
+            ],
+            "row_major_strides": [
+              64,
+              1
+            ],
+            "flat_offset": 8192,
+            "elements": 4096
+          },
+          {
+            "parameter": "alpha",
+            "ordinal": 3,
+            "kind": "scalar"
+          },
+          {
+            "parameter": "beta",
+            "ordinal": 4,
+            "kind": "scalar"
+          }
+        ]
+      },
+      "specialization_note": "shape and row-major strides are concrete compile-time facts; the specialized source contains literal extents"
+    }
+  },
+  {
+    "schema": "turing.kernel-bank-ladder.v1",
+    "kernel": "gemm",
+    "key": "97ec940a554faec4",
+    "contract": "fast",
+    "specialized": {
+      "m": 128,
+      "n": 128,
+      "k": 128
+    },
+    "status": "ADMITTED",
+    "reason": null,
+    "compiler_fingerprint": "1787240278",
+    "source_sha256": "ac7333ea79d700cb7f3590ed26e397a57908008aac0a1bdfd6ecd49a4bb3cd5a",
+    "access_signature": [
+      {
+        "parameter": "A",
+        "mode": "read",
+        "index": "i * k + p",
+        "loop_strides": [
+          [
+            "i",
+            "k"
+          ],
+          [
+            "j",
+            "0"
+          ],
+          [
+            "p",
+            "1"
+          ]
+        ],
+        "line": 7,
+        "column": 32
+      },
+      {
+        "parameter": "B",
+        "mode": "read",
+        "index": "p * n + j",
+        "loop_strides": [
+          [
+            "i",
+            "0"
+          ],
+          [
+            "j",
+            "1"
+          ],
+          [
+            "p",
+            "n"
+          ]
+        ],
+        "line": 7,
+        "column": 47
+      },
+      {
+        "parameter": "C",
+        "mode": "write",
+        "index": "i * n + j",
+        "loop_strides": [
+          [
+            "i",
+            "n"
+          ],
+          [
+            "j",
+            "1"
+          ],
+          [
+            "p",
+            "0"
+          ]
+        ],
+        "line": 8,
+        "column": 12
+      },
+      {
+        "parameter": "C",
+        "mode": "read",
+        "index": "i * n + j",
+        "loop_strides": [
+          [
+            "i",
+            "n"
+          ],
+          [
+            "j",
+            "1"
+          ],
+          [
+            "p",
+            "0"
+          ]
+        ],
+        "line": 8,
+        "column": 50
+      }
+    ],
+    "built_unix": 1787240303.4711812,
+    "worst_abs_error": 9.237055564881302e-14,
+    "first_launch_seconds": 0.00210540002444759,
+    "relaunch_median_seconds": 0.0,
+    "compute_median_seconds": 0.0032509999873582274,
+    "warm_samples": 5,
+    "cold_samples": 3,
+    "gflops": 1.2901581102152833,
+    "binding": {
+      "parameter_ids_at_build": {
+        "alpha": 3,
+        "B": 1,
+        "C": 2,
+        "beta": 4,
+        "A": 0
+      },
+      "note": "ids are deterministically re-derived at load and must equal this build record for unchanged identity inputs; drift refuses the artifact"
+    },
+    "data_layout": {
+      "extents": {
+        "C": [
+          "m",
+          "n"
+        ],
+        "A": [
+          "m",
+          "k"
+        ],
+        "B": [
+          "k",
+          "n"
+        ],
+        "alpha": [],
+        "beta": [],
+        "m": [],
+        "n": [],
+        "k": []
+      },
+      "note": "element counts as products of size parameters; the declaration item_data() partitions by",
+      "parameter_permutation": {
+        "parameter_order": [
+          "A",
+          "B",
+          "C",
+          "alpha",
+          "beta"
+        ],
+        "specialized_parameters": {
+          "m": 128,
+          "n": 128,
+          "k": 128
+        },
+        "arrays_concatenated_in_parameter_order": true,
+        "total_array_elements": 49152,
+        "parameters": [
+          {
+            "parameter": "A",
+            "ordinal": 0,
+            "kind": "array",
+            "extent_symbols": [
+              "m",
+              "k"
+            ],
+            "shape": [
+              128,
+              128
+            ],
+            "row_major_strides": [
+              128,
+              1
+            ],
+            "flat_offset": 0,
+            "elements": 16384
+          },
+          {
+            "parameter": "B",
+            "ordinal": 1,
+            "kind": "array",
+            "extent_symbols": [
+              "k",
+              "n"
+            ],
+            "shape": [
+              128,
+              128
+            ],
+            "row_major_strides": [
+              128,
+              1
+            ],
+            "flat_offset": 16384,
+            "elements": 16384
+          },
+          {
+            "parameter": "C",
+            "ordinal": 2,
+            "kind": "array",
+            "extent_symbols": [
+              "m",
+              "n"
+            ],
+            "shape": [
+              128,
+              128
+            ],
+            "row_major_strides": [
+              128,
+              1
+            ],
+            "flat_offset": 32768,
+            "elements": 16384
+          },
+          {
+            "parameter": "alpha",
+            "ordinal": 3,
+            "kind": "scalar"
+          },
+          {
+            "parameter": "beta",
+            "ordinal": 4,
+            "kind": "scalar"
+          }
+        ]
+      },
+      "specialization_note": "shape and row-major strides are concrete compile-time facts; the specialized source contains literal extents"
+    }
+  },
+  {
+    "schema": "turing.kernel-bank-ladder.v1",
+    "kernel": "gemm",
+    "key": "b3944f75f22b8839",
+    "contract": "fast",
+    "specialized": {
+      "m": 256,
+      "n": 256,
+      "k": 256
+    },
+    "status": "ADMITTED",
+    "reason": null,
+    "compiler_fingerprint": "1787240278",
+    "source_sha256": "ac7333ea79d700cb7f3590ed26e397a57908008aac0a1bdfd6ecd49a4bb3cd5a",
+    "access_signature": [
+      {
+        "parameter": "A",
+        "mode": "read",
+        "index": "i * k + p",
+        "loop_strides": [
+          [
+            "i",
+            "k"
+          ],
+          [
+            "j",
+            "0"
+          ],
+          [
+            "p",
+            "1"
+          ]
+        ],
+        "line": 7,
+        "column": 32
+      },
+      {
+        "parameter": "B",
+        "mode": "read",
+        "index": "p * n + j",
+        "loop_strides": [
+          [
+            "i",
+            "0"
+          ],
+          [
+            "j",
+            "1"
+          ],
+          [
+            "p",
+            "n"
+          ]
+        ],
+        "line": 7,
+        "column": 47
+      },
+      {
+        "parameter": "C",
+        "mode": "write",
+        "index": "i * n + j",
+        "loop_strides": [
+          [
+            "i",
+            "n"
+          ],
+          [
+            "j",
+            "1"
+          ],
+          [
+            "p",
+            "0"
+          ]
+        ],
+        "line": 8,
+        "column": 12
+      },
+      {
+        "parameter": "C",
+        "mode": "read",
+        "index": "i * n + j",
+        "loop_strides": [
+          [
+            "i",
+            "n"
+          ],
+          [
+            "j",
+            "1"
+          ],
+          [
+            "p",
+            "0"
+          ]
+        ],
+        "line": 8,
+        "column": 50
+      }
+    ],
+    "built_unix": 1787240305.2735004,
+    "worst_abs_error": 2.5579538487363607e-13,
+    "first_launch_seconds": 0.004248499986715615,
+    "relaunch_median_seconds": 0.0002801000082399696,
+    "compute_median_seconds": 0.0273594000027515,
+    "warm_samples": 5,
+    "cold_samples": 3,
+    "gflops": 1.2264315736684823,
+    "binding": {
+      "parameter_ids_at_build": {
+        "alpha": 3,
+        "B": 1,
+        "C": 2,
+        "beta": 4,
+        "A": 0
+      },
+      "note": "ids are deterministically re-derived at load and must equal this build record for unchanged identity inputs; drift refuses the artifact"
+    },
+    "data_layout": {
+      "extents": {
+        "C": [
+          "m",
+          "n"
+        ],
+        "A": [
+          "m",
+          "k"
+        ],
+        "B": [
+          "k",
+          "n"
+        ],
+        "alpha": [],
+        "beta": [],
+        "m": [],
+        "n": [],
+        "k": []
+      },
+      "note": "element counts as products of size parameters; the declaration item_data() partitions by",
+      "parameter_permutation": {
+        "parameter_order": [
+          "A",
+          "B",
+          "C",
+          "alpha",
+          "beta"
+        ],
+        "specialized_parameters": {
+          "m": 256,
+          "n": 256,
+          "k": 256
+        },
+        "arrays_concatenated_in_parameter_order": true,
+        "total_array_elements": 196608,
+        "parameters": [
+          {
+            "parameter": "A",
+            "ordinal": 0,
+            "kind": "array",
+            "extent_symbols": [
+              "m",
+              "k"
+            ],
+            "shape": [
+              256,
+              256
+            ],
+            "row_major_strides": [
+              256,
+              1
+            ],
+            "flat_offset": 0,
+            "elements": 65536
+          },
+          {
+            "parameter": "B",
+            "ordinal": 1,
+            "kind": "array",
+            "extent_symbols": [
+              "k",
+              "n"
+            ],
+            "shape": [
+              256,
+              256
+            ],
+            "row_major_strides": [
+              256,
+              1
+            ],
+            "flat_offset": 65536,
+            "elements": 65536
+          },
+          {
+            "parameter": "C",
+            "ordinal": 2,
+            "kind": "array",
+            "extent_symbols": [
+              "m",
+              "n"
+            ],
+            "shape": [
+              256,
+              256
+            ],
+            "row_major_strides": [
+              256,
+              1
+            ],
+            "flat_offset": 131072,
+            "elements": 65536
+          },
+          {
+            "parameter": "alpha",
+            "ordinal": 3,
+            "kind": "scalar"
+          },
+          {
+            "parameter": "beta",
+            "ordinal": 4,
+            "kind": "scalar"
+          }
+        ]
+      },
+      "specialization_note": "shape and row-major strides are concrete compile-time facts; the specialized source contains literal extents"
+    }
+  }
+]

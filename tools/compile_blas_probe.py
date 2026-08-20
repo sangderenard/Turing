@@ -53,6 +53,12 @@ def _sample_args(names: tuple[str, ...], *, m: int, n: int, k: int, seed: int):
             values[name] = 1.5
         elif name == "beta":
             values[name] = 0.5
+        elif name == "c":
+            # cos/sin of one fixed angle: c*c + s*s == 1, so rot's probe is
+            # a genuine orthogonal rotation rather than two loose constants.
+            values[name] = 0.8
+        elif name == "s":
+            values[name] = 0.6
         elif name == "A":
             rows = m if "m" in names else n
             cols = k if "k" in names else n
@@ -160,17 +166,42 @@ def probe(level: int, name: str, source: str, reference, arity: tuple[str, ...],
     # name-based guess collides with it (measured: this cost a false
     # 9.8e-01 "disagreement" that was actually a probe bug, not the
     # compiler's).
+    #
+    # EVERY named output is checked, not just the first: ``rot`` mutates a
+    # PAIR of vectors and can only return one of them, so checking one
+    # buffer would report a clean 0.0 while the other output was wholly
+    # wrong. The reference mutates its own copied arguments in place, so
+    # ``reference_args`` after the call is the oracle for each of them.
     output_names = {
         str(param) for param, _value_id in (fn.metadata.get("named_outputs") or ())
     }
-    inout_param = next(
-        (p for p in ("y", "C") if p in id_by_name and p in output_names),
-        None,
-    )
-    if inout_param is not None:
-        produced = np.asarray(execution.buffers[id_by_name[inout_param]])
-        expected_array = np.asarray(expected)
-        worst = float(np.max(np.abs(produced - expected_array)))
+    # EVERY fed array is compared, not just ``named_outputs``. Measured on
+    # rot: the function records only ``x`` (the one it returns) as a named
+    # output, so an output_names-driven check reported a clean 0.0 while
+    # never looking at ``y`` at all -- and ``y`` is the buffer the in-place
+    # store aliasing defect would corrupt. Read-only inputs are compared
+    # too: they must come back exactly as fed, and a kernel that clobbers
+    # one is a defect worth failing on rather than a detail worth skipping.
+    inout_params = [
+        p for p in arity
+        if p in id_by_name and isinstance(sample[p], np.ndarray)
+    ]
+    if inout_params:
+        worst = 0.0
+        culprit = inout_params[0]
+        for param in inout_params:
+            produced = np.asarray(execution.buffers[id_by_name[param]])
+            error = float(np.max(np.abs(
+                produced - np.asarray(reference_args[param])
+            )))
+            role = "output" if param in output_names else "buffer"
+            print(f"  [{name}] {role} {param!r}: |err| = {error:.3e}")
+            if error > worst:
+                worst, culprit = error, param
+        if worst > 1e-9:
+            return "EQUIVALENT", (
+                f"worst disagreement {worst:.3e} on output {culprit!r}"
+            )
     else:
         ret_values = outputs.get(entrypoint) or ()
         if not ret_values:

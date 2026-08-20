@@ -17,13 +17,17 @@ from pathlib import Path
 import pytest
 
 from src.compiler.control_source import (
+    ControlDeploymentLane,
+    ControlDeploymentRegion,
     ControlProgram,
     LoopBlock,
     ParallelDeployment,
     SequenceBlock,
     StatementBlock,
 )
+from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.deployment_native_emission import render_pooled_control_c
+from src.compiler.deployment_stage import plan_region_deployments
 
 _BACKEND_DIR = (
     Path(__file__).resolve().parents[1]
@@ -51,7 +55,7 @@ def test_pooled_render_declares_everything_it_uses():
     for index in (0, 1, 2):
         assert f"extern void turing_region_{index}(void);" in rendered.source
     assert "turing_pool_start(2)" in rendered.source
-    assert "turing_pool_deploy(turing_deploy_wave_0_lane" in rendered.source
+    assert "turing_pool_deploy_span(turing_deploy_wave_0_span" in rendered.source
     # The serial fallback for the wave is inline, in recorded order.
     assert "turing_region_1();" in rendered.source
     assert "turing_region_2();" in rendered.source
@@ -88,12 +92,22 @@ _REGION_HARNESS = """
 #include <stddef.h>
 static long region_hits[3];
 static void* region_threads[3];
+static long span_hits[17];
 /* No __declspec(dllexport) anywhere: with none present, mingw exports every
    non-static symbol, including the pool API the teardown calls. */
 long turing_test_region_hits(int index) { return region_hits[index]; }
 int turing_test_distinct_threads(void) {
     return region_threads[1] != region_threads[2];
 }
+static void turing_test_span_fn(void* context, long start, long stop) {
+    (void)context;
+    for (long index = start; index < stop; ++index) span_hits[index]++;
+}
+int turing_test_span(int chunk) {
+    for (long index = 0; index < 17; ++index) span_hits[index] = 0;
+    return turing_pool_deploy_span(turing_test_span_fn, 0, 17, chunk);
+}
+long turing_test_span_hit(int index) { return span_hits[index]; }
 static void* current_thread(void);
 void turing_region_0(void) { region_hits[0]++; region_threads[0] = current_thread(); }
 void turing_region_1(void) { region_hits[1]++; region_threads[1] = current_thread(); }
@@ -149,3 +163,57 @@ def test_emitted_control_runs_every_region_exactly_once_per_call(
     assert [
         compiled_control.turing_test_region_hits(index) for index in (0, 1, 2)
     ] == [2, 2, 2]
+
+
+def test_native_span_chunk_visits_every_item_exactly_once(compiled_control):
+    assert compiled_control.turing_test_span(4) == 0
+    assert [compiled_control.turing_test_span_hit(i) for i in range(17)] == [
+        1
+    ] * 17
+
+
+def _region(index: int) -> FusedProgram:
+    return FusedProgram(
+        version=1,
+        feeds={index * 2 + 1},
+        steps=[OpStep(
+            step_id=0, op_name="add",
+            input_ids=[index * 2 + 1], result_id=index * 2 + 2,
+        )],
+        outputs={"out": index * 2 + 2},
+    )
+
+
+def _planned_wave(count: int, *, cores: int = 2):
+    deployment = ControlDeploymentRegion(
+        region_id=7, kind="parallel_candidate",
+        schedule="independent_lanes",
+        lanes=tuple(
+            ControlDeploymentLane(index=i, region_indices=(i,))
+            for i in range(count)
+        ),
+    )
+    plan = plan_region_deployments(
+        {i: _region(i) for i in range(count)},
+        deployment_regions=(deployment,), cores=cores,
+    )
+    program = ControlProgram(
+        root=ParallelDeployment(tuple(
+            StatementBlock((f"__scheduled_region_{i}__",))
+            for i in range(count)
+        )),
+        region_indices=tuple(range(count)),
+        deployment_regions=(deployment,),
+    )
+    return program, plan
+
+
+def test_frame_plan_workers_and_chunk_are_literal_in_native_source():
+    program, plan = _planned_wave(40, cores=2)
+    rendered = render_pooled_control_c(program, deployment_plan=plan)
+
+    # 40 lanes / (2 workers * 4 claims each) => five lanes per claim.
+    assert "turing_pool_start(2)" in rendered.source
+    assert "turing_deploy_wave_0_span, 0, 40, 5" in rendered.source
+    assert rendered.deployment_record[0]["workers"] == 2
+    assert rendered.deployment_record[0]["chunk_size"] == 5

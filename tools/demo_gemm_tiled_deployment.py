@@ -39,6 +39,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -51,7 +52,10 @@ import numpy as np
 
 from src.compiler.deployment_host_pool import HostDeploymentPool
 from src.compiler.deployment_lowering import select_deployment_strategy
-from src.compiler.kernel_bank import open_blas_bank
+from src.compiler.kernel_bank import (
+    open_blas_bank,
+    parameter_layout_permutation,
+)
 from src.compiler.ssa_llvm_backend import prepare_artifact_execution
 
 
@@ -64,12 +68,11 @@ class TiledGemmLanes:
     vocabulary already recognizes for barrier joins.
     """
 
-    def __init__(self, core, size: int, tile: int):
+    def __init__(self, core, size: int, tile: int, prebaked: dict):
         self.size = int(size)
         self.tile = int(tile)
-        if self.size % self.tile:
-            raise ValueError("demo sizes are exact multiples of the tile")
-        self.blocks = self.size // self.tile
+        self.blocks = (self.size + self.tile - 1) // self.tile
+        self.prebaked = prebaked
         entry = next(
             name for name in core.module.functions
             if name.endswith(f"__{core.spec.function_name}")
@@ -85,68 +88,92 @@ class TiledGemmLanes:
 
         tile = self.tile
         self._lane_state = []
-        for bi in range(self.blocks):
-            for bj in range(self.blocks):
-                a_buf = np.zeros(tile * tile)
-                b_buf = np.zeros(tile * tile)
-                c_buf = np.ascontiguousarray(
-                    out[bi * tile:(bi + 1) * tile,
-                        bj * tile:(bj + 1) * tile]
-                ).reshape(-1).copy()
-                feeds = {
-                    self._parameters["A"]: a_buf,
-                    self._parameters["B"]: b_buf,
-                    self._parameters["C"]: c_buf,
-                    self._parameters["alpha"]: np.array([alpha]),
-                    self._parameters["beta"]: np.array([beta]),
-                }
-                for formal in self._function.args:
-                    if int(formal.id) not in feeds:
-                        feeds[int(formal.id)] = (
-                            np.array([0]) if formal.dtype == "int"
-                            else np.zeros(tile * tile)
-                        )
-                execution = prepare_artifact_execution(
-                    self._core.native, feeds
+        for lane in self.prebaked["lanes"]:
+            first_call = lane["calls"][0]["parameters_by_name"]
+            c_map = first_call["C"]
+            c_indices = self._indices(c_map)
+            a_buf = np.zeros(tile * tile)
+            b_buf = np.zeros(tile * tile)
+            c_buf = np.zeros(tile * tile)
+            c_rows, c_columns = c_map["source_shape"]
+            c_buf.reshape(tile, tile)[:c_rows, :c_columns] = (
+                np.asarray(out).reshape(-1)[c_indices].reshape(
+                    c_rows, c_columns
                 )
-                self._lane_state.append({
-                    "bi": bi, "bj": bj,
-                    "a": a_buf, "b": b_buf,
-                    "c": np.asarray(
-                        execution.buffers[self._parameters["C"]]
-                    ),
-                    "beta": np.asarray(
-                        execution.buffers[self._parameters["beta"]]
-                    ),
-                    "execution": execution,
-                })
+            )
+            feeds = {
+                self._parameters["A"]: a_buf,
+                self._parameters["B"]: b_buf,
+                self._parameters["C"]: c_buf,
+                self._parameters["alpha"]: np.array([alpha]),
+                self._parameters["beta"]: np.array([beta]),
+            }
+            for formal in self._function.args:
+                if int(formal.id) not in feeds:
+                    feeds[int(formal.id)] = (
+                        np.array([0]) if formal.dtype == "int"
+                        else np.zeros(tile * tile)
+                    )
+            execution = prepare_artifact_execution(self._core.native, feeds)
+            self._lane_state.append({
+                "record": lane,
+                "a": a_buf, "b": b_buf,
+                "c": np.asarray(
+                    execution.buffers[self._parameters["C"]]
+                ),
+                "beta": np.asarray(
+                    execution.buffers[self._parameters["beta"]]
+                ),
+                "execution": execution,
+            })
         self._a2, self._b2, self._out = a2, b2, out
         self._beta0 = float(beta)
 
+    @staticmethod
+    def _indices(mapping: dict) -> np.ndarray:
+        rows, columns = mapping["source_shape"]
+        row_stride, column_stride = mapping["source_strides"]
+        return (
+            int(mapping["source_offset"])
+            + np.arange(rows)[:, None] * int(row_stride)
+            + np.arange(columns)[None, :] * int(column_stride)
+        ).reshape(-1)
+
     def run_lane(self, index: int) -> None:
         state = self._lane_state[index]
-        tile, blocks = self.tile, self.blocks
-        bi, bj = state["bi"], state["bj"]
+        tile = self.tile
         a_view = np.asarray(
             state["execution"].buffers[self._parameters["A"]]
         )
         b_view = np.asarray(
             state["execution"].buffers[self._parameters["B"]]
         )
-        for bp in range(blocks):
-            a_view[:] = np.ascontiguousarray(
-                self._a2[bi * tile:(bi + 1) * tile,
-                         bp * tile:(bp + 1) * tile]
-            ).reshape(-1)
-            b_view[:] = np.ascontiguousarray(
-                self._b2[bp * tile:(bp + 1) * tile,
-                         bj * tile:(bj + 1) * tile]
-            ).reshape(-1)
-            state["beta"][...] = self._beta0 if bp == 0 else 1.0
+        for call in state["record"]["calls"]:
+            parameters = call["parameters_by_name"]
+            a_map, b_map = parameters["A"], parameters["B"]
+            a_rows, a_columns = a_map["source_shape"]
+            b_rows, b_columns = b_map["source_shape"]
+            a_view.fill(0.0)
+            b_view.fill(0.0)
+            a_view.reshape(tile, tile)[:a_rows, :a_columns] = (
+                self._a2.reshape(-1)[self._indices(a_map)].reshape(
+                    a_rows, a_columns
+                )
+            )
+            b_view.reshape(tile, tile)[:b_rows, :b_columns] = (
+                self._b2.reshape(-1)[self._indices(b_map)].reshape(
+                    b_rows, b_columns
+                )
+            )
+            state["beta"][...] = (
+                self._beta0 if parameters["beta"] == "caller_beta"
+                else float(parameters["beta"])
+            )
             state["execution"].run()
-        self._out[bi * tile:(bi + 1) * tile,
-                  bj * tile:(bj + 1) * tile] = (
-            state["c"].reshape(tile, tile)
+        c_map = state["record"]["calls"][-1]["parameters_by_name"]["C"]
+        c_rows, c_columns = c_map["source_shape"]
+        self._out.reshape(-1)[self._indices(c_map)] = (
+            state["c"].reshape(tile, tile)[:c_rows, :c_columns].reshape(-1)
         )
 
     @property
@@ -165,12 +192,25 @@ def main() -> int:
     )
     parser.add_argument("--root", type=Path,
                         default=ROOT / "build" / "kernel_bank")
+    parser.add_argument(
+        "--plan-output", type=Path,
+        help="write the consumed parameter-permutation/launch matrix as JSON",
+    )
+    parser.add_argument(
+        "--contract", default="fast",
+        help="work contract for the parametric kernel, tile cores, and "
+             "chooser (use 'develop' for the exact default contract)",
+    )
     args = parser.parse_args()
     size = args.size
+    contract = (
+        None if args.contract.strip().lower() in {"", "none", "develop"}
+        else args.contract.strip().lower()
+    )
 
     bank = open_blas_bank(args.root)
     print("== 1. bank: build + auto-profile ==")
-    parametric = bank.get("gemm")
+    parametric = bank.get("gemm", contract=contract)
     # A ladder of candidate cores, every divisor of the task within the
     # buildable range -- the DECISION picks among them; the demo does not.
     candidate_sizes = [
@@ -180,6 +220,7 @@ def main() -> int:
     for candidate in candidate_sizes:
         bank.get(
             "gemm",
+            contract=contract,
             specialized={"m": candidate, "n": candidate, "k": candidate},
         )
 
@@ -191,7 +232,7 @@ def main() -> int:
 
         decision = decide_tiling(
             bank, "gemm", {"m": size, "n": size, "k": size},
-            cores=os.cpu_count(), must_divide=True,
+            contract=contract, cores=os.cpu_count(), must_divide=True,
         )
         print("  tile decision (the system's, not the demo's):")
         for reason in decision.reasons:
@@ -201,7 +242,8 @@ def main() -> int:
             return 1
         tile = decision.tile
     core = bank.get(
-        "gemm", specialized={"m": tile, "n": tile, "k": tile},
+        "gemm", contract=contract,
+        specialized={"m": tile, "n": tile, "k": tile},
     )
     for row in bank.performance_chart("gemm")[-4:]:
         label = str(row["specialized"] or "parametric")
@@ -211,7 +253,7 @@ def main() -> int:
               f"compute={row['compute_avg_seconds']*1e6:8.1f}us "
               f"sizes={row['sizes']}")
 
-    blocks = size // tile
+    blocks = (size + tile - 1) // tile
     lane_total = blocks * blocks
     print("\n== 2. deployment strategy chooses workers + chunk ==")
     choice = select_deployment_strategy(
@@ -223,6 +265,38 @@ def main() -> int:
         print("  -", reason)
     print(f"  => strategy={choice.strategy} workers={choice.workers} "
           f"chunk={choice.chunk}")
+
+    from src.compiler.tiling_strategy import (
+        build_gemm_tile_plan,
+        prebake_gemm_launch_matrix,
+    )
+    tile_plan = build_gemm_tile_plan(
+        size, size, size, tile,
+        worker_budget=choice.workers or 1,
+        reasons=tuple(choice.reasons),
+    )
+    prebaked = prebake_gemm_launch_matrix(
+        tile_plan,
+        variant_key=core.key,
+        parameter_ids=core.id_by_name,
+        total_layout=parameter_layout_permutation(
+            core.spec, {"m": size, "n": size, "k": size},
+        ),
+        core_layout=parameter_layout_permutation(
+            core.spec, {"m": tile, "n": tile, "k": tile},
+        ),
+        chunk_size=choice.chunk or 1,
+    )
+    print(
+        f"  prebaked {sum(len(lane['calls']) for lane in prebaked['lanes'])} "
+        f"module calls in {len(prebaked['launch']['spans'])} launch spans"
+    )
+    if args.plan_output:
+        args.plan_output.parent.mkdir(parents=True, exist_ok=True)
+        args.plan_output.write_text(
+            json.dumps(prebaked, indent=2), encoding="utf-8",
+        )
+        print(f"  wrote prebake matrix {args.plan_output}")
 
     print("\n== 3. the source says how data partitions per m-item ==")
     partition = core.spec.item_data(
@@ -239,7 +313,7 @@ def main() -> int:
     alpha, beta = 1.25, 0.5
     expected = alpha * (a2 @ b2) + beta * c2
 
-    lanes = TiledGemmLanes(core, size, tile)
+    lanes = TiledGemmLanes(core, size, tile, prebaked)
 
     def timed(workers: int, repeats: int = 3) -> tuple[float, np.ndarray]:
         pool = HostDeploymentPool(workers=workers)
@@ -253,8 +327,8 @@ def main() -> int:
                     lambda start, stop: [
                         lanes.run_lane(i) for i in range(start, stop)
                     ],
-                    lanes.lane_count,
-                    chunk=choice.chunk,
+                    prebaked["launch"]["lane_count"],
+                    chunk=prebaked["launch"]["chunk_size"],
                 )
                 samples.append(time.perf_counter() - started)
         finally:

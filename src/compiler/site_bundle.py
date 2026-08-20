@@ -3459,6 +3459,11 @@ def build_program_bundle(
                 # this is the decision the capability table above is raw
                 # material for.
                 "region_deployment_strategies": deployment_plan.as_manifest(),
+                # Frame-level choices are the native scheduling authority:
+                # lanes are BLAS/tile work items, chunk is lanes per claim.
+                # Region strategies above remain the authority for how each
+                # individual numerical body is served.
+                "native_deployment_frames": deployment_plan.waves_manifest(),
             },
             "artifacts": _artifact_inventory(temporary),
         }

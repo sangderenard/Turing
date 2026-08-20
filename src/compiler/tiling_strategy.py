@@ -28,11 +28,9 @@ Evidence consulted, in order:
   from composition overhead.
 * **Cores available and NESTED deployment depth**: a tiled plan inside an
   already-parallel deployment must not multiply worlds. The worker budget
-  is tempered by nesting (``cores // (1 + nested_parallelism)``), and at
-  budget 1 the plan is still emitted -- tiling wins serially through cache
-  locality (measured 1.34x at 256^3, ``docs/KERNEL_BANK_DESIGN.md``
-  section 4.5) -- but the budget and its tempering are recorded so the
-  executor never over-subscribes.
+  is tempered by nesting (``cores // (1 + nested_parallelism)``). Without
+  at least two workers, composition is vetoed unless a future calibration
+  supplies positive serial-tiling evidence.
 
 The plan object (:class:`TiledDeploymentPlan`) is shaped to mirror
 ``ControlDeploymentRegion``: ``kind``/``schedule``/``lanes``/barrier join,
@@ -44,18 +42,17 @@ sequence of steps and not itself split. Executing a lane on a worker is
 therefore safe by construction; executing steps of one lane concurrently
 is not, and the plan's shape makes that distinction unrepresentable.
 
-There is deliberately NO executor in this module and no runtime path
-anywhere else: tiling is a COMPILER choice made by the deployment layer.
+There is deliberately NO executor in this module: tiling is a COMPILER choice
+made by the deployment layer.
 The decision and the plan are compile-time data for the deployment pass to
 consume when it lowers a recognized region -- emitting the tile loop, the
 packing, and the prebaked-core calls natively, with the plan's
 worker-budget bound feeding the same pool machinery (``turing_pool.c``)
-every other independent-lane region uses. Host-side composition of kernel
-calls at runtime was tried, measured, and REMOVED (owner's direction:
-this is not outer-code work); the numbers it produced survive in
-``docs/KERNEL_BANK_DESIGN.md`` as evidence that the lowering is worth
-building -- serial tiled composition alone was 1.34x over a single
-parametric call at 256^3.
+every other independent-lane region uses.
+``tools/demo_gemm_tiled_deployment.py`` is a measurement instrument that
+consumes the prebaked parameter/launch matrix through the host pool while the
+finished-product adoption seam is completed. It is not a Python dependency of
+emitted products.
 """
 from __future__ import annotations
 
@@ -230,10 +227,20 @@ def decide_tiling(
             "(the executor at hand has no parametric edge path)"
         )
     if not fitting:
-        reasons.append(
-            f"every admitted core ({[s for s, _ in candidates]}) exceeds "
-            f"the task's smallest axis ({min(m, n, k)})"
-        )
+        within_axes = [
+            size for size, _probe in candidates
+            if size <= min(m, n, k)
+        ]
+        if must_divide and within_axes:
+            reasons.append(
+                f"admitted cores {within_axes} fit within the task but none "
+                f"divide every axis of {m}x{n}x{k}"
+            )
+        else:
+            reasons.append(
+                f"every admitted core ({[s for s, _ in candidates]}) "
+                f"exceeds the task's smallest axis ({min(m, n, k)})"
+            )
         return TilingDecision(
             False, None, worker_budget, tuple(candidates), tuple(reasons)
         )
@@ -262,11 +269,19 @@ def decide_tiling(
             False, None, worker_budget, tuple(candidates), tuple(reasons)
         )
 
+    if worker_budget < 2:
+        reasons.append(
+            "tiled composition refused at worker budget 1: current packed "
+            "serial composition has no positive calibration evidence"
+        )
+        return TilingDecision(
+            False, None, worker_budget, tuple(candidates), tuple(reasons)
+        )
+
     reasons.append(
         f"tiled composition chosen: {m}x{n}x{k} covered by {best_size}^3 "
-        "cores plus parametric edges; serial tiling already measured "
-        "faster than one parametric call (cache locality), worker budget "
-        f"{worker_budget} available to the executor"
+        "cores plus padded edges, with independent output lanes and "
+        f"worker budget {worker_budget} available to the executor"
     )
     return TilingDecision(
         True, best_size, worker_budget, tuple(candidates), tuple(reasons)
@@ -314,6 +329,101 @@ def build_gemm_tile_plan(
     )
 
 
+def prebake_gemm_launch_matrix(
+    plan: TiledDeploymentPlan,
+    *,
+    variant_key: str,
+    parameter_ids: Mapping[str, int],
+    total_layout: Mapping[str, Any],
+    core_layout: Mapping[str, Any],
+    chunk_size: int,
+) -> dict[str, Any]:
+    """Encode every packing permutation and pool claim before execution.
+
+    This is the compile-complementary bridge between a tiled decision and
+    hyperspecific native modules. Source offsets/strides address the total
+    matrices; packed offsets/strides address the specialized core ABI. No
+    runtime component has to rediscover either layout or repartition lanes.
+    Partial edges use the same square core with zero-filled packed margins;
+    only the valid C window is published. Thus arbitrary positive m/n/k can
+    be prebaked without manufacturing a family of tiny edge modules.
+    """
+
+    chunk_size = max(1, int(chunk_size))
+    tile = int(plan.tile)
+    calls = []
+    for lane in plan.lanes:
+        lane_calls = []
+        for step_index, step in enumerate(lane.steps):
+            lane_calls.append({
+                "step": step_index,
+                "module_key": str(variant_key),
+                "parameters_by_name": {
+                    "A": {
+                        "source_offset": lane.i0 * plan.k + step.p0,
+                        "source_shape": [lane.mi, step.kp],
+                        "source_strides": [plan.k, 1],
+                        "packed_shape": [tile, tile],
+                        "packed_strides": [tile, 1],
+                        "zero_fill_packed_margin": not (
+                            lane.mi == tile and step.kp == tile
+                        ),
+                    },
+                    "B": {
+                        "source_offset": step.p0 * plan.n + lane.j0,
+                        "source_shape": [step.kp, lane.nj],
+                        "source_strides": [plan.n, 1],
+                        "packed_shape": [tile, tile],
+                        "packed_strides": [tile, 1],
+                        "zero_fill_packed_margin": not (
+                            step.kp == tile and lane.nj == tile
+                        ),
+                    },
+                    "C": {
+                        "source_offset": lane.i0 * plan.n + lane.j0,
+                        "source_shape": [lane.mi, lane.nj],
+                        "source_strides": [plan.n, 1],
+                        "packed_shape": [tile, tile],
+                        "packed_strides": [tile, 1],
+                        "zero_fill_packed_margin": not (
+                            lane.mi == tile and lane.nj == tile
+                        ),
+                        "publish_after_last_step": True,
+                    },
+                    "alpha": "caller_alpha",
+                    "beta": "caller_beta" if step_index == 0 else 1.0,
+                },
+            })
+        calls.append({
+            "lane": lane.index,
+            "output_origin": [lane.i0, lane.j0],
+            "calls": lane_calls,
+        })
+    return {
+        "schema": "turing.prebaked-gemm-launch-matrix.v1",
+        "module_key": str(variant_key),
+        "module_binding_by_name": {
+            str(name): int(identifier)
+            for name, identifier in sorted(parameter_ids.items())
+        },
+        "problem_shape": [plan.m, plan.n, plan.k],
+        "tile_shape": [tile, tile, tile],
+        "total_parameter_layout": dict(total_layout),
+        "core_parameter_layout": dict(core_layout),
+        "launch": {
+            "join": plan.join_mode,
+            "workers": plan.worker_budget,
+            "chunk_size": chunk_size,
+            "lane_count": len(plan.lanes),
+            "spans": [
+                [start, min(start + chunk_size, len(plan.lanes))]
+                for start in range(0, len(plan.lanes), chunk_size)
+            ],
+        },
+        "lanes": calls,
+    }
+
+
 __all__ = [
     "TILE_COMPOSITION_KIND",
     "TileStep",
@@ -322,4 +432,5 @@ __all__ = [
     "TilingDecision",
     "decide_tiling",
     "build_gemm_tile_plan",
+    "prebake_gemm_launch_matrix",
 ]
