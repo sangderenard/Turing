@@ -279,6 +279,22 @@ class SSATensorProgram:
         tensor_scalar_broadcast = None
         if canonical == "matmul" and len(tensor_operands) == 2:
             left_shape, right_shape = tensor_operands[0].shape, tensor_operands[1].shape
+            if (
+                len(left_shape) == 2
+                and len(right_shape) == 1
+                and left_shape[1] == right_shape[0]
+            ):
+                # Keep matrix-vector multiplication semantic at the public
+                # layer while adapting it to the fundamental matrix-matrix
+                # repository kernel. These are layout-only views: no shape
+                # constant enters a traced NumPy/Python manifestation.
+                column = self.view(
+                    tensor_operands[1], (right_shape[0], 1),
+                )
+                product = self.operation(
+                    "matmul", tensor_operands[0], column,
+                )
+                return self.view(product, (left_shape[0],))
             if len(left_shape) in {2, 3} and len(right_shape) in {2, 3} and (
                 len(left_shape) == 3 or len(right_shape) == 3
             ):

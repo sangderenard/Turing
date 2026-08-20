@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any, Mapping, MutableMapping, Sequence
 
 
@@ -70,6 +72,58 @@ class NativeGraphReverse:
     seed_value_ids: Mapping[int, int]
     artifact: Any
     saved_binding_count: int
+
+
+@dataclass(frozen=True)
+class BrowserGraphReverse:
+    """The same lowered graph reverse compiled for wasm32-freestanding."""
+
+    name: str
+    wasm_path: Path
+    buffer_order: tuple[int, ...]
+    buffer_shapes: tuple[tuple[Any, ...], ...]
+    buffer_dtypes: tuple[str, ...]
+    extent_order: tuple[tuple[int, str, int | None], ...]
+
+
+def compile_graph_reverse_to_wasm(
+    reverse: NativeGraphReverse,
+    *,
+    directory: Path,
+) -> BrowserGraphReverse:
+    """Compile the already-emitted LLVM VJP to standalone WebAssembly."""
+
+    artifact = reverse.artifact
+    if artifact.shortfalls:
+        raise ValueError("cannot compile an incomplete graph reverse to WASM")
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    source = directory / f"{artifact.name}.ll"
+    wasm = directory / f"{artifact.name}.wasm"
+    source.write_text(artifact.llvm_ir, encoding="utf-8")
+    command = [
+        sys.executable, "-m", "ziglang", "cc",
+        "--target=wasm32-freestanding", "-nostdlib", "-O2",
+        "-Wl,--no-entry", f"-Wl,--export={artifact.name}",
+        "-Wl,--export=__heap_base", "-Wl,--export-memory",
+        "-o", str(wasm), str(source),
+    ]
+    completed = subprocess.run(
+        command, capture_output=True, text=True, check=False,
+    )
+    if completed.returncode != 0 or not wasm.is_file():
+        raise RuntimeError(
+            f"graph reverse WASM compile failed ({completed.returncode}):\n"
+            + completed.stderr[-2000:]
+        )
+    return BrowserGraphReverse(
+        name=str(artifact.name),
+        wasm_path=wasm,
+        buffer_order=tuple(map(int, artifact.buffer_order)),
+        buffer_shapes=tuple(tuple(shape) for shape in artifact.buffer_shapes),
+        buffer_dtypes=tuple(artifact.buffer_dtypes),
+        extent_order=tuple(tuple(item) for item in artifact.extent_order),
+    )
 
 
 def compile_native_graph_reverse(

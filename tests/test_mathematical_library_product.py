@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import shutil
+import subprocess
 
 import numpy as np
 
@@ -53,9 +55,37 @@ def test_outer_math_product_owns_a_synchronized_blas_subunit(tmp_path):
         item["parametric_reverse"]["library_path"]
         for item in object_manifest["artifacts"].values()
     )
+    assert all(
+        (product.directory / "objects" / "blas" / item[
+            "browser_parametric_reverse"
+        ]["wasm_path"]).is_file()
+        for item in object_manifest["artifacts"].values()
+    )
     assert object_manifest["methods"][4]["specializations"] == [
         {"k": 17, "m": 17, "n": 17}
     ]
+    node = shutil.which("node")
+    if node is not None:
+        reverse_loader = product.directory / "objects" / "blas" / object_manifest[
+            "browser_loader"
+        ]
+        reverse_root = product.directory / "objects" / "blas"
+        script = f'''import {{readFile}} from "node:fs/promises";
+import {{fileURLToPath,pathToFileURL}} from "node:url";
+globalThis.fetch=async url=>new Response(await readFile(fileURLToPath(url)));
+const module=await import(pathToFileURL({json.dumps(str(reverse_loader))}).href);
+const reverse=await module.CompiledObjectReverse.load(pathToFileURL({json.dumps(str(reverse_root) + "/")}));
+const result=await reverse.vjp("rot",[new Float64Array([1,-.5,.25,2]),new Float64Array([-.25,1.5,.75,-1])],{{x:new Float64Array([.25,-.5,1.5,2]),y:new Float64Array([-1,.75,.5,-.25]),c:.8,s:.6}});
+console.log(JSON.stringify(Object.fromEntries(Object.entries(result).map(([key,value])=>[key,value?.length===undefined?value:[...value]]))));'''
+        completed = subprocess.run(
+            [node, "--input-type=module", "--eval", script],
+            capture_output=True, text=True, check=True,
+        )
+        browser_reverse = json.loads(completed.stdout)
+        np.testing.assert_allclose(browser_reverse["x"], [0.95, -1.3, -0.25, 2.2])
+        np.testing.assert_allclose(browser_reverse["y"], [0.4, 0.9, 0.75, 0.4])
+        np.testing.assert_allclose(browser_reverse["c"], 6.875)
+        np.testing.assert_allclose(browser_reverse["s"], -0.0625)
     coverage = {
         item["method"]: item for item in matrix["products"]["blas"]["coverage"]
     }
@@ -202,6 +232,8 @@ def test_outer_math_product_owns_a_synchronized_blas_subunit(tmp_path):
     assert "target.tensorMath=this" in javascript
     assert "target.turingBLAS=this.blas" in javascript
     assert "../libraries/blas/web/blas-server.js" in javascript
+    assert "../objects/blas/compiled-reverse.js" in javascript
+    assert "blas.vjp=reverse.vjp.bind(reverse)" in javascript
     installer = product.directory / manifest["surfaces"]["web"]["installer"]
     installer_source = installer.read_text(encoding="utf-8")
     assert "document.currentScript" in installer_source

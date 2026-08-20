@@ -292,9 +292,12 @@ export class TuringMathematicalLibrary {{
     const matrix=JSON.parse(new TextDecoder().decode(bytes));
     const module=await import(new URL("../libraries/blas/web/blas-server.js",base));
     const blas=await module.TuringBLASServer.load(new URL("../libraries/blas/web/",base));
-    return new TuringMathematicalLibrary(matrix,blas);
+    const reverseModule=await import(new URL("../objects/blas/compiled-reverse.js",base));
+    const reverse=await reverseModule.CompiledObjectReverse.load(new URL("../objects/blas/",base));
+    blas.reverse=reverse;blas.vjp=reverse.vjp.bind(reverse);
+    return new TuringMathematicalLibrary(matrix,blas,reverse);
   }}
-  constructor(matrix,blas){{this.matrix=matrix;this.blas=blas;}}
+  constructor(matrix,blas,reverse){{this.matrix=matrix;this.blas=blas;this.blasReverse=reverse;}}
   get libraries(){{return Object.keys(this.matrix.products);}}
   install(target=globalThis,options={{}}){{const primary=options.name??"turingMath";target[primary]=this;target.tensorMath=this;target.turingBLAS=this.blas;return this;}}
 }}
@@ -369,6 +372,7 @@ is recorded per method rather than inferred from which files happen to exist.
 from python import load
 math = load()
 result = math.blas.gemm(a, b)
+gradients = math.blas.vjp("gemm", upstream, a=a, b=b)
 numpy_math = math.install(MyNumericalHost)  # standalone NumPy is the default
 native_math = math.install(AnotherHost, implementation="native")
 math.close()
@@ -406,6 +410,9 @@ WASM coordinator and the BLAS subunit's own verified WASM/shader assemblage.
 For embedding, copy `web/embed-template.html` and adjust the two relative paths
 on its installer script. The script immediately publishes `turingMathReady`;
 once resolved, `turingMath`, `tensorMath`, and `turingBLAS` are page-wide.
+Every BLAS method also exposes its fully compiled graph reverse through
+`await library.blas.vjp(method, upstream, bindings)`. The browser calls the
+packaged WebAssembly reverse directly; it does not interpret graph metadata.
 """
 
 
