@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 
 from src.compiler.backend_identities import apply_backend_identities
 from src.compiler.tensor_ssa_lowering import lower_tensor_calls_to_repository_ssa
@@ -12,6 +13,7 @@ from src.transmogrifier.graph.python_identity_programs import resolve_python_ide
 from src.transmogrifier.graph.python_special_cases import (
     interpret_python_special_case,
 )
+from src.compiler.work_contract import set_active_contract
 
 
 def _module():
@@ -62,7 +64,10 @@ def test_abstract_tensor_blas_identity_exposes_a_backend_intrinsic_family():
     )
 
     assert program is not None
-    assert program.direct_operator == "matmul"
+    assert program.direct_operator == "Call"
+    assert program.direct_attributes["callee"] == "blas.gemm"
+    assert program.direct_attributes["call_role_set"] == "blas"
+    assert program.direct_attributes["call_role"] == "gemm"
     assert program.direct_attributes["semantic_library"] == "src.common.tensors.blas"
     assert program.direct_attributes["semantic_kernel"] == "gemm"
     assert program.direct_attributes["semantic_source_symbol"] == "GEMM_SOURCE"
@@ -117,7 +122,8 @@ def _lower_flagged_matmul():
         "parameters": {"lowering_namespace": "abstract_tensor"},
     }
     special = interpret_python_special_case(call_node)
-    assert special is not None and special.type == "matmul"
+    assert special is not None and special.type == "Call"
+    assert special.attributes["callee"] == "blas.gemm"
 
     left = SSAValue(100, "float32", shape=(2, 3))
     right = SSAValue(101, "float32", shape=(3, 4))
@@ -167,6 +173,7 @@ def test_process_graph_intrinsic_flag_survives_tensor_lowering_and_swaps_for_gls
     assert record["symbol"] == "glslblas_gemm"
     assert record["consumption"] == "deployment_bypass"
     assert record["operand_positions"] == [0, 1]
+    assert record["shader_variant"] == "glslblas_gemm"
     assert intrinsic.attributes["backend_intrinsic_original"] == {
         "op": "Call",
         "callee": "matmul_double",
@@ -175,6 +182,37 @@ def test_process_graph_intrinsic_flag_survives_tensor_lowering_and_swaps_for_gls
     assert swapped.decisions[0].applied
     assert swapped.decisions[0].before_sha256 != swapped.decisions[0].after_sha256
     assert lowered.op == "Call"  # backend swap never mutates universal SSA
+
+
+def test_glsl_intrinsic_receipts_the_contract_selected_source_algorithm():
+    module, result, _lowered = _lower_flagged_matmul()
+    from src.compiler.work_contract import (
+        PRESETS,
+        ShaderOptimizationContract,
+    )
+
+    set_active_contract(dataclasses.replace(
+        PRESETS["develop"],
+        name="source-proof",
+        shaders=ShaderOptimizationContract(blas_gemm="source_algorithm"),
+    ))
+    try:
+        swapped = apply_backend_identities(
+            module, {"flagged": (result,)}, backend="glsl",
+            licensed_inexact=False,
+        )
+    finally:
+        set_active_contract(None)
+    intrinsic = next(
+        instruction
+        for instruction in swapped.module.functions["flagged"].blocks[
+            "entry"
+        ].instrs
+        if instruction.op == "BackendIntrinsic"
+    )
+    assert intrinsic.attributes["backend_intrinsic"]["shader_variant"] == (
+        "source_algorithm"
+    )
 
 
 def test_glsl_intrinsic_location_accepts_an_explicit_gestalt_override():

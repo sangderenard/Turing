@@ -174,7 +174,14 @@ def _backend_intrinsic_swaps(
             "callee": instruction.attributes.get("callee"),
         }
         instruction.op = "BackendIntrinsic"
-        instruction.attributes["backend_intrinsic"] = target.as_record()
+        target_record = target.as_record()
+        if str(backend) == "glsl" and family == "blas.gemm":
+            from .work_contract import active_contract
+
+            target_record["shader_variant"] = (
+                active_contract().shaders.blas_gemm
+            )
+        instruction.attributes["backend_intrinsic"] = target_record
         instruction.attributes["backend_intrinsic_original"] = previous
         instruction.attributes["callee"] = target.symbol
         instruction.attributes["lowered_from"] = previous["op"]

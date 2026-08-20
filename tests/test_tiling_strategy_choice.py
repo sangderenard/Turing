@@ -42,6 +42,26 @@ class _MeasuredBank:
         return object()
 
 
+def test_shader_tiler_defaults_to_the_optimized_gemm_dispatch():
+    from src.compiler.deployment_lowering import ComputeDispatchLimits
+    from src.compiler.tiling_strategy import select_gemm_shader_dispatch
+
+    limits = ComputeDispatchLimits(
+        max_group_count=(65535, 65535, 65535),
+        max_group_size=(1024, 1024, 64),
+        max_invocations=1024,
+    )
+    decision = select_gemm_shader_dispatch(
+        128, 128, 128, backend="glsl", limits=limits,
+    )
+
+    assert decision.variant == "glslblas_gemm"
+    assert decision.tile == 16
+    assert decision.preferred_local_size == 256
+    assert decision.choice.compute.workgroup_size == (256, 1, 1)
+    assert decision.choice.compute.groups == (64, 1, 1)
+
+
 def test_chooser_uses_best_live_profile_and_is_deterministic():
     bank = _MeasuredBank()
     arguments = dict(

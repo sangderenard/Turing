@@ -110,6 +110,8 @@ __all__ = [
     "emit_index_select_source",
     "emit_slice_axis_source",
     "emit_matmul_source",
+    "emit_source_matmul_source",
+    "glsl_blas_shader_identity",
     "glslblas_gemm",
     "execute_backend_intrinsic",
     "emit_permute_source",
@@ -5223,6 +5225,81 @@ def matmul_snippet(
     )
 
 
+def source_matmul_snippet(
+    left_shape: Sequence[int],
+    right_shape: Sequence[int],
+    *,
+    left_dtype: Any = np.float32,
+    right_dtype: Any = np.float32,
+    output_dtype: Any | None = None,
+    base: int = 0,
+) -> ShaderSnippet:
+    """Lower the canonical GEMM loops directly, without a backend identity.
+
+    One invocation owns one output element and preserves the authored ``p``
+    reduction order. Batch broadcasting changes address calculation only; it
+    does not introduce an alternative mathematical algorithm.
+    """
+
+    left_shape, right_shape, batch_shape, output_shape = _matmul_layout(
+        left_shape, right_shape
+    )
+    left_dtype = _normalize_dtype(left_dtype)
+    right_dtype = _normalize_dtype(right_dtype)
+    output_dtype = (
+        _promote_dtype(left_dtype, right_dtype)
+        if output_dtype is None
+        else _normalize_dtype(output_dtype)
+    )
+    if output_dtype.kind == "b":
+        raise TypeError("matmul does not support boolean output")
+
+    rows, inner = left_shape[-2:]
+    columns = right_shape[-1]
+    left_strides = _row_major_strides(left_shape)
+    right_strides = _row_major_strides(right_shape)
+    batch_strides = _row_major_strides(batch_shape)
+    output_type = _glsl_type(output_dtype)
+    lines = [
+        f"uint batch_index = gid / uint({rows * columns});",
+        f"uint matrix_index = gid % uint({rows * columns});",
+        f"uint row = matrix_index / uint({columns});",
+        f"uint column = matrix_index % uint({columns});",
+        "uint batch_remaining = batch_index;",
+        "uint left_offset = uint(0);",
+        "uint right_offset = uint(0);",
+    ]
+    for axis, batch_stride in enumerate(batch_strides):
+        lines.extend([
+            f"uint batch_coord{axis} = batch_remaining / uint({batch_stride});",
+            f"batch_remaining %= uint({batch_stride});",
+        ])
+        if left_shape[axis] != 1:
+            lines.append(
+                f"left_offset += batch_coord{axis} * uint({left_strides[axis]});"
+            )
+        if right_shape[axis] != 1:
+            lines.append(
+                f"right_offset += batch_coord{axis} * uint({right_strides[axis]});"
+            )
+    lines.extend([
+        f"{output_type} total = {output_type}(0);",
+        f"for (uint p = 0u; p < uint({inner}); ++p) {{",
+        "    total += "
+        + _arena_read(
+            left_dtype, 0, f"left_offset + row * uint({inner}) + p", base,
+        )
+        + " * "
+        + _arena_read(
+            right_dtype, 1, f"right_offset + p * uint({columns}) + column", base,
+        )
+        + ";",
+        "}",
+        _arena_write(output_dtype, 2, "gid", "total", base) + ";",
+    ])
+    return ShaderSnippet(lines=tuple(lines), slots=3)
+
+
 def emit_matmul_source(
     left_shape: Sequence[int],
     right_shape: Sequence[int],
@@ -5242,6 +5319,70 @@ def emit_matmul_source(
         )],
         local_size=local_size,
     )
+
+
+def emit_source_matmul_source(
+    left_shape: Sequence[int],
+    right_shape: Sequence[int],
+    *,
+    left_dtype: Any = np.float32,
+    right_dtype: Any = np.float32,
+    output_dtype: Any | None = None,
+    local_size: int = _LOCAL_SIZE,
+) -> str:
+    """Finish the direct source-order lowering of canonical ``blas.gemm``."""
+
+    return compose_shader(
+        [source_matmul_snippet(
+            left_shape,
+            right_shape,
+            left_dtype=left_dtype,
+            right_dtype=right_dtype,
+            output_dtype=output_dtype,
+        )],
+        local_size=local_size,
+    )
+
+
+def glsl_blas_shader_identity(
+    *,
+    role_source: str,
+    variant: str,
+    left_shape: Sequence[int],
+    right_shape: Sequence[int],
+    left_dtype: Any,
+    right_dtype: Any,
+    output_dtype: Any,
+    local_size: int,
+    shader_source: str,
+) -> str:
+    """Name a shader by semantics, source provenance, and specialization.
+
+    Driver-produced program bytes are necessarily device-specific. Their
+    cache address is not: identical humble source, identity choice, types,
+    shapes, and launch specialization always produce this same key.
+    """
+
+    record = {
+        "schema": "turing.glsl-blas-plan.v1",
+        "role": "blas.gemm",
+        "role_source_sha256": hashlib.sha256(
+            role_source.encode("utf-8")
+        ).hexdigest(),
+        "variant": str(variant),
+        "left_shape": list(map(int, left_shape)),
+        "right_shape": list(map(int, right_shape)),
+        "left_dtype": _normalize_dtype(left_dtype).str,
+        "right_dtype": _normalize_dtype(right_dtype).str,
+        "output_dtype": _normalize_dtype(output_dtype).str,
+        "local_size": int(local_size),
+        "shader_sha256": hashlib.sha256(
+            shader_source.encode("utf-8")
+        ).hexdigest(),
+    }
+    return hashlib.sha256(json.dumps(
+        record, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
 
 
 def _resolve_repeat_layout(
@@ -8350,8 +8491,9 @@ def matmul_chunks(
     right: Any,
     *,
     reverse: bool = False,
+    variant: str | None = None,
 ) -> GLChunk:
-    """Execute one native 2-D or broadcasted batched matrix multiplication."""
+    """Execute GEMM using the active contract's GLSL identity policy."""
     left = left if isinstance(left, GLChunk) else GLChunk.from_numpy(left)
     right = right if isinstance(right, GLChunk) else GLChunk.from_numpy(right)
     if reverse:
@@ -8367,33 +8509,64 @@ def matmul_chunks(
 
     out = GLChunk(output_shape, dtype=output_dtype)
     limits = _compute_limits()
-    tile_cap = min(
-        16,
-        int(math.isqrt(limits.max_invocations)),
-        int(math.isqrt(limits.max_group_size[0])),
+    from src.compiler.deployment_lowering import ComputeDispatchLimits
+    from src.compiler.tiling_strategy import select_gemm_shader_dispatch
+
+    dispatch = select_gemm_shader_dispatch(
+        output_shape[-2],
+        output_shape[-1],
+        left_shape[-1],
+        backend="glsl",
+        limits=ComputeDispatchLimits(
+            max_group_count=limits.max_group_count,
+            max_group_size=limits.max_group_size,
+            max_invocations=limits.max_invocations,
+        ),
+        batch_count=_shape_product(output_shape[:-2]),
+        variant=variant,
     )
-    tile = 1 << max(0, tile_cap.bit_length() - 1)
-    thread_count = tile * tile
-    rows, columns = output_shape[-2:]
-    group_count = (
-        _shape_product(output_shape[:-2])
-        * ((rows + tile - 1) // tile)
-        * ((columns + tile - 1) // tile)
+    variant = dispatch.variant
+    local_size = dispatch.choice.compute.workgroup_size[0]
+    emitter = (
+        emit_matmul_source
+        if variant == "glslblas_gemm"
+        else emit_source_matmul_source
     )
-    plan = plan_launch(
-        group_count * thread_count,
-        preferred_local_size=thread_count,
-        binding_count=3,
+    compute = dispatch.choice.compute
+    plan = GLLaunchPlan(
+        compute.count,
+        compute.workgroup_size[0],
+        compute.groups,
+        limits,
+        dispatch.choice,
     )
-    source = emit_matmul_source(
+    source = emitter(
         left_shape,
         right_shape,
         left_dtype=left.dtype,
         right_dtype=right.dtype,
         output_dtype=output_dtype,
-        local_size=thread_count,
+        local_size=local_size,
     )
-    _dispatch(_compile(source), [left, right], out, plan)
+    from src.common.tensors.blas import GEMM_SOURCE
+
+    cache_identity = glsl_blas_shader_identity(
+        role_source=GEMM_SOURCE,
+        variant=variant,
+        left_shape=left_shape,
+        right_shape=right_shape,
+        left_dtype=left.dtype,
+        right_dtype=right.dtype,
+        output_dtype=output_dtype,
+        local_size=local_size,
+        shader_source=source,
+    )
+    _dispatch(
+        _compile(source, cache_identity=cache_identity),
+        [left, right],
+        out,
+        plan,
+    )
     return out
 
 
@@ -8453,6 +8626,11 @@ def execute_backend_intrinsic(
         if value_id not in values:
             raise KeyError(f"missing GLSL intrinsic operand value {value_id}")
         arguments.append(values[value_id])
+    if location == builtin_location and handler is glslblas_gemm:
+        return matmul_chunks(
+            *arguments,
+            variant=record.get("shader_variant"),
+        )
     return handler(*arguments)
 
 

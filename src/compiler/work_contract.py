@@ -56,6 +56,9 @@ reaches a real consumer):
 * ``loops`` — the loop-optimization subcontract. It centralizes the low-priority
   unroll threshold and register-block width; semantic recurrence/effect
   preservation remains a mandatory veto above those preferences.
+* ``shaders`` — the shader-identity subcontract. The GEMM tiler reads it once
+  and defaults to the optimized cooperative GLSL identity; the direct humble
+  source lowering remains an explicit proof/profiling choice.
 * ``extraction`` — the WHOLE ingestion/native-pursual policy, embedded: an
   ``ExtractionContract`` (or path to one). That object already decides
   python-call allowance (INGEST_PYTHON / PYTHON_HOST_CALL), native pursuit
@@ -104,6 +107,7 @@ from typing import Any
 _HONORED_DEPLOYMENT = ("serial",)
 _HONORED_COMPILER = ("zig-cc",)
 _HONORED_DESTINATION = ("native",)
+_HONORED_GLSL_GEMM = ("glslblas_gemm", "source_algorithm")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,6 +125,25 @@ class LoopOptimizationContract:
             raise ValueError("loop unroll_limit must be positive")
         if int(self.register_block_width) < 1:
             raise ValueError("register_block_width must be positive")
+
+
+@dataclasses.dataclass(frozen=True)
+class ShaderOptimizationContract:
+    """Backend-identity choices for shader compilation.
+
+    ``glslblas_gemm`` is the performance default. ``source_algorithm`` is the
+    deliberately humble lowering of the same canonical BLAS role and exists
+    for proof, profiling, and driver-comparison work.
+    """
+
+    blas_gemm: str = "glslblas_gemm"
+
+    def __post_init__(self) -> None:
+        if self.blas_gemm not in _HONORED_GLSL_GEMM:
+            raise ValueError(
+                f"shader blas_gemm={self.blas_gemm!r} is not honored; "
+                f"honored: {_HONORED_GLSL_GEMM}"
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -149,6 +172,11 @@ class WorkContract:
     # parameters have one authority without bloating every work preset.
     loops: LoopOptimizationContract = dataclasses.field(
         default_factory=LoopOptimizationContract,
+    )
+    # Shader backend identity policy. The optimized identity is the default
+    # for every preset; a caller must explicitly request the source algorithm.
+    shaders: ShaderOptimizationContract = dataclasses.field(
+        default_factory=ShaderOptimizationContract,
     )
 
     def __post_init__(self) -> None:
@@ -185,6 +213,7 @@ class WorkContract:
             f"fma={'contract' if self.contract_multiply_add else 'none'}",
             f"unroll<={self.loops.unroll_limit}",
             f"register-block={self.loops.register_block_width}",
+            f"glsl-gemm={self.shaders.blas_gemm}",
         ]
         return f"{self.name}: " + ", ".join(held)
 

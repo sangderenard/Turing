@@ -880,6 +880,24 @@ def lower_tensor_calls_to_repository_ssa(
                 )
                 if (
                     instruction.op in {"Call", "call"}
+                    and instruction.attributes.get("call_role_set") == "blas"
+                    and instruction.attributes.get("call_role") == "gemm"
+                    and instruction.attributes.get("callee") == "blas.gemm"
+                ):
+                    # AbstractTensor submitted a finite BLAS role call.  Its
+                    # semantic identity remains attached while the universal
+                    # tensor lowering supplies the ordinary executable
+                    # fallback. A backend identity may subsequently replace
+                    # that fallback by qualified location.
+                    attributes = dict(instruction.attributes)
+                    attributes.pop("callee", None)
+                    instruction = dataclasses.replace(
+                        instruction,
+                        op="matmul",
+                        attributes=attributes,
+                    )
+                if (
+                    instruction.op in {"Call", "call"}
                     and instruction.attributes.get("callee") is not None
                 ):
                     rewritten.append(instruction)

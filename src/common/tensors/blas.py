@@ -84,6 +84,9 @@ same calling convention as
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Callable
+
 # ---------------------------------------------------------------------------
 # Level 0: scal  --  y[i] = alpha * x[i]
 #
@@ -296,6 +299,52 @@ KERNELS = (
     (5, "rot", ROT_SOURCE, rot_reference, ("x", "y", "c", "s", "n")),
 )
 
+
+@dataclass(frozen=True, slots=True)
+class BLASRole:
+    """One finite semantic role backed by compiler-authored algorithm source."""
+
+    level: int
+    name: str
+    source: str
+    reference: Callable
+    parameter_order: tuple[str, ...]
+    abstract_operator: str | None = None
+
+    @property
+    def identity(self) -> str:
+        return f"blas.{self.name}"
+
+
+_ABSTRACT_OPERATORS = {
+    "dot": "dot",
+    "gemm": "matmul",
+}
+
+BLAS_ROLES = {
+    name: BLASRole(
+        level=level,
+        name=name,
+        source=source,
+        reference=reference,
+        parameter_order=tuple(parameters),
+        abstract_operator=_ABSTRACT_OPERATORS.get(name),
+    )
+    for level, name, source, reference, parameters in KERNELS
+}
+
+
+def blas_role(name: str) -> BLASRole:
+    """Return a role from the closed compiler BLAS vocabulary."""
+
+    try:
+        return BLAS_ROLES[str(name)]
+    except KeyError as error:
+        raise KeyError(
+            f"unknown BLAS role {name!r}; expected one of "
+            f"{tuple(BLAS_ROLES)!r}"
+        ) from error
+
 __all__ = [
     "SCAL_SOURCE", "scal_reference",
     "AXPY_SOURCE", "axpy_reference",
@@ -303,5 +352,5 @@ __all__ = [
     "GEMV_SOURCE", "gemv_reference",
     "GEMM_SOURCE", "gemm_reference",
     "ROT_SOURCE", "rot_reference",
-    "KERNELS",
+    "KERNELS", "BLASRole", "BLAS_ROLES", "blas_role",
 ]

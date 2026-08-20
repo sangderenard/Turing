@@ -10,6 +10,7 @@ the way to the GPU, which is a documented contract, not an accident.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -1097,6 +1098,37 @@ def test_glsl_reads_the_prebaked_matrix_without_rewriting_it(monkeypatch):
     assert interpreted.lane_count == 6
     assert interpreted.calls_per_lane == (1,) * 6
     assert interpreted.choice.compute.count == 6
+
+
+def test_abstract_tensor_glsl_honors_source_algorithm_contract(gl):
+    from src.common.tensors.abstraction import AbstractTensor
+    from src.compiler.work_contract import (
+        PRESETS,
+        ShaderOptimizationContract,
+        set_active_contract,
+    )
+
+    left_values = np.arange(24, dtype=np.float32).reshape(2, 3, 4) / 17.0
+    right_values = np.arange(20, dtype=np.float32).reshape(4, 5) / 13.0
+    contract = dataclasses.replace(
+        PRESETS["develop"],
+        name="source-proof",
+        shaders=ShaderOptimizationContract(blas_gemm="source_algorithm"),
+    )
+    set_active_contract(contract)
+    try:
+        with AbstractTensor.use_backend("glsl"):
+            result = AbstractTensor.tensor(left_values) @ AbstractTensor.tensor(
+                right_values
+            )
+        np.testing.assert_allclose(
+            result.numpy(),
+            np.matmul(left_values, right_values),
+            rtol=2e-5,
+            atol=2e-5,
+        )
+    finally:
+        set_active_contract(None)
 
 
 def test_captured_matmul_dispatches_through_named_glsl_blas_intrinsic(

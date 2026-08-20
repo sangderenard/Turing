@@ -149,6 +149,90 @@ class ComputeMatrixInterpretation:
         }
 
 
+@dataclass(frozen=True)
+class GemmShaderDispatch:
+    """Tiler-owned physical dispatch for one canonical GEMM identity."""
+
+    variant: str
+    tile: int | None
+    logical_work: int
+    preferred_local_size: int
+    choice: Any
+
+
+def select_gemm_shader_dispatch(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    backend: str,
+    limits: Any,
+    batch_count: int = 1,
+    variant: str | None = None,
+) -> GemmShaderDispatch:
+    """Choose the GEMM identity and its dispatch in the tiling authority.
+
+    Consumers provide problem shape and device limits. They do not independently
+    choose a tile, workgroup, or launch extent. The active compile contract is
+    consulted only when the caller has not requested a comparison variant.
+    """
+
+    m, n, k, batch_count = map(int, (m, n, k, batch_count))
+    if min(m, n, k, batch_count) <= 0:
+        raise ValueError("GEMM shader dimensions and batch count must be positive")
+    if variant is None:
+        from .work_contract import active_contract
+
+        variant = active_contract().shaders.blas_gemm
+    variant = str(variant)
+    if variant == "glslblas_gemm":
+        tile_cap = min(
+            16,
+            int(int(limits.max_invocations) ** 0.5),
+            int(int(limits.max_group_size[0]) ** 0.5),
+        )
+        tile = 1 << max(0, tile_cap.bit_length() - 1)
+        preferred_local_size = tile * tile
+        logical_work = (
+            batch_count
+            * ((m + tile - 1) // tile)
+            * ((n + tile - 1) // tile)
+            * preferred_local_size
+        )
+    elif variant == "source_algorithm":
+        tile = None
+        preferred_local_size = min(
+            256,
+            int(limits.max_invocations),
+            int(limits.max_group_size[0]),
+        )
+        logical_work = batch_count * m * n
+    else:
+        raise ValueError(
+            f"unknown GEMM shader identity {variant!r}; expected "
+            "'glslblas_gemm' or 'source_algorithm'"
+        )
+    from .deployment_lowering import select_deployment_strategy
+
+    choice = select_deployment_strategy(
+        backend=str(backend),
+        execution_class="shader-compute",
+        join_mode="barrier",
+        work=logical_work,
+        compute_limits=limits,
+        preferred_local_size=preferred_local_size,
+    )
+    if choice.compute is None:
+        raise ValueError(f"{backend} did not produce GEMM dispatch geometry")
+    return GemmShaderDispatch(
+        variant=variant,
+        tile=tile,
+        logical_work=logical_work,
+        preferred_local_size=preferred_local_size,
+        choice=choice,
+    )
+
+
 def _admitted_square_core_sizes(
     bank: Any, name: str, contract: str | None
 ) -> list[tuple[int, float | None]]:
@@ -554,6 +638,7 @@ def interpret_gemm_compute_matrix(
 
 __all__ = [
     "ComputeMatrixInterpretation",
+    "GemmShaderDispatch",
     "TILE_COMPOSITION_KIND",
     "TileStep",
     "TileLane",
@@ -563,4 +648,5 @@ __all__ = [
     "interpret_gemm_compute_matrix",
     "build_gemm_tile_plan",
     "prebake_gemm_launch_matrix",
+    "select_gemm_shader_dispatch",
 ]

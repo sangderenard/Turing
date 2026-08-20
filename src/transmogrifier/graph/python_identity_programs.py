@@ -121,8 +121,12 @@ PYTHON_IDENTITY_PROGRAMS: tuple[PythonIdentityProgram, ...] = (
         "src.common.tensors.abstraction_methods.blas.matmul",
         "src.common.tensors.abstraction_methods.blas.rmatmul",
         "src.common.tensors.abstraction_methods.blas.imatmul",
-        operator="matmul", inputs=("$receiver", "$arg0"),
+        operator="Call", inputs=("$receiver", "$arg0"),
         attributes={
+            "callee": "blas.gemm",
+            "call_role_set": "blas",
+            "call_role": "gemm",
+            "tensor_operation": "matmul",
             "semantic_library": "src.common.tensors.blas",
             "semantic_kernel": "gemm",
             "semantic_source_symbol": "GEMM_SOURCE",
