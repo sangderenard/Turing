@@ -132,6 +132,18 @@ zero shortfalls. Fixed by pinning scalar loads into their own slot.
 `tests/test_llvm_inplace_store_aliasing.py` pins both the behaviour and the
 emitted IR shape.
 
+### 4.1b OPEN: reusing a loop variable name emits invalid IR
+`tests/test_reused_loop_variable_dominance.py`. Two sequential loops that both
+say `for i in range(n)` — ordinary Python nobody would think twice about —
+emit phi nodes that do not dominate their uses, and the module fails LLVM's
+verifier. Nesting depth, loop count and the accumulator pattern are all
+innocent: four sequential triple-nested matmuls compile fine *when their loop
+variables are named apart*. **`shortfalls` is still `()`**, so the emitter
+claims a clean emission and only the external verifier disagrees — the exact
+false green an automated tool would accept. Workaround: suffix every loop
+variable per block (`i0`, `i1`, …), which is invisible to a caller and
+undiscoverable from an error message that names only LLVM temporaries.
+
 ### 4.2 OPEN, and it blocks specialisation: a write-only array parameter is dead-stored
 `a4bc25d`. Under a **literal** loop bound, whichever array parameter the
 returned value does not depend on is eliminated — gone from `args`,
