@@ -48,6 +48,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 import numpy as np
 
@@ -210,6 +211,20 @@ def main() -> int:
         "--workers", type=int, default=0,
         help="0 consumes the deployment strategy's worker choice; a positive "
              "value is an explicit measurement override",
+    )
+    parser.add_argument(
+        "--gpu", choices=("both", "source", "native", "off"),
+        default="both",
+        help="GPU comparison to run: source-order (naive), compiler-selected "
+             "native/tiled, both (default), or off",
+    )
+    parser.add_argument(
+        "--gpu-iterations", type=int, default=10,
+        help="completed standalone GPU dispatches per reported mean",
+    )
+    parser.add_argument(
+        "--sdl2",
+        help="optional SDL2.dll path for the standalone OpenGL products",
     )
     args = parser.parse_args()
     size = args.size
@@ -471,6 +486,54 @@ def main() -> int:
         f"{native_serial_seconds/native_seconds:5.2f}x"
     )
     print(f"  native vs numpy : {numpy_seconds/native_seconds:5.2f}x")
+
+    if args.gpu != "off":
+        print("\n== 5. standalone native GPU products ==")
+        from tools.demo_glsl_blas_pair import run_comparison
+
+        variants = {
+            "both": ("source_algorithm", "glslblas_gemm"),
+            "source": ("source_algorithm",),
+            "native": ("glslblas_gemm",),
+        }[args.gpu]
+        report = run_comparison(
+            size, size, size,
+            output=ROOT / "build" / "glsl-blas-pair",
+            sdl2=args.sdl2,
+            warmups=3,
+            iterations=args.gpu_iterations,
+            variants=variants,
+        )
+        print(f"  device: {report['device']}")
+        gpu_rows = {}
+        for deployment in report["deployments"]:
+            measurement = deployment["measurement"]
+            gpu_rows[deployment["variant"]] = measurement
+            label = (
+                "GPU source-order (naive)"
+                if deployment["variant"] == "source_algorithm"
+                else "GPU native tiled identity"
+            )
+            print(
+                f"  {label:<28} {measurement['elapsed_ms']:8.2f} ms  "
+                f"{measurement['gflops']:6.2f} GF/s"
+            )
+        if len(gpu_rows) == 2:
+            source = gpu_rows["source_algorithm"]
+            native = gpu_rows["glslblas_gemm"]
+            print(
+                f"  GPU native vs naive: "
+                f"{source['elapsed_ms']/native['elapsed_ms']:5.2f}x"
+            )
+            equivalence = report["equivalence"]
+            print(
+                f"  GPU outputs equivalent: {equivalence['allclose']} "
+                f"(max |difference| {equivalence['max_abs']:.2e})"
+            )
+            assert equivalence["allclose"], (
+                "source-order and native GPU products diverged"
+            )
+        print(f"  GPU report: {report['report_path']}")
     return 0
 
 

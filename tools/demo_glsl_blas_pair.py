@@ -78,6 +78,81 @@ def _run(executable: Path, shader: Path, sdl: Path, output: Path) -> dict:
     return json.loads(line)
 
 
+def run_comparison(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    output: Path,
+    sdl2: str | None = None,
+    warmups: int = 3,
+    iterations: int = 20,
+    build_only: bool = False,
+    variants: tuple[str, ...] = ("source_algorithm", "glslblas_gemm"),
+) -> dict:
+    """Build and optionally run the standalone GLSL GEMM comparison.
+
+    This is shared by the focused GLSL CLI and the end-to-end tiled deployment
+    demo so both commands measure the exact same generated shader products.
+    """
+
+    unknown = set(variants) - {"source_algorithm", "glslblas_gemm"}
+    if unknown:
+        raise ValueError(f"unknown GLSL GEMM variants: {sorted(unknown)}")
+    limits, device = _active_limits()
+    deployments = build_gemm_deployment_pair(
+        m, n, k, limits=limits,
+        warmup_dispatches=warmups,
+        measured_dispatches=iterations,
+    )
+    root = output.resolve()
+    records = []
+    sdl = None if build_only else _sdl_path(sdl2)
+    outputs = []
+    for deployment in deployments:
+        if deployment.variant not in variants:
+            continue
+        written = deployment.write(root / deployment.variant)
+        executable = written.shell_path.with_suffix(".exe")
+        _compile(written.shell_path, executable)
+        record = {
+            "variant": deployment.variant,
+            "manifest": str(written.manifest_path),
+            "shader": str(written.shader_path),
+            "executable": str(executable),
+        }
+        if sdl is not None:
+            result = executable.parent / "C.bin"
+            record["measurement"] = _run(
+                executable, written.shader_path, sdl, result,
+            )
+            outputs.append((deployment.variant, result))
+        records.append(record)
+
+    report = {
+        "schema": "turing.glsl-blas-comparison.v1",
+        "device": device,
+        "shape": {"m": m, "n": n, "k": k},
+        "deployments": records,
+    }
+    if len(outputs) == 2:
+        baseline = np.fromfile(outputs[0][1], dtype=np.float32)
+        specialized = np.fromfile(outputs[1][1], dtype=np.float32)
+        difference = np.abs(baseline - specialized)
+        report["equivalence"] = {
+            "elements": int(baseline.size),
+            "max_abs": float(difference.max(initial=0.0)),
+            "allclose": bool(np.allclose(
+                baseline, specialized, rtol=2e-5, atol=2e-5,
+            )),
+        }
+    root.mkdir(parents=True, exist_ok=True)
+    report_path = root / "comparison.json"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    report["report_path"] = str(report_path)
+    return report
+
+
 def main() -> int:
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
     parser = argparse.ArgumentParser()
@@ -93,54 +168,15 @@ def main() -> int:
     parser.add_argument("--build-only", action="store_true")
     args = parser.parse_args()
 
-    limits, device = _active_limits()
-    deployments = build_gemm_deployment_pair(
-        args.m, args.n, args.k, limits=limits,
-        warmup_dispatches=args.warmups,
-        measured_dispatches=args.iterations,
+    report = run_comparison(
+        args.m, args.n, args.k,
+        output=args.output,
+        sdl2=args.sdl2,
+        warmups=args.warmups,
+        iterations=args.iterations,
+        build_only=args.build_only,
     )
-    root = args.output.resolve()
-    records = []
-    sdl = None if args.build_only else _sdl_path(args.sdl2)
-    outputs = []
-    for deployment in deployments:
-        written = deployment.write(root / deployment.variant)
-        executable = written.shell_path.with_suffix(".exe")
-        _compile(written.shell_path, executable)
-        record = {
-            "variant": deployment.variant,
-            "manifest": str(written.manifest_path),
-            "shader": str(written.shader_path),
-            "executable": str(executable),
-        }
-        if sdl is not None:
-            output = executable.parent / "C.bin"
-            record["measurement"] = _run(
-                executable, written.shader_path, sdl, output,
-            )
-            outputs.append(output)
-        records.append(record)
-
-    report = {
-        "schema": "turing.glsl-blas-comparison.v1",
-        "device": device,
-        "shape": {"m": args.m, "n": args.n, "k": args.k},
-        "deployments": records,
-    }
-    if len(outputs) == 2:
-        baseline = np.fromfile(outputs[0], dtype=np.float32)
-        specialized = np.fromfile(outputs[1], dtype=np.float32)
-        difference = np.abs(baseline - specialized)
-        report["equivalence"] = {
-            "elements": int(baseline.size),
-            "max_abs": float(difference.max(initial=0.0)),
-            "allclose": bool(np.allclose(
-                baseline, specialized, rtol=2e-5, atol=2e-5,
-            )),
-        }
-    root.mkdir(parents=True, exist_ok=True)
-    report_path = root / "comparison.json"
-    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    report_path = report.pop("report_path")
     print(json.dumps(report, indent=2))
     print(f"report: {report_path}")
     return 0

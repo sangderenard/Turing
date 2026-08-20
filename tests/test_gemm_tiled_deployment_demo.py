@@ -39,6 +39,11 @@ def test_the_demo_proves_tiling_shape_correctness_and_gain(tmp_path):
             "--size", "256", "--contract", "fast",
             "--root", str(tmp_path / "bank"),
             "--plan-output", str(plan_path),
+            # This test proves the native tiled deployment lane. The command's
+            # default also runs the independent GPU comparison, which has its
+            # own live-runtime coverage and must not make this CPU gate depend
+            # on an OpenGL-capable test host.
+            "--gpu", "off",
         ],
         capture_output=True, text=True, timeout=900,
     )
