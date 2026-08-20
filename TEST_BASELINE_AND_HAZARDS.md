@@ -52,13 +52,13 @@ These passed on 2026-08-19 and are the cheap, high-signal set. Prefer them.
 
 | check | result | cost |
 |---|---|---|
-| `tools/translation_scorecard.py` | 10/10 journeys equivalent | ~9 s |
+| `tools/translation_scorecard.py` | 17/19 journeys equivalent; levels 14 and 18 stop at materialization | ~6 s |
 | `tests/test_precompile_to_ssa.py` | 34 passed | ~4 s |
 | `tests/test_symbolic_fluid_native_runtime.py` | 1 passed | ~17 s |
 | `tests/test_abstract_tensor_indexing.py` | 2 passed | ~1 s |
 | `tests/test_ssa_fusion_regions.py` | 1 passed | ~3 s |
 | `tests/test_region_kernel_dedup.py` | 2 passed | ~3 s |
-| `tests/test_compiled_linalg.py` | 3 passed, 2 xfailed (strict) | ~12 s |
+| `tests/test_compiled_linalg.py` | 6 passed, 1 xfailed (strict) | ~9 s |
 
 **That table is the recommended regression gate for compiler changes.** It is
 ~40 seconds total and it caught nothing false in this session. Reach past it

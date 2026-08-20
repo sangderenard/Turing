@@ -884,6 +884,12 @@ class IRModule:
     machine_indirect_table: SSAMachineIndirectTable = field(
         default_factory=SSAMachineIndirectTable
     )
+    # Compiler-wide receipts that describe source-to-module decisions.  This
+    # is distinct from Function.metadata: a source transform can affect the
+    # relationship among several lowered functions and must remain observable
+    # even when a backend selects only one function for emission.
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         if not self.deployment_table:
             self.deployment_table = {

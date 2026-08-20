@@ -10150,21 +10150,37 @@ def lower_ast_source_to_ssa(
     )
     from ..transmogrifier.graph.graph_express2 import ProcessGraph
     from .glsl_deployment_strategy import strategize_shell_deployment
+    from .loop_interchange import interchange_reduction_loops
     from .shell_reference_tables import build_class_navigation_table
+    from .work_contract import active_contract
 
     def report(message: str) -> None:
         if progress is not None:
             progress(message)
 
+    authored_source_sha256 = hashlib.sha256(
+        source.encode("utf-8")
+    ).hexdigest()
+    work_contract = active_contract()
+    interchange = interchange_reduction_loops(
+        source, licensed=bool(work_contract.inexact_identities),
+    )
+    source = interchange.source
+    transformed_source_sha256 = hashlib.sha256(
+        source.encode("utf-8")
+    ).hexdigest()
+    if interchange.decisions:
+        report(
+            "ssa-source: loop interchange considered "
+            f"{len(interchange.decisions)} reduction nest(s)"
+        )
     tree = ast.parse(source)
     extraction_policy = extraction_contract
     if extraction_policy is None:
         # The work contract may embed the whole extraction policy; a
         # per-call argument still wins. None from both preserves the
         # historical (gate-disabled) behavior.
-        from .work_contract import active_contract
-
-        extraction_policy = active_contract().extraction
+        extraction_policy = work_contract.extraction
     if extraction_policy is not None:
         from .extraction_contract import ExtractionContract
         if isinstance(extraction_policy, (str, os.PathLike)):
@@ -10329,11 +10345,40 @@ def lower_ast_source_to_ssa(
         class_navigation=build_class_navigation_table(graph),
     )
     report("ssa-source: lowering full planned source to repository SSA")
-    return _class_surface_ssa_program(
+    artifact_name = _identifier(str(name or entrypoint or "whole_source"))
+    module, outputs, exports = _class_surface_ssa_program(
         compilation,
-        _identifier(str(name or entrypoint or "whole_source")),
+        artifact_name,
         tensor_ssa_reference=tensor_ssa_reference,
     )
+    decision_records = tuple({
+        "function": decision.function,
+        "line": int(decision.line),
+        "interchanged": bool(decision.interchanged),
+        "reasons": tuple(map(str, decision.reasons)),
+    } for decision in interchange.decisions)
+    receipt = {
+        "schema": "turing.loop-interchange.v1",
+        "contract": str(work_contract.name),
+        "licensed": bool(work_contract.inexact_identities),
+        "authored_source_sha256": authored_source_sha256,
+        "transformed_source_sha256": transformed_source_sha256,
+        "changed": authored_source_sha256 != transformed_source_sha256,
+        "decisions": decision_records,
+    }
+    module.metadata["loop_interchange"] = receipt
+    for decision in decision_records:
+        function = module.functions.get(
+            f"{artifact_name}__{_identifier(decision['function'])}"
+        )
+        if function is not None:
+            function.metadata.setdefault(
+                "loop_interchange_decisions", ()
+            )
+            function.metadata["loop_interchange_decisions"] = (
+                *function.metadata["loop_interchange_decisions"], decision,
+            )
+    return module, outputs, exports
 
 
 lower_ast_source_to_ssa.__canonical_source_compiler__ = True

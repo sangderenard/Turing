@@ -71,23 +71,6 @@ class InterchangeResult:
     decisions: tuple[InterchangeDecision, ...]
 
 
-def _loop_bound_names(tree: ast.AST) -> dict[str, str]:
-    bounds: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.For)
-            and isinstance(node.target, ast.Name)
-            and isinstance(node.iter, ast.Call)
-            and isinstance(node.iter.func, ast.Name)
-            and node.iter.func.id == "range"
-        ):
-            arguments = node.iter.args
-            stop = arguments[0] if len(arguments) == 1 else arguments[1]
-            if isinstance(stop, ast.Name):
-                bounds[node.target.id] = stop.id
-    return bounds
-
-
 def _stride_of(index: ast.AST, variable: str) -> object:
     """The coefficient of ``variable`` in a linear index, or None.
 
@@ -135,6 +118,50 @@ def _names_in(node: ast.AST) -> set[str]:
     return {
         child.id for child in ast.walk(node) if isinstance(child, ast.Name)
     }
+
+
+def _is_pure_expression(node: ast.AST) -> bool:
+    """Whether evaluating ``node`` has no user-observable effect.
+
+    Interchange changes evaluation order.  V1 therefore admits only the
+    expression vocabulary used by the flat BLAS kernels; calls, attributes,
+    comprehensions, named expressions, and dynamic subscript bases are all
+    refused rather than guessed pure.
+    """
+
+    return all(isinstance(child, (
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Name, ast.Load,
+        ast.Constant, ast.Subscript, ast.Add, ast.Sub, ast.Mult, ast.Div,
+        ast.FloorDiv, ast.Mod, ast.Pow, ast.USub, ast.UAdd,
+    )) for child in ast.walk(node)) and all(
+        isinstance(child.value, ast.Name)
+        for child in ast.walk(node)
+        if isinstance(child, ast.Subscript)
+    )
+
+
+def _is_pure_range_loop(node: ast.For) -> bool:
+    iterator = node.iter
+    return (
+        not node.orelse
+        and isinstance(iterator, ast.Call)
+        and isinstance(iterator.func, ast.Name)
+        and iterator.func.id == "range"
+        and not iterator.keywords
+        and 1 <= len(iterator.args) <= 3
+        and all(_is_pure_expression(argument) for argument in iterator.args)
+    )
+
+
+def _subscript_bases(node: ast.AST) -> tuple[str, ...] | None:
+    bases: list[str] = []
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Subscript):
+            continue
+        if not isinstance(child.value, ast.Name):
+            return None
+        bases.append(child.value.id)
+    return tuple(bases)
 
 
 def _match_reduction_body(
@@ -235,7 +262,14 @@ def interchange_reduction_loops(
         node for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef)
     ]:
-        bounds = _loop_bound_names(function)
+        parameters = {
+            argument.arg
+            for argument in (
+                *function.args.posonlyargs,
+                *function.args.args,
+                *function.args.kwonlyargs,
+            )
+        }
 
         class _Rewriter(ast.NodeTransformer):
             def visit_For(self, node: ast.For):
@@ -267,11 +301,64 @@ def interchange_reduction_loops(
                     if isinstance(load, ast.Subscript)
                 ]
                 split = _split_store(store, accumulator)
+                store_base = store.targets[0].value
+                term_bases = _subscript_bases(term)
 
                 verdict = True
                 if split is None:
                     reasons.append(
                         "store is not c1*acc + rest; not recognized"
+                    )
+                    verdict = False
+                if not (
+                    _is_pure_range_loop(node)
+                    and _is_pure_range_loop(reduction)
+                ):
+                    reasons.append(
+                        "parallel and reduction loops must be side-effect-free "
+                        "range loops without else clauses"
+                    )
+                    verdict = False
+                if not (
+                    _is_pure_expression(term)
+                    and _is_pure_expression(store.targets[0].slice)
+                    and (
+                        split is None
+                        or _is_pure_expression(split[0])
+                        and (
+                            split[1] is None
+                            or _is_pure_expression(split[1])
+                        )
+                    )
+                ):
+                    reasons.append(
+                        "term, scale, remainder, and store index must use the "
+                        "side-effect-free v1 arithmetic/subscript vocabulary"
+                    )
+                    verdict = False
+                if not isinstance(store_base, ast.Name):
+                    reasons.append("store target must be a named formal buffer")
+                    verdict = False
+                elif store_base.id not in parameters:
+                    reasons.append(
+                        f"store buffer {store_base.id!r} is not a formal with "
+                        "compiler-owned storage identity"
+                    )
+                    verdict = False
+                if term_bases is None or any(
+                    base not in parameters for base in (term_bases or ())
+                ):
+                    reasons.append(
+                        "every reduction load must use a named formal buffer"
+                    )
+                    verdict = False
+                elif (
+                    isinstance(store_base, ast.Name)
+                    and store_base.id in term_bases
+                ):
+                    reasons.append(
+                        "reduction term reads the destination buffer; promoted "
+                        "stores would change later reduction inputs"
                     )
                     verdict = False
                 if store_stride != 1 or reduction_store_stride != 0:
@@ -294,7 +381,7 @@ def interchange_reduction_loops(
                         + repr(term_strides)
                     )
                     verdict = False
-                if accumulator in _names_in(term) - {accumulator} or (
+                if accumulator in _names_in(term) or (
                     split is not None and split[1] is not None
                     and (
                         reduction_var in _names_in(split[1])
@@ -308,6 +395,7 @@ def interchange_reduction_loops(
                     verdict = False
                 if split is not None and isinstance(split[0], ast.Name) and (
                     split[0].id in {parallel_var, reduction_var, accumulator}
+                    or split[0].id not in parameters
                 ):
                     reasons.append(
                         "scale factor depends on the loop variables"
@@ -400,7 +488,6 @@ def interchange_reduction_loops(
         ]
         if state["changed"]:
             changed = True
-        del bounds  # bounds reserved for future multi-level decisions
 
     if not changed:
         return InterchangeResult(source, tuple(decisions))
