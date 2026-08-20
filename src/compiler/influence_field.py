@@ -793,6 +793,34 @@ class InfluenceField:
             self._allocate()
         return tuple(self._sources.values())
 
+    def node_keys(self) -> tuple[Any, ...]:
+        """Every node key this field's topology has seen, in insertion order.
+
+        Pure topology, colour-free: for a consumer that wants the graph's
+        shape (e.g. a spectral analysis over its Laplacian) without engaging
+        any of the hue/transport machinery below. Order matches insertion
+        rather than being sorted, since node keys are ``Any`` and not every
+        producer's keys are orderable.
+        """
+
+        return tuple(self._nodes)
+
+    def edge_list(self) -> tuple[tuple[Any, Any, str], ...]:
+        """Every directed edge this field's topology has seen, as
+        ``(source, target, role)``. Pure topology, colour-free -- see
+        :meth:`node_keys`. A consumer building an undirected structure (most
+        spectral graph analysis wants a symmetric adjacency; ``role`` is
+        deliberately kept alongside rather than discarded, since direction
+        and role are real information a caller may still want even when the
+        Laplacian itself is built symmetrized.
+        """
+
+        return tuple(
+            (source, target, role)
+            for source, outgoing in self._outgoing.items()
+            for target, role in outgoing
+        )
+
     def barriers(self) -> Mapping[Any, tuple[str, ...]]:
         """Nodes an IR *declared* to be confluences, and by which roles.
 
