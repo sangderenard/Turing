@@ -12,6 +12,8 @@ from typing import Any, Iterable, Mapping
 from ..common.tensors.mathematical_library import TURING_MATHEMATICAL_LIBRARY
 from .blas_server import BLASServerProduct, build_blas_server
 from .numpy_mathematical_library import emit_numpy_mathematical_library
+from .standard_object_blas import blas_standard_object
+from .standard_object_product import StandardObjectProduct, cook_standard_object
 from .wasm_binary import CodeBuilder, build_module
 
 
@@ -34,6 +36,7 @@ class MathematicalLibraryProduct:
     wasm_path: Path
     demo_path: Path
     blas: BLASServerProduct
+    blas_object: StandardObjectProduct
     manifest: Mapping[str, Any]
 
 
@@ -108,10 +111,112 @@ def _coverage(blas: BLASServerProduct) -> list[dict[str, Any]]:
 def _python_loader() -> str:
     return '''"""Generated Python view of one Turing mathematical library."""
 from __future__ import annotations
+import ctypes
 import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import numpy as np
+
+
+class CompiledObjectReverse:
+    """Generated Python ABI for the product's compiled method VJPs."""
+
+    _DTYPES = {
+        "double": np.float64, "i32": np.int32, "i64": np.int64,
+        "i1": np.bool_, "ptr": np.uintp,
+    }
+
+    def __init__(self, root, record):
+        self.root = Path(root)
+        self.record = record
+        self.methods = tuple(item["name"] for item in record["methods"])
+        self._methods = {item["name"]: item for item in record["methods"]}
+        self._artifacts = record["artifacts"]
+        self._libraries = {}
+
+    def vjp(self, method, upstream, **bindings):
+        method = str(method)
+        try:
+            semantic = self._methods[method]
+            artifact = self._artifacts[method]["parametric_reverse"]
+        except KeyError as error:
+            raise KeyError(f"unknown compiled reverse {method!r}") from error
+        expected = set(semantic["reverse_input_value_ids"])
+        if set(bindings) != expected:
+            raise ValueError(
+                f"{method} reverse bindings must be {sorted(expected)!r}; "
+                f"received {sorted(bindings)!r}"
+            )
+        feeds = {
+            int(semantic["reverse_input_value_ids"][name]): value
+            for name, value in bindings.items()
+        }
+        output_ids = tuple(map(int, semantic["reverse_output_value_ids"]))
+        upstreams = (
+            tuple(upstream) if isinstance(upstream, (tuple, list))
+            else (upstream,)
+        )
+        if len(upstreams) != len(output_ids):
+            raise ValueError(
+                f"{method} reverse needs {len(output_ids)} upstream value(s)"
+            )
+        seed_ids = {
+            int(key): int(value)
+            for key, value in semantic["reverse_seed_value_ids"].items()
+        }
+        feeds.update({
+            seed_ids[output_id]: value
+            for output_id, value in zip(output_ids, upstreams)
+        })
+        order = tuple(map(int, artifact["buffer_order"]))
+        dtypes = tuple(artifact.get("buffer_dtypes") or ("double",) * len(order))
+        buffers = {}
+        for value_id, shape, dtype in zip(order, artifact["buffer_shapes"], dtypes):
+            numpy_dtype = self._DTYPES[str(dtype)]
+            if value_id in feeds:
+                value = np.asarray(feeds[value_id], dtype=numpy_dtype)
+                buffers[value_id] = (
+                    np.ascontiguousarray(value) if value.ndim else value.copy()
+                )
+            else:
+                buffers[value_id] = np.zeros(tuple(shape) or (), dtype=numpy_dtype)
+        pointers = (ctypes.c_void_p * len(order))(*(
+            ctypes.c_void_p(int(buffers[value_id].ctypes.data))
+            for value_id in order
+        ))
+        extents = []
+        for value_id, kind, axis in artifact["extent_order"]:
+            value = buffers[int(value_id)]
+            if kind in ("numel", "element_count"):
+                extents.append(int(value.size))
+            elif kind == "rank":
+                extents.append(int(value.ndim))
+            elif kind in ("dim", "shape") and axis is not None:
+                extents.append(int(value.shape[int(axis)]))
+            elif kind == "shape" and value.ndim == 0:
+                extents.append(0)
+            else:
+                raise ValueError(f"cannot derive reverse extent {(value_id, kind, axis)!r}")
+        library = self._libraries.get(method)
+        if library is None:
+            library = ctypes.CDLL(str(self.root / artifact["library_path"]))
+            self._libraries[method] = library
+        entry = getattr(library, artifact["name"])
+        entry.restype = None
+        entry.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int32),
+        ]
+        extent_array = (ctypes.c_int32 * len(extents))(*extents)
+        entry(pointers, extent_array)
+        gradients = {
+            int(key): int(value)
+            for key, value in semantic["reverse_gradient_value_ids"].items()
+        }
+        return {
+            name: buffers[gradients[int(value_id)]].copy()
+            for name, value_id in semantic["reverse_input_value_ids"].items()
+        }
 
 
 class TuringMathematicalLibrary:
@@ -123,6 +228,11 @@ class TuringMathematicalLibrary:
             raise RuntimeError("mathematical-library matrix identity mismatch")
         self.matrix = json.loads(matrix_bytes)
         product = self.matrix["products"]["blas"]
+        object_path = self.root / product["standard_object"]["path"]
+        object_record = json.loads(
+            (object_path / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.blas_reverse = CompiledObjectReverse(object_path, object_record)
         loader = self.root / product["path"] / "python" / "turing_blas_server.py"
         spec = importlib.util.spec_from_file_location("packaged_turing_blas", loader)
         module = importlib.util.module_from_spec(spec)
@@ -130,6 +240,8 @@ class TuringMathematicalLibrary:
             raise RuntimeError("generated BLAS loader cannot be imported")
         spec.loader.exec_module(module)
         self.blas = module.load(self.root / product["path"])
+        self.blas.reverse = self.blas_reverse
+        self.blas.vjp = self.blas_reverse.vjp
         numpy_loader = self.root / self.manifest["surfaces"]["python"]["numpy"]["module"]
         numpy_spec = importlib.util.spec_from_file_location(
             "packaged_turing_numpy_math", numpy_loader,
@@ -310,9 +422,25 @@ def build_mathematical_library_product(
 
     root = Path(directory).resolve()
     marker = _prepare_root(root)
+    gemm_shapes = tuple(gemm_shapes)
     blas = build_blas_server(
         bank, gemm_shapes, root / "libraries" / "blas",
         contract=contract, cores=cores, candidate_sizes=candidate_sizes,
+    )
+    normalized_gemm_shapes = tuple(
+        (int(shape), int(shape), int(shape))
+        if isinstance(shape, int) else tuple(map(int, shape))
+        for shape in gemm_shapes
+    )
+    blas_object = cook_standard_object(
+        blas_standard_object(specializations={
+            "gemm": tuple(
+                {"m": m, "n": n, "k": k}
+                for m, n, k in normalized_gemm_shapes
+            ),
+        }),
+        directory=root / "objects" / "blas",
+        contract=contract,
     )
     numpy_source, numpy_receipt = emit_numpy_mathematical_library()
     browser_installer = _browser_installer()
@@ -326,6 +454,12 @@ def build_mathematical_library_product(
                 "product_id": blas.manifest["product_id"],
                 "matrix_sha256": blas.manifest["server_matrix_sha256"],
                 "coverage": _coverage(blas),
+                "standard_object": {
+                    "path": "objects/blas",
+                    "product_id": blas_object.manifest["product_id"],
+                    "parametric_forward": "required",
+                    "compiled_graph_reverse": "required",
+                },
             },
         },
         "python_realizations": {
@@ -417,6 +551,13 @@ def build_mathematical_library_product(
                 "product_id": blas.manifest["product_id"],
                 "methods": blas.manifest["methods"],
                 "deployed_roles": blas.manifest["deployed_roles"],
+                "standard_object": {
+                    "manifest": "objects/blas/manifest.json",
+                    "product_id": blas_object.manifest["product_id"],
+                    "methods": [
+                        method["name"] for method in blas_object.manifest["methods"]
+                    ],
+                },
             },
         },
         "surfaces": {
@@ -471,7 +612,7 @@ def build_mathematical_library_product(
     )
     return MathematicalLibraryProduct(
         root, manifest_path, matrix_path, python_loader, numpy_loader, javascript_path,
-        wasm_path, demo_path, blas, manifest,
+        wasm_path, demo_path, blas, blas_object, manifest,
     )
 
 

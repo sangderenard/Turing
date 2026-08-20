@@ -118,6 +118,14 @@ def _variant_record(variant: CompiledVariant) -> dict[str, Any]:
     }
 
 
+def _reverse_artifact_record(
+    reverse: NativeGraphReverse, root: Path,
+) -> dict[str, Any]:
+    record = native_artifact_record(reverse.artifact)
+    record["library_path"] = Path(record["library_path"]).relative_to(root).as_posix()
+    return record
+
+
 def cook_standard_object(
     spec: StandardObject,
     *,
@@ -185,6 +193,10 @@ def cook_standard_object(
                     method.kernel.source.encode("utf-8")
                 ).hexdigest(),
                 "parametric_forward_key": compiled[method.name].parametric_forward.key,
+                "reverse_input_value_ids": {
+                    str(key): int(value) for key, value in
+                    compiled[method.name].parametric_reverse.input_value_ids.items()
+                },
                 "reverse_output_value_ids": list(
                     compiled[method.name].parametric_reverse.output_value_ids
                 ),
@@ -213,8 +225,8 @@ def cook_standard_object(
                 "parametric_forward": _variant_record(
                     compiled[method.name].parametric_forward
                 ),
-                "parametric_reverse": native_artifact_record(
-                    compiled[method.name].parametric_reverse.artifact
+                "parametric_reverse": _reverse_artifact_record(
+                    compiled[method.name].parametric_reverse, root
                 ),
                 "specialized_forwards": [
                     _variant_record(variant) for variant in

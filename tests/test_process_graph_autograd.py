@@ -126,6 +126,25 @@ def test_every_backward_request_returns_the_adjoint_binding_graph(packaging):
         assert product.graph is product.motion.graph
 
 
+def test_abstract_tensor_ingestion_retains_a_complete_multi_output_surface():
+    from src.common.tensors.accelerator_backends.ssa_backend import (
+        SSATensorOperations,
+        SSATensorProgram,
+    )
+
+    program = SSATensorProgram("two_output_surface")
+    left = SSATensorOperations.input(program, (2,))
+    right = SSATensorOperations.input(program, (2,))
+    added, multiplied = left + right, left * right
+
+    graph = abstract_tensor_program_to_process_graph(
+        (added, multiplied), bindings={"left": left, "right": right},
+    )
+
+    assert graph.roots == [added.data.value.id, multiplied.data.value.id]
+    assert {graph.G.nodes[root]["op"] for root in graph.roots} == {"add", "mul"}
+
+
 def test_backward_compilation_obeys_the_execution_contract_source():
     graph = ProcessGraph(materialize_memory=False)
     graph.G.graph["execution_contract"] = {
@@ -220,57 +239,6 @@ def test_mse_numeric_subgraph_derives_graph_backed_adjoint_without_tape():
     }
 
 
-@pytest.mark.xfail(
-    reason="mul(x, x) with a shared operand (the square in every MSE-style "
-    "loss) produces a repository-SSA aggregate whose producer never gets "
-    "linked to its consumer. Before the ssa_llvm_backend.py call-site "
-    "validation added alongside this xfail, that silently emitted a "
-    "GetElementPtr past a placeholder's own 8-byte allocation, loaded "
-    "garbage bytes as a pointer, and wrote through it -- a heap-corrupting "
-    "native access violation with no Python traceback. The validation now "
-    "catches this at compile time (llvm.shortfalls is non-empty) instead of "
-    "crashing. The full causal chain, traced empirically layer by layer "
-    "(2026-08-19): (1) differentiation is CORRECT -- "
-    "process_graph_autograd.py builds add(Indexed(bw_mul_result, 0), "
-    "Indexed(bw_mul_result, 1)), reusing the same tested fan-in mechanism as "
-    "the cross-node shared-use case; (2) region planning "
-    "(glsl_deployment_strategy.py's _build_shell_hierarchy_plan) correctly "
-    "computes non-empty result_bindings for this call; (3) initial SSACallRecord "
-    "construction (fortran_c_shell.py, the 'call_records.setdefault(...).append("
-    "SSACallRecord(...))' site) correctly copies them from the PlanCall; "
-    "(4) a later 'raise-boundary dead-binding' heuristic (fortran_c_shell.py, "
-    "guarded by 'was_unresolved and callee is not None and record.result_bindings "
-    "and not callee_outputs', ending in 'record = replace(record, "
-    "result_bindings=())') false-positives on this call and clears its correct "
-    "bindings, because emit_outputs() finds nothing: the callee is a flat "
-    "out-parameter region (ret void, results via ptr out.0/out.1), so "
-    "emit_outputs() falls through to a section_outputs lookup table with no "
-    "entry for it; (5) the actual gap: section_outputs is populated by a "
-    "mechanism (fortran_c_shell.py, ~3540-3595, the 'existing_outputs = tuple("
-    "section_outputs.get(callee_symbol, ()))' block) that can only synthesize "
-    "a MISSING PROJECTION -- one Const+GetElementPtr+Load reading one position "
-    "of an aggregate call result. It has no way to synthesize a COMBINATION of "
-    "two projections. The add node from step (1) is never itself scheduled as "
-    "a real instruction anywhere in the final SSA, so it has no producer -- "
-    "confirmed directly: no instruction of any kind produces the add's value id "
-    "in the lowered module. Step (4) is an independently real, narrow false "
-    "positive; step (5) is the actual hole -- this pipeline's on-demand "
-    "output-materialization machinery only knows how to project, never to "
-    "combine, and repeated-operand backward is the one shape that needs "
-    "combination. Fixing (5) likely means either teaching that mechanism to "
-    "also synthesize a combining instruction (add) over multiple projections "
-    "of the same aggregate when a desired value id names their sum rather than "
-    "any single position, or -- probably cleaner -- ensuring the region/plan "
-    "scheduler that assigns feed_ids never hands out an id for a graph-level "
-    "add(Indexed, Indexed) node without also scheduling that add as a real "
-    "instruction in some reachable function body. Same root cause reproduces "
-    "in test_real_abstract_nn_linear_loss_runs_process_graph_adjoint_natively "
-    "and test_real_rectconv2d_graph_adjoint_lowers_and_executes_natively "
-    "(both use MSELoss, i.e. the same diff*diff shared operand) -- those two "
-    "were silently executing the same undefined behavior before this fix "
-    "made it loud.",
-    strict=False,
-)
 def test_linear_forward_loss_backward_is_one_parametric_graph_motion(tmp_path):
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 1, "input", label="x", shape=(2, 3))
@@ -381,17 +349,6 @@ def test_linear_forward_loss_backward_is_one_parametric_graph_motion(tmp_path):
     assert float(buffers[lowering.outputs["loss_0"]]) < first_loss
 
 
-@pytest.mark.xfail(
-    reason="Same shared-operand aggregate-linking defect as "
-    "test_linear_forward_loss_backward_is_one_parametric_graph_motion (see "
-    "its xfail reason): MSELoss computes diff*diff, a mul(x, x) whose "
-    "backward produces an aggregate that never gets linked to its consuming "
-    "planned_region. Previously silently executed undefined behavior "
-    "(a native access violation was possible but this run happened not to "
-    "crash); ssa_llvm_backend.py's call-site aggregate validation now makes "
-    "it a compile-time shortfall instead.",
-    strict=False,
-)
 def test_real_abstract_nn_linear_loss_runs_process_graph_adjoint_natively(tmp_path):
     from src.common.tensors.abstract_nn import Linear, MSELoss
     from src.common.tensors.accelerator_backends.ssa_backend import (
@@ -507,17 +464,6 @@ def test_real_abstract_nn_linear_loss_runs_process_graph_adjoint_natively(tmp_pa
     assert not np.array_equal(execution.buffers[2], bias_value)
 
 
-@pytest.mark.xfail(
-    reason="Same shared-operand aggregate-linking defect as "
-    "test_linear_forward_loss_backward_is_one_parametric_graph_motion (see "
-    "its xfail reason): MSELoss computes diff*diff, a mul(x, x) whose "
-    "backward produces an aggregate that never gets linked to its consuming "
-    "planned_region. Previously silently executed undefined behavior "
-    "(a native access violation was possible but this run happened not to "
-    "crash); ssa_llvm_backend.py's call-site aggregate validation now makes "
-    "it a compile-time shortfall instead.",
-    strict=False,
-)
 def test_real_rectconv2d_graph_adjoint_lowers_and_executes_natively(tmp_path):
     from src.common.tensors.abstract_nn import MSELoss, RectConv2d
     from src.common.tensors.accelerator_backends.ssa_backend import (

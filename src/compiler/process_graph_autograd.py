@@ -171,11 +171,23 @@ def abstract_tensor_program_to_process_graph(
         C_TENSOR_OPCODE_ORDER,
     )
 
-    tensor_value = getattr(output, "data", output)
-    program = getattr(tensor_value, "program", None)
+    output_items = tuple(output) if isinstance(output, (tuple, list)) else (output,)
+    if not output_items:
+        raise TypeError("semantic ProcessGraph ingestion requires at least one output")
+    tensor_values = tuple(getattr(item, "data", item) for item in output_items)
+    program = getattr(tensor_values[0], "program", None)
     if program is None or not hasattr(program, "function"):
         raise TypeError(
             "semantic ProcessGraph ingestion requires an SSATensorProgram output"
+        )
+    mismatched_programs = tuple(
+        index for index, value in enumerate(tensor_values)
+        if getattr(value, "program", None) is not program
+    )
+    if mismatched_programs:
+        raise TypeError(
+            "all semantic ProcessGraph outputs must belong to one "
+            f"SSATensorProgram; mismatches={mismatched_programs!r}"
         )
     function = program.function
     block = function.blocks.get("entry")
@@ -424,14 +436,18 @@ def abstract_tensor_program_to_process_graph(
             shape=result.shape, dtype=result.dtype, attributes=attributes,
         )
 
-    root_id = int(tensor_value.value.id)
-    if root_id not in graph.G:
+    root_ids = tuple(int(value.value.id) for value in tensor_values)
+    missing_roots = tuple(root for root in root_ids if root not in graph.G)
+    if missing_roots:
         raise ProcessGraphAutogradError(
-            f"SSA AbstractTensor output {root_id} has no semantic producer"
+            "SSA AbstractTensor outputs have no semantic producer: "
+            f"{missing_roots!r}"
         )
-    reachable = nx.ancestors(graph.G, root_id) | {root_id}
+    reachable: set[int] = set()
+    for root_id in root_ids:
+        reachable |= nx.ancestors(graph.G, root_id) | {root_id}
     graph.G = graph.G.subgraph(reachable).copy()
-    graph.roots = [root_id]
+    graph.roots = list(dict.fromkeys(root_ids))
     graph.G.graph.update({
         "graph_kind": "abstract_tensor_semantic_forward",
         "semantic_authority": "SSATensorProgram authored call recipes",

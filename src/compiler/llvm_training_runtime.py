@@ -64,6 +64,7 @@ class NativeGraphReverse:
     """
 
     name: str
+    input_value_ids: Mapping[str, int]
     output_value_ids: tuple[int, ...]
     gradient_value_ids: Mapping[int, int]
     seed_value_ids: Mapping[int, int]
@@ -130,6 +131,12 @@ def compile_native_graph_reverse(
         raise RuntimeError(f"{name} reverse compilation produced no native library")
     return NativeGraphReverse(
         name=str(name),
+        input_value_ids={
+            str(binding_name): int(
+                getattr(getattr(value, "data", value), "value").id
+            )
+            for binding_name, value in bindings.items()
+        },
         output_value_ids=tuple(map(int, product.adjoint.output_value_ids)),
         gradient_value_ids=dict(product.motion.gradient_value_ids),
         seed_value_ids=dict(product.motion.seed_value_ids),

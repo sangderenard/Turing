@@ -39,6 +39,23 @@ def test_outer_math_product_owns_a_synchronized_blas_subunit(tmp_path):
     assert manifest["libraries"]["blas"]["methods"] == [
         "scal", "axpy", "dot", "gemv", "gemm", "rot",
     ]
+    object_record = manifest["libraries"]["blas"]["standard_object"]
+    object_manifest = json.loads(
+        (product.directory / object_record["manifest"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert object_record["product_id"] == object_manifest["product_id"]
+    assert object_record["methods"] == [
+        "scal", "axpy", "dot", "gemv", "gemm", "rot",
+    ]
+    assert all(
+        item["parametric_reverse"]["library_path"]
+        for item in object_manifest["artifacts"].values()
+    )
+    assert object_manifest["methods"][4]["specializations"] == [
+        {"k": 17, "m": 17, "n": 17}
+    ]
     coverage = {
         item["method"]: item for item in matrix["products"]["blas"]["coverage"]
     }
@@ -60,6 +77,99 @@ def test_outer_math_product_owns_a_synchronized_blas_subunit(tmp_path):
         a = rng.standard_normal((17, 17))
         b = rng.standard_normal((17, 17))
         assert np.max(np.abs(math.blas.gemm(a, b) - a @ b)) < 1.0e-10
+        reverse_x = np.asarray([0.25, -0.5, 1.5, 2.0])
+        reverse_seed = np.asarray([1.0, 2.0, -1.0, 0.5])
+        reverse = math.blas.vjp(
+            "scal", reverse_seed, x=reverse_x, alpha=np.asarray(1.25),
+        )
+        np.testing.assert_allclose(reverse["x"], 1.25 * reverse_seed)
+        np.testing.assert_allclose(
+            reverse["alpha"], np.sum(reverse_x * reverse_seed),
+        )
+        assert math.blas.reverse.methods == (
+            "scal", "axpy", "dot", "gemv", "gemm", "rot",
+        )
+        reverse_y = np.asarray([-1.0, 0.75, 0.5, -0.25])
+        reverse = math.blas.vjp(
+            "axpy", reverse_seed,
+            x=reverse_x, y=reverse_y, alpha=np.asarray(1.25),
+        )
+        np.testing.assert_allclose(reverse["x"], 1.25 * reverse_seed)
+        np.testing.assert_allclose(reverse["y"], reverse_seed)
+        np.testing.assert_allclose(
+            reverse["alpha"], np.sum(reverse_x * reverse_seed),
+        )
+        reverse = math.blas.vjp(
+            "dot", np.asarray(2.5), x=reverse_x, y=reverse_y,
+        )
+        np.testing.assert_allclose(reverse["x"], 2.5 * reverse_y)
+        np.testing.assert_allclose(reverse["y"], 2.5 * reverse_x)
+
+        reverse_a = np.asarray([[0.2, -0.3, 0.7], [1.1, 0.4, -0.2]])
+        reverse_vector = np.asarray([0.5, -1.25, 0.75])
+        reverse_bias = np.asarray([0.1, -0.4])
+        reverse_vector_seed = np.asarray([1.5, -0.5])
+        reverse = math.blas.vjp(
+            "gemv", reverse_vector_seed,
+            a=reverse_a, x=reverse_vector, y=reverse_bias,
+            alpha=np.asarray(1.2), beta=np.asarray(-0.25),
+        )
+        np.testing.assert_allclose(
+            reverse["a"], 1.2 * np.outer(reverse_vector_seed, reverse_vector),
+        )
+        np.testing.assert_allclose(
+            reverse["x"], 1.2 * reverse_a.T @ reverse_vector_seed,
+        )
+        np.testing.assert_allclose(reverse["y"], -0.25 * reverse_vector_seed)
+        np.testing.assert_allclose(
+            reverse["alpha"], reverse_vector_seed @ (reverse_a @ reverse_vector),
+        )
+        np.testing.assert_allclose(
+            reverse["beta"], reverse_vector_seed @ reverse_bias,
+        )
+
+        reverse_b = np.asarray([[0.3, -0.2], [0.4, 0.6], [-0.5, 0.8]])
+        reverse_c = np.asarray([[0.1, -0.4], [0.7, 0.2]])
+        reverse_matrix_seed = np.asarray([[1.0, -0.5], [0.25, 1.5]])
+        reverse = math.blas.vjp(
+            "gemm", reverse_matrix_seed,
+            a=reverse_a, b=reverse_b, c=reverse_c,
+            alpha=np.asarray(1.2), beta=np.asarray(-0.25),
+        )
+        np.testing.assert_allclose(
+            reverse["a"], 1.2 * reverse_matrix_seed @ reverse_b.T,
+        )
+        np.testing.assert_allclose(
+            reverse["b"], 1.2 * reverse_a.T @ reverse_matrix_seed,
+        )
+        np.testing.assert_allclose(reverse["c"], -0.25 * reverse_matrix_seed)
+        np.testing.assert_allclose(
+            reverse["alpha"], np.sum(reverse_matrix_seed * (reverse_a @ reverse_b)),
+        )
+        np.testing.assert_allclose(
+            reverse["beta"], np.sum(reverse_matrix_seed * reverse_c),
+        )
+
+        rot_left_seed = np.asarray([1.0, -0.5, 0.25, 2.0])
+        rot_right_seed = np.asarray([-0.25, 1.5, 0.75, -1.0])
+        reverse = math.blas.vjp(
+            "rot", (rot_left_seed, rot_right_seed),
+            x=reverse_x, y=reverse_y, c=np.asarray(0.8), s=np.asarray(0.6),
+        )
+        np.testing.assert_allclose(
+            reverse["x"], 0.8 * rot_left_seed - 0.6 * rot_right_seed,
+        )
+        np.testing.assert_allclose(
+            reverse["y"], 0.6 * rot_left_seed + 0.8 * rot_right_seed,
+        )
+        np.testing.assert_allclose(
+            reverse["c"],
+            np.sum(rot_left_seed * reverse_x + rot_right_seed * reverse_y),
+        )
+        np.testing.assert_allclose(
+            reverse["s"],
+            np.sum(rot_left_seed * reverse_y - rot_right_seed * reverse_x),
+        )
         assert math.numpy.libraries == ("blas",)
         assert np.max(np.abs(math.numpy.blas.gemm(a, b) - a @ b)) < 1.0e-10
         class Host:

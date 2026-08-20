@@ -222,7 +222,14 @@ class AbstractTensorBLAS:
         alpha: Any = 1.0, beta: Any = 0.0,
     ):
         a, x = self._pair(a, x)
-        product = alpha * (a @ x)
+        vector_shape = tuple(x.shape)
+        if len(vector_shape) == 1:
+            product = (a @ x.reshape((vector_shape[0], 1))).reshape(
+                tuple(a.shape[:-1])
+            )
+        else:
+            product = a @ x
+        product = alpha * product
         return product if y is None else product + beta * a.ensure_tensor(y)
 
     def gemm(

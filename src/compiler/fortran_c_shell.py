@@ -7621,6 +7621,28 @@ def _class_surface_ssa_program(
                     consumed = set(map(int, caller.metadata.get(
                         "source_output_value_ids", ()
                     )))
+                    source_graph = source_graphs_by_symbol.get(
+                        str(record.caller)
+                    )
+                    if source_graph is not None:
+                        # Calls are linked before every graph consumer has
+                        # necessarily become an SSA instruction.  Treat an
+                        # authored graph edge as consumption too; otherwise a
+                        # perfectly live numerical call result can look like a
+                        # dead raise-only object and have its exact result
+                        # binding erased.  This is especially visible in an
+                        # adjoint chain where bw_sum feeds bw_mul.
+                        consumed.update(
+                            int(value_id)
+                            for value_id in bound_caller_ids
+                            if value_id in source_graph
+                            and (
+                                source_graph.out_degree(value_id) > 0
+                                or value_id in getattr(
+                                    source_graph, "graph", {}
+                                ).get("roots", ())
+                            )
+                        )
                     for block in caller.blocks.values():
                         for instruction in block.instrs:
                             consumed.update(

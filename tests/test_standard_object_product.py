@@ -17,6 +17,11 @@ from src.compiler.standard_object_product import (
     StandardProperty,
     cook_standard_object,
 )
+from src.compiler.standard_object_blas import blas_standard_object
+from src.compiler.process_graph_autograd import (
+    abstract_tensor_program_to_process_graph,
+    compile_process_graph_backward,
+)
 
 
 SOURCE = """
@@ -72,3 +77,26 @@ def test_standard_object_publishes_only_compiled_forward_and_reverse(tmp_path):
     assert method.parametric_reverse.artifact.library_path.is_file()
     assert method.parametric_reverse.seed_value_ids
     assert method.specialized_forwards == ()
+
+
+def test_blas_is_a_complete_graph_invertible_standard_object():
+    spec = blas_standard_object()
+
+    assert tuple(method.name for method in spec.methods) == (
+        "scal", "axpy", "dot", "gemv", "gemm", "rot",
+    )
+    for method in spec.methods:
+        capture = method.capture_graph()
+        forward = abstract_tensor_program_to_process_graph(
+            capture.output, bindings=capture.bindings,
+        )
+        reverse = compile_process_graph_backward(
+            forward,
+            wrt=capture.wrt_value_ids,
+            packaging="independent",
+            unit_loss_seed=False,
+        )
+        assert reverse.adjoint.output_value_ids == tuple(forward.roots)
+        assert set(reverse.adjoint.gradient_value_ids) == set(
+            capture.wrt_value_ids
+        )

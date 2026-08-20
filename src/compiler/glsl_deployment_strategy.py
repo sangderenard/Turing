@@ -13094,13 +13094,37 @@ class _ProgramABIValueFact:
     dtype: str | None
 
 
-def _tensor_descriptor(graph: Any, node_id: int) -> dict[str, Any] | None:
+def _tensor_descriptor(
+    graph: Any, node_id: int, _seen: set[int] | None = None,
+) -> dict[str, Any] | None:
     """Return compiler-owned tensor facts without inspecting a runtime value."""
 
     if int(node_id) not in graph.G:
         return None
+    seen = set(_seen or ())
+    if int(node_id) in seen:
+        return None
+    seen.add(int(node_id))
     tensor = dict(graph.G.nodes[int(node_id)].get("tensor") or {})
     if "shape" not in tensor:
+        data = graph.G.nodes[int(node_id)]
+        operation = str(data.get("op") or data.get("type") or "").casefold()
+        # Shape-preserving unary expressions are ordinary dynamic tensor
+        # values too.  Callsite specialization used to see ``-g`` as having
+        # no descriptor, specialize the callee only for its static shape
+        # argument, and accidentally erase G from that callee's ABI.  Follow
+        # the exact unary data edge so nested calls retain their numerical
+        # argument without inspecting any runtime payload.
+        if operation in {
+            "neg", "abs", "sin", "cos", "tan", "exp", "log", "sqrt",
+            "tanh", "clone", "identity",
+        }:
+            parents = tuple(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) != "callee"
+            )
+            if len(parents) == 1:
+                return _tensor_descriptor(graph, parents[0], seen)
         return None
     return {
         "shape": tuple(tensor.get("shape") or ()),
