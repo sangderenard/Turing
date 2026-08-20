@@ -237,6 +237,14 @@ console.log(JSON.stringify(Object.fromEntries(Object.entries(result).map(([key,v
     installer = product.directory / manifest["surfaces"]["web"]["installer"]
     installer_source = installer.read_text(encoding="utf-8")
     assert "document.currentScript" in installer_source
+    demo = (product.directory / manifest["surfaces"]["web"]["demo"]).read_text(
+        encoding="utf-8"
+    )
+    assert "Run all forwards" in demo
+    assert "Run all compiled backwards" in demo
+    assert "source SSA shader" in demo
+    assert "compiled WebAssembly reverse" in demo
+    assert "Run first prebaked GEMM" not in demo
     assert "data-turing-math-base" not in installer_source
     assert "script.dataset.turingMathBase" in installer_source
     assert "globalThis.turingMathReady = ready" in installer_source

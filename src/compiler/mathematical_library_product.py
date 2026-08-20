@@ -353,7 +353,90 @@ def _browser_template() -> str:
 
 
 def _demo() -> str:
-    return '''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Turing mathematical library</title><style>body{background:#081019;color:#eaf2f8;font:15px ui-monospace,monospace;max-width:900px;margin:40px auto;padding:20px}button{padding:10px;background:#65d6e8;border:0;border-radius:6px;font-weight:bold}pre{background:#0d1924;padding:18px;border-radius:9px;white-space:pre-wrap}</style></head><body><h1>Turing mathematical library</h1><p>One semantic catalog, with BLAS packaged as a synchronized library subunit.</p><button id="run">Run first prebaked GEMM</button><pre id="out">loading…</pre><script src="./install-turing-math.js" data-turing-math-base="./"></script><script type="module">const out=document.querySelector('#out'),library=await globalThis.turingMathReady;out.textContent=JSON.stringify({libraries:library.libraries,blas_methods:library.blas.methods,deployed:library.blas.deployedMethods,shapes:library.blas.shapes},null,2);document.querySelector('#run').onclick=async()=>{const [m,n,k]=library.blas.shapes[0],a=new Float32Array(m*k).fill(.1),b=new Float32Array(k*n).fill(.2),t=performance.now(),c=await library.blas.gemm(a,b,{m,n,k}),ms=performance.now()-t;out.textContent=JSON.stringify({method:'blas.gemm',shape:[m,n,k],elapsed_ms:ms,first_value:c[0]},null,2);};</script></body></html>'''
+    return '''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Turing mathematical library</title>
+<style>
+:root{color-scheme:dark;--ink:#eaf2f8;--muted:#91a7b8;--panel:#0d1924;--line:#203646;--cyan:#65d6e8;--green:#76e6a2;--red:#ff8a8a}
+*{box-sizing:border-box}body{background:#081019;color:var(--ink);font:14px ui-monospace,SFMono-Regular,Consolas,monospace;max-width:1160px;margin:0 auto;padding:32px 22px 70px}h1{font-size:28px;margin-bottom:5px}h2{font-size:17px;margin-top:30px}.lead,.muted{color:var(--muted)}.chips{display:flex;gap:7px;flex-wrap:wrap;margin:16px 0}.chip{border:1px solid var(--line);background:var(--panel);border-radius:99px;padding:6px 10px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.card,pre,.notice{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:15px}.card b{display:block;color:var(--cyan);margin-bottom:6px}.toolbar{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:14px 0}button{padding:9px 12px;background:var(--cyan);color:#061017;border:0;border-radius:6px;font:inherit;font-weight:bold;cursor:pointer}button.secondary{background:#203646;color:var(--ink)}button:disabled{opacity:.45;cursor:wait}input{width:72px;padding:8px;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:6px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line)}th,td{text-align:left;padding:10px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-weight:normal}.ok{color:var(--green)}.error{color:var(--red)}pre{overflow:auto;white-space:pre-wrap;line-height:1.5}code{color:#c9f4fb}.notice{display:none;border-color:#785353;color:#ffd2d2}
+</style>
+</head>
+<body>
+<h1>Turing mathematical library</h1>
+<p class="lead">A packaged, installable numerical surface—not a single GEMM demo.</p>
+<div class="chips"><span class="chip">scal</span><span class="chip">axpy</span><span class="chip">dot</span><span class="chip">gemv</span><span class="chip">gemm</span><span class="chip">rot</span></div>
+<div id="fileNotice" class="notice"><b>This page was opened as a file.</b> Browsers block module, WASM, and shader fetches from <code>file://</code>. Run <code>python -m http.server 8767 --directory &lt;product-directory&gt;</code>, then open <code>http://127.0.0.1:8767/web/</code>.</div>
+<section class="grid">
+  <div class="card"><b>Forward surface</b><span id="forwardSummary">Loading WebGPU deployments…</span></div>
+  <div class="card"><b>Backward surface</b><span id="reverseSummary">Loading compiled WASM VJPs…</span></div>
+  <div class="card"><b>Product identity</b><span id="productIdentity">Loading deterministic matrix…</span></div>
+</section>
+<h2>Packaged method matrix</h2>
+<table><thead><tr><th>Method</th><th>Forward</th><th>Backward</th><th>Specialization</th></tr></thead><tbody id="methods"><tr><td colspan="4">Loading…</td></tr></tbody></table>
+<h2>Browser benchmark</h2>
+<p class="muted">Runs the same installed object API a site imports. GEMM reports both the compiler-retained source shader and selected optimized shader.</p>
+<div class="toolbar"><label>iterations <input id="iterations" type="number" min="1" max="100" value="5"></label><button id="forward" disabled>Run all forwards</button><button id="backward" class="secondary" disabled>Run all compiled backwards</button></div>
+<table><thead><tr><th>Operation</th><th>Shape</th><th>Realization</th><th>Mean ms</th><th>Checksum</th></tr></thead><tbody id="results"><tr><td colspan="5">No runs yet.</td></tr></tbody></table>
+<h2>Site-wide installation</h2>
+<pre><code>&lt;script src="./install-turing-math.js" data-turing-math-base="./"&gt;&lt;/script&gt;
+&lt;script type="module"&gt;
+  const math = await window.turingMathReady;
+  const output = await math.blas.gemm(a, b, {m, n, k});
+  const gradients = await math.blas.vjp("gemm", upstream, {a, b, c, alpha, beta});
+&lt;/script&gt;</code></pre>
+<pre id="status">Initializing library…</pre>
+<script src="./install-turing-math.js" data-turing-math-base="./"></script>
+<script type="module">
+const byId=id=>document.getElementById(id),status=byId("status"),body=byId("methods"),results=byId("results");
+if(location.protocol==="file:")byId("fileNotice").style.display="block";
+const elements=value=>value?.length===undefined?[value]:value;
+const checksum=value=>Array.isArray(value)?value.reduce((sum,item)=>sum+checksum(item),0):Array.from(elements(value),Number).reduce((a,b)=>a+b,0);
+const shapeText=shape=>Object.entries(shape).map(([key,value])=>`${key}=${value}`).join(" × ");
+const values=(length,phase=0)=>Float32Array.from({length},(_,i)=>((i+phase)%17-8)/9);
+const reverseValues=(shape,phase=0)=>{const length=shape.length?shape.reduce((a,b)=>a*Number(b),1):1,data=Float64Array.from({length},(_,i)=>((i+phase)%11-5)/7);return shape.length?data:data[0];};
+let library;
+try{
+  library=await globalThis.turingMathReady;
+  const blas=library.blas,reverse=library.blasReverse,objectMethods=reverse.manifest.methods;
+  byId("forwardSummary").innerHTML=`<span class="ok">${blas.deployedMethods.length} WebGPU methods</span><br>${blas.pipelines.size} pipelines materialized lazily`;
+  byId("reverseSummary").innerHTML=`<span class="ok">${objectMethods.length} compiled VJPs</span><br>standalone WebAssembly`;
+  byId("productIdentity").textContent=library.matrix.products.blas.product_id;
+  body.innerHTML=objectMethods.map(method=>{const records=blas.matrix.webgpu_prebakes[method.name]??[],shape=records[0]?.problem_shape??{};return `<tr><td><b>${method.name}</b></td><td class="ok">WebGPU shader</td><td class="ok">compiled WASM VJP</td><td>${shapeText(shape)||"parametric"}</td></tr>`;}).join("");
+  byId("forward").disabled=false;byId("backward").disabled=false;
+  status.textContent=`Installed window.turingMath, window.tensorMath, and window.turingBLAS.\nLibrary product: ${JSON.stringify(library.libraries)}\nMethods: ${blas.methods.join(", ")}`;
+}catch(error){status.className="error";status.textContent=`Library initialization failed: ${error.message}\n\nIf this is a file:// URL, serve the product over HTTP first.`;}
+
+async function forwardCase(method,variant="fast"){
+  const blas=library.blas,record=blas.matrix.webgpu_prebakes[method][0],shape=record.problem_shape;
+  if(method==="scal")return [await blas.scal(values(shape.n),1.25),shape];
+  if(method==="axpy")return [await blas.axpy(values(shape.n),values(shape.n,3),.75),shape];
+  if(method==="dot")return [await blas.dot(values(shape.n),values(shape.n,3)),shape];
+  if(method==="gemv")return [await blas.gemv(values(shape.m*shape.n),values(shape.n,3),{...shape,alpha:.75,beta:.25,y:values(shape.m,5)}),shape];
+  if(method==="rot")return [await blas.rot(values(shape.n),values(shape.n,3),.8,.6),shape];
+  if(method==="gemm")return [await blas.gemm(values(shape.m*shape.k),values(shape.k*shape.n,3),{...shape,alpha:.75,beta:.25,c:values(shape.m*shape.n,5),variant}),shape];
+  throw new Error(`no demo fixture for ${method}`);
+}
+async function timedForward(method,variant,iterations){
+  await forwardCase(method,variant);let output,shape,start=performance.now();
+  for(let i=0;i<iterations;i++)[output,shape]=await forwardCase(method,variant);
+  return {operation:method,shape:shapeText(shape),realization:method==="gemm"?(variant==="source"?"source SSA shader":"selected optimized shader"):"selected WebGPU shader",ms:(performance.now()-start)/iterations,sum:checksum(output)};
+}
+async function timedReverse(method,iterations){
+  const reverse=library.blasReverse,semantic=reverse.manifest.methods.find(item=>item.name===method),artifact=reverse.manifest.artifacts[method].browser_parametric_reverse,index=new Map(artifact.buffer_order.map((id,i)=>[Number(id),i])),bindings={};
+  Object.entries(semantic.reverse_input_value_ids).forEach(([name,id],slot)=>{bindings[name]=reverseValues(artifact.buffer_shapes[index.get(Number(id))],slot);});
+  const seeds=semantic.reverse_output_value_ids.map((id,slot)=>reverseValues(artifact.buffer_shapes[index.get(Number(semantic.reverse_seed_value_ids[String(id)]))],slot+2)),upstream=seeds.length===1?seeds[0]:seeds;
+  let gradients;const start=performance.now();for(let i=0;i<iterations;i++)gradients=await library.blas.vjp(method,upstream,bindings);
+  const shapes=Object.entries(semantic.reverse_input_value_ids).map(([name,id])=>`${name}:${artifact.buffer_shapes[index.get(Number(id))].join("×")||"scalar"}`).join(" ");
+  return {operation:`${method}.vjp`,shape:shapes,realization:"compiled WebAssembly reverse",ms:(performance.now()-start)/iterations,sum:checksum(Object.values(gradients))};
+}
+const render=rows=>{results.innerHTML=rows.map(row=>`<tr><td>${row.operation}</td><td>${row.shape}</td><td>${row.realization}</td><td>${row.ms.toFixed(3)}</td><td>${row.sum.toFixed(5)}</td></tr>`).join("");};
+async function run(button,job){button.disabled=true;status.textContent="Running…";try{const rows=await job();render(rows);status.textContent=`Completed ${rows.length} library realizations.`;}catch(error){status.className="error";status.textContent=error.stack??error.message;}finally{button.disabled=false;}}
+byId("forward").onclick=()=>run(byId("forward"),async()=>{const iterations=Math.max(1,Number(byId("iterations").value)||1),rows=[];for(const method of library.blas.deployedMethods){if(method==="gemm")rows.push(await timedForward(method,"source",iterations));rows.push(await timedForward(method,"fast",iterations));}return rows;});
+byId("backward").onclick=()=>run(byId("backward"),async()=>{const iterations=Math.max(1,Number(byId("iterations").value)||1),rows=[];for(const method of library.blasReverse.methods)rows.push(await timedReverse(method,iterations));return rows;});
+</script>
+</body></html>'''
 
 
 def _readme(product_id: str, blas: BLASServerProduct) -> str:
