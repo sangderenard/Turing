@@ -175,18 +175,21 @@ def test_an_admitted_variant_carries_a_launch_and_compute_profile(bank):
     assert row["sizes"]  # the chart states what was measured
 
 
-def test_a_refused_variant_has_no_profile_row(bank):
-    # gemm specialized below the unroll limit is the standing refused
-    # variant (test_compiled_linalg.py pins the underlying defect).
+def test_tiny_specialized_gemm_is_admitted_and_profiled(bank):
+    # Nested carried-recurrence preservation outranks unrolling, so the old
+    # blanket refusal at/below the unroll threshold is no longer necessary.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        with pytest.raises(BankRefusal):
-            bank.get("gemm", specialized={"m": 4, "n": 4, "k": 4})
+        variant = bank.get(
+            "gemm", contract="fast",
+            specialized={"m": 4, "n": 4, "k": 4},
+        )
+    assert variant.specialized == {"m": 4, "n": 4, "k": 4}
     charted = {
         tuple(sorted(row["specialized"].items()))
         for row in bank.performance_chart("gemm")
     }
-    assert (("k", 4), ("m", 4), ("n", 4)) not in charted
+    assert (("k", 4), ("m", 4), ("n", 4)) in charted
 
 
 def test_a_loaded_variant_refuses_parameter_identity_drift(

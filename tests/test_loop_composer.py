@@ -1218,6 +1218,23 @@ def test_while_ternary_assignment_is_explicit_loop_carried_state():
     assert plan.loop.body_nodes
 
 
+def test_multi_carried_recurrence_preservation_outranks_unrolling():
+    graph = _function_graph(
+        "def kernel(a, b):\n"
+        "    for index in range(4):\n"
+        "        a = a + index\n"
+        "        b = b - index\n"
+        "    return a + b\n",
+        "kernel",
+    )
+
+    plan, = _glsl_composer().compose(graph)
+
+    assert len(plan.loop.carried_bindings) == 2
+    assert plan.strategy is LoopStrategy.NATIVE_SOURCE
+    assert "outranks loop unrolling" in plan.reason
+
+
 def test_sequential_loop_body_does_not_own_captured_predecessor_values():
     graph = _function_graph(
         "def kernel(xs, ys):\n"

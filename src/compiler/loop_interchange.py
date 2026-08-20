@@ -23,6 +23,13 @@ accumulator-promoted form puts the unit-stride axis innermost:
 making every inner-loop access unit-stride in ``j`` -- the shape SIMD
 wants, and the shape real BLAS uses.
 
+For literal extents, a second identity then blocks that unit-stride axis and
+promotes adjacent outputs into one vector of scalar loop-carried accumulators.
+The reduction advances every lane on the same backedge and publishes each
+output once.  Its width comes from ``WorkContract.loops``; the loop coordinator
+retains the recurrence and its lexical-owner closure before considering the
+lower-priority unroll identity.
+
 Two facts make this a COMPILER decision rather than a rewrite users do:
 
 * **Legality is contract law.** Accumulating into ``C`` per ``p`` reorders
@@ -54,11 +61,14 @@ import ast
 import copy
 from dataclasses import dataclass
 
+from .work_contract import LoopOptimizationContract
+
 
 @dataclass(frozen=True)
 class InterchangeDecision:
     """One nest's verdict, with the evidence either way."""
 
+    identity: str
     function: str
     line: int
     interchanged: bool
@@ -69,6 +79,13 @@ class InterchangeDecision:
 class InterchangeResult:
     source: str
     decisions: tuple[InterchangeDecision, ...]
+
+
+UNIT_STRIDE_REDUCTION_IDENTITY = "reduction_to_unit_stride"
+REGISTER_BLOCK_REDUCTION_IDENTITY = "unit_stride_reduction_register_block"
+# Compatibility/default spelling; runtime decisions read the active loop
+# subcontract below rather than treating this alias as a second authority.
+REGISTER_BLOCK_WIDTH = LoopOptimizationContract().register_block_width
 
 
 def linear_index_stride(index: ast.AST, variable: str) -> object:
@@ -238,8 +255,96 @@ def _split_store(
     return None
 
 
+def _range_literal_count(loop: ast.For) -> int | None:
+    """Return the exact forward ``range`` count, or ``None`` if dynamic."""
+
+    iterator = loop.iter
+    if not (
+        isinstance(iterator, ast.Call)
+        and isinstance(iterator.func, ast.Name)
+        and iterator.func.id == "range"
+        and not iterator.keywords
+        and 1 <= len(iterator.args) <= 3
+        and all(isinstance(argument, ast.Constant) for argument in iterator.args)
+    ):
+        return None
+    values = tuple(int(argument.value) for argument in iterator.args)
+    start, stop, step = (
+        (0, values[0], 1)
+        if len(values) == 1
+        else (values[0], values[1], 1)
+        if len(values) == 2
+        else values
+    )
+    if start != 0 or step != 1 or stop < 0:
+        return None
+    return stop
+
+
+def _replace_name(expression: ast.AST, name: str, replacement: ast.expr) -> ast.AST:
+    """Copy ``expression`` while replacing loads of one induction name."""
+
+    class Replace(ast.NodeTransformer):
+        def visit_Name(self, node: ast.Name):  # noqa: N802 - AST API name
+            if isinstance(node.ctx, ast.Load) and node.id == name:
+                return ast.copy_location(copy.deepcopy(replacement), node)
+            return node
+
+    return Replace().visit(copy.deepcopy(expression))
+
+
+def _match_register_block_nest(
+    outer: ast.For,
+) -> tuple[ast.For, ast.For, ast.For, ast.Assign, ast.Assign] | None:
+    """Match the unit-stride identity's prologue plus ``p -> j`` update."""
+
+    if len(outer.body) != 2:
+        return None
+    prologue, reduction = outer.body
+    if not (
+        getattr(prologue, "_turing_loop_identity", None)
+        == UNIT_STRIDE_REDUCTION_IDENTITY
+        and getattr(reduction, "_turing_loop_identity", None)
+        == UNIT_STRIDE_REDUCTION_IDENTITY
+        and isinstance(prologue, ast.For)
+        and isinstance(prologue.target, ast.Name)
+        and len(prologue.body) == 1
+        and isinstance(prologue.body[0], ast.Assign)
+        and isinstance(reduction, ast.For)
+        and len(reduction.body) == 1
+        and isinstance(reduction.body[0], ast.For)
+    ):
+        return None
+    parallel = reduction.body[0]
+    if not (
+        isinstance(parallel.target, ast.Name)
+        and parallel.target.id == prologue.target.id
+        and ast.dump(parallel.iter, include_attributes=False)
+        == ast.dump(prologue.iter, include_attributes=False)
+        and len(parallel.body) == 1
+        and isinstance(parallel.body[0], ast.Assign)
+    ):
+        return None
+    initialize = prologue.body[0]
+    update = parallel.body[0]
+    if not (
+        len(initialize.targets) == 1
+        and isinstance(initialize.targets[0], ast.Subscript)
+        and len(update.targets) == 1
+        and isinstance(update.targets[0], ast.Subscript)
+        and ast.unparse(update.targets[0]) == ast.unparse(initialize.targets[0])
+        and isinstance(update.value, ast.BinOp)
+        and isinstance(update.value.op, ast.Add)
+        and isinstance(update.value.left, ast.Subscript)
+        and ast.unparse(update.value.left) == ast.unparse(update.targets[0])
+    ):
+        return None
+    return prologue, reduction, parallel, initialize, update
+
+
 def interchange_reduction_loops(
     source: str, *, licensed: bool | None = None,
+    register_block_width: int | None = None,
 ) -> InterchangeResult:
     """Interchange every recognized reduction nest the contract licenses.
 
@@ -249,10 +354,18 @@ def interchange_reduction_loops(
     forbids exactly that.
     """
 
-    if licensed is None:
-        from .work_contract import active_contract
+    from .work_contract import active_contract
 
-        licensed = bool(active_contract().inexact_identities)
+    contract = active_contract()
+    if licensed is None:
+        licensed = bool(contract.inexact_identities)
+    block_width = int(
+        contract.loops.register_block_width
+        if register_block_width is None
+        else register_block_width
+    )
+    if block_width < 1:
+        raise ValueError("register_block_width must be positive")
 
     tree = ast.parse(source)
     decisions: list[InterchangeDecision] = []
@@ -419,6 +532,7 @@ def interchange_reduction_loops(
                     )
 
                 decisions.append(InterchangeDecision(
+                    identity=UNIT_STRIDE_REDUCTION_IDENTITY,
                     function=function.name,
                     line=node.lineno,
                     interchanged=verdict,
@@ -472,6 +586,16 @@ def interchange_reduction_loops(
                     )],
                     orelse=[],
                 )
+                # The second identity consumes only this pass's proven first
+                # identity, never an authored loop that happens to have the
+                # same syntax.  These in-memory proof tags are compile
+                # artifacts: consumed before source serialization.
+                prologue._turing_loop_identity = (  # type: ignore[attr-defined]
+                    UNIT_STRIDE_REDUCTION_IDENTITY
+                )
+                accumulate._turing_loop_identity = (  # type: ignore[attr-defined]
+                    UNIT_STRIDE_REDUCTION_IDENTITY
+                )
                 return [prologue, accumulate]
 
         state = {"changed": False}
@@ -489,6 +613,148 @@ def interchange_reduction_loops(
         if state["changed"]:
             changed = True
 
+        class _RegisterBlockRewriter(ast.NodeTransformer):
+            """Apply the second identity to the first identity's output."""
+
+            def visit_For(self, node: ast.For):  # noqa: N802 - AST API name
+                self.generic_visit(node)
+                matched = _match_register_block_nest(node)
+                if matched is None:
+                    return node
+                (prologue, reduction, _parallel,
+                 initialize, update) = matched
+                parallel_name = prologue.target.id
+                count = _range_literal_count(prologue)
+                reasons: list[str] = []
+                verdict = True
+                if count is None:
+                    reasons.append(
+                        "register blocking requires a literal forward unit-step "
+                        "parallel extent"
+                    )
+                    verdict = False
+                elif count < block_width:
+                    reasons.append(
+                        f"parallel extent {count} is smaller than register "
+                        f"block width {block_width}"
+                    )
+                    verdict = False
+                elif count % block_width:
+                    reasons.append(
+                        f"parallel extent {count} does not divide register "
+                        f"block width {block_width}; edge register "
+                        "blocks are not represented by this identity yet"
+                    )
+                    verdict = False
+                if verdict:
+                    reasons.append(
+                        f"unit-stride output loop blocked by "
+                        f"{block_width}; its output values become "
+                        "local loop-carried accumulators across the reduction "
+                        "and publish once"
+                    )
+                decisions.append(InterchangeDecision(
+                    identity=REGISTER_BLOCK_REDUCTION_IDENTITY,
+                    function=function.name,
+                    line=node.lineno,
+                    interchanged=verdict,
+                    reasons=tuple(reasons),
+                ))
+                if not verdict:
+                    return node
+
+                used_names = _names_in(function)
+                block_name = f"{parallel_name}_register_block"
+                while block_name in used_names:
+                    block_name += "_"
+                block_load = ast.Name(id=block_name, ctx=ast.Load())
+                # Keep the generated induction loop in the compiler's
+                # canonical unit-step form.  The coordinate is the affine
+                # map ``block * width + lane``; spelling this as
+                # ``range(0, count, width)`` loses the trip-count relation in
+                # region planning, which can evaporate all but one block.
+                block_base = ast.BinOp(
+                    left=copy.deepcopy(block_load),
+                    op=ast.Mult(),
+                    right=ast.Constant(value=block_width),
+                )
+                initializers = []
+                updates = []
+                publications = []
+                for offset in range(block_width):
+                    coordinate = (
+                        copy.deepcopy(block_base)
+                        if offset == 0
+                        else ast.BinOp(
+                            left=copy.deepcopy(block_base),
+                            op=ast.Add(),
+                            right=ast.Constant(value=offset),
+                        )
+                    )
+                    accumulator = f"{block_name}_acc_{offset}"
+                    initializers.append(ast.Assign(
+                        targets=[ast.Name(id=accumulator, ctx=ast.Store())],
+                        value=_replace_name(
+                            initialize.value, parallel_name, coordinate,
+                        ),
+                    ))
+                    update_term = _replace_name(
+                        update.value.right, parallel_name, coordinate,
+                    )
+                    updates.append(ast.Assign(
+                        targets=[ast.Name(id=accumulator, ctx=ast.Store())],
+                        value=ast.BinOp(
+                            left=ast.Name(id=accumulator, ctx=ast.Load()),
+                            op=ast.Add(),
+                            right=update_term,
+                        ),
+                    ))
+                    publications.append(ast.Assign(
+                        targets=[_replace_name(
+                            initialize.targets[0], parallel_name, coordinate,
+                        )],
+                        value=ast.Name(id=accumulator, ctx=ast.Load()),
+                    ))
+                blocked_reduction = ast.For(
+                    target=copy.deepcopy(reduction.target),
+                    iter=copy.deepcopy(reduction.iter),
+                    body=updates,
+                    orelse=[],
+                )
+                blocked_parallel = ast.For(
+                    target=ast.Name(id=block_name, ctx=ast.Store()),
+                    iter=ast.Call(
+                        func=ast.Name(id="range", ctx=ast.Load()),
+                        args=[ast.Constant(
+                            value=count // block_width,
+                        )],
+                        keywords=[],
+                    ),
+                    body=[*initializers, blocked_reduction, *publications],
+                    orelse=[],
+                )
+                state["changed"] = True
+                return ast.copy_location(
+                    ast.For(
+                        target=copy.deepcopy(node.target),
+                        iter=copy.deepcopy(node.iter),
+                        body=[blocked_parallel],
+                        orelse=copy.deepcopy(node.orelse),
+                    ),
+                    node,
+                )
+
+        function.body = [
+            statement
+            for item in (
+                _RegisterBlockRewriter().visit(statement)
+                for statement in function.body
+            )
+            for statement in (item if isinstance(item, list) else [item])
+        ]
+        if state["changed"]:
+            changed = True
+
     if not changed:
         return InterchangeResult(source, tuple(decisions))
     ast.fix_missing_locations(tree)
@@ -498,5 +764,8 @@ def interchange_reduction_loops(
 __all__ = [
     "InterchangeDecision",
     "InterchangeResult",
+    "REGISTER_BLOCK_REDUCTION_IDENTITY",
+    "REGISTER_BLOCK_WIDTH",
+    "UNIT_STRIDE_REDUCTION_IDENTITY",
     "interchange_reduction_loops",
 ]

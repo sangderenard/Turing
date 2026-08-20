@@ -1,29 +1,18 @@
-# Task 7 — tiny-trip loop evaporation defect
+# Task 7 — tiny-trip loop evaporation defect (resolved 2026-08-20)
 
-## Observed code state
+## Resolution
 
-- `KernelBank.get()` refuses any specialized size at or below
-  `LoopBackendCapabilities.unroll_limit` before compilation.
-- `tests/test_compiled_linalg.py` contains a strict xfail using the SSA
-  reference evaluator.  The stated native form access-violates, so it is not a
-  safe xfail subprocess inside pytest.
-- `evaporate_unrolled_loops()` already requires canonical value IDs.  The
-  defect therefore survives the deterministic-ID migration and is not fixed by
-  renumbering alone.
+- Loop decisions are hierarchical. A nested carried recurrence forms a
+  preservation closure over itself and its lexical owners; unrolling is a
+  lower-priority identity and cannot cross that closure.
+- The 2³ baked-GEMM reference evaluator pin now passes instead of xfails.
+- A native 4³ specialized GEMM admits through `KernelBank` and receives a
+  performance-chart row.
+- The blanket bank refusal at/below the unroll limit was removed.
 
-## Work sequence
+## Remaining boundary
 
-1. Use the reference-evaluator pin as the primary reproducer and inspect the
-   outer-loop induction ownership through `loop_composer.py`.
-2. Repair cloned membership/publication so every outer iteration survives
-   inner-loop evaporation.
-3. Flip the strict xfail, then add a separately contained native subprocess
-   check before relaxing the bank refusal.
-4. Remove or narrow the precompile refusal only after the native proof is safe.
-
-## Acceptance
-
-- The 2³ baked GEMM reference-evaluator pin passes exactly.
-- The native subprocess exits normally and matches NumPy.
-- Bank admission safely accepts newly legal tiny variants without exposing the
-  parent pytest process to an access violation.
+An unrelated dependent-inner-bound ABI issue remains pinned in
+`test_literal_loop_bound_parameter_loss.py`: the mutated parameters survive,
+but the outer induction capture can still appear as one unnamed formal. The
+register-blocked GEMM path does not exhibit that leak.

@@ -10358,13 +10358,14 @@ def lower_ast_source_to_ssa(
         tensor_ssa_reference=tensor_ssa_reference,
     )
     decision_records = tuple({
+        "identity": str(decision.identity),
         "function": decision.function,
         "line": int(decision.line),
         "interchanged": bool(decision.interchanged),
         "reasons": tuple(map(str, decision.reasons)),
     } for decision in interchange.decisions)
     receipt = {
-        "schema": "turing.loop-interchange.v1",
+        "schema": "turing.loop-interchange.v2",
         "contract": str(work_contract.name),
         "licensed": bool(work_contract.inexact_identities),
         "authored_source_sha256": authored_source_sha256,

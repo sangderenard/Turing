@@ -53,6 +53,9 @@ reaches a real consumer):
   passthrough, consumed by both zig cc invocations (LLVM and C shells).
 * ``resolver_epsilon`` — precision bound for baked resolver tables
   (``bounded_constants.materialize_pi`` and series terms).
+* ``loops`` — the loop-optimization subcontract. It centralizes the low-priority
+  unroll threshold and register-block width; semantic recurrence/effect
+  preservation remains a mandatory veto above those preferences.
 * ``extraction`` — the WHOLE ingestion/native-pursual policy, embedded: an
   ``ExtractionContract`` (or path to one). That object already decides
   python-call allowance (INGEST_PYTHON / PYTHON_HOST_CALL), native pursuit
@@ -104,6 +107,23 @@ _HONORED_DESTINATION = ("native",)
 
 
 @dataclasses.dataclass(frozen=True)
+class LoopOptimizationContract:
+    """Priorities and tunable parameters for loop identities."""
+
+    # Unrolling is a low-priority representation identity.  Semantic
+    # preservation closures (carried recurrence, effects, publication) veto it.
+    unroll_limit: int = 8
+    # Number of adjacent unit-stride outputs held as one recurrence vector.
+    register_block_width: int = 4
+
+    def __post_init__(self) -> None:
+        if int(self.unroll_limit) < 1:
+            raise ValueError("loop unroll_limit must be positive")
+        if int(self.register_block_width) < 1:
+            raise ValueError("register_block_width must be positive")
+
+
+@dataclasses.dataclass(frozen=True)
 class WorkContract:
     """One complete answer to "how faithful, and to whom?"."""
 
@@ -125,6 +145,11 @@ class WorkContract:
     destination: str = "native"
     constant_arguments: tuple[str, ...] = ()
     symbolic_arguments: tuple[str, ...] = ()
+    # Compile-complementary loop policy.  This is a subcontract so identity
+    # parameters have one authority without bloating every work preset.
+    loops: LoopOptimizationContract = dataclasses.field(
+        default_factory=LoopOptimizationContract,
+    )
 
     def __post_init__(self) -> None:
         # Refuse, never fall back (fusion_levels doctrine): a contract
@@ -158,6 +183,8 @@ class WorkContract:
             f"register_reuse={'on' if self.register_reuse else 'off'}",
             f"identities={'inexact' if self.inexact_identities else 'exact-only'}",
             f"fma={'contract' if self.contract_multiply_add else 'none'}",
+            f"unroll<={self.loops.unroll_limit}",
+            f"register-block={self.loops.register_block_width}",
         ]
         return f"{self.name}: " + ", ".join(held)
 

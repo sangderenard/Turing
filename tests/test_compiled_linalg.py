@@ -258,8 +258,8 @@ def test_sequential_stores_to_one_array_both_land():
 
 
 # ---------------------------------------------------------------------------
-# Size-baked (specialized) kernels: correct at real sizes, pinned-broken at
-# tiny trip counts.
+# Size-baked (specialized) kernels: correct above and within the optional
+# unroll threshold. Nested carried recurrence preservation outranks unrolling.
 # ---------------------------------------------------------------------------
 
 BAKED_GEMM_TEMPLATE = """
@@ -287,7 +287,7 @@ def _baked_gemm_expected(a, b, c, alpha, beta, size):
 def test_fully_size_baked_gemm_is_exact_above_the_unroll_limit():
     """All three sizes baked to literals -- the kernel bank's specialization
     shape -- computes exactly, natively, at any size whose trip count
-    exceeds the loop unroll limit (8). This is the variant the bank's
+    exceeds the default loop unroll limit. This is the variant the bank's
     admission gate previously refused; the refusal traced to store-version
     alias chains resolving one level instead of to their root
     (ir_indexing.py), fixed alongside this test."""
@@ -308,22 +308,6 @@ def test_fully_size_baked_gemm_is_exact_above_the_unroll_limit():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "at trip counts within the unroll limit the loop evaporator "
-        "unrolls the inner loops but drops the OUTER loop's iteration: its "
-        "induction variable leaks out as a free formal and only the "
-        "iteration where it equals the scratch-fill value computes "
-        "(measured 2026-08-20: 2x2 baked gemm computes row 0 exactly and "
-        "leaves row 1 untouched). The kernel bank's admission gate catches "
-        "this for bank users; this pin covers everyone else. Checked via "
-        "the SSA reference evaluator, NOT natively: the native build of "
-        "this shape hard-crashes (access violation), which no xfail can "
-        "contain -- the evaluator reproduces the same wrong values safely "
-        "and pins the defect at the layer it lives, lowering."
-    ),
-)
 def test_fully_size_baked_gemm_is_exact_within_the_unroll_limit():
     from src.compiler.ssa_reference_evaluator import SSAReferenceEvaluator
 

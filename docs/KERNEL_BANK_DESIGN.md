@@ -78,8 +78,7 @@ specialization dict, and a **compiler fingerprint** (newest mtime over
   source-level specializer should migrate onto it and this document
   updated.
 
-## 4. Defect pinned by the admission gate — FIXED above the unroll limit
-## (2026-08-20), residual pinned below it
+## 4. Literal-loop specialization — fixed across the unroll threshold
 
 Specializing `gemm` to literal sizes (`m=8, n=8, k=8` via
 signature-drop + prologue assignment) produced a LOUD emission shortfall
@@ -106,17 +105,12 @@ commit carrying this edit). Two independent defects were stacked:
    guard still fires on the genuine MSE-family unpacks (verified: the
    three `test_process_graph_autograd.py` xfails still xfail).
 
-**Result**: `gemm` specialized to any size above the loop unroll limit
-(8) now ADMITS — verified 0.0e+00 against its oracle at 16³ and 64³,
-evaluator and native both exact.
-
-**Residual, pinned strict-xfail** (`test_compiled_linalg.py`): at trip
-counts WITHIN the unroll limit, the loop evaporator unrolls inner loops
-but drops the outer loop's iteration (its induction variable leaks out as
-a free formal; a 2×2 baked gemm computes row 0 and leaves row 1
-untouched, and the native build access-violates). The admission gate
-catches this for bank users; do not specialize below the unroll limit
-until the evaporator is fixed.
+**Result**: specialized `gemm` now admits on both sides of the unroll
+threshold. The loop coordinator treats nested carried recurrences as a
+semantic-preservation closure over the recurrence and its lexical owners;
+that higher-priority decision vetoes the optional unroll identity. The 2³
+reference-evaluator pin passes and a native 4³ bank variant admits and is
+profiled, so the blanket small-size precompile refusal has been removed.
 
 ## 4.5 Strategic tiling is a compiler choice by the deployment layer
 

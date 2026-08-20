@@ -2450,7 +2450,72 @@ class LoopComposer:
             ):
                 descriptor = self.describe(graph, node_id)
                 plans.append(self.plan(descriptor))
-        return tuple(plans)
+
+        # Realization decisions form a hierarchy.  A multi-carried loop is a
+        # coordinated recurrence: its whole (initial, updated) vector must
+        # advance on one backedge.  That semantic-preservation requirement
+        # outranks the optional unroll identity, and it closes over lexical
+        # owners because evaporating an owner would also erase its retained
+        # child control.  Only loops outside this closure remain eligible for
+        # low-priority unrolling.
+        nested_loop_ids = {
+            int(candidate.loop.node_id)
+            for owner in plans
+            for candidate in plans
+            if (
+                int(candidate.loop.node_id) != int(owner.loop.node_id)
+                and int(candidate.loop.node_id) in set(map(
+                    int, owner.loop.body_nodes,
+                ))
+            )
+        }
+        protected = {
+            int(plan.loop.node_id)
+            for plan in plans
+            if (
+                len(plan.loop.carried_bindings) > 1
+                or (
+                    plan.loop.carried_bindings
+                    and int(plan.loop.node_id) in nested_loop_ids
+                )
+            )
+        }
+        changed = True
+        while changed:
+            changed = False
+            for plan in plans:
+                loop_id = int(plan.loop.node_id)
+                if loop_id in protected:
+                    continue
+                if protected.intersection(map(int, plan.loop.body_nodes)):
+                    protected.add(loop_id)
+                    changed = True
+
+        def preserve(plan: LoopPlan) -> LoopPlan:
+            if int(plan.loop.node_id) not in protected:
+                return plan
+            if (
+                plan.loop.iterator_kind == "while"
+                and self.capabilities.native_while
+            ) or (
+                plan.loop.iterator_kind != "while"
+                and self.capabilities.native_for
+            ):
+                strategy = LoopStrategy.NATIVE_SOURCE
+            elif self.capabilities.kpn:
+                strategy = LoopStrategy.KPN
+            else:
+                strategy = LoopStrategy.DISPATCH
+            return replace(
+                plan,
+                strategy=strategy,
+                reason=(
+                    "coordinated multi-carried recurrence preservation "
+                    "outranks loop unrolling"
+                ),
+            )
+
+        return tuple(preserve(plan) for plan in plans)
 
     def materialize_semantic_ir(
         self,

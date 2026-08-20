@@ -9,7 +9,11 @@ import tempfile
 import numpy as np
 
 from src.common.tensors.blas import GEMM_SOURCE
-from src.compiler.loop_interchange import interchange_reduction_loops
+from src.compiler.loop_interchange import (
+    REGISTER_BLOCK_REDUCTION_IDENTITY,
+    UNIT_STRIDE_REDUCTION_IDENTITY,
+    interchange_reduction_loops,
+)
 
 
 def _run_gemm(source: str, a, b, c, *, size: int = 5):
@@ -53,6 +57,79 @@ def test_interchanged_gemm_matches_the_authored_program():
     produced = _run_gemm(transformed, a, b, c)
 
     assert np.max(np.abs(produced - expected)) < 2.0e-14
+
+
+def test_specialized_gemm_applies_register_block_identity_and_matches():
+    from src.compiler.kernel_bank import _specialize_source, blas_kernel_specs
+
+    size = 32
+    specialized = _specialize_source(
+        blas_kernel_specs()["gemm"], {"m": size, "n": size, "k": size},
+    )
+    result = interchange_reduction_loops(specialized, licensed=True)
+
+    assert [decision.identity for decision in result.decisions] == [
+        UNIT_STRIDE_REDUCTION_IDENTITY,
+        REGISTER_BLOCK_REDUCTION_IDENTITY,
+    ]
+    assert all(decision.interchanged for decision in result.decisions)
+    assert "for j_register_block in range(8):" in result.source
+    assert "for p in range(32):" in result.source
+    assert result.source.count("j_register_block_acc_") > 4
+
+    rng = np.random.default_rng(27)
+    a = rng.standard_normal(size * size)
+    b = rng.standard_normal(size * size)
+    c = rng.standard_normal(size * size)
+    namespace: dict = {}
+    exec(compile(result.source, "<blocked-gemm>", "exec"), namespace)
+    produced = namespace["gemm"](a.copy(), b.copy(), c.copy(), 1.7, 0.3)
+    expected = (
+        1.7 * (a.reshape(size, size) @ b.reshape(size, size)).reshape(-1)
+        + 0.3 * c
+    )
+    assert np.allclose(produced, expected, rtol=2.0e-13, atol=2.0e-13)
+
+
+def test_serialized_unit_stride_form_is_not_mistaken_for_proven_chain():
+    first = interchange_reduction_loops(GEMM_SOURCE, licensed=True)
+    second = interchange_reduction_loops(first.source, licensed=True)
+
+    assert second.source == first.source
+    assert second.decisions == ()
+
+
+def test_register_width_comes_from_the_active_loop_subcontract():
+    from dataclasses import replace
+
+    from src.compiler.kernel_bank import _specialize_source, blas_kernel_specs
+    from src.compiler.work_contract import (
+        LoopOptimizationContract,
+        PRESETS,
+        set_active_contract,
+    )
+
+    contract = replace(
+        PRESETS["fast"],
+        name="fast-width-two",
+        loops=LoopOptimizationContract(
+            unroll_limit=8, register_block_width=2,
+        ),
+    )
+    specialized = _specialize_source(
+        blas_kernel_specs()["gemm"], {"m": 32, "n": 32, "k": 32},
+    )
+    set_active_contract(contract)
+    try:
+        result = interchange_reduction_loops(specialized)
+    finally:
+        set_active_contract(None)
+
+    assert result.decisions[-1].interchanged
+    assert "blocked by 2" in " ".join(result.decisions[-1].reasons)
+    assert "for j_register_block in range(16):" in result.source
+    assert "j_register_block_acc_1" in result.source
+    assert "j_register_block_acc_2" not in result.source
 
 
 def test_accumulator_in_the_term_is_refused():
@@ -153,9 +230,30 @@ def test_canonical_entry_records_fast_interchange_on_the_source_function():
     assert receipt["licensed"]
     assert receipt["changed"]
     assert receipt["decisions"][0]["interchanged"]
-    assert function.metadata["loop_interchange_decisions"] == (
-        receipt["decisions"][0],
+    assert function.metadata["loop_interchange_decisions"] == receipt["decisions"]
+
+
+def test_specialized_register_block_recurrence_admits_natively(tmp_path):
+    from src.compiler.kernel_bank import open_blas_bank
+
+    variant = open_blas_bank(tmp_path / "blocked-bank").get(
+        "gemm", contract="fast", specialized={"m": 32, "n": 32, "k": 32},
     )
+    entry = variant.module.functions[
+        f"kb_gemm_{variant.key}__gemm"
+    ]
+    operations = [
+        instruction.op
+        for block in entry.blocks.values()
+        for instruction in block.instrs
+    ]
+
+    # i, block, p plus four accumulator recurrences.  Most importantly, the
+    # four accumulator phis coexist in one retained p-loop/backedge.
+    assert operations.count("Phi") == 7
+    decisions = variant.module.metadata["loop_interchange"]["decisions"]
+    assert decisions[-1]["identity"] == REGISTER_BLOCK_REDUCTION_IDENTITY
+    assert decisions[-1]["interchanged"]
 
 
 def test_fast_interchanged_gemm_compiles_and_matches_numpy():

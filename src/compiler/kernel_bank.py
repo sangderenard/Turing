@@ -458,35 +458,6 @@ class KernelBank:
                     f"{name}: cannot bake non-size parameters "
                     f"{sorted(unknown)}"
                 )
-            # A baked size at or below the loop unroll limit makes the
-            # evaporator unroll that loop, and the tiny-trip evaporation
-            # defect (pinned strict-xfail in test_compiled_linalg.py:
-            # the outer loop's iteration is dropped, its induction
-            # variable leaks as a free formal, and the NATIVE BUILD
-            # ACCESS-VIOLATES) then kills the admission probe's process
-            # outright -- a crash the verify gate cannot catch. Refuse
-            # before compiling. The limit is read from the loop
-            # composer's own declaration, not restated here.
-            from .loop_composer import LoopBackendCapabilities
-
-            unroll_limit = int(
-                LoopBackendCapabilities.__dataclass_fields__[
-                    "unroll_limit"
-                ].default
-            )
-            tiny = {
-                parameter: value
-                for parameter, value in specialized.items()
-                if int(value) <= unroll_limit
-            }
-            if tiny:
-                raise BankRefusal(
-                    f"{name}: baked size(s) {tiny} are at or below the "
-                    f"loop unroll limit ({unroll_limit}); the tiny-trip "
-                    "evaporation defect makes such builds crash natively "
-                    "(see tests/test_compiled_linalg.py's pin) -- refused "
-                    "before compilation"
-                )
         key = self.variant_key(
             name, contract=contract, specialized=specialized,
         )

@@ -38,7 +38,8 @@
 EIGH offers the definitional AbstractTensor Jacobi path and an explicit
 `method="blas"` path using the repository's compiled, admission-verified
 `rot` kernel. Small matrices zero-pad to a specialized width-nine module to
-stay above the standing tiny-trip gate; only the valid prefix is published.
+The original run stayed above the then-standing tiny-trip gate; that gate was
+removed after nested carried-recurrence preservation was added (Task 7).
 The report carries the actual module key and deterministic name-to-ID binding.
 The default remains Jacobi.
 

@@ -17597,10 +17597,12 @@ def strategize_shell_deployment(
         inherited.get("remove_loops", False) if remove_loops is None
         else remove_loops
     )
-    unroll_limit = (
-        inherited.get("unroll_limit", 8) if unroll_limit is None
-        else unroll_limit
-    )
+    if unroll_limit is None:
+        from .work_contract import active_contract
+
+        unroll_limit = inherited.get(
+            "unroll_limit", active_contract().loops.unroll_limit,
+        )
     schedule_preference = (
         inherited.get("schedule_preference", "alap")
         if schedule_preference is None else schedule_preference

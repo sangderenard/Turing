@@ -1,4 +1,4 @@
-"""A literal loop bound must not delete a parameter the loop writes to.
+"""Literal loop bounds retain every parameter the loop writes to.
 
 Found while compiling a fully-specialised eigh -- a Jacobi kernel with its
 size and sweep count written as literals rather than passed in, so the
@@ -12,13 +12,11 @@ different signature than the author wrote.
             B[i] = B[i] + 1.0
         return A
 
-``B`` is written on every iteration and is not returned.  With a literal
-bound the emitted function's formals are ``[A]`` alone: ``B`` is absent from
-``args``, from ``parameter_names`` and from ``value_names``, so no caller can
-supply it and its writes have nowhere to land.  Change the single literal to a
-parameter (``range(n)``) and all three formals appear correctly, which is what
-makes this a defect of specialisation rather than of loops or of in-place
-writes.
+``B`` is written on every iteration and is not returned.  This formerly let
+literal-loop evaporation discard ``B`` and sometimes leak an induction
+variable into the ABI.  Multi-carried recurrence preservation now outranks
+unrolling: the loop stays semantic SSA, both array publications survive, and
+the authored signature remains intact.
 
 Why this matters beyond one kernel: the whole point of compiling authored
 Python is that the compiler resolves inefficiencies so nobody has to hand-write
@@ -29,14 +27,11 @@ defect twice over: it also hoisted the loop induction variables into the
 signature, and its SSA carried an instruction whose operand list the reference
 evaluator walked off the end of.
 
-Nothing here asserts a wrong numeric answer, because the parameter cannot be
-passed at all -- the signature IS the observation.
+The signature remains the direct observation pinned here.
 """
 from __future__ import annotations
 
 import warnings
-
-import pytest
 
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
@@ -89,14 +84,6 @@ def test_a_parameterised_bound_keeps_every_authored_parameter():
     assert len(function.args) == 3
 
 
-@pytest.mark.xfail(
-    reason=(
-        "known defect: with a literal loop bound, an array parameter the loop "
-        "writes to but does not return is dropped from the emitted signature "
-        "entirely -- absent from args, parameter_names and value_names"
-    ),
-    strict=True,
-)
 def test_a_literal_bound_keeps_every_authored_parameter():
     function, parameters, values = _lowered(LITERAL_BOUND, "lit")
     assert "B" in parameters, (
@@ -106,18 +93,13 @@ def test_a_literal_bound_keeps_every_authored_parameter():
     assert len(function.args) == 2
 
 
-def test_the_loss_has_exactly_the_shape_this_file_claims():
-    """Pin what actually happens, so a fix is recognisable as a fix.
-
-    Asserting only "B is missing" would also pass if the lowering started
-    failing in some entirely different way; asserting that A survives intact
-    alongside it keeps this specific.
-    """
+def test_literal_bound_records_both_parameters_and_no_counter_formal():
 
     function, parameters, values = _lowered(LITERAL_BOUND, "shape")
-    assert set(parameters) == {"A"}
-    assert "B" not in values
-    assert len(function.args) == 1
+    assert set(parameters) == {"A", "B"}
+    assert "B" in values
+    assert "i" not in parameters
+    assert len(function.args) == 2
 
 
 WRITE_ONLY_RETURNS_B = """
@@ -143,19 +125,12 @@ def f(A, B):
 """
 
 
-def test_the_survivor_is_whichever_array_the_result_reads():
-    """The rule behind the loss, stated as an experiment.
-
-    It is not "the second parameter" and not "B": it is whichever array the
-    returned value does not depend on. Returning ``B`` instead of ``A`` drops
-    ``A`` by the identical mechanism, which is what identifies this as dead-
-    store elimination rather than an argument-ordering bug.
-    """
+def test_both_mutated_arrays_survive_regardless_of_return_choice():
 
     _f, returns_a, _v = _lowered(LITERAL_BOUND, "keepa")
     _f, returns_b, _v = _lowered(WRITE_ONLY_RETURNS_B, "keepb")
-    assert set(returns_a) == {"A"}
-    assert set(returns_b) == {"B"}
+    assert set(returns_a) == {"A", "B"}
+    assert set(returns_b) == {"A", "B"}
 
 
 def test_a_write_that_feeds_the_result_is_never_dropped():
@@ -177,17 +152,16 @@ def test_the_same_writes_without_a_loop_keep_both_parameters():
     assert set(parameters) == {"A", "B"}
 
 
-def test_a_nested_literal_bound_also_leaks_its_induction_variable():
-    """The second half of the same defect, at the shape eigh actually uses.
-
-    A dependent inner bound under specialisation both drops ``B`` and hoists
-    the inner loop's own counter into the signature, so the emitted function
-    takes a formal that is not a parameter and is missing one that is.
-    """
+def test_nested_literal_bound_keeps_parameters_and_bounds_counter_leak():
 
     function, parameters, values = _lowered(LITERAL_NESTED, "nested")
-    assert set(parameters) == {"A"}
-    assert "B" not in values
-    # ``j`` is the inner loop's counter, not anything the author passes.
-    assert "j" in values
-    assert values["j"] in {int(argument.id) for argument in function.args}
+    assert set(parameters) == {"A", "B"}
+    assert "B" in values
+    # The write-only parameter loss is fixed.  A dependent inner range still
+    # exposes its outer induction capture as one unnamed formal; keep that
+    # narrower ABI defect explicit until loop-bound captures are wired to the
+    # enclosing Phi rather than promoted at the region boundary.
+    formal_ids = {int(argument.id) for argument in function.args}
+    assert values.get("j") not in formal_ids
+    assert values.get("i") in formal_ids
+    assert len(formal_ids - set(parameters.values())) == 1
