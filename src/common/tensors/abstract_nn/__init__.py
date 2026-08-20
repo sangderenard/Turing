@@ -37,6 +37,24 @@ _LAZY_EXPORTS = {
     "sample_document_pairs": (".completion_training", "sample_document_pairs"),
     "encode_text": (".completion_training", "encode_text"),
     "decode_text": (".completion_training", "decode_text"),
+    "CompilerTrainingDatabase": (
+        ".training_data_store", "CompilerTrainingDatabase",
+    ),
+    "put_reduced_graph_view": (
+        ".training_data_store", "put_reduced_graph_view",
+    ),
+    "GraphTranslationNetwork": (
+        ".graph_translation_network", "GraphTranslationNetwork",
+    ),
+    "TransformationWeightMatrix": (
+        ".graph_translation_network", "TransformationWeightMatrix",
+    ),
+    "TransformerCellSpec": (
+        ".graph_translation_network", "TransformerCellSpec",
+    ),
+    "TransformerUnavailableError": (
+        ".graph_translation_network", "TransformerUnavailableError",
+    ),
 }
 
 

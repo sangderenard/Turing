@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import networkx as nx
 
 from src.compiler.hierarchical_plan import (
+    HierarchyValueTable,
     PlanCall,
     PlanClosure,
     PlanLine,
@@ -532,6 +533,24 @@ def test_hierarchy_ids_separate_equal_local_value_ids_across_calls():
     assert "arg-bind=[2->0]" in rendered
     assert "result-bind=[2->3]" in rendered
     assert "closure child id=1" in rendered
+
+
+def test_hierarchy_dense_ids_do_not_depend_on_a_previous_table():
+    root = PlanClosure(
+        "root",
+        (4,),
+        (PlanLine.create("Add", inputs=(4, 7), outputs=(9,)),),
+    )
+    first_plan, first = assign_hierarchy_ids(root)
+    poisoned = HierarchyValueTable(tuple(
+        (scope, local, global_id + 1000)
+        for scope, local, global_id in first.correlations
+    ))
+    second_plan, second = assign_hierarchy_ids(root, poisoned)
+
+    assert first_plan == second_plan
+    assert first == second
+    assert tuple(sorted({row[2] for row in second.correlations})) == (0, 1, 2)
 
 
 def test_post_hierarchy_identity_reduction_removes_only_proven_call_boundary():

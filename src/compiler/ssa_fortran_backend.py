@@ -570,13 +570,24 @@ def sin_table_declaration() -> str:
     from .fused_program_wasm_backend import lut_for
 
     values, _achieved, _lower, _upper, _periodic = lut_for("sin")
-    items = ", ".join(
-        f"{value!r}".replace("e", "d") + "_c_double" for value in values
-    )
-    return (
-        f"    real(c_double), parameter :: turing_sin_table(0:{len(values) - 1})"
-        f" = [ {items} ]"
-    )
+    items = [f"{value!r}" + "_c_double" for value in values]
+    # Fortran free-form source has a processor-dependent line limit (132
+    # columns in gfortran's default mode).  This LUT is deliberately large,
+    # so it must be a continued array constructor rather than one giant line.
+    width = 120
+    lines = [
+        f"    real(c_double), parameter :: turing_sin_table(0:{len(values) - 1}) = [ &"
+    ]
+    chunk: list[str] = []
+    for item in items:
+        candidate = ", ".join((*chunk, item))
+        if chunk and len("      " + candidate + ", &") > width:
+            lines.append("      " + ", ".join(chunk) + ", &")
+            chunk = [item]
+        else:
+            chunk.append(item)
+    lines.append("      " + ", ".join(chunk) + " ]")
+    return "\n".join(lines)
 
 
 def _table_sin_fortran(argument: str, shift: float) -> str:
@@ -588,7 +599,7 @@ def _table_sin_fortran(argument: str, shift: float) -> str:
     values, _achieved, lower, upper, periodic = lut_for("sin")
     intervals = len(values) - 1
     def literal(value: float) -> str:
-        return f"{value!r}".replace("e", "d") + "_c_double"
+        return f"{value!r}" + "_c_double"
     x = argument if shift == 0.0 else f"({argument} + {literal(shift)})"
     span = upper - lower
     placed = (
@@ -619,7 +630,7 @@ def _series_sin_fortran(argument: str, shift: float) -> str:
 
     coefficients, pi, _bound = sin_series_terms()
     def literal(value: float) -> str:
-        return f"{value!r}".replace("e", "d") + "_c_double"
+        return f"{value!r}" + "_c_double"
     x = argument if shift == 0.0 else f"({argument} + {literal(shift)})"
     turns = f"nint({x} * {literal(1.0 / pi)})"
     r = f"({x} - {literal(pi)} * real({turns}, c_double))"

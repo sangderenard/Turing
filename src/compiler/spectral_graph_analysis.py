@@ -246,6 +246,41 @@ def _region_spectrum(
     )
 
 
+def analyze_region_spectrum(
+    source: "InfluenceField | Topology",
+    node_order: Sequence[Any],
+    *,
+    loop: "LoopRegion | None" = None,
+    circulant_tol: float = 1e-9,
+) -> RegionSpectrum:
+    """Analyse one explicitly selected topology region.
+
+    This is the bounded counterpart to :func:`analyze_graph_spectrum`: a
+    caller that has first inspected graph size can analyse a small or
+    circulant loop region without forcing a dense eigensolve of an unrelated,
+    much larger whole graph.  Edges crossing the requested boundary are
+    excluded; the region is a spectrum of its induced subgraph.
+    """
+
+    nodes, edges = _topology_of(source)
+    requested = tuple(node_order)
+    known = set(nodes)
+    unknown = [key for key in requested if key not in known]
+    if unknown:
+        raise ValueError(f"region contains nodes absent from topology: {unknown!r}")
+    if len(set(requested)) != len(requested):
+        raise ValueError("region node order contains duplicates")
+    included = set(requested)
+    region_edges = tuple(
+        (source_key, target_key, role) for source_key, target_key, role in edges
+        if source_key in included and target_key in included
+    )
+    return _region_spectrum(
+        requested, region_edges, is_loop_body=loop is not None, loop=loop,
+        circulant_tol=circulant_tol,
+    )
+
+
 def analyze_graph_spectrum(
     source: "InfluenceField | Topology", *, circulant_tol: float = 1e-9,
 ) -> GraphSpectralDecomposition:
@@ -262,12 +297,8 @@ def analyze_graph_spectrum(
     loop_regions = []
     for loop in natural_loop_regions((nodes, edges)):
         region_nodes = tuple(key for key in nodes if key in loop.nodes)
-        region_edges = tuple(
-            (source_key, target_key, role) for source_key, target_key, role in edges
-            if source_key in loop.nodes and target_key in loop.nodes
-        )
-        loop_regions.append(_region_spectrum(
-            region_nodes, region_edges, is_loop_body=True, loop=loop,
+        loop_regions.append(analyze_region_spectrum(
+            (nodes, edges), region_nodes, loop=loop,
             circulant_tol=circulant_tol,
         ))
 
@@ -327,6 +358,7 @@ def profile_projection(
 __all__ = [
     "symmetric_adjacency", "is_circulant",
     "LoopRegion", "natural_loop_regions",
-    "RegionSpectrum", "GraphSpectralDecomposition", "analyze_graph_spectrum",
+    "RegionSpectrum", "GraphSpectralDecomposition", "analyze_region_spectrum",
+    "analyze_graph_spectrum",
     "profile_projection",
 ]

@@ -3,13 +3,152 @@ from __future__ import annotations
 import ast
 import contextlib
 import io
+import subprocess
+import sys
 
 import networkx as nx
 
 from src.common.tensors.topological_reducer import (
     reduce_abstract_tensor_topology,
 )
+from src.common.tensors.abstract_nn.token_encoder import decode_identity_tokens
+from src.common.tensors.abstract_nn.token_lexicon import CompilerTokenLexicon
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
+
+
+def test_ingestion_identity_ledger_versions_authored_rebindings_before_ssa():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse("""
+def kernel(x):
+    signal = x + 1
+    signal = signal * 2
+    return signal
+"""))
+    reduce_abstract_tensor_topology(graph)
+
+    executable = graph.function_table.entry(
+        graph.function_table.reference("kernel")
+    ).graph.G
+    records = executable.graph["ingestion_identity_table"]["signal"]
+    assert [record["version"] for record in records] == [0, 1]
+    assert len({record["value_id"] for record in records}) == 2
+    assert all(record["spelling"] == "signal" for record in records)
+    assert all(len(record["context_sha256"]) == 64 for record in records)
+    assert all(record["context_tokens"] for record in records)
+    assert records[0]["context"]["producer_op"] == "Add"
+    assert records[0]["context"]["dependency_shape"]
+    for record in records:
+        assert tuple(
+            decode_identity_tokens(token_id)["token"]
+            for token_id in record["context_token_ids"]
+        ) == record["context_tokens"]
+
+
+def test_unchanged_source_rebuilds_the_same_dense_token_ordered_ids():
+    source = """
+def kernel(x):
+    signal = x + 1
+    signal = signal * 2
+    return signal
+"""
+
+    def snapshot():
+        graph = ProcessGraph(materialize_memory=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(ast.parse(source))
+        reduce_abstract_tensor_topology(graph)
+        executable = graph.function_table.entry(
+            graph.function_table.reference("kernel")
+        ).graph.G
+        return {
+            "ids": tuple(executable.nodes),
+            "tokens": dict(executable.graph["ssa_identity_tokens"]),
+            "ingestion": dict(executable.graph["ingestion_identity_table"]),
+            "ops": tuple(
+                (
+                    value_id,
+                    data.get("op"),
+                    tuple(data.get("parents") or ()),
+                )
+                for value_id, data in executable.nodes(data=True)
+            ),
+        }
+
+    first = snapshot()
+    second = snapshot()
+    assert first == second
+    assert first["ids"] == tuple(range(len(first["ids"])))
+
+
+def test_unchanged_source_ids_are_stable_across_python_processes():
+    script = r'''
+import ast
+import contextlib
+import io
+import json
+
+from src.common.tensors.topological_reducer import reduce_abstract_tensor_topology
+from src.transmogrifier.graph.graph_express2 import ProcessGraph
+
+source = """
+def kernel(x):
+    signal = x + 1
+    signal = signal * 2
+    return signal
+"""
+graph = ProcessGraph(materialize_memory=False)
+with contextlib.redirect_stdout(io.StringIO()):
+    graph.build_from_ast(ast.parse(source))
+reduce_abstract_tensor_topology(graph)
+executable = graph.function_table.entry(
+    graph.function_table.reference("kernel")
+).graph.G
+print(json.dumps({
+    "ids": list(executable.nodes),
+    "tokens": executable.graph["ssa_identity_tokens"],
+    "ops": [
+        [value_id, str(data.get("op")), list(data.get("parents") or ())]
+        for value_id, data in executable.nodes(data=True)
+    ],
+}, sort_keys=True))
+'''
+    first = subprocess.run(
+        [sys.executable, "-c", script], check=True, capture_output=True,
+        text=True,
+    ).stdout
+    second = subprocess.run(
+        [sys.executable, "-c", script], check=True, capture_output=True,
+        text=True,
+    ).stdout
+
+    assert first == second
+
+
+def test_compiler_token_lexicon_learns_labeled_structural_contexts():
+    context = {
+        "node_kind": "Name",
+        "role": "assignment_target",
+        "target": "Name(id='signal', ctx=Store())",
+        "dependency_shape": ("Input", "Add"),
+    }
+    lexicon = CompilerTokenLexicon().observe_contexts((context,))
+
+    assert "field:role" in lexicon.token_ids
+    assert "value:assignment_target" in lexicon.token_ids
+    assert lexicon.counts["field:role"] == 1
+    assert lexicon.token_id("field:role") == lexicon.token_ids["field:role"]
+    statistics = next(iter(lexicon.context_statistics.values()))
+    assert statistics["count"] == 1
+    assert statistics["token_ids"]
+
+    upgraded = lexicon.upgrade_document({
+        "lexicon_revision": 0,
+        "context": context,
+        "context_token_ids": statistics["token_ids"],
+    })
+    assert upgraded["lexicon_revision"] == lexicon.revision
+    assert upgraded["context_token_ids"] == statistics["token_ids"]
 
 
 def test_schema_guard_constructor_idiom_becomes_one_normalization_operator():

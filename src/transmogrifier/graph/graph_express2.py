@@ -94,6 +94,7 @@ class ProcessGraphAccessor:
 
         return unsubscribe
 
+
 class _RandomFloatQueue(deque):
     """
     Drop-in stand-in for any queue class used elsewhere in ProcessGraph.

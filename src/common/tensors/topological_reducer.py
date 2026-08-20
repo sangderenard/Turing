@@ -6,9 +6,12 @@ import ast
 import builtins
 import copy
 from dataclasses import MISSING, dataclass, fields, is_dataclass
+import hashlib
 import importlib
 import inspect
+import json
 import logging
+import re
 import textwrap
 import types
 from typing import Any, Callable
@@ -18,6 +21,8 @@ import networkx as nx
 from ...compiler.native_compiler_accelerators import (
     lexicographical_topological_order,
 )
+from .abstract_nn.token_encoder import encode_identity_tokens
+from .abstract_nn.token_lexicon import structural_context_tokens
 
 from ...compiler.shell_reference_tables import build_class_navigation_table
 from ...transmogrifier.function_table import (
@@ -885,6 +890,7 @@ def _normalize_lexical_values(
     static_environment: dict[str, _StaticPythonReference] = {}
     deleted_names: set[str] = set()
     identity_bindings: dict[str, list[int]] = {}
+    ingestion_definitions: dict[str, list[tuple[int, dict[str, Any]]]] = {}
     loop_target_bindings_by_ast: dict[int, int] = {}
     static_reference_nodes: dict[tuple[int, str], int] = {}
     first_class_function_nodes: dict[int, int] = {}
@@ -1110,7 +1116,49 @@ def _normalize_lexical_values(
         )
         environment[name] = value
         identity_bindings.setdefault(name, []).append(value)
+        ingestion_definitions.setdefault(name, []).append((value, {}))
         return value
+
+    def record_ingestion_definition(
+        name: str, value: int, target: ast.AST,
+    ) -> None:
+        """Record an authored binding, never a read or SSA-only artifact."""
+
+        value_data = graph.G.nodes.get(int(value), {})
+        dependency_shape = tuple(
+            (str(role), str(graph.G.nodes[parent].get("op", "unknown")))
+            for parent, role in value_data.get("parents", ())
+            if parent in graph.G
+        )
+        source_span = {
+            "line": getattr(target, "lineno", None),
+            "column": getattr(target, "col_offset", None),
+            "end_line": getattr(target, "end_lineno", None),
+            "end_column": getattr(target, "end_col_offset", None),
+        }
+        context = {
+            "spelling": str(name),
+            "node_kind": type(target).__name__,
+            "target": ast.dump(target, include_attributes=False),
+            "producer_op": str(value_data.get("op", "unknown")),
+            "dependency_shape": dependency_shape,
+            "source_span": source_span,
+        }
+        context_tokens = structural_context_tokens(context)
+        ingestion_definitions.setdefault(str(name), []).append((
+            int(value), {
+                **source_span,
+                "context": context,
+                "context_tokens": context_tokens,
+                "context_token_ids": tuple(
+                    encode_identity_tokens({"token": token})
+                    for token in context_tokens
+                ),
+                "context_sha256": hashlib.sha256(
+                    json.dumps(context, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
+            },
+        ))
 
     def static_constant(name: str, value: Any) -> int:
         existing = static_constant_nodes.get(name)
@@ -2259,6 +2307,7 @@ def _normalize_lexical_values(
             static_environment.pop(target.id, None)
             environment[target.id] = value
             identity_bindings.setdefault(target.id, []).append(value)
+            record_ingestion_definition(target.id, value, target)
             _remove_node(graph, id(target))
             return
         if isinstance(target, ast.Attribute):
@@ -2336,6 +2385,7 @@ def _normalize_lexical_values(
                 identity_bindings.setdefault(
                     field_identity, []
                 ).append(node_id)
+                record_ingestion_definition(field_identity, node_id, target)
                 # ``callee_ref``/``method_ref``/``class_ref`` each let a
                 # dependency walk recurse into the thing a node depends on --
                 # a real node reference grounded in the class's own layout,
@@ -3432,8 +3482,9 @@ def _normalize_lexical_values(
             if root in graph.G:
                 _remove_node(graph, root)
 
-    # Stable topological relabeling turns opaque Python object identities into
-    # compact monotonic value IDs without changing the faithfully captured AST.
+    # Stable topological relabeling turns structural token chains into compact
+    # dense value IDs without allowing opaque Python object identities to
+    # participate in the ordering.
     invalid_node_ids = [
         node_id for node_id in graph.G if type(node_id) is not int
     ]
@@ -3451,18 +3502,83 @@ def _normalize_lexical_values(
         "compile-time references must not appear as runtime parent IDs: "
         f"{invalid_parent_ids!r}"
     )
-    source_position = {
-        node_id: (
-            getattr(data.get("expr_obj"), "lineno", -1),
-            getattr(data.get("expr_obj"), "col_offset", -1),
-            str(data.get("type", "")),
-            int(node_id),
+    def stable_token_atom(value: Any) -> str:
+        if isinstance(value, str):
+            address_repr = re.fullmatch(
+                r"<([A-Za-z_][A-Za-z_0-9.]*) object at 0x[0-9A-Fa-f]+>",
+                value,
+            )
+            return (
+                address_repr.group(1)
+                if address_repr is not None else value
+            )
+        if value is None or isinstance(value, (bool, float, int)):
+            return str(value)
+        enum_value = getattr(value, "value", None)
+        if isinstance(enum_value, (bool, float, int, str)):
+            return str(enum_value)
+        value_type = type(value)
+        return f"{value_type.__module__}.{value_type.__qualname__}"
+
+    def node_description(node_id: int) -> dict[str, Any]:
+        data = graph.G.nodes[node_id]
+        expression = data.get("expr_obj")
+        return {
+            "source_span": {
+                "line": getattr(expression, "lineno", -1),
+                "column": getattr(expression, "col_offset", -1),
+                "end_line": getattr(expression, "end_lineno", -1),
+                "end_column": getattr(expression, "end_col_offset", -1),
+            },
+            "ast": (
+                ast.dump(expression, include_attributes=False)
+                if isinstance(expression, ast.AST) else type(expression).__name__
+            ),
+            "type": stable_token_atom(data.get("type", "")),
+            "op": stable_token_atom(data.get("op", "")),
+            "label": stable_token_atom(data.get("label", "")),
+        }
+
+    base_token_chains: dict[int, tuple[str, ...]] = {}
+    for node_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        line = getattr(expression, "lineno", -1)
+        column = getattr(expression, "col_offset", -1)
+        end_line = getattr(expression, "end_lineno", -1)
+        end_column = getattr(expression, "end_col_offset", -1)
+        missing_position = 10**12
+        ordering_prefix = (
+            "priority:0" if str(data.get("type", "")) == "Input" else "priority:1",
+            f"line:{line if line >= 0 else missing_position:012d}",
+            f"column:{column if column >= 0 else missing_position:012d}",
+            f"end_line:{end_line if end_line >= 0 else missing_position:012d}",
+            f"end_column:{end_column if end_column >= 0 else missing_position:012d}",
         )
-        for node_id, data in graph.G.nodes(data=True)
-    }
+        parent_context = tuple(
+            {
+                "role": str(role),
+                "node": node_description(parent_id),
+            }
+            for parent_id, role in data.get("parents", ())
+            if parent_id in graph.G
+        )
+        base_token_chains[node_id] = (
+            *ordering_prefix,
+            *structural_context_tokens({
+                "node": node_description(node_id),
+                "parents": parent_context,
+            }),
+        )
+    chain_versions: dict[tuple[str, ...], int] = {}
+    node_token_chains: dict[int, tuple[str, ...]] = {}
+    for node_id in graph.G.nodes:
+        chain = base_token_chains[node_id]
+        version = chain_versions.get(chain, 0)
+        chain_versions[chain] = version + 1
+        node_token_chains[node_id] = (*chain, f"version:{version}")
     ordered = list(
         lexicographical_topological_order(
-            graph.G, key=lambda node_id: source_position[node_id]
+            graph.G, key=lambda node_id: node_token_chains[node_id]
         )
     )
     mapping = {
@@ -3472,6 +3588,10 @@ def _normalize_lexical_values(
     ordered_graph = nx.DiGraph()
     ordered_graph.graph.update(relabeled.graph)
     ordered_graph.graph["canonical_value_ids"] = True
+    ordered_graph.graph["ssa_identity_tokens"] = {
+        mapping[node_id]: node_token_chains[node_id]
+        for node_id in ordered
+    }
     map_ir = dict(ordered_graph.graph.get("map_ir") or {})
     map_ir["schema_node_ids"] = tuple(
         mapping[node_id]
@@ -3503,6 +3623,33 @@ def _normalize_lexical_values(
             if value_id in mapping
         )
         for name, value_ids in identity_bindings.items()
+    }
+    # Ingestion spelling and SSA definition numbering are separate domains.
+    # ``identity_table`` remains the compact compatibility map used by older
+    # lowering code.  This ledger preserves the original common spelling and
+    # its authored rebinding version before any SSA-only phi/capture/temp
+    # values are introduced.
+    graph.G.graph["ingestion_identity_table"] = {
+        str(name): tuple(
+            {
+                "spelling": str(name),
+                "version": version,
+                "value_id": mapping[value_id],
+                "source_span": {
+                    key: source.get(key)
+                    for key in ("line", "column", "end_line", "end_column")
+                },
+                **({
+                    "context": source["context"],
+                    "context_tokens": source["context_tokens"],
+                    "context_token_ids": source["context_token_ids"],
+                    "context_sha256": source["context_sha256"],
+                } if "context" in source else {}),
+            }
+            for version, (value_id, source) in enumerate(definitions)
+            if value_id in mapping
+        )
+        for name, definitions in ingestion_definitions.items()
     }
     for value_id, data in graph.G.nodes(data=True):
         data["value_id"] = value_id
@@ -5805,6 +5952,13 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         if hasattr(statement, "_python_aggregate_binding_kinds"):
             delattr(statement, "_python_aggregate_binding_kinds")
         function_table.resolve_graph(reference, function_graph)
+    # Function graphs are attached only after the earlier root-graph pass.
+    # Reuse that exact provenance propagation now that every callee body is
+    # available, so a call in a function body retains its returned class.
+    for entry in function_table:
+        entry_graph = getattr(getattr(entry, "graph", None), "G", None)
+        if entry_graph is not None:
+            propagate_returned_receiver_types(entry_graph)
     # External call references and static Python bindings are two views of the
     # same compile-time environment.  Join them once after every call has been
     # declared so compiled shells can invoke imported constructors/functions

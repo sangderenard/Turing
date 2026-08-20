@@ -433,13 +433,13 @@ def assign_hierarchy_ids(
     root: PlanClosure,
     previous: HierarchyValueTable | None = None,
 ) -> tuple[PlanClosure, HierarchyValueTable]:
-    """Assign canonical IDs once and preserve them when a plan is extended.
+    """Assign dense IDs from deterministic scoped-identity token ordering.
 
     ``(closure_id, local_id)`` is a scoped source address, not a second
     runtime identity.  The returned global ID is the one semantic identity
-    used by every later compiler stage.  A refresh may append newly exposed
-    control endpoints, but it must never renumber an endpoint that was
-    already assigned.
+    used by every later compiler stage.  ``previous`` is accepted for API
+    compatibility but never influences the result: unchanged plan structure
+    always produces the same dense IDs without a cache or dispenser.
     """
 
     next_closure = 0
@@ -522,42 +522,25 @@ def assign_hierarchy_ids(
         if left_root != right_root:
             parents[right_root] = left_root
 
-    previous_ids = (
-        {}
-        if previous is None
-        else {
-            (int(scope), int(local)): int(global_id)
-            for scope, local, global_id in previous.correlations
-        }
-    )
-    class_previous_ids: dict[tuple[int, int], set[int]] = {}
+    del previous
+    equivalence_classes: dict[
+        tuple[int, int], list[tuple[int, int]]
+    ] = {}
     for key in keys:
-        if key in previous_ids:
-            class_previous_ids.setdefault(find(key), set()).add(
-                previous_ids[key]
-            )
-    conflicting = {
-        root_key: tuple(sorted(ids))
-        for root_key, ids in class_previous_ids.items()
-        if len(ids) > 1
+        equivalence_classes.setdefault(find(key), []).append(key)
+    class_tokens = {
+        root_key: tuple(sorted(members))
+        for root_key, members in equivalence_classes.items()
     }
-    if conflicting:
-        raise ValueError(
-            "hierarchy refresh attempted to merge previously distinct "
-            f"canonical IDs: {conflicting!r}"
+    root_ids = {
+        root_key: global_id
+        for global_id, root_key in enumerate(
+            sorted(class_tokens, key=lambda item: class_tokens[item])
         )
-
-    root_ids: dict[tuple[int, int], int] = {
-        root_key: next(iter(ids))
-        for root_key, ids in class_previous_ids.items()
     }
-    next_global_id = 1 + max(previous_ids.values(), default=-1)
     correlations = []
     for closure_id, local_id in sorted(keys):
         root_key = find((closure_id, local_id))
-        if root_key not in root_ids:
-            root_ids[root_key] = next_global_id
-            next_global_id += 1
         global_id = root_ids[root_key]
         correlations.append((closure_id, local_id, global_id))
     return planned, HierarchyValueTable(tuple(correlations))
