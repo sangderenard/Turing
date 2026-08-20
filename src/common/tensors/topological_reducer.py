@@ -2795,43 +2795,7 @@ def _normalize_lexical_values(
             else_environment = dict(environment)
             environment.clear()
             environment.update(before)
-            for name in set(before) | set(body_environment) | set(
-                else_environment
-            ):
-                body_value = body_environment.get(name, before.get(name))
-                else_value = else_environment.get(name, before.get(name))
-                if body_value == else_value:
-                    if body_value is not None:
-                        environment[name] = body_value
-                    continue
-                if (
-                    isinstance(test_value, int)
-                    and isinstance(body_value, int)
-                    and isinstance(else_value, int)
-                ):
-                    merged_value = new_node(
-                        "Phi",
-                        name,
-                        attributes={
-                            "binding_name": name,
-                            "source_conditional_id": id(body_statement),
-                        },
-                        parents=(
-                            (test_value, "test"),
-                            (body_value, "body"),
-                            (else_value, "orelse"),
-                        ),
-                    )
-                    environment[name] = merged_value
-                    # The identity history is the authoritative lexical
-                    # version chain used by conditional-control lowering.
-                    # Omitting the merge made a nested branch's continuation
-                    # visible to later expressions but invisible to the
-                    # control overlay, so no executable Phi was emitted for
-                    # either the inner or enclosing conditional.
-                    identity_bindings.setdefault(name, []).append(
-                        merged_value
-                    )
+
             def terminal_branch(statements: list[ast.stmt]) -> bool:
                 if not statements:
                     return False
@@ -2846,12 +2810,66 @@ def _normalize_lexical_values(
                     )
                 )
 
+            body_terminal = terminal_branch(body_statement.body)
+            else_terminal = terminal_branch(body_statement.orelse)
+            # A guard clause -- `if cond: body else: raise` or its mirror --
+            # has only one arm that can ever reach the statement after the
+            # if.  The other arm's bindings (an old value the raising arm
+            # never rebinds, or a value the raising arm never gets to use)
+            # are not an alternative the merge point can observe; inventing
+            # a Phi between them and the live arm's value merges a value
+            # that no execution ever actually produces on that edge, which
+            # a downstream backend then has no real producer for.  Skip the
+            # merge and let the single reachable arm's environment stand.
+            if body_terminal and not else_terminal:
+                environment.update(else_environment)
+            elif else_terminal and not body_terminal:
+                environment.update(body_environment)
+            else:
+                for name in set(before) | set(body_environment) | set(
+                    else_environment
+                ):
+                    body_value = body_environment.get(name, before.get(name))
+                    else_value = else_environment.get(name, before.get(name))
+                    if body_value == else_value:
+                        if body_value is not None:
+                            environment[name] = body_value
+                        continue
+                    if (
+                        isinstance(test_value, int)
+                        and isinstance(body_value, int)
+                        and isinstance(else_value, int)
+                    ):
+                        merged_value = new_node(
+                            "Phi",
+                            name,
+                            attributes={
+                                "binding_name": name,
+                                "source_conditional_id": id(body_statement),
+                            },
+                            parents=(
+                                (test_value, "test"),
+                                (body_value, "body"),
+                                (else_value, "orelse"),
+                            ),
+                        )
+                        environment[name] = merged_value
+                        # The identity history is the authoritative lexical
+                        # version chain used by conditional-control lowering.
+                        # Omitting the merge made a nested branch's continuation
+                        # visible to later expressions but invisible to the
+                        # control overlay, so no executable Phi was emitted for
+                        # either the inner or enclosing conditional.
+                        identity_bindings.setdefault(name, []).append(
+                            merged_value
+                        )
+
             if (
                 isinstance(test_value, int)
                 and isinstance(body_result, int)
                 and isinstance(else_result, int)
-                and terminal_branch(body_statement.body)
-                and terminal_branch(body_statement.orelse)
+                and body_terminal
+                and else_terminal
                 and id(body_statement) in graph.G
             ):
                 _replace_inputs(

@@ -3129,24 +3129,41 @@ def analyze_shader_loop_reductions(
         # including when it is lexically inside a retained loop.  Record it at
         # its source position so it runs on every iteration, not once after the
         # loop.  Other Raise shapes remain blockers.
+        #
+        # The mirror shape -- `if cond: body else: raise` -- is the same
+        # guard clause with the branches swapped: the loop's real work is
+        # the non-raising arm, reached only once the raise is proven
+        # unreachable this iteration.  The reducer no longer merges a Phi
+        # across an if where exactly one arm is a dead end (see the
+        # terminal-branch skip in topological_reducer.py's ast.If
+        # handling), so validating the raise here is enough on its own to
+        # make the whole statement compile.
         validations: list[tuple[int, int, bool]] = []
         validated_raise_signatures: set[tuple[Any, ...]] = set()
         for node_id in loop.body_nodes:
             if node_id not in graph.G:
                 continue
             statement = graph.G.nodes[node_id].get("expr_obj")
-            if not (
-                isinstance(statement, ast.If)
-                and statement.body
-                and all(isinstance(item, ast.Raise) for item in statement.body)
-                and not statement.orelse
-            ):
+            if not isinstance(statement, ast.If):
+                continue
+            body_is_raise = bool(statement.body) and all(
+                isinstance(item, ast.Raise) for item in statement.body
+            )
+            orelse_is_raise = bool(statement.orelse) and all(
+                isinstance(item, ast.Raise) for item in statement.orelse
+            )
+            if body_is_raise and not statement.orelse:
+                raise_items = statement.body
+                raises_when_true = True
+            elif orelse_is_raise and not body_is_raise:
+                raise_items = statement.orelse
+                raises_when_true = False
+            else:
                 continue
             test = statement.test
-            raises_when_true = True
             if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
                 test = test.operand
-                raises_when_true = False
+                raises_when_true = not raises_when_true
             predicate_id = node_for_expression(test)
             if predicate_id is None:
                 continue
@@ -3156,7 +3173,7 @@ def analyze_shader_loop_reductions(
                 not raises_when_true,
             ))
             validated_raise_signatures.update(
-                expression_signature(item) for item in statement.body
+                expression_signature(item) for item in raise_items
             )
         def earliest_member(index: int) -> int:
             return min(

@@ -732,6 +732,87 @@ step, so the safety net's detection is only ever removed at the exact
 moment something else has taken over its job — never as a side effect
 landed on its own.
 
+## 6l. The actually-elegant fix: skip the merge instead of inventing a
+## value for it -- implemented, verified, and it works on the real target
+
+The owner pushed back on 6k's revert: raise's behavior is deeply tied to
+containment of failures ("shells") and to getting the loop's *other*
+paths ("logical pathing") working -- asked for something more elegant,
+or a raise-specific special case, rather than generic value-carrying
+machinery.
+
+**The actually-elegant fix does not touch raise's representation at
+all.** `_compile`'s pattern -- `if cond: body else: raise` -- is a
+guard clause. The raising arm can never reach the statement after the
+`if`: there is no real alternative for the Phi to merge, because no
+execution ever produces a value on that edge. The existing
+`terminal_branch` helper in `topological_reducer.py`'s `ast.If` case
+already recognized this idea, but only fired the "no merge needed"
+special-case when **both** arms terminate. One-arm-terminates is the
+far more common shape and it fell through to the ordinary Phi merge,
+inventing a Phi input on an edge control can never take -- which is
+exactly what starved emission of a producer for "value 9" in 6k.
+
+**The fix (two small, symmetric pieces, landed together):**
+
+1. `topological_reducer.py`'s `ast.If` reduction: moved `terminal_branch`
+   above the merge loop and compute `body_terminal`/`else_terminal`
+   before merging. If exactly one arm is terminal, skip the Phi loop
+   entirely and let the surviving arm's environment stand unmerged --
+   the same way the pre-existing "equal value, skip the Phi" shortcut
+   already worked, just generalized to "the other value was never
+   reachable" instead of "the other value happens to be identical".
+   Both-terminal and neither-terminal behavior is untouched.
+2. `loop_composer.py`'s validated-raise carve-out (previously: only
+   `if cond: raise` with no `orelse`) now also recognizes the mirror
+   shape -- `if cond: body else: raise` -- and lowers the raise to the
+   same `ValidationBlock` abort gate already tested and shipped for the
+   original shape. No new control-flow representation; it is the exact
+   mechanism 6h/6i's "other Raise shapes remain blockers" comment always
+   pointed at, just widened to match the pattern the reducer now leaves
+   it.
+
+**Verified, not assumed:**
+* The minimal probe from §6i now compiles cleanly (`complete: True`, no
+  shortfalls) with real `loop_header`/`loop_body`/`loop_latch` blocks
+  AND a `validation_pass`/`validation_fail` abort gate -- both present,
+  neither dropped.
+* Hand-traced the emitted Fortran: the true arm computes `total + 1.0`
+  and loops; the false arm's `error stop 12` fires before the loop latch
+  is ever reached, so the stale carried value on that edge is never
+  read. `w=1.0,n=3` -> `4.0`; `w=-1.0,n=3` -> aborts on iteration 1.
+  Both match the source's Python semantics exactly.
+* The full local gate (74 tests) plus `test_loop_composer.py`,
+  `test_control_ir_backends.py`, and `test_ssa_fortran_and_optimizing_llvm.py`
+  all pass except one pre-existing, unrelated failure
+  (`test_python_float_is_scalar_extraction_from_a_resident_array`,
+  which builds `SSAValue`/`Function` objects directly and never reaches
+  either edited file).
+* `tests/test_orphaned_loop_refusal.py` rewritten: the guard-clause case
+  now asserts a clean compile with both loop and validation blocks
+  present; a NEW bare-raise-with-no-guard-if case (nothing recognizes
+  it) pins that the orphaned-loop refusal still fires for shapes that
+  really are still blockers, so the safety net stays alive for the
+  cases it was built for.
+* **Run against the real target.** `tools/compile_re_probe.py` no
+  longer hits the raise blocker at all -- `_compile`'s loop (node 431,
+  51 body regions) composes straight through it. The probe now fails
+  much further downstream, at a genuinely new and unrelated wall:
+  `overlay_scheduled_control`'s `nested_root` raises "nested control's
+  regions span 3 sequence scopes of the parent" -- a disagreement
+  between the schedule and the conditional compartments over which of
+  two nested loops (iteration_317, iteration_322) owns regions 37 and
+  53. This is a nested-loop region-ownership conflict, unrelated to
+  raise, and is the next wall for whoever picks this up.
+
+Not yet done: `_parse`'s four raises at varying depths and
+`_compile_charset`'s 5-deep case (the other shapes measured in §6h)
+have not been individually re-measured against this fix -- only
+`_compile`'s pattern (the one this session traced end to end) is
+confirmed. The reducer/loop-composer change is shape-general (any
+single-terminal-arm `if`, any depth), so there is reason to expect the
+others compose too, but that is an expectation, not a measurement.
+
 ## 7. Working rules, re-earned this session
 
 * The soft-read trap is real and it recurs: an unobservable id read as
