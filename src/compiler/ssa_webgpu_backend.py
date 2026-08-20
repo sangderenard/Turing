@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -32,8 +33,8 @@ _BINARY: dict[str, str] = {
     "equal": "f32({0} == {1})", "not_equal": "f32({0} != {1})",
     "less": "f32({0} < {1})", "less_equal": "f32({0} <= {1})",
     "greater": "f32({0} > {1})", "greater_equal": "f32({0} >= {1})",
-    "logical_and": "f32(bool({0}) && bool({1}))",
-    "logical_or": "f32(bool({0}) || bool({1}))",
+    "logical_and": "select(0.0f, 1.0f, ({0} != 0.0f) && ({1} != 0.0f))",
+    "logical_or": "select(0.0f, 1.0f, ({0} != 0.0f) || ({1} != 0.0f))",
     "bitand": "bitcast<f32>(bitcast<u32>({0}) & bitcast<u32>({1}))",
     "bitor": "bitcast<f32>(bitcast<u32>({0}) | bitcast<u32>({1}))",
     "bitxor": "bitcast<f32>(bitcast<u32>({0}) ^ bitcast<u32>({1}))",
@@ -48,7 +49,7 @@ _UNARY: dict[str, str] = {
     "acos": "acos({0})", "atan": "atan({0})", "sinh": "sinh({0})",
     "cosh": "cosh({0})", "tanh": "tanh({0})", "floor": "floor({0})",
     "ceil": "ceil({0})", "round": "round({0})", "trunc": "trunc({0})",
-    "sign": "sign({0})", "logical_not": "f32(!bool({0}))",
+    "sign": "sign({0})", "logical_not": "select(0.0f, 1.0f, {0} == 0.0f)",
     "invert": "bitcast<f32>(~bitcast<u32>({0}))", "copy": "{0}",
     "bool_to_float64": "f32({0})",
 }
@@ -76,6 +77,17 @@ def supported_tensor_operations() -> frozenset[str]:
 
     registered = frozenset(_BINARY) | frozenset(_UNARY) | _SHAPE_ONLY
     return frozenset(registered & CANONICAL_ABSTRACT_TENSOR_OPERATORS)
+
+
+def benchmarkable_tensor_operations() -> Mapping[str, int]:
+    """Return the executable elementwise vocabulary and each operation's arity."""
+
+    supported = supported_tensor_operations()
+    return {
+        operation: 2 if operation in _BINARY else 1
+        for operation in sorted(supported)
+        if operation in _BINARY or operation in _UNARY
+    }
 
 
 @dataclass(frozen=True)
@@ -739,8 +751,185 @@ def emit_module(
     )
 
 
+def emit_gemm_module(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    variant: str = "webgpu_tiled_gemm",
+    tile: int = 16,
+) -> WGSLModule:
+    """Emit one specialized WebGPU GEMM deployment from the BLAS role.
+
+    Both variants retain the same humble ``blas.gemm`` source authority.  The
+    tiled form is a backend identity: it changes work/memory topology, not the
+    mathematical role or its parameter ABI.
+    """
+
+    m, n, k, tile = map(int, (m, n, k, tile))
+    if min(m, n, k) <= 0:
+        raise ValueError("WebGPU GEMM dimensions must be positive")
+    if variant not in {"source_algorithm", "webgpu_tiled_gemm"}:
+        raise ValueError(f"unsupported WebGPU GEMM variant {variant!r}")
+    if tile <= 0 or tile * tile > 256:
+        raise ValueError("WebGPU GEMM tile must be positive and at most 256 lanes")
+
+    from ..common.tensors.blas import blas_role
+    from .compiled_program_api import CompiledProgramAPI, EntryPoint
+    from .shader_component_abi import component_abi_from_layout
+    from .shader_stages import COMPUTE, BufferBinding, ShaderIOLayout
+
+    role = blas_role("gemm")
+    bindings = """@group(0) @binding(0) var<storage, read> feed_A: array<f32>;
+@group(0) @binding(1) var<storage, read> feed_B: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output_C: array<f32>;"""
+    if variant == "source_algorithm":
+        local = min(256, max(1, tile * tile))
+        count = m * n
+        launch_plan = plan_wgsl_launch(count, preferred_local_size=local)
+        groups = launch_plan.groups
+        source = f"""{bindings}
+
+@compute @workgroup_size({launch_plan.workgroup_size[0]}, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) grid: vec3<u32>) {{
+  let linear_index = gid.x + gid.y * grid.x * {launch_plan.workgroup_size[0]}u;
+  if (linear_index >= {count}u) {{ return; }}
+  let row = linear_index / {n}u;
+  let column = linear_index % {n}u;
+  var sum = 0.0f;
+  for (var p = 0u; p < {k}u; p += 1u) {{
+    sum += feed_A[row * {k}u + p] * feed_B[p * {n}u + column];
+  }}
+  output_C[linear_index] = sum;
+}}
+"""
+        mapping = "one invocation per output element; source p-loop retained"
+    else:
+        groups = ((n + tile - 1) // tile, (m + tile - 1) // tile, 1)
+        launch_plan = WGSLLaunchPlan(
+            m * n, (tile, tile, 1), groups,
+        )
+        source = f"""{bindings}
+
+var<workgroup> tile_A: array<f32, {tile * tile}>;
+var<workgroup> tile_B: array<f32, {tile * tile}>;
+
+@compute @workgroup_size({tile}, {tile}, 1)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {{
+  let row = wid.y * {tile}u + lid.y;
+  let column = wid.x * {tile}u + lid.x;
+  let lane = lid.y * {tile}u + lid.x;
+  var sum = 0.0f;
+  for (var base = 0u; base < {k}u; base += {tile}u) {{
+    let a_column = base + lid.x;
+    let b_row = base + lid.y;
+    tile_A[lane] = 0.0f;
+    tile_B[lane] = 0.0f;
+    if (row < {m}u && a_column < {k}u) {{
+      tile_A[lane] = feed_A[row * {k}u + a_column];
+    }}
+    if (b_row < {k}u && column < {n}u) {{
+      tile_B[lane] = feed_B[b_row * {n}u + column];
+    }}
+    workgroupBarrier();
+    for (var inner = 0u; inner < {tile}u; inner += 1u) {{
+      sum += tile_A[lid.y * {tile}u + inner]
+           * tile_B[inner * {tile}u + lid.x];
+    }}
+    workgroupBarrier();
+  }}
+  if (row < {m}u && column < {n}u) {{
+    output_C[row * {n}u + column] = sum;
+  }}
+}}
+"""
+        mapping = "one workgroup per output tile; A/B promoted through shared tiles"
+
+    io_layout = ShaderIOLayout(
+        COMPUTE.name,
+        feeds=(
+            BufferBinding("feed_A", "feed", "f32", 0),
+            BufferBinding("feed_B", "feed", "f32", 1),
+        ),
+        outputs=(BufferBinding("output_C", "output", "f32", 2),),
+    )
+    name = f"blas_gemm_{variant}_{m}_{n}_{k}"
+    component_abi = component_abi_from_layout(
+        name, "wgsl", io_layout,
+        decorations={
+            "execution_model": "compute",
+            "workgroup_size": launch_plan.workgroup_size,
+            "sentinel_policy": "validate-before-dispatch/publish-after-dispatch",
+        },
+    )
+    identity = {
+        "identity": "webgpu_tiled_gemm",
+        "applied": variant == "webgpu_tiled_gemm",
+        "role": role.identity,
+        "mapping": mapping,
+    }
+    metadata = {
+        "execution_model": "compute",
+        "storage": "WebGPU storage buffers",
+        "workgroup_size": launch_plan.workgroup_size,
+        "dispatch_workgroups": groups,
+        "count": m * n,
+        "stage": COMPUTE.name,
+        "io_layout": io_layout.to_mapping(),
+        "component_abi": component_abi.to_mapping(),
+        "role": role.identity,
+        "role_source_sha256": hashlib.sha256(role.source.encode("utf-8")).hexdigest(),
+        "variant": variant,
+        "problem_shape": {"m": m, "n": n, "k": k},
+        "backend_identities": [identity],
+    }
+    api = CompiledProgramAPI(
+        module=name, language="wgsl", entry="main",
+        entry_points=(EntryPoint("main", "main", "numerical"),),
+        metadata=metadata,
+    )
+    return WGSLModule(
+        name, source, True, (), api, launch_plan,
+        io_layout, component_abi, (identity,),
+    )
+
+
+def emit_operator_module(operation: str, count: int) -> WGSLModule:
+    """Emit one benchmarkable AbstractTensor operation through shared SSA."""
+
+    vocabulary = benchmarkable_tensor_operations()
+    if operation not in vocabulary:
+        raise ValueError(f"operation {operation!r} is not benchmarkable on WebGPU")
+    count = int(count)
+    if count <= 0:
+        raise ValueError("WebGPU operator element count must be positive")
+    arity = vocabulary[operation]
+    args = [SSAValue(index + 1, "float32") for index in range(arity)]
+    result = SSAValue(arity + 1, "float32")
+    function = Function(
+        operation,
+        args,
+        {"entry": BasicBlock("entry", [
+            Instr(
+                operation, args, result,
+                attributes={"tensor_operation": operation},
+            ),
+            Instr("Ret", [result], None),
+        ])},
+    )
+    return emit_module(
+        IRModule({operation: function}),
+        name=f"abstract_tensor_{operation}_{count}",
+        outputs={operation: (result,)},
+        count=count,
+    )
+
+
 __all__ = [
     "WGSLComputeLimits", "WGSLEmissionError", "WGSLLaunchPlan", "WGSLModule", "WGSLShortfall",
-    "emit_module", "plan_gemm_matrix_deployment", "plan_wgsl_launch",
+    "benchmarkable_tensor_operations", "emit_gemm_module", "emit_module",
+    "emit_operator_module", "plan_gemm_matrix_deployment", "plan_wgsl_launch",
     "supported_tensor_operations",
 ]

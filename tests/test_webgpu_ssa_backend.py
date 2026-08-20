@@ -10,7 +10,10 @@ from src.compiler.precompile_to_ssa import (
     lower_precompile_and_control_to_ssa,
 )
 from src.compiler.ssa_webgpu_backend import (
+    benchmarkable_tensor_operations,
+    emit_gemm_module,
     emit_module,
+    emit_operator_module,
     plan_gemm_matrix_deployment,
     plan_wgsl_launch,
 )
@@ -263,3 +266,36 @@ def test_webgpu_reads_the_prebaked_matrix_without_rewriting_it():
     assert interpreted.lane_count == 6
     assert interpreted.calls_per_lane == (1,) * 6
     assert interpreted.choice.compute.count == 6
+
+
+def test_every_advertised_benchmark_operation_is_complete_wgsl():
+    vocabulary = benchmarkable_tensor_operations()
+    assert {"add", "mul", "sqrt", "logical_and", "bitxor"} <= vocabulary.keys()
+
+    for operation in vocabulary:
+        artifact = emit_operator_module(operation, 256)
+        assert artifact.complete, (operation, artifact.shortfalls)
+        assert "@compute" in artifact.source
+        assert "output_0[linear_index]" in artifact.source
+    logical = emit_operator_module("logical_and", 256).source
+    assert "select(0.0f, 1.0f" in logical
+    assert "bool(" not in logical
+
+
+def test_webgpu_gemm_variants_share_the_role_and_abi_but_change_topology():
+    source = emit_gemm_module(65, 33, 17, variant="source_algorithm")
+    tiled = emit_gemm_module(65, 33, 17, variant="webgpu_tiled_gemm")
+    source_meta = source.api.to_mapping()["metadata"]
+    tiled_meta = tiled.api.to_mapping()["metadata"]
+
+    assert source.complete and tiled.complete
+    assert source_meta["role"] == tiled_meta["role"] == "blas.gemm"
+    assert source_meta["role_source_sha256"] == tiled_meta["role_source_sha256"]
+    assert source_meta["io_layout"] == tiled_meta["io_layout"]
+    assert "for (var p = 0u" in source.source
+    assert "var<workgroup> tile_A" in tiled.source
+    assert "workgroupBarrier()" in tiled.source
+    assert tiled.launch_plan.workgroup_size == (16, 16, 1)
+    assert tiled.launch_plan.groups == (3, 5, 1)
+    assert not source_meta["backend_identities"][0]["applied"]
+    assert tiled_meta["backend_identities"][0]["applied"]
