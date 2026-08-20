@@ -548,6 +548,52 @@ directly next time.
   reversible-machine instrument from §6c) — do not treat "it compiles"
   as "the abort semantics are correct."
 
+## 6i. Following §6h's own verification order surfaced a worse, more
+## urgent bug than the one it was scoped to fix — closed (commit ``7825a27``)
+
+Followed the plan exactly: built the smallest authored probe first. It
+did NOT hit the documented refusal. It compiled — `complete: True`, no
+shortfall, the Python materializer accepted it with no refusal — and
+ran to a plausible but WRONG answer. Isolated precisely (a control
+probe with the raise replaced by benign work composes a real loop
+normally, confirming `raise` specifically was the cause): a blocked
+loop's own construct (`control_program is None`) was silently excluded
+from `prepare_graph_precompile`'s `considered_reductions`, but its body
+regions stayed in the flat schedule with nothing checking that their
+owning loop had actually composed. The regions just ran once, unlooped;
+the `raise` statement itself was dropped with no trace. Checked and
+ruled out as a work-contract escape hatch: identical under `prove`, the
+strictest preset.
+
+**This was a live silent-wrongness bug reachable by any authored loop
+with real blockers, not specific to `re`.** Fixed by refusing loudly
+the moment a blocked loop's regions are found still scheduled, naming
+the loop id, its exact regions, and its blockers
+(`glsl_deployment_strategy.py`, `prepare_graph_precompile`). Verified:
+the benign control case is unaffected, the ~40s gate (72 passed) and
+full scorecard (17/19) are unchanged, and — the real payoff — `re`'s
+own main loop (node 431, 51 regions, exactly the loop §6g/6h already
+named) now hits this refusal immediately, before ever reaching the
+conditional overlay. **`re`'s closure was exposed to this same silent-
+wrongness risk all along**, not merely the "duplicated regions" crash
+Task D made legible — that crash was a coincidence of this specific
+program's markers scattering across multiple scopes; a program whose
+markers didn't scatter would have compiled silently wrong, exactly like
+the two-line probe did.
+
+**Net effect on §6h's plan**: unchanged in shape, safer to attempt now.
+The two-piece raise-composition feature (loop-composer blocker
+exemption + `Raise` statement lowering in conditional arms, reusing the
+existing `turing_validation_error` abort call) is still the way to make
+`re`'s loops actually compose instead of refuse. What changed is the
+floor under it: before this fix, a mistake in that feature could have
+made a REFUSING program start silently compiling wrong instead (the
+worst regression shape). Now the orphaned-loop guard stands between any
+such mistake and a silent wrong answer — a bug in the raise-lowering
+piece is far more likely to surface as a loud refusal or an obviously
+wrong scorecard result than to slip through unnoticed. Still worth the
+same fresh-session care §6h asked for; the safety margin is just wider.
+
 ## 7. Working rules, re-earned this session
 
 * The soft-read trap is real and it recurs: an unobservable id read as
