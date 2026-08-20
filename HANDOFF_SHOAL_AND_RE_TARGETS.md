@@ -594,6 +594,60 @@ piece is far more likely to surface as a loud refusal or an obviously
 wrong scorecard result than to slip through unnoticed. Still worth the
 same fresh-session care §6h asked for; the safety margin is just wider.
 
+## 6j. §6h's "two pieces" undersold the real depth — found before writing
+## any of piece 2, not implemented
+
+Started piece 1 (exempt the loop-composer's blocker for a `Raise` sitting
+in an otherwise-composable conditional's terminal arm) and stopped before
+writing it, having found the actual blocker one layer deeper than either
+§6h or the original §6g described.
+
+**The conflation, precisely.** `_ordinary_conditional_control_programs`
+(`glsl_deployment_strategy.py` ~6074) builds a `ConditionalBlock`'s
+`orelse` from `else_regions` — the set of scheduled NUMERICAL regions
+whose deployment nodes fall in the branch-compartment analysis's
+`"orelse"` role:
+
+```python
+orelse = (
+    SequenceBlock(tuple(StatementBlock(...) for index in else_regions))
+    if else_regions else None
+)
+```
+
+A `raise` computes no value and gets no scheduled region — for a
+raise-only `else`, `else_regions` is the empty tuple, so `orelse = None`.
+**That is structurally identical to an authored `if cond: body` with no
+`else` clause at all.** The two meanings — "there genuinely is no else"
+(fall through, keep the pre-if value) and "the else aborts" (never fall
+through, the pre-if value is never valid past this point) — are not
+distinguished anywhere in the region-scheduling layer. `lower_conditional`
+downstream cannot tell them apart because the information was already
+lost before it ever runs.
+
+**This is why §6h's "add a `Raise` case to conditional-arm statement
+lowering" undersold the work.** There is no arm left by the time
+statement lowering would run — an abort-only arm has already been
+reduced to `None`, same as "absent." Making this real needs a
+representation for "this arm aborts" that survives from wherever
+`_branch_compartments`/deployment classification first sees the raise,
+through `ConditionalBlock` (a new field, or a sentinel `orelse` distinct
+from `None` and from `SequenceBlock(())`), to the lowering (which must
+then skip the merge-Phi's orelse contribution entirely rather than
+supplying the topological_reducer's phantom pre-if placeholder — that
+placeholder was fine as an inert, unread value; it is NOT fine as
+"the value control lowering emits code to produce" if lowering ever
+tries to materialize it for the abort arm).
+
+**Net**: this is genuinely the multi-layer design work §6g originally
+called it, not the two-file "add a case" §6h re-scoped it to after
+finding the abort-CALL machinery already existed (which is still true
+and still reusable — `turing_validation_error` is real and unaffected
+by any of this; only the ARM-REPRESENTATION problem is deeper than
+assumed). Not attempted further this pass. The orphaned-loop refusal
+from §6i still stands as the safety net regardless of when this is
+tackled.
+
 ## 7. Working rules, re-earned this session
 
 * The soft-read trap is real and it recurs: an unobservable id read as
