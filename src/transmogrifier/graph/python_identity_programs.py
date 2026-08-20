@@ -118,9 +118,15 @@ PYTHON_IDENTITY_PROGRAMS: tuple[PythonIdentityProgram, ...] = (
         "src.common.tensors.abstraction.AbstractTensor.__matmul__",
         "src.common.tensors.abstraction.AbstractTensor.__rmatmul__",
         "src.common.tensors.abstraction.AbstractTensor.__imatmul__",
+        "src.common.tensors.abstraction_methods.blas.matmul",
+        "src.common.tensors.abstraction_methods.blas.rmatmul",
+        "src.common.tensors.abstraction_methods.blas.imatmul",
         operator="matmul", inputs=("$receiver", "$arg0"),
         attributes={
-            "semantic_library": "abstract_tensor_blas",
+            "semantic_library": "src.common.tensors.blas",
+            "semantic_kernel": "gemm",
+            "semantic_source_symbol": "GEMM_SOURCE",
+            "semantic_parameters": {"alpha": 1.0, "beta": 0.0},
             "backend_intrinsic_family": "blas.gemm",
         },
         description=(

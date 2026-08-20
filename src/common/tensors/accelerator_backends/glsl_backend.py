@@ -111,6 +111,7 @@ __all__ = [
     "emit_slice_axis_source",
     "emit_matmul_source",
     "glslblas_gemm",
+    "execute_backend_intrinsic",
     "emit_permute_source",
     "emit_repeat_source",
     "emit_reduce_source",
@@ -8408,6 +8409,53 @@ def glslblas_gemm(left: Any, right: Any, *, reverse: bool = False) -> GLChunk:
     return matmul_chunks(left, right, reverse=reverse)
 
 
+def execute_backend_intrinsic(
+    instruction: Any,
+    values: Mapping[int, Any],
+    *,
+    gestalt_overrides: Mapping[str, Any] | None = None,
+) -> Any:
+    """Consume one GLSL-qualified repository-SSA intrinsic boundary.
+
+    ``values`` is keyed by deterministic SSA value id.  A deployment gestalt
+    may replace a qualified location with its own callable explicitly; absent
+    that override, only backend locations owned by this module are accepted.
+    """
+
+    if str(getattr(instruction, "op", "")) != "BackendIntrinsic":
+        raise ValueError("GLSL intrinsic execution requires BackendIntrinsic SSA")
+    record = dict(getattr(instruction, "attributes", {}).get(
+        "backend_intrinsic"
+    ) or {})
+    if record.get("backend") != "glsl":
+        raise ValueError(
+            f"GLSL cannot consume intrinsic for backend {record.get('backend')!r}"
+        )
+    location = str(record.get("location") or "")
+    builtin_location = (
+        "src.common.tensors.accelerator_backends.glsl_backend:"
+        "glslblas_gemm"
+    )
+    handlers = {builtin_location: glslblas_gemm}
+    handlers.update(dict(gestalt_overrides or {}))
+    handler = handlers.get(location)
+    if handler is None:
+        raise KeyError(f"no GLSL deployment intrinsic is installed at {location!r}")
+    positions = tuple(map(int, record.get("operand_positions") or ()))
+    arguments = []
+    for position in positions:
+        try:
+            value_id = int(instruction.args[position].id)
+        except (IndexError, AttributeError) as error:
+            raise ValueError(
+                f"intrinsic operand position {position} is absent"
+            ) from error
+        if value_id not in values:
+            raise KeyError(f"missing GLSL intrinsic operand value {value_id}")
+        arguments.append(values[value_id])
+    return handler(*arguments)
+
+
 def repeat_chunk(
     chunk: GLChunk,
     repeats: Any,
@@ -8778,7 +8826,11 @@ def execute_captured_fused_program(
             int(step.attrs.get("dim", 0)),
         )
     elif kind == "matmul":
-        result = matmul_chunks(input_chunks[0], input_chunks[1])
+        # The captured ProcessGraph is the orchestration gestalt.  Its
+        # canonical matmul boundary resolves to the same named intrinsic as
+        # the repository-SSA backend identity library, rather than bypassing
+        # that identity by calling the implementation helper directly.
+        result = glslblas_gemm(input_chunks[0], input_chunks[1])
     elif kind == "index_select":
         result = index_select_chunk(
             input_chunks[0],

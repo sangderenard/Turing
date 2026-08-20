@@ -2452,8 +2452,10 @@ class AbstractTensor:
         return lambda result: result
 
     def matmul(self, other: AbstractTensor) -> AbstractTensor:
-        """Matrix multiplication."""
-        return self._apply_operator("matmul", self, other)
+        """Matrix multiplication through the compiler-owned BLAS semantic seam."""
+        from .abstraction_methods.blas import matmul
+
+        return matmul(self, other)
 
     def _apply_operator(self, op: str, left: Any, right: Any):
         """
@@ -2619,7 +2621,9 @@ class AbstractTensor:
         return self._apply_operator("pow", self, other)
 
     def __matmul__(self, other):
-        return self._apply_operator("matmul", self, other)
+        from .abstraction_methods.blas import matmul
+
+        return matmul(self, other)
 
     def __eq__(self, other):
         return self.equal(other)
@@ -2662,7 +2666,9 @@ class AbstractTensor:
         return self._apply_operator("pow", other, self)
 
     def __rmatmul__(self, other):
-        return self._apply_operator("matmul", other, self)
+        from .abstraction_methods.blas import rmatmul
+
+        return rmatmul(self, other)
 
     # In-place operators
     def __iadd__(self, other):
@@ -2687,7 +2693,9 @@ class AbstractTensor:
         return self._apply_operator("ipow", self, other)
 
     def __imatmul__(self, other):
-        return self._apply_operator("imatmul", self, other)
+        from .abstraction_methods.blas import imatmul
+
+        return imatmul(self, other)
 
     # --- Indexing helpers ---
     def __getitem__(self, idx):

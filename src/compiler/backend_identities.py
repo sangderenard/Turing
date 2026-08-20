@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from ..transmogrifier.ssa import IRModule, SSAValue
+from .backend_intrinsics import BackendIntrinsicTarget, resolve_backend_intrinsic
 
 
 @dataclass(frozen=True)
@@ -65,8 +66,31 @@ def _dtype_topology(module: IRModule) -> tuple[tuple[str, int, str], ...]:
 
 
 def _topology_sha(module: IRModule) -> str:
+    instructions = []
+    for function_name, function in module.functions.items():
+        for block_name, block in function.blocks.items():
+            for index, instruction in enumerate(block.instrs):
+                intrinsic = instruction.attributes.get("backend_intrinsic")
+                instructions.append((
+                    str(function_name),
+                    str(block_name),
+                    int(index),
+                    str(instruction.op),
+                    tuple(int(value.id) for value in instruction.args),
+                    None if instruction.res is None else int(instruction.res.id),
+                    str(instruction.attributes.get("callee") or ""),
+                    (
+                        str(intrinsic.get("location") or "")
+                        if isinstance(intrinsic, Mapping) else ""
+                    ),
+                ))
     payload = json.dumps(
-        _dtype_topology(module), separators=(",", ":"),
+        {
+            "values": _dtype_topology(module),
+            "instructions": instructions,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
@@ -92,6 +116,98 @@ def _rewrite_output_values(
             by_id.get(int(value.id), copy.deepcopy(value)) for value in values
         )
     return rewritten
+
+
+def _backend_intrinsic_swaps(
+    module: IRModule,
+    outputs: Mapping[str, Sequence[SSAValue]],
+    *,
+    backend: str,
+    overrides: Mapping[
+        str, BackendIntrinsicTarget | Mapping[str, Any]
+    ] | None,
+) -> tuple[
+    IRModule,
+    dict[str, tuple[SSAValue, ...]],
+    BackendIdentityDecision | None,
+]:
+    """Swap flagged semantic calls to a backend-owned intrinsic identity."""
+
+    candidates = []
+    for function_name, function in module.functions.items():
+        for block_name, block in function.blocks.items():
+            for index, instruction in enumerate(block.instrs):
+                candidate = instruction.attributes.get(
+                    "backend_intrinsic_candidate"
+                )
+                family = instruction.attributes.get(
+                    "backend_intrinsic_family"
+                )
+                if not isinstance(candidate, Mapping) or not family:
+                    continue
+                candidates.append((
+                    str(function_name), str(block_name), index,
+                    str(family), dict(candidate),
+                ))
+    if not candidates:
+        return module, _rewrite_output_values(module, outputs), None
+
+    before = _topology_sha(module)
+    transformed = copy.deepcopy(module)
+    applied = 0
+    unavailable = []
+    for function_name, block_name, index, family, candidate in candidates:
+        target = resolve_backend_intrinsic(
+            family,
+            backend=str(backend),
+            lowering_namespace=candidate.get("lowering_namespace"),
+            overrides=overrides,
+        )
+        if target is None:
+            unavailable.append(family)
+            continue
+        instruction = transformed.functions[function_name].blocks[
+            block_name
+        ].instrs[index]
+        previous = {
+            "op": str(instruction.op),
+            "callee": instruction.attributes.get("callee"),
+        }
+        instruction.op = "BackendIntrinsic"
+        instruction.attributes["backend_intrinsic"] = target.as_record()
+        instruction.attributes["backend_intrinsic_original"] = previous
+        instruction.attributes["callee"] = target.symbol
+        instruction.attributes["lowered_from"] = previous["op"]
+        applied += 1
+
+    if not applied:
+        transformed = module
+    after = _topology_sha(transformed)
+    reasons = []
+    if applied:
+        reasons.append(
+            f"swapped {applied} flagged semantic call(s) to backend-owned "
+            f"{backend} intrinsic locations"
+        )
+    if unavailable:
+        reasons.append(
+            "no qualified target for: " + ", ".join(sorted(set(unavailable)))
+        )
+    decision = BackendIdentityDecision(
+        identity="backend_intrinsic_location_swap",
+        priority=10,
+        backends=(str(backend),),
+        applied=bool(applied),
+        exact=True,
+        reasons=tuple(reasons),
+        before_sha256=before,
+        after_sha256=after,
+    )
+    return (
+        transformed,
+        _rewrite_output_values(transformed, outputs),
+        decision,
+    )
 
 
 def _shader_float32_storage(
@@ -162,6 +278,9 @@ def apply_backend_identities(
     *,
     backend: str,
     licensed_inexact: bool | None = None,
+    intrinsic_overrides: Mapping[
+        str, BackendIntrinsicTarget | Mapping[str, Any]
+    ] | None = None,
 ) -> BackendIdentityResult:
     """Apply the ordered identity library for one backend.
 
@@ -178,6 +297,12 @@ def apply_backend_identities(
         str(name): tuple(values) for name, values in outputs.items()
     }
     decisions = []
+    current, current_outputs, intrinsic_decision = _backend_intrinsic_swaps(
+        current, current_outputs, backend=str(backend),
+        overrides=intrinsic_overrides,
+    )
+    if intrinsic_decision is not None:
+        decisions.append(intrinsic_decision)
     current, current_outputs, decision = _shader_float32_storage(
         current, current_outputs, backend=str(backend),
         licensed_inexact=bool(licensed_inexact),

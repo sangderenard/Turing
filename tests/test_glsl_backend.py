@@ -41,6 +41,7 @@ from src.common.tensors.accelerator_backends.glsl_backend import (
     emit_program_source,
     emit_stack_source,
     emit_topk_offsets_source,
+    execute_captured_fused_program,
     execute_program,
     fuse_elementwise,
     gl_context_info,
@@ -59,6 +60,9 @@ from src.common.tensors.accelerator_backends.glsl_backend import (
     topk_chunks,
 )
 from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
+from src.common.tensors.accelerator_backends.c_primitive_program import (
+    CapturedFusedProgram,
+)
 
 from src.common.tensors.accelerator_backends import gl_context as glctx
 
@@ -1093,6 +1097,40 @@ def test_glsl_reads_the_prebaked_matrix_without_rewriting_it(monkeypatch):
     assert interpreted.lane_count == 6
     assert interpreted.calls_per_lane == (1,) * 6
     assert interpreted.choice.compute.count == 6
+
+
+def test_captured_matmul_dispatches_through_named_glsl_blas_intrinsic(
+    monkeypatch,
+):
+    from src.common.tensors.accelerator_backends import glsl_backend
+
+    program = FusedProgram(
+        version=1,
+        feeds={10, 11},
+        steps=[OpStep(0, "matmul", [10, 11], {}, 12)],
+        outputs={"result": 12},
+        meta={
+            10: Meta(shape=(2, 3), dtype="float32", device="glsl"),
+            11: Meta(shape=(3, 4), dtype="float32", device="glsl"),
+            12: Meta(shape=(2, 4), dtype="float32", device="glsl"),
+        },
+        extras={"kernel_kind": "matmul"},
+    )
+    left, right, result = object(), object(), object()
+    observed = []
+    monkeypatch.setattr(
+        glsl_backend,
+        "glslblas_gemm",
+        lambda first, second: observed.append((first, second)) or result,
+    )
+
+    outputs = execute_captured_fused_program(
+        CapturedFusedProgram(program, {}),
+        {10: left, 11: right},
+    )
+
+    assert outputs == {"result": result}
+    assert observed == [(left, right)]
 
 
 @pytest.mark.parametrize(
