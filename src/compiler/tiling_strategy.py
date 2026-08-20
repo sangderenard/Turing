@@ -53,7 +53,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 TILE_COMPOSITION_KIND = "tile_composition"
 
@@ -292,6 +292,7 @@ def decide_tiling(
     cores: int | None = None,
     nested_parallelism: int = 0,
     must_divide: bool = False,
+    candidate_sizes: Iterable[int] | None = None,
 ) -> TilingDecision:
     """Should this call be tiled, with which core, under how many workers?
 
@@ -324,6 +325,13 @@ def decide_tiling(
 
     m, n, k = (int(sizes[axis]) for axis in ("m", "n", "k"))
     candidates = _admitted_square_core_sizes(bank, name, contract)
+    if candidate_sizes is not None:
+        allowed = frozenset(map(int, candidate_sizes))
+        candidates = [entry for entry in candidates if entry[0] in allowed]
+        reasons.append(
+            "candidate scope fixed by caller to "
+            f"{sorted(allowed)}; other admitted bank cores are excluded"
+        )
     if not candidates:
         reasons.append(
             "no admitted, current square specialized core exists in the "

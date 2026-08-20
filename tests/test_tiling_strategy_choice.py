@@ -77,6 +77,17 @@ def test_chooser_uses_best_live_profile_and_is_deterministic():
     assert first.candidates == ((32, 0.001), (64, 0.002))
 
 
+def test_chooser_can_fix_its_candidate_scope_against_bank_history():
+    decision = decide_tiling(
+        _MeasuredBank(), "gemm", {"m": 64, "n": 64, "k": 64},
+        contract="fast", cores=4, candidate_sizes=(32,),
+    )
+
+    assert decision.tiled and decision.tile == 32
+    assert decision.candidates == ((32, 0.001),)
+    assert "candidate scope fixed" in " ".join(decision.reasons)
+
+
 class _CompositionBank(_MeasuredBank):
     def inventory(self):
         return [

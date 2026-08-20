@@ -422,6 +422,9 @@ int {function_name}_lanes(void) {{ return {lane_count}; }}
 void {function_name}_shutdown(void) {{ turing_pool_stop(); }}
 """
     source_sha = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    matrix_payload = json.dumps(
+        matrix, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
     manifest = {
         "schema": PRODUCT_SCHEMA,
         "function": function_name,
@@ -449,6 +452,10 @@ void {function_name}_shutdown(void) {{ turing_pool_stop(); }}
         "python_runtime_dependency": False,
         "fallback": "serial execution of the same prebaked lane span",
         "serial_control": f"{function_name}_serial",
+        # A native product is independently inspectable and can be regrouped
+        # into a larger BLAS server without rerunning compiler decisions.
+        "launch_matrix_sha256": hashlib.sha256(matrix_payload).hexdigest(),
+        "launch_matrix": matrix,
     }
     return NativeGemmProductSource(function_name, source, manifest)
 
@@ -547,7 +554,7 @@ def compile_native_gemm_product(
             )
     decision = decide_tiling(
         bank, "gemm", shape, contract=contract, cores=cores,
-        must_divide=False,
+        must_divide=False, candidate_sizes=candidate_sizes,
     )
     if not decision.tiled or decision.tile is None:
         raise NativeGemmProductError(

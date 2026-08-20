@@ -292,6 +292,9 @@ def test_webgpu_gemm_variants_share_the_role_and_abi_but_change_topology():
     assert source_meta["role"] == tiled_meta["role"] == "blas.gemm"
     assert source_meta["role_source_sha256"] == tiled_meta["role_source_sha256"]
     assert source_meta["io_layout"] == tiled_meta["io_layout"]
+    assert source_meta["io_layout"]["uniforms"][0]["name"] == "gemm_scalars"
+    assert "gemm_scalars.alpha * sum" in source.source
+    assert "gemm_scalars.beta * output_C" in tiled.source
     assert "for (var p = 0u" in source.source
     assert "var<workgroup> tile_A" in tiled.source
     assert "workgroupBarrier()" in tiled.source

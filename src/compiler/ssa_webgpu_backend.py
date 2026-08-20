@@ -780,9 +780,11 @@ def emit_gemm_module(
     from .shader_stages import COMPUTE, BufferBinding, ShaderIOLayout
 
     role = blas_role("gemm")
-    bindings = """@group(0) @binding(0) var<storage, read> feed_A: array<f32>;
+    bindings = """struct GemmScalars { alpha: f32, beta: f32 };
+@group(0) @binding(0) var<storage, read> feed_A: array<f32>;
 @group(0) @binding(1) var<storage, read> feed_B: array<f32>;
-@group(0) @binding(2) var<storage, read_write> output_C: array<f32>;"""
+@group(0) @binding(2) var<storage, read_write> output_C: array<f32>;
+@group(0) @binding(3) var<uniform> gemm_scalars: GemmScalars;"""
     if variant == "source_algorithm":
         local = min(256, max(1, tile * tile))
         count = m * n
@@ -801,7 +803,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   for (var p = 0u; p < {k}u; p += 1u) {{
     sum += feed_A[row * {k}u + p] * feed_B[p * {n}u + column];
   }}
-  output_C[linear_index] = sum;
+  output_C[linear_index] = gemm_scalars.alpha * sum
+                         + gemm_scalars.beta * output_C[linear_index];
 }}
 """
         mapping = "one invocation per output element; source p-loop retained"
@@ -841,7 +844,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     workgroupBarrier();
   }}
   if (row < {m}u && column < {n}u) {{
-    output_C[row * {n}u + column] = sum;
+    let index = row * {n}u + column;
+    output_C[index] = gemm_scalars.alpha * sum
+                    + gemm_scalars.beta * output_C[index];
   }}
 }}
 """
@@ -854,6 +859,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             BufferBinding("feed_B", "feed", "f32", 1),
         ),
         outputs=(BufferBinding("output_C", "output", "f32", 2),),
+        uniforms=(BufferBinding("gemm_scalars", "uniform", "f32x2", 3),),
     )
     name = f"blas_gemm_{variant}_{m}_{n}_{k}"
     component_abi = component_abi_from_layout(
