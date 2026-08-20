@@ -161,6 +161,50 @@ if INVENTED:
     )
 
 
+_TENSOR_RECEIVER = "AbstractTensor"
+_TENSOR_IMPORT_MODULE = "src.common.tensors"
+
+
+def _tensor_call_forms() -> dict[str, bool]:
+    """Every catalogued tensor operation, and how Python spells a call to it.
+
+    ``True`` means the operation is reached through the class
+    (``AbstractTensor.arange(...)``), ``False`` through a receiver
+    (``x.clip(...)``).
+
+    That split is *read from* ``AbstractTensor`` with
+    ``inspect.getattr_static`` rather than listed here, for the same reason
+    the scalar table is audited against ``ssa_llvm_backend``: a hand-kept list
+    of which operations are static is a vocabulary this file would be making
+    up, and it would drift silently the first time the class changed.  The
+    catalogue owns *which* operations exist; the class owns *how they are
+    called*; this module supplies only the Python text.
+    """
+
+    import inspect
+
+    from ..common.tensors.abstraction import AbstractTensor
+    from ..common.tensors.operator_catalog import (
+        CANONICAL_ABSTRACT_TENSOR_OPERATORS,
+    )
+
+    forms: dict[str, bool] = {}
+    for name in CANONICAL_ABSTRACT_TENSOR_OPERATORS:
+        try:
+            static = inspect.getattr_static(AbstractTensor, name)
+        except AttributeError:
+            # Catalogued but not present on the class: an operation the SSA
+            # vocabulary knows and this destination cannot call. Left out, so
+            # reaching it raises the ordinary "no Python form" refusal rather
+            # than emitting a call to something that does not exist.
+            continue
+        forms[name] = isinstance(static, staticmethod)
+    return forms
+
+
+TENSOR_CALL_FORMS = _tensor_call_forms()
+
+
 def _expression(source: str) -> ast.expr:
     """One source fragment as a real expression node.
 
@@ -337,6 +381,37 @@ class _BodyMaterializer:
                 self.uses_math = True
             operand = self.operand(instruction.args[0])
             self.assign(result, _UNARY_SPELLING[operation].format(operand))
+            return
+
+        tensor_operation = str(
+            attributes.get("tensor_operation")
+            or attributes.get("tensor_candidate")
+            or operation
+        )
+        if tensor_operation in TENSOR_CALL_FORMS:
+            # A catalogued tensor operation. Every operand is positional in
+            # the SSA -- verified on real lowered programs: ``clip`` arrives
+            # as (x, lo, hi), ``index_select`` as (x, dim, indices) -- so the
+            # Python call is the same sequence, split only by whether the
+            # class or the first operand is the receiver.
+            operands = [self.operand(argument) for argument in instruction.args]
+            if TENSOR_CALL_FORMS[tensor_operation]:
+                call = (
+                    f"{_TENSOR_RECEIVER}.{tensor_operation}"
+                    f"({', '.join(operands)})"
+                )
+            else:
+                if not operands:
+                    raise MaterializationError(
+                        f"{self.function.name}: {tensor_operation!r} is a "
+                        "method on a tensor but the SSA gives it no operand "
+                        "to call it on"
+                    )
+                call = (
+                    f"{operands[0]}.{tensor_operation}"
+                    f"({', '.join(operands[1:])})"
+                )
+            self.assign(result, call)
             return
 
         if operation in UNIMPLEMENTED:
