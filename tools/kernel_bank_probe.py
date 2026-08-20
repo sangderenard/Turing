@@ -4,6 +4,7 @@
     python tools/kernel_bank_probe.py --matrix        # prebuild the matrix
     python tools/kernel_bank_probe.py --inventory     # list the bank
     python tools/kernel_bank_probe.py --specialize    # try size-baked builds
+    python tools/kernel_bank_probe.py --chart         # performance charts
 
 Diagnostic probe, not a test suite: reports what routed where and whether
 admission verification held, in the style of tools/compile_blas_probe.py.
@@ -30,9 +31,33 @@ def main() -> int:
     parser.add_argument("--matrix", action="store_true")
     parser.add_argument("--inventory", action="store_true")
     parser.add_argument("--specialize", action="store_true")
+    parser.add_argument("--chart", action="store_true")
     args = parser.parse_args()
 
     bank = open_blas_bank(args.root)
+
+    if args.chart:
+        # The auto-collected performance chart: launch vs compute averages
+        # per admitted variant, the evidence the deployment strategy calls
+        # read. Collected during every build (matrix or on-demand); this
+        # only renders what the manifests already hold.
+        for name in bank.specs:
+            rows = bank.performance_chart(name)
+            if not rows:
+                print(f"{name}: no profiled variants (build some: --matrix)")
+                continue
+            print(f"{name}:")
+            for row in rows:
+                specialized = str(row["specialized"] or "parametric")
+                launch = row["launch_avg_seconds"]
+                compute = row["compute_avg_seconds"]
+                print(
+                    f"  contract={row['contract']:<8} {specialized:<28} "
+                    f"sizes={row['sizes']} "
+                    f"launch={launch * 1e6:8.1f} us  "
+                    f"compute={compute * 1e6:8.1f} us"
+                )
+        return 0
 
     if args.inventory:
         for row in bank.inventory():

@@ -81,7 +81,7 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
-MANIFEST_SCHEMA = "turing.kernel-bank.v1"
+MANIFEST_SCHEMA = "turing.kernel-bank.v2"  # v2: + profile, data_layout
 
 
 class BankRefusal(RuntimeError):
@@ -101,6 +101,59 @@ class KernelSpec:
     size_parameters: tuple[str, ...]
     #: (sizes, rng) -> {parameter: value} covering parameter_order.
     example_inputs: Callable[[Mapping[str, int], np.random.Generator], dict]
+    #: HOW A DEPLOYMENT MATRIX KNOWS PER-ITEM DATA SIZE. Each array
+    #: parameter's element count as a product of size-parameter names --
+    #: ``{"A": ("m", "k"), "x": ("n",), "alpha": ()}`` -- declared by the
+    #: kernel author because the flat-buffer convention erases it: a
+    #: compiled variant's ABI sees only 1-D spans, and a custom loop's
+    #: stride arithmetic (``a[i * k + p]``) is opaque to any partitioner.
+    #: From this declaration, ``item_data(axis, sizes)`` derives what one
+    #: index of a loop axis consumes of every parameter -- which is the
+    #: fact a runtime deployment matrix needs to hand each lane/chunk its
+    #: byte ranges. ``None`` means undeclared: partitioning machinery must
+    #: refuse rather than guess.
+    extents: Mapping[str, tuple[str, ...]] | None = None
+
+    def item_data(
+        self, axis: str, sizes: Mapping[str, int],
+    ) -> dict[str, dict[str, int]]:
+        """Elements each parameter contributes per item of ``axis``.
+
+        Returns ``{"split": {parameter: elements_per_item},
+        "shared": {parameter: total_elements}}``: a parameter whose extent
+        includes ``axis`` is SPLIT across items (one ``axis`` index owns
+        the product of its remaining dimensions); one whose extent does
+        not include ``axis`` is SHARED whole by every item. Size
+        parameters and other scalars are omitted -- they are broadcast by
+        value, not partitioned. Raises ``BankRefusal`` when extents were
+        never declared, because a partitioner guessing byte ranges is how
+        buffers get torn.
+        """
+
+        if self.extents is None:
+            raise BankRefusal(
+                f"{self.name}: no extents declared; per-item data size "
+                "cannot be derived and must not be guessed"
+            )
+        if axis not in self.size_parameters:
+            raise BankRefusal(
+                f"{self.name}: {axis!r} is not a size parameter "
+                f"{self.size_parameters!r}"
+            )
+        split: dict[str, int] = {}
+        shared: dict[str, int] = {}
+        for parameter, dims in self.extents.items():
+            if not dims:
+                continue  # scalar: broadcast by value
+            count = 1
+            for dim in dims:
+                count *= int(sizes[dim]) if isinstance(dim, str) else int(dim)
+            if axis in dims:
+                per_item = count // int(sizes[axis])
+                split[parameter] = per_item
+            else:
+                shared[parameter] = count
+        return {"split": split, "shared": shared}
 
 
 @dataclass
@@ -269,6 +322,35 @@ class KernelBank:
                     f"{name}: cannot bake non-size parameters "
                     f"{sorted(unknown)}"
                 )
+            # A baked size at or below the loop unroll limit makes the
+            # evaporator unroll that loop, and the tiny-trip evaporation
+            # defect (pinned strict-xfail in test_compiled_linalg.py:
+            # the outer loop's iteration is dropped, its induction
+            # variable leaks as a free formal, and the NATIVE BUILD
+            # ACCESS-VIOLATES) then kills the admission probe's process
+            # outright -- a crash the verify gate cannot catch. Refuse
+            # before compiling. The limit is read from the loop
+            # composer's own declaration, not restated here.
+            from .loop_composer import LoopBackendCapabilities
+
+            unroll_limit = int(
+                LoopBackendCapabilities.__dataclass_fields__[
+                    "unroll_limit"
+                ].default
+            )
+            tiny = {
+                parameter: value
+                for parameter, value in specialized.items()
+                if int(value) <= unroll_limit
+            }
+            if tiny:
+                raise BankRefusal(
+                    f"{name}: baked size(s) {tiny} are at or below the "
+                    f"loop unroll limit ({unroll_limit}); the tiny-trip "
+                    "evaporation defect makes such builds crash natively "
+                    "(see tests/test_compiled_linalg.py's pin) -- refused "
+                    "before compilation"
+                )
         key = self.variant_key(
             name, contract=contract, specialized=specialized,
         )
@@ -403,6 +485,17 @@ class KernelBank:
             "note": "informational only; ids are re-derived at load "
                     "(unstable across lowerings)",
         }
+        if spec.extents is not None:
+            manifest["data_layout"] = {
+                "extents": {
+                    parameter: list(dims)
+                    for parameter, dims in spec.extents.items()
+                },
+                "note": "element counts as products of size parameters; "
+                        "the declaration item_data() partitions by",
+            }
+        if verification["admitted"]:
+            manifest["profile"] = self._profile(variant, verification)
         (directory / "manifest.json").write_text(
             json.dumps(manifest, indent=2), encoding="utf-8",
         )
@@ -412,6 +505,82 @@ class KernelBank:
                 f"{verification['reason']}"
             )
         return variant
+
+    def _profile(self, variant: CompiledVariant, verification: dict) -> dict:
+        """Auto-collected performance profile, taken at build time.
+
+        Every admitted variant gets a LAUNCH average and a COMPUTE average,
+        because the deployment strategy layer is starved without them: the
+        single admission timing is a cold call, which conflates dispatch
+        overhead with arithmetic and understates steady state badly (noted
+        the day the bank was built). The split here is measured, not
+        modeled: warm repeats on the already-prepared execution give the
+        compute average; cold repeats with the execution cache cleared give
+        the full launch+compute cost; launch is their difference, floored
+        at zero. Timings are medians (robust to a scheduler hiccup at
+        build time), sample counts recorded, sizes stated -- so a
+        performance chart row is auditable evidence, deployment-
+        classification style, not a mystery number.
+        """
+
+        spec = variant.spec
+        sizes = {
+            str(parameter): int(value)
+            for parameter, value in (
+                verification.get("probe_sizes") or {}
+            ).items()
+        }
+        rng = np.random.default_rng(
+            int(hashlib.sha256(variant.key.encode()).hexdigest()[:8], 16)
+        )
+        sample = spec.example_inputs(sizes, rng)
+
+        warm: list[float] = []
+        for _ in range(5):
+            started = time.perf_counter()
+            variant.run(sample)
+            warm.append(time.perf_counter() - started)
+        cold: list[float] = []
+        for _ in range(3):
+            variant._executions.clear()
+            started = time.perf_counter()
+            variant.run(sample)
+            cold.append(time.perf_counter() - started)
+        compute_avg = float(np.median(warm))
+        cold_avg = float(np.median(cold))
+        return {
+            "sizes": sizes,
+            "compute_avg_seconds": compute_avg,
+            "cold_avg_seconds": cold_avg,
+            "launch_avg_seconds": max(0.0, cold_avg - compute_avg),
+            "warm_samples": len(warm),
+            "cold_samples": len(cold),
+        }
+
+    def performance_chart(self, name: str) -> list[dict]:
+        """Every profiled variant of ``name``: the chart the deployment
+        strategy calls read. One row per manifest carrying a profile,
+        newest build last; refused variants have no profile and no row."""
+
+        rows = []
+        for manifest in self.inventory():
+            if manifest.get("kernel") != name:
+                continue
+            profile = manifest.get("profile")
+            if not profile:
+                continue
+            rows.append({
+                "key": manifest.get("key"),
+                "contract": manifest.get("contract"),
+                "specialized": manifest.get("specialized") or {},
+                "sizes": profile.get("sizes") or {},
+                "launch_avg_seconds": profile.get("launch_avg_seconds"),
+                "compute_avg_seconds": profile.get("compute_avg_seconds"),
+                "cold_avg_seconds": profile.get("cold_avg_seconds"),
+                "built_unix": manifest.get("built_unix"),
+            })
+        rows.sort(key=lambda row: row.get("built_unix") or 0)
+        return rows
 
     def _verify(self, variant: CompiledVariant) -> dict:
         """The admission check: compiled output must match the Python
@@ -609,10 +778,134 @@ def _blas_example_inputs(arity: tuple[str, ...]):
     return generate
 
 
-_BLAS_SIZE_PARAMETERS = {
-    "scal": ("n",), "axpy": ("n",), "dot": ("n",),
-    "gemv": ("m", "n"), "gemm": ("m", "n", "k"),
-}
+def derive_size_parameters_from_source(
+    source: str, function_name: str,
+) -> tuple[str, ...]:
+    """The parameters that bound loops, read from the authored source.
+
+    A size parameter IS a parameter some ``range`` stops at -- that is the
+    whole definition, and the source states it; a side table restating it
+    would drift. Order follows first lexical appearance as a bound, which
+    is the nesting order for these kernels.
+    """
+
+    tree = ast.parse(source)
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+    parameters = {argument.arg for argument in function.args.args}
+    ordered: list[str] = []
+    for node in ast.walk(function):
+        if (
+            isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Name)
+            and node.iter.func.id == "range"
+        ):
+            arguments = node.iter.args
+            stop = arguments[0] if len(arguments) == 1 else arguments[1]
+            if (
+                isinstance(stop, ast.Name)
+                and stop.id in parameters
+                and stop.id not in ordered
+            ):
+                ordered.append(stop.id)
+    return tuple(ordered)
+
+
+def derive_extents_from_source(
+    source: str, function_name: str,
+) -> dict[str, tuple[str, ...]]:
+    """Each parameter's extent product, read from the AUTHORED SOURCE.
+
+    The kernel's own loop bounds and index arithmetic are the single
+    authority on data layout -- a hand-maintained mirror table would drift
+    the moment a kernel changes. The flat row-major convention the whole
+    bank compiles under makes derivation exact:
+
+    * ``x[i]`` with ``for i in range(n)`` -> ``x`` spans ``(n,)``;
+    * ``A[i * k + p]`` -> the multiplier is the row stride and the row
+      variable's own loop bound is the leading dimension: ``(bound(i), k)``.
+
+    A parameter never subscripted is a scalar, ``()``. An index shape this
+    reader does not recognize raises -- a partitioner working from a
+    guessed extent is how buffers get torn, so unknown stays unknown
+    loudly.
+    """
+
+    tree = ast.parse(source)
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+    parameters = [argument.arg for argument in function.args.args]
+
+    bounds: dict[str, str] = {}
+    for node in ast.walk(function):
+        if (
+            isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name)
+            and isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Name)
+            and node.iter.func.id == "range"
+        ):
+            arguments = node.iter.args
+            stop = arguments[0] if len(arguments) == 1 else arguments[1]
+            if isinstance(stop, ast.Name):
+                bounds[node.target.id] = stop.id
+
+    def index_dims(expression: ast.AST) -> tuple[str, ...] | None:
+        if isinstance(expression, ast.Name):
+            bound = bounds.get(expression.id)
+            return (bound,) if bound else None
+        if isinstance(expression, ast.BinOp) and isinstance(
+            expression.op, ast.Add
+        ):
+            for product, offset in (
+                (expression.left, expression.right),
+                (expression.right, expression.left),
+            ):
+                if not (
+                    isinstance(product, ast.BinOp)
+                    and isinstance(product.op, ast.Mult)
+                    and isinstance(product.left, ast.Name)
+                    and isinstance(product.right, ast.Name)
+                ):
+                    continue
+                names = (product.left.id, product.right.id)
+                for variable, stride in (names, names[::-1]):
+                    row_bound = bounds.get(variable)
+                    inner = index_dims(offset)
+                    if row_bound and inner is not None and stride not in bounds:
+                        return (row_bound, stride)
+        return None
+
+    extents: dict[str, tuple[str, ...]] = {}
+    for node in ast.walk(function):
+        if not (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in parameters
+        ):
+            continue
+        dims = index_dims(node.slice)
+        if dims is None:
+            raise BankRefusal(
+                f"{function_name}: cannot derive an extent from the index "
+                f"expression {ast.unparse(node)!r}; declare extents "
+                "explicitly rather than letting a partitioner guess"
+            )
+        previous = extents.get(node.value.id)
+        if previous is not None and previous != dims:
+            raise BankRefusal(
+                f"{function_name}: parameter {node.value.id!r} is indexed "
+                f"with disagreeing extents {previous!r} and {dims!r}"
+            )
+        extents[node.value.id] = dims
+    for parameter in parameters:
+        extents.setdefault(parameter, ())
+    return extents
 
 
 def blas_kernel_specs() -> dict[str, KernelSpec]:
@@ -626,8 +919,9 @@ def blas_kernel_specs() -> dict[str, KernelSpec]:
             function_name=name,
             reference=reference,
             parameter_order=tuple(arity),
-            size_parameters=_BLAS_SIZE_PARAMETERS[name],
+            size_parameters=derive_size_parameters_from_source(source, name),
             example_inputs=_blas_example_inputs(tuple(arity)),
+            extents=derive_extents_from_source(source, name),
         )
     return specs
 
