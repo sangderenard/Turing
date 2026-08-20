@@ -120,6 +120,63 @@ def test_the_loss_has_exactly_the_shape_this_file_claims():
     assert len(function.args) == 1
 
 
+WRITE_ONLY_RETURNS_B = """
+def f(A, B):
+    for i in range(4):
+        A[i] = A[i] * 2.0
+        B[i] = B[i] + 1.0
+    return B
+"""
+
+READ_INTO_RESULT = """
+def f(A, B):
+    for i in range(4):
+        A[i] = A[i] * 2.0 + B[i]
+    return A
+"""
+
+NO_LOOP = """
+def f(A, B):
+    A[0] = A[0] * 2.0
+    B[0] = B[0] + 1.0
+    return A
+"""
+
+
+def test_the_survivor_is_whichever_array_the_result_reads():
+    """The rule behind the loss, stated as an experiment.
+
+    It is not "the second parameter" and not "B": it is whichever array the
+    returned value does not depend on. Returning ``B`` instead of ``A`` drops
+    ``A`` by the identical mechanism, which is what identifies this as dead-
+    store elimination rather than an argument-ordering bug.
+    """
+
+    _f, returns_a, _v = _lowered(LITERAL_BOUND, "keepa")
+    _f, returns_b, _v = _lowered(WRITE_ONLY_RETURNS_B, "keepb")
+    assert set(returns_a) == {"A"}
+    assert set(returns_b) == {"B"}
+
+
+def test_a_write_that_feeds_the_result_is_never_dropped():
+    """Reading B into the returned value keeps it, which is the tell.
+
+    The eliminated store is not unobservable -- it lands in an array the
+    CALLER owns and can read afterwards. It only looks dead from inside the
+    function, and that is precisely the reasoning error.
+    """
+
+    _function, parameters, _values = _lowered(READ_INTO_RESULT, "readin")
+    assert set(parameters) == {"A", "B"}
+
+
+def test_the_same_writes_without_a_loop_keep_both_parameters():
+    """Bounds the defect to the loop path rather than to in-place writes."""
+
+    _function, parameters, _values = _lowered(NO_LOOP, "noloop")
+    assert set(parameters) == {"A", "B"}
+
+
 def test_a_nested_literal_bound_also_leaks_its_induction_variable():
     """The second half of the same defect, at the shape eigh actually uses.
 
