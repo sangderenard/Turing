@@ -456,8 +456,97 @@ functions — up from 45; the surviving arms are real):
   named spelling, behind a contract axis). That is next-session design
   work, not a filter tweak.
 * Secondary, real, and needed once loops compose: ``embed``'s
-  cross-scope duplication (thread ONE insert-once state through the
-  recursion, or refuse when a nested control's markers span scopes).
+  cross-scope duplication — **fixed** (frontier task D, commit
+  ``843f95a``): a candidate nested control's regions are now checked
+  against every insertion scope before ``embed`` runs, and a genuine
+  span refuses by name instead of duplicating. Confirmed directly
+  against ``_compile``: the crash is now the precise 3-scope refusal
+  named below, not an opaque duplicate-count mismatch.
+
+## 6h. The raise-blocker, measured precisely (later session, no fix attempted)
+
+Re-scoped from §6g's "next-session design work" into something concrete
+enough to implement, but NOT implemented — the correctness stakes
+(conditional-arm lowering is shared by every program in the tree, not
+just re) argued against a blind attempt at the tail of an already long
+session. What follows is the measured shape, precise enough to execute
+directly next time.
+
+* **The raise shape is narrower than §6g assumed, and it is uniform.**
+  Every blocked loop's raise is the SAME AST pattern: a bare
+  ``raise error(...)`` as the sole content of the deepest ``orelse`` in
+  an ``if/elif/.../else`` cascade — never a raise mixed into an
+  otherwise-continuing arm, never inside a ``try``. Measured exactly:
+  ``_compile`` has exactly ONE such raise (the whole opcode dispatch's
+  final ``else``, 12 ``elif``s deep); ``_compile_charset`` has exactly
+  one (5 deep); ``_parse`` has four, at varying nesting depths,
+  including some nested inside an outer arm's own body before another
+  elif chain. All four are the identical leaf shape, just occurring
+  multiple times in one function. (``getuntil``/``_parse_flags`` not
+  fully re-derived this pass — their raises read, on a source-level
+  scan, as ordinary already-covered ``if cond: raise``-no-orelse; if
+  they are still listed as blocked, re-verify which specific loop node
+  and raise triggers it before assuming this same shape covers them.)
+* **No existing machinery already handles it — checked and ruled out.**
+  ``topological_reducer.py``'s ``ast.If`` reduction has a
+  ``terminal_branch`` optimization that recognizes "both arms
+  terminate" (return/raise/an already-merged nested if) and skips the
+  ordinary Phi merge for that case — but it requires BOTH arms to
+  terminate. Verified directly on ``_compile``'s actual final elif: the
+  body arm's last statement is real bytecode-emitting work (itself
+  ending in a further nested ``If``, not a terminal), so
+  ``terminal_branch(body)`` is False and the optimization never
+  engages. The reducer falls through to the ORDINARY Phi merge,
+  contributing the PRE-if value as the raise arm's placeholder for any
+  name the body touches (harmless in isolation — nothing ever consumes
+  it since the raise path never reaches the merge at runtime — but it
+  means the graph carries a phantom orelse value, not a real
+  representation of "this arm aborts").
+* **The abort-call mechanism this needs already exists and already
+  works** — it just isn't wired to fire from inside a composed
+  conditional's arm. The existing validated-raise carve-out (simple
+  ``if cond: raise``, no orelse) already converts to a
+  ``ValidationBlock``, and ``precompile_to_ssa.py``'s lowering for it
+  is real and tested: emit a predicate branch, and on the failing side
+  ``self.emit(Handler.Call, [], attributes={"callee":
+  "turing_validation_error", "error_code": int(block.error_code)})``
+  before branching to the passing continuation. This is the
+  "declared abort gap" §6g asked for a contract axis to decide — it is
+  already decided and already built, just not reachable from a
+  ``Raise`` sitting inside one arm of a real, multi-arm ``ConditionalBlock``.
+* **What is actually missing, precisely, in two pieces:**
+  1. The loop composer's blocker (`loop_composer.py` ~3425-3436,
+     `forbidden = (ast.Raise, ...)`) must stop blocking a `Raise` when
+     it sits in the terminal arm of an otherwise-composable conditional
+     — the conditional composition machinery (real since level 16,
+     cross-scope-safe since Task D) can already carry it structurally;
+     only the blocker's blanket refusal stands in the way.
+  2. Conditional-ARM STATEMENT lowering (wherever `ConditionalBlock`'s
+     `body`/`orelse` sequences get lowered to instructions —
+     `precompile_to_ssa.py`'s statement dispatch, the same family
+     `ValidationBlock` already has a case in) needs a NEW case for a
+     bare `ast.Raise` reached as an ordinary statement: emit the same
+     `turing_validation_error` call the existing mechanism uses, and
+     do not require that arm to contribute a real value to the merge
+     Phi (the topological_reducer's phantom pre-if placeholder can
+     stand in structurally; nothing will ever read it at runtime).
+* **Why not attempted this pass**: both pieces touch machinery every
+  authored conditional in the tree goes through, not just re's. A bug
+  in piece 2 specifically is the worst failure shape this whole arc has
+  spent itself fighting — a program that used to correctly REFUSE to
+  compile could instead compile to something that silently continues
+  past where it should have aborted. The right verification order,
+  next time: build the smallest possible authored scorecard-style probe
+  first (`if cond: total = total + 1.0 else: raise ValueError(...)`,
+  called only on inputs where the raise branch is never taken), confirm
+  it now compiles AND its non-raising path still matches the oracle,
+  confirm the ~40s gate and full scorecard stay green, and ONLY THEN
+  spend the ~2.5 minute `compile_re_probe.py` run to see how much of
+  re's closure the fix actually unblocks. Verifying that the abort path
+  itself actually aborts correctly at runtime is a separate, later
+  concern (needs either a native crash-to-shortfall style check or the
+  reversible-machine instrument from §6c) — do not treat "it compiles"
+  as "the abort semantics are correct."
 
 ## 7. Working rules, re-earned this session
 
