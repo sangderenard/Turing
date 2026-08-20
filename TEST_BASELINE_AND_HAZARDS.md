@@ -59,6 +59,7 @@ These passed on 2026-08-19 and are the cheap, high-signal set. Prefer them.
 | `tests/test_ssa_fusion_regions.py` | 1 passed | ~3 s |
 | `tests/test_region_kernel_dedup.py` | 2 passed | ~3 s |
 | `tests/test_compiled_linalg.py` | 6 passed, 1 xfailed (strict) | ~9 s |
+| `tests/test_ir_sequence_tables.py` | 23 passed | ~3 s |
 
 **That table is the recommended regression gate for compiler changes.** It is
 ~40 seconds total and it caught nothing false in this session. Reach past it

@@ -425,23 +425,46 @@ def test_compiled_retained_loop_mutates_caller_sequence_record(tmp_path):
         os.add_dll_directory(str(Path(fortran_compiler()).resolve().parent))
     library = ctypes.CDLL(str(artifact.executable_path))
     function = library.planned_control
+    entry = emitted.api.entry_point("planned_control")
+    ctypes_by_name = {
+        "c_int32": ctypes.c_int32,
+        "c_int64": ctypes.c_int64,
+        "c_double": ctypes.c_double,
+    }
     function.argtypes = [
-        ctypes.c_int32,
-        ctypes.POINTER(ctypes.c_double),
-        ctypes.POINTER(ctypes.c_int32),
-        ctypes.c_int32,
-        ctypes.POINTER(ctypes.c_int32),
-        ctypes.c_double,
+        (
+            ctypes_by_name[parameter.ctypes_name]
+            if parameter.passing == "value"
+            else ctypes.POINTER(ctypes_by_name[parameter.ctypes_name])
+        )
+        for parameter in entry.parameters
     ]
     function.restype = None
     arena = (ctypes.c_double * 4)()
-    length = ctypes.c_int32(0)
+    length = ctypes.c_int64(0)
     status = ctypes.c_int32(-1)
     assert artifact.entrypoint == "planned_control"
-    assert [parameter.name for parameter in emitted.api.entry_point(
-        "planned_control"
-    ).parameters][:1] == ["extent_1"]
-    function(1, arena, ctypes.byref(length), 4, ctypes.byref(status), 7.5)
+    assert artifact.c_source_path.read_text(encoding="utf-8") == ""
+    extent_parameters = tuple(
+        parameter for parameter in entry.parameters
+        if parameter.role == "extent"
+    )
+    assert extent_parameters[0].name == "extent_1"
+    # Extents are runtime ABI values for a library.  The loop has one trip-
+    # count extent and the retained four-element arena supplies every dynamic
+    # dimension required by the caller and its linked sequence helper.
+    extent_arguments = tuple(
+        1 if parameter.name == "extent_1" else 4
+        for parameter in extent_parameters
+    )
+    function(
+        *extent_arguments,
+        arena,
+        ctypes.byref(length),
+        4,
+        ctypes.byref(status),
+        7.5,
+    )
     assert length.value == 4
     assert status.value == 1
     assert list(arena) == [7.5, 7.5, 7.5, 7.5]

@@ -1167,12 +1167,18 @@ def compile_fortran_module_c_shell(
     output = Path(directory).resolve()
     output.mkdir(parents=True, exist_ok=True)
     entry = _entrypoint(module, entrypoint)
-    extents = _extent_values(entry, extent_overrides)
+    # A shared library exports the emitted ABI directly: dynamic extents are
+    # ordinary runtime arguments supplied by its eventual caller. Requiring
+    # concrete values here applies the standalone shell's allocation concern
+    # to a product that has no shell and makes otherwise valid shape-dynamic
+    # libraries impossible to build. Standalone products still need every
+    # extent resolved because their generated C harness owns the allocations.
+    extents = {} if library else _extent_values(entry, extent_overrides)
     values = tuple(item for item in entry.parameters if item.role != "extent")
     input_parameters = tuple(
         item for item in values if item.role in {"input", "inout"}
     )
-    file_ports = _system_file_configurations(module, entry)
+    file_ports = () if library else _system_file_configurations(module, entry)
     system_parameters = {
         parameter.name
         for port in file_ports
@@ -1214,7 +1220,7 @@ def compile_fortran_module_c_shell(
     final_outputs_path = output / "final-outputs.bin"
     fortran_path.write_text(module.source, encoding="utf-8")
     c_path.write_text(
-        emit_fortran_c_shell_source(
+        "" if library else emit_fortran_c_shell_source(
             module,
             trace=trace,
             entrypoint=entry.name,
