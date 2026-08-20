@@ -171,7 +171,9 @@ def main() -> int:
     )
     for row in bank.performance_chart("gemm")[-4:]:
         label = str(row["specialized"] or "parametric")
-        print(f"  {label:<30} launch={row['launch_avg_seconds']*1e6:8.1f}us "
+        print(f"  {label:<30} "
+              f"first_launch={row['first_launch_seconds']*1e6:8.1f}us "
+              f"relaunch={row['relaunch_avg_seconds']*1e6:8.1f}us "
               f"compute={row['compute_avg_seconds']*1e6:8.1f}us "
               f"sizes={row['sizes']}")
 
@@ -205,22 +207,25 @@ def main() -> int:
 
     lanes = TiledGemmLanes(core, size, tile)
 
-    def timed(workers: int) -> tuple[float, np.ndarray]:
-        out = c2.copy()
-        lanes.bind(a2, b2, out, alpha, beta)
+    def timed(workers: int, repeats: int = 3) -> tuple[float, np.ndarray]:
         pool = HostDeploymentPool(workers=workers)
+        samples, executed, out = [], 0, None
         try:
-            started = time.perf_counter()
-            executed = pool.deploy_span(
-                lambda start, stop: [
-                    lanes.run_lane(i) for i in range(start, stop)
-                ],
-                lanes.lane_count,
-                chunk=choice.chunk,
-            )
-            elapsed = time.perf_counter() - started
+            for _ in range(repeats):
+                out = c2.copy()
+                lanes.bind(a2, b2, out, alpha, beta)
+                started = time.perf_counter()
+                executed = pool.deploy_span(
+                    lambda start, stop: [
+                        lanes.run_lane(i) for i in range(start, stop)
+                    ],
+                    lanes.lane_count,
+                    chunk=choice.chunk,
+                )
+                samples.append(time.perf_counter() - started)
         finally:
             pool.close()
+        elapsed = float(np.median(samples))
         worst = float(np.max(np.abs(out - expected)))
         print(f"  workers={workers}: {elapsed*1000:8.2f} ms over "
               f"{executed} chunk(s), worst |err| {worst:.2e}")
@@ -231,21 +236,24 @@ def main() -> int:
     workers = choice.workers or max(1, (os.cpu_count() or 2) - 1)
     pool_seconds, _ = timed(workers)
 
-    single = parametric.run({
-        "A": a2.reshape(-1), "B": b2.reshape(-1), "C": c2.reshape(-1),
-        "alpha": alpha, "beta": beta, "m": size, "n": size, "k": size,
-    })
-    started = time.perf_counter()
-    parametric.run({
-        "A": a2.reshape(-1), "B": b2.reshape(-1), "C": c2.reshape(-1),
-        "alpha": alpha, "beta": beta, "m": size, "n": size, "k": size,
-    })
-    parametric_seconds = time.perf_counter() - started
-    del single
+    # Steady-state medians for the reference rows, matching
+    # docs/BLAS_VS_NUMPY_PROFILE.md's methodology -- a cold single shot
+    # penalizes numpy's thread-pool spin-up and our first dispatch alike,
+    # and a comparison against a handicapped reference is not a gain.
+    def steady(operation, repeats: int = 5) -> float:
+        operation()  # warm
+        samples = []
+        for _ in range(repeats):
+            started = time.perf_counter()
+            operation()
+            samples.append(time.perf_counter() - started)
+        return float(np.median(samples))
 
-    started = time.perf_counter()
-    alpha * (a2 @ b2) + beta * c2
-    numpy_seconds = time.perf_counter() - started
+    parametric_seconds = steady(lambda: parametric.run({
+        "A": a2.reshape(-1), "B": b2.reshape(-1), "C": c2.reshape(-1),
+        "alpha": alpha, "beta": beta, "m": size, "n": size, "k": size,
+    }))
+    numpy_seconds = steady(lambda: alpha * (a2 @ b2) + beta * c2)
 
     flops = 2.0 * size ** 3
     print("\n== summary ==")

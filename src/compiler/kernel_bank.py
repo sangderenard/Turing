@@ -548,11 +548,29 @@ class KernelBank:
             cold.append(time.perf_counter() - started)
         compute_avg = float(np.median(warm))
         cold_avg = float(np.median(cold))
+        # Two DIFFERENT launch costs, measured separately -- conflating
+        # them under-reports launch for every variant profiled after its
+        # admission probe (observed: a specialized core charting
+        # launch=0.0 because its one true first launch had already been
+        # paid before profiling began):
+        #
+        # * FIRST launch -- library load, first dispatch, page faults --
+        #   is paid exactly once per variant per process. The admission
+        #   probe's own timing IS that first call ever, so it is read
+        #   from there, never re-measurable afterwards.
+        # * RELAUNCH -- preparing a fresh execution (buffer allocation
+        #   and binding) for a new call signature -- recurs, and is what
+        #   the cache-cleared cold repeats isolate.
+        first_call = float(
+            verification.get("probe_call_seconds") or cold_avg
+        )
         return {
             "sizes": sizes,
             "compute_avg_seconds": compute_avg,
             "cold_avg_seconds": cold_avg,
-            "launch_avg_seconds": max(0.0, cold_avg - compute_avg),
+            "first_call_seconds": first_call,
+            "first_launch_seconds": max(0.0, first_call - compute_avg),
+            "relaunch_avg_seconds": max(0.0, cold_avg - compute_avg),
             "warm_samples": len(warm),
             "cold_samples": len(cold),
         }
@@ -574,7 +592,8 @@ class KernelBank:
                 "contract": manifest.get("contract"),
                 "specialized": manifest.get("specialized") or {},
                 "sizes": profile.get("sizes") or {},
-                "launch_avg_seconds": profile.get("launch_avg_seconds"),
+                "first_launch_seconds": profile.get("first_launch_seconds"),
+                "relaunch_avg_seconds": profile.get("relaunch_avg_seconds"),
                 "compute_avg_seconds": profile.get("compute_avg_seconds"),
                 "cold_avg_seconds": profile.get("cold_avg_seconds"),
                 "built_unix": manifest.get("built_unix"),

@@ -49,12 +49,14 @@ def main() -> int:
             print(f"{name}:")
             for row in rows:
                 specialized = str(row["specialized"] or "parametric")
-                launch = row["launch_avg_seconds"]
+                first = row["first_launch_seconds"]
+                relaunch = row["relaunch_avg_seconds"]
                 compute = row["compute_avg_seconds"]
                 print(
                     f"  contract={row['contract']:<8} {specialized:<28} "
                     f"sizes={row['sizes']} "
-                    f"launch={launch * 1e6:8.1f} us  "
+                    f"first_launch={first * 1e6:8.1f} us  "
+                    f"relaunch={relaunch * 1e6:8.1f} us  "
                     f"compute={compute * 1e6:8.1f} us"
                 )
         return 0

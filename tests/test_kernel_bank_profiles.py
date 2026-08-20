@@ -4,12 +4,14 @@ Two facts the deployment strategy layer is starved without, both
 established here:
 
 * **Timing**: every admitted variant is profiled AT BUILD TIME with a
-  LAUNCH average (preparation + dispatch, measured by clearing the
-  execution cache) and a COMPUTE average (warm steady-state repeats),
-  recorded in its manifest and readable as a chart
+  COMPUTE average (warm steady-state medians) and TWO distinct launch
+  costs: FIRST launch (library load + first dispatch -- read from the
+  admission probe, the only first call a variant ever has) and RELAUNCH
+  (fresh-execution preparation, re-measured by clearing the execution
+  cache). Recorded in the manifest, readable as a chart
   (``KernelBank.performance_chart``). The single cold admission timing
-  that existed before conflated the two, which is exactly the bias that
-  made admission-probe throughput unusable as strategy evidence.
+  that existed before conflated all three, which is exactly the bias
+  that made admission-probe throughput unusable as strategy evidence.
 
 * **Per-item data size**: how a custom loop's data partitions across the
   items of a deployment matrix. Derived from the AUTHORED SOURCE -- the
@@ -125,7 +127,14 @@ def test_an_admitted_variant_carries_a_launch_and_compute_profile(bank):
     assert rows, "an admitted variant must be profiled at build"
     row = rows[-1]
     assert row["compute_avg_seconds"] > 0
-    assert row["launch_avg_seconds"] >= 0
+    # The two launch costs are distinct facts: FIRST launch (library load
+    # and first dispatch, read from the admission probe -- the only first
+    # call there ever is) and RELAUNCH (fresh-execution preparation,
+    # re-measurable by clearing the cache). Conflating them charted a
+    # specialized core at launch=0 because its one true first launch was
+    # paid before profiling began.
+    assert row["first_launch_seconds"] >= 0
+    assert row["relaunch_avg_seconds"] >= 0
     assert row["cold_avg_seconds"] >= row["compute_avg_seconds"]
     assert row["sizes"]  # the chart states what was measured
 
