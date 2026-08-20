@@ -181,6 +181,60 @@ Left unfixed on purpose: another session was actively committing to
 edit to a dead-store rule in a file under concurrent change is the unscoped
 move this tree's guidance warns against.
 
+## 4.5 What compiling the REAL `AbstractTensor.eigh` actually needs
+
+Worth stating carefully, because two faster readings of this were wrong and
+both are the kind of wrong that looks convincing.
+
+**It lowers.** The real 86-line `eigh` — ellipsis indexing, `.clone()`,
+`.sign()`, `.to_dtype()`, batch dims and all — goes through
+`lower_ast_source_to_ssa` unmodified and produces 18 functions, 430
+instructions in the entry, its real three-level loop nest (sweeps → p → q)
+intact, and non-empty outputs. The front half of the pipeline is not the
+problem.
+
+**Wrong reading #1: "only `clone` and `to_dtype` are missing."** That came
+from treating `supported_tensor_operations()` as a description of what emits.
+It is an inventory, and `tensor_likeness()`, the accessor over the `_TENSOR`
+table, **has no callers at all**.
+
+**Wrong reading #2: "no tensor operation emits."** Also false. There is a real
+tensor-kernel emission path (`unary_double`, `binary_double`,
+`binary_scalar_double`, expanded from `c_tensor_opcode`), and a full authored
+kernel library in `c_backend_llvm_ssa.py`.
+
+**What is actually true**, measured:
+
+* A parameter with no declared shape is compiled as a **scalar**. `x + y` and
+  `x.sqrt()` emit cleanly as `fadd`/`llvm.sqrt` — that says nothing about
+  tensor support, which is why it misled me.
+* The tensor kernel path fires only when the **element count is statically
+  known**. `tensor_ssa_lowering.py` routes an op to `unary_double`/
+  `binary_double` only if `c_tensor_opcode(op)` exists *and* a count can be
+  formed. So real tensor emission is gated on **shape propagation**, not on
+  the operator tables.
+* `sign` HAS an opcode (`unary`, 40) and still fails — no count. `clone`,
+  `copy`, `matmul`, `to_dtype`, `zeros_like` have **no opcode**.
+* **Ellipsis indexing is the structural blocker.** `S[..., p, q]` lowers to
+  index tuples as first-class constants combined with `Add` (tuple
+  concatenation): `Const(())` for the ellipsis, `Const((0, 0))` for the
+  explicit part, joined and handed to `GetElementPtr`. Fortran refuses
+  outright (`cannot express literal () in Fortran`); LLVM reports `address
+  index is not an emitted integer scalar` 19 times. Constant-folding that
+  concatenation so `GetElementPtr` receives a concrete index would remove the
+  largest single group of shortfalls.
+* The Fortran lane has its own separate problems on this shape: a cloned array
+  came out declared **scalar** (`real(c_double), intent(in), value`) and the
+  region holding the mutating loop emitted an **empty body**.
+
+**Order of work, if someone takes this on:** shape/rank propagation for tensor
+parameters first (it unblocks the kernel path wholesale), then the ellipsis
+index folding, then the individual operators — and `clone` must emit a real
+copy. `cast_double_to_double_values(a, out, n)` is exactly that kernel and is
+already in the library. Do **not** alias it to its operand the way the shape-
+only set is aliased: `eigh` opens with `S = A.clone()` precisely so the
+in-place rotations that follow do not reach `A`.
+
 ## 5. Is Jacobi still the right algorithm?
 
 Yes for now, with one correction already made, and with no claim that it beats
