@@ -21,8 +21,10 @@ from typing import Any, Callable, Mapping, Sequence
 from .kernel_bank import CompiledVariant, KernelBank, KernelSpec
 from .llvm_training_runtime import (
     BrowserGraphReverse,
+    NativeGraphForward,
     NativeGraphReverse,
     compile_graph_reverse_to_wasm,
+    compile_native_graph_forward,
     compile_native_graph_reverse,
     native_artifact_record,
 )
@@ -66,15 +68,32 @@ class MethodGraphCapture:
 @dataclass(frozen=True)
 class StandardMethod:
     name: str
-    kernel: KernelSpec
+    kernel: KernelSpec | None
     capture_graph: Callable[[], MethodGraphCapture]
     specializations: tuple[Mapping[str, int], ...] = ()
+    authored_source: str | None = None
+    installation: str | None = None
 
     def __post_init__(self) -> None:
-        if self.name != self.kernel.name:
+        if self.kernel is not None and self.name != self.kernel.name:
             raise ValueError(
                 f"method {self.name!r} must name kernel {self.kernel.name!r}"
             )
+        if self.kernel is None and not self.authored_source:
+            raise ValueError(
+                f"graph-forward method {self.name!r} requires authored source"
+            )
+        if self.kernel is None and self.specializations:
+            raise ValueError(
+                f"graph-forward method {self.name!r} cannot yet specialize"
+            )
+
+    @property
+    def source(self) -> str:
+        return (
+            self.kernel.source
+            if self.kernel is not None else str(self.authored_source)
+        )
 
 
 @dataclass(frozen=True)
@@ -101,9 +120,9 @@ class StandardObject:
 @dataclass(frozen=True)
 class CompiledStandardMethod:
     spec: StandardMethod
-    parametric_forward: CompiledVariant
+    parametric_forward: CompiledVariant | NativeGraphForward
     parametric_reverse: NativeGraphReverse
-    browser_reverse: BrowserGraphReverse
+    browser_reverse: BrowserGraphReverse | None
     specialized_forwards: tuple[CompiledVariant, ...]
 
 
@@ -130,6 +149,27 @@ def _variant_record(variant: CompiledVariant) -> dict[str, Any]:
         "specialized": dict(variant.specialized),
         "manifest": str((variant.directory / "manifest.json").resolve()),
         "verification": dict(manifest.get("verification") or {}),
+    }
+
+
+def _forward_record(
+    forward: CompiledVariant | NativeGraphForward,
+    root: Path,
+) -> dict[str, Any]:
+    if isinstance(forward, CompiledVariant):
+        return {"kind": "kernel_bank", **_variant_record(forward)}
+    record = native_artifact_record(forward.artifact)
+    record["library_path"] = Path(record["library_path"]).relative_to(
+        root
+    ).as_posix()
+    return {
+        "kind": "captured_graph",
+        "key": forward.key,
+        "source_sha256": forward.source_sha256,
+        "input_value_ids": dict(forward.input_value_ids),
+        "output_value_ids": list(forward.output_value_ids),
+        "artifact": record,
+        "specialized": {},
     }
 
 
@@ -262,6 +302,7 @@ def cook_standard_object(
     *,
     directory: str | Path,
     contract: str | None = None,
+    reverse_backends: Sequence[str] = ("native", "wasm"),
 ) -> StandardObjectProduct:
     """Compile and publish one complete standard numerical object.
 
@@ -271,11 +312,30 @@ def cook_standard_object(
     specialization can never make an otherwise incomplete method publishable.
     """
 
+    selected_reverse_backends = tuple(dict.fromkeys(
+        str(backend).strip().lower() for backend in reverse_backends
+    ))
+    unknown_reverse_backends = set(selected_reverse_backends) - {
+        "native", "wasm",
+    }
+    if unknown_reverse_backends:
+        raise ValueError(
+            "unsupported compiled reverse backends: "
+            f"{sorted(unknown_reverse_backends)!r}"
+        )
+    if "native" not in selected_reverse_backends:
+        raise ValueError(
+            "native is currently the required standard-object reverse "
+            "baseline; additional backends are independent realizations"
+        )
+
     root = Path(directory).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    bank = KernelBank(root / "forward-bank", {
+    kernel_specs = {
         method.name: method.kernel for method in spec.methods
-    })
+        if method.kernel is not None
+    }
+    bank = KernelBank(root / "forward-bank", kernel_specs)
     surface_record = (
         _compile_object_surface(spec.surface, identity=spec.identity, root=root)
         if spec.surface is not None else None
@@ -283,10 +343,17 @@ def cook_standard_object(
     compiled: dict[str, CompiledStandardMethod] = {}
 
     for method in spec.methods:
-        forward = bank.get(
-            method.name, contract=contract, specialized=None,
-        )
         capture = method.capture_graph()
+        forward = (
+            bank.get(method.name, contract=contract, specialized=None)
+            if method.kernel is not None else compile_native_graph_forward(
+                capture.output,
+                bindings=capture.bindings,
+                source=method.source,
+                name=f"{spec.identity.replace('.', '_')}__{method.name}",
+                directory=root / "forward-graph" / method.name,
+            )
+        )
         reverse = compile_native_graph_reverse(
             capture.output,
             bindings=capture.bindings,
@@ -295,9 +362,12 @@ def cook_standard_object(
             directory=root / "reverse" / method.name,
             unit_output_seed=False,
         )
-        browser_reverse = compile_graph_reverse_to_wasm(
-            reverse,
-            directory=root / "browser-reverse" / method.name,
+        browser_reverse = (
+            compile_graph_reverse_to_wasm(
+                reverse,
+                directory=root / "browser-reverse" / method.name,
+            )
+            if "wasm" in selected_reverse_backends else None
         )
         specializations = tuple(
             bank.get(
@@ -306,12 +376,15 @@ def cook_standard_object(
                 specialized=dict(parameters),
             )
             for parameters in method.specializations
-        )
+        ) if method.kernel is not None else ()
         compiled[method.name] = CompiledStandardMethod(
             method, forward, reverse, browser_reverse, specializations,
         )
 
-    browser_loader_source = _browser_reverse_javascript()
+    browser_loader_source = (
+        _browser_reverse_javascript()
+        if "wasm" in selected_reverse_backends else None
+    )
     semantic_manifest = {
         "schema": STANDARD_OBJECT_SCHEMA,
         "object": {
@@ -325,18 +398,25 @@ def cook_standard_object(
             "parametric_forward_required": True,
             "parametric_graph_reverse_required": True,
             "reverse_must_be_backend_compiled": True,
-            "browser_reverse_must_be_compiled": True,
+            "compiled_reverse_backends": list(selected_reverse_backends),
+            "browser_reverse_must_be_compiled": (
+                "wasm" in selected_reverse_backends
+            ),
             "specializations_are_optional_overlays": True,
         },
-        "browser_loader_source_sha256": hashlib.sha256(
-            browser_loader_source.encode("utf-8")
-        ).hexdigest(),
+        **({
+            "browser_loader_source_sha256": hashlib.sha256(
+                browser_loader_source.encode("utf-8")
+            ).hexdigest(),
+        } if browser_loader_source is not None else {}),
         "methods": [
             {
                 "name": method.name,
+                "source": method.source,
                 "source_sha256": hashlib.sha256(
-                    method.kernel.source.encode("utf-8")
+                    method.source.encode("utf-8")
                 ).hexdigest(),
+                "installation": method.installation,
                 "parametric_forward_key": compiled[method.name].parametric_forward.key,
                 "reverse_input_value_ids": {
                     str(key): int(value) for key, value in
@@ -360,27 +440,60 @@ def cook_standard_object(
             }
             for method in spec.methods
         ],
+        "deployment_matrix": [
+            row
+            for method in spec.methods
+            for row in (
+                {
+                    "method": method.name,
+                    "parameters": {},
+                    "key": compiled[method.name].parametric_forward.key,
+                    "kind": (
+                        "captured_graph"
+                        if isinstance(
+                            compiled[method.name].parametric_forward,
+                            NativeGraphForward,
+                        ) else "kernel_bank"
+                    ),
+                },
+                *(
+                    {
+                        "method": method.name,
+                        "parameters": dict(variant.specialized),
+                        "key": variant.key,
+                        "kind": "kernel_bank",
+                    }
+                    for variant in compiled[method.name].specialized_forwards
+                ),
+            )
+        ],
     }
     product_id = hashlib.sha256(_canonical(semantic_manifest)).hexdigest()
-    browser_loader = root / "compiled-reverse.js"
-    browser_loader.write_text(
-        browser_loader_source, encoding="utf-8", newline="\n",
-    )
+    browser_loader = None
+    if browser_loader_source is not None:
+        browser_loader = root / "compiled-reverse.js"
+        browser_loader.write_text(
+            browser_loader_source, encoding="utf-8", newline="\n",
+        )
     manifest = {
         **semantic_manifest,
         "product_id": product_id,
-        "browser_loader": browser_loader.relative_to(root).as_posix(),
+        **({
+            "browser_loader": browser_loader.relative_to(root).as_posix(),
+        } if browser_loader is not None else {}),
         "artifacts": {
             method.name: {
-                "parametric_forward": _variant_record(
-                    compiled[method.name].parametric_forward
+                "parametric_forward": _forward_record(
+                    compiled[method.name].parametric_forward, root
                 ),
                 "parametric_reverse": _reverse_artifact_record(
                     compiled[method.name].parametric_reverse, root
                 ),
-                "browser_parametric_reverse": _browser_reverse_record(
-                    compiled[method.name].browser_reverse, root
-                ),
+                **({
+                    "browser_parametric_reverse": _browser_reverse_record(
+                        compiled[method.name].browser_reverse, root
+                    ),
+                } if compiled[method.name].browser_reverse is not None else {}),
                 "specialized_forwards": [
                     _variant_record(variant) for variant in
                     compiled[method.name].specialized_forwards
@@ -403,20 +516,19 @@ def cook_standard_object(
 def mathematical_sublibrary_object(
     library: Any,
     *,
-    kernels: Mapping[str, KernelSpec],
+    kernels: Mapping[str, KernelSpec] | None,
     graph_captures: Mapping[str, Callable[[], MethodGraphCapture]],
     specializations: Mapping[str, Sequence[Mapping[str, int]]] | None = None,
 ) -> StandardObject:
     """Adapt a canonical mathematical sublibrary without copying its catalog."""
 
     names = tuple(method.name for method in library.methods)
-    missing_kernels = set(names) - set(kernels)
+    kernel_map = dict(kernels or {})
     missing_captures = set(names) - set(graph_captures)
-    extras = (set(kernels) | set(graph_captures)) - set(names)
-    if missing_kernels or missing_captures or extras:
+    extras = (set(kernel_map) | set(graph_captures)) - set(names)
+    if missing_captures or extras:
         raise ValueError(
             "mathematical object implementation does not equal its catalog: "
-            f"missing_kernels={sorted(missing_kernels)!r}, "
             f"missing_graph_captures={sorted(missing_captures)!r}, "
             f"extras={sorted(extras)!r}"
         )
@@ -427,9 +539,11 @@ def mathematical_sublibrary_object(
         methods=tuple(
             StandardMethod(
                 name,
-                kernels[name],
+                kernel_map.get(name),
                 graph_captures[name],
                 tuple(matrix.get(name, ())),
+                authored_source=str(library.method(name).source),
+                installation=library.method(name).installation,
             )
             for name in names
         ),

@@ -135,6 +135,49 @@ def test_tensor_instruction_materializes_real_repository_ssa_kernel_operands():
     )
 
 
+def test_left_integer_literal_uses_double_scalar_tensor_abi():
+    literal = SSAValue(1100, dtype="int32", shape=())
+    source = SSAValue(1101, dtype="float64", shape=(4,))
+    result = SSAValue(1102, dtype="float64", shape=(4,))
+    caller = Function(
+        "left_literal",
+        [source],
+        {"entry": BasicBlock("entry", [
+            Instr(
+                Handler.Const.value, [], literal,
+                attributes={"constant": 1},
+            ),
+            Instr(Handler.Add.value, [literal, source], result),
+            Instr(Handler.Ret.value, [result], None),
+        ])},
+    )
+    module = IRModule({caller.name: caller})
+
+    shortfalls = lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference(),
+    )
+
+    assert shortfalls == ()
+    instructions = caller.blocks["entry"].instrs
+    scalar_call = next(
+        instruction for instruction in instructions
+        if instruction.op == Handler.Call.value
+        and instruction.attributes.get("callee") == "binary_scalar_double"
+    )
+    scalar = scalar_call.args[1]
+    scalar_definition = next(
+        instruction for instruction in instructions
+        if instruction.res == scalar
+    )
+    assert scalar.dtype == "float64"
+    assert scalar_definition.attributes["constant"] == 1.0
+    assert scalar_call.args[0] == source
+    assert not any(
+        instruction.attributes.get("callee") == "broadcast_double"
+        for instruction in instructions
+    )
+
+
 def test_whole_module_tensor_recipes_expand_views_transpose_reduction_cast_and_cbrt():
     source = SSAValue(2000, dtype="float64", shape=(2, 3))
     dim0 = SSAValue(2001, dtype="int32")

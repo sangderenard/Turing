@@ -13,6 +13,7 @@ from ..common.tensors.mathematical_library import TURING_MATHEMATICAL_LIBRARY
 from .blas_server import BLASServerProduct, build_blas_server
 from .numpy_mathematical_library import emit_numpy_mathematical_library
 from .standard_object_blas import blas_standard_object
+from .standard_object_trigonometry import trigonometry_standard_object
 from .standard_object_product import StandardObjectProduct, cook_standard_object
 from .wasm_binary import CodeBuilder, build_module
 
@@ -37,6 +38,7 @@ class MathematicalLibraryProduct:
     demo_path: Path
     blas: BLASServerProduct
     blas_object: StandardObjectProduct
+    trigonometry_object: StandardObjectProduct
     manifest: Mapping[str, Any]
 
 
@@ -219,6 +221,190 @@ class CompiledObjectReverse:
         }
 
 
+class CompiledStandardObject:
+    """One source-bearing standard object, deployment matrix, and installer."""
+
+    _DTYPES = CompiledObjectReverse._DTYPES
+
+    def __init__(self, root, record):
+        self.root = Path(root)
+        self.record = record
+        self.methods = tuple(item["name"] for item in record["methods"])
+        self.sources = {
+            item["name"]: item["source"] for item in record["methods"]
+        }
+        self.deployment_matrix = tuple(record["deployment_matrix"])
+        self._artifacts = record["artifacts"]
+        self._libraries = {}
+        self._installations = {}
+
+    def authored_source(self, method):
+        try:
+            return self.sources[str(method)]
+        except KeyError as error:
+            raise KeyError(f"unknown authored method {method!r}") from error
+
+    def select(self, method, parameters=None):
+        requested = dict(parameters or {})
+        rows = [
+            row for row in self.deployment_matrix
+            if row["method"] == method and row["parameters"] == requested
+        ]
+        if not rows and requested:
+            rows = [
+                row for row in self.deployment_matrix
+                if row["method"] == method and not row["parameters"]
+            ]
+        if len(rows) != 1:
+            raise RuntimeError(
+                f"{method} deployment matrix has {len(rows)} matches for "
+                f"{requested!r}"
+            )
+        row = rows[0]
+        if not row["parameters"]:
+            return self._artifacts[method]["parametric_forward"]
+        return next(
+            record
+            for record in self._artifacts[method]["specialized_forwards"]
+            if record["key"] == row["key"]
+        )
+
+    def __getattr__(self, method):
+        if method not in self.methods:
+            raise AttributeError(method)
+
+        def invoke(*args, **bindings):
+            deployment_parameters = bindings.pop("_deployment_parameters", None)
+            artifact = self.select(method, deployment_parameters)
+            expected = tuple(artifact["input_value_ids"])
+            if len(args) > len(expected):
+                raise TypeError(f"{method} accepts {len(expected)} inputs")
+            bound = dict(zip(expected, args))
+            overlap = set(bound) & set(bindings)
+            if overlap:
+                raise TypeError(f"{method} repeats bindings {sorted(overlap)!r}")
+            bound.update(bindings)
+            if set(bound) != set(expected):
+                raise TypeError(
+                    f"{method} bindings must be {sorted(expected)!r}"
+                )
+            return self._call(method, artifact, bound)
+
+        return invoke
+
+    @staticmethod
+    def _installed_argument(value):
+        return value.data if hasattr(value, "ensure_tensor") else value
+
+    @staticmethod
+    def _installed_result(template, value):
+        if isinstance(value, tuple):
+            return tuple(
+                CompiledStandardObject._installed_result(template, item)
+                for item in value
+            )
+        return template.ensure_tensor(value)
+
+    def install(self, host):
+        """Replace declared host operators with this object's deployer."""
+
+        if host in self._installations:
+            return self
+        originals = {}
+        installable = {
+            item["name"] for item in self.record["methods"]
+            if item.get("installation") == "instance_operator"
+        }
+        for method in installable:
+            originals[method] = (
+                method in vars(host), getattr(host, method),
+            )
+
+            def deployed(template, *args, __method=method, **kwargs):
+                raw_args = tuple(
+                    self._installed_argument(value)
+                    for value in (template, *args)
+                )
+                raw_kwargs = {
+                    name: self._installed_argument(value)
+                    for name, value in kwargs.items()
+                }
+                result = getattr(self, __method)(*raw_args, **raw_kwargs)
+                return self._installed_result(template, result)
+
+            setattr(host, method, deployed)
+        self._installations[host] = originals
+        packs = tuple(getattr(host, "_installed_operator_packs", ()))
+        setattr(host, "_installed_operator_packs", (*packs, self))
+        return self
+
+    def uninstall(self, host):
+        originals = self._installations.pop(host, None)
+        if originals is None:
+            return self
+        for method, (owned, original) in originals.items():
+            if owned:
+                setattr(host, method, original)
+            else:
+                delattr(host, method)
+        packs = tuple(
+            pack for pack in getattr(host, "_installed_operator_packs", ())
+            if pack is not self
+        )
+        setattr(host, "_installed_operator_packs", packs)
+        return self
+
+    def _call(self, method, record, bindings):
+        if record.get("kind") != "captured_graph":
+            raise RuntimeError(f"{method} is not a captured-graph forward")
+        artifact = record["artifact"]
+        feeds = {
+            int(record["input_value_ids"][name]): value
+            for name, value in bindings.items()
+        }
+        order = tuple(map(int, artifact["buffer_order"]))
+        dtypes = tuple(artifact.get("buffer_dtypes") or ("double",) * len(order))
+        buffers = {}
+        for value_id, shape, dtype in zip(order, artifact["buffer_shapes"], dtypes):
+            numpy_dtype = self._DTYPES[str(dtype)]
+            if value_id in feeds:
+                value = np.asarray(feeds[value_id], dtype=numpy_dtype)
+                buffers[value_id] = np.ascontiguousarray(value).copy()
+            else:
+                buffers[value_id] = np.zeros(tuple(shape) or (), dtype=numpy_dtype)
+        pointers = (ctypes.c_void_p * len(order))(*(
+            ctypes.c_void_p(int(buffers[value_id].ctypes.data))
+            for value_id in order
+        ))
+        extents = []
+        for value_id, kind, axis in artifact["extent_order"]:
+            value = buffers[int(value_id)]
+            if kind in ("numel", "element_count"):
+                extents.append(int(value.size))
+            elif kind == "rank":
+                extents.append(int(value.ndim))
+            elif kind in ("dim", "shape") and axis is not None:
+                extents.append(int(value.shape[int(axis)]))
+            else:
+                raise ValueError(f"cannot derive forward extent {(value_id, kind, axis)!r}")
+        library = self._libraries.get(method)
+        if library is None:
+            library = ctypes.CDLL(str(self.root / artifact["library_path"]))
+            self._libraries[method] = library
+        entry = getattr(library, artifact["name"])
+        entry.restype = None
+        entry.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int32),
+        ]
+        extent_array = (ctypes.c_int32 * len(extents))(*extents)
+        entry(pointers, extent_array)
+        outputs = tuple(
+            buffers[int(value_id)].copy()
+            for value_id in record["output_value_ids"]
+        )
+        return outputs[0] if len(outputs) == 1 else outputs
+
+
 class TuringMathematicalLibrary:
     def __init__(self, root=None):
         self.root = Path(root or Path(__file__).resolve().parents[1])
@@ -242,6 +428,18 @@ class TuringMathematicalLibrary:
         self.blas = module.load(self.root / product["path"])
         self.blas.reverse = self.blas_reverse
         self.blas.vjp = self.blas_reverse.vjp
+        trig_product = self.matrix["products"].get("trigonometry")
+        if trig_product is not None:
+            trig_path = self.root / trig_product["standard_object"]["path"]
+            trig_record = json.loads(
+                (trig_path / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.trigonometry = CompiledStandardObject(trig_path, trig_record)
+            self.trigonometry_reverse = CompiledObjectReverse(
+                trig_path, trig_record,
+            )
+            self.trigonometry.reverse = self.trigonometry_reverse
+            self.trigonometry.vjp = self.trigonometry_reverse.vjp
         numpy_loader = self.root / self.manifest["surfaces"]["python"]["numpy"]["module"]
         numpy_spec = importlib.util.spec_from_file_location(
             "packaged_turing_numpy_math", numpy_loader,
@@ -264,7 +462,13 @@ class TuringMathematicalLibrary:
             raise ValueError("implementation must be 'numpy' or 'native'") from error
         hook = getattr(host, "install_mathematical_library", None)
         if hook is not None:
-            return hook(provider)
+            hook(provider)
+            for name in provider.libraries:
+                sublibrary = getattr(provider, name, None)
+                installer = getattr(sublibrary, "install", None)
+                if installer is not None:
+                    installer(host)
+            return provider
         setattr(host, str(attribute), provider)
         return provider
 
@@ -441,13 +645,21 @@ byId("backward").onclick=()=>run(byId("backward"),async()=>{const iterations=Mat
 
 def _readme(product_id: str, blas: BLASServerProduct) -> str:
     methods = ", ".join(blas.manifest["methods"])
+    trigonometry_methods = ", ".join(
+        method.name
+        for method in TURING_MATHEMATICAL_LIBRARY.library(
+            "trigonometry"
+        ).methods
+    )
     return f"""# Turing mathematical library
 
 Product identity: `{product_id}`.
 
-This is the outer mathematical-library product. `libraries/blas` is its first
-subunit. The semantic BLAS catalog contains {methods}; its deployment coverage
-is recorded per method rather than inferred from which files happen to exist.
+This is the outer mathematical-library product. It contains synchronized BLAS
+and trigonometry subunits. The semantic BLAS catalog contains {methods}. The
+trigonometry object is ingested from the existing AbstractTensor surface and
+contains {trigonometry_methods}. Deployment coverage is recorded per method
+rather than inferred from which files happen to exist.
 
 ## Python
 
@@ -456,10 +668,21 @@ from python import load
 math = load()
 result = math.blas.gemm(a, b)
 gradients = math.blas.vjp("gemm", upstream, a=a, b=b)
+wave = math.trigonometry.sin(x)
+wave_gradient = math.trigonometry.vjp("sin", upstream, value=x)
 numpy_math = math.install(MyNumericalHost)  # standalone NumPy is the default
 native_math = math.install(AnotherHost, implementation="native")
 math.close()
 ```
+
+Native installation is active deployment, not a side namespace: each standard
+object replaces the host instance operators it declares. For example, the
+trigonometry pack replaces `AbstractTensor.sin`, selects a row from its own
+deployment matrix, and invokes that baked artifact. The very same pack retains
+the exact authored definition through
+`math.trigonometry.authored_source("sin")`; `uninstall()` (also used by
+`AbstractTensor.use_semantic_mathematical_library()`) restores the displaced
+operator.
 
 `math.numpy` is a standalone NumPy class whose numerical bodies were manifested
 from the canonical AbstractTensor graphs by the compiler. `math.blas` is the
@@ -481,8 +704,10 @@ AbstractTensor.use_semantic_mathematical_library()
 
 ## Native
 
-Include `native/turing_mathematical_library.h`. It exposes the packaged BLAS
-subunit ABI; library binaries and target information are listed in
+Include `native/turing_mathematical_library.h` for the packed BLAS ABI. The
+trigonometry standard object publishes one native forward DLL and one fully
+compiled native graph-reverse DLL per existing method under
+`objects/trigonometry`; all binaries and target information are listed in
 `manifest.json`.
 
 ## Browser
@@ -508,7 +733,7 @@ def build_mathematical_library_product(
     cores: int | None = None,
     candidate_sizes: tuple[int, ...] = (16, 32, 64, 128, 256),
 ) -> MathematicalLibraryProduct:
-    """Build the outer shell and its currently packaged BLAS subunit."""
+    """Build the outer shell and its synchronized mathematical subunits."""
 
     root = Path(directory).resolve()
     marker = _prepare_root(root)
@@ -532,6 +757,12 @@ def build_mathematical_library_product(
         directory=root / "objects" / "blas",
         contract=contract,
     )
+    trigonometry_object = cook_standard_object(
+        trigonometry_standard_object(),
+        directory=root / "objects" / "trigonometry",
+        contract=contract,
+        reverse_backends=("native",),
+    )
     numpy_source, numpy_receipt = emit_numpy_mathematical_library()
     browser_installer = _browser_installer()
     browser_template = _browser_template()
@@ -547,6 +778,29 @@ def build_mathematical_library_product(
                 "standard_object": {
                     "path": "objects/blas",
                     "product_id": blas_object.manifest["product_id"],
+                    "parametric_forward": "required",
+                    "compiled_graph_reverse": "required",
+                },
+            },
+            "trigonometry": {
+                "path": "objects/trigonometry",
+                "product_id": trigonometry_object.manifest["product_id"],
+                "coverage": [
+                    {
+                        "method": method["name"],
+                        "identity": f"trigonometry.{method['name']}",
+                        "realizations": {
+                            "native_forward": "packaged",
+                            "native_reverse": "packaged",
+                            "wasm_reverse": "not-selected",
+                            "webgpu": "not-yet-packaged",
+                        },
+                    }
+                    for method in trigonometry_object.manifest["methods"]
+                ],
+                "standard_object": {
+                    "path": "objects/trigonometry",
+                    "product_id": trigonometry_object.manifest["product_id"],
                     "parametric_forward": "required",
                     "compiled_graph_reverse": "required",
                 },
@@ -649,6 +903,22 @@ def build_mathematical_library_product(
                     ],
                 },
             },
+            "trigonometry": {
+                "path": "objects/trigonometry",
+                "product_id": trigonometry_object.manifest["product_id"],
+                "methods": [
+                    method["name"]
+                    for method in trigonometry_object.manifest["methods"]
+                ],
+                "standard_object": {
+                    "manifest": "objects/trigonometry/manifest.json",
+                    "product_id": trigonometry_object.manifest["product_id"],
+                    "methods": [
+                        method["name"]
+                        for method in trigonometry_object.manifest["methods"]
+                    ],
+                },
+            },
         },
         "surfaces": {
             "native": {
@@ -664,6 +934,12 @@ def build_mathematical_library_product(
                             "libraries/blas/"
                             + blas.manifest["surfaces"]["native"]["header"]
                         ),
+                    },
+                    "trigonometry": {
+                        "object": "objects/trigonometry/manifest.json",
+                        "forward_artifacts": "per-method native DLL",
+                        "reverse_artifacts": "per-method native DLL",
+                        "python_runtime_dependency": False,
                     },
                 },
             },
@@ -681,7 +957,7 @@ def build_mathematical_library_product(
                 },
                 "native": {
                     "selector": "native",
-                    "provider": "TuringMathematicalLibrary.blas",
+                    "provider": "TuringMathematicalLibrary",
                 },
             },
             "web": {
@@ -702,7 +978,7 @@ def build_mathematical_library_product(
     )
     return MathematicalLibraryProduct(
         root, manifest_path, matrix_path, python_loader, numpy_loader, javascript_path,
-        wasm_path, demo_path, blas, blas_object, manifest,
+        wasm_path, demo_path, blas, blas_object, trigonometry_object, manifest,
     )
 
 

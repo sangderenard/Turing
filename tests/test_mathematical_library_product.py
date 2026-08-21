@@ -1,4 +1,4 @@
-"""The outer product synchronizes its BLAS subunit on every surface."""
+"""The outer product synchronizes plural mathematical subunits."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import subprocess
 
 import numpy as np
 
+from src.common.tensors.mathematical_library import TRIGONOMETRY_LIBRARY
 from src.compiler.kernel_bank import open_blas_bank
 from src.compiler.mathematical_library_product import (
     MATRIX_SCHEMA,
@@ -26,7 +27,7 @@ def _load_generated(path):
     return module
 
 
-def test_outer_math_product_owns_a_synchronized_blas_subunit(tmp_path):
+def test_outer_math_product_owns_synchronized_library_subunits(tmp_path):
     product = build_mathematical_library_product(
         open_blas_bank(tmp_path / "bank"), (17,), tmp_path / "math",
         contract="fast", cores=2, candidate_sizes=(8,),
@@ -37,7 +38,7 @@ def test_outer_math_product_owns_a_synchronized_blas_subunit(tmp_path):
     assert manifest["schema"] == PRODUCT_SCHEMA
     assert matrix["schema"] == MATRIX_SCHEMA
     assert hashlib.sha256(matrix_bytes).hexdigest() == manifest["product_id"]
-    assert list(matrix["products"]) == ["blas"]
+    assert list(matrix["products"]) == ["blas", "trigonometry"]
     assert manifest["libraries"]["blas"]["methods"] == [
         "scal", "axpy", "dot", "gemv", "gemm", "rot",
     ]
@@ -64,6 +65,30 @@ def test_outer_math_product_owns_a_synchronized_blas_subunit(tmp_path):
     assert object_manifest["methods"][4]["specializations"] == [
         {"k": 17, "m": 17, "n": 17}
     ]
+    trigonometry_record = manifest["libraries"]["trigonometry"][
+        "standard_object"
+    ]
+    trigonometry_manifest = json.loads(
+        (product.directory / trigonometry_record["manifest"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    trigonometry_methods = tuple(
+        method.name for method in TRIGONOMETRY_LIBRARY.methods
+    )
+    assert tuple(manifest["libraries"]["trigonometry"]["methods"]) == (
+        trigonometry_methods
+    )
+    assert tuple(trigonometry_record["methods"]) == trigonometry_methods
+    assert trigonometry_record["product_id"] == (
+        trigonometry_manifest["product_id"]
+    )
+    assert all(
+        item["parametric_forward"]["kind"] == "captured_graph"
+        and item["parametric_forward"]["artifact"]["library_path"]
+        and item["parametric_reverse"]["library_path"]
+        for item in trigonometry_manifest["artifacts"].values()
+    )
     node = shutil.which("node")
     if node is not None:
         reverse_loader = product.directory / "objects" / "blas" / object_manifest[
@@ -99,7 +124,7 @@ console.log(JSON.stringify(Object.fromEntries(Object.entries(result).map(([key,v
     generated = _load_generated(product.python_loader)
     math = generated.load(product.directory)
     try:
-        assert math.libraries == ("blas",)
+        assert math.libraries == ("blas", "trigonometry")
         assert math.blas.methods == (
             "scal", "axpy", "dot", "gemv", "gemm", "rot",
         )
@@ -134,6 +159,30 @@ console.log(JSON.stringify(Object.fromEntries(Object.entries(result).map(([key,v
         )
         np.testing.assert_allclose(reverse["x"], 2.5 * reverse_y)
         np.testing.assert_allclose(reverse["y"], 2.5 * reverse_x)
+
+        trig_input = np.asarray([0.25, 0.5, 0.75, 1.0])
+        assert math.trigonometry.methods == trigonometry_methods
+        np.testing.assert_allclose(
+            math.trigonometry.sin(trig_input), np.sin(trig_input),
+        )
+        trig_reverse = math.trigonometry.vjp(
+            "sin", np.ones_like(trig_input), value=trig_input,
+        )
+        np.testing.assert_allclose(trig_reverse["value"], np.cos(trig_input))
+        trig_coverage = {
+            item["method"]: item
+            for item in matrix["products"]["trigonometry"]["coverage"]
+        }
+        assert set(trig_coverage) == set(trigonometry_methods)
+        assert all(
+            item["realizations"] == {
+                "native_forward": "packaged",
+                "native_reverse": "packaged",
+                "wasm_reverse": "not-selected",
+                "webgpu": "not-yet-packaged",
+            }
+            for item in trig_coverage.values()
+        )
 
         reverse_a = np.asarray([[0.2, -0.3, 0.7], [1.1, 0.4, -0.2]])
         reverse_vector = np.asarray([0.5, -1.25, 0.75])
@@ -218,10 +267,26 @@ console.log(JSON.stringify(Object.fromEntries(Object.entries(result).map(([key,v
         assert math.install(AbstractTensor) is math.numpy
         assert AbstractTensor.compiled_math is math.numpy
         assert AbstractTensor.math.product is math.numpy
+        assert AbstractTensor.trigonometry is semantic.trigonometry
         tensor = AbstractTensor.get_tensor([1.0, 2.0, 3.0])
         assert AbstractTensor.blas.scal(tensor, 2.0).tolist() == [2.0, 4.0, 6.0]
         assert AbstractTensor.use_semantic_mathematical_library() is semantic
         assert AbstractTensor.math is semantic
+
+        original_sin = AbstractTensor.sin
+        assert math.install(AbstractTensor, implementation="native") is math
+        assert AbstractTensor.sin is not original_sin
+        assert math.trigonometry.authored_source("sin") == (
+            TRIGONOMETRY_LIBRARY.method("sin").source
+        )
+        assert math.trigonometry.select("sin")["kind"] == "captured_graph"
+        installed_input = AbstractTensor.get_tensor([0.25, 0.5, 0.75, 1.0])
+        np.testing.assert_allclose(
+            installed_input.sin().tolist(),
+            np.sin([0.25, 0.5, 0.75, 1.0]),
+        )
+        assert AbstractTensor.use_semantic_mathematical_library() is semantic
+        assert AbstractTensor.sin is original_sin
     finally:
         math.close()
 

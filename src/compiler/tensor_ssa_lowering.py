@@ -1552,88 +1552,124 @@ def lower_tensor_calls_to_repository_ssa(
                                     instruction, output_argument=1,
                                 ))
                             elif kind == "binary" and len(data_args) == 2:
-                                conformed_args = []
-                                for operand in data_args:
-                                    if tuple(operand.shape) == tuple(result.shape):
-                                        conformed_args.append(operand)
-                                        continue
-                                    if not operand.shape or not result.shape:
-                                        # Shapes unknown statically: conforming
-                                        # is a runtime decision, so route the
-                                        # operand through broadcast_double with
-                                        # extent metadata -- never a silent
-                                        # mismatched elementwise call.
-                                        operand_extents = ensure_dynamic(prefix, operand)
-                                        result_extents = ensure_dynamic(prefix, result)
+                                left_constant = constants.get(
+                                    int(data_args[0].id)
+                                )
+                                if (
+                                    int(data_args[0].id) in constants
+                                    and not tuple(data_args[0].shape)
+                                    and tuple(data_args[1].shape)
+                                    and isinstance(left_constant, (int, float))
+                                    and not isinstance(left_constant, bool)
+                                ):
+                                    # AST arithmetic retains a literal in
+                                    # operand zero (``1 + tensor``).  The
+                                    # repository tensor ABI is double-based;
+                                    # broadcasting the original i32 storage
+                                    # through ``broadcast_double`` reads four
+                                    # uninitialised bytes and corrupts the
+                                    # result.  Materialize the numerical
+                                    # scalar at the ABI dtype and use the
+                                    # existing scalar kernel, exactly as the
+                                    # right-literal path below already does.
+                                    scalar, scalar_def = constant(
+                                        float(left_constant), "float64"
+                                    )
+                                    reverse, reverse_def = constant(1, "int32")
+                                    prefix.extend((scalar_def, reverse_def))
+                                    emitted.append(call(
+                                        "binary_scalar_double",
+                                        [
+                                            data_args[1], scalar, result,
+                                            count, opcode_ssa, reverse,
+                                        ],
+                                        result,
+                                        instruction,
+                                        output_argument=2,
+                                    ))
+                                else:
+                                    conformed_args = []
+                                    for operand in data_args:
+                                        if tuple(operand.shape) == tuple(result.shape):
+                                            conformed_args.append(operand)
+                                            continue
+                                        if not operand.shape or not result.shape:
+                                            # Shapes unknown statically: conforming
+                                            # is a runtime decision, so route the
+                                            # operand through broadcast_double with
+                                            # extent metadata -- never a silent
+                                            # mismatched elementwise call.
+                                            operand_extents = ensure_dynamic(prefix, operand)
+                                            result_extents = ensure_dynamic(prefix, result)
+                                            broadcasted = fresh(
+                                                shape=result.shape,
+                                                dtype=operand.dtype or "float64",
+                                            )
+                                            emitted.append(call(
+                                                "broadcast_double",
+                                                [
+                                                    operand,
+                                                    broadcasted,
+                                                    operand_extents["shape"],
+                                                    operand_extents["rank"],
+                                                    result_extents["shape"],
+                                                    result_extents["rank"],
+                                                ],
+                                                broadcasted,
+                                                instruction,
+                                                output_argument=1,
+                                            ))
+                                            register_tensor(
+                                                broadcasted, storage="temporary",
+                                                metadata_state="dynamic",
+                                                extent_ids_from=tensor_table.by_id(int(result.id)),
+                                            )
+                                            conformed_args.append(broadcasted)
+                                            continue
                                         broadcasted = fresh(
                                             shape=result.shape,
                                             dtype=operand.dtype or "float64",
                                         )
+                                        input_shape, input_shape_def = int_vector(
+                                            operand.shape
+                                        )
+                                        input_rank, input_rank_def = constant(
+                                            len(operand.shape), "int32"
+                                        )
+                                        output_shape, output_shape_def = int_vector(
+                                            result.shape
+                                        )
+                                        output_rank, output_rank_def = constant(
+                                            len(result.shape), "int32"
+                                        )
+                                        prefix.extend((
+                                            input_shape_def,
+                                            input_rank_def,
+                                            output_shape_def,
+                                            output_rank_def,
+                                        ))
                                         emitted.append(call(
                                             "broadcast_double",
                                             [
                                                 operand,
                                                 broadcasted,
-                                                operand_extents["shape"],
-                                                operand_extents["rank"],
-                                                result_extents["shape"],
-                                                result_extents["rank"],
+                                                input_shape,
+                                                input_rank,
+                                                output_shape,
+                                                output_rank,
                                             ],
                                             broadcasted,
                                             instruction,
                                             output_argument=1,
                                         ))
                                         register_tensor(
-                                            broadcasted, storage="temporary",
-                                            metadata_state="dynamic",
-                                            extent_ids_from=tensor_table.by_id(int(result.id)),
+                                            broadcasted, storage="temporary"
                                         )
                                         conformed_args.append(broadcasted)
-                                        continue
-                                    broadcasted = fresh(
-                                        shape=result.shape,
-                                        dtype=operand.dtype or "float64",
-                                    )
-                                    input_shape, input_shape_def = int_vector(
-                                        operand.shape
-                                    )
-                                    input_rank, input_rank_def = constant(
-                                        len(operand.shape), "int32"
-                                    )
-                                    output_shape, output_shape_def = int_vector(
-                                        result.shape
-                                    )
-                                    output_rank, output_rank_def = constant(
-                                        len(result.shape), "int32"
-                                    )
-                                    prefix.extend((
-                                        input_shape_def,
-                                        input_rank_def,
-                                        output_shape_def,
-                                        output_rank_def,
-                                    ))
                                     emitted.append(call(
-                                        "broadcast_double",
-                                        [
-                                            operand,
-                                            broadcasted,
-                                            input_shape,
-                                            input_rank,
-                                            output_shape,
-                                            output_rank,
-                                        ],
-                                        broadcasted,
-                                        instruction,
-                                        output_argument=1,
+                                        "binary_double", [conformed_args[0], conformed_args[1], result, count, opcode_ssa],
+                                        result, instruction, output_argument=2,
                                     ))
-                                    register_tensor(
-                                        broadcasted, storage="temporary"
-                                    )
-                                    conformed_args.append(broadcasted)
-                                emitted.append(call(
-                                    "binary_double", [conformed_args[0], conformed_args[1], result, count, opcode_ssa],
-                                    result, instruction, output_argument=2,
-                                ))
                             elif kind == "binary" and len(data_args) == 1:
                                 scalar_key = next((key for key in ("right_scalar", "left_scalar") if key in instruction.attributes), None)
                                 scalar_payload = instruction.attributes.get(scalar_key) if scalar_key else (metadata[-1] if metadata else None)

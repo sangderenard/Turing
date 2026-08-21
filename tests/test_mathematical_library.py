@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
+import math
 
 from src.common.tensors.blas import BLAS_ROLES
+from src.common.tensors.abstraction_methods import trigonometry as trig_surface
 from src.common.tensors.mathematical_library import (
     BLAS_LIBRARY,
     CATALOG_SCHEMA,
     TURING_MATHEMATICAL_LIBRARY,
+    TRIGONOMETRY_LIBRARY,
 )
 
 
@@ -17,6 +21,19 @@ def test_blas_sublibrary_discovers_every_authored_method_in_order():
     assert tuple(method.name for method in BLAS_LIBRARY.methods) == tuple(BLAS_ROLES)
     assert TURING_MATHEMATICAL_LIBRARY.library("blas") is BLAS_LIBRARY
     assert BLAS_LIBRARY.method("gemm").identity == "blas.gemm"
+
+
+def test_trigonometry_is_a_second_canonical_sublibrary():
+    assert TURING_MATHEMATICAL_LIBRARY.library(
+        "trigonometry"
+    ) is TRIGONOMETRY_LIBRARY
+    existing = tuple(
+        name for name, function in vars(trig_surface).items()
+        if inspect.isfunction(function)
+        and tuple(inspect.signature(function).parameters)[:1] == ("self",)
+    )
+    assert tuple(method.name for method in TRIGONOMETRY_LIBRARY.methods) == existing
+    assert TRIGONOMETRY_LIBRARY.method("sin").identity == "trigonometry.sin"
 
 
 def test_method_signatures_are_derived_from_authored_source():
@@ -60,9 +77,12 @@ def test_catalog_mapping_is_self_contained_and_canonicalizable():
 def test_abstract_tensor_receives_the_same_outer_blas_hierarchy():
     from src.common.tensors.abstraction import AbstractTensor
 
-    assert AbstractTensor.math.libraries == ("blas",)
+    assert AbstractTensor.math.libraries == ("blas", "trigonometry")
     assert AbstractTensor.math.blas is AbstractTensor.blas
     assert AbstractTensor.blas.methods == tuple(BLAS_ROLES)
+    assert AbstractTensor.trigonometry.methods == tuple(
+        method.name for method in TRIGONOMETRY_LIBRARY.methods
+    )
     x = AbstractTensor.get_tensor([1.0, 2.0, 3.0])
     y = AbstractTensor.get_tensor([4.0, 5.0, 6.0])
     assert AbstractTensor.blas.scal(x, 2.0).tolist() == [2.0, 4.0, 6.0]
@@ -73,6 +93,11 @@ def test_abstract_tensor_receives_the_same_outer_blas_hierarchy():
     assert all(abs(a - b) < 1.0e-12 for a, b in zip(
         ry.tolist(), [2.6, 2.8, 3.0],
     ))
+    np_values = [0.25, 0.5]
+    assert all(abs(a - b) < 1.0e-12 for a, b in zip(
+        AbstractTensor.trigonometry.sin(np_values).tolist(),
+        [math.sin(value) for value in np_values],
+    ))
 
 
 def test_abstract_tensor_semantic_namespace_can_be_restored():
@@ -82,3 +107,4 @@ def test_abstract_tensor_semantic_namespace_can_be_restored():
     assert AbstractTensor.use_semantic_mathematical_library() is semantic
     assert AbstractTensor.math is semantic
     assert AbstractTensor.blas is semantic.blas
+    assert AbstractTensor.trigonometry is semantic.trigonometry

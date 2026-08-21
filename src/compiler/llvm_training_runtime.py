@@ -10,6 +10,7 @@ selecting a group therefore changes only which declared parameters are stepped.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -72,6 +73,70 @@ class NativeGraphReverse:
     seed_value_ids: Mapping[int, int]
     artifact: Any
     saved_binding_count: int
+
+
+@dataclass(frozen=True)
+class NativeGraphForward:
+    """An existing AbstractTensor method graph compiled without rewriting it."""
+
+    name: str
+    key: str
+    source_sha256: str
+    input_value_ids: Mapping[str, int]
+    output_value_ids: tuple[int, ...]
+    artifact: Any
+
+
+def compile_native_graph_forward(
+    output: Any,
+    *,
+    bindings: Mapping[str, Any],
+    source: str,
+    name: str,
+    directory: Path,
+) -> NativeGraphForward:
+    """Compile the SSA graph produced by an existing AbstractTensor method."""
+
+    from ..transmogrifier.ssa import IRModule
+    from .ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
+
+    output_items = tuple(output) if isinstance(output, (tuple, list)) else (output,)
+    if not output_items:
+        raise ValueError("compiled graph forward requires at least one output")
+    values = tuple(getattr(item, "data", item) for item in output_items)
+    program = getattr(values[0], "program", None)
+    if program is None or not hasattr(program, "function"):
+        raise TypeError("compiled graph forward requires SSATensorProgram outputs")
+    if any(getattr(value, "program", None) is not program for value in values):
+        raise TypeError("compiled graph forward outputs must share one program")
+    function = program.function
+    emitted = emit_ssa_function_to_llvm(
+        IRModule({function.name: function}),
+        function.name,
+        entry_name=str(name),
+    )
+    if emitted.shortfalls:
+        raise RuntimeError(f"{name} forward LLVM shortfalls: {emitted.shortfalls!r}")
+    artifact = compile_artifact(emitted, directory=Path(directory))
+    if artifact.library_path is None:
+        raise RuntimeError(f"{name} forward compilation produced no native library")
+    source_sha = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    key = hashlib.sha256(
+        (source_sha + "\0" + artifact.llvm_ir).encode("utf-8")
+    ).hexdigest()[:16]
+    return NativeGraphForward(
+        name=str(name),
+        key=key,
+        source_sha256=source_sha,
+        input_value_ids={
+            str(binding_name): int(
+                getattr(getattr(value, "data", value), "value").id
+            )
+            for binding_name, value in bindings.items()
+        },
+        output_value_ids=tuple(int(value.value.id) for value in values),
+        artifact=artifact,
+    )
 
 
 @dataclass(frozen=True)

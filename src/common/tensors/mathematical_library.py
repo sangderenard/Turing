@@ -13,9 +13,11 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 import hashlib
+import inspect
 from typing import Any
 
 from .blas import BLAS_ROLES, BLASRole
+from .abstraction_methods import trigonometry as _trigonometry_surface
 
 
 CATALOG_SCHEMA = "turing.mathematical-library.v1"
@@ -42,6 +44,7 @@ class MathematicalMethod:
     source: str
     source_sha256: str
     abstract_operators: tuple[str, ...] = ()
+    installation: str | None = None
 
     def to_mapping(self, *, include_source: bool = True) -> dict[str, Any]:
         record = {
@@ -53,6 +56,7 @@ class MathematicalMethod:
             "source_symbol": self.source_symbol,
             "source_sha256": self.source_sha256,
             "abstract_operators": list(self.abstract_operators),
+            "installation": self.installation,
         }
         if include_source:
             record["source"] = self.source
@@ -177,10 +181,46 @@ BLAS_LIBRARY = MathematicalSubLibrary(
     methods=tuple(_method_from_blas_role(role) for role in BLAS_ROLES.values()),
 )
 
+
+def _trigonometry_methods() -> tuple[MathematicalMethod, ...]:
+    """Ingest the existing AbstractTensor trigonometry method surface."""
+
+    module_source = inspect.getsource(_trigonometry_surface)
+    tree = ast.parse(module_source)
+    methods = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or not node.args.args:
+            continue
+        if node.args.args[0].arg != "self" or node.name.startswith("_"):
+            continue
+        function = getattr(_trigonometry_surface, node.name)
+        source = inspect.getsource(function)
+        methods.append(MathematicalMethod(
+            name=node.name,
+            identity=f"trigonometry.{node.name}",
+            level=len(methods),
+            parameters=(MathematicalParameter("value", "tensor", "read"),),
+            result={"kind": "tensor"},
+            source_symbol=(
+                f"{_trigonometry_surface.__name__}.{node.name}"
+            ),
+            source=source,
+            source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            abstract_operators=(node.name,),
+            installation="instance_operator",
+        ))
+    return tuple(methods)
+
+TRIGONOMETRY_LIBRARY = MathematicalSubLibrary(
+    name="trigonometry",
+    identity="trigonometry",
+    methods=_trigonometry_methods(),
+)
+
 TURING_MATHEMATICAL_LIBRARY = MathematicalLibrary(
     name="Turing mathematical library",
     identity="turing.math",
-    libraries=(BLAS_LIBRARY,),
+    libraries=(BLAS_LIBRARY, TRIGONOMETRY_LIBRARY),
 )
 
 
@@ -238,12 +278,34 @@ class AbstractTensorBLAS:
         return c * x + s * y, c * y - s * x
 
 
+class AbstractTensorTrigonometry:
+    """Graph-visible projection of the canonical trigonometry sublibrary."""
+
+    def __init__(self, tensor_type: type):
+        self.tensor_type = tensor_type
+        self.catalog = TRIGONOMETRY_LIBRARY
+
+    @property
+    def methods(self) -> tuple[str, ...]:
+        return tuple(method.name for method in self.catalog.methods)
+
+    def __getattr__(self, name: str):
+        if name not in self.methods:
+            raise AttributeError(name)
+
+        def apply(value: Any):
+            return getattr(self.tensor_type.get_tensor(value), name)()
+
+        return apply
+
+
 class AbstractTensorMathematicalLibrary:
     """The outer namespace installed on one AbstractTensor implementation."""
 
     def __init__(self, tensor_type: type):
         self.catalog = TURING_MATHEMATICAL_LIBRARY
         self.blas = AbstractTensorBLAS(tensor_type)
+        self.trigonometry = AbstractTensorTrigonometry(tensor_type)
 
     @property
     def libraries(self) -> tuple[str, ...]:
@@ -314,13 +376,40 @@ class AbstractTensorProviderBLAS:
         return self._wrap(x, left), self._wrap(x, right)
 
 
+class AbstractTensorProviderTrigonometry:
+    """Adapt a compiled trigonometry object back into AbstractTensor values."""
+
+    def __init__(self, tensor_type: type, provider: Any):
+        self.tensor_type = tensor_type
+        self.provider = provider
+        self.catalog = TRIGONOMETRY_LIBRARY
+
+    @property
+    def methods(self) -> tuple[str, ...]:
+        return tuple(self.provider.methods)
+
+    def __getattr__(self, name: str):
+        if name not in self.methods:
+            raise AttributeError(name)
+
+        def apply(value: Any):
+            tensor = self.tensor_type.get_tensor(value)
+            return tensor.ensure_tensor(getattr(self.provider, name)(tensor.data))
+
+        return apply
+
+
 class AbstractTensorProviderMathematicalLibrary:
-    """Installed product projection retaining the outer library hierarchy."""
+    """Installed product projection retaining its packaged hierarchy."""
 
     def __init__(self, tensor_type: type, product: Any):
         self.catalog = TURING_MATHEMATICAL_LIBRARY
         self.product = product
         self.blas = AbstractTensorProviderBLAS(tensor_type, product.blas)
+        if hasattr(product, "trigonometry"):
+            self.trigonometry = AbstractTensorProviderTrigonometry(
+                tensor_type, product.trigonometry,
+            )
 
     @property
     def libraries(self) -> tuple[str, ...]:
@@ -334,20 +423,35 @@ def install_abstract_tensor_mathematical_library(
 
     namespace = AbstractTensorMathematicalLibrary(tensor_type)
     setattr(tensor_type, "_semantic_math", namespace)
+    setattr(tensor_type, "_mathematical_library_overlays", ())
     setattr(tensor_type, "math", namespace)
     setattr(tensor_type, "blas", namespace.blas)
+    setattr(tensor_type, "trigonometry", namespace.trigonometry)
 
     def install_compiled(cls, product):
         installed = AbstractTensorProviderMathematicalLibrary(cls, product)
         setattr(cls, "compiled_math", product)
+        setattr(
+            cls,
+            "_mathematical_library_overlays",
+            (*cls._mathematical_library_overlays, installed),
+        )
         setattr(cls, "math", installed)
         setattr(cls, "blas", installed.blas)
+        setattr(cls, "trigonometry", installed.trigonometry)
         return product
 
     def use_semantic(cls):
+        for pack in reversed(tuple(
+            getattr(cls, "_installed_operator_packs", ())
+        )):
+            uninstall = getattr(pack, "uninstall", None)
+            if uninstall is not None:
+                uninstall(cls)
         semantic = cls._semantic_math
         setattr(cls, "math", semantic)
         setattr(cls, "blas", semantic.blas)
+        setattr(cls, "trigonometry", semantic.trigonometry)
         return semantic
 
     setattr(
@@ -365,9 +469,12 @@ def install_abstract_tensor_mathematical_library(
 
 __all__ = [
     "BLAS_LIBRARY",
+    "TRIGONOMETRY_LIBRARY",
     "AbstractTensorBLAS",
+    "AbstractTensorTrigonometry",
     "AbstractTensorMathematicalLibrary",
     "AbstractTensorProviderBLAS",
+    "AbstractTensorProviderTrigonometry",
     "AbstractTensorProviderMathematicalLibrary",
     "CATALOG_SCHEMA",
     "MathematicalLibrary",

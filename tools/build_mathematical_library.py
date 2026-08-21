@@ -75,6 +75,25 @@ def _verify(product) -> None:
             "verified math.blas methods: "
             + ", ".join(f"{name}={error:.1e}" for name, error in checks.items())
         )
+        trig_input = np.asarray([0.25, 0.5, 0.75, 1.0])
+        trig_forward_error = float(np.max(np.abs(
+            library.trigonometry.sin(trig_input) - np.sin(trig_input)
+        )))
+        trig_gradient = library.trigonometry.vjp(
+            "sin", np.ones_like(trig_input), value=trig_input,
+        )["value"]
+        trig_reverse_error = float(np.max(np.abs(
+            trig_gradient - np.cos(trig_input)
+        )))
+        if max(trig_forward_error, trig_reverse_error) >= 1.0e-9:
+            raise RuntimeError(
+                "outer Python/trigonometry surface diverged: "
+                f"forward={trig_forward_error!r}, reverse={trig_reverse_error!r}"
+            )
+        print(
+            "verified math.trigonometry: "
+            f"sin={trig_forward_error:.1e}, sin.vjp={trig_reverse_error:.1e}"
+        )
         numpy_checks = {
             "scal": float(np.max(np.abs(library.numpy.blas.scal(x, 1.25) - 1.25 * x))),
             "axpy": float(np.max(np.abs(

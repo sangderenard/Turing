@@ -8,6 +8,7 @@ import subprocess
 
 import numpy as np
 
+from src.common.tensors.mathematical_library import TRIGONOMETRY_LIBRARY
 from src.common.tensors.accelerator_backends.ssa_backend import (
     SSATensorOperations,
     SSATensorProgram,
@@ -23,9 +24,14 @@ from src.compiler.standard_object_product import (
     standard_object_from_source,
 )
 from src.compiler.standard_object_blas import blas_standard_object
+from src.compiler.standard_object_trigonometry import (
+    trigonometry_standard_object,
+)
+from src.compiler.ssa_llvm_backend import prepare_artifact_execution
 from src.compiler.process_graph_autograd import (
     abstract_tensor_program_to_process_graph,
     compile_process_graph_backward,
+    obtain_graph_reverse,
 )
 
 
@@ -94,6 +100,7 @@ def test_standard_object_publishes_only_compiled_forward_and_reverse(tmp_path):
         "parametric_forward_required": True,
         "parametric_graph_reverse_required": True,
         "reverse_must_be_backend_compiled": True,
+        "compiled_reverse_backends": ["native", "wasm"],
         "browser_reverse_must_be_compiled": True,
         "specializations_are_optional_overlays": True,
     }
@@ -155,4 +162,111 @@ def test_blas_is_a_complete_graph_invertible_standard_object():
         assert reverse.adjoint.output_value_ids == tuple(forward.roots)
         assert set(reverse.adjoint.gradient_value_ids) == set(
             capture.wrt_value_ids
+        )
+
+
+def test_trigonometry_is_a_complete_second_graph_invertible_standard_object():
+    spec = trigonometry_standard_object()
+
+    assert tuple(method.name for method in spec.methods) == tuple(
+        method.name for method in TRIGONOMETRY_LIBRARY.methods
+    )
+    for method in spec.methods:
+        capture = method.capture_graph()
+        reverse = obtain_graph_reverse(
+            capture.output,
+            bindings=capture.bindings,
+            wrt=capture.wrt_value_ids,
+            unit_output_seed=False,
+        )
+        assert reverse.adjoint.output_value_ids
+        assert set(reverse.adjoint.gradient_value_ids) == set(
+            capture.wrt_value_ids
+        )
+
+
+def test_trigonometry_can_publish_native_reverse_without_forcing_wasm(tmp_path):
+    product = cook_standard_object(
+        trigonometry_standard_object(),
+        directory=tmp_path,
+        contract="fast",
+        reverse_backends=("native",),
+    )
+
+    assert product.manifest["publication_invariant"][
+        "compiled_reverse_backends"
+    ] == ["native"]
+    assert "browser_loader" not in product.manifest
+    assert tuple(product.methods) == tuple(
+        method.name for method in TRIGONOMETRY_LIBRARY.methods
+    )
+    assert {
+        row["method"] for row in product.manifest["deployment_matrix"]
+    } == set(product.methods)
+    assert all(
+        row["parameters"] == {} and row["kind"] == "captured_graph"
+        for row in product.manifest["deployment_matrix"]
+    )
+    assert {
+        method["name"]: method["source"]
+        for method in product.manifest["methods"]
+    } == {
+        method.name: method.source
+        for method in TRIGONOMETRY_LIBRARY.methods
+    }
+    for method in product.methods.values():
+        assert method.parametric_reverse.artifact.library_path.is_file()
+        assert method.browser_reverse is None
+
+    samples = {
+        "acosh": np.asarray([1.25, 1.5, 2.0, 3.0]),
+        "asin": np.asarray([-0.6, -0.2, 0.25, 0.7]),
+        "acos": np.asarray([-0.6, -0.2, 0.25, 0.7]),
+        "atanh": np.asarray([-0.6, -0.2, 0.25, 0.7]),
+    }
+    default = np.asarray([0.25, 0.5, 0.75, 1.0])
+    references = {
+        "sin": np.sin, "cos": np.cos, "tan": np.tan,
+        "asin": np.arcsin, "acos": np.arccos, "atan": np.arctan,
+        "sinh": np.sinh, "cosh": np.cosh, "tanh": np.tanh,
+        "asinh": np.arcsinh, "acosh": np.arccosh, "atanh": np.arctanh,
+        "sec": lambda x: 1 / np.cos(x),
+        "csc": lambda x: 1 / np.sin(x),
+        "cot": lambda x: np.cos(x) / np.sin(x),
+        "sech": lambda x: 1 / np.cosh(x),
+        "csch": lambda x: 1 / np.sinh(x),
+        "coth": lambda x: np.cosh(x) / np.sinh(x),
+        "sinc": lambda x: np.sin(x) / x,
+    }
+    for name, method in product.methods.items():
+        values = samples.get(name, default)
+        forward = method.parametric_forward
+        execution = prepare_artifact_execution(
+            forward.artifact,
+            {forward.input_value_ids["value"]: values},
+        ).run()
+        np.testing.assert_allclose(
+            execution.buffers[forward.output_value_ids[0]],
+            references[name](values),
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        )
+        reverse = method.parametric_reverse
+        seed_id = reverse.seed_value_ids[reverse.output_value_ids[0]]
+        reverse_execution = prepare_artifact_execution(
+            reverse.artifact,
+            {
+                reverse.input_value_ids["value"]: values,
+                seed_id: np.ones_like(values),
+            },
+        ).run()
+        gradient = reverse_execution.buffers[
+            reverse.gradient_value_ids[reverse.input_value_ids["value"]]
+        ]
+        step = 1.0e-6
+        finite_difference = (
+            references[name](values + step) - references[name](values - step)
+        ) / (2 * step)
+        np.testing.assert_allclose(
+            gradient, finite_difference, rtol=2.0e-5, atol=2.0e-6,
         )
