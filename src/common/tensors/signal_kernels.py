@@ -446,9 +446,12 @@ def sqrt_kernel_source(seed: tuple[float, ...],
     the even binade, exactly as the angle palette takes an index. That
     boundary is deliberate and currently forced: extracting the exponent
     inside the kernel needs either a ``frexp`` primitive the authored
-    vocabulary lacks, or a data-dependent ``while`` loop -- and a probe of
-    the latter HUNG the compiler for ten minutes without producing a module,
-    so it is not an option today.
+    vocabulary lacks, or a data-dependent range reduction inside the kernel.
+    A bounded ``for`` with a branch and ONE carried scalar does compile and
+    is correct; a second carried scalar miscompiles. An unbounded ``while``
+    probe timed out at ten minutes, but the machine was under a concurrent
+    compiler bootstrap at the time, so that is not evidence about the
+    construct -- retest it on a quiet machine before concluding anything.
 
     The caller's reduction is free: scaling by a power of four is exact, so
     ``sqrt(m * 4**k) = 2**k * sqrt(m)`` holds to the bit.

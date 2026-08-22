@@ -191,14 +191,25 @@ that `ssa_self_check.run_all` diagnosed in one call.
 
    | shape | result |
    |---|---|
-   | `while v >= 1.0:` unbounded | **HANGS** the compiler, 10 min, no module |
+   | `while v >= 1.0:` unbounded | timed out at 10 min — **UNPROVEN, see below** |
    | `for j in range(6):` with `if`/`else`, ONE carried scalar | **admits, correct** |
    | same, TWO carried scalars (`v` and `s`) | compiles, **fails verification** by 494 on a 500-magnitude input |
 
-   So branching inside a bounded loop is fine; it is the *unbounded* trip
-   count that hangs, and a *second* loop-carried scalar mutated in a branch
-   that miscompiles. Admission caught the last one — the oracle earned its
-   keep. That points at the frozen-carried defect
+   **The `while` row is not a finding.** That probe ran while another agent
+   was bootstrapping the compiler and using the machine, so a timeout is
+   equally explained by contention. It is recorded as unproven rather than
+   deleted, because the retest is cheap and worth doing on a quiet machine —
+   but do not treat "`while` is unsupported" as established, and do not
+   design around it. I stated it as a defect on one timed-out sample, which
+   was wrong.
+
+   The other two rows stand regardless of load: they are value results, not
+   timings. A second loop-carried scalar mutated in a branch produces
+   deterministically wrong numbers, which contention does not explain.
+   Admission caught it — the oracle earned its keep, and it caught it
+   precisely because the reference is the same source executed as Python
+   rather than a hand-written twin that might have shared the mistake. That
+   points at the frozen-carried defect
    `ssa_self_check.suspicious_loop_invariant_formals` exists to flag; run it
    on the module before believing any multi-accumulator kernel.
 
