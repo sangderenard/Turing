@@ -7179,6 +7179,7 @@ def compile_project_bootstrap_creep(
     unit_timeout_seconds: float | None = DEFAULT_UNIT_TIMEOUT_SECONDS,
     extraction_contract: str | Path | None = DEFAULT_PROJECT_EXTRACTION_CONTRACT,
     bootstrap_products: Iterable[str | Path] = (),
+    seed_product: str | Path | None = None,
     max_rounds: int = 16,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -7204,7 +7205,9 @@ def compile_project_bootstrap_creep(
     rounds: list[dict[str, Any]] = []
     installed_names: set[str] = set()
     installed_regions: set[tuple[str, ...]] = set()
-    prior_seed: Path | None = None
+    prior_seed = (
+        None if seed_product is None else Path(seed_product).resolve()
+    )
     fixed_point: dict[str, Any] | None = None
 
     def report(stage: str, **details: Any) -> None:

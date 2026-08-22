@@ -218,13 +218,16 @@ def test_project_bootstrap_creep_feeds_only_newly_verified_products(
         lambda _paths: tmp_path / "registry.json",
     )
 
+    prior_seed = tmp_path / "previous-generation"
     manifest = compile_project_bootstrap_creep(
-        source, tmp_path / "creep", max_rounds=8,
+        source, tmp_path / "creep", seed_product=prior_seed,
+        max_rounds=8,
     )
 
     assert len(calls) == 2
     assert calls[0]["bootstrap_products"] == ()
     assert calls[0]["emit_native"] is True
+    assert calls[0]["seed_product"] == prior_seed.resolve()
     assert calls[1]["bootstrap_products"] == (
         (tmp_path / "creep" / "round_000").resolve(),
     )

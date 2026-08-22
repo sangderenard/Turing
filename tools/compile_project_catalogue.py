@@ -284,6 +284,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             extraction_contract=arguments.extraction_contract,
             bootstrap_products=selected_products,
+            seed_product=arguments.seed_product,
             max_rounds=arguments.max_bootstrap_rounds,
             progress=lambda event: print(
                 json.dumps(event, sort_keys=True), flush=True,
