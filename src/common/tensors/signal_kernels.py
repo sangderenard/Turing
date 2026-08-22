@@ -384,6 +384,65 @@ def circular_vjp_source(cores: _signal.CoreSet, name: str) -> str:
 
 
 
+#: Newton's iteration for sqrt is a fixed point of the function itself,
+#: ``y <- (y + x/y)/2``, so it is SELF-CORRECTING: the seed's accuracy barely
+#: matters and each step roughly squares the correct digits. Measured on the
+#: mantissa band, that is worth far more than a better polynomial:
+#:
+#:     series core, 48 coefficients          328.10 ulp p95
+#:     the same core plus one Newton step      0.79 ulp p95
+#:     degree-6 seed plus two Newton steps     0.79 ulp p95
+#:
+#: Seven coefficients and two steps land where forty-eight coefficients
+#: cannot. The rewrite is worth more than the approximation, which is the
+#: identity argument in miniature.
+SQRT_NEWTON_STEPS = 2
+
+
+def sqrt_seed(degree: int = 6) -> tuple[float, ...]:
+    """A cheap relative-weighted polynomial seed for the mantissa band."""
+
+    import mpmath
+
+    nodes = np.linspace(0.25, 1.0, 8 * (int(degree) + 1))
+    with mpmath.workdps(40):
+        values = np.array(
+            [float(mpmath.sqrt(mpmath.mpf(float(node)))) for node in nodes]
+        )
+    coefficients = np.polynomial.polynomial.polyfit(
+        nodes, values, int(degree), w=1.0 / np.abs(values),
+    )
+    return tuple(float(value) for value in coefficients)
+
+
+def sqrt_kernel_source(seed: tuple[float, ...],
+                       steps: int = SQRT_NEWTON_STEPS) -> str:
+    """``sqrt`` on the MANTISSA BAND, seeded then Newton-refined.
+
+    Takes an argument already reduced to ``[0.25, 1)``; the caller supplies
+    the even binade, exactly as the angle palette takes an index. That
+    boundary is deliberate and currently forced: extracting the exponent
+    inside the kernel needs either a ``frexp`` primitive the authored
+    vocabulary lacks, or a data-dependent ``while`` loop -- and a probe of
+    the latter HUNG the compiler for ten minutes without producing a module,
+    so it is not an option today.
+
+    The caller's reduction is free: scaling by a power of four is exact, so
+    ``sqrt(m * 4**k) = 2**k * sqrt(m)`` holds to the bit.
+    """
+
+    body = [
+        "\ndef sqrt(x, y, n):\n",
+        "    for i in range(n):\n",
+        "        m = x[i]\n",
+        f"        r = {_horner_expression('m', seed)}\n",
+    ]
+    body.extend("        r = 0.5 * (r + m / r)\n" for _ in range(int(steps)))
+    body.append("        y[i] = r\n")
+    body.append("    return y\n")
+    return "".join(body)
+
+
 def kernel_reference(source: str, name: str) -> Callable[..., Any]:
     """The oracle: the same source, executed as Python.
 
@@ -481,6 +540,9 @@ def signal_kernel_specs(quality: str = DEFAULT_KERNEL_QUALITY, *,
 
 
 __all__ = [
+    "SQRT_NEWTON_STEPS",
+    "sqrt_kernel_source",
+    "sqrt_seed",
     "core_expression",
     "DEFAULT_KERNEL_QUALITY",
     "output_vjp_source",
