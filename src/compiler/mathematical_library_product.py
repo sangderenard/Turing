@@ -148,6 +148,30 @@ class CompiledObjectReverse:
         self._artifacts = record["artifacts"]
         self._libraries = {}
 
+    @staticmethod
+    def _checked_feed(value, declared, dtype, method, value_id):
+        """A fed buffer must MATCH the shape its artifact was compiled for.
+
+        Without this the artifact's own outputs are allocated at the baked
+        shape while the caller's input is taken as given, so feeding eight
+        elements to a core baked at four returns four -- a wrong answer with
+        no error, which is the defect class this whole surface exists to end.
+        A compiled artifact simply cannot serve a shape it was not built for;
+        saying so is the only honest option until the capture carries a
+        runtime extent.
+        """
+
+        array = np.asarray(value, dtype=dtype)
+        expected = tuple(int(extent) for extent in (declared or ()))
+        if tuple(array.shape) != expected:
+            raise ValueError(
+                f"{method} was compiled for shape {expected!r} at value "
+                f"{value_id}, but received {tuple(array.shape)!r}. This "
+                f"artifact cannot serve that shape; select a deployment row "
+                f"baked for it, or call the authored source."
+            )
+        return np.ascontiguousarray(array) if array.ndim else array.copy()
+
     def vjp(self, method, upstream, **bindings):
         method = str(method)
         try:
@@ -188,9 +212,8 @@ class CompiledObjectReverse:
         for value_id, shape, dtype in zip(order, artifact["buffer_shapes"], dtypes):
             numpy_dtype = self._DTYPES[str(dtype)]
             if value_id in feeds:
-                value = np.asarray(feeds[value_id], dtype=numpy_dtype)
-                buffers[value_id] = (
-                    np.ascontiguousarray(value) if value.ndim else value.copy()
+                buffers[value_id] = self._checked_feed(
+                    feeds[value_id], shape, numpy_dtype, method, value_id,
                 )
             else:
                 buffers[value_id] = np.zeros(tuple(shape) or (), dtype=numpy_dtype)
@@ -258,6 +281,30 @@ class CompiledStandardObject:
         #: how many it had to hand back to its own authored source because no
         #: baked width covered the caller's shape.
         self.routing = {}
+
+    @staticmethod
+    def _checked_feed(value, declared, dtype, method, value_id):
+        """A fed buffer must MATCH the shape its artifact was compiled for.
+
+        Without this the artifact's own outputs are allocated at the baked
+        shape while the caller's input is taken as given, so feeding eight
+        elements to a core baked at four returns four -- a wrong answer with
+        no error, which is the defect class this whole surface exists to end.
+        A compiled artifact simply cannot serve a shape it was not built for;
+        saying so is the only honest option until the capture carries a
+        runtime extent.
+        """
+
+        array = np.asarray(value, dtype=dtype)
+        expected = tuple(int(extent) for extent in (declared or ()))
+        if tuple(array.shape) != expected:
+            raise ValueError(
+                f"{method} was compiled for shape {expected!r} at value "
+                f"{value_id}, but received {tuple(array.shape)!r}. This "
+                f"artifact cannot serve that shape; select a deployment row "
+                f"baked for it, or call the authored source."
+            )
+        return np.ascontiguousarray(array) if array.ndim else array.copy()
 
     def shape_rows(self, method):
         """Baked deployment rows for one method, widest core first."""
@@ -485,8 +532,9 @@ class CompiledStandardObject:
         for value_id, shape, dtype in zip(order, artifact["buffer_shapes"], dtypes):
             numpy_dtype = self._DTYPES[str(dtype)]
             if value_id in feeds:
-                value = np.asarray(feeds[value_id], dtype=numpy_dtype)
-                buffers[value_id] = np.ascontiguousarray(value).copy()
+                buffers[value_id] = self._checked_feed(
+                    feeds[value_id], shape, numpy_dtype, method, value_id,
+                )
             else:
                 buffers[value_id] = np.zeros(tuple(shape) or (), dtype=numpy_dtype)
         pointers = (ctypes.c_void_p * len(order))(*(
