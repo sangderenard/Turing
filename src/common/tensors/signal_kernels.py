@@ -135,6 +135,145 @@ _PARTNER_RULE = re.compile(
     r"^gx = unbroadcast\((-?)g \* (\w+)\(x\), x\.shape\)$"
 )
 
+#: Derivatives expressed in the method's OWN OUTPUT rather than its argument:
+#: ``tan`` -> ``g * (1 + y*y)``, ``tanh`` -> ``g * (1 - y*y)``. The forward
+#: value is already computed by the reduction, so these cost one extra
+#: multiply-add and no second evaluation.
+_OUTPUT_RULE = re.compile(
+    r"^gx = unbroadcast\(g \* \(1 ([+-]) .*\), x\.shape\)$"
+)
+
+
+def vjp_plan(name: str) -> tuple[str, str]:
+    """How ``name``'s reverse should be obtained, and why.
+
+    Four answers, and the FIRST is the default and the most important:
+
+    ``identity``
+        The registry declares no backward rule for this method, because the
+        authored surface composes it from others -- ``sec`` is ``cos() ** -1``.
+        Differentiating that composition is already correct and already
+        happens. Baking a dedicated reverse here would invent a rule the
+        registry deliberately withholds, and a second statement of a
+        derivative is a second chance to disagree with the first. So anything
+        reasonable as an identity is BYPASSED, not baked: no kernel, no
+        variant matrix row, nothing to keep in step.
+
+    ``partner`` / ``output``
+        A rule exists and has a shape this module can author.
+
+    ``unsupported``
+        A rule exists in a shape this module will not guess at.
+    """
+
+    from .backward_registry import BACKWARD_RULES
+
+    entry = BACKWARD_RULES.get(str(name)) or {}
+    rule = (entry.get("backward") or {}).get("x")
+    if rule is None:
+        return "identity", (
+            "no backward rule is declared; the authored surface composes this "
+            "method from others and differentiating that composition is the "
+            "derivative"
+        )
+    text = str(rule).strip()
+    if _PARTNER_RULE.match(text):
+        return "partner", text
+    if _OUTPUT_RULE.match(text):
+        return "output", text
+    return "unsupported", text
+
+
+def _octant_chain(target: str, branches: tuple[str, str, str, str]) -> str:
+    """One if/elif chain writing ONE statement per branch.
+
+    ``target`` empty means each branch entry is already a full statement;
+    otherwise it is assigned the branch expression. Deliberately one
+    statement per branch, and it must WRITE ITS DESTINATION here rather than
+    set a local for use after the merge: the latter emits a pointer-valued
+    phi that does not dominate its uses, LLVM rejects the module, and
+    ``artifact.shortfalls`` stays empty -- the false green ``blas.py``
+    records under section 4.1b.
+    """
+
+    statements = tuple(
+        branch if not target else f"{target} = {branch}" for branch in branches
+    )
+    first, second, third, fourth = statements
+    return (
+        f"        if q < 1.0:\n            {first}\n"
+        f"        elif q < 2.0:\n            {second}\n"
+        f"        elif q < 3.0:\n            {third}\n"
+        f"        else:\n            {fourth}\n"
+    )
+
+
+#: ``tan`` per octant. The sine is ``sp, cp, -sp, -cp`` and the cosine is
+#: ``cp, -sp, -cp, sp``, so the ratio alternates and the signs cancel in
+#: pairs.
+_TANGENT_BRANCHES = ("sp / cp", "-cp / sp", "sp / cp", "-cp / sp")
+
+
+def _tangent_selection_lines(store: Callable[[str], str]) -> str:
+    """``tan`` selected and STORED inside each branch.
+
+    The store must happen in the branch. Assigning a local in each arm and
+    using it after the merge emits a pointer-valued phi that does not
+    dominate its uses, and LLVM rejects the module while
+    ``artifact.shortfalls`` stays empty -- the false green ``blas.py``
+    records under section 4.1b. Writing the destination inside the branch is
+    what the working ``sin``/``cos`` kernels do, and it is an authoring
+    constraint here for the same reason distinct loop variable names are.
+
+    ``store`` receives the branch's expression and returns the statement,
+    so the forward and the VJP share the selection and differ only in what
+    they write.
+    """
+
+    return _octant_chain(
+        "", tuple(store(branch) for branch in _TANGENT_BRANCHES),
+    )
+
+
+def tan_kernel_source(cores: _signal.CoreSet) -> str:
+    """``tan`` as the ratio of one octant reduction's two polynomials."""
+
+    return (
+        "\ndef tan(x, y, n):\n"
+        "    for i in range(n):\n"
+        + _reduction_lines(cores, "")
+        + _tangent_selection_lines(lambda ratio: f"y[i] = {ratio}")
+        + "    return y\n"
+    )
+
+
+def output_vjp_source(cores: _signal.CoreSet, name: str) -> str:
+    """A VJP stated in the method's OWN output, ``g * (1 +- y*y)``.
+
+    The forward value is recovered from the same reduction the forward uses,
+    so the derivative costs one multiply-add rather than a second evaluation.
+    The sign is taken from the authored rule, never assumed here.
+    """
+
+    plan, rule = vjp_plan(name)
+    if plan != "output":
+        raise ValueError(f"{name} is not an output-form rule: {plan} ({rule})")
+    if name != "tan":
+        raise ValueError(
+            f"{name} needs a hyperbolic core to recover its forward value; "
+            f"only the circular reduction is authored here"
+        )
+    sign = _OUTPUT_RULE.match(rule).group(1)
+    return (
+        f"\ndef {name}_vjp(x, g, d, n):\n"
+        "    for i in range(n):\n"
+        + _reduction_lines(cores, "")
+        + _tangent_selection_lines(
+            lambda ratio: f"d[i] = g[i] * (1.0 {sign} ({ratio}) * ({ratio}))"
+        )
+        + "    return d\n"
+    )
+
 
 def circular_vjp_source(cores: _signal.CoreSet, name: str) -> str:
     """The VJP of one circular method, DERIVED from its authored rule.
@@ -181,6 +320,8 @@ def circular_vjp_source(cores: _signal.CoreSet, name: str) -> str:
     )
 
 
+
+
 def kernel_reference(source: str, name: str) -> Callable[..., Any]:
     """The oracle: the same source, executed as Python.
 
@@ -194,12 +335,22 @@ def kernel_reference(source: str, name: str) -> Callable[..., Any]:
     return namespace[name]
 
 
+#: Forwards this module authors, and how each is emitted. ``tan`` shares the
+#: circular reduction rather than getting its own, so all three cost one
+#: octant reduction and differ only in what the branch stores.
+_FORWARD_SOURCE: Mapping[str, Callable[[Any], str]] = {
+    "sin": lambda cores: circular_kernel_source(cores, "sin"),
+    "cos": lambda cores: circular_kernel_source(cores, "cos"),
+    "tan": tan_kernel_source,
+}
+
+
 def kernel_spec(cores: _signal.CoreSet, name: str):
     """One :class:`KernelSpec` for the forward of ``name``."""
 
     from ...compiler.kernel_bank import KernelSpec
 
-    source = circular_kernel_source(cores, name)
+    source = _FORWARD_SOURCE[name](cores)
     return KernelSpec(
         name=name, source=source, function_name=name,
         reference=kernel_reference(source, name),
@@ -217,7 +368,16 @@ def vjp_spec(cores: _signal.CoreSet, name: str):
 
     from ...compiler.kernel_bank import KernelSpec
 
-    source = circular_vjp_source(cores, name)
+    plan, rule = vjp_plan(name)
+    if plan == "identity":
+        raise ValueError(
+            f"{name} is an identity over other methods and is bypassed, not "
+            f"baked: {rule}"
+        )
+    source = (
+        output_vjp_source(cores, name) if plan == "output"
+        else circular_vjp_source(cores, name)
+    )
     return KernelSpec(
         name=f"{name}_vjp", source=source, function_name=f"{name}_vjp",
         reference=kernel_reference(source, f"{name}_vjp"),
@@ -233,18 +393,29 @@ def vjp_spec(cores: _signal.CoreSet, name: str):
 
 def signal_kernel_specs(quality: str = "audio", *,
                         include_vjp: bool = True) -> Mapping[str, Any]:
-    """Every kernel this module can author, at one baked quality."""
+    """Every kernel this module authors, at one baked quality.
+
+    Only what has to be baked. Methods whose derivative is an identity over
+    these -- ``sec``, ``csc``, ``cot``, ``sech``, ``csch``, ``coth``,
+    ``sinc`` -- are absent on purpose: see :func:`vjp_plan`. Skipping them is
+    not a coverage gap, it is what keeps the variant matrix from multiplying
+    by methods that have nothing of their own to compute.
+    """
 
     cores = _signal.signal_math(quality).cores
-    specs = {name: kernel_spec(cores, name) for name in ("sin", "cos")}
+    specs = {name: kernel_spec(cores, name) for name in _FORWARD_SOURCE}
     if include_vjp:
-        specs.update({
-            f"{name}_vjp": vjp_spec(cores, name) for name in ("sin", "cos")
-        })
+        for name in _FORWARD_SOURCE:
+            if vjp_plan(name)[0] == "identity":
+                continue
+            specs[f"{name}_vjp"] = vjp_spec(cores, name)
     return specs
 
 
 __all__ = [
+    "output_vjp_source",
+    "tan_kernel_source",
+    "vjp_plan",
     "circular_kernel_source",
     "circular_vjp_source",
     "kernel_reference",
