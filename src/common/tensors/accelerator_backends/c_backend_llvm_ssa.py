@@ -2706,6 +2706,22 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
 ) -> TapeLLVMModule:
     """Lower a recorded AbstractTensor tape directly to real C-kernel LLVM.
 
+    **DEAD CODE, KEPT AS REFERENCE.** Nothing in the compiler or in any
+    deployment product reaches this function. Its only callers are
+    ``llvm_jit_backend.compile_torture_case_to_llvm`` -- itself a differential
+    oracle over the backend torture matrix rather than a deployment backend --
+    and ``tests/test_c_backend_llvm_ssa.py``. It is NOT a standard path
+    through the compiler: a standard object, a kernel-bank variant and every
+    shader product are lowered from repository SSA by
+    ``emit_ssa_function_to_llvm``, which never consults this module.
+
+    Retained deliberately, not by neglect. Being independent of the standard
+    path is exactly what lets it serve as a differential reference (see
+    ``src/compiler/llvm_optimizing_pipeline.py``, which keeps it as the
+    unoptimized comparison). Do not route new work through it, and do not
+    delete it to tidy up: a differential that shares machinery with the thing
+    it checks proves nothing.
+
     This first direct path covers the C backend's actual elementwise dispatch,
     rank-two ``matmul_double``, and recorded ``tensor_from_list`` constants.
     It emits calls to functions present in :data:`TRANSLATIONS`; it never emits

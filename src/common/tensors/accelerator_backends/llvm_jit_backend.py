@@ -1,4 +1,22 @@
-"""LLVM compute compilation and execution through the shared profiled C shell."""
+"""LLVM compute compilation and execution through the shared profiled C shell.
+
+**This is a differential ORACLE, not a deployment backend.** The name is a
+misnomer worth reading past: the only public entry,
+``compile_torture_case_to_llvm``, accepts a ``CapturedTortureCase`` and
+nothing else, so a standard object or kernel-bank variant cannot be routed
+through it even in principle. Its consumers are
+``backend_torture_runner`` (the shared AbstractTensor backend torture matrix)
+and ``src/compiler/llvm_optimizing_pipeline.py``, which keeps it as the
+unoptimized comparison.
+
+It reaches LLVM by ``lower_abstract_tensor_tape_to_llvm_ssa`` -- a tape path
+that is itself dead to the compiler and kept only for reference. Neither is a
+standard path: deployment products lower from repository SSA through
+``emit_ssa_function_to_llvm``.
+
+Their independence from the standard path is the whole point. Keep them
+working, measure against them, and do not migrate deployment work onto them.
+"""
 
 from __future__ import annotations
 

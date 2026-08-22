@@ -14,7 +14,10 @@ from .blas_server import BLASServerProduct, build_blas_server
 from .numpy_mathematical_library import emit_numpy_mathematical_library
 from .standard_object_blas import blas_standard_object
 from .standard_object_trigonometry import trigonometry_standard_object
-from .standard_object_product import StandardObjectProduct, cook_standard_object
+from .standard_object_product import (
+    StandardObjectProduct,
+    cook_standard_object,
+)
 from .wasm_binary import CodeBuilder, build_module
 
 
@@ -120,6 +123,14 @@ import json
 from pathlib import Path
 import numpy as np
 
+try:
+    from src.common.tensors.source_realization import realizing_authored_source
+except ImportError:
+    # A released loader remains independently usable.  Recursive source
+    # realization is only meaningful when it is being ingested by Turing.
+    def realizing_authored_source():
+        return False
+
 
 class CompiledObjectReverse:
     """Generated Python ABI for the product's compiled method VJPs."""
@@ -200,10 +211,15 @@ class CompiledObjectReverse:
                 extents.append(0)
             else:
                 raise ValueError(f"cannot derive reverse extent {(value_id, kind, axis)!r}")
-        library = self._libraries.get(method)
+        # Keyed by the ARTIFACT, never by the method: one method now owns a
+        # deployment row per baked width, each its own library with its own
+        # entry symbol, and a per-method cache handed the baseline's library
+        # to a specialized call, which then could not find its entry point.
+        cache_key = str(artifact["library_path"])
+        library = self._libraries.get(cache_key)
         if library is None:
             library = ctypes.CDLL(str(self.root / artifact["library_path"]))
-            self._libraries[method] = library
+            self._libraries[cache_key] = library
         entry = getattr(library, artifact["name"])
         entry.restype = None
         entry.argtypes = [
@@ -237,6 +253,53 @@ class CompiledStandardObject:
         self._artifacts = record["artifacts"]
         self._libraries = {}
         self._installations = {}
+        #: Installed-call routing evidence, in the spirit of the kernel bank's
+        #: routing_log: how many calls each method served from a baked core and
+        #: how many it had to hand back to its own authored source because no
+        #: baked width covered the caller's shape.
+        self.routing = {}
+
+    def shape_rows(self, method):
+        """Baked deployment rows for one method, widest core first."""
+
+        rows = [
+            row for row in self.deployment_matrix
+            if row["method"] == str(method)
+        ]
+        rows.sort(
+            key=lambda row: max(
+                [int(value) for value in row["parameters"].values()
+                 if isinstance(value, int)] or [0]
+            ),
+            reverse=True,
+        )
+        return tuple(rows)
+
+    def row_for_elements(self, method, elements):
+        """The baked row that answers EXACTLY this many elements, if any.
+
+        Deliberately exact. A wider core would compute the right values on a
+        prefix and leave the rest of its output buffer untouched, and a
+        narrower one would answer only part of the call -- both are silently
+        wrong shapes, which is the defect this selection exists to end. Serving
+        an arbitrary length from a narrower core is a TILING decision and
+        belongs in the lowering, not in a host-side loop here.
+        """
+
+        for row in self.shape_rows(method):
+            declared = [
+                int(value) for value in row["parameters"].values()
+                if isinstance(value, int)
+            ]
+            if declared and int(declared[0]) == int(elements):
+                return row
+        return None
+
+    def _record_route(self, method, route):
+        counters = self.routing.setdefault(
+            str(method), {"baked": 0, "authored_source": 0},
+        )
+        counters[route] = counters.get(route, 0) + 1
 
     def authored_source(self, method):
         try:
@@ -245,15 +308,27 @@ class CompiledStandardObject:
             raise KeyError(f"unknown authored method {method!r}") from error
 
     def select(self, method, parameters=None):
-        requested = dict(parameters or {})
-        rows = [
-            row for row in self.deployment_matrix
-            if row["method"] == method and row["parameters"] == requested
-        ]
-        if not rows and requested:
+        selecting_baseline = parameters is None
+        if parameters is None:
             rows = [
                 row for row in self.deployment_matrix
-                if row["method"] == method and not row["parameters"]
+                if row["method"] == method and row.get("baseline", False)
+            ]
+            # Products emitted before explicit baseline markers used the
+            # empty parameter row as their baseline.  Keep those durable
+            # packages loadable while new matrices can baseline a real row
+            # such as {"n": 2}.
+            if not rows:
+                rows = [
+                    row for row in self.deployment_matrix
+                    if row["method"] == method and row["parameters"] == {}
+                ]
+            requested = None
+        else:
+            requested = dict(parameters)
+            rows = [
+                row for row in self.deployment_matrix
+                if row["method"] == method and row["parameters"] == requested
             ]
         if len(rows) != 1:
             raise RuntimeError(
@@ -261,7 +336,7 @@ class CompiledStandardObject:
                 f"{requested!r}"
             )
         row = rows[0]
-        if not row["parameters"]:
+        if selecting_baseline:
             return self._artifacts[method]["parametric_forward"]
         return next(
             record
@@ -310,17 +385,44 @@ class CompiledStandardObject:
 
         if host in self._installations:
             return self
-        originals = {}
-        installable = {
-            item["name"] for item in self.record["methods"]
-            if item.get("installation") == "instance_operator"
-        }
-        for method in installable:
-            originals[method] = (
-                method in vars(host), getattr(host, method),
+        originals = []
+        installable = []
+        for item in self.record["methods"]:
+            installation = item.get("installation")
+            if installation == "instance_operator":
+                installable.append((item["name"], host))
+            elif str(installation).startswith("namespace_operator:"):
+                namespace = str(installation).split(":", 1)[1]
+                installable.append((item["name"], getattr(host, namespace)))
+        for method, target in installable:
+            current = getattr(target, method)
+            originals.append((target, method, method in vars(target), current))
+            authored_callable = getattr(
+                current, "__turing_authored_source_callable__", current,
             )
 
-            def deployed(template, *args, __method=method, **kwargs):
+            def deployed(
+                template, *args, __method=method,
+                __authored=authored_callable, **kwargs,
+            ):
+                if realizing_authored_source():
+                    return __authored(template, *args, **kwargs)
+                # A baked core answers exactly the width it was baked at. When
+                # the caller's shape is not one of them the authored source
+                # answers instead -- correct, slower, and COUNTED, rather than
+                # a baked core quietly returning its own width. Covering an
+                # arbitrary width from a baked core is deployment tiling; until
+                # the lowering emits that tile loop, this is the honest route.
+                probe = self._installed_argument(template)
+                elements = getattr(probe, "size", None)
+                row = (
+                    None if elements is None
+                    else self.row_for_elements(__method, int(elements))
+                )
+                if elements is not None and row is None:
+                    self._record_route(__method, "authored_source")
+                    return __authored(template, *args, **kwargs)
+                self._record_route(__method, "baked")
                 raw_args = tuple(
                     self._installed_argument(value)
                     for value in (template, *args)
@@ -329,10 +431,25 @@ class CompiledStandardObject:
                     name: self._installed_argument(value)
                     for name, value in kwargs.items()
                 }
+                if row is not None and not row.get("baseline", False):
+                    raw_kwargs["_deployment_parameters"] = dict(
+                        row["parameters"]
+                    )
                 result = getattr(self, __method)(*raw_args, **raw_kwargs)
-                return self._installed_result(template, result)
+                tensor_template = next((
+                    value for value in (template, *args)
+                    if hasattr(value, "ensure_tensor")
+                ), None)
+                if tensor_template is not None:
+                    return self._installed_result(tensor_template, result)
+                if hasattr(host, "get_tensor"):
+                    if isinstance(result, tuple):
+                        return tuple(host.get_tensor(value) for value in result)
+                    return host.get_tensor(result)
+                return result
 
-            setattr(host, method, deployed)
+            deployed.__turing_authored_source_callable__ = authored_callable
+            setattr(target, method, deployed)
         self._installations[host] = originals
         packs = tuple(getattr(host, "_installed_operator_packs", ()))
         setattr(host, "_installed_operator_packs", (*packs, self))
@@ -342,11 +459,11 @@ class CompiledStandardObject:
         originals = self._installations.pop(host, None)
         if originals is None:
             return self
-        for method, (owned, original) in originals.items():
+        for target, method, owned, original in originals:
             if owned:
-                setattr(host, method, original)
+                setattr(target, method, original)
             else:
-                delattr(host, method)
+                delattr(target, method)
         packs = tuple(
             pack for pack in getattr(host, "_installed_operator_packs", ())
             if pack is not self
@@ -387,10 +504,15 @@ class CompiledStandardObject:
                 extents.append(int(value.shape[int(axis)]))
             else:
                 raise ValueError(f"cannot derive forward extent {(value_id, kind, axis)!r}")
-        library = self._libraries.get(method)
+        # Keyed by the ARTIFACT, never by the method: one method now owns a
+        # deployment row per baked width, each its own library with its own
+        # entry symbol, and a per-method cache handed the baseline's library
+        # to a specialized call, which then could not find its entry point.
+        cache_key = str(artifact["library_path"])
+        library = self._libraries.get(cache_key)
         if library is None:
             library = ctypes.CDLL(str(self.root / artifact["library_path"]))
-            self._libraries[method] = library
+            self._libraries[cache_key] = library
         entry = getattr(library, artifact["name"])
         entry.restype = None
         entry.argtypes = [

@@ -601,6 +601,12 @@ _LLVM_INTRINSIC_DECLARATIONS: dict[str, str] = {
     "llvm.memcpy.p0.p0.i64": (
         "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)"
     ),
+    # Zero fills reach this from the BACKWARD side: the derivative of any
+    # step-like operation is zero almost everywhere, and the authored rule
+    # spells that ``zeros_like``.
+    "llvm.memset.p0.i64": (
+        "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1 immarg)"
+    ),
 }
 
 
@@ -637,6 +643,54 @@ def _kernel_signature(symbol: str) -> tuple[str, tuple[str, ...]]:
 def _double_literal(value: _Any) -> str:
     bits = _struct.unpack(">Q", _struct.pack(">d", float(value)))[0]
     return f"0x{bits:016X}"
+
+
+#: Bytes one element of each LLVM ABI type occupies in a buffer. This is the
+#: SAME set ``prepare_artifact_execution`` allocates from -- double/f64,
+#: i32, i64, i1 as one byte (numpy bool_), ptr as a machine word -- so a block
+#: copy or fill sized from here matches what the runtime actually allocated.
+#:
+#: Sizing bulk memory as "elements * 8" is only correct while every buffer is
+#: a double. It silently writes FOUR TIMES the allocation for an i32 buffer
+#: and eight times for an i1 one, past the end, into whatever follows.
+_LLVM_TYPE_BYTES: dict[str, int] = {
+    "double": 8, "i64": 8, "ptr": 8, "i32": 4, "i1": 1,
+}
+
+
+def _value_bytes(value: _Any) -> int:
+    """Bytes one element of ``value`` occupies, from its declared type."""
+
+    llvm_type = _value_llvm_type(value)
+    try:
+        return _LLVM_TYPE_BYTES[llvm_type]
+    except KeyError as error:
+        raise ValueError(
+            f"no ABI byte width declared for LLVM type {llvm_type!r}"
+        ) from error
+
+
+def _value_block_bytes(value: _Any) -> int:
+    """Bytes the whole buffer behind ``value`` occupies."""
+
+    return _value_element_count(value) * _value_bytes(value)
+
+
+def _align(llvm_type: _Any) -> int:
+    """Natural alignment of one LLVM ABI value, in bytes.
+
+    ``align 8`` is a PROMISE to LLVM, not a formatting detail. It is true for
+    double, i64 and ptr, and false for an element inside an i32 or i1 buffer:
+    element one of an i32 array sits at offset 4. LLVM is entitled to act on
+    the claim -- widening or vectorising the access -- so an over-stated
+    alignment on an under-aligned address is a miscompile waiting for the
+    right optimisation pass, not a cosmetic wart.
+
+    Over-aligning an ``alloca`` is a different case and stays at 8: there the
+    number is a request for the allocation, and asking for more is safe.
+    """
+
+    return _LLVM_TYPE_BYTES.get(str(llvm_type), 8)
 
 
 def _value_llvm_type(value: _Any) -> str:
@@ -1337,6 +1391,7 @@ def _emit_repository_call_module(
         address_members: dict[int, str] = {}
         address_slots: dict[int, str] = {}
         span_addresses: dict[int, str] = {}
+        span_address_types: dict[int, str] = {}
         allocated: set[int] = set()
         output_pointer = {
             int(value.id): f"%out.{index}"
@@ -1448,7 +1503,8 @@ def _emit_repository_call_module(
                 source_type = _value_llvm_type(value)
                 loaded = f"%load.{tag}"
                 body.append(
-                    f"  {loaded} = load {source_type}, ptr {slot_home}, align 8"
+                    f"  {loaded} = load {source_type}, ptr {slot_home}, "
+                    f"align {_align(source_type)}"
                 )
                 if _reuse_registers and slot_home.startswith(_CACHEABLE_SLOT):
                     register_cache[slot_home] = (loaded, source_type)
@@ -1620,15 +1676,18 @@ def _emit_repository_call_module(
                 if count == 1:
                     loaded = f"%return.load.{output_index}.{len(body)}"
                     body.append(
-                        f"  {loaded} = load {llvm_type}, ptr {source}, align 8"
+                        f"  {loaded} = load {llvm_type}, ptr {source}, "
+                        f"align {_align(llvm_type)}"
                     )
                     body.append(
-                        f"  store {llvm_type} {loaded}, ptr {destination}, align 8"
+                        f"  store {llvm_type} {loaded}, ptr {destination}, "
+                        f"align {_align(llvm_type)}"
                     )
                 else:
                     body.append(
                         "  call void @llvm.memcpy.p0.p0.i64("
-                        f"ptr {destination}, ptr {source}, i64 {count * 8}, i1 false)"
+                        f"ptr {destination}, ptr {source}, "
+                        f"i64 {count * _LLVM_TYPE_BYTES[llvm_type]}, i1 false)"
                     )
         active_block: str | None = None
         # An elementwise op over a span expands into its own loop, which ends
@@ -1711,7 +1770,8 @@ def _emit_repository_call_module(
                 else:
                     llvm_type = _value_llvm_type(result)
                     body.append(
-                        f"  store {llvm_type} {literal(payload, llvm_type)}, ptr {target}, align 8"
+                        f"  store {llvm_type} {literal(payload, llvm_type)}, ptr {target}, "
+                        f"align {_align(llvm_type)}"
                     )
                     if _reuse_registers and target.startswith(_CACHEABLE_SLOT):
                         register_cache[target] = (
@@ -1888,11 +1948,29 @@ def _emit_repository_call_module(
                     body.append(
                         "  call void @llvm.memcpy.p0.p0.i64("
                         f"ptr {destination}, ptr {source_pointer}, "
-                        f"i64 {_value_element_count(result) * 8}, i1 false)"
+                        f"i64 {_value_block_bytes(result)}, i1 false)"
                     )
                     pointers[result_id] = destination
                 else:
                     pointers[result_id] = source_pointer
+                continue
+
+            if operation in {"zeros_like", "zeros"} and result is not None:
+                # A zero fill is the whole emission. This arrives from the
+                # BACKWARD side: the derivative of a step-like operation --
+                # `floor`, `ceil`, `round`, any comparison -- is zero almost
+                # everywhere, and the authored rule states that as
+                # ``zeros_like(x)``. Without this the reverse of every such
+                # operation stops with "no repository LLVM emission" while its
+                # forward compiles perfectly, which is exactly the asymmetry
+                # that made `floor` uncompilable backwards.
+                destination = output_pointer.get(result_id) or pointer(result)
+                body.append(
+                    "  call void @llvm.memset.p0.i64("
+                    f"ptr {destination}, i8 0, "
+                    f"i64 {_value_block_bytes(result)}, i1 false)"
+                )
+                pointers[result_id] = destination
                 continue
 
             if operation in {"GetElementPtr", "getelementptr"} and result is not None:
@@ -2009,6 +2087,7 @@ def _emit_repository_call_module(
                         # aggregate-member path already does.
                         pointers[result_id] = computed
                         span_addresses[result_id] = computed
+                        span_address_types[result_id] = element_type
                         continue
                     shortfalls.append(LLVMEmissionShortfall(
                         name, operation,
@@ -2082,13 +2161,22 @@ def _emit_repository_call_module(
                 # source's own read below may still be served from cache
                 # first -- reading precedes the write.
                 destination = address_slots.get(int(address.id), pointer(address))
-                source_type = _value_llvm_type(source)
-                loaded_value = f"%store.load.{tag}"
-                body.append(
-                    f"  {loaded_value} = load {source_type}, ptr {pointer(source)}, align 8"
+                # An indexed destination has the element type of its base
+                # span, not necessarily the scalar expression stored into
+                # it.  Python commonly writes an integer loop/index value to
+                # a default float work array.  Loading/storing in the source
+                # type writes only four bytes of an eight-byte element and is
+                # both numerically wrong and ABI-corrupting.  Reconcile at
+                # the store boundary exactly as scalar result cells do.
+                destination_type = span_address_types.get(
+                    int(address.id), _value_llvm_type(source),
+                )
+                loaded_value = load_as(
+                    source, destination_type, f"store.{tag}",
                 )
                 body.append(
-                    f"  store {source_type} {loaded_value}, ptr {destination}, align 8"
+                    f"  store {destination_type} {loaded_value}, "
+                    f"ptr {destination}, align 8"
                 )
                 register_cache.clear()
                 continue
@@ -2239,7 +2327,8 @@ def _emit_repository_call_module(
                         call_result = f"%call.{tag}"
                         body.append(f"  {call_result} = call {returns} @{symbol}({joined})")
                         body.append(
-                            f"  store {returns} {call_result}, ptr {pointer(result)}, align 8"
+                            f"  store {returns} {call_result}, ptr {pointer(result)}, "
+                            f"align {_align(returns)}"
                         )
                     continue
 
@@ -2500,7 +2589,8 @@ def _emit_repository_call_module(
                 )
                 cast_target = pointer(result)
                 body.append(
-                    f"  store {result_type} {rendered}, ptr {cast_target}, align 8"
+                    f"  store {result_type} {rendered}, ptr {cast_target}, "
+                    f"align {_align(result_type)}"
                 )
                 if _reuse_registers and cast_target.startswith(_CACHEABLE_SLOT):
                     register_cache[cast_target] = (rendered, result_type)
@@ -2699,8 +2789,16 @@ def _emit_repository_call_module(
                         *operands, out=register
                     ).splitlines():
                         body.append(f"  {rendered_line}")
-                    if operation in PREDICATE_OPERATIONS:
-                        result_type = "i1"
+                    # Scalar likeness templates operate in the promoted
+                    # operand domain.  Keep that actual register type until
+                    # the declared-result reconciliation below.  Retaining
+                    # the result's declared integer type here emitted, for
+                    # example, ``store i32 %double_register`` when an integer
+                    # compiler index was gated by a floating predicate.
+                    result_type = (
+                        "i1" if operation in PREDICATE_OPERATIONS
+                        else operand_type
+                    )
                 # The cell was alloca'd with the value's DECLARED type; a
                 # narrower computed result stored raw left garbage bytes that
                 # a later declared-type load reinterpreted (an i32 mul result
@@ -2743,7 +2841,8 @@ def _emit_repository_call_module(
                         register, result_type = converted, declared_type
                 scalar_target = pointer(result)
                 body.append(
-                    f"  store {result_type} {register}, ptr {scalar_target}, align 8"
+                    f"  store {result_type} {register}, ptr {scalar_target}, "
+                    f"align {_align(result_type)}"
                 )
                 if _reuse_registers and scalar_target.startswith(_CACHEABLE_SLOT):
                     register_cache[scalar_target] = (register, result_type)
@@ -3342,12 +3441,26 @@ def emit_ssa_function_to_llvm(
                 value_llvm_types[int(instruction.res.id)] = _value_llvm_type(
                     instruction.res
                 )
+    returned_ids = {
+        int(argument.id)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op in {"Ret", "ret", "Return", "return"}
+        for argument in instruction.args
+    }
+    buffer_aliases: dict[int, int] = {}
 
     def buffer(value_id: int) -> str:
         # The instruction stream is already scheduled by the compiler; a
         # buffer pointer is loaded inline at its first use, in stream order,
         # never collected and reordered.
         value_id = int(value_id)
+        seen = set()
+        while value_id in buffer_aliases:
+            if value_id in seen:
+                raise ValueError("cyclic SSA buffer alias")
+            seen.add(value_id)
+            value_id = int(buffer_aliases[value_id])
         if value_id not in buffer_index:
             index = len(buffer_ids)
             buffer_index[value_id] = index
@@ -3519,7 +3632,8 @@ def emit_ssa_function_to_llvm(
         llvm_type = _value_llvm_type(argument)
         register = f"%argument.{int(argument.id)}"
         lines.append(
-            f"  {register} = load {llvm_type}, ptr {argument_pointer}, align 8"
+            f"  {register} = load {llvm_type}, ptr {argument_pointer}, "
+            f"align {_align(llvm_type)}"
         )
         scalars[int(argument.id)] = (register, llvm_type)
 
@@ -3724,7 +3838,8 @@ def emit_ssa_function_to_llvm(
                     ))
                     continue
                 lines.append(
-                    f"  store {stored[1]} {stored[0]}, ptr {destination[0]}, align 8"
+                    f"  store {stored[1]} {stored[0]}, ptr {destination[0]}, "
+                    f"align {_align(stored[1])}"
                 )
                 continue
 
@@ -3741,7 +3856,8 @@ def emit_ssa_function_to_llvm(
                 llvm_type = _value_llvm_type(instruction.res)
                 register = f"%load.{result_id}"
                 lines.append(
-                    f"  {register} = load {llvm_type}, ptr {address[0]}, align 8"
+                    f"  {register} = load {llvm_type}, ptr {address[0]}, "
+                    f"align {_align(llvm_type)}"
                 )
                 scalars[result_id] = (register, llvm_type)
                 continue
@@ -3775,6 +3891,28 @@ def emit_ssa_function_to_llvm(
                         f"  store {declared} {rendering}, ptr {destination}, "
                         "align 8"
                     )
+                continue
+
+            if (
+                operation in _SHAPE_ONLY
+                and instruction.res is not None
+                and instruction.args
+            ):
+                source_id = int(instruction.args[0].id)
+                if result_id in returned_ids:
+                    source_pointer = buffer(source_id)
+                    destination = buffer(result_id)
+                    if destination != source_pointer:
+                        lines.append(
+                            "  call void @llvm.memcpy.p0.p0.i64("
+                            f"ptr {destination}, ptr {source_pointer}, "
+                            f"i64 {_value_element_count(instruction.res) * 8}, "
+                            "i1 false)"
+                        )
+                    scalars[result_id] = (destination, "ptr")
+                else:
+                    buffer_aliases[result_id] = source_id
+                    scalars[result_id] = (buffer(source_id), "ptr")
                 continue
 
             callee = instruction.attributes.get("callee")
@@ -3882,7 +4020,8 @@ def emit_ssa_function_to_llvm(
                     scalars[result_id] = (register, returns)
                     destination = buffer(result_id)
                     lines.append(
-                        f"  store {returns} {register}, ptr {destination}, align 8"
+                        f"  store {returns} {register}, ptr {destination}, "
+                        f"align {_align(returns)}"
                     )
                 continue
 
