@@ -24,6 +24,7 @@ decorate a node while retaining its ordinary child-role traversal.
 from __future__ import annotations
 
 import ast
+import copy
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -300,6 +301,153 @@ def hoist_walrus_assignments(tree: ast.AST) -> ast.AST:
     ``NamedExpr`` reaches the deep compiler from a once-evaluated position."""
 
     _WalrusHoister().visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
+class _ContextInliner(ast.NodeTransformer):
+    """Replace a ``with`` by the statements its context manager actually runs.
+
+    A context manager is not control flow. It reads a slot, writes a value,
+    runs the body, and writes the old value back -- no branch, no iteration,
+    no continuation to merge. ``extended_precision.precision`` is exactly
+    that and nothing else::
+
+        previous = getattr(_state, "limbs", 1)   # get
+        _state.limbs = limbs                     # set
+        yield limbs                              # body
+        _state.limbs = previous                  # restore
+
+    Treating it as control flow is what blocks it: loop composition forbids
+    ``ast.With`` in a loop body, grouped with ``raise`` and ``await`` as
+    control divergence -- right for those, a category error for this. So the
+    statement is turned into the statements it already is, at ingestion,
+    exactly as a walrus is hoisted above so no raw ``NamedExpr`` reaches the
+    deep compiler. Nothing downstream then needs to learn what a context
+    manager is.
+
+    The halves are READ FROM THE CONTEXT MANAGER'S OWN SOURCE rather than
+    matched against a table of known names. Whatever it does before its
+    ``yield`` is the set-up, whatever it does after is the clean-up, and the
+    body goes between them. A manager this cannot read keeps its ``with``,
+    and therefore keeps its blocker, because an unread context may carry real
+    effects and dropping them silently is the failure this avoids.
+    """
+
+    def __init__(self, resolver) -> None:
+        self.resolver = resolver
+        self.counter = 0
+        self.inlined: list[str] = []
+
+    @staticmethod
+    def _halves(definition: ast.FunctionDef):
+        """Set-up and clean-up: the statements either side of the ``yield``."""
+
+        def holds_yield(node) -> bool:
+            return any(isinstance(inner, (ast.Yield, ast.YieldFrom))
+                       for inner in ast.walk(node))
+
+        setup: list[ast.stmt] = []
+        for statement in definition.body:
+            if isinstance(statement, ast.Try) and holds_yield(statement):
+                for inner in statement.body:
+                    if holds_yield(inner):
+                        break
+                    setup.append(inner)
+                return setup, list(statement.finalbody)
+            if holds_yield(statement):
+                return setup, []
+            setup.append(statement)
+        return None
+
+    def _bind(self, definition: ast.FunctionDef, call: ast.Call,
+              setup: list[ast.stmt], cleanup: list[ast.stmt]):
+        """Both halves, in ONE renaming scope, parameters bound by assignment.
+
+        The halves must share a scope: the set-up's temporary is what the
+        clean-up restores from, so renaming them apart leaves the restore
+        reading a name nothing defined.
+
+        Parameters are bound by an assignment rather than substituted into
+        their uses. A manager may reassign its own parameter -- ``precision``
+        opens with ``limbs = int(limbs)`` -- and substituting the call's
+        argument for every load would silently discard that, so the argument
+        is assigned once and the manager's own code proceeds normally.
+        """
+
+        self.counter += 1
+        tag = f"__ctx{self.counter}_"
+        parameters = [argument.arg for argument in definition.args.args]
+        owned = set(parameters) | {
+            node.id
+            for statement in (*setup, *cleanup)
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        }
+
+        class Rebind(ast.NodeTransformer):
+            def visit_Name(self, node):  # noqa: N802
+                if node.id in owned:
+                    return ast.copy_location(
+                        ast.Name(id=tag + node.id, ctx=node.ctx), node,
+                    )
+                return node
+
+        def rebind(statements):
+            kept = []
+            for statement in statements:
+                # A docstring is documentation, not a step the manager runs.
+                if (isinstance(statement, ast.Expr)
+                        and isinstance(statement.value, ast.Constant)
+                        and isinstance(statement.value.value, str)):
+                    continue
+                kept.append(Rebind().visit(copy.deepcopy(statement)))
+            return kept
+
+        binding = [
+            ast.Assign(targets=[ast.Name(id=tag + name, ctx=ast.Store())],
+                       value=copy.deepcopy(value))
+            for name, value in zip(parameters, call.args)
+        ]
+        return binding + rebind(setup), rebind(cleanup)
+
+    def visit_With(self, node):  # noqa: N802
+        node = self.generic_visit(node)
+        prologue: list[ast.stmt] = []
+        epilogue: list[ast.stmt] = []
+        for item in node.items:
+            call = item.context_expr
+            if not isinstance(call, ast.Call):
+                return node
+            definition = self.resolver(call)
+            if definition is None:
+                return node
+            halves = self._halves(definition)
+            if halves is None:
+                return node
+            if item.optional_vars is not None:
+                # ``as`` names the yielded value, which is the one thing the
+                # halves do not carry between them. Left alone rather than
+                # guessed at.
+                return node
+            setup, cleanup = self._bind(definition, call, *halves)
+            prologue.extend(setup)
+            # Clean-ups undo in reverse, innermost first.
+            epilogue[:0] = cleanup
+            self.inlined.append(ast.unparse(call))
+        return prologue + list(node.body) + epilogue
+
+
+def inline_context_managers(tree: ast.AST, resolver) -> ast.AST:
+    """Turn every readable ``with`` in ``tree`` into its equivalent statements.
+
+    ``resolver`` maps a call node to the ``FunctionDef`` it references, or to
+    ``None`` when it cannot be read. Resolution is the caller's because only
+    the caller knows how names in this tree bind.
+    """
+
+    inliner = _ContextInliner(resolver)
+    inliner.visit(tree)
     ast.fix_missing_locations(tree)
     return tree
 
