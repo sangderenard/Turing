@@ -684,6 +684,10 @@ PREBAKE_SETS: Mapping[str, PrebakeSettings] = {
         "audio", "direct", "structured", 1.0e-9,
         "well past 24-bit; every method on its own core",
     ),
+    "double": PrebakeSettings(
+        "double", "direct", "structured", 1.0e-15,
+        "everything the working type can hold; the dispatch default",
+    ),
     "reference": PrebakeSettings(
         "reference", "direct", "best", 1.0e-15,
         "per-core best measured family; the default for analysis work",

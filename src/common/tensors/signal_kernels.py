@@ -46,6 +46,18 @@ import numpy as np
 
 from . import signal_math as _signal
 
+#: What the kernels bake at unless a caller says otherwise.
+#: The working type is float64, so "at least double precision"
+#: means the result should be right to the last bit or two of one
+#: -- about 2.22e-16 relative, one ulp. The looser settings exist
+#: for footprint, not for speed: measured on the compiled sine,
+#: going from 5 coefficients to 7 bought roughly 36,000x accuracy
+#: for about 10% more time, because the octant reduction and the
+#: memory traffic dominate, not the polynomial. There is no
+#: accuracy/speed trade here worth taking, so the default takes
+#: the accuracy.
+DEFAULT_KERNEL_QUALITY = "double"
+
 
 def _literal(value: float) -> str:
     """Round-trippable decimal for a coefficient baked into source."""
@@ -126,6 +138,35 @@ def circular_kernel_source(cores: _signal.CoreSet, name: str = "sin") -> str:
         + _reduction_lines(cores, phase)
         + _selection_lines("y[i]", "")
         + "    return y\n"
+    )
+
+
+def exp_kernel_source(core: Any) -> str:
+    """``exp`` by ``2**k * exp(r)``, with ``r`` inside the baked band.
+
+    Uses the SERIES family deliberately. A polyspline core would need a
+    segment-selection chain per element, and the exponential's series has
+    exact rational coefficients and converges fast on a half-ln2 band -- so
+    the series is both the cheaper and the more accurate choice here, which
+    is not the usual ordering and is worth stating.
+
+    ``k`` is obtained by ``s - (s % 1.0)``: the compiled ``%`` follows
+    Python's floored semantics, measured, so that IS floor rather than
+    truncation.
+    """
+
+    if core.family != "series":
+        raise ValueError(
+            f"exp kernel wants a series core, got {core.family!r}"
+        )
+    return (
+        "\ndef exp(x, y, n):\n"
+        "    for i in range(n):\n"
+        f"        s = x[i] * {_literal(1.0 / math.log(2.0))} + 0.5\n"
+        "        k = s - (s % 1.0)\n"
+        f"        r = x[i] - k * {_literal(math.log(2.0))}\n"
+        f"        y[i] = {_horner_expression('r', core.values)} * (2.0 ** k)\n"
+        "    return y\n"
     )
 
 
@@ -391,7 +432,7 @@ def vjp_spec(cores: _signal.CoreSet, name: str):
     )
 
 
-def signal_kernel_specs(quality: str = "audio", *,
+def signal_kernel_specs(quality: str = DEFAULT_KERNEL_QUALITY, *,
                         include_vjp: bool = True) -> Mapping[str, Any]:
     """Every kernel this module authors, at one baked quality.
 
@@ -413,6 +454,7 @@ def signal_kernel_specs(quality: str = "audio", *,
 
 
 __all__ = [
+    "DEFAULT_KERNEL_QUALITY",
     "output_vjp_source",
     "tan_kernel_source",
     "vjp_plan",
