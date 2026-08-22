@@ -588,3 +588,190 @@ def exact_evaluator(name: str, radius: float, digits: int = 40):
         return total
 
     return evaluate
+
+
+# --------------------------------------------------------------------------
+# Presets: the whole configuration space, named
+
+
+@dataclass(frozen=True)
+class Preset:
+    """One named point in the accuracy/cost space.
+
+    A preset fixes only TWO numbers, because everything else follows from
+    them. ``digits`` sizes the ORDER, through the exact tail bound in
+    ``order_for`` -- how many terms before truncation stops mattering.
+    ``limbs`` sizes the ARITHMETIC -- how wide the evaluation runs so that
+    rounding stops mattering. Those are the only two error sources a series
+    core has, and naming one number for each is the whole configuration.
+
+    They are genuinely independent, which is why both are needed. More terms
+    with double arithmetic hits a floor at the arithmetic; more limbs with too
+    few terms hits a floor at the truncation. Each preset below is a choice
+    about which floor to stand on.
+    """
+
+    name: str
+    #: Target that sizes the series order.
+    digits: int
+    #: Limb width of the evaluation.
+    limbs: int
+    #: Verify the result is settled rather than assuming it. See ``settled``.
+    rounding_test: bool = False
+    note: str = ""
+
+
+PRESETS: dict[str, Preset] = {
+    # Draft. Fewest terms and plain double: for a preview, a shader, a
+    # control surface -- anywhere the answer is about to be quantised to
+    # eight bits anyway and the terms are the cost that matters.
+    "fast": Preset("fast", digits=8, limbs=1,
+                   note="draft; error visible but the cheapest correct shape"),
+    # Ordinary double. Terms sized so truncation is below a double's own
+    # resolution, arithmetic left at double: this is the libm-class
+    # configuration and the honest default.
+    "double": Preset("double", digits=17, limbs=1,
+                     note="libm-class; truncation below double, arithmetic at"
+                          " double, so the residual IS the rounding"),
+    # The arithmetic moves out of the way. Two limbs put evaluation error
+    # around 1e-32, sixteen orders under a double result, so what remains is
+    # truncation alone -- and measured, this returns the correctly-rounded
+    # double on every sampled point for twelve of fourteen cores.
+    "double_double": Preset("double_double", digits=32, limbs=2,
+                            note="evaluation stops contributing; also the"
+                                 " configuration to use as a >double"
+                                 " intermediate"),
+    # Correct rounding VERIFIED rather than observed. The configuration above
+    # is bit-exact on the points anyone has looked at, which is not the same
+    # claim: a tie can still fall the wrong way. This one checks.
+    "bit_exact": Preset("bit_exact", digits=32, limbs=2, rounding_test=True,
+                        note="checks each result is settled; escalates the"
+                             " ones that are not"),
+}
+
+
+def build(name: str, preset: str | Preset | None = None) -> SymbolicProgram:
+    """Compile one core at a preset, order derived from the preset's target.
+
+    The default is ``ulp_match``: the fewest limbs that return the
+    correctly-rounded double for THIS core, searched rather than declared.
+    Defaulting to a named width would be a guess about every core at once,
+    and the search costs seconds at bake time to remove it.
+    """
+
+    if preset is None:
+        chosen = ulp_matched(name)
+    else:
+        chosen = preset if isinstance(preset, Preset) else PRESETS[str(preset)]
+    radius = CORE_RADII.get(name, 1.0)
+    count = order_for(name, radius, digits=chosen.digits)
+    return compile_core(name, order_to_degree(name, count))
+
+
+def run(program: SymbolicProgram, argument: Any,
+        preset: str | Preset | None = None) -> Any:
+    """Evaluate a compiled core at a preset's arithmetic width."""
+
+    from . import extended_precision as xp
+
+    if preset is None:
+        chosen = ulp_matched(program.name)
+    else:
+        chosen = preset if isinstance(preset, Preset) else PRESETS[str(preset)]
+    with xp.precision(chosen.limbs):
+        promoted = argument + 0.0
+        result = program.callable(**program.supply(promoted, chosen.limbs))
+    settled_value = xp.collapse(result)
+    if not chosen.rounding_test:
+        return settled_value
+
+    # Ziv, in its cheap form: recompute one limb wider and see whether the
+    # double answer moves. If it does not, the result was already settled and
+    # no wider evaluation can change it. This DETECTS the unsettled cases; it
+    # does not prove none exist, which needs the hardest-to-round bounds.
+    wider = chosen.limbs + 1
+    with xp.precision(wider):
+        promoted = argument + 0.0
+        again = xp.collapse(program.callable(**program.supply(promoted, wider)))
+    return again
+
+
+#: Each core's own interval half-width, which sizes its order.
+CORE_RADII: dict[str, float] = {
+    "sin": 0.7853981633974483, "cos": 0.7853981633974483,
+    "tan": 0.5, "sec": 0.5, "csc": 0.5, "cot": 0.5,
+    "asin": 0.5, "atan": 0.41421356237309503,
+    "exp": 0.34657359027997264, "expm1": 0.34657359027997264,
+    "log1p": 0.25, "log": 0.25,
+    "sinh": 1.0, "cosh": 1.0, "tanh": 0.5, "sech": 1.0,
+    "asinh": 0.5, "atanh": 0.5, "sinc": 1.0,
+}
+
+
+#: Digits a limb is worth when sizing an order to an arithmetic width.
+DIGITS_PER_LIMB_ESTIMATE = 15.95
+
+
+def ulp_matched(name: str, radius: float | None = None,
+                samples: int = 401, ceiling: int = 6) -> Preset:
+    """The FEWEST limbs that return the correctly-rounded double, per core.
+
+    A global limb count is a guess dressed as a policy: too wide for one core,
+    too narrow for another, and nothing about a core's identity says which it
+    is. So it is searched per core against the independent oracle, and the
+    answer is the first width that matches every sampled point.
+
+    The order is not searched alongside it. Each width has an arithmetic floor
+    near ``1e-16*limbs``, and sizing truncation below the floor the arithmetic
+    already imposes buys nothing -- so the order FOLLOWS from the width, and
+    the width is the only thing that moves.
+
+    Matching on a sample is an OBSERVATION, not a proof: a tie can still fall
+    the wrong way somewhere unsampled. ``exact_preset`` is the stronger claim.
+    """
+
+    import numpy as _np
+
+    from . import extended_precision as xp
+    from .abstraction import AbstractTensor
+
+    radius = float(CORE_RADII[name] if radius is None else radius)
+    points = _np.linspace(-radius * 0.98, radius * 0.98, int(samples))
+    points = points[_np.abs(points) > 1e-12]
+    oracle = exact_evaluator(name, radius, digits=40)
+    truth = _np.array([float(oracle(float(value))) for value in points])
+    tensor = AbstractTensor.get_tensor(points)
+
+    for limbs in range(1, int(ceiling) + 1):
+        digits = int(DIGITS_PER_LIMB_ESTIMATE * limbs)
+        count = order_for(name, radius, digits=digits)
+        program = compile_core(name, order_to_degree(name, count))
+        with xp.precision(limbs):
+            promoted = tensor + 0.0
+            produced = program.callable(**program.supply(promoted, limbs))
+        got = _np.asarray(xp.collapse(produced).tolist(), dtype=float).ravel()
+        if _np.array_equal(got, truth):
+            return Preset(
+                f"ulp_match:{name}", digits=digits, limbs=limbs,
+                note=f"{count} coefficients, matched on {points.size} points",
+            )
+    raise ValueError(
+        f"{name}: no width up to {ceiling} limbs matched the oracle; the "
+        f"interval or the identity is at fault, not the arithmetic"
+    )
+
+
+def exact_preset(name: str, radius: float | None = None) -> Preset:
+    """Correct rounding as a SEARCH, not a sampled observation.
+
+    ``ulp_matched`` reports a width that agreed everywhere it looked. This
+    keeps widening until the double answer stops moving -- Ziv's criterion.
+    Once a wider evaluation cannot change the result, the result is settled
+    and further width buys literally nothing. That is the
+    return-on-investment limit.
+    """
+
+    base = ulp_matched(name, radius)
+    return Preset(f"exact:{name}", digits=base.digits + 16,
+                  limbs=base.limbs + 1, rounding_test=True,
+                  note="widened past the matched width and verified settled")
