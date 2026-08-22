@@ -11,6 +11,7 @@ uses the same proven deployments without surrendering source recursively.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ast
 import json
 import os
 from pathlib import Path
@@ -111,8 +112,38 @@ def _activate_compute_dispatch(product, qualified_name: str):
     return owner, deployed
 
 
+def _activate_qualified_scalar(product, qualified_name: str):
+    """Re-prove one ABI-selected scalar leaf and return its authored owner."""
+
+    from .project_compilation_product import _resolve_product_callable
+
+    link = dict(product.links[str(qualified_name)])
+    source_module = str(link.get("source_module") or "")
+    if not source_module:
+        raise ValueError("scalar bootstrap link has no source module")
+    owner, authored = _resolve_product_callable(
+        source_module, str(qualified_name),
+    )
+    library = product.root / str(link.get("native_library") or "")
+    receipt_path = library.parent / "native-verification.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    probes = []
+    for record in receipt.get("probes") or ():
+        arguments = ast.literal_eval(str(record.get("arguments") or "()"))
+        keywords = ast.literal_eval(str(record.get("keywords") or "{}"))
+        probes.append(dict(keywords) if keywords else tuple(arguments))
+    deployed = product.verify_native_scalar_callable(
+        str(qualified_name),
+        authored,
+        probes,
+        activation_adapter="qualified-scalar-call-v1",
+    )
+    return owner, deployed
+
+
 _ACTIVATION_ADAPTERS: dict[str, Callable[..., tuple[Any, Callable[..., Any]]]] = {
     "compute-dispatch-record-v1": _activate_compute_dispatch,
+    "qualified-scalar-call-v1": _activate_qualified_scalar,
 }
 _ACTIVE_DEPLOYMENTS: dict[tuple[str, str], Callable[..., Any]] = {}
 

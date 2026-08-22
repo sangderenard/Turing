@@ -14,6 +14,7 @@ from typing import Sequence
 from src.compiler.project_compilation_product import (
     DEFAULT_PROJECT_EXTRACTION_CONTRACT,
     compile_project_call,
+    compile_project_bootstrap_creep,
     compile_project_product,
     compile_process_graph_creep,
     compile_process_graph_subdivision_integral,
@@ -207,6 +208,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="maximum automatic creep depth (default: 32)",
     )
     parser.add_argument(
+        "--creep-project", action="store_true",
+        help=(
+            "autonomously compile, verify, feed proven native products into "
+            "later bounded passes, and stop at a durable fixed point"
+        ),
+    )
+    parser.add_argument(
+        "--max-bootstrap-rounds", type=int, default=16,
+        help="maximum autonomous project bootstrap passes (default: 16)",
+    )
+    parser.add_argument(
         "--linked-planned-unit", action="append", default=[],
         help=argparse.SUPPRESS,
     )
@@ -247,6 +259,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             "products": [item.to_mapping() for item in activations],
         }, sort_keys=True), flush=True)
 
+    if arguments.creep_project:
+        if arguments.source is None:
+            parser.error("--creep-project requires --source")
+        manifest = compile_project_bootstrap_creep(
+            arguments.source,
+            arguments.output,
+            entries=arguments.entry or None,
+            jobs=arguments.jobs,
+            max_total_resident_bytes=(
+                None if arguments.max_total_gb is None
+                else int(arguments.max_total_gb * 1024 ** 3)
+            ),
+            worker_resident_reservation_bytes=int(
+                arguments.worker_reserve_gb * 1024 ** 3
+            ),
+            max_worker_memory_bytes=(
+                None if arguments.max_worker_gb == 0
+                else int(arguments.max_worker_gb * 1024 ** 3)
+            ),
+            unit_timeout_seconds=(
+                None if arguments.unit_timeout_seconds == 0
+                else arguments.unit_timeout_seconds
+            ),
+            extraction_contract=arguments.extraction_contract,
+            bootstrap_products=selected_products,
+            max_rounds=arguments.max_bootstrap_rounds,
+            progress=lambda event: print(
+                json.dumps(event, sort_keys=True), flush=True,
+            ),
+        )
+        print(json.dumps({
+            "status": manifest["status"],
+            "rounds": len(manifest["rounds"]),
+            "installed": len(manifest["installed_qualified_names"]),
+            "manifest": str(arguments.output.resolve() / "manifest.json"),
+        }, sort_keys=True), flush=True)
+        return 0 if manifest["status"] == "sealed" else 1
+
     if arguments.creep_resolved_plan:
         if arguments.compile_resolved_plan or arguments.compile_subdivision_plan:
             parser.error(
@@ -281,6 +331,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else arguments.unit_timeout_seconds
             ),
             max_subdivision_depth=arguments.max_subdivision_depth,
+            bootstrap_products=selected_products,
             progress=lambda event: print(
                 json.dumps(event, sort_keys=True), flush=True,
             ),

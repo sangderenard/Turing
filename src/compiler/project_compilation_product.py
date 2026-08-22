@@ -339,6 +339,8 @@ class ProjectCompilationProduct:
         qualified_name: str,
         authored_callable: Callable[..., Any],
         probes: Sequence[Sequence[Any] | Mapping[str, Any]],
+        *,
+        activation_adapter: str | None = None,
     ) -> Callable[..., Any]:
         """Load a scalar native unit only after ABI and behavior agree.
 
@@ -500,6 +502,9 @@ class ProjectCompilationProduct:
             "fallback_probe_count": int(route_counts["fallback"]),
             "probes": probe_records,
             "status": "verified",
+            **({
+                "activation_adapter": str(activation_adapter),
+            } if activation_adapter is not None else {}),
         }
         receipt_path = library_path.parent / "native-verification.json"
         _atomic_json(receipt_path, verification)
@@ -2018,6 +2023,138 @@ def open_project_compilation_product(
             for item in link_table.get("links", ())
         },
     )
+
+
+def _resolve_product_callable(
+    source_module: str,
+    qualified_name: str,
+) -> tuple[Any, Callable[..., Any]]:
+    """Resolve an authored module/class callable without executing a project."""
+
+    if ".<locals>." in str(qualified_name):
+        raise ValueError("lexically nested callables have no importable owner")
+    module = importlib.import_module(str(source_module))
+    parts = str(qualified_name).split(".")
+    owner: Any = module
+    for component in parts[:-1]:
+        owner = getattr(owner, component)
+    callable_value = getattr(owner, parts[-1])
+    if not callable(callable_value):
+        raise TypeError(f"authored target {qualified_name!r} is not callable")
+    return owner, callable_value
+
+
+def verify_project_scalar_units_automatically(
+    directory: str | Path,
+) -> tuple[dict[str, Any], ...]:
+    """Verify every emitted unit whose API proves a complete scalar surface.
+
+    Selection is ABI-driven. Unsupported records, arrays, methods requiring an
+    instance, and side-effecting/inout surfaces are refused by the scalar
+    verifier and remain ordinary source fallbacks. No function-name allowlist
+    participates in compiler creep.
+    """
+
+    from .compiled_program_api import load_api
+
+    product = open_project_compilation_product(directory)
+    sample_values = {
+        "c_bool": (False, True, True),
+        "c_int32": (-3, 1, 5),
+        "c_int64": (-3, 1, 5),
+        "c_uint8": (0, 1, 5),
+        "c_float": (-3.25, 1.25, 4.5),
+        "c_double": (-3.25, 1.25, 4.5),
+    }
+    results = []
+    for qualified_name, link_value in sorted(product.links.items()):
+        link = dict(link_value)
+        if link.get("kind") == "source-region-integral":
+            continue
+        record = {
+            "qualified_name": str(qualified_name),
+            "status": "unsupported",
+        }
+        try:
+            source_module = str(link.get("source_module") or "")
+            if not source_module:
+                raise ValueError("unit receipt has no importable source module")
+            _owner, authored = _resolve_product_callable(
+                source_module, str(qualified_name),
+            )
+            api_path = product.root / str(link.get("native_api") or "")
+            descriptor = load_api(api_path)
+            entry_name = str(link.get("native_entrypoint") or "")
+            entry = next((
+                item for item in descriptor.get("entry_points", ())
+                if str(item.get("name")) == entry_name
+            ), None)
+            if entry is None:
+                raise ValueError("native entrypoint is absent from its API")
+            parameters = tuple(entry.get("parameters") or ())
+            inputs = tuple(
+                parameter for parameter in parameters
+                if parameter.get("role") in {"input", "inout"}
+            )
+            outputs = tuple(
+                parameter for parameter in parameters
+                if parameter.get("role") in {"output", "inout"}
+            )
+            if (
+                len(outputs) != 1
+                or outputs[0].get("role") != "output"
+                or any(
+                    parameter.get("shape") or parameter.get("extents")
+                    or parameter.get("extent")
+                    for parameter in parameters
+                )
+            ):
+                raise ValueError("native API is not a pure scalar surface")
+            domains = []
+            source_names = []
+            for parameter in inputs:
+                source_name = str(parameter.get("source_name") or "")
+                if not source_name or "." in source_name:
+                    raise ValueError("native input lacks a direct source parameter")
+                try:
+                    domain = sample_values[str(parameter["ctypes"])]
+                except KeyError as error:
+                    raise ValueError(
+                        f"no scalar probe domain for {error.args[0]!r}"
+                    ) from error
+                source_names.append(source_name)
+                domains.append(domain)
+            if len(source_names) != len(set(source_names)):
+                raise ValueError("native scalar inputs repeat a source parameter")
+            probes = tuple({
+                source_name: domain[probe_index]
+                for source_name, domain in zip(
+                    source_names, domains, strict=True,
+                )
+            } for probe_index in range(3))
+            deployed = product.verify_native_scalar_callable(
+                str(qualified_name),
+                authored,
+                probes,
+                activation_adapter="qualified-scalar-call-v1",
+            )
+            verification = dict(deployed.__turing_native_verification__)
+            record.update({
+                "status": "verified",
+                "probe_count": int(verification["probe_count"]),
+                "native_probe_count": int(
+                    verification["native_probe_count"]
+                ),
+                "fallback_probe_count": int(
+                    verification["fallback_probe_count"]
+                ),
+            })
+        except Exception as error:
+            record.update({
+                "reason": f"{type(error).__name__}: {error}",
+            })
+        results.append(record)
+    return tuple(results)
 
 
 def _defined_names(statement: ast.stmt) -> tuple[str, ...]:
@@ -5378,6 +5515,7 @@ def compile_resolved_process_graph_plan(
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
     unit_timeout_seconds: float | None = DEFAULT_UNIT_TIMEOUT_SECONDS,
+    worker_environment: Mapping[str, str] | None = None,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Crawl a resolved unit plan in isolated, resource-bounded workers.
@@ -5523,6 +5661,7 @@ def compile_resolved_process_graph_plan(
             cwd=repository_root,
             stdout=worker_log,
             stderr=subprocess.STDOUT,
+            env=(None if worker_environment is None else dict(worker_environment)),
         )
         running[index] = {
             "process": process,
@@ -5713,6 +5852,7 @@ def compile_process_graph_subdivision_plan(
     worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
     unit_timeout_seconds: float | None = DEFAULT_UNIT_TIMEOUT_SECONDS,
+    worker_environment: Mapping[str, str] | None = None,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Compile every deterministic child integral in bounded workers."""
@@ -5784,7 +5924,8 @@ def compile_process_graph_subdivision_plan(
             "--subdivision-plan", str(source_plan_path),
             "--subdivision-integral", str(index),
             "--output", str(destination),
-        ], cwd=repository_root, stdout=worker_log, stderr=subprocess.STDOUT)
+        ], cwd=repository_root, stdout=worker_log, stderr=subprocess.STDOUT,
+            env=(None if worker_environment is None else dict(worker_environment)))
         running[index] = {
             "process": process,
             "started": time.perf_counter(),
@@ -5958,6 +6099,7 @@ def compile_process_graph_creep(
     max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
     unit_timeout_seconds: float | None = DEFAULT_UNIT_TIMEOUT_SECONDS,
     max_subdivision_depth: int = 32,
+    bootstrap_products: Iterable[str | Path] = (),
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Autonomously crawl bounded units and every strictly deeper cut.
@@ -5983,6 +6125,16 @@ def compile_process_graph_creep(
     depth_limit = int(max_subdivision_depth)
     if depth_limit < 0:
         raise ValueError("maximum subdivision depth must be non-negative")
+    selected_bootstrap_products = tuple(dict.fromkeys(
+        Path(path).resolve() for path in bootstrap_products
+    ))
+    worker_environment = os.environ.copy()
+    if selected_bootstrap_products:
+        from .compiler_bootstrap_runtime import COMPILER_BOOTSTRAP_PRODUCTS_ENV
+
+        worker_environment[COMPILER_BOOTSTRAP_PRODUCTS_ENV] = os.pathsep.join(
+            str(path) for path in selected_bootstrap_products
+        )
 
     def report(stage: str, **details: Any) -> None:
         if progress is not None:
@@ -6085,6 +6237,7 @@ def compile_process_graph_creep(
             ),
             "max_worker_memory_bytes": max_worker_memory_bytes,
             "unit_timeout_seconds": unit_timeout_seconds,
+            "worker_environment": worker_environment,
             "progress": lambda event, round_index=round_index: report(
                 "creep_worker", round=round_index, event=dict(event),
             ),
@@ -6161,6 +6314,9 @@ def compile_process_graph_creep(
         "process_graph_unit_plan": unit_plan_path.as_posix(),
         "process_graph_unit_plan_sha256": _file_sha256(unit_plan_path),
         "max_subdivision_depth": depth_limit,
+        "bootstrap_products": [
+            path.as_posix() for path in selected_bootstrap_products
+        ],
         "rounds": rounds,
         "counts": counts,
         "verified_products": verified_products,
@@ -6247,6 +6403,7 @@ def compile_project_product(
     extraction_contract: str | Path | None = DEFAULT_PROJECT_EXTRACTION_CONTRACT,
     emit_native: bool = False,
     seed_product: str | Path | None = None,
+    bootstrap_products: Iterable[str | Path] = (),
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Compile authored calls in isolated workers across several cores.
@@ -6265,6 +6422,9 @@ def compile_project_product(
     root = Path(directory).resolve()
     root.mkdir(parents=True, exist_ok=True)
     source = source_file.read_text(encoding="utf-8")
+    inherited_bootstrap_products = tuple(dict.fromkeys(
+        Path(path).resolve() for path in bootstrap_products
+    ))
     seed_root = None if seed_product is None else Path(seed_product).resolve()
     if seed_root is not None and seed_root.is_file():
         if seed_root.name != "manifest.json":
@@ -6471,7 +6631,16 @@ def compile_project_product(
                     ),
                 }, sort_keys=True),
             ))
-        process = subprocess.Popen(command)
+        worker_environment = os.environ.copy()
+        if inherited_bootstrap_products:
+            from .compiler_bootstrap_runtime import (
+                COMPILER_BOOTSTRAP_PRODUCTS_ENV,
+            )
+
+            worker_environment[COMPILER_BOOTSTRAP_PRODUCTS_ENV] = os.pathsep.join(
+                str(path) for path in inherited_bootstrap_products
+            )
+        process = subprocess.Popen(command, env=worker_environment)
         running[index] = {
             "qualified_name": qualified_name,
             "root": unit_root,
@@ -6904,6 +7073,9 @@ def compile_project_product(
         ),
         "native_emission_requested": bool(emit_native),
         "seed_product": None if seed_root is None else seed_root.as_posix(),
+        "bootstrap_products": [
+            path.as_posix() for path in inherited_bootstrap_products
+        ],
         "units": completed_records,
         "creep_frontier": compilation_creep_frontier(
             completed_records, source_dependencies, contained_integrals,
@@ -6918,6 +7090,7 @@ def compile_project_product(
         receipt = json.loads((unit_root / "unit.json").read_text(encoding="utf-8"))
         links.append({
             "qualified_name": str(record["qualified_name"]),
+            "source_module": str(receipt.get("source_module") or ""),
             "authored_source_sha256": str(
                 receipt.get("authored_source_sha256") or ""
             ),
@@ -6970,6 +7143,247 @@ def compile_project_product(
         "order": "dependencies-first",
         "links": links,
     })
+    if emit_native:
+        automatic_verification = list(
+            verify_project_scalar_units_automatically(root)
+        )
+        manifest["automatic_native_verification"] = automatic_verification
+        verified_by_name = {
+            str(item["qualified_name"]): dict(item)
+            for item in automatic_verification
+        }
+        for record in manifest["units"]:
+            verification = verified_by_name.get(str(record["qualified_name"]))
+            if verification is not None:
+                record["native_verification_status"] = str(
+                    verification["status"]
+                )
+                if verification.get("reason"):
+                    record["native_verification_reason"] = str(
+                        verification["reason"]
+                    )
+        _atomic_json(root / "manifest.json", manifest)
+    return manifest
+
+
+def compile_project_bootstrap_creep(
+    source_path: str | Path,
+    directory: str | Path,
+    *,
+    entries: Iterable[str] | None = None,
+    python_executable: str | Path = sys.executable,
+    jobs: int | None = None,
+    max_total_resident_bytes: int | None = None,
+    worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
+    max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
+    unit_timeout_seconds: float | None = DEFAULT_UNIT_TIMEOUT_SECONDS,
+    extraction_contract: str | Path | None = DEFAULT_PROJECT_EXTRACTION_CONTRACT,
+    bootstrap_products: Iterable[str | Path] = (),
+    max_rounds: int = 16,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Compile, prove, install for later workers, and repeat to a fixed point.
+
+    This is the compiler-owned project bootstrap loop.  It discovers the
+    authored catalogue itself, runs every pass in the existing bounded worker
+    scheduler, emits native products, proves eligible deployments, and gives
+    only those receipt-backed products to the next pass.  Partial products are
+    also used as source-region seeds, so a successful inner integral can make
+    its enclosing authored call tractable without a person selecting either.
+    """
+
+    source_file = Path(source_path).resolve()
+    root = Path(directory).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    round_limit = int(max_rounds)
+    if round_limit < 1:
+        raise ValueError("project bootstrap creep needs at least one round")
+    active_products = list(dict.fromkeys(
+        Path(path).resolve() for path in bootstrap_products
+    ))
+    rounds: list[dict[str, Any]] = []
+    installed_names: set[str] = set()
+    installed_regions: set[tuple[str, ...]] = set()
+    prior_seed: Path | None = None
+    fixed_point: dict[str, Any] | None = None
+
+    def report(stage: str, **details: Any) -> None:
+        if progress is not None:
+            progress({"stage": stage, **details})
+
+    def write_progress(status: str) -> None:
+        _atomic_json(root / "creep-progress.json", {
+            "schema": "turing.project-bootstrap-creep-progress.v1",
+            "source": source_file.as_posix(),
+            "status": status,
+            "max_rounds": round_limit,
+            "active_products": [path.as_posix() for path in active_products],
+            "installed_qualified_names": sorted(installed_names),
+            "installed_source_regions": [
+                list(chain) for chain in sorted(installed_regions)
+            ],
+            "rounds": rounds,
+            **({"fixed_point": fixed_point} if fixed_point is not None else {}),
+        })
+
+    write_progress("running")
+    for round_index in range(round_limit):
+        round_root = root / f"round_{round_index:03d}"
+        report(
+            "bootstrap_creep_round_start", round=round_index,
+            active_product_count=len(active_products),
+        )
+        product = compile_project_product(
+            source_file,
+            round_root,
+            entries=entries,
+            python_executable=python_executable,
+            jobs=jobs,
+            max_total_resident_bytes=max_total_resident_bytes,
+            worker_resident_reservation_bytes=(
+                worker_resident_reservation_bytes
+            ),
+            max_worker_memory_bytes=max_worker_memory_bytes,
+            unit_timeout_seconds=unit_timeout_seconds,
+            extraction_contract=extraction_contract,
+            emit_native=True,
+            seed_product=prior_seed,
+            bootstrap_products=active_products,
+            progress=lambda event, round_index=round_index: report(
+                "bootstrap_creep_worker", round=round_index,
+                event=dict(event),
+            ),
+        )
+        verified_names = {
+            str(record["qualified_name"])
+            for record in product.get("automatic_native_verification") or ()
+            if record.get("status") == "verified"
+        }
+        verified_regions = {
+            tuple(map(str, region.get("identity_token_chain") or ()))
+            for unit in product.get("units") or ()
+            for region in unit.get("source_region_integrals") or ()
+            if region.get("native_verification_status") == "verified"
+        }
+        verified_regions.discard(())
+        new_names = verified_names - installed_names
+        new_regions = verified_regions - installed_regions
+        if new_names:
+            active_products.append(round_root.resolve())
+        installed_names.update(verified_names)
+        installed_regions.update(verified_regions)
+        prior_seed = round_root.resolve()
+        unit_counts: dict[str, int] = {}
+        for unit in product.get("units") or ():
+            status = str(unit.get("status") or "unknown")
+            unit_counts[status] = unit_counts.get(status, 0) + 1
+        subdivision_creeps = []
+        for unit in product.get("units") or ():
+            if unit.get("status") == "complete":
+                continue
+            plan_name = unit.get("process_graph_unit_plan")
+            unit_name = unit.get("path")
+            if not plan_name or not unit_name:
+                continue
+            plan_path = round_root / str(plan_name)
+            graph_path = (
+                round_root / str(unit_name) / "resolved-process-graph.pkl"
+            )
+            if not plan_path.is_file() or not graph_path.is_file():
+                continue
+            qualified_name = str(unit.get("qualified_name") or "unit")
+            subdivision_root = (
+                round_root / "process-graph-creeps"
+                / encoded_call_name(qualified_name)
+            )
+            subdivision = compile_process_graph_creep(
+                graph_path,
+                plan_path,
+                subdivision_root,
+                python_executable=python_executable,
+                jobs=jobs,
+                max_total_resident_bytes=max_total_resident_bytes,
+                worker_resident_reservation_bytes=(
+                    worker_resident_reservation_bytes
+                ),
+                max_worker_memory_bytes=max_worker_memory_bytes,
+                unit_timeout_seconds=unit_timeout_seconds,
+                bootstrap_products=active_products,
+                progress=lambda event, round_index=round_index, qualified_name=qualified_name: report(
+                    "bootstrap_creep_subdivision", round=round_index,
+                    qualified_name=qualified_name, event=dict(event),
+                ),
+            )
+            subdivision_creeps.append({
+                "qualified_name": qualified_name,
+                "product": subdivision_root.as_posix(),
+                "status": str(subdivision.get("status") or ""),
+                "verified_product_count": len(
+                    subdivision.get("verified_products") or ()
+                ),
+                "fixed_point_count": len(
+                    subdivision.get("fixed_points") or ()
+                ),
+            })
+        verification_frontier = [
+            dict(record)
+            for record in product.get("automatic_native_verification") or ()
+            if record.get("status") != "verified"
+        ]
+        round_record = {
+            "round": round_index,
+            "product": round_root.as_posix(),
+            "unit_counts": unit_counts,
+            "new_verified_qualified_names": sorted(new_names),
+            "new_verified_source_regions": [
+                list(chain) for chain in sorted(new_regions)
+            ],
+            "creep_frontier": list(product.get("creep_frontier") or ()),
+            "native_verification_frontier": verification_frontier,
+            "process_graph_creeps": subdivision_creeps,
+        }
+        rounds.append(round_record)
+        report("bootstrap_creep_round_finish", **round_record)
+        if not new_names and not new_regions:
+            fixed_point = {
+                "kind": "no-new-proven-deployments",
+                "round": round_index,
+                "action": (
+                    "lower-or-verify-the-persisted-creep-frontier; source-"
+                    "fallback-remains-authoritative"
+                ),
+            }
+            break
+        write_progress("running")
+    else:
+        fixed_point = {
+            "kind": "maximum-bootstrap-rounds",
+            "round": round_limit - 1,
+            "action": "raise-only-after-inspecting-the-persisted-frontier",
+        }
+
+    manifest = {
+        "schema": "turing.project-bootstrap-creep-product.v1",
+        "source": source_file.as_posix(),
+        "source_sha256": _file_sha256(source_file),
+        "max_rounds": round_limit,
+        "rounds": rounds,
+        "active_products": [path.as_posix() for path in active_products],
+        "installed_qualified_names": sorted(installed_names),
+        "installed_source_regions": [
+            list(chain) for chain in sorted(installed_regions)
+        ],
+        "fixed_point": fixed_point,
+        "status": (
+            "sealed"
+            if rounds
+            and not rounds[-1]["creep_frontier"]
+            and not rounds[-1]["native_verification_frontier"]
+            else "frontier"
+        ),
+    }
+    _atomic_json(root / "manifest.json", manifest)
+    write_progress(str(manifest["status"]))
     return manifest
 
 
@@ -6982,6 +7396,7 @@ __all__ = [
     "SOURCE_REGION_INTEGRAL_SCHEMA",
     "UNIT_ARTIFACT_SCHEMA",
     "compile_project_call",
+    "compile_project_bootstrap_creep",
     "compile_project_product",
     "compile_process_graph_creep",
     "compile_process_graph_subdivision_integral",
@@ -7005,4 +7420,5 @@ __all__ = [
     "resident_bytes",
     "source_region_integral_accounting",
     "verify_structural_resident_table_integral",
+    "verify_project_scalar_units_automatically",
 ]

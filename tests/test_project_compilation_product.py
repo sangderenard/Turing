@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from src.compiler.project_compilation_product import (
     compilation_creep_frontier,
+    compile_project_bootstrap_creep,
     compile_process_graph_creep,
     compile_process_graph_subdivision_plan,
     compile_resolved_process_graph_unit,
@@ -29,6 +30,7 @@ from src.compiler.project_compilation_product import (
     resident_bytes,
     source_region_integral_accounting,
     verify_structural_resident_table_integral,
+    verify_project_scalar_units_automatically,
 )
 
 
@@ -175,6 +177,119 @@ def test_compiler_creep_crawls_nested_plans_and_stops_repeated_cut(
     assert json.loads(
         (tmp_path / "creep" / "manifest.json").read_text(encoding="utf-8")
     ) == manifest
+
+
+def test_project_bootstrap_creep_feeds_only_newly_verified_products(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "compiler_part.py"
+    source.write_text("def leaf(value):\n    return value + 1\n", encoding="utf-8")
+    calls = []
+
+    def compile_round(_source, output, **kwargs):
+        round_index = len(calls)
+        calls.append({
+            "output": output,
+            "bootstrap_products": tuple(kwargs["bootstrap_products"]),
+            "seed_product": kwargs["seed_product"],
+            "emit_native": kwargs["emit_native"],
+        })
+        verified = round_index == 0
+        return {
+            "units": [{
+                "qualified_name": "leaf",
+                "status": "complete",
+                "source_region_integrals": [],
+            }],
+            "automatic_native_verification": [{
+                "qualified_name": "leaf",
+                "status": "verified" if verified else "unsupported",
+            }],
+            "creep_frontier": [],
+        }
+
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.compile_project_product",
+        compile_round,
+    )
+
+    manifest = compile_project_bootstrap_creep(
+        source, tmp_path / "creep", max_rounds=8,
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["bootstrap_products"] == ()
+    assert calls[0]["emit_native"] is True
+    assert calls[1]["bootstrap_products"] == (
+        (tmp_path / "creep" / "round_000").resolve(),
+    )
+    assert calls[1]["seed_product"] == (
+        tmp_path / "creep" / "round_000"
+    ).resolve()
+    assert manifest["installed_qualified_names"] == ["leaf"]
+    assert manifest["fixed_point"]["kind"] == "no-new-proven-deployments"
+
+
+def test_project_bootstrap_creep_automatically_crawls_failed_unit_plan(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "compiler_part.py"
+    source.write_text("def root(value):\n    return value\n", encoding="utf-8")
+    observed = []
+
+    def compile_round(_source, output, **_kwargs):
+        unit_root = output / "units" / "root"
+        unit_root.mkdir(parents=True)
+        (unit_root / "resolved-process-graph.pkl").write_bytes(b"graph")
+        plan = unit_root / "process-graph-units.json"
+        plan.write_text("{}", encoding="utf-8")
+        return {
+            "units": [{
+                "qualified_name": "root",
+                "status": "failed",
+                "path": "units/root",
+                "process_graph_unit_plan": (
+                    "units/root/process-graph-units.json"
+                ),
+            }],
+            "automatic_native_verification": [],
+            "creep_frontier": [{"qualified_name": "root"}],
+        }
+
+    def crawl(graph, plan, output, **kwargs):
+        observed.append((graph, plan, output, kwargs["bootstrap_products"]))
+        return {
+            "status": "frontier",
+            "verified_products": [{"status": "verified"}],
+            "fixed_points": [{"kind": "minimum-integral"}],
+        }
+
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.compile_project_product",
+        compile_round,
+    )
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.compile_process_graph_creep",
+        crawl,
+    )
+
+    manifest = compile_project_bootstrap_creep(
+        source, tmp_path / "creep", max_rounds=4,
+    )
+
+    assert len(observed) == 1
+    assert observed[0][0].name == "resolved-process-graph.pkl"
+    assert observed[0][1].name == "process-graph-units.json"
+    assert manifest["rounds"][0]["process_graph_creeps"] == [{
+        "qualified_name": "root",
+        "product": (
+            tmp_path / "creep" / "round_000" / "process-graph-creeps"
+            / encoded_call_name("root")
+        ).as_posix(),
+        "status": "frontier",
+        "verified_product_count": 1,
+        "fixed_point_count": 1,
+    }]
 
 
 def test_process_graph_workers_wait_for_terminal_dependencies_not_success():
@@ -1076,6 +1191,81 @@ def test_link_product_loads_the_selected_repository_ssa_unit(tmp_path):
     assert product.load_repository_ssa("leaf") == (
         "module", "outputs", "exports",
     )
+
+
+def test_automatic_scalar_verification_is_abi_selected(
+    tmp_path, monkeypatch,
+):
+    owner = SimpleNamespace()
+
+    def leaf(value):
+        return value + 1
+
+    owner.leaf = leaf
+    observed = {}
+
+    class Product:
+        root = tmp_path
+        links = {
+            "leaf": {
+                "source_module": "compiler_leaf_module",
+                "native_api": "leaf.api.yaml",
+                "native_entrypoint": "leaf_native",
+            },
+        }
+
+        def verify_native_scalar_callable(
+            self, qualified_name, authored, probes, *, activation_adapter=None,
+        ):
+            observed.update({
+                "qualified_name": qualified_name,
+                "authored": authored,
+                "probes": tuple(probes),
+                "activation_adapter": activation_adapter,
+            })
+
+            def deployed(value):
+                return value + 1
+
+            deployed.__turing_native_verification__ = {
+                "probe_count": 3,
+                "native_probe_count": 3,
+                "fallback_probe_count": 0,
+            }
+            return deployed
+
+    (tmp_path / "leaf.api.yaml").write_text("api", encoding="utf-8")
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product."
+        "open_project_compilation_product",
+        lambda _path: Product(),
+    )
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product._resolve_product_callable",
+        lambda _module, _name: (owner, leaf),
+    )
+    monkeypatch.setattr(
+        "src.compiler.compiled_program_api.load_api",
+        lambda _path: {"entry_points": [{
+            "name": "leaf_native",
+            "parameters": [
+                {
+                    "name": "value", "source_name": "value",
+                    "role": "input", "ctypes": "c_int64",
+                },
+                {"name": "result", "role": "output", "ctypes": "c_int64"},
+            ],
+        }]},
+    )
+
+    result, = verify_project_scalar_units_automatically(tmp_path)
+
+    assert result["status"] == "verified"
+    assert observed["authored"] is leaf
+    assert observed["probes"] == (
+        {"value": -3}, {"value": 1}, {"value": 5},
+    )
+    assert observed["activation_adapter"] == "qualified-scalar-call-v1"
 
 
 def _verified_install_fixture(tmp_path):

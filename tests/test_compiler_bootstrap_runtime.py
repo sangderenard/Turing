@@ -100,6 +100,60 @@ def test_bootstrap_product_environment_is_a_deterministic_path_set(
     assert runtime.compiler_bootstrap_product_paths() == selected
 
 
+def test_qualified_scalar_adapter_replays_persisted_probes(
+    tmp_path, monkeypatch,
+):
+    native_root = tmp_path / "native"
+    native_root.mkdir()
+    library = native_root / "leaf.dll"
+    library.write_bytes(b"native")
+    (native_root / "native-verification.json").write_text(json.dumps({
+        "probes": [
+            {"arguments": "()", "keywords": "{'value': -3}"},
+            {"arguments": "()", "keywords": "{'value': 5}"},
+        ],
+    }), encoding="utf-8")
+    owner = SimpleNamespace()
+
+    def authored(value):
+        return value + 1
+
+    observed = {}
+
+    class Product:
+        root = tmp_path
+        links = {"leaf": {
+            "source_module": "compiler_leaf_module",
+            "native_library": "native/leaf.dll",
+        }}
+
+        def verify_native_scalar_callable(
+            self, qualified_name, selected, probes, *, activation_adapter=None,
+        ):
+            observed.update({
+                "qualified_name": qualified_name,
+                "selected": selected,
+                "probes": tuple(probes),
+                "activation_adapter": activation_adapter,
+            })
+            return authored
+
+    monkeypatch.setattr(
+        project_compilation_product,
+        "_resolve_product_callable",
+        lambda _module, _name: (owner, authored),
+    )
+
+    selected_owner, deployed = runtime._activate_qualified_scalar(
+        Product(), "leaf",
+    )
+
+    assert selected_owner is owner
+    assert deployed is authored
+    assert observed["probes"] == ({"value": -3}, {"value": 5})
+    assert observed["activation_adapter"] == "qualified-scalar-call-v1"
+
+
 def test_bootstrap_receipt_writer_cannot_clobber_worker_failure(tmp_path):
     failure = tmp_path / "failure.json"
     activation = tmp_path / "bootstrap-activation.json"
