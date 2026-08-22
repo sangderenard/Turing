@@ -2474,6 +2474,20 @@ class AbstractTensor:
         elif isinstance(right, AbstractTensor) and isinstance(left, (list, tuple)):
             left = right.ensure_tensor(left)       # instead of get_tensor(... Faculty.NUMPY)
 
+        # N-double shim. An operand carrying ``_limbs`` denotes the sum of its
+        # limbs, and the expansion below is written in ordinary tensor
+        # arithmetic -- so it records on the tape as the chain that actually
+        # produced the value, and the gradient flows through it with no
+        # separate derivative to maintain. It sits HERE, above the backend
+        # unwrap, because every step is built from + - * on the base dtype:
+        # one implementation covers every backend. Declining costs one
+        # attribute lookup, so single-limb work pays essentially nothing.
+        from .extended_precision import apply as _extended_apply
+
+        extended_result = _extended_apply(op, left, right)
+        if extended_result is not None:
+            return extended_result
+
         # Record first using the original operand wrappers so parameter identity
         # is preserved on the tape (ids match actual model params).
         finalize = AbstractTensor._pre_autograd(op, [x for x in (left, right) if x is not None])
