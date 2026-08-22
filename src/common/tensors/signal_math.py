@@ -188,21 +188,11 @@ def _reference(core: str, digits: int = 40) -> Callable[[Any], Any]:
     Scalar in, scalar out, for the node-sampling callers.
     """
 
-    from .signal_symbolic import reference_program
+    from .signal_symbolic import exact_evaluator
 
     spec = CORE_RANGES[str(core)]
     radius = max(abs(float(spec.low)), abs(float(spec.high)))
-    wide = reference_program(str(core), radius, digits=int(digits))
-
-    def evaluate(value: Any) -> float:
-        from . import extended_precision as xp
-
-        tensor = AbstractTensor.get_tensor(np.asarray([float(value)]))
-        return float(np.asarray(
-            xp.collapse(wide(tensor)).tolist(), dtype=np.float64,
-        ).ravel()[0])
-
-    return evaluate
+    return exact_evaluator(str(core), radius, digits=int(digits))
 
 
 # --------------------------------------------------------------------------
@@ -471,29 +461,31 @@ def _measure(core: BakedCore) -> BakedCore:
     floor of the INSTRUMENT rather than at the target.
     """
 
-    from .signal_symbolic import reference_program
+    from fractions import Fraction
+
     from . import extended_precision as xp
 
     digits = working_digits(core.epsilon)
-    spec = CORE_RANGES[core.core]
-    radius = max(abs(float(spec.low)), abs(float(spec.high)))
-    truth = reference_program(core.core, radius, digits=digits)
-    wide = xp.limbs_for_digits(digits)
+    truth = _reference(core.core, digits=digits)
 
     positions = np.linspace(core.low, core.high, 801)
     tensor = AbstractTensor.get_tensor(positions)
-    with xp.precision(wide):
-        expected = truth(tensor)
-        if core.corrections and core.family in ("structured", "exact", "series"):
-            produced = _evaluate_extended(tensor, core, collapse=False)
-        else:
-            produced = evaluate_core(tensor, core)
-        difference = expected - produced
-        settled = xp.collapse(expected)
-        gap = xp.collapse(difference)
+    if core.corrections and core.family in ("structured", "exact", "series"):
+        pieces = _evaluate_extended(tensor, core, collapse=False)
+        limbs = [pieces] + list(getattr(pieces, "_limbs", ()))
+    else:
+        limbs = [evaluate_core(tensor, core)]
+    columns = [np.asarray(limb.tolist(), dtype=np.float64).ravel()
+               for limb in limbs]
 
-    magnitude = np.abs(np.asarray(settled.tolist(), dtype=np.float64).ravel())
-    absolute = np.abs(np.asarray(gap.tolist(), dtype=np.float64).ravel())
+    magnitude = np.empty(positions.size)
+    absolute = np.empty(positions.size)
+    for index, item in enumerate(positions):
+        produced = sum((Fraction(float(column[index])) for column in columns),
+                       Fraction(0))
+        expected = truth(float(item))
+        magnitude[index] = abs(float(expected))
+        absolute[index] = abs(float(produced - expected))
     # A genuine zero of the function contributes its absolute error; dividing
     # there would report inf for a core that is exactly right.
     relative = np.where(magnitude > 0.0,
@@ -1122,7 +1114,23 @@ def fit_core(core: str, family: str = DEFAULT_FAMILY,
         # log 1.4 against 3317.
         family = "series"
     if family == "structured" and structure is None:
-        family = "polyspline"
+        # A core with no parity has no structure for the "structured" form to
+        # carry, so the choice is between a FIT and the function's own series.
+        # This used to pick the fit, from a time when the series coefficients
+        # were themselves fitted; they are derived exactly now, so the fit's
+        # residual floor is a floor for no reason -- measured three lines
+        # above, exp is 1.0 ulp as a series against 3.1 as a polyspline and
+        # log 1.4 against 3317. The kernels cannot emit a segment-selection
+        # chain either, so the fit was also unbakeable.
+        #
+        # Conditional, because not every core HAS a series: sqrt is reached by
+        # Newton, which is a fixed point of the answer rather than a Taylor
+        # expansion, and there is nothing for the identity table to derive.
+        # Where no series exists the fit is the only form, and the kernel
+        # generator refusing to emit it is the honest outcome.
+        from .signal_symbolic import TRANSCENDENTALS
+
+        family = "series" if str(core) in TRANSCENDENTALS else "polyspline"
     fitters = {
         "exact": fit_exact, "structured": fit_structured,
         "polyspline": fit_polyspline, "series": fit_series, "lut": fit_lut,

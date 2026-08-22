@@ -59,6 +59,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from fractions import Fraction
+from functools import lru_cache
 from typing import Any, Callable, Sequence
 
 import sympy
@@ -139,6 +140,7 @@ REARRANGEMENTS: dict[str, str] = {
 # Derivation
 
 
+@lru_cache(maxsize=256)
 def reduced_series(name: str, order: int) -> sympy.Expr:
     """The identity, composed and REDUCED by SymPy into one polynomial.
 
@@ -156,6 +158,7 @@ def reduced_series(name: str, order: int) -> sympy.Expr:
     return sympy.expand(expanded.removeO())
 
 
+@lru_cache(maxsize=256)
 def structured_coefficients(name: str, order: int) -> tuple:
     """The exact rational coefficients the structured form needs.
 
@@ -202,6 +205,7 @@ def _rational(value: Any) -> Fraction:
     return Fraction(int(sympy.numer(value)), int(sympy.denom(value)))
 
 
+@lru_cache(maxsize=512)
 def order_for(name: str, radius: float, digits: int = 17,
               ceiling: int | None = None) -> int:
     """The smallest order whose OMITTED TAIL is below the target. Derived.
@@ -332,6 +336,7 @@ def _horner(count: int) -> sympy.Expr:
     return expression
 
 
+@lru_cache(maxsize=256)
 def compile_core(name: str, order: int) -> SymbolicProgram:
     """Derive, structure, and compile one core to AbstractTensor Python.
 
@@ -444,6 +449,7 @@ CONSTANT_RECIPES: dict[str, str] = {
 }
 
 
+@lru_cache(maxsize=64)
 def constant_rational(name: str, digits: int = 64) -> Fraction:
     """A transcendental constant as an exact rational, to ``digits``.
 
@@ -495,6 +501,7 @@ def constant_limbs(name: str, limbs: int = 2, scale: Fraction | None = None
 # Exact evaluation: the reference every measurement needs
 
 
+@lru_cache(maxsize=128)
 def reference_program(name: str, radius: float, digits: int = 40):
     """A high-accuracy evaluator that IS the compiled program, run wider.
 
@@ -530,6 +537,7 @@ def reference_program(name: str, radius: float, digits: int = 40):
     return evaluate_reference
 
 
+@lru_cache(maxsize=128)
 def exact_evaluator(name: str, radius: float, digits: int = 40):
     """An INDEPENDENT oracle: the same identity, evaluated in exact rationals.
 

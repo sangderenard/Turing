@@ -39,6 +39,10 @@ _IMPLEMENTATION = "operator"
 _QUALITY = "audio"
 
 
+#: The coordinator serving compiled kernels, once one has been installed.
+_LAUNCHER = None
+
+
 def use_signal_math(quality: str = "audio") -> str:
     """Route the whole surface through the baked signal-math cores.
 
@@ -56,6 +60,41 @@ def use_signal_math(quality: str = "audio") -> str:
     global _IMPLEMENTATION, _QUALITY
     signal_math(str(quality))
     _IMPLEMENTATION, _QUALITY = "signal_math", str(quality)
+    return _IMPLEMENTATION
+
+
+def use_signal_kernels(quality: str = "draft") -> str:
+    """Route the surface through COMPILED kernels the bank has admitted.
+
+    ``use_signal_math`` selects the eager cores: the authoring surface, which
+    is the same mathematics interpreted one tensor operation at a time. This
+    selects the COMPILED form of that same mathematics. The bank builds each
+    kernel from the baked cores, verifies it against the kernel's own Python
+    reference, and refuses to serve a variant that did not match -- so an
+    admitted kernel is one that demonstrated agreement, not one that merely
+    emitted.
+
+    A name the bank has no kernel for falls back to the EAGER surface rather
+    than to the backend operator. The choice stays "our mathematics, compiled
+    or interpreted"; it never silently reverts to a borrowed libm, which is
+    the failure this pack exists to end.
+
+    Gradients: the launched forward returns a fresh tensor, so the tape does
+    not see the chain that produced it. The bank carries the VJP kernels
+    (``sin_vjp`` and friends) but nothing binds them to autograd yet, so this
+    route is forward-only. ``use_signal_math`` remains the differentiable one.
+    """
+
+    from pathlib import Path
+
+    from ..signal_kernels import signal_kernel_specs
+    from ....compiler.kernel_bank import KernelBank, LaunchCoordinator
+
+    global _IMPLEMENTATION, _QUALITY, _LAUNCHER
+    specs = signal_kernel_specs(str(quality))
+    bank = KernelBank(Path("build") / "signal_bank" / str(quality), specs)
+    _LAUNCHER = LaunchCoordinator(bank)
+    _IMPLEMENTATION, _QUALITY = "signal_kernels", str(quality)
     return _IMPLEMENTATION
 
 
@@ -77,9 +116,38 @@ def _surface():
     return signal_math(_QUALITY)
 
 
+def _routed(name: str, value):
+    """One routed launch, or ``None`` when the bank has no kernel by that name.
+
+    Returning ``None`` rather than raising is what lets a partial pack be
+    useful: the bank carries kernels for a handful of the surface today, and
+    the rest must keep working through the eager cores.
+    """
+
+    if _LAUNCHER is None or name not in _LAUNCHER.bank.specs:
+        return None
+
+    import numpy as np
+
+    from ..abstraction import AbstractTensor
+
+    source = np.asarray(value.tolist(), dtype=np.float64)
+    flat = source.reshape(-1)
+    produced = _LAUNCHER.launch(
+        name, x=flat.copy(), y=np.zeros_like(flat), n=int(flat.size),
+    )
+    settled = np.asarray(produced, dtype=np.float64).reshape(source.shape)
+    return AbstractTensor.get_tensor(settled, like=value)
+
+
 def _dispatch(name: str, value):
     """One place where the choice is made, so every method reads the same."""
 
+    if _IMPLEMENTATION == "signal_kernels":
+        routed = _routed(name, value)
+        if routed is not None:
+            return routed
+        return getattr(_surface(), name)(value)
     if _IMPLEMENTATION == "signal_math":
         return getattr(_surface(), name)(value)
     return value._apply_operator(name, value, None)
