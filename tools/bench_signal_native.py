@@ -161,13 +161,68 @@ def limbed_source(coefficients, structure) -> str:
     )
 
 
-def bake(name: str, limbs: int, digits: int, tag: str):
+def mixed_source(coefficients, structure, tail: int) -> str:
+    """Horner in plain double, with the LAST ``tail`` steps in double-double.
+
+    Horner's error is not spread evenly across its steps. The early terms are
+    tiny -- a sine core's last coefficient is around 1e-14 -- so a rounding
+    there is negligible against the running total. The final accumulations
+    carry the magnitude, and their roundings ARE the result's error.
+
+    Measured on sine over its octant, against the exact oracle:
+
+        dd tail steps    correctly rounded
+              0                 81.767%
+              1                 98.833%
+              2                100.000%
+
+    So two steps buy what fourteen do, and the other twelve can stay cheap.
+    This is the shape a Ziv fast path wants: nearly always already correct,
+    at nearly the cost of the plain evaluation.
+    """
+
+    emitter = Emitter()
+    pairs = [ss.limb_decomposition(value, 2) for value in coefficients]
+    count = len(pairs)
+    split_at = max(count - 1 - int(tail), 0)
+    ordered = list(reversed(pairs[:-1]))
+
+    lines = ["def core(x, y, n):", "    for i in range(n):", "        v = x[i]"]
+    lines.append("        s = v * v" if structure in ("odd", "even") else "        s = v")
+    plain = repr(pairs[-1][0])
+    for index, (head, _tail) in enumerate(ordered[:split_at]):
+        step = f"p{index}"
+        lines.append(f"        {step} = {plain} * s + {repr(head)}")
+        plain = step
+    emitter.lines = []
+    if structure in ("odd", "even"):
+        high, low = emitter.two_product("v", "v")
+    else:
+        high, low = "v", "0.0"
+    total_high, total_low = plain, "0.0"
+    for head, rest in ordered[split_at:]:
+        total_high, total_low = emitter.multiply(
+            total_high, total_low, high, low)
+        total_high, total_low = emitter.add(
+            total_high, total_low, repr(head), repr(rest))
+    if structure in ("odd", "factored"):
+        total_high, total_low = emitter.multiply(
+            total_high, total_low, "v", "0.0")
+    emitter.write(f"y[i] = {total_high} + {total_low}")
+    return "\n".join(lines + emitter.lines + ["    return y"])
+
+
+def bake(name: str, limbs: int, digits: int, tag: str, tail: int = 0):
     """Source -> SSA -> LLVM -> a linked, callable kernel."""
 
     count = ss.order_for(name, ss.CORE_RADII[name], digits=digits)
     program = ss.compile_core(name, ss.order_to_degree(name, count))
-    source = (limbed_source(program.coefficients, program.structure)
-              if limbs > 1 else single_limb_source(program))
+    if tail:
+        source = mixed_source(program.coefficients, program.structure, tail)
+    elif limbs > 1:
+        source = limbed_source(program.coefficients, program.structure)
+    else:
+        source = single_limb_source(program)
     module, _outputs, exports = lower_ast_source_to_ssa(
         source, "core", name=tag)
     entry = list(exports)[0]
@@ -212,12 +267,17 @@ def main(argv=None) -> int:
         truth = np.array([float(oracle(float(points[index])))
                           for index in sampled])
         for preset in arguments.presets:
-            if preset == "ulp_match":
+            tail = 0
+            if preset.startswith("mixed"):
+                tail = int(preset.split(":")[1]) if ":" in preset else 2
+                chosen = ss.ulp_matched(name)
+            elif preset == "ulp_match":
                 chosen = ss.ulp_matched(name)
             else:
                 chosen = ss.PRESETS[preset]
             program, artifact, native, identifiers, source = bake(
-                name, chosen.limbs, chosen.digits, f"kb_{name}_{preset}")
+                name, chosen.limbs, chosen.digits, f"kb_{name}_{preset.replace(':','_')}",
+                tail=tail)
             output = np.zeros(size)
             feed = {
                 identifiers["x"]: points.copy(),
