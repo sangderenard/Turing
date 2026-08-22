@@ -175,21 +175,34 @@ CORE_RANGES: Mapping[str, CoreRange] = {
 _REFERENCE_OVERRIDES: dict[str, Callable[[Any], Any]] = {}
 
 
-def _reference(core: str) -> Callable[[Any], Any]:
-    """Arbitrary-precision reference used to fit AND to score every core."""
+def _reference(core: str, digits: int = 40) -> Callable[[Any], Any]:
+    """The reference every core is scored against: the compiled program.
 
-    import mpmath
+    This used to hand back an ``mpmath`` function, which made a library the
+    authority on what these functions ARE -- the same borrowing this pack
+    exists to end, moved from run time to bake time. It is now the SymPy
+    derivation compiled to AbstractTensor Python and run at a longer order
+    and more limbs, so there is one implementation and a disagreement always
+    names a culprit.
 
-    if not _REFERENCE_OVERRIDES:
-        _REFERENCE_OVERRIDES["log1p"] = lambda u: mpmath.log(1 + u)
-        _REFERENCE_OVERRIDES["expm1"] = lambda u: mpmath.exp(u) - 1
-    override = _REFERENCE_OVERRIDES.get(str(core))
-    if override is not None:
-        return override
-    try:
-        return getattr(mpmath, str(core))
-    except AttributeError as error:
-        raise KeyError(f"no mpmath reference for core {core!r}") from error
+    Scalar in, scalar out, for the node-sampling callers.
+    """
+
+    from .signal_symbolic import reference_program
+
+    spec = CORE_RANGES[str(core)]
+    radius = max(abs(float(spec.low)), abs(float(spec.high)))
+    wide = reference_program(str(core), radius, digits=int(digits))
+
+    def evaluate(value: Any) -> float:
+        from . import extended_precision as xp
+
+        tensor = AbstractTensor.get_tensor(np.asarray([float(value)]))
+        return float(np.asarray(
+            xp.collapse(wide(tensor)).tolist(), dtype=np.float64,
+        ).ravel()[0])
+
+    return evaluate
 
 
 # --------------------------------------------------------------------------
@@ -275,7 +288,14 @@ def limbs_for(epsilon: float) -> int:
 
     from .extended_precision import SENSIBLE_LIMIT
 
-    needed = int(math.ceil(-math.log10(epsilon) / DIGITS_PER_LIMB))
+    # Sized from the WORKING precision, not from the target. Sizing to the
+    # target exactly makes the evaluation error the same size as the thing
+    # being targeted -- at 1e-15 that is one limb, one limb is double, and the
+    # core then measures ordinary double rounding no matter how exact its
+    # coefficients are. ``working_digits`` already states how much finer than
+    # the target the derivation must be, so the limb count follows from it
+    # rather than from a floor chosen here.
+    needed = int(math.ceil(working_digits(epsilon) / DIGITS_PER_LIMB))
     return int(min(max(needed, 1), SENSIBLE_LIMIT))
 
 
@@ -441,52 +461,48 @@ def evaluate_core(reduced: Any, core: BakedCore) -> Any:
 
 
 def _measure(core: BakedCore) -> BakedCore:
-    """Score a freshly baked core against the reference on its own interval.
+    """Score a baked core against the same program run wider.
 
-    The comparison happens in ARBITRARY PRECISION, over every limb the core
-    produced. Collapsing to a double first -- which this used to do -- puts a
-    floor of one ulp under every measurement, so a core baked for 1e-25 could
-    never be scored as having reached it, and growth would stop the moment it
-    hit the floor of the instrument rather than the target.
+    The difference is formed in EXTENDED arithmetic before it is collapsed.
+    That matters more than it sounds: subtracting two nearly-equal doubles
+    destroys exactly the digits being measured, so a difference computed in
+    double puts a floor of one ulp under every measurement and a core baked
+    for 1e-25 could never be scored as reaching it -- growth would stop at the
+    floor of the INSTRUMENT rather than at the target.
     """
 
-    import mpmath
+    from .signal_symbolic import reference_program
+    from . import extended_precision as xp
 
-    reference = _reference(core.core)
-    positions = np.linspace(core.low, core.high, 4001)
+    digits = working_digits(core.epsilon)
+    spec = CORE_RANGES[core.core]
+    radius = max(abs(float(spec.low)), abs(float(spec.high)))
+    truth = reference_program(core.core, radius, digits=digits)
+    wide = xp.limbs_for_digits(digits)
+
+    positions = np.linspace(core.low, core.high, 801)
     tensor = AbstractTensor.get_tensor(positions)
+    with xp.precision(wide):
+        expected = truth(tensor)
+        if core.corrections and core.family in ("structured", "exact", "series"):
+            produced = _evaluate_extended(tensor, core, collapse=False)
+        else:
+            produced = evaluate_core(tensor, core)
+        difference = expected - produced
+        settled = xp.collapse(expected)
+        gap = xp.collapse(difference)
 
-    # A polynomial family carrying corrections is evaluated UNCOLLAPSED so the
-    # measurement sees everything it computed. Table families collapse on the
-    # way out, and are scored at the precision they actually deliver.
-    if core.corrections and core.family in ("structured", "exact", "series"):
-        produced = _evaluate_extended(tensor, core, collapse=False)
-        pieces = [produced] + list(getattr(produced, "_limbs", ()))
-    else:
-        pieces = [evaluate_core(tensor, core)]
-    limbs = [np.asarray(piece.tolist(), dtype=np.float64).ravel()
-             for piece in pieces]
-
-    worst_relative = mpmath.mpf(0)
-    worst_absolute = mpmath.mpf(0)
-    with mpmath.workdps(working_digits(core.epsilon)):
-        for index, item in enumerate(positions):
-            value = mpmath.fsum(
-                [mpmath.mpf(float(limb[index])) for limb in limbs]
-            )
-            expected = mpmath.mpf(reference(mpmath.mpf(float(item))))
-            difference = abs(value - expected)
-            worst_absolute = max(worst_absolute, difference)
-            # A genuine zero of the function contributes its absolute error;
-            # dividing there would report inf for a core that is exactly right.
-            worst_relative = max(
-                worst_relative,
-                difference / abs(expected) if expected != 0 else difference,
-            )
+    magnitude = np.abs(np.asarray(settled.tolist(), dtype=np.float64).ravel())
+    absolute = np.abs(np.asarray(gap.tolist(), dtype=np.float64).ravel())
+    # A genuine zero of the function contributes its absolute error; dividing
+    # there would report inf for a core that is exactly right.
+    relative = np.where(magnitude > 0.0,
+                        absolute / np.where(magnitude > 0.0, magnitude, 1.0),
+                        absolute)
     return replace(
         core,
-        measured_error=float(worst_relative),
-        measured_absolute=float(worst_absolute),
+        measured_error=float(np.max(relative)),
+        measured_absolute=float(np.max(absolute)),
     )
 
 
@@ -524,23 +540,24 @@ def _chebyshev_nodes(low: float, high: float, count: int) -> np.ndarray:
 
 
 def _split_high_low(values, limbs: int = 2):
-    """Each arbitrary-precision value as ``limbs`` doubles that sum to it.
+    """Each value as ``limbs`` doubles that sum to it.
 
-    Returns the leading doubles and, separately, the remaining limbs of each
-    value -- so a core stores its coefficients to whatever width its target
-    requires instead of to whatever width a double happens to be.
+    ``Fraction`` is exact and ``float(Fraction)`` is correctly rounded, so
+    each step takes the nearest double and carries the remainder forward
+    without loss. That is the whole reason no arbitrary-precision library is
+    needed at bake time: these coefficients were rational all along.
     """
 
-    import mpmath
+    from fractions import Fraction
 
     heads, tails = [], []
     for value in values:
         parts = []
-        rest = mpmath.mpf(value)
+        rest = value if isinstance(value, Fraction) else Fraction(value)
         for _ in range(max(int(limbs), 1)):
             head = float(rest)
             parts.append(head)
-            rest = rest - mpmath.mpf(head)
+            rest = rest - Fraction(head)
         heads.append(parts[0])
         tails.append(tuple(parts[1:]))
     return tuple(heads), tuple(tails)
@@ -548,41 +565,29 @@ def _split_high_low(values, limbs: int = 2):
 
 def _exact_structured_coefficients(core: str, structure: str, order: int,
                                    epsilon: float = 1.0e-15):
-    """Structured coefficients taken EXACTLY, not fitted.
+    """Structured coefficients, derived symbolically and split into limbs.
 
-    Same form as the fitted structured core -- ``sin(y) = y*P(y*y)``, so
-    parity, ``sin(0) = 0`` and the absence of knots are all still structural --
-    but the coefficients are the function's own Taylor coefficients rather
-    than a least-squares solution. That difference is the whole accuracy
-    story, measured on the sine core over its octant interval:
-
-        core                    coeffs      p50      p95
-        structured (fitted)          7     3.00     7.00 ulp
-        exact series order 15        8     0.00     1.00 ulp
-        exact series order 17        9     0.00     1.00 ulp
-
-    One additional coefficient, and the residual drops to the same place
-    libm sits. A fit cannot go below its own residual no matter how much
-    degree it is given -- degrees 8, 10 and 12 all sat at one ceiling, which
-    is what a fit's floor looks like from the outside. Exact coefficients
-    have no such floor; they are limited only by truncation order, which
-    growth can raise.
-
-    Only the odd (or even) coefficients are kept, because the form already
-    carries the parity: taking every other Taylor coefficient IS the
-    expansion of ``f(y)/y`` in ``y*y``.
+    This used to call ``mpmath.taylor`` on a callable, which DIFFERENTIATES
+    NUMERICALLY: its error grows with order however much working precision it
+    is given, so the bake plateaued at 6.29e-18 and growth could not pass the
+    plateau because longer series scored worse. The coefficients now come from
+    ``signal_symbolic``, where SymPy derives them from the function's own
+    identity as exact rationals, and the only thing left to decide is how many
+    limbs to keep them in.
     """
 
-    import mpmath
-
-    reference = _reference(core)
-    with mpmath.workdps(working_digits(epsilon)):
-        series = mpmath.taylor(reference, 0.0, int(order))
-    first = 1 if structure == "odd" else 0
-    return _split_high_low(
-        [series[index] for index in range(first, int(order) + 1, 2)],
-        limbs_for(epsilon),
+    from .signal_symbolic import (
+        limb_decomposition, order_to_degree, structured_coefficients,
     )
+
+    count = max(int(order) // 2 + 1, 2)
+    coefficients = structured_coefficients(
+        str(core), order_to_degree(str(core), count),
+    )
+    limbs = limbs_for(epsilon)
+    split = [limb_decomposition(value, limbs) for value in coefficients]
+    return (tuple(parts[0] for parts in split),
+            tuple(tuple(parts[1:]) for parts in split))
 
 
 def _structured_coefficients(core: str, structure: str, low: float,
@@ -595,41 +600,41 @@ def _structured_coefficients(core: str, structure: str, low: float,
     precisely the metrics one checks first.
     """
 
-    import mpmath
+    from .signal_symbolic import structured_coefficients
 
     reference = _reference(core)
-    with mpmath.workdps(60):
-        if structure == "factored":
-            origin = float(mpmath.diff(reference, 0))
+    # The value at the origin is not a limit to be probed -- it is the
+    # structured series' leading coefficient, known exactly. Taking a
+    # numerical derivative or sampling at 1e-25 to find it was estimating
+    # something already derived.
+    origin = float(_split_high_low(
+        [structured_coefficients(str(core), 6)[0]], 1)[0][0])
 
-            def fitted(u: float) -> float:
-                return origin if u == 0.0 else float(reference(u) / u)
-        elif structure == "odd":
-            origin = float(mpmath.diff(reference, 0))
+    if structure == "factored":
+        def fitted(u: float) -> float:
+            return origin if u == 0.0 else float(reference(u)) / u
+    elif structure == "odd":
+        def fitted(u: float) -> float:
+            if u <= 0.0:
+                return origin
+            root = math.sqrt(u)
+            return float(reference(root)) / root
+    else:
+        def fitted(u: float) -> float:
+            return origin if u <= 0.0 else float(reference(math.sqrt(u)))
 
-            def fitted(u: float) -> float:
-                if u <= 0.0:
-                    return origin
-                root = mpmath.sqrt(u)
-                return float(reference(root) / root)
-        else:
-            limit = float(reference(mpmath.mpf("1e-25")))
-
-            def fitted(u: float) -> float:
-                return limit if u <= 0.0 else float(reference(mpmath.sqrt(u)))
-
-        # A factored core fits in the ORIGINAL argument over the core's own
-        # interval; odd and even cores fit in its square, which is what makes
-        # the parity structural.
-        count = max(8 * (int(degree) + 1), 64)
-        if structure == "factored":
-            nodes = _chebyshev_nodes(float(low), float(high), count)
-        else:
-            reach = max(abs(float(low)), abs(float(high))) ** 2
-            nodes = _chebyshev_nodes(0.0, reach, count)
-        samples = np.asarray(
-            [fitted(float(node)) for node in nodes], dtype=np.float64,
-        )
+    # A factored core fits in the ORIGINAL argument over the core's own
+    # interval; odd and even cores fit in its square, which is what makes
+    # the parity structural.
+    count = max(8 * (int(degree) + 1), 64)
+    if structure == "factored":
+        nodes = _chebyshev_nodes(float(low), float(high), count)
+    else:
+        reach = max(abs(float(low)), abs(float(high))) ** 2
+        nodes = _chebyshev_nodes(0.0, reach, count)
+    samples = np.asarray(
+        [fitted(float(node)) for node in nodes], dtype=np.float64,
+    )
     # Weight by 1/|g| so the fit minimises RELATIVE residual. For a factored
     # or odd core the factor outside the polynomial is exact, so g's relative
     # error IS f's relative error -- this weighting, not a larger degree, is
@@ -707,12 +712,10 @@ def fit_exact(core: str, epsilon: float | None = None) -> BakedCore:
         # to the plain series (as this function used to) threw the factored
         # evaluator away, which is the whole reason the root is exact.
         def build_factored(order: int) -> BakedCore:
-            import mpmath
+            from .signal_symbolic import structured_coefficients
 
-            with mpmath.workdps(working_digits(epsilon)):
-                coefficients = mpmath.taylor(_reference(core), spec.centre,
-                                             int(order))
-            highs, lows = _split_high_low(coefficients[1:], limbs_for(epsilon))
+            coefficients = structured_coefficients(str(core), int(order))
+            highs, lows = _split_high_low(coefficients, limbs_for(epsilon))
             return _measure(BakedCore(
                 core=core, family="exact", epsilon=epsilon,
                 low=spec.low, high=spec.high, structure="factored",
@@ -781,34 +784,45 @@ def fit_polyspline(core: str, epsilon: float | None = None,
 
 
 def fit_series(core: str, epsilon: float | None = None) -> BakedCore:
-    """Grow the truncated series until it MEASURES under epsilon.
+    """A plain series core, coefficients derived rather than differentiated.
 
-    Never a set term count. A closed form bounds only the family it was
-    derived for: the sine remainder ``r**(2k+1)/(2k+1)!`` says nothing true
-    about ``atan``, whose coefficients have no factorial decay. Growing to the
-    measured target is what let ``log`` admit at order 27 where a
-    sine-derived count gave 1.08e-05, and what lets ``atan`` report honestly
-    that no order in the ladder admits.
+    The ``series`` family exists as the DIFFERENTIAL set: the same numbers
+    without the parity carried in the form, so the structured form's benefit
+    can be measured rather than asserted.
     """
 
-    import mpmath
+    from .signal_symbolic import (
+        limb_decomposition, order_for, reduced_series, TRANSCENDENTALS,
+    )
+    import sympy
 
     epsilon = validate_epsilon(epsilon)
     spec = CORE_RANGES[core]
-    reference = _reference(core)
+    radius = max(abs(float(spec.low) - float(spec.centre)),
+                 abs(float(spec.high) - float(spec.centre)))
 
     def build(order: int) -> BakedCore:
-        with mpmath.workdps(60):
-            coefficients = mpmath.taylor(reference, spec.centre, order)
-        highs, lows = _split_high_low(coefficients)
+        polynomial = sympy.Poly(
+            reduced_series(str(core), int(order)), sympy.Symbol("z"),
+        )
+        exact = [polynomial.coeff_monomial(sympy.Symbol("z") ** power)
+                 if power else polynomial.coeff_monomial(1)
+                 for power in range(int(order) + 1)]
+        limbs = limbs_for(epsilon)
+        split = [limb_decomposition(value, limbs) for value in exact]
         return _measure(BakedCore(
             core=core, family="series", epsilon=epsilon,
             low=spec.low, high=spec.high, centre=spec.centre,
-            values=highs, corrections=lows,
-            note=f"{spec.note}; order {order} about {spec.centre:g}",
+            values=tuple(parts[0] for parts in split),
+            corrections=tuple(tuple(parts[1:]) for parts in split),
+            note=f"{spec.note}; order {order} about {spec.centre:g}, derived",
         ))
 
-    return _grow(build, range(3, GROWTH_LIMITS["series"] + 1, 2))
+    try:
+        count = order_for(str(core), radius, digits=int(-math.log10(epsilon)))
+    except (KeyError, ValueError):
+        count = 24
+    return _grow(build, range(3, max(2 * count + 2, 12), 2))
 
 
 @dataclass(frozen=True)
@@ -882,7 +896,8 @@ def bake_angle_palette(divisions: int) -> AnglePalette:
     Only the FIRST QUADRANT is computed; the rest is index arithmetic and a
     sign. That is not a storage trick bolted on -- it is what makes the
     symmetries exact rather than merely accurate. Evaluating ``sin`` at the
-    half turn directly returns mpmath's own residue for pi (~1e-61), not
+    half turn is PLACED exactly, while a computed reference returns its own
+    residue for pi at whatever width it was derived to, not
     zero, and ``s[k] + s[N-k]`` misses zero by the same amount. Folding makes
     ``sin`` at 0 and the half turn exactly +0, the quarter turns exactly +-1,
     and odd symmetry hold to the bit, because those values are placed rather
@@ -892,7 +907,6 @@ def bake_angle_palette(divisions: int) -> AnglePalette:
     sine and cosine, since ``cos(k) = sin(k + N/4)``.
     """
 
-    import mpmath
 
     divisions = int(divisions)
     if divisions < 1:
@@ -902,17 +916,22 @@ def bake_angle_palette(divisions: int) -> AnglePalette:
             f"a palette divides the turn into quadrants; {divisions} is not a "
             f"multiple of four"
         )
+    from fractions import Fraction
+
+    from .signal_symbolic import constant_rational, exact_evaluator
+
     quarter = divisions // 4
-    with mpmath.workdps(60):
-        turn = 2 * mpmath.pi / divisions
-        # One quadrant, endpoints placed exactly rather than computed.
-        exact_quadrant = [mpmath.mpf(0)] + [
-            mpmath.sin(turn * index) for index in range(1, quarter)
-        ] + [mpmath.mpf(1)]
-        quadrant = [float(value) for value in exact_quadrant]
-        quadrant_low = [
-            float(value - mpmath.mpf(float(value))) for value in exact_quadrant
-        ]
+    digits = 40
+    turn = 2 * constant_rational("pi", digits) / divisions
+    sine_of = exact_evaluator("sin", float(turn * quarter) + 0.1, digits=digits)
+    # One quadrant, endpoints placed exactly rather than computed.
+    exact_quadrant = ([Fraction(0)]
+                      + [sine_of(turn * index) for index in range(1, quarter)]
+                      + [Fraction(1)])
+    quadrant = [float(value) for value in exact_quadrant]
+    quadrant_low = [
+        float(value - Fraction(float(value))) for value in exact_quadrant
+    ]
 
     def fold(table: list, index: int) -> float:
         """Quadrant folding. The same reflections and sign apply to both
@@ -925,15 +944,24 @@ def bake_angle_palette(divisions: int) -> AnglePalette:
             return table[2 * quarter - index]
         return -fold(table, index - 2 * quarter)
 
+    def exact_quadrant_value(index: int) -> Fraction:
+        """The folded EXACT entry, for scoring against what was stored."""
+
+        index %= divisions
+        if index <= quarter:
+            return exact_quadrant[index]
+        if index <= 2 * quarter:
+            return exact_quadrant[2 * quarter - index]
+        return -exact_quadrant_value(index - 2 * quarter)
+
     sine = tuple(fold(quadrant, index) for index in range(divisions))
     cosine = tuple(fold(quadrant, index + quarter) for index in range(divisions))
     sine_low = tuple(fold(quadrant_low, index) for index in range(divisions))
     cosine_low = tuple(
         fold(quadrant_low, index + quarter) for index in range(divisions)
     )
-    with mpmath.workdps(60):
-        turn = 2 * mpmath.pi / divisions
-        # Scored against the same arbitrary-precision values the table was
+    if True:
+        # Scored against the same exact values the table was
         # rounded from, so "0" means correctly rounded rather than
         # self-consistent.
         # Scored in ULP OF FULL SCALE, not of each value. Sine and cosine are
@@ -947,8 +975,8 @@ def bake_angle_palette(divisions: int) -> AnglePalette:
         worst = 0.0
         for index in range(divisions):
             for stored, exact in (
-                (sine[index], mpmath.sin(turn * index)),
-                (cosine[index], mpmath.cos(turn * index)),
+                (sine[index], exact_quadrant_value(index)),
+                (cosine[index], exact_quadrant_value(index + quarter)),
             ):
                 worst = max(worst, abs(stored - float(exact)) / scale)
     return AnglePalette(divisions, sine, cosine, sine_low, cosine_low,
@@ -1013,14 +1041,17 @@ def fit_lut(core: str, epsilon: float | None = None,
             )
 
         def evaluate_low(positions: np.ndarray) -> np.ndarray:
-            import mpmath
+            from fractions import Fraction
 
-            with mpmath.workdps(40):
-                values = [reference(float(item)) for item in positions]
-            return np.asarray(
-                [float(value - mpmath.mpf(float(value))) for value in values],
-                dtype=np.float64,
-            )
+            from .signal_symbolic import exact_evaluator
+
+            radius = max(abs(float(spec.low)), abs(float(spec.high)))
+            oracle = exact_evaluator(str(core), radius, digits=40)
+            pieces = []
+            for item in positions:
+                value = oracle(float(item))
+                pieces.append(float(value - Fraction(float(value))))
+            return np.asarray(pieces, dtype=np.float64)
 
     def build(intervals: int) -> BakedCore:
         positions = np.linspace(spec.low, spec.high, intervals + 1)

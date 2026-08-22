@@ -99,6 +99,10 @@ TRANSCENDENTALS: dict[str, dict] = {
     "exp": _identity(sympy.exp, None),
     "expm1": _identity(lambda z: sympy.exp(z) - 1, "factored"),
     "log1p": _identity(lambda z: sympy.log(1 + z), "factored"),
+    # log's core sits on a mantissa band about 1, and a series about 1 in
+    # u = x-1 IS log1p's series. Naming it separately would derive the same
+    # coefficients twice and invite the two copies to drift apart.
+    "log": _identity(lambda z: sympy.log(1 + z), "factored"),
     # hyperbolic
     "sinh": _identity(sympy.sinh, "odd"),
     "cosh": _identity(sympy.cosh, "even"),
@@ -199,7 +203,7 @@ def _rational(value: Any) -> Fraction:
 
 
 def order_for(name: str, radius: float, digits: int = 17,
-              ceiling: int = 96) -> int:
+              ceiling: int | None = None) -> int:
     """The smallest order whose OMITTED TAIL is below the target. Derived.
 
     A chosen order is a tuning knob, and a knob on fifteen cores is fifteen
@@ -217,6 +221,23 @@ def order_for(name: str, radius: float, digits: int = 17,
     """
 
     import math as _math
+
+    # The ceiling GROWS rather than being fixed. It is stated in series order
+    # while the answer is a coefficient count, and for a parity core those
+    # differ by a factor of two -- so a fixed ceiling silently offers a slow
+    # series half the terms it was allowed and then reports the interval as
+    # too wide. Escalating only on failure keeps the cost on the cores that
+    # need it: sine settles at the first try, atanh needs four times the order.
+    if ceiling is None:
+        for attempt in (48, 96, 192, 384, 768):
+            try:
+                return order_for(name, radius, digits, ceiling=attempt)
+            except ValueError:
+                continue
+        raise ValueError(
+            f"{name}: no order up to 768 meets {digits} digits at radius "
+            f"{float(radius)}; narrow the interval with an identity instead"
+        )
 
     structure = TRANSCENDENTALS[name]["structure"]
     coefficients = [_rational(value)
@@ -468,3 +489,102 @@ def constant_limbs(name: str, limbs: int = 2, scale: Fraction | None = None
         parts.append(head)
         rest = rest - Fraction(head)
     return tuple(parts)
+
+
+# --------------------------------------------------------------------------
+# Exact evaluation: the reference every measurement needs
+
+
+def reference_program(name: str, radius: float, digits: int = 40):
+    """A high-accuracy evaluator that IS the compiled program, run wider.
+
+    There is exactly one implementation of every function here: the one SymPy
+    derived and the compiler turned into AbstractTensor Python. A reference
+    written any other way -- an arbitrary-precision library, a rational
+    re-implementation of the same series -- is a SECOND implementation, and
+    then a disagreement between them names no culprit.
+
+    So the reference is the same program at a longer order and more limbs.
+    Comparing a shipping configuration against a wider one measures exactly
+    what shipping costs: truncation and arithmetic width, the two things the
+    configuration chose. Whether the IDENTITY itself is right is a separate
+    question, and identities are what answer it -- a wrong identity has to
+    survive round trips through unrelated compositions, which an error would
+    have to be elaborately harmonised to do.
+
+    Returns a callable taking a tensor and giving back the extended result
+    with every limb intact.
+    """
+
+    from . import extended_precision as xp
+
+    count = order_for(name, max(abs(float(radius)), 1e-9), digits=digits)
+    program = compile_core(name, order_to_degree(name, count))
+    limbs = xp.limbs_for_digits(digits)
+
+    def evaluate_reference(argument: Any) -> Any:
+        with xp.precision(limbs):
+            promoted = argument + 0.0
+            return program.callable(**program.supply(promoted, limbs))
+
+    return evaluate_reference
+
+
+def exact_evaluator(name: str, radius: float, digits: int = 40):
+    """An INDEPENDENT oracle: the same identity, evaluated in exact rationals.
+
+    This is deliberately not the compiled program. ``reference_program`` runs
+    that program wider, which measures truncation and limb width honestly but
+    is structurally blind to a wrong identity or a bad lowering -- both sides
+    inherit them, so they agree while being wrong together.
+
+    This path shares only the identity table. The coefficients are SymPy's
+    exact rationals and the arithmetic is ``Fraction``, so nothing rounds and
+    nothing goes through the compiler. When it disagrees with the compiled
+    program, the disagreement is informative, which is the only property an
+    oracle really needs.
+
+    Not for shipping and not on any evaluation path -- exact rationals grow
+    without bound and this is thousands of times slower than the program.
+    """
+
+    if name == "log":
+        inner = exact_evaluator("atanh", 0.2, digits)
+
+        def evaluate_log(value: Any) -> Fraction:
+            x = value if isinstance(value, Fraction) else Fraction(float(value))
+            return 2 * inner((x - 1) / (x + 1))
+
+        return evaluate_log
+
+    if name == "sqrt":
+        cap = 10 ** (int(digits) + 12)
+
+        def evaluate_sqrt(value: Any) -> Fraction:
+            x = value if isinstance(value, Fraction) else Fraction(float(value))
+            if x <= 0:
+                return Fraction(0)
+            root = Fraction(1)
+            for _ in range(int(digits).bit_length() + 8):
+                root = ((root + x / root) / 2).limit_denominator(cap)
+            return root
+
+        return evaluate_sqrt
+
+    count = order_for(name, max(abs(float(radius)), 1e-9), digits=digits)
+    structure = TRANSCENDENTALS[name]["structure"]
+    coefficients = [_rational(value) for value in
+                    structured_coefficients(name, order_to_degree(name, count))]
+    cap = 10 ** (int(digits) + 12)
+
+    def evaluate(value: Any) -> Fraction:
+        z = value if isinstance(value, Fraction) else Fraction(float(value))
+        variable = z * z if structure in ("odd", "even") else z
+        total = Fraction(0)
+        for coefficient in reversed(coefficients):
+            total = (total * variable + coefficient).limit_denominator(cap)
+        if structure in ("odd", "factored"):
+            total = total * z
+        return total
+
+    return evaluate
