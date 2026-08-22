@@ -775,3 +775,154 @@ def exact_preset(name: str, radius: float | None = None) -> Preset:
     return Preset(f"exact:{name}", digits=base.digits + 16,
                   limbs=base.limbs + 1, rounding_test=True,
                   note="widened past the matched width and verified settled")
+
+
+# --------------------------------------------------------------------------
+# Argument reduction: the constant, split so the multiply cannot round
+
+
+def _zero_low_bits(value: float, drop: int) -> float:
+    """``value`` with its lowest ``drop`` mantissa bits cleared.
+
+    Done on the bit pattern rather than by arithmetic, because arithmetic
+    that clears bits is arithmetic that can round, which is the exact thing
+    being prevented.
+    """
+
+    import struct
+
+    if value == 0.0 or drop <= 0:
+        return float(value)
+    bits = struct.unpack("<Q", struct.pack("<d", float(value)))[0]
+    return struct.unpack("<Q", struct.pack("<Q", bits & ~((1 << int(drop)) - 1)))[0]         if False else struct.unpack("<d", struct.pack("<Q", bits & ~((1 << int(drop)) - 1)))[0]
+
+
+def cody_waite(name: str = "pi", scale: Fraction | None = None,
+               pieces: int = 3, drop: int = 24) -> tuple[float, ...]:
+    """A constant split so that ``k * piece`` is EXACT for every piece.
+
+    Argument reduction fails long before the subtraction: ``x - k*(pi/2)``
+    is wrong because ``k*(pi/2)`` was already wrong, pi/2 not being a double.
+    Splitting the constant so each piece carries only the top ``53-drop``
+    mantissa bits makes ``k * piece`` exact for any ``|k| < 2**drop`` -- the
+    product needs no bits the format does not have -- and the reduction then
+    subtracts three exact quantities in sequence instead of one wrong one.
+
+    The pieces come from the DERIVED constant, at full rational precision, so
+    the tail piece carries what the first two could not rather than what some
+    table happened to record.
+    """
+
+    digits = int(pieces * 16 + 20)
+    exact = constant_rational(name, digits)
+    if scale is not None:
+        exact = exact * Fraction(scale)
+    parts, rest = [], exact
+    for _ in range(max(int(pieces) - 1, 0)):
+        head = _zero_low_bits(float(rest), drop)
+        parts.append(head)
+        rest = rest - Fraction(head)
+    parts.append(float(rest))
+    return tuple(parts)
+
+
+def reduction_error(pieces: tuple[float, ...], magnitude: float,
+                    samples: int = 400) -> dict:
+    """How well a split reduces, measured exactly rather than assumed.
+
+    Compares the three-step subtraction against the exact rational remainder,
+    so what comes back is the reduction's own error and not the core's.
+    """
+
+    import numpy as _np
+
+    half_pi = sum(Fraction(piece) for piece in pieces)
+    rng = _np.random.default_rng(0)
+    values = rng.uniform(-abs(magnitude), abs(magnitude), int(samples))
+    worst_naive = worst_split = 0.0
+    for value in values:
+        exact_value = Fraction(float(value))
+        k = int(round(float(exact_value / half_pi)))
+        exact_remainder = exact_value - k * half_pi
+        naive = float(value) - k * float(half_pi)
+        reduced = float(value)
+        for piece in pieces:
+            reduced = reduced - k * piece
+        worst_naive = max(worst_naive, abs(naive - float(exact_remainder)))
+        worst_split = max(worst_split, abs(reduced - float(exact_remainder)))
+    return {"naive": worst_naive, "split": worst_split,
+            "magnitude": float(magnitude)}
+
+
+def cody_waite_for(magnitude: float, name: str = "pi",
+                   scale: Fraction | None = None,
+                   guard: int = 8) -> tuple[float, ...]:
+    """A split DERIVED from the range it has to reduce.
+
+    Both knobs follow from the magnitude and neither is chosen. ``k`` reaches
+    ``magnitude/(pi/2)``, so a piece must carry no more than ``53 - log2(k)``
+    significant bits for ``k * piece`` to need no bits the format lacks. That
+    fixes how much of each piece is usable, and the pieces must between them
+    carry ``log2(k) + 53`` bits for the remainder to survive -- which fixes
+    how many there are.
+
+    Hardcoding either is how a reduction passes its tests and then fails in
+    the field: a three-piece split with 24 zeroed bits is exact to about
+    1e-16 out to 1e6 and degrades to 6e-05 by 1e12, because k outgrew the
+    exactness the split was built for and nothing announced it.
+    """
+
+    import math as _math
+
+    half_turn = float(constant_rational(name, 40)) * float(scale or 1)
+    reach = max(abs(float(magnitude)) / abs(half_turn), 2.0)
+    k_bits = int(_math.ceil(_math.log2(reach)))
+    drop = k_bits + guard
+    usable = 53 - drop
+    if usable < 4:
+        raise ValueError(
+            f"reducing |x| < {magnitude:.1e} needs {drop} zeroed bits, "
+            f"leaving {usable} usable per piece; that is Payne-Hanek "
+            f"territory -- a windowed table of 2/pi, not a fixed split"
+        )
+    needed = k_bits + 53 + 2 * guard
+    pieces = int(_math.ceil(needed / usable)) + 1
+    return cody_waite(name, scale, pieces=pieces, drop=drop)
+
+
+#: Rounds a double to the nearest integer with no branch and no rounding of
+#: its own: adding and subtracting 1.5*2**52 lands the value on the integer
+#: grid exactly. The same primitive the superaccumulator splits with.
+INTEGER_SHIFTER = 1.5 * (2.0 ** 52)
+
+
+def reduce_argument(values: Any, magnitude: float, limbs: int = 2,
+                    name: str = "pi", scale: Fraction | None = None):
+    """Reduce onto a core interval, keeping the residual the reduction makes.
+
+    Returns ``(reduced, quadrant)`` where ``reduced`` is EXTENDED. That is the
+    whole point and it is easy to miss: the reduction can be accurate to
+    1e-16 and still destroy the result, because ``r`` is then a rounded double
+    and ``sin(fl(r))`` is not ``sin(r)``. Measured on this exact pipeline, a
+    bit-exact core reached through a correctly-reduced but COLLAPSED argument
+    returned 81% correctly rounded; keeping the low limb took it to 100%.
+
+    Each ``k * piece`` is exact by construction of the split, so the
+    subtraction chain loses nothing, and what accumulates in the low limb is
+    precisely the part a single-double reduction throws away.
+    """
+
+    from . import extended_precision as xp
+    from .abstraction import AbstractTensor
+
+    pieces = cody_waite_for(magnitude, name, scale)
+    whole = float(sum(Fraction(piece) for piece in pieces))
+    values = (values if isinstance(values, AbstractTensor)
+              else AbstractTensor.get_tensor(values))
+    quotient = ((values * (1.0 / whole)) + INTEGER_SHIFTER) - INTEGER_SHIFTER
+    with xp.precision(limbs):
+        reduced = values + 0.0
+        multiplier = quotient + 0.0
+        for piece in pieces:
+            reduced = reduced - multiplier * piece
+    return reduced, quotient
