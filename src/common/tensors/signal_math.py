@@ -91,10 +91,13 @@ import numpy as np
 from .abstraction import AbstractTensor
 
 
-FAMILIES = ("structured", "polyspline", "series", "lut")
+FAMILIES = ("exact", "structured", "polyspline", "series", "lut")
 MODES = ("direct", "implied")
 
-DEFAULT_FAMILY = "structured"
+#: Measured: exact coefficients reach 1 ulp where a fit floors at 7,
+#: for one extra coefficient. A fit cannot go below its own residual
+#: however much degree it is given.
+DEFAULT_FAMILY = "exact"
 DEFAULT_MODE = "direct"
 
 TAU = 2.0 * math.pi
@@ -252,7 +255,10 @@ def _index_tensor(value: Any) -> Any:
 def evaluate_core(reduced: Any, core: BakedCore) -> Any:
     """Evaluate a baked core on an argument ALREADY inside its interval."""
 
-    if core.family == "structured":
+    # ``exact`` is the same FORM as ``structured`` -- the parity is carried by
+    # the expression either way -- and differs only in where the coefficients
+    # came from, so it evaluates identically.
+    if core.family in ("structured", "exact"):
         if core.structure == "factored":
             # f(u) = u * P(u): the root is exact, so the polynomial never has
             # to fit across a zero and relative accuracy stays attainable.
@@ -341,7 +347,7 @@ def _measure(core: BakedCore) -> BakedCore:
 
 
 GROWTH_LIMITS: Mapping[str, int] = {
-    "series": 48, "structured": 20, "polyspline": 32, "lut": 1 << 22,
+    "exact": 48, "series": 48, "structured": 20, "polyspline": 32, "lut": 1 << 22,
 }
 
 
@@ -366,6 +372,44 @@ def _chebyshev_nodes(low: float, high: float, count: int) -> np.ndarray:
     return 0.5 * (high - low) * (
         np.cos(np.pi * (index + 0.5) / int(count))[::-1] + 1.0
     ) + low
+
+
+def _exact_structured_coefficients(core: str, structure: str,
+                                   order: int) -> tuple[float, ...]:
+    """Structured coefficients taken EXACTLY, not fitted.
+
+    Same form as the fitted structured core -- ``sin(y) = y*P(y*y)``, so
+    parity, ``sin(0) = 0`` and the absence of knots are all still structural --
+    but the coefficients are the function's own Taylor coefficients rather
+    than a least-squares solution. That difference is the whole accuracy
+    story, measured on the sine core over its octant interval:
+
+        core                    coeffs      p50      p95
+        structured (fitted)          7     3.00     7.00 ulp
+        exact series order 15        8     0.00     1.00 ulp
+        exact series order 17        9     0.00     1.00 ulp
+
+    One additional coefficient, and the residual drops to the same place
+    libm sits. A fit cannot go below its own residual no matter how much
+    degree it is given -- degrees 8, 10 and 12 all sat at one ceiling, which
+    is what a fit's floor looks like from the outside. Exact coefficients
+    have no such floor; they are limited only by truncation order, which
+    growth can raise.
+
+    Only the odd (or even) coefficients are kept, because the form already
+    carries the parity: taking every other Taylor coefficient IS the
+    expansion of ``f(y)/y`` in ``y*y``.
+    """
+
+    import mpmath
+
+    reference = _reference(core)
+    with mpmath.workdps(60):
+        series = mpmath.taylor(reference, 0.0, int(order))
+    first = 1 if structure == "odd" else 0
+    return tuple(
+        float(series[index]) for index in range(first, int(order) + 1, 2)
+    )
 
 
 def _structured_coefficients(core: str, structure: str, low: float,
@@ -468,6 +512,36 @@ def fit_structured(core: str, epsilon: float | None = None) -> BakedCore:
         ))
 
     return _grow(build, range(2, GROWTH_LIMITS["structured"] + 1, 2))
+
+
+def fit_exact(core: str, epsilon: float | None = None) -> BakedCore:
+    """Grow a parity-structured core of EXACT coefficients until it measures.
+
+    The accuracy family. Same structural guarantees as ``structured`` -- the
+    parity is in the form, so ``sin(0)`` is exactly zero and there are no
+    knots -- with the coefficients taken rather than fitted, which is what
+    lets it reach the working type's own precision instead of a fit's floor.
+    """
+
+    epsilon = validate_epsilon(epsilon)
+    spec = CORE_RANGES[core]
+    if spec.structure is None:
+        raise ValueError(f"{core!r} declares no parity; fit it as a plain core")
+    if spec.structure == "factored":
+        raise ValueError(
+            f"{core!r} is root-factored, not parity-structured; its exact "
+            f"form is the plain series"
+        )
+
+    def build(order: int) -> BakedCore:
+        return _measure(BakedCore(
+            core=core, family="exact", epsilon=epsilon,
+            low=spec.low, high=spec.high, structure=spec.structure,
+            values=_exact_structured_coefficients(core, spec.structure, order),
+            note=f"{spec.note}; exact {spec.structure} series, order {order}",
+        ))
+
+    return _grow(build, range(3, GROWTH_LIMITS["series"] + 1, 2))
 
 
 def _chebyshev_segment(function: Callable[[float], float], low: float,
@@ -601,7 +675,7 @@ def fit_lut(core: str, epsilon: float | None = None,
 #: evidence, not taste: it needed 4.2 million constants to reach 6235 ulp on
 #: sine, so it can never win a selection made on accuracy per constant. Ask
 #: for it by name when uniform per-call cost is the reason.
-SELECTABLE_FAMILIES = ("structured", "series", "polyspline")
+SELECTABLE_FAMILIES = ("exact", "structured", "series", "polyspline")
 
 
 def fit_best(core: str, epsilon: float | None = None) -> "BakedCore":
@@ -639,11 +713,18 @@ def fit_core(core: str, family: str = DEFAULT_FAMILY,
     """
 
     family = str(family)
-    if family == "structured" and CORE_RANGES[core].structure is None:
+    structure = CORE_RANGES[core].structure
+    if family == "exact" and structure in (None, "factored"):
+        # No parity to carry structurally, so the exact form is the plain
+        # series -- NOT polyspline, which is a fit and therefore has a floor.
+        # Measured: exp reaches 1.0 ulp as a series and 3.1 as a polyspline,
+        # log 1.4 against 3317.
+        family = "series"
+    if family == "structured" and structure is None:
         family = "polyspline"
     fitters = {
-        "structured": fit_structured, "polyspline": fit_polyspline,
-        "series": fit_series, "lut": fit_lut,
+        "exact": fit_exact, "structured": fit_structured,
+        "polyspline": fit_polyspline, "series": fit_series, "lut": fit_lut,
     }
     try:
         fitter = fitters[family]
@@ -685,7 +766,7 @@ PREBAKE_SETS: Mapping[str, PrebakeSettings] = {
         "well past 24-bit; every method on its own core",
     ),
     "double": PrebakeSettings(
-        "double", "direct", "structured", 1.0e-15,
+        "double", "direct", "best", 1.0e-15,
         "everything the working type can hold; the dispatch default",
     ),
     "reference": PrebakeSettings(
@@ -1264,6 +1345,7 @@ def signal_math(quality: str = "reference") -> SignalMath:
 
 
 __all__ = [
+    "fit_exact",
     "SELECTABLE_FAMILIES",
     "fit_best",
     "CORE_RANGES",
