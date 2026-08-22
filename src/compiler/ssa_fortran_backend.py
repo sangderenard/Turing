@@ -115,7 +115,11 @@ _BINARY: dict[str, str] = {
     "Or": "ior({0}, {1})",
     "Xor": "ieor({0}, {1})",
     "Shl": "shiftl({0}, {1})",
-    "Shr": "shiftr({0}, {1})",
+    # Repository/source ``>>`` follows Python signed-integer semantics.  A
+    # zero-filling machine shift must arrive as a distinct legalized machine
+    # operation; spelling the universal operator as SHIFTR makes negative
+    # loop-carried values grow large and can make termination impossible.
+    "Shr": "shifta({0}, {1})",
     "AShr": "shifta({0}, {1})",
     "MatMul": "matmul({0}, {1})",
     "Max": "max({0}, {1})",
@@ -143,12 +147,13 @@ _BINARY: dict[str, str] = {
     "bitor": "ior({0}, {1})",
     "bitxor": "ieor({0}, {1})",
     "shl": "shiftl({0}, {1})",
-    "shr": "shiftr({0}, {1})",
+    "shr": "shifta({0}, {1})",
 }
 
 _UNARY: dict[str, str] = {
     "Neg": "(-{0})",
     "Abs": "abs({0})",
+    "BitLength": "turing_python_bit_length(int({0}, c_int64_t))",
     "Not": "not({0})",
     "LNot": "(.not. {0})",
     # Numeric conversions. These arrive named after their LLVM opcodes,
@@ -666,6 +671,12 @@ def _literal(value: Any, dtype: str | None = None) -> str:
         and str(_DTYPE_KIND.get(str(dtype), "")).startswith("real")
     ):
         value = float(value)
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and str(dtype) in {"int64", "i64", "opaque_ref"}
+    ):
+        return f"{value}_c_int64_t"
     return _literal_payload(value)
 
 
@@ -1608,13 +1619,29 @@ class _FunctionEmitter:
         """
 
         value = self._typed(value)
+        producer = self._producers.get(value.id)
+        if producer is not None and value.id in self._inlined:
+            operation = (
+                producer.attributes.get("tensor_operation") or producer.op
+            )
+            # An explicitly bitwise producer remains numeric even when the
+            # source expression is consumed through Python truthiness.  The
+            # control lowering can consequently record its surrounding value
+            # as bool, but Fortran must still spell ``not(mask)`` as
+            # ``mask == 0`` and ``logical_and(mask, flag)`` as
+            # ``mask /= 0 .and. flag``.  Overloaded And/Or/Xor make the same
+            # decision from their operands.
+            if operation in {
+                "bitand", "bitor", "bitxor", "shl", "shr",
+                "And", "Or", "Xor",
+            }:
+                return self._instruction_is_logical(producer)
         # LLVM's i1 is intrinsically a logical value.  Check the recorded
         # scalar kind before examining an inlined producer: an imported
         # ``fcmp`` is represented as an ordinary Call and would otherwise be
         # misclassified merely because its expression was inlined.
         if str(getattr(value, "dtype", "") or "") in _LOGICAL_DTYPES:
             return True
-        producer = self._producers.get(value.id)
         if producer is not None and value.id in self._inlined:
             operation = (
                 producer.attributes.get("tensor_operation") or producer.op
@@ -1648,6 +1675,29 @@ class _FunctionEmitter:
             or operation in _LOGICAL_BINARY
             or operation in _LOGICAL_RESULT_UNARY
         )
+
+    def _truth_zero(self, value: SSAValue) -> str:
+        """Return a zero with the kind of ``value``'s emitted expression."""
+
+        typed = self._typed(value)
+        producer = self._producers.get(typed.id)
+        if producer is not None and typed.id in self._inlined:
+            operation = (
+                producer.attributes.get("tensor_operation") or producer.op
+            )
+            if operation in {
+                "bitand", "bitor", "bitxor", "shl", "shr",
+                "And", "Or", "Xor",
+            } and not self._instruction_is_logical(producer):
+                # Bit expressions are deliberately normalized to c_int64_t
+                # at every nesting level by _expression.
+                return "0_c_int64_t"
+        dtype = str(typed.dtype or self.dtype).casefold()
+        if dtype.endswith("int64"):
+            return "0_c_int64_t"
+        if dtype.endswith(("int32", "int")):
+            return "0_c_int32_t"
+        return "0.0_c_double"
 
     def _batched_matmul(self, instr: Instr, operation: str) -> list[str] | None:
         """A matmul over leading batch dimensions, as nested loops.
@@ -1720,6 +1770,17 @@ class _FunctionEmitter:
         """
 
         operation = instr.attributes.get("tensor_operation") or instr.op
+        if operation in {
+            "bitand", "bitor", "bitxor", "And", "Or", "Xor",
+        }:
+            # These operators are overloaded in repository SSA.  Their
+            # operands, not a context-refined result dtype, determine whether
+            # the emitted expression is LOGICAL or an integer bit operation.
+            return bool(instr.args) and all(
+                self._is_logical(value) for value in instr.args
+            )
+        if operation in {"shl", "shr"}:
+            return False
         if instr.res is not None and str(instr.res.dtype or "") in _LOGICAL_DTYPES:
             return True
         if operation in _SHAPE_ONLY and instr.args:
@@ -1747,15 +1808,6 @@ class _FunctionEmitter:
                 isinstance(element, bool) for element in values
             ):
                 return True
-        if operation in {"And", "Or", "Xor"}:
-            # These repository ops are overloaded: logical operands mean
-            # boolean conjunction/disjunction, integer operands mean bitwise
-            # arithmetic.  The expression emitter already makes this same
-            # distinction; assignment coercion must not subsequently treat an
-            # integer IOR as a mask and wrap it in MERGE.
-            return bool(instr.args) and all(
-                self._is_logical(value) for value in instr.args
-            )
         return (
             operation in _COMPARISON
             or operation in _LOGICAL_BINARY
@@ -2391,10 +2443,36 @@ class _FunctionEmitter:
                 instr.res is None
                 or position < 0
                 or position >= len(instr.args)
-                or int(instr.args[position].id) != int(instr.res.id)
             ):
                 return None
-            self._locals[instr.res.id] = self._typed(instr.res)
+            aliases_frame = bool(
+                instr.attributes.get("result_aliases_frame", False)
+            )
+            if (
+                int(instr.args[position].id) != int(instr.res.id)
+                and not aliases_frame
+            ):
+                return None
+            # Linked aggregate/sequence calls publish into an explicit caller
+            # frame slot.  Their semantic Call result remains the authored
+            # graph identity, while downstream storage consumers deliberately
+            # use the frame argument.  Emitting the call is sufficient; no
+            # fictitious assignment to the semantic aggregate is required.
+            if aliases_frame and int(instr.res.id) not in {
+                int(argument.id) for argument in self.function.args
+            }:
+                # A linked call may be the producer of a compiler-local
+                # sequence frame.  In that case the aliased output operand is
+                # intentionally absent from the caller's public arguments,
+                # but it still needs a real automatic-array declaration in
+                # the caller.  Treat the exact callee output operand as that
+                # local; dynamic-rank propagation has already copied the
+                # formal's array contract onto this identity.
+                self._locals[instr.res.id] = self._typed(
+                    instr.args[position]
+                )
+            elif not aliases_frame:
+                self._locals[instr.res.id] = self._typed(instr.res)
         elif output_count == 1 and instr.res is not None:
             self._locals[instr.res.id] = self._typed(instr.res)
             arguments.append(_name(instr.res))
@@ -2827,12 +2905,7 @@ class _FunctionEmitter:
                 if self._is_logical(value):
                     logical_args.append(expression)
                     continue
-                dtype = str(self._typed(value).dtype or self.dtype)
-                zero = (
-                    "0_c_int64_t" if dtype.endswith("int64")
-                    else "0_c_int32_t" if dtype.endswith(("int32", "int"))
-                    else "0.0_c_double"
-                )
+                zero = self._truth_zero(value)
                 logical_args.append(f"({expression} /= {zero})")
             operator = ".and." if op in {"LAnd", "logical_and"} else ".or."
             return f"({logical_args[0]} {operator} {logical_args[1]})"
@@ -2850,7 +2923,12 @@ class _FunctionEmitter:
                 f"int({argument}, c_int64_t)" for argument in args
             ))
             if str(instr.res.dtype or self.dtype) in _INTEGER_DTYPES:
-                return f"int({expression}, c_int)"
+                kind = (
+                    "c_int64_t"
+                    if str(instr.res.dtype or self.dtype).endswith("64")
+                    else "c_int"
+                )
+                return f"int({expression}, {kind})"
             return f"real({expression}, c_double)"
 
         if op == "invert" and len(args) == 1:
@@ -3033,6 +3111,16 @@ class _FunctionEmitter:
             )
             if source_rank > 0 and result_rank == 0:
                 operand += "(" + ", ".join("1" for _ in range(source_rank)) + ")"
+            if (
+                str(instr.attributes.get("extraction_identity") or "")
+                == "builtins.float"
+                or str(instr.attributes.get("source_operator") or "") == "float"
+            ):
+                # Python float(...) is an authored conversion boundary, not
+                # merely an assignment between coincidentally equal inferred
+                # dtypes. Keep that conversion explicit after extracting a
+                # scalar from resident array storage.
+                return f"real({operand}, c_double)"
             return self._coerce_value_to_target(
                 instr.res, instr.args[0], operand
             )
@@ -3096,6 +3184,11 @@ class _FunctionEmitter:
             # by _numeric on its consumer. Converting here as well would
             # wrap what was already wrapped.
             return template.format(*args)
+        if op in {"LNot", "logical_not"} and len(args) == 1:
+            if self._is_logical(instr.args[0]):
+                return f"(.not. {args[0]})"
+            zero = self._truth_zero(instr.args[0])
+            return f"({args[0]} == {zero})"
         if op in _UNARY and len(args) == 1:
             if op not in _LOGICAL_UNARY and op not in _LOGICAL_RESULT_UNARY:
                 args = self._numeric(instr, args)
@@ -3107,11 +3200,7 @@ class _FunctionEmitter:
             args = conformed
             mask = args[0]
             if not self._is_logical(instr.args[0]):
-                mask_dtype = str(getattr(instr.args[0], "dtype", "")).casefold()
-                zero = "0_c_int64_t" if mask_dtype.endswith("int64") else (
-                    "0_c_int32_t" if mask_dtype.endswith(("int32", "int"))
-                    else "0.0_c_double"
-                )
+                zero = self._truth_zero(instr.args[0])
                 mask = f"({mask} /= {zero})"
             true_value = self._coerce_to_result(instr, instr.args[1], args[1])
             false_value = self._coerce_to_result(instr, instr.args[2], args[2])
@@ -3171,6 +3260,9 @@ class _FunctionEmitter:
                     or ""
                 )
                 condition = self._operand(instr.args[0])
+                if not self._is_logical(instr.args[0]):
+                    zero = self._truth_zero(instr.args[0])
+                    condition = f"({condition} /= {zero})"
                 body.append(f"    if ({condition}) then")
                 self._emit_phi_copies(block.name, true_target, body, indent=6)
                 body.append(f"      goto {self._label(true_target)}")
@@ -4580,13 +4672,14 @@ def emit_module(
                     if instruction.res is not None:
                         logical_ids.add(int(instruction.res.id))
                 elif operation in {"LNot", "Not", "logical_not"}:
-                    logical_ids.update(int(value.id) for value in instruction.args)
                     if instruction.res is not None:
                         logical_ids.add(int(instruction.res.id))
                 elif operation in _COMPARISON and instruction.res is not None:
                     logical_ids.add(int(instruction.res.id))
-                if instruction.op in {"CondBr", "condbr"} and instruction.args:
-                    logical_ids.add(int(instruction.args[0].id))
+                # CondBr accepts ordinary scalar truthiness.  Its operand is
+                # logical only when the producer/declared dtype says so; an
+                # integer loop-carried value such as ``while value`` must stay
+                # integer and be compared with zero at emission.
         for value_id in logical_ids:
             dtypes[value_id] = "bool"
         function_value_dtypes[str(function_name)] = dtypes
@@ -4985,6 +5078,19 @@ def emit_module(
         "  implicit none",
         "contains",
         "",
+        "  pure integer(c_int64_t) function turing_python_bit_length(value)",
+        "    integer(c_int64_t), intent(in), value :: value",
+        "    integer(c_int64_t) :: magnitude",
+        "    if (value == 0_c_int64_t) then",
+        "      turing_python_bit_length = 0_c_int64_t",
+        "    else if (value == -huge(value) - 1_c_int64_t) then",
+        "      turing_python_bit_length = bit_size(value)",
+        "    else",
+        "      magnitude = abs(value)",
+        "      turing_python_bit_length = bit_size(magnitude) - leadz(magnitude)",
+        "    end if",
+        "  end function turing_python_bit_length",
+        "",
         *[sub.source for sub in subroutines],
         "",
         f"end module {name}",
@@ -5027,6 +5133,17 @@ def emit_module(
             for source_name, value_id in function.metadata.get(
                 "parameter_names", ()
             )
+        })
+        scalar_source_transforms = {
+            int(value_id): (str(source_name), str(transform))
+            for value_id, source_name, transform in function.metadata.get(
+                "scalar_source_transforms", ()
+            )
+        }
+        source_names.update({
+            value_id: source_name
+            for value_id, (source_name, _transform)
+            in scalar_source_transforms.items()
         })
         # Record-valued parameters are expanded into fields and carry their
         # own accounting names. Scalar source parameters can survive that
@@ -5075,6 +5192,11 @@ def emit_module(
                 kind=kind,
                 note=note,
                 source_names=source_names,
+                source_transforms={
+                    value_id: transform
+                    for value_id, (_source_name, transform)
+                    in scalar_source_transforms.items()
+                },
                 dynamic_array_extents=emitted_dynamic_arrays.get(
                     function_name, {}
                 ),
@@ -5093,6 +5215,143 @@ def emit_module(
             )
         )
     control_entries = [e.name for e in entry_points if e.kind == "control"]
+    sequence_output_surfaces: dict[str, list[dict[str, Any]]] = {}
+    for function_name, table in module_sequence_tables.items():
+        function = functions.get(function_name)
+        if function is None:
+            continue
+        materializations = tuple(
+            function.metadata.get("extraction_materializations", ())
+        )
+        surfaces = []
+        for output_index, output in enumerate(named_outputs.get(function_name, ())):
+            descriptor = next((
+                candidate
+                for candidate in table.sequences.values()
+                if int(output.id) == int(candidate.sequence_id)
+                or int(output.id) in set(map(int, candidate.column_value_ids))
+            ), None)
+            if descriptor is None:
+                continue
+            materialization = next((
+                str(record.get("extraction_identity"))
+                for record in materializations
+                if int(record.get("source_sequence_id", -1))
+                == int(descriptor.sequence_id)
+                and str(record.get("lowering") or "").startswith("immutable")
+            ), None)
+            surfaces.append({
+                "output_index": int(output_index),
+                "sequence_id": int(descriptor.sequence_id),
+                "materialization_identity": materialization,
+            })
+        if surfaces:
+            sequence_output_surfaces[function_name] = surfaces
+    sequence_runtime_bindings: dict[str, list[dict[str, Any]]] = {}
+    sequence_source_transforms = {
+        function_name: {
+            int(sequence_id): (str(source_name), str(transform))
+            for sequence_id, source_name, transform
+            in function.metadata.get("sequence_source_transforms", ())
+        }
+        for function_name, function in functions.items()
+    }
+    entry_by_name = {entry.name: entry for entry in entry_points}
+    for function_name, table in module_sequence_tables.items():
+        described = entry_by_name.get(function_name)
+        if described is None:
+            continue
+        parameter_names = {parameter.name for parameter in described.parameters}
+        extent_parameters = tuple(
+            parameter.name
+            for parameter in described.parameters
+            if parameter.role == "extent"
+        )
+        extent_runtime_policies = {
+            extent: ("unit" if extent == "extent_1" else "capacity")
+            for extent in extent_parameters
+        }
+        function = functions.get(function_name)
+        authored_parameter_roots = {
+            str(item if isinstance(item, str) else item[0])
+            for item in (
+                () if function is None
+                else function.metadata.get("parameter_names", ())
+            )
+        }
+        if function is not None:
+            authored_parameter_roots.update(map(
+                str,
+                dict(function.metadata.get("parameter_record_abi") or {}),
+            ))
+            authored_parameter_roots.update(map(
+                str,
+                dict(function.metadata.get("parameter_value_abi") or {}),
+            ))
+        for parameter in described.parameters:
+            if (
+                not parameter.source_name
+                or str(parameter.source_name).split(".", 1)[0]
+                not in authored_parameter_roots
+            ):
+                continue
+            parameter_extents = tuple(dict.fromkeys((
+                *((parameter.extent,) if parameter.extent is not None else ()),
+                *parameter.extents,
+            )))
+            for extent in parameter_extents:
+                if extent in extent_runtime_policies:
+                    extent_runtime_policies[extent] = (
+                        f"source_length:{parameter.source_name}"
+                    )
+        bindings = []
+        for descriptor in table.sequences.values():
+            required_ids = (
+                int(descriptor.length_address_id),
+                int(descriptor.capacity_value_id),
+                *((int(descriptor.status_address_id),)
+                  if descriptor.status_address_id is not None else ()),
+            )
+            required_parameters = tuple(f"t{value_id}" for value_id in required_ids)
+            if any(name not in parameter_names for name in required_parameters):
+                continue
+            status_values = next((
+                dict(candidate.metadata.get("status_values") or {})
+                for candidate in functions.values()
+                if int(candidate.metadata.get(
+                    "sequence_id",
+                    candidate.metadata.get("destination_sequence_id", -1),
+                )) == int(descriptor.sequence_id)
+                and candidate.metadata.get("status_values")
+            ), {})
+            bindings.append({
+                "sequence_id": int(descriptor.sequence_id),
+                "column_parameters": [
+                    f"t{int(value_id)}"
+                    for value_id in descriptor.column_value_ids
+                    if f"t{int(value_id)}" in parameter_names
+                ],
+                "local_column_value_ids": [
+                    int(value_id)
+                    for value_id in descriptor.column_value_ids
+                    if f"t{int(value_id)}" not in parameter_names
+                ],
+                "length_parameter": f"t{int(descriptor.length_address_id)}",
+                "capacity_parameter": f"t{int(descriptor.capacity_value_id)}",
+                "status_parameter": (
+                    f"t{int(descriptor.status_address_id)}"
+                    if descriptor.status_address_id is not None else None
+                ),
+                # These values are now part of the published ABI contract;
+                # consumers never need to reverse-engineer generated extent
+                # spellings. Fixed one-cell length/status arenas use unit
+                # extents and every remaining dynamic sequence extent uses
+                # the caller-selected capacity.
+                "extent_parameters": dict(extent_runtime_policies),
+                "status_values": status_values,
+            })
+        if bindings:
+            sequence_runtime_bindings[function_name] = bindings
     api = CompiledProgramAPI(
         module=name,
         language="fortran",
@@ -5127,11 +5386,47 @@ def emit_module(
                                 "sequence_value_names", ()
                             )
                         ).get(int(descriptor.sequence_id), ())),
+                        **({
+                            "source_name": sequence_source_transforms[
+                                function_name
+                            ][int(descriptor.sequence_id)][0],
+                            "source_names": [sequence_source_transforms[
+                                function_name
+                            ][int(descriptor.sequence_id)][0]],
+                            "source_transform": sequence_source_transforms[
+                                function_name
+                            ][int(descriptor.sequence_id)][1],
+                        } if int(descriptor.sequence_id) in (
+                            sequence_source_transforms.get(function_name, {})
+                        ) else {}),
                     }
                     for descriptor in table.sequences.values()
                 ]
                 for function_name, table in module_sequence_tables.items()
                 if function_name in functions and table.sequences
+            },
+            # A sequence arena can be both an ABI input/inout and the authored
+            # return value.  Ordinary scalar output accounting intentionally
+            # omits that alias, so publish the return-to-descriptor correlation
+            # explicitly rather than asking wrappers to infer it from argument
+            # order or source spelling.
+            "sequence_output_surface_schema": (
+                "turing.repository-ssa-sequence-output-surfaces.v1"
+            ),
+            "sequence_output_surfaces": sequence_output_surfaces,
+            "sequence_runtime_binding_schema": (
+                "turing.repository-ssa-sequence-runtime-bindings.v1"
+            ),
+            "sequence_runtime_bindings": sequence_runtime_bindings,
+            "validation_contract_schema": (
+                "turing.repository-ssa-validation-contracts.v1"
+            ),
+            "validation_contracts": {
+                function_name: list(
+                    function.metadata.get("validation_contracts", ())
+                )
+                for function_name, function in functions.items()
+                if function.metadata.get("validation_contracts")
             },
             "class_table_schema": "turing.repository-ssa-class-table.v1",
             "class_table": [

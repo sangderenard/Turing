@@ -55,7 +55,7 @@ These passed on 2026-08-19 and are the cheap, high-signal set. Prefer them.
 
 | check | result | cost |
 |---|---|---|
-| `tools/translation_scorecard.py` | 17/19 journeys equivalent; levels 14 and 18 stop at materialization | ~6 s |
+| `tools/translation_scorecard.py` | 18/19 journeys equivalent; level 18 stops at materialization | ~6 s |
 | `tests/test_precompile_to_ssa.py` | 34 passed | ~4 s |
 | `tests/test_symbolic_fluid_native_runtime.py` | 1 passed | ~17 s |
 | `tests/test_abstract_tensor_indexing.py` | 2 passed | ~1 s |

@@ -331,41 +331,6 @@ def _index_tensor(value: Any) -> Any:
     )
 
 
-def _evaluate_extended(reduced: Any, core: BakedCore,
-                       collapse: bool = True) -> Any:
-    """Horner in double-double over coefficients that carry their remainder.
-
-    An exact core's coefficients are the function's own Taylor coefficients,
-    and the limiting error is then the EVALUATION, not the approximation: a
-    Horner chain in double commits a rounding at every one of its twenty
-    steps. Measured on the sine core, the identical series goes from 82% of
-    results correctly rounded to 100%, ahead of libm's 97.7%, with no change
-    to the coefficients at all.
-    """
-
-    from . import extended_precision as xp
-
-    values, corrections = core.values, core.corrections
-    # The width is read off the coefficients, not fixed at two: a core baked
-    # for a finer target carries more limbs and must be EVALUATED at that
-    # width or the storage was pointless.
-    width = 1 + len(corrections[0])
-    with xp.precision(width):
-        if core.family == "series":
-            base = reduced - core.centre
-        elif core.structure == "factored":
-            base = reduced
-        else:
-            base = reduced * reduced
-        total = xp.constant_limbs(reduced, (values[-1],) + tuple(corrections[-1]))
-        for index in range(len(values) - 2, -1, -1):
-            total = total * base + xp.constant_limbs(
-                reduced, (values[index],) + tuple(corrections[index]))
-        if core.family != "series" and core.structure in ("factored", "odd"):
-            total = total * reduced
-    return xp.collapse(total) if collapse else total
-
-
 def evaluate_core(reduced: Any, core: BakedCore) -> Any:
     """Evaluate a baked core on an argument ALREADY inside its interval."""
 
@@ -373,8 +338,6 @@ def evaluate_core(reduced: Any, core: BakedCore) -> Any:
     # the expression either way -- and differs only in where the coefficients
     # came from, so it evaluates identically.
     if core.family in ("structured", "exact"):
-        if core.corrections:
-            return _evaluate_extended(reduced, core)
         if core.structure == "factored":
             # f(u) = u * P(u): the root is exact, so the polynomial never has
             # to fit across a zero and relative accuracy stays attainable.
@@ -384,8 +347,6 @@ def evaluate_core(reduced: Any, core: BakedCore) -> Any:
         return reduced * polynomial if core.structure == "odd" else polynomial
 
     if core.family == "series":
-        if core.corrections:
-            return _evaluate_extended(reduced, core)
         return _horner(reduced - core.centre, core.values)
 
     if core.family == "polyspline":
@@ -424,30 +385,7 @@ def evaluate_core(reduced: Any, core: BakedCore) -> Any:
     index = _index_tensor(base)
     left = table.index_select(0, index)
     right = table.index_select(0, index + 1)
-    if not core.corrections:
-        return left + (right - left) * weight
-
-    # With node corrections the stored values stop contributing error at all,
-    # and the interpolation runs in double-double so the subtraction of two
-    # neighbouring nodes -- which cancels, and cancellation is where a table
-    # actually loses digits -- is exact. What remains is the LINEAR
-    # TRUNCATION between nodes, which is a property of the spacing and not of
-    # the arithmetic, so this cannot rescue a table that is simply too coarse.
-    from . import extended_precision as xp
-
-    low_table = AbstractTensor.get_tensor(
-        np.asarray(core.corrections, dtype=np.float64), like=reduced,
-    )
-    # Both lookups happen OUTSIDE the precision block. Index arithmetic
-    # inside it would be promoted by the shim like any other operand, and
-    # ``index + 1`` would arrive at ``index_select`` as a float expansion.
-    near_low = low_table.index_select(0, index)
-    far_low = low_table.index_select(0, index + 1)
-    with xp.precision(2):
-        near = xp.pair(left, near_low)
-        far = xp.pair(right, far_low)
-        result = near + (far - near) * weight
-    return xp.collapse(result)
+    return left + (right - left) * weight
 
 
 def _measure(core: BakedCore) -> BakedCore:
@@ -470,13 +408,8 @@ def _measure(core: BakedCore) -> BakedCore:
 
     positions = np.linspace(core.low, core.high, 801)
     tensor = AbstractTensor.get_tensor(positions)
-    if core.corrections and core.family in ("structured", "exact", "series"):
-        pieces = _evaluate_extended(tensor, core, collapse=False)
-        limbs = [pieces] + list(getattr(pieces, "_limbs", ()))
-    else:
-        limbs = [evaluate_core(tensor, core)]
-    columns = [np.asarray(limb.tolist(), dtype=np.float64).ravel()
-               for limb in limbs]
+    columns = [np.asarray(
+        evaluate_core(tensor, core).tolist(), dtype=np.float64).ravel()]
 
     magnitude = np.empty(positions.size)
     absolute = np.empty(positions.size)
@@ -1002,25 +935,6 @@ def fit_lut(core: str, epsilon: float | None = None,
                 ).tolist(), dtype=np.float64,
             ).ravel()
 
-        def evaluate_low(positions: np.ndarray) -> np.ndarray:
-            """The half of each node a double cannot hold.
-
-            Taken from the generator itself rather than from arbitrary
-            precision: the series core already carries its coefficients'
-            corrections, so evaluating it extended and keeping BOTH limbs
-            costs one tensor pass over the nodes instead of one mpmath call
-            per node -- which matters at a table size that runs to millions.
-            """
-
-            if not generator.corrections:
-                return np.zeros_like(positions)
-            extended = _evaluate_extended(
-                AbstractTensor.get_tensor(positions), generator, collapse=False,
-            )
-            limbs = getattr(extended, "_limbs", ())
-            if not limbs:
-                return np.zeros_like(positions)
-            return np.asarray(limbs[0].tolist(), dtype=np.float64).ravel()
     else:
         source = (f"reference prerun (series fell short at "
                   f"{generator.measured_error:.2e})")
@@ -1032,28 +946,12 @@ def fit_lut(core: str, epsilon: float | None = None,
                 dtype=np.float64,
             )
 
-        def evaluate_low(positions: np.ndarray) -> np.ndarray:
-            from fractions import Fraction
-
-            from .signal_symbolic import exact_evaluator
-
-            radius = max(abs(float(spec.low)), abs(float(spec.high)))
-            oracle = exact_evaluator(str(core), radius, digits=40)
-            pieces = []
-            for item in positions:
-                value = oracle(float(item))
-                pieces.append(float(value - Fraction(float(value))))
-            return np.asarray(pieces, dtype=np.float64)
-
     def build(intervals: int) -> BakedCore:
         positions = np.linspace(spec.low, spec.high, intervals + 1)
         return _measure(BakedCore(
             core=core, family="lut", epsilon=epsilon,
             low=spec.low, high=spec.high,
             values=tuple(float(value) for value in evaluate(positions)),
-            corrections=tuple(
-                float(value) for value in evaluate_low(positions)
-            ),
             note=f"{spec.note}; {intervals} intervals from {source}",
         ))
 

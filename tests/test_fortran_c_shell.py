@@ -29,6 +29,412 @@ from src.compiler.shell_io import (
 )
 
 
+def test_pure_region_dce_preserves_an_exact_required_source_feed():
+    from src.compiler.ir_identities import drop_dead_pure_region_calls
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    region_value = SSAValue(131, "int64")
+    region = Function("probe__planned_region_13", [], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], region_value, attributes={"value": 7}),
+            Instr("Ret", [region_value], None),
+        ]),
+    })
+    aggregate = SSAValue(200)
+    index = SSAValue(201, "int64")
+    pointer = SSAValue(202, "ptr")
+    projected = SSAValue(131, "int64")
+    caller = Function("probe", [], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "Call", [], aggregate,
+                attributes={
+                    "callee": region.name,
+                    "result_convention": "ssa.aggregate",
+                },
+            ),
+            Instr("Const", [], index, attributes={"value": 0}),
+            Instr("GetElementPtr", [aggregate, index], pointer),
+            Instr("Load", [pointer], projected),
+        ]),
+    }, metadata={"required_source_value_ids": (131,)})
+    functions = {caller.name: caller, region.name: region}
+
+    assert drop_dead_pure_region_calls(functions) == 0
+    assert region.name in functions
+    assert any(
+        instruction.res is projected
+        for instruction in caller.blocks["entry"].instrs
+    )
+
+
+def test_pure_region_dce_discards_only_an_outputless_uncalled_integral():
+    from src.compiler.ir_identities import drop_dead_pure_region_calls
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    token = SSAValue(87, "int64")
+    owner = Function("probe", [], {"entry": BasicBlock("entry", [])})
+    region = Function("probe__planned_region_4", [], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "string_token", [], token,
+                attributes={"text": b"\x00asm", "token": 17},
+            ),
+        ]),
+    }, metadata={
+        "source_region_integral": {
+            "owner": owner.name,
+            "identity_token_chain": (
+                "source-region", owner.name, "closure:53", "region_4",
+            ),
+            "output_value_ids": (),
+        },
+    })
+    functions = {owner.name: owner, region.name: region}
+
+    assert drop_dead_pure_region_calls(functions) == 1
+    assert region.name not in functions
+    assert owner.metadata["discarded_outputless_source_regions"] == ({
+        "function": region.name,
+        "identity_token_chain": (
+            "source-region", owner.name, "closure:53", "region_4",
+        ),
+        "reason": "uncalled-pure-no-published-outputs",
+    },)
+
+
+def test_linked_method_record_fields_use_outer_authored_parameter_identity():
+    from src.compiler.fortran_c_shell import (
+        _linked_authored_parameter_aliases,
+    )
+
+    caller = SimpleNamespace(metadata={
+        "parameter_names": (("body", 10),),
+        "parameter_record_abi": {"body": {"identity": "Builder"}},
+    })
+    callee = SimpleNamespace(metadata={
+        "parameter_names": (),
+        "parameter_record_abi": {"self": {"identity": "Builder"}},
+    })
+    caller_graph = SimpleNamespace(graph={
+        "identity_table": {"body": (10, 110)},
+        "function_parameters": ("body",),
+    })
+    callee_graph = SimpleNamespace(graph={
+        "identity_table": {"self": (3, 103)},
+        "function_parameters": ("self",),
+    })
+
+    assert _linked_authored_parameter_aliases(
+        caller, callee, caller_graph, callee_graph, ((10, 3),)
+    ) == {"self": "body"}
+    # Same-spelling SSA versions are not formal aliases.
+    assert _linked_authored_parameter_aliases(
+        caller, callee, caller_graph, callee_graph, ((110, 103),)
+    ) == {}
+    projected_callee_graph = SimpleNamespace(graph={
+        "identity_table": {}, "function_parameters": (),
+    })
+    callee_records = SimpleNamespace(records={
+        3: SimpleNamespace(identity="Builder"),
+    })
+    assert _linked_authored_parameter_aliases(
+        caller,
+        callee,
+        caller_graph,
+        projected_callee_graph,
+        ((10, 3),),
+        None,
+        callee_records,
+    ) == {"self": "body"}
+
+
+def test_linked_sequence_argument_binds_its_complete_physical_descriptor():
+    from src.compiler.fortran_c_shell import _bind_sequence_storage_members
+
+    callee = SimpleNamespace(
+        column_value_ids=(0,),
+        length_address_id=10,
+        capacity_value_id=11,
+        status_address_id=12,
+        live_flags_value_id=13,
+    )
+    caller = SimpleNamespace(
+        column_value_ids=(191,),
+        length_address_id=370,
+        capacity_value_id=371,
+        status_address_id=372,
+        live_flags_value_id=373,
+    )
+    bindings = {}
+
+    assert _bind_sequence_storage_members(bindings, callee, caller)
+    assert bindings == {0: 191, 10: 370, 11: 371, 12: 372, 13: 373}
+
+
+def test_authored_text_parameter_declares_its_utf8_sequence_view():
+    from src.compiler.fortran_c_shell import (
+        _authored_text_parameter_transforms,
+    )
+
+    graph = SimpleNamespace(graph={
+        "identity_table": {"function_name": (8,), "memory_pages": (12,)},
+        "function_parameter_annotations": {
+            "function_name": "str",
+            "memory_pages": "int",
+        },
+    })
+
+    assert _authored_text_parameter_transforms(graph) == (
+        (8, 8, "function_name", "utf8"),
+    )
+
+
+def test_optional_record_none_predicate_uses_row_handle_sentinel():
+    from src.compiler.control_source import ControlExpression
+    from src.compiler.fortran_c_shell import (
+        _rewrite_optional_row_handle_none_predicate,
+    )
+
+    predicate = ControlExpression("eq", (
+        ControlExpression("value", value_id=165),
+        ControlExpression("const", value_id=180, literal=None),
+    ))
+
+    rewritten = _rewrite_optional_row_handle_none_predicate(predicate, (165,))
+
+    assert rewritten.op == "eq"
+    assert rewritten.operands[0].value_id == 165
+    assert rewritten.operands[1].literal == -1
+
+
+def test_mapping_pop_none_rewrites_predicate_without_record_parameters():
+    import networkx as nx
+
+    from src.compiler.control_source import (
+        ConditionalBlock, ControlExpression, ControlProgram, ControlSequenceMutation,
+        LoopBlock, SequenceBlock, StatementBlock,
+    )
+    from src.compiler.fortran_c_shell import (
+        _record_sequence_projection_bindings,
+    )
+
+    graph = nx.DiGraph()
+    graph.graph["parameter_sequence_record_abi"] = {}
+    mutation = ControlSequenceMutation(
+        20,
+        "pop",
+        (21, 22),
+        23,
+        policy="unique",
+        argument_kind="mapping_pop_default_none",
+    )
+    predicate = ControlExpression("eq", (
+        ControlExpression("value", value_id=23),
+        ControlExpression("const", literal=None),
+    ))
+    control = ControlProgram(SequenceBlock((
+        LoopBlock(
+            "item", "0", "1", "1", SequenceBlock(()),
+            sequence_mutations=(mutation,),
+        ),
+        ConditionalBlock(24, StatementBlock(("consume",)),
+                         predicate_expression=predicate),
+    )))
+
+    rewritten, bindings, fields = _record_sequence_projection_bindings(
+        graph, control,
+    )
+    conditional = rewritten.root.blocks[1]
+
+    assert bindings == ()
+    assert fields == ()
+    assert conditional.predicate_expression.operands[1].literal == -1
+
+
+def test_sequence_query_producer_is_scheduled_before_earlier_consumer():
+    from src.compiler.control_source import (
+        ConditionalBlock, ControlExpression, LoopBlock, SequenceBlock,
+        SequenceQueryBlock, StatementBlock,
+    )
+    from src.compiler.fortran_c_shell import (
+        _schedule_sequence_query_dependencies,
+    )
+
+    consumer = ConditionalBlock(
+        180,
+        StatementBlock(("consume",)),
+        predicate_expression=ControlExpression("eq", (
+            ControlExpression("value", value_id=165),
+            ControlExpression("const", literal=-1),
+        )),
+    )
+    producer = SequenceBlock((
+        LoopBlock(
+            "row", "0", "n", "1", StatementBlock(("produce",)),
+            source_loop_node_id=164,
+        ),
+        SequenceQueryBlock(
+            result_value_id=165,
+            sequence_value_id=213,
+            operation="first_or_default",
+            default_value_id=62,
+            producer_loop_node_id=164,
+        ),
+    ))
+
+    scheduled = _schedule_sequence_query_dependencies(SequenceBlock((
+        consumer, producer, StatementBlock(("tail",)),
+    )))
+
+    assert scheduled.blocks == (
+        producer.blocks[0], producer.blocks[1], consumer,
+        StatementBlock(("tail",)),
+    )
+
+
+def test_sequence_query_scheduler_repairs_a_query_separated_before_its_loop():
+    from src.compiler.control_source import (
+        ConditionalBlock, ControlExpression, LoopBlock, SequenceBlock,
+        SequenceQueryBlock, StatementBlock,
+    )
+    from src.compiler.fortran_c_shell import (
+        _schedule_sequence_query_dependencies,
+    )
+
+    consumer = ConditionalBlock(
+        180,
+        StatementBlock(("consume",)),
+        predicate_expression=ControlExpression("eq", (
+            ControlExpression("value", value_id=165),
+            ControlExpression("const", literal=-1),
+        )),
+    )
+    query = SequenceQueryBlock(
+        result_value_id=165,
+        sequence_value_id=213,
+        operation="first_or_default",
+        default_value_id=62,
+        producer_loop_node_id=164,
+    )
+    producer = LoopBlock(
+        "row", "0", "n", "1", StatementBlock(("produce",)),
+        source_loop_node_id=164,
+    )
+    tail = StatementBlock(("tail",))
+
+    scheduled = _schedule_sequence_query_dependencies(SequenceBlock((
+        consumer, query, tail, producer,
+    )))
+
+    assert scheduled.blocks == (producer, query, consumer, tail)
+
+
+def test_joined_inline_list_recovers_dynamic_elements_from_consuming_call():
+    import ast
+    import networkx as nx
+
+    from src.compiler.fortran_c_shell import _joined_list_literal_mutations
+
+    expression = ast.parse("_vector([uleb(index)])", mode="eval").body
+    element = expression.args[0].elts[0]
+    graph = nx.DiGraph()
+    graph.add_node(
+        100,
+        value_id=32,
+        type="Constant",
+        expr_obj=None,
+        parents=(),
+        attributes={"aggregate_kind": "list", "value": []},
+    )
+    graph.add_node(
+        200, value_id=44, type="Call", expr_obj=element, parents=(),
+    )
+    graph.add_node(
+        300,
+        value_id=45,
+        type="Call",
+        expr_obj=expression,
+        parents=((100, "arg:0"),),
+    )
+
+    mutations = _joined_list_literal_mutations(graph, (32,))
+
+    assert len(mutations) == 1
+    assert mutations[0].sequence_value_id == 32
+    assert mutations[0].argument_value_ids == (44,)
+    assert mutations[0].effect_node_id == 200
+
+
+def test_singleton_bytes_view_retains_its_dynamic_scalar_materialization():
+    import ast
+    import networkx as nx
+
+    from src.compiler.fortran_c_shell import _sequence_concat_ops
+
+    singleton = ast.parse("[value]", mode="eval").body
+    graph = nx.DiGraph()
+    graph.add_node(100, value_id=102, type="Lookup", parents=())
+    graph.add_node(
+        101,
+        value_id=103,
+        type="List",
+        expr_obj=singleton,
+        parents=((100, "elts:0"),),
+        attributes={
+            "aggregate_kind": "list",
+            "aggregate_leaf_value_ids": (102,),
+        },
+    )
+    graph.add_node(
+        108,
+        value_id=108,
+        type="Call",
+        parents=((101, "arg:0"),),
+        attributes={
+            "aggregate_kind": "bytes",
+            "producer_kind": "aggregate_materialization",
+            "aggregate_leaf_value_ids": (103,),
+        },
+    )
+
+    operations, aliases, singleton_values = _sequence_concat_ops(graph)
+
+    assert operations == ()
+    assert aliases == ((108, 103),)
+    assert singleton_values == {108: 102}
+
+
+def test_retained_control_expression_recursively_keeps_bitwise_masks():
+    import ast
+    import networkx as nx
+
+    from src.compiler.fortran_c_shell import _graph_control_expression
+
+    graph = nx.DiGraph()
+    graph.add_node(0, type="Input", parents=())
+    graph.add_node(
+        1, type="Const", parents=(), attributes={"value": 0x40},
+    )
+    graph.add_node(
+        2, type="BitAnd", op="bitand", expr_obj=ast.parse("x & 64").body[0].value,
+        parents=((0, "lhs"), (1, "rhs")),
+    )
+    graph.add_node(
+        3, type="LogicalNot", op="logical_not",
+        parents=((2, "operand"),),
+    )
+
+    expression = _graph_control_expression(graph, 3)
+
+    assert expression.op == "not"
+    assert expression.operands[0].op == "bitand"
+    assert expression.operands[0].operands[0].op == "value"
+    assert expression.operands[0].operands[0].value_id == 0
+    assert expression.operands[0].operands[1].op == "const"
+    assert expression.operands[0].operands[1].literal == 0x40
+
+
 class _ArenaState:
     def __init__(self):
         self.values = np.arange(4.0)
@@ -913,6 +1319,143 @@ def test_nested_if_threads_inner_phi_into_outer_phi():
     assert not function.metadata.get("structural_output_shortfalls")
 
 
+def test_iterable_loop_target_is_accounted_as_coordinator_lowered():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def total(values):\n"
+        "    result = 0\n"
+        "    for value in values:\n"
+        "        result += value\n"
+        "    return result\n",
+        "total",
+        name="iterable_target_accounting",
+    )
+    function = module.functions["iterable_target_accounting__total"]
+    iterable_targets = {
+        int(instruction.res.id)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None
+        and instruction.op == "Load"
+        and instruction.attributes.get("binding") in {
+            "iterable", "projected_iterable", "static_iterable",
+            "closure_iterable",
+        }
+    }
+
+    assert iterable_targets
+    assert iterable_targets.issubset(set(
+        map(int, function.metadata["lowered_source_value_ids"])
+    ))
+
+
+def test_annotated_string_sequence_is_a_typed_token_arena():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.ssa_fortran_backend import emit_module
+
+    module, outputs, exports = lower_ast_source_to_ssa(
+        "from typing import Sequence\n"
+        "def count_x(values: Sequence[str]) -> int:\n"
+        "    total = 0\n"
+        "    for value in values:\n"
+        "        if value == 'x':\n"
+        "            total += 1\n"
+        "    return total\n",
+        "count_x",
+        name="annotated_string_sequence",
+    )
+    function = module.functions["annotated_string_sequence__count_x"]
+    parameter_ids = dict(function.metadata["parameter_names"])
+    sequence_id = int(parameter_ids["values"])
+    descriptor = module.sequence_tables[function.name].sequences[sequence_id]
+
+    assert descriptor.column_dtypes == ("int64",)
+    assert descriptor.writable is False
+    emitted = emit_module(
+        module,
+        name="annotated_string_sequence",
+        outputs=outputs,
+        extra_roots=exports,
+    )
+    assert emitted.complete, [item.format() for item in emitted.shortfalls]
+
+
+def test_sequence_of_authored_records_projects_fields_inside_loop():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.project_compilation_product import (
+        _unexplained_root_argument_ids,
+    )
+
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "from dataclasses import dataclass\n"
+        "from typing import Sequence\n"
+        "@dataclass\n"
+        "class Row:\n"
+        "    kind: str\n"
+        "    value: int\n"
+        "def total(rows: Sequence[Row]) -> int:\n"
+        "    result = 0\n"
+        "    for row in rows:\n"
+        "        if row.kind == 'keep':\n"
+        "            result += row.value\n"
+        "    return result\n",
+        "total",
+        name="record_row_projection",
+    )
+    function = module.functions["record_row_projection__total"]
+
+    assert _unexplained_root_argument_ids(function) == ()
+    projected_fields = {
+        field_name
+        for _value_id, field_name, _dtype
+        in function.metadata["record_sequence_projection_fields"]
+    }
+    assert projected_fields == {"kind", "value"}
+
+
+def test_filtered_authored_record_sequence_keeps_row_provenance():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.project_compilation_product import (
+        _unexplained_root_argument_ids,
+    )
+
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "from dataclasses import dataclass\n"
+        "from typing import Sequence\n"
+        "@dataclass\n"
+        "class Row:\n"
+        "    kind: str\n"
+        "    value: int\n"
+        "def total(rows: Sequence[Row]) -> int:\n"
+        "    selected = [row for row in rows if row.kind == 'keep']\n"
+        "    result = 0\n"
+        "    for row in selected:\n"
+        "        result += row.value\n"
+        "    return result\n",
+        "total",
+        name="filtered_record_row_projection",
+    )
+    function = module.functions["filtered_record_row_projection__total"]
+    unexplained = _unexplained_root_argument_ids(function)
+    definitions = {
+        int(instruction.res.id)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None
+    }
+    projected_fields = {
+        int(value_id): field_name
+        for value_id, field_name, _dtype
+        in function.metadata["record_sequence_projection_fields"]
+    }
+
+    assert set(projected_fields.values()) == {"kind", "value"}
+    assert set(projected_fields).issubset(definitions)
+    assert not set(projected_fields).intersection(unexplained)
+    assert unexplained == ()
+
+
 def test_pursued_re_compile_uses_one_external_multikey_table_contract():
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
@@ -1403,6 +1946,81 @@ end module affine_fortran
     c_source = artifact.c_source_path.read_text(encoding="utf-8")
     assert "slots[0] = slots[1]" in c_source
     assert "memcpy(slots[0], slots[1]" not in c_source
+
+
+@pytest.mark.skipif(
+    fortran_compiler() is None,
+    reason="no Fortran compiler installed",
+)
+def test_compiled_library_contract_records_selected_root_not_link_order(tmp_path):
+    source = """
+module linked_fortran
+  use, intrinsic :: iso_c_binding
+  implicit none
+contains
+  subroutine linked_helper() bind(C, name="linked_helper")
+  end subroutine linked_helper
+  subroutine authored_root() bind(C, name="authored_root")
+  end subroutine authored_root
+end module linked_fortran
+"""
+    entries = tuple(
+        EntryPoint(name=name, symbol=name, kind="control", parameters=())
+        for name in ("linked_helper", "authored_root")
+    )
+    module = FortranModule(
+        "linked_fortran",
+        source,
+        api=CompiledProgramAPI(
+            module="linked_fortran",
+            language="fortran",
+            entry="linked_helper",
+            entry_points=entries,
+        ),
+    )
+
+    artifact = compile_fortran_module_c_shell(
+        module,
+        {},
+        tmp_path,
+        entrypoint="authored_root",
+        name="linked_native",
+        library=True,
+    )
+    import yaml
+
+    published = yaml.safe_load(artifact.api_path.read_text(encoding="utf-8"))
+
+    assert artifact.entrypoint == "authored_root"
+    assert published["entry"] == "authored_root"
+    assert tuple(item["name"] for item in published["entry_points"]) == (
+        "linked_helper",
+        "authored_root",
+    )
+    assert published["metadata"]["packed_entrypoints"]["authored_root"] == {
+        "schema": "turing.packed-pointer-array.v1",
+        "symbol": "authored_root__packed",
+        "parameter_count": 0,
+    }
+    assert "authored_root__packed" in artifact.c_source_path.read_text(
+        encoding="utf-8"
+    )
+    # The ordinary typed ABI remains directly callable as advertised; the
+    # packed pointer-array entry is an additional generic transport surface.
+    import ctypes
+
+    runtime_handles = []
+    if os.name == "nt" and hasattr(os, "add_dll_directory"):
+        for dependency in published.get("metadata", {}).get(
+            "runtime_dependencies", ()
+        ):
+            parent = Path(str(dependency["path"])).resolve().parent
+            runtime_handles.append(os.add_dll_directory(str(parent)))
+    library = ctypes.CDLL(str(artifact.executable_path.resolve()))
+    assert getattr(library, "authored_root") is not None
+    assert getattr(library, "authored_root__packed") is not None
+    # Keep Windows DLL search handles resident until after both lookups.
+    assert runtime_handles or os.name != "nt"
 
 
 @pytest.mark.skipif(

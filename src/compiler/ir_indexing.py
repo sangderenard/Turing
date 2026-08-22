@@ -121,3 +121,116 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                         args=[root(a) if int(a.id) in aliases else a
                               for a in instruction.args],
                     )
+
+    _propagate_scalar_dtypes(functions)
+
+
+def _propagate_scalar_dtypes(functions) -> None:
+    """Settle scalar contracts after structural indexing is expanded.
+
+    ``Indexed`` knows the element dtype of its base, while the universal
+    ``GetElementPtr`` temporary intentionally does not.  Preserve that fact
+    across the rewrite, then carry casts and integer arithmetic through the
+    one function's SSA namespace.  Caller/callee agreement is handled by the
+    explicit call signature; a bare integer ID is never used to conflate two
+    function-local values.  This is type accounting only: IDs and instruction
+    order are unchanged.
+    """
+
+    integers = {"int", "int8", "int16", "int32", "int64", "i32", "i64"}
+    floats = {"float", "float16", "float32", "float64", "double", "f32", "f64"}
+    preserving = {
+        "Add", "Sub", "Mul", "FloorDiv", "Mod", "Pow", "Min", "Max",
+        "BitAnd", "BitOr", "BitXor", "Shl", "Shr", "Neg", "Abs",
+    }
+    predicates = {
+        "Eq", "Ne", "Lt", "Le", "Gt", "Ge", "ULt", "ULe",
+        "LAnd", "LOr", "LNot", "LXor",
+    }
+
+    for function in functions.values():
+        values: dict[int, list[SSAValue]] = {}
+        instructions = []
+        for value in function.args:
+            values.setdefault(int(value.id), []).append(value)
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                instructions.append(instruction)
+                for value in (
+                    *instruction.args,
+                    *((instruction.res,) if instruction.res is not None else ()),
+                ):
+                    values.setdefault(int(value.id), []).append(value)
+
+        dtype_of: dict[int, str] = {}
+        for value_id, occurrences in values.items():
+            declared = [str(value.dtype) for value in occurrences if value.dtype]
+            if "int64" in declared or "i64" in declared:
+                dtype_of[value_id] = "int64"
+            elif declared:
+                dtype_of[value_id] = declared[0]
+
+        address_base: dict[int, int] = {}
+        for instruction in instructions:
+            if (
+                instruction.op == "GetElementPtr"
+                and instruction.res is not None
+                and instruction.args
+            ):
+                address_base[int(instruction.res.id)] = int(
+                    instruction.args[0].id
+                )
+
+        for _ in range(max(1, len(instructions))):
+            changed = False
+            for instruction in instructions:
+                if instruction.res is None:
+                    continue
+                result_id = int(instruction.res.id)
+                operand_dtypes = tuple(
+                    dtype_of.get(int(value.id)) for value in instruction.args
+                )
+                inferred = None
+                if instruction.op == "Const":
+                    literal = instruction.attributes.get("value")
+                    inferred = (
+                        "bool" if isinstance(literal, bool)
+                        else "int64" if isinstance(literal, int)
+                        else "float64" if isinstance(literal, float)
+                        else None
+                    )
+                elif instruction.op == "Cast":
+                    inferred = instruction.attributes.get("target_dtype")
+                elif instruction.op == "Load" and instruction.args:
+                    base_id = address_base.get(int(instruction.args[0].id))
+                    inferred = (
+                        None if base_id is None else dtype_of.get(base_id)
+                    )
+                elif instruction.op == "BitLength":
+                    inferred = "int64"
+                elif instruction.op in predicates:
+                    inferred = "bool"
+                elif instruction.op in preserving and operand_dtypes and all(
+                    candidate is not None for candidate in operand_dtypes
+                ):
+                    if any(candidate in floats for candidate in operand_dtypes):
+                        inferred = "float64"
+                    elif all(
+                        candidate in integers for candidate in operand_dtypes
+                    ):
+                        inferred = "int64"
+                elif instruction.op in {"Div", "Sqrt", "Exp", "Log"}:
+                    inferred = "float64"
+                if inferred in {
+                    "int", "int8", "int16", "int32", "i32", "i64",
+                }:
+                    inferred = "int64"
+                if inferred is not None and dtype_of.get(result_id) != inferred:
+                    dtype_of[result_id] = str(inferred)
+                    changed = True
+            if not changed:
+                break
+
+        for value_id, dtype in dtype_of.items():
+            for value in values.get(value_id, ()):
+                value.dtype = dtype

@@ -400,11 +400,17 @@ def build_map_dependency_regions(
             continue
         for _node_id, data in function_graph.G.nodes(data=True):
             attributes = data.get("attributes") or {}
-            callee = attributes.get("callee_ref")
-            if callee is None:
-                callee = attributes.get("method_ref")
-            if callee is not None:
-                pending.append(int(callee))
+            callees = {
+                int(attributes[field])
+                for field in (
+                    "callee_ref",
+                    "method_ref",
+                    "constructor_ref",
+                    "first_class_function_ref",
+                )
+                if attributes.get(field) is not None
+            }
+            pending.extend(sorted(callees, reverse=True))
 
     mapped: set[int] = set()
     bindings: list[tuple[str, int]] = []

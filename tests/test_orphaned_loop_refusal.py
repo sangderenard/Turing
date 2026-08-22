@@ -31,6 +31,9 @@ import warnings
 import pytest
 
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+from src.compiler.glsl_deployment_strategy import (
+    CompilationSubdivisionRequired,
+)
 
 
 GUARD_CLAUSE_RAISE_SOURCE = (
@@ -79,12 +82,17 @@ def _lower(source: str, name: str):
 
 
 def test_a_bare_raise_inside_a_loop_still_refuses():
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(CompilationSubdivisionRequired) as excinfo:
         _lower(BARE_RAISE_SOURCE, "orphanrefusal")
 
     message = str(excinfo.value)
     assert "loop's body regions are scheduled but the loop itself" in message
     assert "blockers=('Raise',)" in message
+    receipt = excinfo.value.to_failure_mapping()
+    assert receipt["frontier_kind"] == "compilation-subdivision-required"
+    boundary, = receipt["subdivision_boundaries"]
+    assert boundary["kind"] == "loop-control-owner"
+    assert boundary["blockers"] == ["Raise"]
 
 
 def test_a_guard_clause_raise_inside_a_loop_compiles_and_validates():

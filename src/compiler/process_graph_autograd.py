@@ -329,6 +329,20 @@ def abstract_tensor_program_to_process_graph(
             parents = (int(args[0].id),)
         elif callee == "sum_double":
             operation, parents = "sum", (int(args[0].id),)
+        elif callee == "sign_double":
+            operation, parents = "sign", (int(args[0].id),)
+            # sign is piecewise constant.  Treat it like the comparison masks
+            # below: retain its forward value for routing, but do not invent a
+            # numerical derivative through its discontinuity.
+            attributes["predicate"] = True
+        elif callee == "create_arange":
+            start = float(const_value(args[0]))
+            step = float(const_value(args[1]))
+            count = int(const_value(args[2]))
+            operation, parents = "const", ()
+            attributes["value"] = tuple(
+                start + step * index for index in range(count)
+            )
         elif callee == "broadcast_double":
             operation, parents = "broadcast_to", (int(args[0].id),)
             attributes["shape"] = tuple(map(int, result.shape))

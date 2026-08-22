@@ -204,6 +204,32 @@ def test_literal_module_constants_are_static_function_bindings():
     assert direct_function.python_bindings["CARD_SIZE"] == 2000
 
 
+def test_literal_module_table_can_reference_earlier_literal_constants():
+    graph = _ingest(
+        "I32 = 0x7F\nI64 = 0x7E\n"
+        "VALUE_TYPE = {'i32': I32, 'i64': I64}\n\n"
+        "def encode(name):\n    return VALUE_TYPE[name]\n",
+        {},
+    )
+    (_node_id, data), = _definitions(graph, "encode")
+
+    assert data["expr_obj"]._python_bindings["VALUE_TYPE"] == {
+        "i32": 0x7F,
+        "i64": 0x7E,
+    }
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("encode").graph
+    assert function_graph.python_bindings["VALUE_TYPE"] == {
+        "i32": 0x7F,
+        "i64": 0x7E,
+    }
+    assert not any(
+        str((node.get("attributes") or {}).get("binding_name")) == "VALUE_TYPE"
+        and str((node.get("attributes") or {}).get("binding_kind")) == "external"
+        for _node_id, node in function_graph.G.nodes(data=True)
+    )
+
+
 def test_class_field_default_does_not_shadow_method_parameter():
     graph = _ingest(
         """

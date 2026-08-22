@@ -9,11 +9,13 @@ complete ordinary-SSA dependency closure into the program module.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from math import prod
 from typing import Any
 
-from ..abstraction import AbstractTensor
+from ..abstraction import AbstractTensor, register_backend
 from ..abstraction_methods.indexing import lower_basic_index, normalize_index
 from ....transmogrifier.ssa import (
     BasicBlock,
@@ -37,6 +39,11 @@ from .c_backend_llvm_ssa import (
 # available for ingestion; advanced stack/cat can already compose structurally.
 # The other 22 primitive functions form the directly compilable Fortran ABI.
 SSA_TENSOR_FORTRAN_SOURCE_ONLY = frozenset({"stack_double", "cat_double"})
+
+
+_ACTIVE_SSA_PROGRAM: ContextVar["SSATensorProgram | None"] = ContextVar(
+    "turing_active_ssa_tensor_program", default=None,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +95,16 @@ class SSATensorProgram:
         self._next_value_id = 0
         self._next_tensor_id = 0
         self._finished = False
+
+    @contextmanager
+    def activate(self):
+        """Route implicit AbstractTensor factories into this source program."""
+
+        token = _ACTIVE_SSA_PROGRAM.set(self)
+        try:
+            yield self
+        finally:
+            _ACTIVE_SSA_PROGRAM.reset(token)
 
     @property
     def block(self) -> BasicBlock:
@@ -777,6 +794,8 @@ class SSATensorOperations(AbstractTensor):
         ):
             program = like.data.program
         if program is None:
+            program = _ACTIVE_SSA_PROGRAM.get()
+        if program is None:
             program = SSATensorProgram("ssa_tensor_literal")
         result = cls(track_time=False, tape=tape)
         result._program = program
@@ -949,7 +968,7 @@ class SSATensorOperations(AbstractTensor):
         return program.constant(data, shape_of(data))
 
     def full_(self, size, fill_value, dtype=None, device=None) -> SSATensorValue:
-        program = getattr(self, "_program", None)
+        program = getattr(self, "_program", None) or _ACTIVE_SSA_PROGRAM.get()
         if program is None:
             raise ValueError("construct SSA tensors through an SSATensorProgram")
         return program.full(tuple(size), float(fill_value))
@@ -963,6 +982,33 @@ class SSATensorOperations(AbstractTensor):
     def clone_(self, tensor: SSATensorValue | None = None) -> SSATensorValue:
         source = tensor or self.data
         return source.program.operation("add", source, 0.0)
+
+    def to_dtype_(self, dtype) -> SSATensorValue:
+        # Repository tensor storage is presently double even for integral and
+        # logical values; casting therefore changes values, not the ABI.  The
+        # linalg source uses this for 0/1 comparison masks, whose values are
+        # already exactly representable, so the source-preserving realization
+        # is an explicit copy.
+        return self.data.program.operation("add", self.data, 0.0)
+
+    def stack_(self, tensors, dim=0) -> SSATensorValue:
+        values = tuple(self._data(tensor) for tensor in tensors)
+        if not values:
+            raise ValueError("SSA stack requires at least one tensor")
+        program = values[0].program
+        if any(value.program is not program for value in values):
+            raise ValueError("SSA stack inputs must share one source program")
+        base_shape = values[0].shape
+        if any(value.shape != base_shape for value in values):
+            raise ValueError("SSA stack inputs must have equal shapes")
+        dim = int(dim) % (len(base_shape) + 1)
+        output_shape = base_shape[:dim] + (len(values),) + base_shape[dim:]
+        output = program.full(output_shape, 0.0)
+        for position, value in enumerate(values):
+            index = [slice(None)] * len(output_shape)
+            index[dim] = position
+            output = program.index_set(output, tuple(index), value)
+        return output
 
     def _view_value(self, shape: tuple[int, ...]) -> SSATensorValue:
         return self.data.program.view(self.data, tuple(shape))
@@ -1002,6 +1048,18 @@ class SSATensorOperations(AbstractTensor):
             dim %= len(shape)
             target = shape[:dim] + shape[dim + 1:] if shape[dim] == 1 else shape
         return self._view_value(target)
+
+    def expand_(self, shape) -> SSATensorValue:
+        requested = tuple(int(size) for size in shape)
+        source = self.data.shape
+        if len(requested) < len(source):
+            raise ValueError("SSA expand cannot reduce tensor rank")
+        padded = (1,) * (len(requested) - len(source)) + source
+        target = tuple(
+            padded[index] if size == -1 else size
+            for index, size in enumerate(requested)
+        )
+        return self.data.program.broadcast(self.data, target)
 
     def sum_(self, dim=None, keepdim=False) -> SSATensorValue:
         if dim is not None:
@@ -1148,7 +1206,7 @@ class SSATensorOperations(AbstractTensor):
     def arange_(self, start, end=None, step=1, *, dtype=None, device=None) -> SSATensorValue:
         if end is None:
             start, end = 0, start
-        program = getattr(self, "_program", None)
+        program = getattr(self, "_program", None) or _ACTIVE_SSA_PROGRAM.get()
         if program is None:
             raise ValueError("construct SSA tensors through an SSATensorProgram")
         return program.arange(float(start), float(end), float(step))
@@ -1202,6 +1260,9 @@ def _round_hook(self, n=None):
 
 
 SSATensorOperations.round_ = _round_hook
+
+
+register_backend("ssa", SSATensorOperations)
 
 
 def emit_ssa_tensor_backend_runtime(

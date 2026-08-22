@@ -1,4 +1,5 @@
 import ast
+import ast
 import inspect
 import textwrap
 from types import SimpleNamespace
@@ -134,6 +135,57 @@ def test_control_loop_backedges_are_exact_hierarchy_dependencies():
     plan = _build_shell_hierarchy_plan(shell)
 
     assert plan.captures == (1, 2)
+
+
+def test_direct_aggregate_return_binds_call_from_source_span_and_backing_storage():
+    child_graph = nx.DiGraph()
+    child_graph.add_node(
+        1,
+        type="Input",
+        attributes={"binding_name": "value", "binding_kind": "external"},
+    )
+    returned = ast.parse("def leaf(value):\n    return bytes(value)\n").body[0]
+    return_call = returned.body[0].value
+    child_graph.add_node(
+        9,
+        type="Call",
+        parents=((1, "arg:0"),),
+        attributes={"extraction_identity": "builtins.bytes"},
+        expr_obj=return_call,
+    )
+    child_graph.add_node(10, type="Return", expr_obj=returned.body[0])
+    child_graph.add_edge(1, 9)
+    child_graph.graph.update({
+        "identity_table": {"value": (1,)},
+        "function_outputs": (),
+    })
+    child = SimpleNamespace(
+        process_graph=SimpleNamespace(G=child_graph),
+        dispatch_subgraphs=(),
+        callsite_function_shells={},
+        loop_plans=(),
+        shell_control_program=None,
+        _captured_return_value_ids=(),
+    )
+    parent_graph = nx.DiGraph()
+    parent_graph.add_node(
+        0, type="Input", attributes={"binding_name": "value"},
+    )
+    parent_graph.add_node(5, type="Call", parents=((0, "arg:0"),), attributes={})
+    parent_graph.add_edge(0, 5)
+    parent_graph.graph["identity_table"] = {"value": (0,)}
+    parent = SimpleNamespace(
+        process_graph=SimpleNamespace(G=parent_graph),
+        dispatch_subgraphs=(),
+        callsite_function_shells={5: child},
+        loop_plans=(),
+        shell_control_program=None,
+    )
+
+    call = _build_shell_hierarchy_plan(parent).items[0]
+
+    assert isinstance(call, PlanCall)
+    assert call.result_bindings == ((1, 5),)
 
 
 def test_loop_carried_initializer_is_region_capture_not_body_constant():
@@ -627,6 +679,98 @@ def test_direct_return_expression_receives_public_output_identity():
     assert direct.G.nodes[output_id]["op"].lower() == "add"
 
 
+def test_sequence_concat_identity_keeps_bytes_out_of_numeric_addition():
+    from src.compiler.fortran_c_shell import _sequence_concat_ops
+
+    module = ast.parse(
+        "def packet(tag: int, payload: bytes) -> bytes:\n"
+        "    return bytes([tag]) + payload\n"
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    packet = next(
+        entry.graph for entry in graph.function_table
+        if entry.name == "packet"
+    )
+
+    operations, aliases = _sequence_concat_ops(packet.G)
+
+    assert len(operations) == 1
+    result_id, prefix_id, payload_id, kind, prefix_scalar, payload_scalar = (
+        operations[0]
+    )
+    assert kind == "bytes"
+    assert prefix_scalar is not None
+    assert payload_scalar is None
+    assert result_id != prefix_id != payload_id
+    assert aliases
+
+
+def test_sequence_concat_uses_constant_singleton_scalar_leaf():
+    from src.compiler.fortran_c_shell import _sequence_concat_ops
+    from src.compiler.glsl_deployment_strategy import (
+        _fold_callsite_structural_values,
+    )
+
+    module = ast.parse(
+        "def packet(payload: bytes) -> bytes:\n"
+        "    return payload + bytes([11])\n"
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    packet = next(
+        entry.graph for entry in graph.function_table
+        if entry.name == "packet"
+    )
+    _fold_callsite_structural_values(packet)
+
+    operations, _aliases = _sequence_concat_ops(packet.G)
+
+    assert len(operations) == 1
+    _result, _payload, singleton, kind, lhs_scalar, rhs_scalar = operations[0]
+    assert kind == "bytes"
+    assert lhs_scalar is None
+    assert rhs_scalar is not None
+    assert rhs_scalar != singleton
+    leaf_data = next(
+        data for _node_id, data in packet.G.nodes(data=True)
+        if int(data.get("value_id", -1)) == rhs_scalar
+    )
+    assert leaf_data.get("constant") == 11
+
+
+def test_sequence_kind_crosses_pursued_call_before_concat_lowering():
+    from src.compiler.fortran_c_shell import _sequence_value_kinds
+
+    module = ast.parse(
+        "def emit(tag: int) -> bytes:\n"
+        "    return bytes([tag])\n"
+        "\n"
+        "def packet(tag: int) -> bytes:\n"
+        "    return emit(tag) + bytes([11])\n"
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    emit = next(entry for entry in graph.function_table if entry.name == "emit")
+    packet = next(
+        entry.graph for entry in graph.function_table if entry.name == "packet"
+    )
+
+    kinds = _sequence_value_kinds(
+        packet.G,
+        return_sequence_kind_by_reference={emit.reference.address: "bytes"},
+    )
+    output_id = packet.G.graph["identity_table"]["result_0"][-1]
+
+    assert kinds[output_id] == "bytes"
+
+
 def test_hierarchical_control_inserts_call_inside_owner_loop_scope():
     child = PlanClosure(
         "child",
@@ -969,6 +1113,41 @@ def test_hierarchical_control_survives_value_alias_missing_from_table():
     updated, initial = composed.program.value_aliases[0]
     assert initial == table.global_id(planned.closure_id, 0)
     assert updated != initial
+
+
+def test_python_integer_chain_is_int64_before_backend_lowering():
+    region = PlanClosure(
+        "region_0",
+        captures=(1, 2),
+        items=(
+            PlanLine.create(
+                "int", inputs=(1,), outputs=(3,), input_roles=("arg:0",),
+            ),
+            PlanLine.create("Const", outputs=(4,), attributes={"value": 1}),
+            PlanLine.create("Sub", inputs=(3, 4), outputs=(5,)),
+            PlanLine.create("BitLength", inputs=(5,), outputs=(6,)),
+            PlanLine.create("Shl", inputs=(4, 6), outputs=(7,)),
+            PlanLine.create("min", inputs=(2, 7), outputs=(8,)),
+        ),
+        value_shapes=tuple(
+            (
+                value_id, (),
+                "int64" if value_id in {1, 2} else "float64",
+            )
+            for value_id in range(1, 9)
+        ),
+    )
+
+    instructions = plan_region_to_ssa_instrs(region)
+    dtypes = {
+        int(instruction.res.id): instruction.res.dtype
+        for instruction in instructions if instruction.res is not None
+    }
+
+    assert dtypes == {
+        3: "int64", 4: "int64", 5: "int64", 6: "int64",
+        7: "int64", 8: "int64",
+    }
 
 
 import ast

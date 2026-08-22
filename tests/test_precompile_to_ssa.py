@@ -8,25 +8,33 @@ from src.compiler.control_source import (
     ConditionalBlock,
     ControlProgram,
     ControlExpression,
+    ControlSequenceMutation,
     ControlUniform,
     LoopBlock,
     LoopControlBlock,
     ParallelDeployment,
     RecursionRegion,
     SequenceBlock,
+    SequenceMutationBlock,
+    SequenceQueryBlock,
     StatementBlock,
     StateMachineTick,
     WhileBlock,
     overlay_scheduled_control,
 )
 from src.compiler.precompile_to_ssa import (
+    _materialize_control_constants,
+    ResolvedSequenceSchema,
     find_ssa_cycles,
     lower_control_program_to_ssa,
     lower_class_navigation_to_ssa,
+    lower_fused_integral_to_repository_ssa,
     lower_fused_program_to_ssa,
     lower_precompile_and_control_to_ssa,
     lower_control_sections_to_ssa,
+    link_verified_source_region_integrals,
     merge_repository_ssa_modules,
+    resolve_sequence_schemas,
 )
 from src.compiler.ssa_fortran_backend import emit_module
 from src.compiler.shell_reference_tables import (
@@ -34,7 +42,7 @@ from src.compiler.shell_reference_tables import (
     ClassNavigationRecord,
     ClassNavigationTable,
 )
-from src.transmogrifier.ssa import IRModule
+from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
 from src.transmogrifier.function_table import ParameterContract
 
 
@@ -51,6 +59,87 @@ def _program(*steps):
             for value_id in value_ids
         },
     )
+
+
+def test_structural_integral_lowers_resident_mapping_store_not_numeric_slots():
+    program = FusedProgram(
+        version=1,
+        feeds={13, 19, 289},
+        steps=[OpStep(0, "IndexedStore", [289, 13, 19], {}, 290)],
+        outputs={"mutated": 290},
+        meta={},
+        extras={
+            "structural_resident_table_contract": {
+                "schema": "turing.structural-resident-table-integral.v1",
+                "sequences": [{
+                    "sequence_id": 289,
+                    "policy": "unique",
+                    "column_count": 2,
+                    "writable": True,
+                    "column_dtypes": ["int64", "int64"],
+                    "storage_identity": "Builder.external_values",
+                    "value_record": "SSAValue",
+                    "value_optional": True,
+                }],
+                "stores": [{
+                    "effect_value_id": 290,
+                    "key_value_id": 13,
+                    "stored_value_id": 19,
+                    "sequence_value_id": 289,
+                }],
+            },
+        },
+    )
+
+    module, outputs, exports, shortfalls = (
+        lower_fused_integral_to_repository_ssa(
+            program, function_name="restore_external_value",
+        )
+    )
+
+    assert shortfalls == ()
+    assert exports == ("restore_external_value",)
+    assert outputs == {"restore_external_value": ()}
+    function = module.functions["restore_external_value"]
+    calls = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+    ]
+    assert calls[0].attributes["ssa_sequence_operation"] == "table_store"
+    assert calls[0].attributes["callee"] in module.functions
+    assert module.sequence_tables["restore_external_value"].sequences[
+        289
+    ].column_dtypes == ("int64", "int64")
+    previous = next(value for value in function.args if value.id == 19)
+    assert previous.accounting == {
+        "structural_record_identity": "SSAValue",
+        "structural_record_handle": True,
+    }
+
+
+
+def test_control_wrapper_materializes_authored_constants_outside_its_abi():
+    dynamic = SSAValue(0, dtype="int")
+    literal = SSAValue(1, dtype="int")
+    result = SSAValue(2, dtype="int")
+    function = Function(
+        "control",
+        [dynamic, literal],
+        {"entry": BasicBlock("entry", [Instr("Add", [dynamic, literal], result)])},
+    )
+
+    _materialize_control_constants(
+        function, {1: 8}, value_dtypes={0: "int", 1: "int"},
+    )
+
+    assert [argument.id for argument in function.args] == [0]
+    instruction = function.blocks["entry"].instrs[0]
+    assert instruction.op == "Const"
+    assert instruction.res.id == 1
+    assert instruction.res.dtype == "int"
+    assert instruction.attributes == {"value": 8}
 
 
 def test_repeat_lowers_as_native_fortran_axis_tiling():
@@ -367,6 +456,31 @@ def test_structural_region_ops_are_ssa_values_and_indexes_are_legalized():
     assert "Store" in operations
 
 
+def test_index_dtype_propagation_is_scoped_per_function_identity():
+    from src.compiler.ir_indexing import lower_indexing_to_ssa_addressing
+
+    base = SSAValue(1, dtype="int64", shape=(3,))
+    index = SSAValue(2, dtype="int64")
+    loaded = SSAValue(3, dtype="float64")
+    region = Function(
+        "region", [base, index],
+        {"entry": BasicBlock("entry", [Instr("Indexed", [base, index], loaded)])},
+    )
+    aggregate = SSAValue(3, dtype="ssa.aggregate")
+    root = Function("root", [], {"entry": BasicBlock("entry", [])})
+    root.args.append(aggregate)
+
+    lower_indexing_to_ssa_addressing({"region": region, "root": root})
+
+    region_result = next(
+        instruction.res
+        for instruction in region.blocks["entry"].instrs
+        if instruction.op == "Load"
+    )
+    assert region_result.dtype == "int64"
+    assert aggregate.dtype == "ssa.aggregate"
+
+
 def test_record_field_getattr_becomes_a_loaded_region_capture():
     from src.compiler.hierarchical_plan import PlanClosure, PlanLine
 
@@ -408,6 +522,18 @@ def test_record_field_getattr_becomes_a_loaded_region_capture():
     assert shortfalls == ()
     region_function = module.functions["planned_control__planned_region_0"]
     assert [value.id for value in region_function.args] == [7, 6]
+    assert region_function.metadata["source_region_integral"] == {
+        "schema": "turing.source-region-integral.v1",
+        "owner": "planned_control",
+        "plan_name": "region_0",
+        "region_index": 0,
+        "closure_id": -1,
+        "identity_token_chain": (
+            "source-region", "planned_control", "closure:-1", "region_0",
+        ),
+        "capture_value_ids": (7, 6),
+        "output_value_ids": (8,),
+    }
     assert [instruction.op for instruction in region_function.blocks["entry"].instrs] == [
         "Add"
     ]
@@ -420,6 +546,94 @@ def test_record_field_getattr_becomes_a_loaded_region_capture():
     assert "getattr" not in control_operations
     assert "GetElementPtr" in control_operations
     assert "Load" in control_operations
+
+
+def test_verified_source_region_link_replaces_only_an_exact_structural_abi():
+    token_chain = (
+        "source-region", "planned_control", "closure:1", "region_0",
+    )
+    argument = SSAValue(1, dtype="float64")
+    result = SSAValue(2, dtype="float64")
+    metadata = {
+        "source_region_integral": {
+            "schema": "turing.source-region-integral.v1",
+            "identity_token_chain": token_chain,
+        },
+    }
+    current = Function(
+        "planned_control__planned_region_0", [argument],
+        {"entry": BasicBlock("entry", [Instr("Neg", [argument], result)])},
+        metadata=dict(metadata),
+    )
+    linked = Function(
+        current.name, [argument],
+        {"entry": BasicBlock("entry", [Instr("Abs", [argument], result)])},
+        metadata=dict(metadata),
+    )
+    module = IRModule({current.name: current})
+    outputs = {current.name: (result,)}
+    linked_module = IRModule({linked.name: linked})
+
+    receipts = link_verified_source_region_integrals(
+        module,
+        outputs,
+        {token_chain: (
+            linked_module,
+            {linked.name: (result,)},
+            {
+                "status": "verified",
+                "identity_token_chain": token_chain,
+                "probe_count": 3,
+            },
+        )},
+    )
+
+    assert receipts == ({
+        "ssa_function": current.name,
+        "identity_token_chain": list(token_chain),
+        "status": "linked",
+        "probe_count": 3,
+    },)
+    assert module.functions[current.name].blocks["entry"].instrs[0].op == "Abs"
+
+
+def test_stale_source_region_link_falls_back_to_current_source_lowering():
+    token_chain = (
+        "source-region", "planned_control", "closure:1", "region_0",
+    )
+    argument = SSAValue(1, dtype="float64")
+    result = SSAValue(2, dtype="float64")
+    current = Function(
+        "planned_control__planned_region_0", [argument],
+        {"entry": BasicBlock("entry", [Instr("Neg", [argument], result)])},
+        metadata={"source_region_integral": {
+            "identity_token_chain": token_chain,
+        }},
+    )
+    stale_argument = SSAValue(99, dtype="float64")
+    linked = Function(
+        current.name, [stale_argument], current.blocks,
+        metadata=current.metadata,
+    )
+    module = IRModule({current.name: current})
+
+    receipt, = link_verified_source_region_integrals(
+        module,
+        {current.name: (result,)},
+        {token_chain: (
+            IRModule({linked.name: linked}),
+            {linked.name: (result,)},
+            {
+                "status": "verified",
+                "identity_token_chain": token_chain,
+                "probe_count": 3,
+            },
+        )},
+    )
+
+    assert receipt["status"] == "fallback"
+    assert receipt["reason"] == "input-abi-mismatch"
+    assert module.functions[current.name] is current
 
 
 def test_repository_module_merge_retains_numerical_and_object_surfaces():
@@ -717,6 +931,288 @@ def test_cross_region_live_out_survives_local_consumption():
     assert [value.id for value in calls[1].args] == [10, 11]
 
 
+def test_generator_sequence_plan_call_is_scheduled_before_result_consumer():
+    from src.compiler.control_source import (
+        ControlProgram, ControlSequenceMutation, LoopBlock, SequenceBlock,
+        StatementBlock,
+    )
+    from src.compiler.hierarchical_plan import PlanCall, PlanClosure, PlanLine
+    from src.compiler.precompile_to_ssa import _schedule_loop_callsites
+
+    producer = LoopBlock(
+        "item", "0", "n", "1", SequenceBlock(()),
+        source_loop_node_id=204,
+        sequence_mutations=(ControlSequenceMutation(
+            215, "append", (108,), 205, policy="duplicates",
+        ),),
+    )
+    consumer = StatementBlock(("__scheduled_region_29__",))
+    hierarchy = PlanClosure("root", (), (
+        PlanCall(
+            206,
+            PlanClosure("vector", (0,), ()),
+            argument_bindings=((215, 0),),
+            result_bindings=((9, 206),),
+        ),
+        PlanClosure(
+            "region_29", (206,),
+            (PlanLine.create("Add", inputs=(206, 206), outputs=(207,)),),
+        ),
+    ))
+
+    scheduled, bindings = _schedule_loop_callsites(
+        ControlProgram(SequenceBlock((consumer, producer))),
+        hierarchy,
+        {29: ((206,), (207,))},
+        {29: ((206,), (207,))},
+    )
+
+    assert bindings[206] == ((215,), (206,))
+    assert scheduled.root.blocks == (
+        producer,
+        StatementBlock(("__plan_callsite_206__",)),
+        consumer,
+    )
+
+
+def test_mapping_update_lowers_to_existing_table_store_identity():
+    control = ControlProgram(LoopBlock(
+        "item", "0", "1", "1", SequenceBlock(()),
+        sequence_mutations=(ControlSequenceMutation(
+            20,
+            "update",
+            (21, 22),
+            23,
+            policy="unique",
+            argument_kind="mapping_items",
+        ),),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="mapping_update",
+        first_value_id=1000,
+        sequence_declarations=((20, "unique", 2, True),),
+        sequence_column_dtypes={20: ("int64", "float64")},
+    )
+    calls = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if str(instruction.op).casefold() == "call"
+    ]
+
+    assert shortfalls == ()
+    assert any(
+        instruction.attributes.get("ssa_sequence_operation") == "table_store"
+        for instruction in calls
+    )
+
+
+def test_mapping_setdefault_returns_initialized_child_table_handle():
+    control = ControlProgram(LoopBlock(
+        "item", "0", "1", "1", SequenceBlock(()),
+        sequence_mutations=(ControlSequenceMutation(
+            20,
+            "setdefault",
+            (21, 22),
+            23,
+            policy="unique",
+            argument_kind="mapping_setdefault",
+        ),),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="mapping_setdefault",
+        first_value_id=1000,
+        sequence_declarations=((20, "unique", 2, True),),
+        sequence_column_dtypes={20: ("int64", "int")},
+        resolved_sequence_schemas={20: ResolvedSequenceSchema(
+            column_count=2,
+            policy="unique",
+            writable=True,
+            retains_deleted_rows=True,
+            nested_table=True,
+            nested_value_dtype="int64",
+        )},
+    )
+    instructions = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+
+    assert shortfalls == ()
+    assert any(
+        instruction.attributes.get("ssa_sequence_operation")
+        == "setdefault_lookup"
+        for instruction in instructions
+    )
+    assert any(
+        instruction.attributes.get("ssa_sequence_operation") == "table_store"
+        for instruction in instructions
+    )
+    assert any(
+        instruction.res is not None
+        and instruction.res.id == 23
+        and str(instruction.op).casefold() == "phi"
+        for instruction in instructions
+    )
+
+
+def test_mapping_pop_none_lowers_to_typed_optional_lookup_then_delete():
+    control = ControlProgram(LoopBlock(
+        "item", "0", "1", "1", SequenceBlock(()),
+        sequence_mutations=(ControlSequenceMutation(
+            20,
+            "pop",
+            (21, 22),
+            23,
+            policy="unique",
+            argument_kind="mapping_pop_default_none",
+        ),),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="mapping_pop_none",
+        first_value_id=1000,
+        sequence_declarations=((20, "unique", 2, True),),
+        sequence_column_dtypes={20: ("int64", "int64")},
+        resolved_sequence_schemas={20: ResolvedSequenceSchema(
+            column_count=2,
+            policy="unique",
+            writable=True,
+            retains_deleted_rows=True,
+            nested_table=False,
+        )},
+    )
+    instructions = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+    calls = [
+        instruction for instruction in instructions
+        if str(instruction.op).casefold() == "call"
+    ]
+    defaults = [
+        instruction for instruction in instructions
+        if str(instruction.op).casefold() == "const"
+        and instruction.attributes.get("value") == -1
+    ]
+
+    assert shortfalls == ()
+    assert len(defaults) == 1
+    assert defaults[0].res.dtype == "int64"
+    assert any(
+        instruction.attributes.get("ssa_sequence_operation") == "lookup"
+        for instruction in calls
+    )
+    assert any(
+        instruction.attributes.get("ssa_sequence_operation") == "table_delete"
+        for instruction in calls
+    )
+
+
+def test_structural_dependency_chain_delays_early_sequence_mutation():
+    from src.compiler.control_source import (
+        ControlProgram, ControlSequenceMutation, LoopBlock, SequenceBlock,
+        SequenceMutationBlock, StatementBlock,
+    )
+    from src.compiler.hierarchical_plan import PlanCall, PlanClosure, PlanLine
+    from src.compiler.precompile_to_ssa import _schedule_loop_callsites
+
+    producer = LoopBlock(
+        "item", "0", "n", "1", SequenceBlock(()),
+        source_loop_node_id=204,
+        sequence_mutations=(ControlSequenceMutation(
+            215, "append", (108,), 205, policy="duplicates",
+        ),),
+    )
+    final_mutation = SequenceMutationBlock(ControlSequenceMutation(
+        188, "append", (208,), 209, policy="duplicates",
+    ))
+    region_29 = StatementBlock(("__scheduled_region_29__",))
+    region_30 = StatementBlock(("__scheduled_region_30__",))
+    hierarchy = PlanClosure("root", (), (
+        PlanCall(
+            206,
+            PlanClosure("vector", (0,), ()),
+            argument_bindings=((215, 0),),
+            result_bindings=((9, 206),),
+        ),
+        PlanClosure(
+            "region_29", (206,),
+            (PlanLine.create("Add", inputs=(206, 206), outputs=(207,)),),
+        ),
+        PlanClosure(
+            "region_30", (207,),
+            (PlanLine.create("Add", inputs=(207, 207), outputs=(208,)),),
+        ),
+    ))
+
+    scheduled, _bindings = _schedule_loop_callsites(
+        ControlProgram(SequenceBlock((
+            final_mutation, region_29, region_30, producer,
+        ))),
+        hierarchy,
+        {},
+        {
+            29: ((206,), (207,)),
+            30: ((207,), (208,)),
+        },
+    )
+
+    assert scheduled.root.blocks == (
+        producer,
+        StatementBlock(("__plan_callsite_206__",)),
+        region_29,
+        region_30,
+        final_mutation,
+    )
+
+
+def test_joined_generator_singleton_appends_scalar_without_temporary_sequence():
+    from src.compiler.control_source import (
+        ControlProgram, ControlSequenceMutation, LoopBlock, SequenceBlock,
+    )
+    from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
+
+    control = ControlProgram(LoopBlock(
+        "item", "0", "1", "1", SequenceBlock(()),
+        sequence_mutations=(ControlSequenceMutation(
+            215, "append", (108,), 205, policy="duplicates",
+        ),),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="joined_singleton",
+        first_value_id=1000,
+        sequence_declarations=((215, "duplicates", 1, True),),
+        joined_sequence_ids=(215,),
+        joined_singleton_values={108: 102},
+    )
+
+    calls = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if str(instruction.op).casefold() == "call"
+    ]
+    singleton = next(
+        instruction for instruction in calls
+        if instruction.attributes.get("ssa_sequence_operation")
+        == "append_joined_singleton"
+    )
+    assert shortfalls == ()
+    assert singleton.attributes["joined_source_sequence_id"] == 108
+    assert singleton.attributes["joined_source_value_id"] == 102
+    assert 108 not in function.metadata["sequence_table"].sequences
+
+
 def test_region_outputs_consume_exact_dispatch_boundary():
     from src.compiler.hierarchical_plan import PlanClosure, PlanLine
 
@@ -789,6 +1285,25 @@ def test_control_ssa_resolves_named_output_from_retained_id_history():
     assert function.metadata["parameter_names"] == ()
     assert function.metadata["control_ir"] is True
     assert [value.id for value in function.blocks["entry"].instrs[-1].args] == [7]
+
+
+def test_control_ssa_names_authored_parameter_used_by_structured_predicate():
+    control = ControlProgram(ConditionalBlock(
+        0,
+        SequenceBlock(()),
+        SequenceBlock(()),
+        predicate_expression=ControlExpression("value", value_id=0),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=10,
+        value_name_histories={"flag": (0,)},
+        parameter_names=("flag",),
+    )
+
+    assert shortfalls == ()
+    assert function.metadata["parameter_names"] == (("flag", 0),)
 
 
 def test_loop_collection_binding_is_indexed_store_after_region_publication():
@@ -1334,6 +1849,309 @@ def test_condition_loop_break_and_switch_default_lower_to_cfg_ssa():
     assert function.metadata["recursion_table"][4]["loops"][0][
         "domain"
     ] == "condition"
+
+
+def test_terminal_loop_return_runs_after_predicated_sequence_effects():
+    predicate = ControlExpression("value", value_id=10)
+    argument = ControlExpression(
+        "bitand",
+        (
+            ControlExpression("value", value_id=0),
+            ControlExpression("const", value_id=11, literal=127),
+        ),
+        value_id=12,
+    )
+    control = ControlProgram(WhileBlock(
+        predicate_value_id=20,
+        condition=SequenceBlock(()),
+        body=SequenceBlock(()),
+        predicate_expression=ControlExpression(
+            "const", value_id=20, literal=True
+        ),
+        sequence_mutations=(ControlSequenceMutation(
+            sequence_value_id=30,
+            operator="append",
+            argument_value_ids=(12,),
+            effect_node_id=40,
+            policy="duplicates",
+            predicate_expression=predicate,
+            argument_expressions=(argument,),
+        ),),
+        terminal_controls=(LoopControlBlock(
+            "break",
+            predicate_value_id=10,
+            expect_true=False,
+            predicate_expression=predicate,
+            source_action="loop-return",
+        ),),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(control)
+
+    assert shortfalls == ()
+    append_block = next(
+        block for block in function.blocks.values()
+        if any(
+            instruction.attributes.get("ssa_sequence_operation") == "append"
+            for instruction in block.instrs
+        )
+    )
+    return_block = next(
+        block for block in function.blocks.values()
+        if any(
+            instruction.attributes.get("source_control") == "loop-return"
+            for instruction in block.instrs
+        )
+    )
+    assert return_block.name.startswith("sequence_mutation_merge")
+    assert return_block.name in append_block.successors
+    assert 12 not in {value.id for value in function.args}
+
+
+def test_lexical_sequence_mutation_block_stays_inside_conditional_arm():
+    mutation = ControlSequenceMutation(
+        sequence_value_id=30,
+        operator="append",
+        argument_value_ids=(12,),
+        effect_node_id=40,
+        policy="duplicates",
+    )
+    control = ControlProgram(ConditionalBlock(
+        predicate_value_id=10,
+        body=SequenceBlock((SequenceMutationBlock(mutation),)),
+        orelse=SequenceBlock(()),
+        predicate_expression=ControlExpression(
+            "value", value_id=10
+        ),
+        source_node_id=50,
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(control)
+
+    assert shortfalls == ()
+    append_site = next(
+        (block.name, instruction)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("source_effect_node_id") == 40
+    )
+    assert append_site[0].startswith("if_true")
+    assert append_site[1].attributes["ssa_sequence_operation"] == "append"
+
+
+def test_conditional_sequence_assignment_replaces_one_resident_arena():
+    control = ControlProgram(ConditionalBlock(
+        predicate_value_id=10,
+        body=SequenceBlock(()),
+        orelse=SequenceBlock(()),
+        predicate_expression=ControlExpression("value", value_id=10),
+        carried_sequence_aliases=((31, 30, 30, 32),),
+        source_node_id=50,
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        sequence_initializations=(
+            (30, "duplicates", 1),
+            (31, "duplicates", 1),
+        ),
+        sequence_declarations=(
+            (30, "duplicates", 1, True),
+            (31, "duplicates", 1, False),
+        ),
+        value_aliases={32: 30},
+        plan_callsite_bindings={99: ((12,), (31,))},
+    )
+
+    assert shortfalls == ()
+    replacements = [
+        (block.name, instruction)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("ssa_sequence_operation") == "replace"
+    ]
+    assert len(replacements) == 1
+    assert replacements[0][0].startswith("if_true")
+    planned_call = next(
+        (block.name, instruction)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("plan_callsite_id") == 99
+    )
+    assert planned_call[0].startswith("if_true")
+    assert any(
+        instruction.attributes.get("binding")
+        == "ssa_sequence_replace_clear"
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+    assert not any(
+        instruction.op == "Phi"
+        and instruction.attributes.get("binding") == "conditional_carried"
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+
+
+def test_sequence_first_or_default_query_is_resident_and_receipted():
+    control = ControlProgram(SequenceBlock((
+        SequenceMutationBlock(ControlSequenceMutation(
+            sequence_value_id=30,
+            operator="append",
+            argument_value_ids=(12,),
+            effect_node_id=40,
+            policy="duplicates",
+        )),
+        SequenceQueryBlock(
+            result_value_id=50,
+            sequence_value_id=30,
+            operation="first_or_default",
+            default_value_id=13,
+            source_call_node_id=41,
+            extraction_identity="builtins.next",
+            result_alias_ids=(51,),
+        ),
+    )))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        sequence_initializations=((30, "duplicates", 1),),
+        sequence_declarations=((30, "duplicates", 1, True),),
+    )
+
+    assert shortfalls == ()
+    query_phi = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None and instruction.res.id == 50
+    )
+    assert query_phi.op == "Phi"
+    assert query_phi.attributes["extraction_identity"] == "builtins.next"
+    assert 50 not in {value.id for value in function.args}
+    assert 51 not in {value.id for value in function.args}
+
+
+def test_fixed_width_sequence_append_passes_every_row_column():
+    control = ControlProgram(SequenceBlock((
+        SequenceMutationBlock(ControlSequenceMutation(
+            sequence_value_id=30,
+            operator="append",
+            argument_value_ids=(12, 13),
+            effect_node_id=40,
+            policy="duplicates",
+            argument_kind="row",
+        )),
+    )))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        sequence_initializations=((30, "duplicates", 2),),
+        sequence_declarations=((30, "duplicates", 2, True),),
+    )
+
+    assert shortfalls == ()
+    append = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("ssa_sequence_operation") == "append"
+    )
+    assert tuple(value.id for value in append.args[-2:]) == (12, 13)
+
+
+def test_local_sequence_lifetime_resets_without_erasing_source_sequence():
+    function, shortfalls = lower_control_program_to_ssa(
+        ControlProgram(SequenceBlock(())),
+        sequence_declarations=(
+            (30, "duplicates", 1, True),
+            (40, "duplicates", 1, True),
+        ),
+        source_sequence_ids=(30,),
+    )
+
+    assert shortfalls == ()
+    initialized = {
+        int(instruction.attributes["sequence_id"])
+        for instruction in function.blocks["entry"].instrs
+        if instruction.attributes.get("binding")
+        == "ssa_local_sequence_initialize"
+    }
+    assert initialized == {40}
+
+
+def test_compile_time_mapping_initializes_a_typed_local_table():
+    function, shortfalls = lower_control_program_to_ssa(
+        ControlProgram(SequenceBlock(())),
+        sequence_declarations=((30, "unique", 2, False),),
+        sequence_initializations=((
+            30, "literal_table=((101, 127), (202, 126))", 2,
+        ),),
+        sequence_column_dtypes={30: ("int64", "int64")},
+    )
+
+    assert shortfalls == ()
+    entry = function.blocks["entry"].instrs
+    literal_stores = [
+        instruction for instruction in entry
+        if instruction.attributes.get("binding")
+        == "ssa_sequence_literal_table"
+        and instruction.op == "Store"
+    ]
+    assert len(literal_stores) == 4
+    assert all(instruction.args[0].dtype == "int64"
+               for instruction in literal_stores)
+    assert any(
+        instruction.attributes.get("binding")
+        == "ssa_sequence_literal_table_length"
+        for instruction in entry
+    )
+
+
+def test_literal_table_initialization_agrees_with_unique_declaration():
+    schemas, shortfalls = resolve_sequence_schemas(({
+        "sequence_declarations": ((30, "unique", 2, False),),
+        "sequence_initializations": ((
+            30, "literal_table=((101, 127),)", 2,
+        ),),
+    },))
+
+    assert shortfalls == ()
+    assert schemas[30].policy == "unique"
+    assert schemas[30].column_count == 2
+
+
+def test_resident_iterable_loop_uses_logical_length_not_storage_extent():
+    control = ControlProgram(LoopBlock(
+        induction="iteration_9",
+        start="0",
+        stop="__iterable_extent_30__",
+        step="1",
+        body=SequenceBlock(()),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        sequence_declarations=((30, "duplicates", 1, False),),
+        source_sequence_ids=(30,),
+    )
+
+    assert shortfalls == ()
+    length_loads = [
+        instruction
+        for instruction in function.blocks["entry"].instrs
+        if instruction.op == "Load"
+        and instruction.attributes.get("binding")
+        == "resident_iterable_length"
+    ]
+    assert len(length_loads) == 1
+    assert length_loads[0].attributes["sequence_id"] == 30
+    assert not any(
+        instruction.op == "Call"
+        and instruction.attributes.get("binding") == "iterable_extent"
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
 
 
 def test_sequence_while_condition_reloads_length_at_latch():

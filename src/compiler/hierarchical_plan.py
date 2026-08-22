@@ -90,6 +90,8 @@ TENSOR_OPERATION_SCALAR_SPELLING: dict[str, str] = {
     "less_equal": "Le", "greater": "Gt", "greater_equal": "Ge",
     "logical_and": "LAnd", "logical_or": "LOr",
     "logical_not": "LNot", "maximum": "Max", "minimum": "Min",
+    "bitand": "BitAnd", "bitor": "BitOr", "bitxor": "BitXor",
+    "shl": "Shl", "shr": "Shr", "invert": "Invert",
     "sqrt": "Sqrt", "exp": "Exp", "log": "Log",
 }
 
@@ -137,12 +139,99 @@ def plan_region_to_ssa_instrs(
         "land", "logical_and", "lor", "logical_or", "lnot",
         "logical_not", "is", "is_not", "contains", "not_contains",
     }
-    integer_result_ops = {"len", "length", "extent"}
+    integer_result_ops = {
+        "len", "length", "extent", "bitlength", "bit_length",
+    }
     scalar_cast_dtypes = {
         "float": "float64",
-        "int": "int",
+        # Python ``int`` is not the backend's C ``int``.  Repository SSA uses
+        # the widest portable signed scalar ABI for authored Python integers;
+        # wrappers retain authored fallback for values outside that domain.
+        "int": "int64",
         "bool": "bool",
     }
+
+    def semantic_input_ids(item: PlanLine) -> tuple[int, ...]:
+        if len(item.input_roles) != len(item.inputs):
+            return tuple(map(int, item.inputs))
+        return tuple(
+            int(value_id)
+            for value_id, role in zip(
+                item.inputs, item.input_roles, strict=True,
+            )
+            if str(role).casefold() not in {
+                "callee", "func", "function", "definition",
+                "operator", "operator_reference",
+            }
+        )
+
+    def promoted_numeric_dtype(value_ids: tuple[int, ...]) -> str | None:
+        candidates = {
+            str(dtype_of.get(int(value_id)) or "")
+            for value_id in value_ids
+        }
+        if candidates.intersection({
+            "float", "float16", "float32", "float64", "double",
+            "f16", "f32", "f64",
+        }):
+            return "float64"
+        if candidates.intersection({"int64", "i64"}):
+            return "int64"
+        if candidates.intersection({"int", "int32", "i32"}):
+            return "int"
+        if candidates == {"bool"}:
+            return "bool"
+        return None
+
+    # Refine permissive graph-domain defaults using authored scalar operator
+    # semantics before constructing any SSAValue.  Iterate because a chain
+    # such as int(record[index]) -> min -> shift must carry the corrected
+    # integer width through every intermediate, independent of node order.
+    dtype_preserving_ops = {
+        "add", "sub", "mul", "floordiv", "mod", "pow", "neg", "abs",
+        "min", "max", "minimum", "maximum", "bitand", "bitor",
+        "bitxor", "shl", "shr", "invert",
+    }
+    projection_ops = {
+        "indexed", "getitem", "get_item", "subscript", "load",
+    }
+    for _ in range(max(1, len(region.items))):
+        changed = False
+        for item in region.items:
+            if not isinstance(item, PlanLine) or not item.outputs:
+                continue
+            output_id = int(item.outputs[0])
+            opcode = str(item.opcode).casefold()
+            inferred: str | None = None
+            if opcode in {"const", "constant"}:
+                literal = dict(item.attributes).get("value")
+                inferred = (
+                    "bool" if isinstance(literal, bool)
+                    else "int64" if isinstance(literal, int)
+                    else "float64" if isinstance(literal, float)
+                    else None
+                )
+            elif opcode in predicate_ops:
+                inferred = "bool"
+            elif opcode in integer_result_ops:
+                inferred = "int64"
+            elif opcode in scalar_cast_dtypes:
+                inferred = scalar_cast_dtypes[opcode]
+            elif opcode in {"truediv", "div"}:
+                inferred = "float64"
+            elif opcode in dtype_preserving_ops:
+                inferred = promoted_numeric_dtype(semantic_input_ids(item))
+            elif opcode in projection_ops:
+                sources = semantic_input_ids(item)
+                inferred = (
+                    None if not sources else dtype_of.get(int(sources[0]))
+                )
+            if inferred is not None and dtype_of.get(output_id) != inferred:
+                dtype_of[output_id] = inferred
+                changed = True
+        if not changed:
+            break
+
     for item in region.items:
         if not isinstance(item, PlanLine):
             continue
@@ -152,13 +241,13 @@ def plan_region_to_ssa_instrs(
             if isinstance(literal, bool):
                 dtype_of[int(item.outputs[0])] = "bool"
             elif isinstance(literal, int):
-                dtype_of[int(item.outputs[0])] = "int"
+                dtype_of[int(item.outputs[0])] = "int64"
             elif isinstance(literal, float):
                 dtype_of[int(item.outputs[0])] = "float64"
         if item.outputs and opcode in predicate_ops:
             dtype_of[int(item.outputs[0])] = "bool"
         elif item.outputs and opcode in integer_result_ops:
-            dtype_of[int(item.outputs[0])] = "int"
+            dtype_of[int(item.outputs[0])] = "int64"
         elif item.outputs and opcode in scalar_cast_dtypes:
             dtype_of[int(item.outputs[0])] = scalar_cast_dtypes[opcode]
         if opcode == "getelementptr":
@@ -167,7 +256,7 @@ def plan_region_to_ssa_instrs(
             # key retains any authored type and is lowered through a table.
             index_inputs = item.inputs[1:]
             for value_id in index_inputs:
-                dtype_of[int(value_id)] = "int"
+                dtype_of[int(value_id)] = "int64"
 
     def value(value_id: int) -> SSAValue:
         value_id = int(value_id)
@@ -232,18 +321,13 @@ def plan_region_to_ssa_instrs(
         # happens to carry a CPython function object in operand zero.
         paired_inputs = tuple(zip(item.inputs, item.input_roles))
         if len(item.input_roles) == len(item.inputs):
-            semantic_inputs = tuple(
-                int(value_id)
-                for value_id, role in paired_inputs
-                if str(role).casefold() not in {
-                    "callee", "func", "function", "definition",
-                }
-            )
+            semantic_inputs = semantic_input_ids(item)
             semantic_roles = tuple(
                 str(role)
                 for _value_id, role in paired_inputs
                 if str(role).casefold() not in {
                     "callee", "func", "function", "definition",
+                    "operator", "operator_reference",
                 }
             )
         else:

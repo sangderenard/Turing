@@ -24,6 +24,7 @@ from ..common.tensors.fused_ir import (
     Meta,
     OpStep,
     canonical_elementwise_op,
+    flatten_tensor_constant,
     ordered_feed_ids,
     uniform_tensor_constant,
 )
@@ -1100,10 +1101,23 @@ def plan_process_graph_dispatches(
         raise ValueError(
             "fusion planning requires loop structure to be normalized first"
         )
+    def has_only_numeric_constant_operands(node_id: int) -> bool:
+        for parent_id, _role in graph.G.nodes[node_id].get("parents") or ():
+            if _operation(graph, int(parent_id)) != "const":
+                continue
+            try:
+                flatten_tensor_constant(
+                    graph.G.nodes[int(parent_id)].get("constant")
+                )
+            except (TypeError, ValueError):
+                return False
+        return True
+
     fusible = {
         node_id
         for node_id in graph.G
         if _operation(graph, node_id) in profile.fusible_ops
+        and has_only_numeric_constant_operands(int(node_id))
     }
     induced = graph.G.subgraph(fusible)
     components = list(nx.weakly_connected_components(induced))

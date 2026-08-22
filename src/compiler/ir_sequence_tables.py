@@ -51,6 +51,102 @@ class SSASequenceLowering:
         return not self.shortfalls
 
 
+def schedule_joined_sequence_mutations(function: Function) -> int:
+    """Place a list-of-bytes dual-view update after its source is complete.
+
+    Sequence concatenation is itself lowered into resident reset/append-slice
+    operations. A joined-list append that consumes that result must follow
+    those operations in the same CFG compartment; source position alone is
+    insufficient because the concatenation has no standalone control block.
+    This pass moves only a proven local unit and never crosses a basic-block
+    boundary.
+    """
+
+    moved = 0
+    for block in function.blocks.values():
+        index = 0
+        while index < len(block.instrs):
+            extend = block.instrs[index]
+            attributes = extend.attributes or {}
+            if (
+                extend.op not in {"Call", "call"}
+                or attributes.get("ssa_sequence_operation")
+                != "extend_joined_bytes"
+                or attributes.get("joined_source_sequence_id") is None
+            ):
+                index += 1
+                continue
+            source_sequence_id = int(
+                attributes["joined_source_sequence_id"]
+            )
+            effect_id = attributes.get("source_effect_node_id")
+            count_index = next((
+                candidate
+                for candidate in range(index - 1, -1, -1)
+                if (
+                    block.instrs[candidate].attributes.get(
+                        "ssa_sequence_operation"
+                    ) == "append_joined_count"
+                    and block.instrs[candidate].attributes.get(
+                        "source_effect_node_id"
+                    ) == effect_id
+                )
+            ), None)
+            if count_index is None:
+                index += 1
+                continue
+            unit_results = {
+                int(instruction.res.id)
+                for instruction in block.instrs[count_index:index + 1]
+                if instruction.res is not None
+            }
+            unit_end = index + 1
+            while unit_end < len(block.instrs) and (
+                block.instrs[unit_end].op in {"Store", "store"}
+                and any(
+                    int(argument.id) in unit_results
+                    for argument in block.instrs[unit_end].args
+                )
+            ):
+                unit_end += 1
+            source_indices = [
+                candidate
+                for candidate, instruction in enumerate(block.instrs)
+                if candidate >= unit_end
+                and int(instruction.attributes.get("sequence_id", -1))
+                == source_sequence_id
+            ]
+            if not source_indices:
+                index = unit_end
+                continue
+            source_end = max(source_indices) + 1
+            source_results = {
+                int(block.instrs[candidate].res.id)
+                for candidate in source_indices
+                if block.instrs[candidate].res is not None
+            }
+            while source_end < len(block.instrs) and any(
+                int(argument.id) in source_results
+                for argument in block.instrs[source_end].args
+            ):
+                if block.instrs[source_end].res is not None:
+                    source_results.add(int(block.instrs[source_end].res.id))
+                source_end += 1
+            unit = block.instrs[count_index:unit_end]
+            del block.instrs[count_index:unit_end]
+            insertion = source_end - len(unit)
+            for instruction in unit:
+                instruction.attributes["joined_sequence_scheduled_after_source"] = (
+                    source_sequence_id
+                )
+            block.instrs[insertion:insertion] = unit
+            moved += 1
+            index = insertion + len(unit)
+    if moved:
+        function.metadata["scheduled_joined_sequence_mutations"] = moved
+    return moved
+
+
 class _Builder:
     def __init__(self, first_value_id: int) -> None:
         self.next_value_id = int(first_value_id)
@@ -105,6 +201,69 @@ class _Builder:
             },
         )
         block.successors.extend((if_true.name, if_false.name))
+
+
+def _child_pool_identity_ids(
+    pool: SSAChildTablePoolDescriptor | None,
+) -> tuple[int, ...]:
+    """Return every SSA identity reserved by a child-table descriptor."""
+
+    if pool is None:
+        return ()
+    return tuple(int(value_id) for value_id in (
+        *pool.column_value_ids,
+        pool.length_value_id,
+        pool.capacity_value_id,
+        pool.row_stride_value_id,
+        *((pool.status_value_id,) if pool.status_value_id is not None else ()),
+        *((pool.live_flags_value_id,) if pool.live_flags_value_id is not None else ()),
+    ))
+
+
+def _sequence_descriptor_identity_ids(
+    descriptor: SSASequenceDescriptor,
+) -> tuple[int, ...]:
+    """Return storage and compile-time identities owned by a descriptor.
+
+    Some identities, notably status cells and the sequence's own identity, are
+    not arguments of every generated helper.  They still occupy the enclosing
+    program's deterministic SSA namespace and therefore must never be minted
+    again for a helper-local value.
+    """
+
+    return tuple(int(value_id) for value_id in (
+        descriptor.sequence_id,
+        *descriptor.column_value_ids,
+        descriptor.length_address_id,
+        descriptor.capacity_value_id,
+        *((descriptor.status_address_id,) if descriptor.status_address_id is not None else ()),
+        *((descriptor.live_flags_value_id,) if descriptor.live_flags_value_id is not None else ()),
+        *_child_pool_identity_ids(descriptor.child_table_pool),
+    ))
+
+
+def _first_fresh_identity(
+    *descriptors: SSASequenceDescriptor,
+    values: tuple[SSAValue, ...] = (),
+    pools: tuple[SSAChildTablePoolDescriptor, ...] = (),
+    minimum: int | None = None,
+) -> int:
+    """Choose the deterministic first ID above every identity in scope."""
+
+    reserved = {
+        *(value.id for value in values),
+        *(
+            value_id
+            for descriptor in descriptors
+            for value_id in _sequence_descriptor_identity_ids(descriptor)
+        ),
+        *(
+            value_id
+            for pool in pools
+            for value_id in _child_pool_identity_ids(pool)
+        ),
+    }
+    return max(max(reserved, default=-1) + 1, int(minimum or 0))
 
 
 def _storage_values(
@@ -170,6 +329,7 @@ def lower_sequence_insert(
     *,
     function_name: str | None = None,
     operation: str = "insert",
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Build fixed-capacity row insertion with optional linear key dedup.
 
@@ -182,8 +342,9 @@ def lower_sequence_insert(
         return unsupported
 
     storage = _storage_values(descriptor)
-    first_id = max((value.id for value in storage), default=-1) + 1
-    builder = _Builder(first_id)
+    builder = _Builder(_first_fresh_identity(
+        descriptor, values=storage, minimum=first_value_id
+    ))
     row_values = tuple(
         builder.fresh(dtype)
         for dtype in descriptor.column_dtypes
@@ -340,6 +501,7 @@ def lower_sequence_append(
     descriptor: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Lower source ``append`` through the shared destination insertion policy."""
 
@@ -347,6 +509,7 @@ def lower_sequence_append(
         descriptor,
         function_name=function_name,
         operation="append",
+        first_value_id=first_value_id,
     )
 
 
@@ -354,6 +517,7 @@ def lower_sequence_add(
     descriptor: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Lower source ``add`` through the same storage, retaining key dedup."""
 
@@ -361,6 +525,7 @@ def lower_sequence_add(
         descriptor,
         function_name=function_name,
         operation="add",
+        first_value_id=first_value_id,
     )
 
 
@@ -368,6 +533,7 @@ def lower_sequence_fill(
     descriptor: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Fill a caller arena with one repeated value and publish its length."""
 
@@ -377,7 +543,9 @@ def lower_sequence_fill(
     if len(descriptor.column_value_ids) != 1 or descriptor.key_columns:
         raise ValueError("sequence fill requires one duplicate-policy column")
     storage = _storage_values(descriptor)
-    builder = _Builder(max(value.id for value in storage) + 1)
+    builder = _Builder(_first_fresh_identity(
+        descriptor, values=storage, minimum=first_value_id
+    ))
     value = builder.fresh(descriptor.column_dtypes[0])
     requested = builder.fresh("int")
     entry = builder.block("entry")
@@ -439,6 +607,7 @@ def lower_sequence_append_fill(
     descriptor: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Append one repeated value without discarding resident rows."""
 
@@ -450,7 +619,9 @@ def lower_sequence_append_fill(
             "sequence append-fill requires one duplicate-policy column"
         )
     storage = _storage_values(descriptor)
-    builder = _Builder(max(value.id for value in storage) + 1)
+    builder = _Builder(_first_fresh_identity(
+        descriptor, values=storage, minimum=first_value_id
+    ))
     value = builder.fresh(descriptor.column_dtypes[0])
     requested = builder.fresh("int")
     entry = builder.block("entry")
@@ -520,6 +691,7 @@ def lower_sequence_append_slice(
     source: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Append a unit-stride source slice to resident destination storage.
 
@@ -547,7 +719,9 @@ def lower_sequence_append_slice(
         value.id: value
         for value in (*destination_storage, *source_storage)
     }.values())
-    builder = _Builder(max(value.id for value in all_storage) + 1)
+    builder = _Builder(_first_fresh_identity(
+        destination, source, values=all_storage, minimum=first_value_id
+    ))
     lower = builder.fresh("int")
     upper = builder.fresh("int")
     entry = builder.block("entry")
@@ -759,6 +933,7 @@ def lower_sequence_pack_bits(
     source: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Pack a 0/1 byte sequence into little-endian fixed-width words."""
 
@@ -775,7 +950,9 @@ def lower_sequence_pack_bits(
         value.id: value
         for value in (*_storage_values(destination), *_storage_values(source))
     }.values())
-    builder = _Builder(max(value.id for value in storage) + 1)
+    builder = _Builder(_first_fresh_identity(
+        destination, source, values=storage, minimum=first_value_id
+    ))
     width = builder.fresh("int")
     entry = builder.block("entry")
     outer_header = builder.block("word_header")
@@ -905,6 +1082,7 @@ def lower_sequence_prepend(
     descriptor: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Insert one scalar at index zero by shifting resident rows right."""
 
@@ -914,7 +1092,9 @@ def lower_sequence_prepend(
     if len(descriptor.column_value_ids) != 1 or descriptor.key_columns:
         raise ValueError("sequence prepend requires one duplicate-policy column")
     storage = _storage_values(descriptor)
-    builder = _Builder(max(value.id for value in storage) + 1)
+    builder = _Builder(_first_fresh_identity(
+        descriptor, values=storage, minimum=first_value_id
+    ))
     value = builder.fresh(descriptor.column_dtypes[0])
     entry = builder.block("entry")
     header = builder.block("shift_header")
@@ -997,6 +1177,7 @@ def lower_sequence_prepend_packed_bytes(
     source: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Prepend one scalar and a packed little-endian byte sequence."""
 
@@ -1015,7 +1196,9 @@ def lower_sequence_prepend_packed_bytes(
         value.id: value
         for value in (*_storage_values(destination), *_storage_values(source))
     }.values())
-    builder = _Builder(max(value.id for value in storage) + 1)
+    builder = _Builder(_first_fresh_identity(
+        destination, source, values=storage, minimum=first_value_id
+    ))
     prefix = builder.fresh(destination.column_dtypes[0])
     byte_width = builder.fresh("int")
     entry = builder.block("entry")
@@ -1199,13 +1382,16 @@ def lower_sequence_contains(
     descriptor: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Build a key-column membership scan returning one boolean value."""
 
     if not descriptor.key_columns:
         raise ValueError("sequence membership requires at least one key column")
     storage = _storage_values(descriptor)
-    builder = _Builder(max((value.id for value in storage), default=-1) + 1)
+    builder = _Builder(_first_fresh_identity(
+        descriptor, values=storage, minimum=first_value_id
+    ))
     key_dtypes = tuple(
         descriptor.column_dtypes[column] for column in descriptor.key_columns
     )
@@ -1317,6 +1503,7 @@ def lower_table_lookup(
     *,
     function_name: str | None = None,
     default_parameter: bool = False,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Build key lookup for a two-column table and publish found status.
 
@@ -1335,7 +1522,9 @@ def lower_table_lookup(
         raise ValueError("table lookup requires a caller-visible status cell")
     storage = _storage_values(descriptor)
     status_arena = SSAValue(descriptor.status_address_id, dtype="int", shape=(1,))
-    builder = _Builder(max((*[value.id for value in storage], status_arena.id)) + 1)
+    builder = _Builder(_first_fresh_identity(
+        descriptor, values=(*storage, status_arena), minimum=first_value_id
+    ))
     key_dtypes = tuple(
         descriptor.column_dtypes[column] for column in descriptor.key_columns
     )
@@ -1452,6 +1641,7 @@ def lower_table_store(
     descriptor: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Build update-existing-or-insert for a two-column fixed table."""
 
@@ -1468,7 +1658,9 @@ def lower_table_store(
         raise ValueError("table store requires a caller-visible status cell")
     storage = _storage_values(descriptor)
     status_arena = SSAValue(descriptor.status_address_id, dtype="int", shape=(1,))
-    builder = _Builder(max((*[value.id for value in storage], status_arena.id)) + 1)
+    builder = _Builder(_first_fresh_identity(
+        descriptor, values=(*storage, status_arena), minimum=first_value_id
+    ))
     key_dtypes = tuple(
         descriptor.column_dtypes[column] for column in descriptor.key_columns
     )
@@ -1601,6 +1793,7 @@ def lower_table_delete(
     descriptor: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Build key deletion by clearing the table's caller-owned live flag.
 
@@ -1623,7 +1816,9 @@ def lower_table_delete(
         raise ValueError("table delete requires caller-visible live flags")
     storage = _storage_values(descriptor)
     status_arena = SSAValue(descriptor.status_address_id, dtype="int", shape=(1,))
-    builder = _Builder(max((*[value.id for value in storage], status_arena.id)) + 1)
+    builder = _Builder(_first_fresh_identity(
+        descriptor, values=(*storage, status_arena), minimum=first_value_id
+    ))
     key_dtypes = tuple(
         descriptor.column_dtypes[column] for column in descriptor.key_columns
     )
@@ -1716,6 +1911,7 @@ def lower_table_delete_first(
     descriptor: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Delete the first live row, matching ``del table[next(iter(table))]``."""
 
@@ -1726,7 +1922,9 @@ def lower_table_delete_first(
         raise ValueError("first-row deletion requires status and live arenas")
     storage = _storage_values(descriptor)
     status_arena = SSAValue(descriptor.status_address_id, dtype="int", shape=(1,))
-    builder = _Builder(max((*[value.id for value in storage], status_arena.id)) + 1)
+    builder = _Builder(_first_fresh_identity(
+        descriptor, values=(*storage, status_arena), minimum=first_value_id
+    ))
     entry = builder.block("entry")
     header = builder.block("delete_header")
     body = builder.block("delete_body")
@@ -1792,6 +1990,7 @@ def lower_child_table_delete(
     pool: SSAChildTablePoolDescriptor,
     *,
     function_name: str,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Clear one key in the child slice selected by an explicit handle."""
 
@@ -1806,7 +2005,9 @@ def lower_child_table_delete(
         pool.live_flags_value_id,
     )
     storage = [SSAValue(int(value_id)) for value_id in storage_ids]
-    builder = _Builder(max(storage_ids) + 1)
+    builder = _Builder(_first_fresh_identity(
+        pools=(pool,), minimum=first_value_id
+    ))
     handle = builder.fresh("int")
     query = builder.fresh(pool.column_dtypes[0] if pool.column_dtypes else "unknown")
     entry = builder.block("entry")
@@ -1886,6 +2087,7 @@ def lower_sequence_extend(
     source: SSASequenceDescriptor,
     *,
     function_name: str | None = None,
+    first_value_id: int | None = None,
 ) -> SSASequenceLowering:
     """Lower extend to source iteration plus the destination's insert policy."""
 
@@ -1896,7 +2098,11 @@ def lower_sequence_extend(
         raise ValueError("sequence extend requires matching row widths")
 
     insert_name = f"ssa_sequence_{destination.sequence_id}_insert"
-    insert_lowering = lower_sequence_insert(destination, function_name=insert_name)
+    insert_lowering = lower_sequence_insert(
+        destination,
+        function_name=insert_name,
+        first_value_id=first_value_id,
+    )
     if not insert_lowering.complete:
         return insert_lowering
 
@@ -1905,7 +2111,25 @@ def lower_sequence_extend(
     all_storage = tuple({value.id: value for value in (
         *destination_storage, *source_storage
     )}.values())
-    builder = _Builder(max((value.id for value in all_storage), default=-1) + 1)
+    insert_ids = {
+        value.id
+        for function in insert_lowering.functions
+        for value in (
+            *function.args,
+            *(
+                instruction.res
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.res is not None
+            ),
+        )
+    }
+    builder = _Builder(_first_fresh_identity(
+        destination,
+        source,
+        values=all_storage,
+        minimum=max(insert_ids, default=(first_value_id or -1) - 1) + 1,
+    ))
     entry = builder.block("entry")
     header = builder.block("extend_header")
     body = builder.block("extend_body")
@@ -2033,13 +2257,22 @@ def lower_sequence_aggregate_constants(
     functions: dict[str, Function],
     sequence_tables: dict[str, SSASequenceTable],
 ) -> None:
-    """Replace proven empty collection literals with caller-provided arenas.
+    """Replace structural collection literals with their proven SSA arenas.
 
     An empty list/set constructor is metadata plus storage allocation, not a
     scalar literal a numerical backend can print.  Once a sequence descriptor
     proves that value is mutable row storage, remove only its empty aggregate
     ``Const`` and expose the same SSA value as an arena argument.  Non-empty
-    aggregates and values without a sequence descriptor are untouched.
+    aggregates normally remain untouched.
+
+    A compile-time table is the other exact case: its ``literal_table`` setup
+    has already emitted ordinary per-column stores into a frame arena.  The
+    original Python ``dict``/``set`` value is then structural provenance, not
+    a second runtime value.  Replace that aggregate ``Const`` with the same
+    explicit arena argument used by other compiler-local sequences, but only
+    when the same function contains the marked literal-table initialization
+    for that exact arena identity.  The emitted runtime binding allocates the
+    frame; the retained stores populate it on every invocation.
     """
 
     arena_ids = {
@@ -2051,6 +2284,16 @@ def lower_sequence_aggregate_constants(
     if not arena_ids:
         return
     for function in functions.values():
+        locally_initialized_arena_ids = {
+            int(instruction.args[0].id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in {"GetElementPtr", "getelementptr"}
+            and instruction.args
+            and instruction.attributes.get("binding")
+            in {"ssa_sequence_literal_table", "ssa_sequence_literal_bytes"}
+            and int(instruction.args[0].id) in arena_ids
+        }
         promoted: dict[int, SSAValue] = {}
         for block in function.blocks.values():
             rewritten = []
@@ -2063,8 +2306,24 @@ def lower_sequence_aggregate_constants(
                     and instruction.res is not None
                     and int(instruction.res.id) in arena_ids
                     and isinstance(literal, (list, tuple, set, dict))
-                    and len(literal) == 0
                 ):
+                    value_id = int(instruction.res.id)
+                    if value_id in locally_initialized_arena_ids:
+                        # The marked stores are the executable value. Keeping
+                        # the authored aggregate as a scalar Const asks every
+                        # backend to print a Python container as one literal.
+                        promoted[value_id] = SSAValue(
+                            value_id,
+                            dtype=instruction.res.dtype or "unknown",
+                            accounting={
+                                "sequence_arena": True,
+                                "compile_time_initialized": True,
+                            },
+                        )
+                        continue
+                    if len(literal) != 0:
+                        rewritten.append(instruction)
+                        continue
                     promoted[int(instruction.res.id)] = SSAValue(
                         int(instruction.res.id),
                         dtype=instruction.res.dtype or "unknown",
@@ -2095,6 +2354,7 @@ __all__ = [
     "lower_sequence_contains",
     "lower_sequence_extend",
     "lower_sequence_insert",
+    "schedule_joined_sequence_mutations",
     "lower_table_lookup",
     "lower_table_delete",
     "lower_table_delete_first",

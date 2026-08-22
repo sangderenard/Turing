@@ -201,27 +201,182 @@ class ProgramABIField:
     #: arithmetic is compiled as scalar arithmetic, which is the wrong program
     #: for a tensor and reports no shortfall while being so.
     shape: tuple[int, ...] | None = None
+    # Exact schema named by ``storage: record``.  A nested record is a
+    # structural correlation, not an opaque Python reference: its leaf fields
+    # remain the physical values that cross the native boundary.
+    record: str | None = None
+    # Interpretation of a keyed field's int64 key column.  Words use the
+    # repository string-token path; deterministic graph/value identities are
+    # already integers and must pass through without hashing or renumbering.
+    key_encoding: str | None = None
+    # Optional schema of each keyed value row.  The keyed value column then
+    # carries row handles into this record table rather than opaque objects.
+    value_record: str | None = None
+    # Ordered, exact vocabulary for a scalar that carries one token from a
+    # token chain.  The native value is its one-based position (zero is
+    # reserved for absence), so it is compact, deterministic, reversible from
+    # the receipt, and has no hash/collision path.
+    token_vocabulary: tuple[str, ...] | None = None
+    # A deterministic-identity keyed record can use its key as the selected
+    # row identity, eliminating a redundant value/slot column.
+    value_identity: str | None = None
+    # Ordered physical columns for a variable-length row table.  When nested
+    # under a keyed value record, the deterministic row identity selects a
+    # slice from each flattened column arena.
+    table_columns: tuple[Mapping[str, Any], ...] | None = None
 
     @classmethod
     def from_mapping(cls, location: str, raw: Any) -> "ProgramABIField":
         if not isinstance(raw, Mapping):
             raise ExtractionContractError(f"{location} must be a mapping")
-        allowed = {"storage", "dtype", "rank", "mutable", "default", "shape"}
+        allowed = {
+            "storage", "dtype", "rank", "mutable", "default", "shape",
+            "record",
+            "key_encoding",
+            "value_record",
+            "token_vocabulary",
+            "value_identity",
+            "columns",
+        }
         extra = sorted(set(raw) - allowed)
         if extra:
             raise ExtractionContractError(
                 f"{location} has unknown fields {extra}"
             )
         storage = str(raw.get("storage") or "")
-        if storage not in {"scalar", "span", "record", "reference", "keyed"}:
+        if storage not in {
+            "scalar", "span", "record", "reference", "keyed", "table",
+        }:
             raise ExtractionContractError(
                 f"{location}.storage must be scalar, span, record, reference, "
-                "or keyed"
+                "keyed, or table"
             )
         dtype = raw.get("dtype")
         if storage in {"scalar", "span", "keyed"} and not dtype:
             raise ExtractionContractError(
                 f"{location}.dtype is required for {storage} storage"
+            )
+        nested_record = raw.get("record")
+        if storage == "record":
+            if not nested_record:
+                raise ExtractionContractError(
+                    f"{location}.record is required for record storage"
+                )
+        elif nested_record is not None:
+            raise ExtractionContractError(
+                f"{location}.record is only valid for record storage"
+            )
+        key_encoding = raw.get("key_encoding")
+        value_record = raw.get("value_record")
+        value_identity = raw.get("value_identity")
+        if storage == "keyed":
+            key_encoding = str(key_encoding or "string_token")
+            if key_encoding not in {"string_token", "integer_identity"}:
+                raise ExtractionContractError(
+                    f"{location}.key_encoding must be string_token or "
+                    "integer_identity"
+                )
+            if value_record is not None:
+                value_record = str(value_record)
+            if value_identity is not None:
+                value_identity = str(value_identity)
+                if value_identity != "key":
+                    raise ExtractionContractError(
+                        f"{location}.value_identity must be key"
+                    )
+                if key_encoding != "integer_identity" or value_record is None:
+                    raise ExtractionContractError(
+                        f"{location}.value_identity key requires an "
+                        "integer_identity keyed value_record"
+                    )
+        elif key_encoding is not None:
+            raise ExtractionContractError(
+                f"{location}.key_encoding is only valid for keyed storage"
+            )
+        elif value_record is not None:
+            raise ExtractionContractError(
+                f"{location}.value_record is only valid for keyed storage"
+            )
+        elif value_identity is not None:
+            raise ExtractionContractError(
+                f"{location}.value_identity is only valid for keyed storage"
+            )
+        raw_vocabulary = raw.get("token_vocabulary")
+        token_vocabulary = None
+        if raw_vocabulary is not None:
+            if storage != "scalar" or str(dtype) != "int64":
+                raise ExtractionContractError(
+                    f"{location}.token_vocabulary requires scalar int64 "
+                    "storage"
+                )
+            if not isinstance(raw_vocabulary, (list, tuple)) or not all(
+                isinstance(token, str) and token
+                for token in raw_vocabulary
+            ):
+                raise ExtractionContractError(
+                    f"{location}.token_vocabulary must be non-empty strings"
+                )
+            token_vocabulary = tuple(map(str, raw_vocabulary))
+            if len(token_vocabulary) != len(set(token_vocabulary)):
+                raise ExtractionContractError(
+                    f"{location}.token_vocabulary contains duplicate tokens"
+                )
+        raw_columns = raw.get("columns")
+        table_columns = None
+        if storage == "table":
+            if not isinstance(raw_columns, (list, tuple)) or not raw_columns:
+                raise ExtractionContractError(
+                    f"{location}.columns must be a non-empty list for table "
+                    "storage"
+                )
+            columns = []
+            for position, raw_column in enumerate(raw_columns):
+                column_location = f"{location}.columns[{position}]"
+                if not isinstance(raw_column, Mapping):
+                    raise ExtractionContractError(
+                        f"{column_location} must be a mapping"
+                    )
+                extra_column = sorted(
+                    set(raw_column) - {"name", "dtype", "token_vocabulary"}
+                )
+                if extra_column:
+                    raise ExtractionContractError(
+                        f"{column_location} has unknown fields {extra_column}"
+                    )
+                name = raw_column.get("name")
+                column_dtype = raw_column.get("dtype")
+                if not isinstance(name, str) or not name or not column_dtype:
+                    raise ExtractionContractError(
+                        f"{column_location} requires name and dtype"
+                    )
+                column_vocabulary = raw_column.get("token_vocabulary")
+                if column_vocabulary is not None and (
+                    not isinstance(column_vocabulary, (list, tuple))
+                    or not all(
+                        isinstance(token, str) and token
+                        for token in column_vocabulary
+                    )
+                ):
+                    raise ExtractionContractError(
+                        f"{column_location}.token_vocabulary must contain "
+                        "non-empty strings"
+                    )
+                columns.append({
+                    "name": name,
+                    "dtype": str(column_dtype),
+                    **({} if column_vocabulary is None else {
+                        "token_vocabulary": tuple(map(str, column_vocabulary)),
+                    }),
+                })
+            names = tuple(column["name"] for column in columns)
+            if len(names) != len(set(names)):
+                raise ExtractionContractError(
+                    f"{location}.columns contains duplicate names"
+                )
+            table_columns = tuple(columns)
+        elif raw_columns is not None:
+            raise ExtractionContractError(
+                f"{location}.columns is only valid for table storage"
             )
         rank = raw.get("rank", 0)
         if not isinstance(rank, int) or isinstance(rank, bool) or rank < 0:
@@ -236,11 +391,14 @@ class ProgramABIField:
             raise ExtractionContractError(
                 f"{location}.rank must be positive for span storage"
             )
-        # A keyed field is a mapping whose keys are words. It lowers to the
-        # repository's universal string tokens: parallel key/value vectors plus
-        # a length, so a constant key and a name hashed at run time land on the
-        # same slot without a shared intern counter. Its rank is the vector's,
-        # which is always one -- the mapping is flat.
+        if storage == "table" and rank not in {0, 1}:
+            raise ExtractionContractError(
+                f"{location}.rank must be zero or one for table storage"
+            )
+        # A keyed field lowers to parallel int64-key/value vectors plus a
+        # length. Word keys use universal string tokens; deterministic integer
+        # identities (such as canonical SSA node ids) pass through unchanged.
+        # Its rank is the vector's, which is always one -- the mapping is flat.
         if storage == "keyed" and rank not in {0, 1}:
             raise ExtractionContractError(
                 f"{location}.rank must be zero or one for keyed storage"
@@ -285,6 +443,12 @@ class ProgramABIField:
             raw.get("default"),
             "default" in raw,
             shape,
+            None if nested_record is None else str(nested_record),
+            None if key_encoding is None else str(key_encoding),
+            None if value_record is None else str(value_record),
+            token_vocabulary,
+            value_identity,
+            table_columns,
         )
 
     def receipt(self) -> dict[str, Any]:
@@ -298,6 +462,30 @@ class ProgramABIField:
             result["shape"] = list(self.shape)
         if self.has_default:
             result["default"] = self.default
+        if self.record is not None:
+            result["record"] = self.record
+        if self.key_encoding is not None:
+            result["key_encoding"] = self.key_encoding
+        if self.value_record is not None:
+            result["value_record"] = self.value_record
+        if self.token_vocabulary is not None:
+            result["token_vocabulary"] = list(self.token_vocabulary)
+        if self.value_identity is not None:
+            result["value_identity"] = self.value_identity
+        if self.table_columns is not None:
+            result["columns"] = [
+                {
+                    **dict(column),
+                    **(
+                        {"token_vocabulary": list(
+                            column["token_vocabulary"]
+                        )}
+                        if column.get("token_vocabulary") is not None
+                        else {}
+                    ),
+                }
+                for column in self.table_columns
+            ]
         return result
 
 
@@ -392,6 +580,23 @@ class ProgramABIContract:
             }
             identity = str(record_raw.get("identity") or name)
             records[str(name)] = ProgramABIRecord(identity, fields)
+        for record_name, record in records.items():
+            for field_name, field in record.fields.items():
+                if field.record is not None and field.record not in records:
+                    raise ExtractionContractError(
+                        "program_abi.records."
+                        f"{record_name}.fields.{field_name}.record names "
+                        f"unknown record {field.record!r}"
+                    )
+                if (
+                    field.value_record is not None
+                    and field.value_record not in records
+                ):
+                    raise ExtractionContractError(
+                        "program_abi.records."
+                        f"{record_name}.fields.{field_name}.value_record names "
+                        f"unknown record {field.value_record!r}"
+                    )
         raw_bindings = raw.get("bindings", ())
         if not isinstance(raw_bindings, list):
             raise ExtractionContractError("program_abi.bindings must be a list")

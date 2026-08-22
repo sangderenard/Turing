@@ -434,6 +434,23 @@ def compose_hierarchical_control(
                     else value(expression.value_id),
                     expression.literal,
                 )
+            def rewrite_mutation(mutation):
+                return replace(
+                    mutation,
+                    sequence_value_id=value(mutation.sequence_value_id),
+                    argument_value_ids=tuple(
+                        value(value_id)
+                        for value_id in mutation.argument_value_ids
+                    ),
+                    effect_node_id=value(mutation.effect_node_id),
+                    predicate_expression=rewrite_expression(
+                        mutation.predicate_expression
+                    ),
+                    argument_expressions=tuple(
+                        rewrite_expression(expression)
+                        for expression in mutation.argument_expressions
+                    ),
+                )
             if isinstance(block, StatementBlock):
                 local_region = _region_marker(block)
                 if local_region is None:
@@ -471,20 +488,37 @@ def compose_hierarchical_control(
                     rename_control_text(block.stop),
                     rename_control_text(block.step),
                     body,
-                    tuple(
+                    carried_aliases=tuple(
                         (value(updated), value(initial))
                         for updated, initial in block.carried_aliases
                     ),
-                    block.parallel_iterations,
-                    block.dispatch_shell,
-                    (
+                    result_ports=tuple(
+                        (value(port), value(initial), value(updated))
+                        for port, initial, updated in block.result_ports
+                    ),
+                    carried_seeds=tuple(
+                        (value(initial), literal)
+                        for initial, literal in block.carried_seeds
+                    ),
+                    parallel_iterations=block.parallel_iterations,
+                    dispatch_shell=block.dispatch_shell,
+                    recursion_region_id=(
                         None
                         if block.recursion_region_id is None
                         else recursion_region_map[
                             int(block.recursion_region_id)
                         ]
                     ),
-                    block.schedule_preference,
+                    schedule_preference=block.schedule_preference,
+                    sequence_mutations=tuple(
+                        rewrite_mutation(mutation)
+                        for mutation in block.sequence_mutations
+                    ),
+                    comparison=block.comparison,
+                    terminal_controls=tuple(
+                        rewrite(terminal)
+                        for terminal in block.terminal_controls
+                    ),
                 )
             if isinstance(block, WhileBlock):
                 body = rewrite(block.body)
@@ -498,17 +532,34 @@ def compose_hierarchical_control(
                     value(block.predicate_value_id),
                     rewrite(block.condition),
                     body,
-                    tuple(
+                    carried_aliases=tuple(
                         (value(updated), value(initial))
                         for updated, initial in block.carried_aliases
                     ),
-                    (
+                    result_ports=tuple(
+                        (value(port), value(initial), value(updated))
+                        for port, initial, updated in block.result_ports
+                    ),
+                    carried_seeds=tuple(
+                        (value(initial), literal)
+                        for initial, literal in block.carried_seeds
+                    ),
+                    recursion_region_id=(
                         None if block.recursion_region_id is None
                         else recursion_region_map[int(block.recursion_region_id)]
                     ),
-                    rewrite_expression(block.predicate_expression),
-                    (),
-                    block.source_loop_node_id,
+                    predicate_expression=rewrite_expression(
+                        block.predicate_expression
+                    ),
+                    sequence_mutations=tuple(
+                        rewrite_mutation(mutation)
+                        for mutation in block.sequence_mutations
+                    ),
+                    source_loop_node_id=block.source_loop_node_id,
+                    terminal_controls=tuple(
+                        rewrite(terminal)
+                        for terminal in block.terminal_controls
+                    ),
                 )
             if isinstance(block, LoopControlBlock):
                 return LoopControlBlock(
@@ -517,6 +568,7 @@ def compose_hierarchical_control(
                     else value(block.predicate_value_id),
                     block.expect_true,
                     rewrite_expression(block.predicate_expression),
+                    block.source_action,
                 )
             if isinstance(block, StateMachineTick):
                 return StateMachineTick(
@@ -544,6 +596,8 @@ def compose_hierarchical_control(
                     value(block.predicate_value_id),
                     block.error_code,
                     block.expect_true,
+                    rewrite_expression(block.predicate_expression),
+                    block.extraction_identity,
                 )
             if isinstance(block, StreamPublishBlock):
                 publication = StreamPublishBlock(

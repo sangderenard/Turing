@@ -1,5 +1,160 @@
 # Why isn't this translating? — a decision tree
 
+The executable tree can inspect either its historical symbolic-fluid fixture
+or an already-published repository-SSA unit. The latter is the appropriate
+route when debugging the compiler compiling itself: it does not rebuild a
+proxy program, and it selects functions through their authored-name
+correlation.
+
+An isolated meta-compilation worker can also be inspected before it has
+published SSA:
+
+```powershell
+python tools/diagnose_translation.py --compilation-unit build/compiler-bootstrap-catalogue/lower_control_creep_v1/units/lower_control_program_to_ssa
+```
+
+Stage 0 reads the worker's durable `compile-progress.json`, `failure.json`,
+and `unit.json`. A resource stop remains a resource frontier, a frontend
+exception remains a pre-publication structural frontier, and a published unit
+flows directly into the ordinary repository-SSA checks. This distinction is
+essential for meta-compiling: an absent artifact cannot truthfully be called
+malformed SSA.
+
+For a published partial compiler unit, Stage 0 also reads the exact hashed
+`process-graph-units.json` used to build it and prints the unresolved authored
+dependency closure in leaves-first order. Follow that order before repairing
+the caller: a caller's unresolved calls, unknown boundary types, or conditional
+accounting can be downstream of a dependency that still had to remain source.
+The bounded scheduler uses the same rule operationally. It runs independent
+leaves in parallel, waits for every direct dependency to reach a terminal
+receipt, links only verified dependencies, and preserves partial/failed ones as
+authored-source fallbacks. Thus worker timing cannot decide whether a proven
+dependency is linked into its caller.
+
+Resolved-unit workers also persist their latest internal phase and memory in
+`compile-progress.json`. If the parent enforces a memory/time boundary, that
+last phase is copied into the failure receipt before Stage 0 routes it. A
+subdivision raised while preparing an authored fallback records the fallback's
+actual function reference and qualified name; the child integral is therefore
+attached to its real owner, not to the selected caller that happened to expose
+it. Identical owned boundaries encountered through several callers collapse to
+one deterministic token chain.
+
+For a whole bounded pass, inspect the product rather than opening 58 receipts
+by hand:
+
+```powershell
+python tools/diagnose_translation.py --compilation-product build/compiler-bootstrap-catalogue/lower_control_program_to_ssa_v259
+```
+
+The same inlet accepts a deterministic subdivision product. It reads
+``integrals`` as first-class compiler work rather than silently treating the
+product as empty. ``source-only`` is a safe terminal result, while
+``compiled-unverified`` remains an open semantic/ABI frontier and is never
+reported as clean. Live products also remain open while any worker is running,
+even when their pending queue is empty.
+
+### Meta-compilation branch
+
+Ordinary translation begins at published SSA. Compiler bootstrapping has two
+earlier layers, so route it in this order:
+
+1. Inspect one worker with ``--compilation-unit``. A resource stop during
+   ``deployment-instantiation`` belongs to authored function/SCC activation;
+   divide that shell before asking any SSA question. A stop during
+   ``repository-ssa-lowering`` belongs to the selected numeric integral.
+2. Inspect the bounded pass with ``--compilation-product``. A failed child is
+   a worker/compiler frontier, ``partial`` is an SSA or boundary-contract
+   frontier, ``source-only`` is a safe terminal authored fallback, and
+   ``compiled-unverified`` is still open until exact semantic and ABI probes
+   pass. Running or pending work is never reported as clean.
+3. For a partial resolved unit, follow the printed authored-name dependency
+   repair order leaves-first. For a partial subdivision product, follow the
+   deterministic context-token identities recorded beside unresolved boundary
+   values; local integer slots are correlation aids, not the repair identity.
+4. Install only a verified product. Recursive compilation must be able to
+   recover its authored source rather than descending into the installed
+   binary.
+
+The Stage 0 ``NEXT`` line is the recursion guard for this process. A published
+``subdivision-integrals.json`` means the current boundary can be divided and
+the child plan should run before retrying its parent. A partial subdivision
+product with no deeper plan has reached a semantic boundary instead: another
+blind cut or a larger resource allowance cannot repair it. Fix the reported
+type propagation, identity, control lowering, or storage/ABI semantics in the
+owning authored source, regenerate the parent plan, and retain source fallback
+until exact verification succeeds.
+
+Meta-compilation adds one important discriminator inside that semantic branch:
+a planner region is not automatically a numerical integral.  A region whose
+operation mutates resident structure (for example ``IndexedStore`` into an
+annotated mapping field) must retain the MapIR-declared key/value/record
+contract and lower through the repository sequence-table machinery.  Sending
+it through ordinary numeric ``FusedProgram`` lowering erases its containing
+record ABI and presents anonymous boundary scalars.  The correct repair is to
+propagate the structural contract into the captured region and emit a typed
+resident mutation integral; do not subdivide again, guess dtypes, or run the
+whole blocked function shell once outside its loop.  Such an integral remains
+``compiled-unverified`` until a mutation/ABI equivalence probe passes.
+
+A standalone subdivision directory is itself a compilation product. Inspect
+it with the same decision-tree inlet used for an aggregate catalogue::
+
+    python -m tools.diagnose_translation --compilation-product build/<subdivision-product>
+
+For a resident-table mutation, ``verified`` means the repository-SSA artifact
+and its self-contained sequence helper passed an exact ABI audit plus insert,
+update, and fixed-capacity rejection probes.  It does **not** mean the child is
+already installed into a blocked loop owner.  If the owner has no control
+program, linking only its body would erase iteration semantics; keep authored
+source authoritative and repair or subdivide the control owner first.
+
+Fresh frozen plans also pin a compiler-toolchain fingerprint covering the
+reducer, planner, repository-SSA lowering, backend identity modules, and
+extraction contract. If any of those files changes, compilation refuses the
+stale plan and Stage 0 names the changed files. Legacy plans remain readable,
+but Stage 0 explicitly reports that compiler staleness cannot be ruled out.
+
+The bounded producers for those diagnostic objects are:
+
+```powershell
+python -m tools.compile_project_catalogue --resolved-process-graph <graph.pkl> --process-graph-unit-plan <units.json> --compile-resolved-plan --output <product> --jobs 3 --max-total-gb 12 --max-worker-gb 4
+python -m tools.compile_project_catalogue --subdivision-plan <subdivision-integrals.json> --compile-subdivision-plan --output <children> --jobs 3 --max-total-gb 12 --max-worker-gb 4
+```
+
+These commands are the meta-compilation counterpart to the scorecard: they
+preserve exact inputs, isolate RAM/time, and publish durable phase receipts
+instead of rebuilding a smaller proxy and guessing from its behavior.
+
+The product view reports live/pending/terminal counts, groups hard failures by
+their stable authored error category (without conflating volatile node ids),
+and groups partial publications by their next declared repair action.
+
+```powershell
+python tools/diagnose_translation.py --repository-ssa build/compiler-bootstrap-catalogue/wasm_build_module_native_diagnostic_v249/units/build_module/repository-ssa.pkl --entry build_module --stages 1,2,4
+```
+
+In repository mode, Stage 1 reads the sibling `unit.json` completeness
+receipt when present, Stage 2 checks the selected repository function, and
+Stage 4 reports only the repository function boundary. It deliberately does
+not claim that an internal SSA value is observable from a later backend.
+
+Stage 2 also checks the dominance edge specific to generator-backed sequence
+queries, plus the structural sequence dataflow used heavily by meta-compiling
+compiler functions. A query result can have one globally valid producer and
+therefore pass ordinary dangling/duplicate checks while still being consumed
+before its producer loop executes. Likewise, a resident sequence descriptor
+can be a valid formal while its contents are consumed before their append
+chain runs, or an immutable ``bytes([value])`` view can exist without ever
+materializing that scalar. The diagnostic reports these as distinct failures:
+producer ordering versus missing singleton materialization.
+
+For compiler self-compilation, use the tree twice: first on the published
+repository SSA, then run the product's native equivalence probes. A clean
+Stage 2 proves the structural route is internally coherent; it does **not**
+prove the emitted ABI populated strings, records, or returned bytes correctly.
+Exact authored/native probes with zero fallback remain the semantic gate.
+
 A translation runs Python → ProcessGraph → dual IR → repository SSA →
 backend (Fortran / LLVM / C shell) → runtime buffers. A defect anywhere
 surfaces at the **end**, as a compiler error or a wrong number. The
@@ -740,6 +895,10 @@ tool — each answer narrowed what the next tool had to look at.
 | 16 | opcode census (ad hoc) | is an instruction missing, or in the wrong domain | `fmul` 118 + `mul` 22 = SSA's 140 `Mul`. Nothing missing — 22 were integer. **This named the bug.** |
 | 17 | `--trace` on `compile_fortran_module_c_shell` (built here) | per-launch timing/status inside a standalone executable | compile-time-only ring buffer; an untraced artifact has none of this code in it at all |
 | 18 | `trace_fortran_alias.py` (built here) | does a buffer get written ANYWHERE reachable in a whole-program native build | follows one token through nested `call` statements by position; proved `state.height` is never written across 5 hops, and where `state.next_height` is |
+| 19 | `compile_project_catalogue.py --compile-resolved-plan` | which compiler units fit and publish SSA under explicit RAM/time bounds | parallel leaves-first compilation with authored-source fallback for unverified dependencies |
+| 20 | `diagnose_translation.py --compilation-unit` | where one self-compilation worker actually stopped | durable phase/resource routing before SSA exists; ordinary SSA stages after publication |
+| 21 | `compile_project_catalogue.py --compile-subdivision-plan` | can a resource-bound SCC be converted into smaller deterministic integrals | bounded function-shell/owned-region workers and a sealed result matrix |
+| 22 | `diagnose_translation.py --compilation-product` | what the aggregate bootstrap frontier now is | distinguishes source-only, partial, compiled-unverified, resource failure, running, and pending work |
 
 **What each stage cost when skipped.** Steps 8 and 9 existed only after
 days of reasoning about structure. Every one of those days would have been

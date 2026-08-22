@@ -43,6 +43,7 @@ class LoopStateEffectMode(str, Enum):
     OPAQUE = "opaque"
     INDEXED_PUBLICATION = "indexed_publication"
     SEQUENCE_MUTATION = "sequence_mutation"
+    MAPPING_MUTATION = "mapping_mutation"
 
 
 @dataclass(frozen=True)

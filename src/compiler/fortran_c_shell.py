@@ -14,6 +14,7 @@ import copy
 from fnmatch import fnmatchcase
 import json
 import os
+import sys
 from pathlib import Path
 import re
 import subprocess
@@ -256,6 +257,473 @@ def _record_receipts_for_function(
         if len(candidates) == 1:
             selected["self"] = candidates[0]
     return selected
+
+
+def _authored_annotation_field_receipt(
+    annotation: ast.AST,
+) -> Mapping[str, Any] | None:
+    """Return the exact scalar/fixed-span ABI stated by an annotation."""
+
+    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+        members = (annotation.left, annotation.right)
+        concrete = tuple(
+            member for member in members
+            if not (isinstance(member, ast.Constant) and member.value is None)
+            and not (isinstance(member, ast.Name) and member.id == "None")
+        )
+        if len(concrete) == 1 and len(concrete) != len(members):
+            receipt = _authored_annotation_field_receipt(concrete[0])
+            if receipt is not None:
+                return {**dict(receipt), "optional": True}
+
+    if isinstance(annotation, ast.Name):
+        scalar = {
+            "int": "int64", "float": "float64", "bool": "bool",
+        }.get(annotation.id)
+        if scalar is not None:
+            return {
+                "storage": "scalar", "dtype": scalar, "rank": 0,
+                "mutable": False,
+            }
+        if annotation.id in {"bytes", "bytearray", "str"}:
+            return {
+                "storage": "span", "dtype": "int64", "rank": 1,
+                "mutable": False,
+                "aggregate_kind": annotation.id,
+            }
+        return None
+    if not isinstance(annotation, ast.Subscript):
+        return None
+    container = (
+        annotation.value.id
+        if isinstance(annotation.value, ast.Name)
+        else annotation.value.attr
+        if isinstance(annotation.value, ast.Attribute)
+        else ""
+    )
+    if container == "Literal":
+        members = (
+            tuple(annotation.slice.elts)
+            if isinstance(annotation.slice, ast.Tuple)
+            else (annotation.slice,)
+        )
+        vocabulary = tuple(
+            str(member.value)
+            for member in members
+            if isinstance(member, ast.Constant)
+            and isinstance(member.value, str)
+        )
+        if len(vocabulary) == len(members) and vocabulary:
+            return {
+                "storage": "scalar", "dtype": "int64", "rank": 0,
+                "mutable": False, "token_vocabulary": vocabulary,
+            }
+        return None
+    if container == "Optional":
+        receipt = _authored_annotation_field_receipt(annotation.slice)
+        return (
+            None if receipt is None
+            else {**dict(receipt), "optional": True}
+        )
+    if container not in {"list", "tuple", "Sequence", "Iterable"}:
+        return None
+    element = annotation.slice
+    fixed_length = None
+    if isinstance(element, ast.Tuple) and element.elts:
+        if container == "tuple" and not any(
+            isinstance(item, ast.Constant) and item.value is Ellipsis
+            for item in element.elts
+        ):
+            element_dtypes = tuple(
+                item.id if isinstance(item, ast.Name) else None
+                for item in element.elts
+            )
+            if len(set(element_dtypes)) != 1:
+                return None
+            fixed_length = len(element.elts)
+        element = element.elts[0]
+    if not isinstance(element, ast.Name):
+        return None
+    dtype = {
+        "int": "int64", "float": "float64", "bool": "bool",
+        "bytes": "int64", "bytearray": "int64", "str": "int64",
+    }.get(element.id)
+    if dtype is None:
+        return None
+    receipt = {
+        "storage": "span", "dtype": dtype, "rank": 1,
+        "mutable": False,
+        "aggregate_kind": container.casefold(),
+    }
+    if fixed_length is not None:
+        receipt["fixed_length"] = int(fixed_length)
+    return receipt
+
+
+def _authored_complete_record_schemas(
+    tree: ast.Module,
+) -> dict[str, Mapping[str, Any]]:
+    """Publish dataclass constructors only when every field has a physical ABI.
+
+    Per-function record views may safely expose only fields a function uses.
+    Construction is stricter: a partial class layout would silently discard
+    authored state, so one unsupported declared field refuses the whole schema.
+    """
+
+    schemas: dict[str, Mapping[str, Any]] = {}
+    for statement in tree.body:
+        if not isinstance(statement, ast.ClassDef):
+            continue
+        decorators = {
+            target.id
+            if isinstance(target, ast.Name)
+            else target.attr
+            if isinstance(target, ast.Attribute)
+            else ""
+            for decorator in statement.decorator_list
+            for target in (
+                decorator.func if isinstance(decorator, ast.Call) else decorator,
+            )
+        }
+        if "dataclass" not in decorators:
+            continue
+        declared = [
+            field for field in statement.body
+            if isinstance(field, ast.AnnAssign)
+            and isinstance(field.target, ast.Name)
+        ]
+        if not declared:
+            continue
+        fields: dict[str, Mapping[str, Any]] = {}
+        complete = True
+        for field in declared:
+            receipt = _authored_annotation_field_receipt(field.annotation)
+            if receipt is None:
+                complete = False
+                break
+            receipt = dict(receipt)
+            if field.value is not None:
+                try:
+                    receipt["default"] = ast.literal_eval(field.value)
+                except (TypeError, ValueError):
+                    pass
+            fields[field.target.id] = receipt
+        if complete:
+            schemas[statement.name] = {
+                "identity": statement.name,
+                "fields": fields,
+                "source_derived": True,
+            }
+    return schemas
+
+
+def _authored_sequence_record_views(
+    tree: ast.Module,
+    schemas: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Mapping[str, Any]]]:
+    """Derive exact ``Sequence[Record]`` parameter row contracts.
+
+    The sequence is caller-owned columnar storage; its loop target is a row
+    correlation, never a Python object crossing the native ABI. Only complete
+    authored record schemas are admitted, so every projected field has a
+    declared physical representation before lowering begins.
+    """
+
+    views: dict[str, dict[str, Mapping[str, Any]]] = {}
+
+    def element_record(annotation: ast.AST | None) -> str | None:
+        if not isinstance(annotation, ast.Subscript):
+            return None
+        container = (
+            annotation.value.id
+            if isinstance(annotation.value, ast.Name)
+            else annotation.value.attr
+            if isinstance(annotation.value, ast.Attribute)
+            else ""
+        )
+        if container not in {"list", "tuple", "Sequence", "Iterable"}:
+            return None
+        element = annotation.slice
+        if isinstance(element, ast.Tuple) and len(element.elts) == 1:
+            element = element.elts[0]
+        identity = (
+            element.id if isinstance(element, ast.Name)
+            else element.attr if isinstance(element, ast.Attribute)
+            else None
+        )
+        return str(identity) if identity in schemas else None
+
+    def visit(
+        qualified_name: str,
+        definition: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> None:
+        for argument in (
+            *definition.args.posonlyargs,
+            *definition.args.args,
+            *definition.args.kwonlyargs,
+        ):
+            identity = element_record(argument.annotation)
+            if identity is None:
+                continue
+            schema = dict(schemas[identity])
+            views.setdefault(qualified_name, {})[argument.arg] = {
+                "identity": str(schema.get("identity") or identity),
+                "fields": copy.deepcopy(dict(schema.get("fields") or {})),
+                "aggregate_kind": "tuple",
+                "mutable": False,
+                "source_derived": True,
+            }
+
+    for statement in tree.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            visit(statement.name, statement)
+        elif isinstance(statement, ast.ClassDef):
+            for member in statement.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    visit(f"{statement.name}.{member.name}", member)
+    return views
+
+
+def _authored_dataclass_record_views(
+    tree: ast.Module,
+) -> dict[str, dict[str, Mapping[str, Any]]]:
+    """Derive exact per-method record views from authored class fields.
+
+    This is deliberately conservative.  Dataclass annotations and ordinary
+    ``__init__`` assignments are admitted only when they have an unambiguous
+    physical scalar/span representation.  A method that touches an unsupported
+    field receives no inferred receiver view.  Per-method views include only
+    fields that method reads or writes (plus fields required by same-receiver
+    method calls), so compiling a small method does not manufacture ABI
+    obligations for unrelated state.  Mutation is recorded in that view; the
+    initializer's construction writes do not make every field mutable forever.
+
+    The historical function name is retained because it is imported by tests
+    and downstream tooling, but ordinary authored classes are intentionally
+    part of the same source-derived ABI faculty.
+    """
+
+    classes = {
+        statement.name: statement
+        for statement in tree.body
+        if isinstance(statement, ast.ClassDef)
+    }
+
+    def field_receipt(annotation: ast.AST) -> Mapping[str, Any] | None:
+        return _authored_annotation_field_receipt(annotation)
+
+    def initialized_field_receipt(value: ast.AST) -> Mapping[str, Any] | None:
+        """Prove a scalar field from its authored initializer, without guessing."""
+
+        scalar_type = None
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id in {"int", "float", "bool"}
+        ):
+            scalar_type = value.func.id
+        elif isinstance(value, ast.Constant):
+            # bool is an int subclass, so order is significant here.
+            if isinstance(value.value, bool):
+                scalar_type = "bool"
+            elif isinstance(value.value, int):
+                scalar_type = "int"
+            elif isinstance(value.value, float):
+                scalar_type = "float"
+        dtype = {
+            "int": "int64", "float": "float64", "bool": "bool",
+        }.get(scalar_type or "")
+        if dtype is None:
+            return None
+        return {
+            "storage": "scalar", "dtype": dtype, "rank": 0,
+            "mutable": False,
+        }
+
+    class_fields: dict[str, dict[str, Mapping[str, Any]]] = {}
+    class_methods: dict[str, dict[str, ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+    for class_name, definition in classes.items():
+        fields = {}
+        methods = {}
+        for statement in definition.body:
+            if isinstance(statement, ast.AnnAssign) and isinstance(
+                statement.target, ast.Name
+            ):
+                receipt = field_receipt(statement.annotation)
+                if receipt is not None:
+                    fields[statement.target.id] = receipt
+            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                methods[statement.name] = statement
+        initializer = methods.get("__init__")
+        if initializer is not None:
+            for node in ast.walk(initializer):
+                target = None
+                receipt = None
+                if isinstance(node, ast.AnnAssign):
+                    target = node.target
+                    receipt = field_receipt(node.annotation)
+                elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+                    target = node.targets[0]
+                    receipt = initialized_field_receipt(node.value)
+                if not (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                    and receipt is not None
+                ):
+                    continue
+                previous = fields.get(target.attr)
+                if previous is None:
+                    fields[target.attr] = receipt
+                elif dict(previous) != dict(receipt):
+                    # Conflicting physical declarations are not a proven ABI.
+                    fields.pop(target.attr, None)
+        class_fields[class_name] = fields
+        class_methods[class_name] = methods
+
+    required_cache: dict[tuple[str, str], dict[str, bool] | None] = {}
+
+    def method_fields(
+        class_name: str, method_name: str, active=(),
+    ) -> dict[str, bool] | None:
+        key = (class_name, method_name)
+        if key in required_cache:
+            return required_cache[key]
+        if key in active:
+            return {}
+        method = class_methods.get(class_name, {}).get(method_name)
+        if method is None:
+            return None
+        direct: dict[str, bool] = {}
+        nested_calls: set[str] = set()
+        for node in ast.walk(method):
+            if not isinstance(node, ast.Attribute):
+                continue
+            if not (
+                isinstance(node.value, ast.Name)
+                and node.value.id in {"self", "cls"}
+            ):
+                continue
+            if node.attr in class_methods.get(class_name, {}):
+                if isinstance(getattr(node, "ctx", None), ast.Load):
+                    nested_calls.add(node.attr)
+            else:
+                direct[node.attr] = bool(
+                    direct.get(node.attr, False)
+                    or isinstance(getattr(node, "ctx", None), ast.Store)
+                )
+        if not set(direct) <= set(class_fields.get(class_name, {})):
+            required_cache[key] = None
+            return None
+        for callee in sorted(nested_calls):
+            inherited = method_fields(class_name, callee, (*active, key))
+            if inherited is None:
+                required_cache[key] = None
+                return None
+            for field_name, mutable in inherited.items():
+                direct[field_name] = bool(
+                    direct.get(field_name, False) or mutable
+                )
+        required_cache[key] = direct
+        return direct
+
+    views: dict[str, dict[str, Mapping[str, Any]]] = {}
+    for class_name, methods in class_methods.items():
+        for method_name in methods:
+            fields = method_fields(class_name, method_name)
+            if fields is None or not fields:
+                continue
+            views[f"{class_name}.{method_name}"] = {
+                "self": {
+                    "identity": class_name,
+                    "fields": {
+                        name: dict(class_fields[class_name][name])
+                        for name in sorted(fields)
+                    },
+                }
+            }
+            for name, mutable in fields.items():
+                views[f"{class_name}.{method_name}"]["self"]["fields"][name][
+                    "mutable"
+                ] = mutable
+
+    def annotation_class_name(annotation: ast.AST | None) -> str | None:
+        if isinstance(annotation, ast.Name):
+            return annotation.id
+        if isinstance(annotation, ast.Attribute):
+            return annotation.attr
+        return None
+
+    def add_annotated_parameter_views(
+        qualified_name: str,
+        method: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> None:
+        arguments = (
+            *method.args.posonlyargs,
+            *method.args.args,
+            *method.args.kwonlyargs,
+        )
+        for argument in arguments:
+            if argument.arg in {"self", "cls"}:
+                continue
+            record_name = annotation_class_name(argument.annotation)
+            if record_name not in class_fields:
+                continue
+            used: dict[str, bool] = {}
+            nested_calls: set[str] = set()
+            for node in ast.walk(method):
+                if not (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == argument.arg
+                ):
+                    continue
+                if node.attr in class_methods.get(record_name, {}):
+                    if isinstance(getattr(node, "ctx", None), ast.Load):
+                        nested_calls.add(node.attr)
+                else:
+                    used[node.attr] = bool(
+                        used.get(node.attr, False)
+                        or isinstance(getattr(node, "ctx", None), ast.Store)
+                    )
+            for callee in sorted(nested_calls):
+                inherited = method_fields(record_name, callee)
+                if inherited is None:
+                    used = {}
+                    break
+                for field_name, mutable in inherited.items():
+                    used[field_name] = bool(
+                        used.get(field_name, False) or mutable
+                    )
+            if not used:
+                continue
+            if not set(used) <= set(class_fields[record_name]):
+                # The annotation names the class, but this function needs a
+                # field whose physical representation was not proven. Do not
+                # publish a partial parameter ABI.
+                continue
+            fields = {
+                name: {
+                    **dict(class_fields[record_name][name]),
+                    "mutable": bool(mutable),
+                }
+                for name, mutable in sorted(used.items())
+            }
+            views.setdefault(qualified_name, {})[argument.arg] = {
+                "identity": record_name,
+                "fields": fields,
+            }
+
+    for statement in tree.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            add_annotated_parameter_views(statement.name, statement)
+        elif isinstance(statement, ast.ClassDef):
+            for member in statement.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    add_annotated_parameter_views(
+                        f"{statement.name}.{member.name}", member,
+                    )
+    return views
 
 
 def _entrypoint(module: Any, name: str | None = None) -> Any:
@@ -1135,6 +1603,51 @@ static int turing_read_file(
     return source
 
 
+def emit_fortran_packed_library_source(entry: Any) -> tuple[str, str]:
+    """Emit a bounded-arity C entry over an arbitrary Fortran frame.
+
+    Every published ABI parameter owns one pointer-array slot. Reference
+    parameters use the slot directly; value parameters are dereferenced using
+    their published C type. This preserves the complete typed ABI while
+    avoiding host FFI and platform call surfaces with fixed argument-count
+    limits.
+    """
+
+    symbol = f"{entry.symbol}__packed"
+    prototype_arguments = []
+    call_arguments = []
+    for index, parameter in enumerate(entry.parameters):
+        c_type = str(parameter.c_type)
+        pointer = parameter.passing == "reference"
+        prototype_arguments.append(c_type + (" *" if pointer else ""))
+        call_arguments.append(
+            f"({c_type} *)arguments[{index}]" if pointer
+            else f"*(({c_type} *)arguments[{index}])"
+        )
+    prototype = ", ".join(prototype_arguments) or "void"
+    call = ", ".join(call_arguments)
+    source = "\n".join((
+        "#include <stddef.h>",
+        "#include <stdint.h>",
+        "#include <stdbool.h>",
+        "#if defined(_WIN32)",
+        "#  define TURING_EXPORT __declspec(dllexport)",
+        "#else",
+        "#  define TURING_EXPORT __attribute__((visibility(\"default\")))",
+        "#endif",
+        f"extern void {entry.symbol}({prototype});",
+        "",
+        f"TURING_EXPORT int {symbol}(void **arguments, size_t argument_count) {{",
+        f"    if (argument_count != {len(entry.parameters)}) return 0;",
+        "    if (argument_count != 0 && arguments == NULL) return 0;",
+        f"    {entry.symbol}({call});",
+        "    return 1;",
+        "}",
+        "",
+    ))
+    return source, symbol
+
+
 def compile_fortran_module_c_shell(
     module: Any,
     inputs: Mapping[str, Any],
@@ -1219,8 +1732,11 @@ def compile_fortran_module_c_shell(
     state_path = output / "initial-state.bin"
     final_outputs_path = output / "final-outputs.bin"
     fortran_path.write_text(module.source, encoding="utf-8")
-    c_path.write_text(
-        "" if library else emit_fortran_c_shell_source(
+    packed_symbol = None
+    if library:
+        c_source, packed_symbol = emit_fortran_packed_library_source(entry)
+    else:
+        c_source = emit_fortran_c_shell_source(
             module,
             trace=trace,
             entrypoint=entry.name,
@@ -1228,16 +1744,22 @@ def compile_fortran_module_c_shell(
             extent_overrides=extents,
             initial_state_filename=state_path.name,
             final_outputs_filename=final_outputs_path.name,
-        ),
-        encoding="utf-8",
-    )
+        )
+    c_path.write_text(c_source, encoding="utf-8")
     # Pack runtime dependencies into the contract at compile time. The
     # producer knows them here -- the compiler's own bin directory is where a
     # gfortran-built library's support DLLs live -- and a consumer must never
     # rediscover them by loader archaeology (nodus boundary error register,
     # E15: a missing libgfortran presented as a silent LoadLibrary failure
     # that mimicked an ABI bug).
-    api = module.api
+    # The compiled product's public contract must name the entry point that
+    # was actually selected above.  A repository module can contain linked
+    # dependency controls before its authored root, so preserving the
+    # emitter's incidental first-control default here can advertise a helper
+    # (for example ``uleb``) as the callable product instead of the requested
+    # root.  Keep every exported entry, but make the shell/library selection
+    # authoritative for this artifact.
+    api = replace(module.api, entry=entry.name)
     runtime_dependencies = []
     if os.name == "nt":
         toolchain_bin = Path(compiler).parent
@@ -1255,6 +1777,16 @@ def compile_fortran_module_c_shell(
     if runtime_dependencies:
         metadata = dict(api.metadata)
         metadata["runtime_dependencies"] = runtime_dependencies
+        api = replace(api, metadata=metadata)
+    if packed_symbol is not None:
+        metadata = dict(api.metadata)
+        packed_entrypoints = dict(metadata.get("packed_entrypoints") or {})
+        packed_entrypoints[str(entry.name)] = {
+            "schema": "turing.packed-pointer-array.v1",
+            "symbol": str(packed_symbol),
+            "parameter_count": len(entry.parameters),
+        }
+        metadata["packed_entrypoints"] = packed_entrypoints
         api = replace(api, metadata=metadata)
     api.write(api_path)
     state_path.write_bytes(bytes(state_bytes))
@@ -1281,12 +1813,22 @@ def compile_fortran_module_c_shell(
         raise FortranEmissionError(str(error)) from error
     if library:
         # A shared library of the section: compile the Fortran module and link
-        # it -shared, exporting its symbols. No C-shell main, no runtime input.
+        # it with the packed C ABI adapter. There is no main or runtime input.
         commands = (
             [compiler, *fortran_flags, "-c", str(fortran_path), "-o", str(fortran_object)],
+            [gcc, *c_flags, "-std=c11", "-c", str(c_path), "-o", str(c_object)],
             [
-                compiler, "-shared", "-o", str(executable), str(fortran_object),
+                compiler, "-shared", "-o", str(executable),
+                str(fortran_object), str(c_object),
                 *standalone_runtime_shim_sources(compiler, output, standalone),
+                # MinGW does not export a Fortran ``bind(C)`` procedure from
+                # a DLL merely because the procedure has a stable C symbol.
+                # The API contract publishes that direct symbol and the
+                # native verifiers call it, while the C pointer-array adapter
+                # is an additional generic entry rather than a replacement.
+                # Export the bind(C) surface on Windows so the DLL and its
+                # descriptor cannot disagree about what is callable.
+                *(("-Wl,--export-all-symbols",) if os.name == "nt" else ()),
             ],
         )
     else:
@@ -1327,6 +1869,139 @@ def compile_fortran_module_c_shell(
         final_outputs_path=final_outputs_path,
         entrypoint=entry.name,
     )
+
+
+def _current_authored_parameter_annotations(
+    graph_obj: Any,
+) -> dict[str, str]:
+    """Return the exact annotation spellings for this function graph."""
+
+    catalogue = dict(
+        graph_obj.graph.get("function_parameter_annotations") or {}
+    )
+    if catalogue and all(isinstance(value, str) for value in catalogue.values()):
+        return {str(name): str(value) for name, value in catalogue.items()}
+    function_name = str(graph_obj.graph.get("function_name") or "")
+    owner = graph_obj.graph.get("method_owner")
+    candidates = (
+        f"{owner}.{function_name}" if owner else None,
+        str(graph_obj.graph.get("qualified_name") or "") or None,
+        function_name or None,
+    )
+    for identity in candidates:
+        annotations = catalogue.get(identity) if identity is not None else None
+        if isinstance(annotations, Mapping):
+            return {
+                str(name): str(value)
+                for name, value in annotations.items()
+            }
+    return {}
+
+
+def _authored_sequence_annotation_contract(
+    annotation: str,
+) -> tuple[str, int, bool, tuple[str, ...]] | None:
+    """Interpret only explicit homogeneous collection parameter annotations."""
+
+    try:
+        expression = ast.parse(str(annotation), mode="eval").body
+    except SyntaxError:
+        return None
+    if not isinstance(expression, ast.Subscript):
+        return None
+    container = (
+        expression.value.id
+        if isinstance(expression.value, ast.Name)
+        else expression.value.attr
+        if isinstance(expression.value, ast.Attribute)
+        else ""
+    )
+    element_nodes = (
+        tuple(expression.slice.elts)
+        if isinstance(expression.slice, ast.Tuple)
+        else (expression.slice,)
+    )
+    scalar_dtypes = {
+        "bool": "bool",
+        "int": "int64",
+        "float": "float64",
+        # Repository SSA represents authored text by its deterministic token.
+        "str": "int64",
+    }
+
+    def scalar_dtype(node: ast.AST) -> str | None:
+        spelling = (
+            node.id if isinstance(node, ast.Name)
+            else node.attr if isinstance(node, ast.Attribute)
+            else ""
+        )
+        return scalar_dtypes.get(str(spelling))
+
+    if container in {"Mapping", "MutableMapping", "Dict", "dict"}:
+        if len(element_nodes) != 2:
+            return None
+        dtypes = tuple(scalar_dtype(node) for node in element_nodes)
+        if any(dtype is None for dtype in dtypes):
+            return None
+        return (
+            "unique", 2,
+            container in {"MutableMapping", "Dict", "dict"},
+            tuple(str(dtype) for dtype in dtypes),
+        )
+    if container not in {
+        "Sequence", "Iterable", "Collection", "List", "list",
+        "Tuple", "tuple", "Set", "set", "FrozenSet", "frozenset",
+    }:
+        return None
+    # tuple[T, ...] is one homogeneous sequence. A fixed heterogeneous tuple
+    # is a record and must not be flattened through this path.
+    if len(element_nodes) == 2 and isinstance(
+        element_nodes[1], ast.Constant
+    ) and element_nodes[1].value is Ellipsis:
+        element_nodes = element_nodes[:1]
+    if len(element_nodes) != 1:
+        return None
+    dtype = scalar_dtype(element_nodes[0])
+    if dtype is None:
+        return None
+    return (
+        "unique" if container in {"Set", "set", "FrozenSet", "frozenset"}
+        else "duplicates",
+        1,
+        container in {"List", "list", "Set", "set"},
+        (dtype,),
+    )
+
+
+def _authored_text_parameter_transforms(
+    graph_obj: Any,
+) -> tuple[tuple[int, int, str, str], ...]:
+    """Represent each runtime ``str`` formal by its exact UTF-8 sequence."""
+
+    identity = graph_obj.graph.get("identity_table") or {}
+    transforms = []
+    for parameter_name, annotation in (
+        _current_authored_parameter_annotations(graph_obj).items()
+    ):
+        try:
+            expression = ast.parse(str(annotation), mode="eval").body
+        except SyntaxError:
+            continue
+        spelling = (
+            expression.id
+            if isinstance(expression, ast.Name)
+            else expression.attr
+            if isinstance(expression, ast.Attribute)
+            else ""
+        )
+        history = tuple(map(int, identity.get(str(parameter_name), ())))
+        if spelling != "str" or not history:
+            continue
+        source_id = int(history[0])
+        transforms.append((
+            source_id, source_id, str(parameter_name), "utf8",
+        ))
+    return tuple(transforms)
 
 
 def _field_slot_ops(
@@ -1381,6 +2056,7 @@ def _field_slot_ops(
     table_deletions: list[
         tuple[int, int | tuple[int, ...], int | None, str]
     ] = []
+    tombstone_sequence_ids: set[int] = set()
     retained_sequence_ids: set[int] = set()
     nested_sequence_ids: set[int] = set()
     nested_record_fields: dict[int, tuple[str, int]] = {}
@@ -1388,6 +2064,26 @@ def _field_slot_ops(
     field_aggregate_kinds = dict(
         graph_obj.graph.get("class_field_aggregate_kinds") or {}
     )
+    # A dataclass annotation is also an exact physical record contract.  Keep
+    # its span kind available to the class-field coordinator so a read such as
+    # ``self.locals`` becomes the declared sequence arena, never a scalar load
+    # from the receiver slot vector.  Explicit frontend aggregate evidence
+    # wins when both are present.
+    declared_self_record = dict(
+        (graph_obj.graph.get("parameter_record_abi") or {}).get("self") or {}
+    )
+    declared_span_kinds = {
+        str(field_name): str(field.get("aggregate_kind"))
+        for field_name, field in dict(
+            declared_self_record.get("fields") or {}
+        ).items()
+        if str(field.get("storage") or "") == "span"
+        and field.get("aggregate_kind") is not None
+    }
+    field_aggregate_kinds = {
+        **declared_span_kinds,
+        **field_aggregate_kinds,
+    }
     field_value_aggregate_kinds = dict(
         graph_obj.graph.get("class_field_value_aggregate_kinds") or {}
     )
@@ -1420,6 +2116,47 @@ def _field_slot_ops(
     lexical_sequence_ids: dict[tuple[str, str], int] = {}
     inferred_nested_table_bases: dict[int, int] = {}
     aggregate_reads: list[tuple[str, str, int]] = []
+
+    def fixed_row_width(annotation: Any) -> int | None:
+        """Read a fixed tuple row width from an authored container annotation."""
+
+        if not isinstance(annotation, str) or not annotation.strip():
+            return None
+        try:
+            outer = ast.parse(annotation, mode="eval").body
+        except SyntaxError:
+            return None
+        if not isinstance(outer, ast.Subscript):
+            return None
+        element = outer.slice
+        if not isinstance(element, ast.Subscript):
+            return None
+        tuple_name = element.value
+        if not (
+            isinstance(tuple_name, ast.Name) and tuple_name.id == "tuple"
+            or isinstance(tuple_name, ast.Attribute)
+            and tuple_name.attr in {"tuple", "Tuple"}
+        ):
+            return None
+        columns = (
+            tuple(element.slice.elts)
+            if isinstance(element.slice, ast.Tuple)
+            else (element.slice,)
+        )
+        if any(isinstance(column, ast.Constant) and column.value is Ellipsis
+               for column in columns):
+            return None
+        return len(columns) if len(columns) > 1 else None
+
+    annotated_row_widths: dict[int, int] = {}
+    for binding_name, annotation in dict(
+        graph_obj.graph.get("type_annotations") or {}
+    ).items():
+        width = fixed_row_width(annotation)
+        if width is None:
+            continue
+        for value_id in identity.get(str(binding_name), ()):
+            annotated_row_widths[int(value_id)] = int(width)
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         if node_operation(data) != "getattr":
@@ -1489,6 +2226,60 @@ def _field_slot_ops(
         if storage_identity in retained_storage_identities:
             retained_sequence_ids.add(sequence_id)
 
+    # An authored homogeneous collection annotation is sufficient physical
+    # ABI evidence even when the Input node itself has no Python aggregate
+    # value attached. This matters for detached compilation: Sequence[str]
+    # is a token arena, not an untyped scalar that happens to be indexed.
+    declared_sequence_ids = {
+        int(sequence_id)
+        for sequence_id, _policy, _columns, _writable
+        in sequence_declarations
+    }
+    for parameter_name, annotation in (
+        _current_authored_parameter_annotations(graph_obj).items()
+    ):
+        contract = _authored_sequence_annotation_contract(annotation)
+        history = tuple(map(int, identity.get(str(parameter_name), ())))
+        if contract is None or not history:
+            continue
+        sequence_id = int(history[0])
+        if sequence_id in declared_sequence_ids:
+            continue
+        policy, column_count, writable, _dtypes = contract
+        lexical_sequence_ids.setdefault(
+            ("parameter", str(parameter_name)), sequence_id
+        )
+        sequence_declarations.append((
+            sequence_id, policy, int(column_count), bool(writable),
+        ))
+        declared_sequence_ids.add(sequence_id)
+        retained_sequence_ids.add(sequence_id)
+
+    # Source-derived ``Sequence[Record]`` metadata survives graph extraction
+    # independently of any one Input wrapper. Declare its caller-owned
+    # columnar arena explicitly so later field projections share one physical
+    # descriptor instead of minting anonymous fallback columns.
+    for parameter_name, record in dict(
+        graph_obj.graph.get("parameter_sequence_record_abi") or {}
+    ).items():
+        history = tuple(map(int, identity.get(str(parameter_name), ())))
+        fields = tuple(dict(record.get("fields") or {}))
+        if not history or not fields:
+            continue
+        sequence_id = int(history[0])
+        lexical_sequence_ids.setdefault(
+            ("parameter", str(parameter_name)), sequence_id
+        )
+        sequence_declarations.append((
+            sequence_id,
+            "duplicates",
+            sum(
+                2 if bool(receipt.get("optional")) else 1
+                for receipt in dict(record.get("fields") or {}).values()
+            ),
+            bool(record.get("mutable", False)),
+        ))
+
     # An unannotated parameter can still state a complete aggregate contract
     # through authored operations.  ``key in p`` plus ``p[key]`` whose result
     # is iterated proves a keyed table whose values are child sequences.  This
@@ -1544,6 +2335,17 @@ def _field_slot_ops(
     # identity in the method sequence table.  Tuple values remain record rows
     # and are handled by projected-row/record lowering rather than pretending
     # the heterogeneous record itself is one homogeneous arena.
+    singleton_structural_scalar_ids = {
+        int(leaf_ids[0])
+        for _candidate_id, candidate in graph_obj.nodes(data=True)
+        for leaf_ids in (tuple(map(
+            int,
+            (candidate.get("attributes") or {}).get(
+                "aggregate_leaf_value_ids", ()
+            ),
+        )),)
+        if len(leaf_ids) == 1
+    }
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         attributes = data.get("attributes") or {}
@@ -1552,13 +2354,66 @@ def _field_slot_ops(
             "list", "set", "dict", "bytes", "bytearray"
         }:
             continue
+        if (
+            aggregate_kind == "bytes"
+            and attributes.get("producer_kind")
+            == "aggregate_materialization"
+        ):
+            # ``bytes(local_sequence)`` is a result view over the local arena,
+            # not a second independently allocated sequence.  Root authority
+            # below maps it to its sole source only after that relation is
+            # proven; declaring another arena here fabricates an ABI input.
+            continue
         sequence_id = int(data.get("value_id", node_id))
+        leaf_ids = tuple(map(int, attributes.get(
+            "aggregate_leaf_value_ids", ()
+        )))
+        if (
+            len(leaf_ids) == 1 and sequence_id == leaf_ids[0]
+            or sequence_id in singleton_structural_scalar_ids
+        ):
+            # A singleton literal/wrapper may deliberately reuse its sole
+            # scalar leaf as a reducible structural identity.  It is consumed
+            # by concat lowering as ``append_scalar`` and owns no arena of its
+            # own. Declaring that scalar id as a sequence turns ordinary
+            # parameters such as ``section_id`` into rank-1 arrays.
+            continue
         sequence_declarations.append((
             sequence_id,
             "unique" if aggregate_kind in {"set", "dict"} else "duplicates",
-            2 if aggregate_kind == "dict" else 1,
-            aggregate_kind != "bytes",
+            (
+                (
+                    int(attributes.get("mapping_key_column_count", 1)) + 1
+                ) if aggregate_kind == "dict"
+                else max(
+                    int(attributes.get("sequence_column_count", 1)),
+                    annotated_row_widths.get(sequence_id, 1),
+                )
+            ),
+            bool(attributes.get(
+                "sequence_writable", aggregate_kind != "bytes"
+            )),
         ))
+        mapping_items = attributes.get("compile_time_mapping_items")
+        if aggregate_kind == "dict" and mapping_items is not None:
+            from .string_table import string_token
+
+            encoded_rows = tuple(
+                (
+                    string_token(key) if isinstance(key, str) else key,
+                    string_token(item) if isinstance(item, str) else item,
+                )
+                for key, item in tuple(mapping_items)
+            )
+            sequence_initializations.append((
+                sequence_id,
+                f"literal_table={encoded_rows!r}",
+                2,
+            ))
+        if attributes.get("mapping_value_aggregate_kind") in {
+            "list", "set", "dict", "bytearray"
+        }:
+            nested_sequence_ids.add(sequence_id)
     def table_sequence(base_id: int) -> tuple[int | None, str | None]:
         if base_id not in graph_obj:
             return None, None
@@ -1569,6 +2424,11 @@ def _field_slot_ops(
         if inferred_sequence_id is not None:
             return inferred_sequence_id, "parameter.inferred_nested_table"
         attributes = base_data.get("attributes") or {}
+        if attributes.get("compile_time_mapping_items") is not None:
+            return (
+                int(base_data.get("value_id", base_id)),
+                f"constant.{attributes.get('binding_name', base_id)}",
+            )
         field_name = attributes.get("attribute")
         if field_aggregate_kinds.get(str(field_name)) == "dict":
             canonical = canonical_field(str(field_name))
@@ -1859,6 +2719,53 @@ def _field_slot_ops(
             sequence_value_id,
             storage_identity,
         ))
+    # A retained mapping ``pop`` is lowered by the control mutation identity,
+    # not by this field-op table.  It nevertheless changes the table's
+    # physical ABI: lookup-and-delete requires the same live-flag/tombstone
+    # storage as authored ``del table[key]``.  Survey that structural fact
+    # separately so it cannot accidentally emit a second deletion.
+    for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
+        data = graph_obj.nodes[node_id]
+        if node_operation(data) != "pop":
+            continue
+        receiver_nodes = tuple(
+            int(parent)
+            for parent, role in (data.get("parents") or ())
+            if str(role) in {"operand", "value", "object", "base", "receiver"}
+            and parent in graph_obj
+        )
+        if not receiver_nodes:
+            func_nodes = tuple(
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role) == "func" and parent in graph_obj
+            )
+            if len(func_nodes) != 1:
+                continue
+            func_data = graph_obj.nodes[func_nodes[0]]
+            func_attributes = func_data.get("attributes") or {}
+            if (
+                node_operation(func_data) != "getattr"
+                or str(func_attributes.get("attribute") or "") != "pop"
+            ):
+                continue
+            receiver_nodes = tuple(
+                int(parent)
+                for parent, role in (func_data.get("parents") or ())
+                if str(role) in {"value", "object", "base", "receiver"}
+                and parent in graph_obj
+            )
+        if len(receiver_nodes) != 1:
+            continue
+        receiver_data = graph_obj.nodes[receiver_nodes[0]]
+        receiver_attributes = receiver_data.get("attributes") or {}
+        if receiver_attributes.get("aggregate_kind") == "dict":
+            tombstone_sequence_ids.add(int(
+                receiver_data.get("value_id", receiver_nodes[0])
+            ))
+        sequence_id, _storage_identity = table_sequence(receiver_nodes[0])
+        if sequence_id is not None:
+            tombstone_sequence_ids.add(int(sequence_id))
     # Runtime sequence replication (``[x] * count``) is a fill of resident
     # caller storage, not numerical multiplication and not a Python literal.
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
@@ -1901,6 +2808,57 @@ def _field_slot_ops(
             f"fill={literal!r};count={count_ids[0]}",
             1,
         ))
+    # An unannotated local can still have a fixed-width row contract when the
+    # authored mutation supplies a tuple record.  The mutation extractor has
+    # already expanded that tuple into its exact leaf identities.  Reconcile
+    # those leaves with the resident declaration before control lowering so a
+    # list initially spelled ``[]`` is not frozen as a one-column sequence and
+    # then rejected when ``append((left, right))`` reaches it.  Conflicting row
+    # widths remain unresolved and are refused later; choosing one would invent
+    # an ABI that the source does not state.
+    declared_sequence_ids = {
+        int(sequence_id) for sequence_id, *_rest in sequence_declarations
+    }
+    resident_by_value = {
+        int(sequence_id): int(sequence_id)
+        for sequence_id in declared_sequence_ids
+    }
+    for history in identity.values():
+        history_ids = tuple(map(int, history))
+        residents = tuple(
+            value_id for value_id in history_ids
+            if value_id in declared_sequence_ids
+        )
+        if len(set(residents)) != 1:
+            continue
+        resident = residents[0]
+        resident_by_value.update({
+            value_id: resident for value_id in history_ids
+        })
+    observed_row_widths: dict[int, set[int]] = {}
+    for mutation in _sequence_append_call_mutations(graph_obj):
+        if mutation.argument_kind != "row":
+            continue
+        resident = resident_by_value.get(int(mutation.sequence_value_id))
+        width = len(tuple(mutation.argument_value_ids))
+        if resident is not None and width > 1:
+            observed_row_widths.setdefault(int(resident), set()).add(width)
+    inferred_row_widths = {
+        sequence_id: next(iter(widths))
+        for sequence_id, widths in observed_row_widths.items()
+        if len(widths) == 1
+    }
+    sequence_declarations = [
+        (
+            sequence_id,
+            policy,
+            max(column_count, inferred_row_widths.get(sequence_id, 1)),
+            writable,
+        )
+        for sequence_id, policy, column_count, writable
+        in sequence_declarations
+    ]
+
     key_width_by_sequence: dict[int, int] = {}
     for _effect_or_result, key_ids, sequence_id, *_rest in (
         *table_lookups, *table_stores, *table_deletions
@@ -1980,6 +2938,7 @@ def _field_slot_ops(
             (slot, identity, value_id)
             for slot, (identity, value_id) in nested_record_fields.items()
         )),
+        tuple(sorted(tombstone_sequence_ids)),
     )
 
 
@@ -2061,6 +3020,1950 @@ def _sequence_augassign_ops(graph_obj: Any) -> tuple[tuple[int, int, int], ...]:
             continue
         operations.append((result_id, destination_id, source_id))
     return tuple(operations)
+
+
+def _sequence_concat_ops(
+    graph_obj: Any,
+    *,
+    call_result_kinds: Mapping[int, str] | None = None,
+    structural_aliases: Mapping[int, tuple[int, str]] | None = None,
+) -> tuple[
+    tuple[tuple[int, int, int, str, int | None, int | None], ...],
+    tuple[tuple[int, int], ...],
+    dict[int, int],
+]:
+    """Recognize value-producing sequence ``+`` without numericizing it.
+
+    Python's ``bytes + bytes`` and ``list + list`` allocate a new logical
+    sequence; they are not elementwise arithmetic.  ProcessGraph deliberately
+    keeps the authored ``Add`` spelling, so this identity proves sequence
+    semantics from the operands' aggregate contracts (including pursued-call
+    result contracts) and returns both concat operations and immutable
+    materialization aliases such as ``bytes([value]) -> [value]``.
+    """
+
+    sequence_kinds = {"list", "bytes", "bytearray"}
+    resident_by_value: dict[int, int] = {}
+    kind_by_value: dict[int, str] = {}
+    singleton_by_resident: dict[int, int] = {}
+    for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
+        data = graph_obj.nodes[node_id]
+        attributes = data.get("attributes") or {}
+        kind = str(attributes.get("aggregate_kind") or "")
+        if kind not in sequence_kinds:
+            continue
+        value_id = int(data.get("value_id", node_id))
+        if attributes.get("producer_kind") == "aggregate_materialization":
+            source_nodes = tuple(
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role).startswith("arg:") and parent in graph_obj
+            )
+            sources = tuple(
+                int(graph_obj.nodes[parent].get("value_id", parent))
+                for parent in source_nodes
+            )
+            if len(sources) == 1:
+                resident_id = resident_by_value.get(
+                    sources[0], sources[0]
+                )
+                resident_by_value[value_id] = resident_id
+                kind_by_value[value_id] = kind
+                # ``bytes([opcode])`` is an immutable view of a singleton
+                # authored aggregate.  The materializer may carry the leaf
+                # ledger even when its transient list source does not; retain
+                # that exact scalar identity on the physical resident so
+                # concat lowering emits append_scalar and does not demand a
+                # sequence descriptor for a one-byte temporary.
+                source_expression = (
+                    graph_obj.nodes[source_nodes[0]].get("expr_obj")
+                    if len(source_nodes) == 1 else None
+                )
+                source_attributes = (
+                    graph_obj.nodes[source_nodes[0]].get("attributes") or {}
+                    if len(source_nodes) == 1 else {}
+                )
+                literal_singleton = (
+                    isinstance(source_expression, (ast.List, ast.Tuple, ast.Set))
+                    and len(source_expression.elts) == 1
+                ) or (
+                    source_attributes.get("aggregate_kind") in {
+                        "list", "tuple", "set"
+                    }
+                    and len(tuple(source_attributes.get(
+                        "aggregate_leaf_value_ids", ()
+                    ))) == 1
+                )
+                if os.environ.get("TURING_DEBUG_SEQUENCE_CONCAT"):
+                    print(
+                        "DEBUGMATERIALIZE "
+                        f"value={value_id} kind={kind!r} sources={sources!r} "
+                        f"source_expr={ast.dump(source_expression, include_attributes=False) if isinstance(source_expression, ast.AST) else None!r} "
+                        f"source_kind={source_attributes.get('aggregate_kind')!r} "
+                        f"source_type={graph_obj.nodes[source_nodes[0]].get('type')!r} "
+                        f"source_constant={graph_obj.nodes[source_nodes[0]].get('constant')!r} "
+                        f"source_attributes={source_attributes!r} "
+                        f"source_leaves={tuple(source_attributes.get('aggregate_leaf_value_ids', ()))!r} "
+                        f"materializer_leaves={tuple(attributes.get('aggregate_leaf_value_ids', ()))!r}",
+                        file=sys.stderr,
+                    )
+                # Prefer the authored singleton aggregate's leaf ledger.  A
+                # bytes materializer records its direct argument (the list)
+                # as its leaf, while the list records the actual scalar.  The
+                # latter is what append_scalar must consume.  Fall back to the
+                # materializer ledger only for frontends which omit source
+                # aggregate metadata.
+                leaves = (
+                    tuple(map(int, source_attributes.get(
+                        "aggregate_leaf_value_ids", ()
+                    )))
+                    if literal_singleton else ()
+                )
+                if not leaves and literal_singleton:
+                    leaves = tuple(map(int, attributes.get(
+                        "aggregate_leaf_value_ids", ()
+                    )))
+                if len(leaves) == 1:
+                    singleton_by_resident[int(resident_id)] = leaves[0]
+                continue
+        resident_by_value[value_id] = value_id
+        kind_by_value[value_id] = kind
+        leaves = tuple(map(int, attributes.get(
+            "aggregate_leaf_value_ids", ()
+        )))
+        if len(leaves) == 1:
+            singleton_by_resident[value_id] = leaves[0]
+
+    for value_id, kind in dict(call_result_kinds or {}).items():
+        if str(kind) not in sequence_kinds:
+            continue
+        resident_by_value[int(value_id)] = int(value_id)
+        kind_by_value[int(value_id)] = str(kind)
+    for value_id, (resident_id, kind) in dict(
+        structural_aliases or {}
+    ).items():
+        if str(kind) not in sequence_kinds:
+            continue
+        resident_by_value[int(value_id)] = int(resident_id)
+        resident_by_value.setdefault(int(resident_id), int(resident_id))
+        kind_by_value[int(value_id)] = str(kind)
+        kind_by_value.setdefault(int(resident_id), str(kind))
+    # IndexedStore and its loop-result versions are deterministic names for
+    # the same resident arena.  Retain that correlation while recognizing
+    # structural concatenations across control-versioned sequence names.
+    storage_aliases = _loop_carried_storage_aliases(graph_obj)
+    changed = True
+    while changed:
+        changed = False
+        for alias_id, source_id in storage_aliases.items():
+            resident_id = resident_by_value.get(int(source_id))
+            kind = kind_by_value.get(int(source_id))
+            if resident_id is None or kind not in sequence_kinds:
+                continue
+            if resident_by_value.get(int(alias_id)) != int(resident_id):
+                resident_by_value[int(alias_id)] = int(resident_id)
+                kind_by_value[int(alias_id)] = str(kind)
+                changed = True
+        for node_id, data in graph_obj.nodes(data=True):
+            if str(data.get("op") or data.get("type") or "").casefold() not in {
+                "phi", "loopresult", "loopexit",
+            }:
+                continue
+            value_id = int(data.get("value_id", node_id))
+            resolved_parents = {
+                (
+                    int(resident_by_value[parent_value]),
+                    str(kind_by_value[parent_value]),
+                )
+                for parent, role in data.get("parents") or ()
+                if str(role) not in {"control", "test"}
+                and parent in graph_obj
+                for parent_value in (
+                    int(graph_obj.nodes[parent].get("value_id", parent)),
+                )
+                if parent_value in resident_by_value
+                and parent_value in kind_by_value
+            }
+            if len(resolved_parents) != 1:
+                continue
+            resident_id, kind = next(iter(resolved_parents))
+            if resident_by_value.get(value_id) != resident_id:
+                resident_by_value[value_id] = resident_id
+                kind_by_value[value_id] = kind
+                changed = True
+
+    operations: list[
+        tuple[int, int, int, str, int | None, int | None]
+    ] = []
+    # Deterministic ids are source ordered, so inner concatenations precede
+    # the outer expression that consumes them.
+    for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
+        data = graph_obj.nodes[node_id]
+        if str(data.get("type") or data.get("op") or "") != "Add":
+            continue
+        parents = {
+            str(role): int(parent)
+            for parent, role in (data.get("parents") or ())
+        }
+        lhs_node = parents.get("lhs")
+        rhs_node = parents.get("rhs")
+        if lhs_node is None or rhs_node is None:
+            continue
+        lhs_value = int(graph_obj.nodes[lhs_node].get("value_id", lhs_node))
+        rhs_value = int(graph_obj.nodes[rhs_node].get("value_id", rhs_node))
+        lhs = resident_by_value.get(lhs_value)
+        rhs = resident_by_value.get(rhs_value)
+        if lhs is None or rhs is None:
+            if os.environ.get("TURING_DEBUG_SEQUENCE_CONCAT"):
+                print(
+                    "DEBUGSEQMISS "
+                    f"fn={graph_obj.graph.get('function_name')} "
+                    f"result={int(data.get('value_id', node_id))} "
+                    f"lhs_value={lhs_value} lhs_resident={lhs} "
+                    f"rhs_value={rhs_value} rhs_resident={rhs} "
+                    f"source={ast.unparse(data.get('expr_obj')) if isinstance(data.get('expr_obj'), ast.AST) else None!r}",
+                    file=sys.stderr,
+                )
+            continue
+        lhs_kind = kind_by_value.get(lhs_value, kind_by_value.get(lhs))
+        rhs_kind = kind_by_value.get(rhs_value, kind_by_value.get(rhs))
+        if lhs_kind != rhs_kind:
+            if os.environ.get("TURING_DEBUG_SEQUENCE_CONCAT"):
+                print(
+                    "DEBUGSEQMISS "
+                    f"fn={graph_obj.graph.get('function_name')} "
+                    f"result={int(data.get('value_id', node_id))} "
+                    f"lhs_kind={lhs_kind!r} rhs_kind={rhs_kind!r} "
+                    f"source={ast.unparse(data.get('expr_obj')) if isinstance(data.get('expr_obj'), ast.AST) else None!r}",
+                    file=sys.stderr,
+                )
+            continue
+        result_id = int(data.get("value_id", node_id))
+        result_kind = str(lhs_kind)
+        operations.append((
+            result_id, int(lhs), int(rhs), result_kind,
+            singleton_by_resident.get(int(lhs)),
+            singleton_by_resident.get(int(rhs)),
+        ))
+        if os.environ.get("TURING_DEBUG_SEQUENCE_CONCAT"):
+            print(
+                "DEBUGSEQ "
+                f"fn={graph_obj.graph.get('function_name')} "
+                f"result={result_id} lhs={int(lhs)} rhs={int(rhs)} "
+                f"lhs_scalar={singleton_by_resident.get(int(lhs))} "
+                f"rhs_scalar={singleton_by_resident.get(int(rhs))} "
+                f"source={ast.unparse(data.get('expr_obj')) if isinstance(data.get('expr_obj'), ast.AST) else None!r}",
+                file=sys.stderr,
+            )
+        resident_by_value[result_id] = result_id
+        kind_by_value[result_id] = result_kind
+
+    aliases = tuple(sorted(
+        (int(value_id), int(resident_id))
+        for value_id, resident_id in resident_by_value.items()
+        if int(value_id) != int(resident_id)
+    ))
+    singleton_materializations = {
+        int(value_id): int(singleton_by_resident[int(resident_id)])
+        for value_id, resident_id in aliases
+        if int(resident_id) in singleton_by_resident
+    }
+    return tuple(operations), aliases, singleton_materializations
+
+
+def _sequence_value_kinds(
+    graph_obj: Any,
+    *,
+    return_sequence_kind_by_reference: Mapping[int, str] | None = None,
+) -> dict[int, str]:
+    """Resolve sequence semantics through calls and structural expressions.
+
+    A pursued callee's result is represented in its caller by the callee's
+    return value identity, not by another aggregate-construction node. Merely
+    scanning nodes carrying ``aggregate_kind`` therefore loses a sequence at
+    exactly the boundary where an ordinary helper returns it. Resolve direct
+    aggregate facts, known call returns, materialization aliases, and sequence
+    concatenations as one backend-independent structural closure.
+    """
+
+    sequence_kinds = {"list", "bytes", "bytearray"}
+    kinds: dict[int, str] = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        kind = str(attributes.get("aggregate_kind") or "")
+        if kind not in sequence_kinds:
+            continue
+        value_id = int(data.get("value_id", node_id))
+        kinds[value_id] = kind
+        if attributes.get("producer_kind") != "aggregate_materialization":
+            continue
+        sources = tuple(
+            int(graph_obj.nodes[parent].get("value_id", parent))
+            for parent, role in (data.get("parents") or ())
+            if str(role).startswith("arg:") and parent in graph_obj
+        )
+        if len(sources) == 1:
+            kinds[sources[0]] = kind
+
+    call_result_kinds: dict[int, str] = {}
+    return_kinds = dict(return_sequence_kind_by_reference or {})
+    for node_id, data in graph_obj.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        reference = attributes.get(
+            "callee_ref", attributes.get("method_ref")
+        )
+        if reference is None:
+            continue
+        kind = return_kinds.get(int(reference))
+        if kind in sequence_kinds:
+            value_id = int(data.get("value_id", node_id))
+            call_result_kinds[value_id] = str(kind)
+            kinds[value_id] = str(kind)
+
+    structural_aliases = {
+        int(result_id): (int(source_id), "bytes")
+        for result_id, source_id, _source_name, _transform
+        in (
+            *_utf8_encode_aliases(graph_obj),
+            *(
+                record for record in _bytes_join_source_transforms(graph_obj)
+                if str(record[3]) == "join_bytes"
+            ),
+        )
+    }
+    concatenations, aliases, _singletons = _sequence_concat_ops(
+        graph_obj,
+        call_result_kinds=call_result_kinds,
+        structural_aliases=structural_aliases,
+    )
+    for result_id, _lhs, _rhs, kind, _lhs_scalar, _rhs_scalar in concatenations:
+        kinds[int(result_id)] = str(kind)
+    for alias_id, resident_id in aliases:
+        resident_kind = kinds.get(int(resident_id))
+        if resident_kind is not None:
+            kinds[int(alias_id)] = resident_kind
+    return kinds
+
+
+def _promote_conditional_sequence_aliases(
+    control: Any,
+    graph_obj: Any,
+    *,
+    call_result_kinds: Mapping[int, str] | None = None,
+    structural_aliases: Mapping[int, tuple[int, str]] | None = None,
+):
+    """Turn branch-carried aggregate versions into resident arena carries.
+
+    Ordinary conditional planning records every authored assignment in the
+    scalar-shaped ``carried_aliases`` tuple.  Once source/call analysis proves
+    those values are sequences, retain one initial arena, copy the selected
+    branch value into it, and correlate the post-branch SSA spelling with that
+    arena.  This is an IR correction, not a receipt-only relabeling.
+    """
+
+    from .control_source import (
+        CallBlock, ConditionalBlock, LoopBlock, SequenceBlock, WhileBlock,
+    )
+
+    sequence_kinds = {"list", "bytes", "bytearray"}
+    resident_by_value: dict[int, int] = {}
+    kind_by_value: dict[int, str] = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        kind = str(attributes.get("aggregate_kind") or "")
+        if kind not in sequence_kinds:
+            continue
+        value_id = int(data.get("value_id", node_id))
+        resident_by_value[value_id] = value_id
+        kind_by_value[value_id] = kind
+    for value_id, kind in dict(call_result_kinds or {}).items():
+        if str(kind) in sequence_kinds:
+            resident_by_value[int(value_id)] = int(value_id)
+            kind_by_value[int(value_id)] = str(kind)
+    for value_id, (resident_id, kind) in dict(
+        structural_aliases or {}
+    ).items():
+        if str(kind) not in sequence_kinds:
+            continue
+        resident_by_value[int(value_id)] = int(resident_id)
+        kind_by_value[int(value_id)] = str(kind)
+        kind_by_value.setdefault(int(resident_id), str(kind))
+
+    # In-place stores and their Phi/loop-result spellings are storage
+    # versions, not scalar values.  Resolve them to their original arena before
+    # inspecting conditional carries, otherwise the branch becomes an opaque
+    # scalar Phi and every later row projection leaks into the public ABI.
+    storage_aliases = _loop_carried_storage_aliases(graph_obj)
+    changed = True
+    while changed:
+        changed = False
+        for alias_id, source_id in storage_aliases.items():
+            resident_id = resident_by_value.get(int(source_id))
+            kind = kind_by_value.get(int(source_id))
+            if resident_id is None or kind not in sequence_kinds:
+                continue
+            if resident_by_value.get(int(alias_id)) != int(resident_id):
+                resident_by_value[int(alias_id)] = int(resident_id)
+                kind_by_value[int(alias_id)] = str(kind)
+                changed = True
+        for node_id, data in graph_obj.nodes(data=True):
+            if str(data.get("op") or data.get("type") or "").casefold() not in {
+                "phi", "loopresult", "loopexit",
+            }:
+                continue
+            value_id = int(data.get("value_id", node_id))
+            resolved_parents = {
+                (
+                    int(resident_by_value[parent_value]),
+                    str(kind_by_value[parent_value]),
+                )
+                for parent, role in data.get("parents") or ()
+                if str(role) not in {"control", "test"}
+                and parent in graph_obj
+                for parent_value in (
+                    int(graph_obj.nodes[parent].get("value_id", parent)),
+                )
+                if parent_value in resident_by_value
+                and parent_value in kind_by_value
+            }
+            if len(resolved_parents) != 1:
+                continue
+            resident_id, kind = next(iter(resolved_parents))
+            if resident_by_value.get(value_id) != resident_id:
+                resident_by_value[value_id] = resident_id
+                kind_by_value[value_id] = kind
+                changed = True
+
+    promoted_aliases: dict[int, tuple[int, str]] = {}
+    destination_ids: set[int] = set()
+
+    def promote(block):
+        if isinstance(block, ConditionalBlock):
+            scalar = []
+            sequences = list(block.carried_sequence_aliases)
+            for carried in block.carried_aliases:
+                true_id, false_id, initial_id, merged_id = map(int, carried)
+                initial_resident = resident_by_value.get(initial_id)
+                initial_kind = kind_by_value.get(initial_id)
+                true_resident = resident_by_value.get(true_id)
+                false_resident = resident_by_value.get(false_id)
+                true_kind = kind_by_value.get(true_id)
+                false_kind = kind_by_value.get(false_id)
+                if (
+                    initial_resident is None
+                    or initial_kind not in sequence_kinds
+                    or true_resident is None
+                    or false_resident is None
+                    or true_kind != initial_kind
+                    or false_kind != initial_kind
+                ):
+                    scalar.append(carried)
+                    continue
+                destination = int(initial_resident)
+                sequences.append((
+                    int(true_resident), int(false_resident),
+                    destination, merged_id,
+                ))
+                destination_ids.add(destination)
+                resident_by_value[merged_id] = destination
+                kind_by_value[merged_id] = initial_kind
+                promoted_aliases[merged_id] = (destination, initial_kind)
+            return replace(
+                block,
+                body=promote(block.body),
+                orelse=(
+                    None if block.orelse is None else promote(block.orelse)
+                ),
+                carried_aliases=tuple(scalar),
+                carried_sequence_aliases=tuple(sequences),
+            )
+        if isinstance(block, SequenceBlock):
+            return replace(block, blocks=tuple(promote(x) for x in block.blocks))
+        if isinstance(block, LoopBlock):
+            promoted_body = promote(block.body)
+            scalar_carries = []
+            sequence_updates: set[tuple[int, int]] = set()
+            for updated_id, initial_id in block.carried_aliases:
+                updated_id = int(updated_id)
+                initial_id = int(initial_id)
+                updated_resident = resident_by_value.get(updated_id)
+                initial_resident = resident_by_value.get(initial_id)
+                if (
+                    updated_resident is None
+                    or initial_resident is None
+                    or updated_resident != initial_resident
+                    or kind_by_value.get(updated_id) not in sequence_kinds
+                    or kind_by_value.get(initial_id) not in sequence_kinds
+                ):
+                    scalar_carries.append((updated_id, initial_id))
+                    continue
+                sequence_updates.add((updated_id, initial_id))
+                kind = str(kind_by_value[initial_id])
+                promoted_aliases[updated_id] = (
+                    int(initial_resident), kind,
+                )
+                destination_ids.add(int(initial_resident))
+            scalar_ports = []
+            for port_id, initial_id, updated_id in block.result_ports:
+                key = (int(updated_id), int(initial_id))
+                if key not in sequence_updates:
+                    scalar_ports.append((
+                        int(port_id), int(initial_id), int(updated_id)
+                    ))
+                    continue
+                resident_id = int(resident_by_value[int(initial_id)])
+                kind = str(kind_by_value[int(initial_id)])
+                resident_by_value[int(port_id)] = resident_id
+                kind_by_value[int(port_id)] = kind
+                promoted_aliases[int(port_id)] = (resident_id, kind)
+            return replace(
+                block,
+                body=promoted_body,
+                carried_aliases=tuple(scalar_carries),
+                result_ports=tuple(scalar_ports),
+            )
+        if isinstance(block, WhileBlock):
+            return replace(
+                block,
+                condition=promote(block.condition),
+                body=promote(block.body),
+            )
+        if isinstance(block, CallBlock):
+            return replace(block, callee=promote(block.callee))
+        return block
+
+    promoted = replace(control, root=promote(control.root))
+    return promoted, promoted_aliases, tuple(sorted(destination_ids))
+
+
+def _constant_struct_pack_materializations(graph_obj: Any):
+    """Fold fully source-static ``struct.pack`` calls to byte-sequence facts."""
+
+    import struct
+
+    materializations = []
+    for node_id, data in sorted(graph_obj.nodes(data=True)):
+        attributes = data.get("attributes") or {}
+        if attributes.get("extraction_identity") != "_struct.pack":
+            continue
+        arguments = tuple(
+            int(parent)
+            for parent, role in sorted(
+                data.get("parents") or (),
+                key=lambda item: int(str(item[1]).split(":", 1)[1])
+                if str(item[1]).startswith("arg:") else 1 << 30,
+            )
+            if str(role).startswith("arg:") and int(parent) in graph_obj
+        )
+        values = []
+        for argument in arguments:
+            argument_data = graph_obj.nodes[argument]
+            argument_attributes = argument_data.get("attributes") or {}
+            if "value" in argument_attributes:
+                values.append(argument_attributes["value"])
+            elif argument_data.get("constant") is not None:
+                values.append(argument_data["constant"])
+            else:
+                break
+        if len(values) != len(arguments) or not values:
+            continue
+        try:
+            payload = struct.pack(*values)
+        except (struct.error, TypeError, ValueError):
+            continue
+        value_id = int(data.get("value_id", node_id))
+        updated = dict(attributes)
+        updated.update({
+            "producer_kind": "constant_sequence",
+            "aggregate_kind": "bytes",
+            "sequence_key_columns": (),
+            "sequence_column_count": 1,
+            "sequence_writable": False,
+            "constant_bytes": bytes(payload),
+        })
+        data["attributes"] = updated
+        materializations.append((
+            value_id,
+            bytes(payload),
+            int(node_id),
+            "_struct.pack",
+        ))
+    return tuple(materializations)
+
+
+def _constant_byte_literal_materializations(graph_obj: Any):
+    """Publish authored byte literals through the resident sequence ABI."""
+
+    materializations = []
+    for node_id, data in sorted(graph_obj.nodes(data=True)):
+        attributes = data.get("attributes") or {}
+        literal = attributes.get("value", data.get("constant"))
+        if not isinstance(literal, bytes):
+            continue
+        value_id = int(data.get("value_id", node_id))
+        updated = dict(attributes)
+        updated.update({
+            "producer_kind": "constant_sequence",
+            "aggregate_kind": "bytes",
+            "sequence_key_columns": (),
+            "sequence_column_count": 1,
+            "sequence_writable": False,
+            "constant_bytes": bytes(literal),
+        })
+        data["attributes"] = updated
+        materializations.append((
+            value_id, bytes(literal), int(node_id), None,
+        ))
+    return tuple(materializations)
+
+
+def _sequence_append_call_mutations(graph_obj: Any):
+    """Recover authored resident ``append/add`` calls as lexical effects."""
+
+    from .control_source import ControlSequenceMutation
+
+    sequence_kinds = {"list", "set", "bytes", "bytearray"}
+    mutations = [
+        ControlSequenceMutation(
+            sequence_value_id=int(record["sequence_value_id"]),
+            operator=str(record["operator"]),
+            argument_value_ids=tuple(map(
+                int, record["argument_value_ids"]
+            )),
+            effect_node_id=int(node_id),
+            policy=record.get("policy"),
+        )
+        for node_id, record in sorted(
+            (
+                graph_obj.graph.get("source_sequence_mutation_records")
+                or {}
+            ).items(),
+            key=lambda item: int(item[0]),
+        )
+    ]
+    recorded_effect_ids = {
+        int(mutation.effect_node_id) for mutation in mutations
+    }
+    for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
+        data = graph_obj.nodes[node_id]
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Attribute)
+            and expression.func.attr in {"append", "add"}
+        ):
+            continue
+        if int(node_id) in recorded_effect_ids:
+            continue
+        parents = tuple(data.get("parents") or ())
+        destination_node = next((
+            int(parent) for parent, role in parents
+            if str(role) == "operand" and int(parent) in graph_obj
+        ), None)
+        arguments = tuple(
+            int(parent) for parent, role in parents
+            if str(role).startswith("arg:") and int(parent) in graph_obj
+        )
+        if destination_node is None or len(arguments) != 1:
+            continue
+        destination = graph_obj.nodes[destination_node]
+        attributes = destination.get("attributes") or {}
+        if attributes.get("aggregate_kind") not in sequence_kinds:
+            continue
+        mutations.append(ControlSequenceMutation(
+            sequence_value_id=int(destination.get(
+                "value_id", destination_node
+            )),
+            operator=str(expression.func.attr),
+            argument_value_ids=(int(graph_obj.nodes[arguments[0]].get(
+                "value_id", arguments[0]
+            )),),
+            effect_node_id=int(data.get("value_id", node_id)),
+            policy=(
+                "unique" if expression.func.attr == "add"
+                else "duplicates"
+            ),
+        ))
+    nodes_by_value = {
+        int(data.get("value_id", node_id)): data
+        for node_id, data in graph_obj.nodes(data=True)
+    }
+    expanded_mutations = []
+    for mutation in mutations:
+        arguments: list[int] = []
+        for value_id in mutation.argument_value_ids:
+            attributes = (
+                nodes_by_value.get(int(value_id), {}).get("attributes") or {}
+            )
+            leaves = tuple(map(
+                int, attributes.get("aggregate_leaf_value_ids", ())
+            ))
+            if attributes.get("aggregate_kind") == "tuple" and leaves:
+                arguments.extend(leaves)
+            else:
+                arguments.append(int(value_id))
+        expanded_mutations.append(replace(
+            mutation,
+            argument_value_ids=tuple(arguments),
+            argument_kind=(
+                "row" if len(arguments) > 1 else mutation.argument_kind
+            ),
+        ))
+    return tuple(expanded_mutations)
+
+
+def _joined_byte_sequence_ids(
+    graph_obj: Any,
+    *,
+    call_result_kinds: Mapping[int, str],
+    declared_sequence_ids: Iterable[int],
+    structural_byte_sequence_ids: Iterable[int] = (),
+    transformed_call_source_ids: Iterable[int] = (),
+) -> tuple[int, ...]:
+    """Find resident ``list[bytes]`` identities needing dual ABI views.
+
+    The authored outer list owns an element count, while its eventual empty
+    byte join owns a flattened byte stream. Parameters already express these
+    as ``row_count``/``join_bytes`` source transforms; this recovers the same
+    representation for locals without inspecting Python values.
+    """
+
+    declared = set(map(int, declared_sequence_ids))
+    node_by_value = {
+        int(data.get("value_id", node_id)): data
+        for node_id, data in graph_obj.nodes(data=True)
+    }
+    byte_values = {
+        int(value_id)
+        for value_id, data in node_by_value.items()
+        if str((data.get("attributes") or {}).get("aggregate_kind"))
+        in {"bytes", "bytearray"}
+    }
+    byte_values.update(
+        int(value_id)
+        for value_id, kind in call_result_kinds.items()
+        if str(kind) in {"bytes", "bytearray"}
+    )
+    byte_values.update(map(int, structural_byte_sequence_ids))
+    seeds: set[int] = set(map(int, transformed_call_source_ids))
+    for value_id, data in node_by_value.items():
+        attributes = data.get("attributes") or {}
+        if attributes.get("aggregate_kind") != "list":
+            continue
+        leaves = tuple(map(
+            int, attributes.get("aggregate_leaf_value_ids", ())
+        ))
+        if not leaves:
+            leaves = tuple(
+                int(graph_obj.nodes[parent].get("value_id", parent))
+                for parent, role in (data.get("parents") or ())
+                if str(role).startswith("elts") and parent in graph_obj
+            )
+        if leaves and all(int(leaf) in byte_values for leaf in leaves):
+            seeds.add(int(value_id))
+    append_mutations = _sequence_append_call_mutations(graph_obj)
+    for mutation in append_mutations:
+        if (
+            mutation.operator == "append"
+            and len(mutation.argument_value_ids) == 1
+            and int(mutation.argument_value_ids[0]) in byte_values
+        ):
+            seeds.add(int(mutation.sequence_value_id))
+
+    if os.environ.get("TURING_DEBUG_JOINED_SEQUENCE"):
+        print(
+            "DEBUGJOINED "
+            f"fn={graph_obj.graph.get('function_name')} "
+            f"bytes={tuple(sorted(byte_values))!r} "
+            f"seeds={tuple(sorted(seeds))!r} "
+            f"mutations={tuple((int(item.sequence_value_id), tuple(map(int, item.argument_value_ids))) for item in append_mutations)!r} "
+            f"transformed={tuple((int(value_id), str((node_by_value.get(int(value_id), {}).get('attributes') or {}).get('binding_name')), ast.dump(node_by_value.get(int(value_id), {}).get('expr_obj'), include_attributes=False) if isinstance(node_by_value.get(int(value_id), {}).get('expr_obj'), ast.AST) else None) for value_id in sorted(map(int, transformed_call_source_ids)))!r} "
+            f"identities={tuple((str(name), tuple(map(int, history))) for name, history in (graph_obj.graph.get('identity_table') or {}).items() if str(name) in {'types', 'entries'})!r} "
+            f"declared={tuple(sorted(declared))!r}",
+            file=sys.stderr,
+        )
+
+    mutation_destinations = {
+        int(item.sequence_value_id) for item in append_mutations
+    }
+    joined = {
+        int(value_id)
+        for value_id in seeds
+        if (
+            int(value_id) in declared
+            or int(value_id) in mutation_destinations
+            or (
+                node_by_value.get(int(value_id), {}).get("attributes") or {}
+            ).get("aggregate_kind") == "list"
+            or isinstance(
+                (
+                    (graph_obj.nodes.get(int(value_id), {}).get("attributes")
+                     or {}).get(
+                        "value",
+                        graph_obj.nodes.get(int(value_id), {}).get("constant"),
+                    )
+                ),
+                list,
+            )
+        )
+    }
+    for history in (graph_obj.graph.get("identity_table") or {}).values():
+        identities = set(map(int, history))
+        if identities & seeds:
+            joined.update(identities & declared)
+    return tuple(sorted(joined))
+
+
+def _joined_list_literal_mutations(
+    graph_obj: Any, joined_sequence_ids: Iterable[int]
+) -> tuple[Any, ...]:
+    """Materialize each authored list element into its resident dual view."""
+
+    from .control_source import ControlSequenceMutation
+
+    joined = set(map(int, joined_sequence_ids))
+    mutations = []
+    emitted: set[tuple[int, int, int]] = set()
+
+    def append_mutation(
+        sequence_id: int, effect_node_id: int, value_id: int,
+    ) -> None:
+        key = (int(sequence_id), int(effect_node_id), int(value_id))
+        if key in emitted:
+            return
+        emitted.add(key)
+        mutations.append(ControlSequenceMutation(
+            sequence_value_id=int(sequence_id),
+            operator="append",
+            argument_value_ids=(int(value_id),),
+            effect_node_id=int(effect_node_id),
+            policy="duplicates",
+            argument_kind="joined_literal_element",
+        ))
+
+    nodes = tuple(graph_obj.nodes(data=True))
+
+    def expression_node(expression: ast.AST) -> tuple[int, int] | None:
+        exact = [
+            (int(node_id), int(data.get("value_id", node_id)))
+            for node_id, data in nodes
+            if data.get("expr_obj") is expression
+        ]
+        if len(exact) == 1:
+            return exact[0]
+        position = (
+            int(getattr(expression, "lineno", -1) or -1),
+            int(getattr(expression, "col_offset", -1) or -1),
+            int(getattr(expression, "end_lineno", -1) or -1),
+            int(getattr(expression, "end_col_offset", -1) or -1),
+            type(expression),
+        )
+        positioned = [
+            (int(node_id), int(data.get("value_id", node_id)))
+            for node_id, data in nodes
+            for candidate in (data.get("expr_obj"),)
+            if isinstance(candidate, ast.AST)
+            and (
+                int(getattr(candidate, "lineno", -2) or -2),
+                int(getattr(candidate, "col_offset", -2) or -2),
+                int(getattr(candidate, "end_lineno", -2) or -2),
+                int(getattr(candidate, "end_col_offset", -2) or -2),
+                type(candidate),
+            ) == position
+        ]
+        return positioned[0] if len(positioned) == 1 else None
+
+    for node_id, data in sorted(
+        nodes, key=lambda item: int(item[0])
+    ):
+        sequence_id = int(data.get("value_id", node_id))
+        if sequence_id not in joined:
+            continue
+        expression = data.get("expr_obj")
+        if not isinstance(expression, ast.List):
+            continue
+        elements = sorted(
+            [
+                (
+                int(parent), str(role),
+                int(graph_obj.nodes[parent].get("value_id", parent)),
+                )
+                for parent, role in (data.get("parents") or ())
+                if str(role).startswith("elts") and parent in graph_obj
+            ],
+            key=lambda item: (
+                int(item[1].split(":", 1)[1])
+                if ":" in item[1] and item[1].split(":", 1)[1].isdigit()
+                else item[0]
+            ),
+        )
+        for parent, _role, value_id in elements:
+            append_mutation(sequence_id, parent, value_id)
+
+    # The source realizer may specialize an inline dynamic list into an empty
+    # structural resident while retaining the authored list only on the Call
+    # that consumes it (``_vector([uleb(index)])``). Its elements are still
+    # ordinary ProcessGraph nodes. Correlate those exact AST objects/source
+    # spans back to their deterministic value identities and initialize the
+    # resident before the consuming call.
+    for _call_node_id, data in sorted(nodes, key=lambda item: int(item[0])):
+        expression = data.get("expr_obj")
+        if not isinstance(expression, ast.Call) or not expression.args:
+            continue
+        literal = expression.args[0]
+        if not isinstance(literal, ast.List):
+            continue
+        sequence_ids = tuple(dict.fromkeys(
+            int(graph_obj.nodes[parent].get("value_id", parent))
+            for parent, role in (data.get("parents") or ())
+            if str(role) == "arg:0" and parent in graph_obj
+        ))
+        if len(sequence_ids) != 1 or sequence_ids[0] not in joined:
+            continue
+        for element in literal.elts:
+            correlated = expression_node(element)
+            if correlated is None:
+                continue
+            effect_node_id, value_id = correlated
+            append_mutation(sequence_ids[0], effect_node_id, value_id)
+    return tuple(mutations)
+
+
+def _graph_control_expression(
+    graph_obj: Any, node_id: int, visiting: frozenset[int] = frozenset(),
+):
+    """Translate a retained scalar predicate from ProcessGraph structure."""
+
+    from .control_source import ControlExpression
+
+    node_id = int(node_id)
+    if node_id in visiting or node_id not in graph_obj:
+        return ControlExpression("value", value_id=node_id)
+    data = graph_obj.nodes[node_id]
+    expression = data.get("expr_obj")
+    attributes = data.get("attributes") or {}
+    literal = attributes.get("value", data.get("constant"))
+    if isinstance(expression, ast.Constant):
+        literal = expression.value
+        if literal is None:
+            return ControlExpression("const", value_id=node_id, literal=None)
+    if isinstance(literal, (bool, int, float)) and str(
+        data.get("type") or ""
+    ).casefold() in {"constant", "const"}:
+        return ControlExpression("const", value_id=node_id, literal=literal)
+    if attributes.get("aggregate_kind") in {
+        "list", "set", "dict", "tuple", "bytes", "bytearray",
+    }:
+        return ControlExpression(
+            "sequence_nonempty",
+            (ControlExpression("value", value_id=node_id),),
+            value_id=node_id,
+            literal=attributes.get("aggregate_kind") in {"set", "dict"},
+        )
+    parents = tuple(data.get("parents") or ())
+    ordered = tuple(
+        int(parent)
+        for parent, role in sorted(
+            parents,
+            key=lambda item: (
+                int(str(item[1]).split(":")[-1])
+                if str(item[1]).split(":")[-1].isdigit() else 0
+            ),
+        )
+        if str(role) not in {"callee", "ops", "operator"}
+    )
+    if isinstance(expression, ast.BoolOp):
+        operator = "and" if isinstance(expression.op, ast.And) else "or"
+        operands = tuple(
+            _graph_control_expression(
+                graph_obj, parent, visiting | {node_id}
+            )
+            for parent in ordered
+        )
+        if operands:
+            result = operands[0]
+            for operand in operands[1:]:
+                result = ControlExpression(
+                    operator, (result, operand), value_id=node_id
+                )
+            return result
+    operation = {
+        "add": "add", "sub": "sub", "mul": "mul",
+        "div": "div", "truediv": "div",
+        "less": "lt", "lt": "lt",
+        "lessequal": "le", "less_equal": "le", "le": "le",
+        "greater": "gt", "gt": "gt",
+        "greaterequal": "ge", "greater_equal": "ge", "ge": "ge",
+        "equal": "eq", "eq": "eq",
+        "notequal": "ne", "not_equal": "ne", "ne": "ne",
+        "logical_and": "and", "land": "and",
+        "logical_or": "or", "lor": "or",
+        "logical_not": "not", "lnot": "not",
+        "neg": "neg", "usub": "neg",
+        "bitand": "bitand", "bitor": "bitor",
+        "bitxor": "bitxor", "shl": "shl", "shr": "shr",
+        "invert": "invert",
+    }.get(str(data.get("op") or data.get("type") or "").casefold())
+    if operation is not None:
+        arity = 1 if operation in {"not", "neg", "invert"} else 2
+        operands = tuple(
+            _graph_control_expression(
+                graph_obj, parent, visiting | {node_id}
+            )
+            for parent in ordered[:arity]
+        )
+        if len(operands) == arity:
+            return ControlExpression(operation, operands, value_id=node_id)
+    return ControlExpression("value", value_id=node_id)
+
+
+def _attach_graph_control_expressions(control: Any, graph_obj: Any):
+    """Recover structured predicates for every retained conditional."""
+
+    from .control_source import (
+        CallBlock, ConditionalBlock, LoopBlock, SequenceBlock, WhileBlock,
+    )
+
+    def attach(block):
+        if isinstance(block, ConditionalBlock):
+            return replace(
+                block,
+                body=attach(block.body),
+                orelse=(None if block.orelse is None else attach(block.orelse)),
+                predicate_expression=_graph_control_expression(
+                    graph_obj, int(block.predicate_value_id)
+                ),
+            )
+        if isinstance(block, SequenceBlock):
+            return replace(
+                block, blocks=tuple(attach(item) for item in block.blocks)
+            )
+        if isinstance(block, LoopBlock):
+            return replace(block, body=attach(block.body))
+        if isinstance(block, WhileBlock):
+            return replace(
+                block,
+                condition=attach(block.condition),
+                body=attach(block.body),
+            )
+        if isinstance(block, CallBlock):
+            return replace(block, callee=attach(block.callee))
+        return block
+
+    return replace(control, root=attach(control.root))
+
+
+def _install_lexical_sequence_mutations(
+    control: Any,
+    graph: Any,
+    dispatch_subgraphs: Iterable[Any],
+    *,
+    extra_mutations: Iterable[Any] = (),
+):
+    """Place non-loop sequence effects into their authored control scope."""
+
+    from .control_source import (
+        CallBlock,
+        ConditionalBlock,
+        ControlExpression,
+        LoopBlock,
+        SequenceBlock,
+        SequenceMutationBlock,
+        StatementBlock,
+        WhileBlock,
+    )
+    from .glsl_deployment_strategy import (
+        _branch_compartments,
+        _retained_control_value_id,
+        _source_control_records,
+    )
+
+    mutations = tuple((
+        *_sequence_append_call_mutations(graph.G),
+        *tuple(extra_mutations),
+    ))
+    if not mutations:
+        return control, ()
+
+    existing_effect_ids: set[int] = set()
+
+    def gather(block):
+        if isinstance(block, SequenceMutationBlock):
+            existing_effect_ids.add(int(block.mutation.effect_node_id))
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                gather(child)
+        elif isinstance(block, ConditionalBlock):
+            gather(block.body)
+            if block.orelse is not None:
+                gather(block.orelse)
+        elif isinstance(block, (LoopBlock, WhileBlock)):
+            existing_effect_ids.update(
+                int(item.effect_node_id) for item in block.sequence_mutations
+            )
+            if isinstance(block, WhileBlock):
+                gather(block.condition)
+            gather(block.body)
+        elif isinstance(block, CallBlock):
+            gather(block.callee)
+
+    gather(control.root)
+    mutations = tuple(
+        item for item in mutations
+        if int(item.effect_node_id) not in existing_effect_ids
+    )
+    if not mutations:
+        return control, ()
+
+    def node_position(node_id: int) -> tuple[int, int, int]:
+        data = graph.G.nodes.get(int(node_id), {})
+        expression = data.get("expr_obj")
+        span = data.get("source_span") or {}
+        return (
+            int(getattr(expression, "lineno", span.get("line", 1 << 30)) or (1 << 30)),
+            int(getattr(expression, "col_offset", span.get("column", 0)) or 0),
+            int(node_id),
+        )
+
+    region_positions = {
+        int(index): min(
+            (
+                node_position(int(node_id))
+                for node_id in subgraph.G.graph.get("deployment_nodes", ())
+            ),
+            default=(1 << 30, 0, int(index)),
+        )
+        for index, subgraph in enumerate(dispatch_subgraphs)
+    }
+
+    def block_position(block) -> tuple[int, int, int]:
+        if isinstance(block, SequenceMutationBlock):
+            return node_position(int(block.mutation.effect_node_id))
+        if isinstance(block, StatementBlock) and len(block.lines) == 1:
+            line = block.lines[0]
+            if line.startswith("__scheduled_region_") and line.endswith("__"):
+                return region_positions.get(
+                    int(line[len("__scheduled_region_"):-2]),
+                    (1 << 30, 0, 0),
+                )
+        if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
+            return node_position(int(block.source_node_id))
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            source_id = getattr(block, "source_loop_node_id", None)
+            if source_id is not None:
+                return node_position(int(source_id))
+        if isinstance(block, CallBlock):
+            return node_position(int(block.callsite_id))
+        if isinstance(block, SequenceBlock) and block.blocks:
+            return min(map(block_position, block.blocks))
+        return (1 << 30, 0, 0)
+
+    def insert_ordered(block, mutation_block):
+        sequence = block if isinstance(block, SequenceBlock) else SequenceBlock((block,))
+        decorated = [
+            (block_position(child), index, child)
+            for index, child in enumerate(sequence.blocks)
+        ]
+        decorated.append((
+            block_position(mutation_block), len(decorated), mutation_block,
+        ))
+        return SequenceBlock(tuple(
+            child for _position, _index, child in sorted(
+                decorated, key=lambda item: (item[0], item[1])
+            )
+        ))
+
+    memberships = _branch_compartments(graph)
+    retained_mutation_records = (
+        graph.G.graph.get("source_sequence_mutation_records") or {}
+    )
+
+    def insert_in_conditional(block, owner_id, arm, mutation_block):
+        if isinstance(block, ConditionalBlock):
+            if int(block.source_node_id or -1) == int(owner_id):
+                if str(arm) == "body":
+                    return replace(
+                        block,
+                        body=insert_ordered(block.body, mutation_block),
+                    ), True
+                return replace(
+                    block,
+                    orelse=insert_ordered(
+                        block.orelse or SequenceBlock(()), mutation_block,
+                    ),
+                ), True
+            body, inserted = insert_in_conditional(
+                block.body, owner_id, arm, mutation_block
+            )
+            if inserted:
+                return replace(block, body=body), True
+            if block.orelse is not None:
+                orelse, inserted = insert_in_conditional(
+                    block.orelse, owner_id, arm, mutation_block
+                )
+                if inserted:
+                    return replace(block, orelse=orelse), True
+            return block, False
+        if isinstance(block, SequenceBlock):
+            children = []
+            inserted = False
+            for child in block.blocks:
+                projected, child_inserted = insert_in_conditional(
+                    child, owner_id, arm, mutation_block
+                )
+                children.append(projected)
+                inserted |= child_inserted
+            return SequenceBlock(tuple(children)), inserted
+        if isinstance(block, LoopBlock):
+            body, inserted = insert_in_conditional(
+                block.body, owner_id, arm, mutation_block
+            )
+            return replace(block, body=body), inserted
+        if isinstance(block, WhileBlock):
+            body, inserted = insert_in_conditional(
+                block.body, owner_id, arm, mutation_block
+            )
+            return replace(block, body=body), inserted
+        if isinstance(block, CallBlock):
+            callee, inserted = insert_in_conditional(
+                block.callee, owner_id, arm, mutation_block
+            )
+            return replace(block, callee=callee), inserted
+        return block, False
+
+    root = control.root
+    unplaced = []
+    for mutation in mutations:
+        mutation_block = SequenceMutationBlock(mutation)
+        guarded = tuple(dict.fromkeys((
+            *tuple(
+            (int(owner), str(arm))
+            for owner, arm in memberships.get(int(mutation.effect_node_id), ())
+            if str(arm) in {"body", "orelse"}
+            ),
+            *tuple(
+                (int(owner), str(arm))
+                for owner, arm in (
+                    retained_mutation_records.get(
+                        int(mutation.effect_node_id), {}
+                    ).get("branch_memberships", ())
+                )
+                if str(arm) in {"body", "orelse"}
+            ),
+        )))
+        if os.environ.get("TURING_DEBUG_SEQUENCE_MUTATION"):
+            print(
+                "DEBUGMUTATION "
+                f"fn={graph.G.graph.get('function_name')} "
+                f"effect={int(mutation.effect_node_id)} "
+                f"sequence={int(mutation.sequence_value_id)} "
+                f"guarded={guarded}",
+                file=sys.stderr,
+            )
+        inserted = False
+        # Innermost authored condition has the latest source position.
+        for owner_id, arm in sorted(
+            guarded, key=lambda item: node_position(item[0]), reverse=True,
+        ):
+            root, inserted = insert_in_conditional(
+                root, owner_id, arm, mutation_block
+            )
+            if inserted:
+                break
+        if not inserted:
+            # A branch containing only structural storage effects owns no
+            # numerical region, so ordinary region overlay has no marker from
+            # which to materialize its ConditionalBlock.  Reconstruct that
+            # authored branch from the retained pre-fold control record, then
+            # place the complete wrapper inside its nearest surviving outer
+            # conditional (or at the lexical root).
+            synthesized = None
+            remaining_guards = guarded
+            if guarded:
+                owner_id, arm = sorted(
+                    guarded,
+                    key=lambda item: node_position(item[0]),
+                    reverse=True,
+                )[0]
+                record = _source_control_records(graph.G).get(owner_id)
+                owner_node_id = (
+                    int(owner_id) if int(owner_id) in graph.G else next((
+                        int(node_id)
+                        for node_id, data in graph.G.nodes(data=True)
+                        if int(data.get("value_id", node_id)) == int(owner_id)
+                    ), None)
+                )
+                owner_data = (
+                    {} if owner_node_id is None
+                    else graph.G.nodes[int(owner_node_id)]
+                )
+                expression = (
+                    record.get("expression")
+                    if record is not None
+                    else owner_data.get("expr_obj")
+                )
+                recorded_predicate_id = (
+                    None if record is None else record.get("predicate_id")
+                )
+                if recorded_predicate_id is None:
+                    recorded_predicate_id = next((
+                        int(parent)
+                        for parent, role in owner_data.get("parents", ())
+                        if str(role) == "test"
+                    ), None)
+                predicate_id = (
+                    None if not isinstance(expression, ast.If)
+                    else _retained_control_value_id(
+                        graph.G,
+                        recorded_predicate_id,
+                        expression.test,
+                    )
+                )
+                if predicate_id is None and isinstance(expression, ast.If):
+                    direct_test = next((
+                        int(parent)
+                        for parent, role in owner_data.get("parents", ())
+                        if str(role) == "test" and int(parent) in graph.G
+                    ), None)
+                    if direct_test is not None:
+                        predicate_id = int(
+                            graph.G.nodes[direct_test].get(
+                                "value_id", direct_test
+                            )
+                        )
+                if (
+                    predicate_id is None
+                    and recorded_predicate_id is not None
+                    and isinstance(expression, ast.If)
+                ):
+                    # The conditional node may have been folded out after its
+                    # immutable source-control record was published.  That
+                    # record already speaks in the canonical value identity
+                    # consumed by region/control SSA; retain it directly.
+                    predicate_id = int(recorded_predicate_id)
+                if os.environ.get("TURING_DEBUG_SEQUENCE_MUTATION"):
+                    print(
+                        "DEBUGMUTATION-GUARD "
+                        f"effect={int(mutation.effect_node_id)} "
+                        f"owner={owner_id} owner_node={owner_node_id} "
+                        f"recorded_predicate={recorded_predicate_id} "
+                        f"predicate={predicate_id} "
+                        f"expression={type(expression).__name__}",
+                        file=sys.stderr,
+                    )
+                if predicate_id is not None:
+                    empty = SequenceBlock(())
+                    synthesized = ConditionalBlock(
+                        int(predicate_id),
+                        mutation_block if arm == "body" else empty,
+                        mutation_block if arm == "orelse" else None,
+                        predicate_expression=_graph_control_expression(
+                            graph.G, int(predicate_id)
+                        ),
+                        source_node_id=int(owner_id),
+                    )
+                    remaining_guards = tuple(
+                        item for item in guarded if item != (owner_id, arm)
+                    )
+            if synthesized is not None:
+                for owner_id, arm in sorted(
+                    remaining_guards,
+                    key=lambda item: node_position(item[0]),
+                    reverse=True,
+                ):
+                    root, inserted = insert_in_conditional(
+                        root, owner_id, arm, synthesized
+                    )
+                    if inserted:
+                        break
+                if not inserted:
+                    root = insert_ordered(root, synthesized)
+            elif guarded:
+                unplaced.append(int(mutation.effect_node_id))
+            else:
+                root = insert_ordered(root, mutation_block)
+    return replace(control, root=root), tuple(unplaced)
+
+
+def _control_expression_value_ids(expression: Any) -> frozenset[int]:
+    if expression is None:
+        return frozenset()
+    return frozenset((
+        *((int(expression.value_id),) if expression.value_id is not None else ()),
+        *(
+            value_id
+            for operand in expression.operands
+            for value_id in _control_expression_value_ids(operand)
+        ),
+    ))
+
+
+def _control_block_consumes_values(block: Any, value_ids: Iterable[int]) -> bool:
+    """Whether a control subtree observes any exact SSA identity."""
+
+    from .control_source import (
+        CallBlock, ConditionalBlock, LoopBlock, SequenceBlock,
+        SequenceMutationBlock, SequenceQueryBlock, ValidationBlock,
+        WhileBlock,
+    )
+
+    wanted = set(map(int, value_ids))
+    if not wanted:
+        return False
+    if isinstance(block, ConditionalBlock):
+        if (
+            int(block.predicate_value_id) in wanted
+            or _control_expression_value_ids(
+                block.predicate_expression
+            ).intersection(wanted)
+        ):
+            return True
+        return (
+            _control_block_consumes_values(block.body, wanted)
+            or block.orelse is not None
+            and _control_block_consumes_values(block.orelse, wanted)
+        )
+    if isinstance(block, ValidationBlock):
+        return (
+            int(block.predicate_value_id) in wanted
+            or bool(_control_expression_value_ids(
+                block.predicate_expression
+            ).intersection(wanted))
+        )
+    if isinstance(block, SequenceMutationBlock):
+        mutation = block.mutation
+        return bool(
+            set(map(int, mutation.argument_value_ids)).intersection(wanted)
+            or _control_expression_value_ids(
+                mutation.predicate_expression
+            ).intersection(wanted)
+        )
+    if isinstance(block, SequenceQueryBlock):
+        consumed = {int(block.sequence_value_id)}
+        if block.default_value_id is not None:
+            consumed.add(int(block.default_value_id))
+        return bool(consumed.intersection(wanted))
+    if isinstance(block, CallBlock):
+        return bool(
+            {int(caller) for caller, _callee in block.argument_bindings}
+            .intersection(wanted)
+            or _control_block_consumes_values(block.callee, wanted)
+        )
+    if isinstance(block, SequenceBlock):
+        return any(
+            _control_block_consumes_values(child, wanted)
+            for child in block.blocks
+        )
+    if isinstance(block, LoopBlock):
+        return _control_block_consumes_values(block.body, wanted)
+    if isinstance(block, WhileBlock):
+        return (
+            _control_block_consumes_values(block.condition, wanted)
+            or _control_block_consumes_values(block.body, wanted)
+        )
+    return False
+
+
+def _schedule_sequence_query_dependencies(root: Any) -> Any:
+    """Place a producer-loop/query unit before its first lexical consumer."""
+
+    from .control_source import (
+        CallBlock, ConditionalBlock, LoopBlock, SequenceBlock,
+        SequenceQueryBlock, WhileBlock,
+    )
+
+    if isinstance(root, SequenceBlock):
+        scheduled_children = [
+            _schedule_sequence_query_dependencies(child)
+            for child in root.blocks
+        ]
+        # Sequential composition is associative: nested SequenceBlocks carry
+        # no scope or closure.  Flatten them before dependency scheduling so
+        # a generator loop appended in one planner group can move ahead of a
+        # consumer retained in an earlier group.
+        children = [
+            grandchild
+            for child in scheduled_children
+            for grandchild in (
+                child.blocks if isinstance(child, SequenceBlock) else (child,)
+            )
+        ]
+        changed = True
+        while changed:
+            changed = False
+            for loop_index, loop in enumerate(children):
+                if (
+                    not isinstance(loop, LoopBlock)
+                    or loop.source_loop_node_id is None
+                ):
+                    continue
+                query_indexes = [
+                    index
+                    for index, candidate in enumerate(children)
+                    if isinstance(candidate, SequenceQueryBlock)
+                    and candidate.producer_loop_node_id is not None
+                    and int(candidate.producer_loop_node_id)
+                    == int(loop.source_loop_node_id)
+                ]
+                queries = [children[index] for index in query_indexes]
+                if not queries:
+                    continue
+                produced = {
+                    int(value_id)
+                    for query in queries
+                    for value_id in (
+                        query.result_value_id, *query.result_alias_ids,
+                    )
+                }
+                unit_indexes = {loop_index, *query_indexes}
+                consumer_index = next((
+                    index
+                    for index, candidate in enumerate(children)
+                    if index not in unit_indexes
+                    and _control_block_consumes_values(candidate, produced)
+                ), None)
+                # Source-position insertion and later structural recovery may
+                # separate a generator loop from its query, or even leave the
+                # query before the loop.  The pair is one semantic producer
+                # unit.  Normalize it at its earliest existing position, and
+                # move it farther forward when an earlier consumer requires
+                # that dominance edge.
+                anchor = min(unit_indexes)
+                if consumer_index is not None:
+                    anchor = min(anchor, consumer_index)
+                rebuilt = [
+                    candidate
+                    for index, candidate in enumerate(children)
+                    if index not in unit_indexes
+                ]
+                adjusted_anchor = sum(
+                    1
+                    for index in range(anchor)
+                    if index not in unit_indexes
+                )
+                rebuilt[adjusted_anchor:adjusted_anchor] = [loop, *queries]
+                if rebuilt != children:
+                    children = rebuilt
+                    changed = True
+                    break
+        return replace(root, blocks=tuple(children))
+    if isinstance(root, ConditionalBlock):
+        return replace(
+            root,
+            body=_schedule_sequence_query_dependencies(root.body),
+            orelse=(
+                None if root.orelse is None
+                else _schedule_sequence_query_dependencies(root.orelse)
+            ),
+        )
+    if isinstance(root, LoopBlock):
+        return replace(
+            root, body=_schedule_sequence_query_dependencies(root.body)
+        )
+    if isinstance(root, WhileBlock):
+        return replace(
+            root,
+            condition=_schedule_sequence_query_dependencies(root.condition),
+            body=_schedule_sequence_query_dependencies(root.body),
+        )
+    if isinstance(root, CallBlock):
+        return replace(
+            root, callee=_schedule_sequence_query_dependencies(root.callee)
+        )
+    return root
+
+
+def _install_lexical_sequence_queries(
+    control: Any,
+    graph: Any,
+    dispatch_subgraphs: Iterable[Any],
+):
+    """Replace supported generator consumers with resident sequence queries."""
+
+    from .control_source import (
+        CallBlock, ConditionalBlock, LoopBlock, SequenceBlock,
+        SequenceQueryBlock, WhileBlock,
+    )
+
+    graph_obj = graph.G
+    queries = []
+    unsupported = []
+    for node_id, data in sorted(graph_obj.nodes(data=True)):
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Name)
+            and expression.func.id in {"len", "next", "sum"}
+        ):
+            continue
+        arguments = tuple(
+            int(parent)
+            for parent, role in data.get("parents") or ()
+            if str(role).startswith("arg:") and int(parent) in graph_obj
+        )
+        if not arguments:
+            continue
+        sequence_id = arguments[0]
+        sequence_data = graph_obj.nodes[sequence_id]
+        sequence_attributes = sequence_data.get("attributes") or {}
+        producer_loop_node_id = None
+        if (
+            sequence_data.get("type") == "LoopResult"
+            and sequence_attributes.get("result_kind") == "collection"
+        ):
+            producer_loop_node_id = int(sequence_attributes["loop_id"])
+        elif (
+            expression.func.id == "len"
+            and sequence_attributes.get("aggregate_kind")
+            in {"list", "bytes", "bytearray", "tuple"}
+            and sequence_attributes.get("producer_kind")
+            in {"sequence_materialization", "aggregate_materialization"}
+        ):
+            producer_loop_node_id = next((
+                int(parent)
+                for parent, role in sequence_data.get("parents") or ()
+                if str(role) == "generators"
+            ), None)
+        if producer_loop_node_id is None:
+            continue
+        identity = (data.get("attributes") or {}).get("extraction_identity")
+        result_id = int(data.get("value_id", node_id))
+        result_alias_ids = tuple(dict.fromkeys(
+            int(graph_obj.nodes[child].get("value_id", child))
+            for child, role in data.get("children") or ()
+            if str(role) == "lhs"
+            and int(child) in graph_obj
+            and isinstance(
+                graph_obj.nodes[int(child)].get("expr_obj"), ast.Name
+            )
+        ))
+        if os.environ.get("TURING_DEBUG_BUILTIN_SELECTION"):
+            print(
+                "DEBUGQUERY "
+                f"fn={graph_obj.graph.get('function_name')} "
+                f"call={int(node_id)} result={result_id} "
+                f"aliases={result_alias_ids} sequence={sequence_id}",
+                file=sys.stderr,
+            )
+        if expression.func.id == "len":
+            queries.append(SequenceQueryBlock(
+                result_value_id=result_id,
+                sequence_value_id=sequence_id,
+                operation="length",
+                source_call_node_id=int(node_id),
+                extraction_identity=identity,
+                result_alias_ids=result_alias_ids,
+                producer_loop_node_id=producer_loop_node_id,
+            ))
+            continue
+        if expression.func.id == "next":
+            if len(arguments) != 2:
+                unsupported.append(int(node_id))
+                continue
+            queries.append(SequenceQueryBlock(
+                result_value_id=result_id,
+                sequence_value_id=sequence_id,
+                operation="first_or_default",
+                default_value_id=int(arguments[1]),
+                source_call_node_id=int(node_id),
+                extraction_identity=identity,
+                result_alias_ids=result_alias_ids,
+                producer_loop_node_id=producer_loop_node_id,
+            ))
+            continue
+
+        materializer_id = sequence_attributes.get("materializer_node_id")
+        materializer = (
+            {} if materializer_id not in graph_obj
+            else graph_obj.nodes[int(materializer_id)]
+        )
+        element_id = next((
+            int(parent)
+            for parent, role in materializer.get("parents") or ()
+            if str(role) == "elt" and int(parent) in graph_obj
+        ), None)
+        element_data = (
+            {} if element_id is None else graph_obj.nodes[element_id]
+        )
+        element_literal = (element_data.get("attributes") or {}).get(
+            "value", element_data.get("constant")
+        )
+        explicit_start = (
+            None if len(arguments) == 1
+            else (graph_obj.nodes[arguments[1]].get("attributes") or {}).get(
+                "value", graph_obj.nodes[arguments[1]].get("constant")
+            )
+        )
+        if element_literal != 1 or explicit_start not in {None, 0}:
+            unsupported.append(int(node_id))
+            continue
+        queries.append(SequenceQueryBlock(
+            result_value_id=result_id,
+            sequence_value_id=sequence_id,
+            operation="length",
+            source_call_node_id=int(node_id),
+            extraction_identity=identity,
+            result_alias_ids=result_alias_ids,
+            producer_loop_node_id=producer_loop_node_id,
+        ))
+
+    if not queries:
+        return control, tuple(unsupported)
+
+    def insert_after_producer(block, query):
+        if (
+            os.environ.get("TURING_DEBUG_BUILTIN_SELECTION")
+            and isinstance(block, LoopBlock)
+        ):
+            print(
+                "DEBUGQUERYLOOP "
+                f"call={query.source_call_node_id} "
+                f"candidate={block.source_loop_node_id}",
+                file=sys.stderr,
+            )
+        if (
+            isinstance(block, LoopBlock)
+            and block.source_loop_node_id is not None
+            and int(block.source_loop_node_id)
+            == int(query.producer_loop_node_id)
+        ):
+            return SequenceBlock((block, query)), True
+        if isinstance(block, SequenceBlock):
+            children = []
+            inserted = False
+            for child in block.blocks:
+                projected, child_inserted = insert_after_producer(child, query)
+                children.append(projected)
+                inserted |= child_inserted
+            return SequenceBlock(tuple(children)), inserted
+        if isinstance(block, ConditionalBlock):
+            body, inserted = insert_after_producer(block.body, query)
+            orelse = block.orelse
+            if not inserted and orelse is not None:
+                orelse, inserted = insert_after_producer(orelse, query)
+            return replace(block, body=body, orelse=orelse), inserted
+        if isinstance(block, LoopBlock):
+            body, inserted = insert_after_producer(block.body, query)
+            return replace(block, body=body), inserted
+        if isinstance(block, WhileBlock):
+            body, inserted = insert_after_producer(block.body, query)
+            return replace(block, body=body), inserted
+        if isinstance(block, CallBlock):
+            callee, inserted = insert_after_producer(block.callee, query)
+            return replace(block, callee=callee), inserted
+        return block, False
+
+    root = control.root
+    unplaced = list(unsupported)
+    for query in queries:
+        if query.producer_loop_node_id is None:
+            unplaced.append(int(query.source_call_node_id))
+            continue
+        root, inserted = insert_after_producer(root, query)
+        if os.environ.get("TURING_DEBUG_BUILTIN_SELECTION"):
+            print(
+                "DEBUGQUERYPLACE "
+                f"fn={graph_obj.graph.get('function_name')} "
+                f"call={query.source_call_node_id} "
+                f"producer={query.producer_loop_node_id} inserted={inserted}",
+                file=sys.stderr,
+            )
+        if not inserted:
+            unplaced.append(int(query.source_call_node_id))
+    root = _schedule_sequence_query_dependencies(root)
+    return replace(control, root=root), tuple(unplaced)
+
+
+def _utf8_encode_aliases(
+    graph_obj: Any,
+) -> tuple[tuple[int, int, str, str], ...]:
+    """Return exact ``str.encode('utf-8')`` source-boundary aliases.
+
+    Encoding is an ABI transform: the authored caller still accepts ``str``;
+    the native function receives its deterministic UTF-8 byte sequence.  Only
+    the explicit UTF-8 spelling is admitted, so locale/default-codec behavior
+    is never inferred.
+    """
+
+    aliases = []
+    for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
+        data = graph_obj.nodes[node_id]
+        if str(data.get("op") or data.get("type") or "").casefold() != "encode":
+            continue
+        parents = {
+            str(role): int(parent)
+            for parent, role in (data.get("parents") or ())
+        }
+        operand_node = parents.get("operand")
+        encoding_node = parents.get("arg:0")
+        if operand_node is None or encoding_node is None:
+            continue
+        operand = graph_obj.nodes.get(operand_node, {})
+        encoding = graph_obj.nodes.get(encoding_node, {})
+        operand_attributes = operand.get("attributes") or {}
+        encoding_value = (encoding.get("attributes") or {}).get(
+            "value", encoding.get("constant")
+        )
+        source_name = operand_attributes.get("binding_name")
+        if (
+            operand_attributes.get("binding_kind") != "parameter"
+            or source_name is None
+            or str(encoding_value).casefold().replace("_", "-") != "utf-8"
+        ):
+            continue
+        aliases.append((
+            int(data.get("value_id", node_id)),
+            int(operand.get("value_id", operand_node)),
+            str(source_name),
+            "utf8",
+        ))
+    return tuple(aliases)
+
+
+def _bytes_join_source_transforms(
+    graph_obj: Any,
+) -> tuple[tuple[int, int, str, str], ...]:
+    """Describe ``b''.join(list(parameter))`` as native byte views.
+
+    The list view carries authored row count while the join view carries the
+    flattened bytes.  Both name the same authored iterable so a wrapper can
+    materialize it exactly once and publish the two deterministic ABI views.
+    """
+
+    transforms = []
+    for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
+        data = graph_obj.nodes[node_id]
+        if str(data.get("op") or data.get("type") or "").casefold() != "join":
+            continue
+        parents = {
+            str(role): int(parent)
+            for parent, role in (data.get("parents") or ())
+        }
+        separator_id = parents.get("operand")
+        materialized_id = parents.get("arg:0")
+        if separator_id is None or materialized_id is None:
+            continue
+        separator = graph_obj.nodes.get(separator_id, {})
+        separator_value = (separator.get("attributes") or {}).get(
+            "value", separator.get("constant")
+        )
+        materialized = graph_obj.nodes.get(materialized_id, {})
+        materialized_attributes = materialized.get("attributes") or {}
+        if (
+            separator_value != b""
+            or materialized_attributes.get("producer_kind")
+            != "aggregate_materialization"
+            or materialized_attributes.get("aggregate_kind") != "list"
+            or materialized_attributes.get("static_python_reference") != "list"
+        ):
+            continue
+        sources = tuple(map(
+            int, materialized_attributes.get("materialized_source_value_ids", ())
+        ))
+        if len(sources) != 1:
+            continue
+        source = graph_obj.nodes.get(sources[0], {})
+        source_name = (source.get("attributes") or {}).get("binding_name")
+        if source_name is None:
+            continue
+        transforms.extend((
+            (
+                int(materialized.get("value_id", materialized_id)),
+                int(materialized.get("value_id", materialized_id)),
+                str(source_name),
+                "row_count",
+            ),
+            (
+                int(data.get("value_id", node_id)),
+                int(data.get("value_id", node_id)),
+                str(source_name),
+                "join_bytes",
+            ),
+        ))
+    return tuple(transforms)
+
+
+def _scalar_source_transforms(
+    graph_obj: Any,
+    sequence_transforms: Iterable[tuple[int, int, str, str]],
+) -> tuple[tuple[int, str, str], ...]:
+    """Describe scalar ABI projections such as source-backed ``len``.
+
+    A linked call can legitimately consume a scalar whose producer is a
+    structural sequence operation omitted from the numerical SSA region.
+    Retaining only that scalar as an anonymous function argument leaves a
+    native wrapper no exact way to construct it.  Record the authored source
+    and projection at the compilation boundary instead.
+    """
+
+    transformed_values = {
+        int(result_id): (
+            str(source_name),
+            (
+                "utf8_length" if str(transform) == "utf8"
+                else "materialized_length" if str(transform) == "row_count"
+                else "sequence_length"
+            ),
+        )
+        for result_id, _source_id, source_name, transform
+        in sequence_transforms
+    }
+    records: list[tuple[int, str, str]] = []
+    for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
+        data = graph_obj.nodes[node_id]
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Name)
+            and expression.func.id == "len"
+        ):
+            continue
+        arguments = tuple(
+            int(parent)
+            for parent, role in data.get("parents") or ()
+            if str(role).startswith("arg:") and int(parent) in graph_obj
+        )
+        if len(arguments) != 1:
+            continue
+        argument = graph_obj.nodes[arguments[0]]
+        argument_id = int(argument.get("value_id", arguments[0]))
+        source = transformed_values.get(argument_id)
+        if source is None:
+            attributes = argument.get("attributes") or {}
+            source_name = attributes.get("binding_name")
+            if (
+                attributes.get("binding_kind") == "parameter"
+                and source_name is not None
+            ):
+                source = (str(source_name), "sequence_length")
+            elif (
+                attributes.get("producer_kind")
+                == "aggregate_materialization"
+            ):
+                materialized_sources = tuple(map(
+                    int, attributes.get("materialized_source_value_ids", ())
+                ))
+                if len(materialized_sources) == 1:
+                    source_data = next((
+                        candidate
+                        for candidate_id, candidate in graph_obj.nodes(data=True)
+                        if int(candidate.get("value_id", candidate_id))
+                        == materialized_sources[0]
+                    ), None)
+                    source_attributes = (
+                        {} if source_data is None
+                        else source_data.get("attributes") or {}
+                    )
+                    source_name = source_attributes.get("binding_name")
+                    if source_name is not None:
+                        source = (
+                            str(source_name), "materialized_length"
+                        )
+        if source is not None:
+            records.append((
+                int(data.get("value_id", node_id)), source[0], source[1]
+            ))
+    return tuple(records)
 
 
 def _sequence_append_fill_ops(
@@ -2621,6 +5524,843 @@ def _nested_row_projection_ops(
     return tuple(dict.fromkeys(operations))
 
 
+def _rewrite_optional_row_handle_none_predicate(
+    expression: Any, handle_ids: Iterable[int],
+) -> Any:
+    """Compare optional record row handles with their physical -1 sentinel."""
+
+    if expression is None:
+        return None
+    handles = set(map(int, handle_ids))
+    operands = tuple(
+        _rewrite_optional_row_handle_none_predicate(operand, handles)
+        for operand in expression.operands
+    )
+    rewritten = replace(expression, operands=operands)
+    if rewritten.op not in {"eq", "ne"} or len(operands) != 2:
+        return rewritten
+    for handle_index, none_index in ((0, 1), (1, 0)):
+        handle = operands[handle_index]
+        none = operands[none_index]
+        if (
+            handle.value_id is None
+            or int(handle.value_id) not in handles
+            or none.op != "const"
+            or none.literal is not None
+        ):
+            continue
+        replaced = list(operands)
+        replaced[none_index] = replace(none, literal=-1)
+        return replace(rewritten, operands=tuple(replaced))
+    return rewritten
+
+
+def _record_sequence_projection_bindings(
+    graph_obj: Any, control: Any,
+) -> tuple[
+    Any,
+    tuple[tuple[int, int, str, object], ...],
+    tuple[tuple[int, str, str], ...],
+]:
+    """Project fields of ``Sequence[Record]`` rows at their loop binding.
+
+    The authored parameter is a columnar resident sequence. A lexical loop
+    target names the current row, while each ``target.field`` names one exact
+    column load at the same induction. This preserves the ordinary intuitive
+    source and gives downstream regions/calls real in-loop producers instead
+    of promoting field values to anonymous public inputs.
+    """
+
+    records = dict(
+        graph_obj.graph.get("parameter_sequence_record_abi") or {}
+    )
+    identities = graph_obj.graph.get("identity_table") or {}
+    aliases_by_value: dict[int, frozenset[int]] = {}
+    for history in identities.values():
+        aliases = frozenset(map(int, history))
+        for value_id in aliases:
+            aliases_by_value[int(value_id)] = aliases
+    parameter_by_sequence: dict[int, tuple[str, Mapping[str, Any]]] = {}
+    for parameter_name, record in records.items():
+        for value_id in identities.get(str(parameter_name), ()):
+            parameter_by_sequence[int(value_id)] = (
+                str(parameter_name), record,
+            )
+    row_loop_bindings = tuple(dict.fromkeys((
+        *tuple(getattr(control, "iterable_bindings", ())),
+        *tuple(
+            (int(iterable_id), int(target_id), str(induction))
+            for iterable_id, target_id, induction, projection
+            in getattr(control, "projected_iterable_bindings", ())
+            if projection is None
+        ),
+    )))
+    bindings: list[tuple[int, int, str, object]] = []
+    fields: list[tuple[int, str, str]] = []
+    direct_rows: dict[int, tuple[int, Mapping[str, Any]]] = {}
+    for iterable_id, target_id, _induction in row_loop_bindings:
+        selected = parameter_by_sequence.get(int(iterable_id))
+        if selected is None:
+            iterable_aliases = aliases_by_value.get(
+                int(iterable_id), frozenset((int(iterable_id),))
+            )
+            selected = next((
+                record for candidate, record in parameter_by_sequence.items()
+                if candidate in iterable_aliases
+            ), None)
+        if selected is not None:
+            _parameter_name, record = selected
+            direct_rows[int(target_id)] = (int(iterable_id), record)
+
+    # A filtered comprehension over a record sequence stores integer row
+    # handles into its derived resident sequence.  Recover that relationship
+    # from the exact mutation argument identity; no Python row object is
+    # reconstructed and no name spelling participates in the correlation.
+    from .control_source import (
+        CallBlock, ConditionalBlock, LoopBlock, SequenceBlock,
+        SequenceMutationBlock, SequenceQueryBlock, WhileBlock,
+    )
+
+    mutations = []
+    queries = []
+
+    def gather_mutations(block):
+        if isinstance(block, SequenceMutationBlock):
+            mutations.append(block.mutation)
+        elif isinstance(block, SequenceQueryBlock):
+            queries.append(block)
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                gather_mutations(child)
+        elif isinstance(block, ConditionalBlock):
+            gather_mutations(block.body)
+            if block.orelse is not None:
+                gather_mutations(block.orelse)
+        elif isinstance(block, (LoopBlock, WhileBlock)):
+            mutations.extend(block.sequence_mutations)
+            if isinstance(block, WhileBlock):
+                gather_mutations(block.condition)
+            gather_mutations(block.body)
+        elif isinstance(block, CallBlock):
+            gather_mutations(block.callee)
+
+    gather_mutations(control.root)
+    derived_sequences: dict[int, tuple[int, Mapping[str, Any]]] = {}
+    for mutation in mutations:
+        if str(mutation.operator) not in {"append", "add"}:
+            continue
+        arguments = set(map(int, mutation.argument_value_ids))
+        for target_id, origin in direct_rows.items():
+            target_aliases = aliases_by_value.get(
+                int(target_id), frozenset((int(target_id),))
+            )
+            if arguments.intersection(target_aliases):
+                derived_sequences[int(mutation.sequence_value_id)] = origin
+                effect_id = int(mutation.effect_node_id)
+                if effect_id in graph_obj:
+                    # Hierarchical composition namespaces resident storage,
+                    # while a later authored loop still names the source
+                    # materializer result.  The mutation's retained effect
+                    # node is their exact correlation receipt.
+                    derived_sequences[int(graph_obj.nodes[effect_id].get(
+                        "value_id", effect_id
+                    ))] = origin
+
+    optional_projections: dict[
+        int, tuple[tuple[int, int, int, int, str], ...]
+    ] = {}
+    # ``mapping.pop(key, None)`` has the same physical optional-handle ABI as
+    # ``first_or_default``: its lookup result is -1 when absent.  Register the
+    # exact effect identity even when no parameter-record projection exists so
+    # an authored ``result is None`` predicate is rewritten consistently.
+    for mutation in mutations:
+        if (
+            str(mutation.operator) == "pop"
+            and mutation.argument_kind == "mapping_pop_default_none"
+        ):
+            optional_projections[int(mutation.effect_node_id)] = ()
+    optional_query_calls: set[int] = set()
+    for query in queries:
+        if str(query.operation) != "first_or_default":
+            continue
+        origin = derived_sequences.get(int(query.sequence_value_id))
+        if origin is None:
+            continue
+        origin_sequence_id, record = origin
+        receivers = {
+            int(query.result_value_id), *map(int, query.result_alias_ids)
+        }
+        physical_columns = {}
+        physical_column = 0
+        for field_name, receipt in dict(record.get("fields") or {}).items():
+            if bool(receipt.get("optional")):
+                physical_column += 1
+            physical_columns[str(field_name)] = (
+                physical_column, str(receipt.get("dtype") or "unknown")
+            )
+            physical_column += 1
+        projected = []
+        for node_id, data in graph_obj.nodes(data=True):
+            if str(data.get("op") or data.get("type") or "").casefold() != "getattr":
+                continue
+            attribute = str(
+                (data.get("attributes") or {}).get("attribute") or ""
+            )
+            if attribute not in physical_columns or not any(
+                int(graph_obj.nodes[parent].get("value_id", parent)) in receivers
+                and str(role) in {"value", "object", "base", "receiver"}
+                for parent, role in (data.get("parents") or ())
+                if parent in graph_obj
+            ):
+                continue
+            column, dtype = physical_columns[attribute]
+            result_id = int(data.get("value_id", node_id))
+            projected.append((
+                int(origin_sequence_id), int(query.result_value_id),
+                result_id, int(column), str(dtype),
+            ))
+            fields.append((result_id, attribute, str(dtype)))
+        if projected:
+            optional_projections[int(query.result_value_id)] = tuple(projected)
+            if query.source_call_node_id is not None:
+                optional_query_calls.add(int(query.source_call_node_id))
+
+    for iterable_id, target_id, induction in row_loop_bindings:
+        selected = parameter_by_sequence.get(int(iterable_id))
+        if selected is None:
+            iterable_aliases = aliases_by_value.get(
+                int(iterable_id), frozenset((int(iterable_id),))
+            )
+            selected = next((
+                record for candidate, record in parameter_by_sequence.items()
+                if candidate in iterable_aliases
+            ), None)
+        derived = False
+        if selected is None:
+            selected = derived_sequences.get(int(iterable_id))
+            derived = selected is not None
+        if selected is None:
+            continue
+        if derived:
+            origin_sequence_id, record = selected
+        else:
+            _parameter_name, record = selected
+            origin_sequence_id = int(iterable_id)
+        field_contracts = tuple(dict(record.get("fields") or {}).items())
+        field_columns = {}
+        physical_column = 0
+        for field_name, field_receipt in field_contracts:
+            if bool(field_receipt.get("optional")):
+                # Presence precedes value.  Attribute access selects the value
+                # column; an explicit ``is None`` field test can consume the
+                # adjacent presence column without overloading its payload.
+                physical_column += 1
+            field_columns[str(field_name)] = physical_column
+            physical_column += 1
+        # Loop targets with the same authored spelling are distinct SSA
+        # identities (two separate ``for row in ...`` bindings are the common
+        # case).  The graph's GetAttr receiver already carries the exact target
+        # value; consulting the scope-free name history here conflates those
+        # loops and places a later field load in the earlier coordinator.
+        target_aliases = frozenset((int(target_id),))
+        if not derived:
+            # The conceptual row itself is a stable integer handle.  Field
+            # values are loaded from the source columns below; retaining a
+            # second flat-element load for the row would confuse column zero
+            # with the record identity when a comprehension republishes it.
+            bindings.append((
+                int(origin_sequence_id), int(target_id), str(induction),
+                "induction",
+            ))
+        for node_id, data in graph_obj.nodes(data=True):
+            if str(data.get("op") or data.get("type") or "").casefold() != "getattr":
+                continue
+            attribute = str(
+                (data.get("attributes") or {}).get("attribute") or ""
+            )
+            if attribute not in field_columns or not any(
+                int(graph_obj.nodes[parent].get("value_id", parent))
+                in target_aliases
+                and str(role) in {"value", "object", "base", "receiver"}
+                for parent, role in (data.get("parents") or ())
+                if parent in graph_obj
+            ):
+                continue
+            result_id = int(data.get("value_id", node_id))
+            receipt = dict(next(
+                field_receipt
+                for field_name, field_receipt in field_contracts
+                if str(field_name) == attribute
+            ))
+            bindings.append((
+                int(origin_sequence_id), result_id, str(induction),
+                (
+                    (
+                        "column_at_value", int(field_columns[attribute]),
+                        int(target_id),
+                    )
+                    if derived else int(field_columns[attribute])
+                ),
+            ))
+            fields.append((
+                result_id, attribute, str(receipt.get("dtype") or "unknown")
+            ))
+    def expression_values(expression):
+        if expression is None:
+            return frozenset()
+        return frozenset((
+            *((int(expression.value_id),) if expression.value_id is not None else ()),
+            *(value for operand in expression.operands for value in expression_values(operand)),
+        ))
+
+    def attach_optional(block):
+        if isinstance(block, SequenceQueryBlock):
+            return replace(
+                block,
+                row_handle=(
+                    block.source_call_node_id is not None
+                    and int(block.source_call_node_id) in optional_query_calls
+                ),
+            )
+        if isinstance(block, SequenceBlock):
+            return replace(
+                block,
+                blocks=tuple(attach_optional(child) for child in block.blocks),
+            )
+        if isinstance(block, ConditionalBlock):
+            body = attach_optional(block.body)
+            orelse = (
+                None if block.orelse is None
+                else attach_optional(block.orelse)
+            )
+            predicate_expression = (
+                _rewrite_optional_row_handle_none_predicate(
+                    block.predicate_expression, optional_projections
+                )
+            )
+            values = expression_values(predicate_expression)
+            entry = tuple(
+                projection
+                for handle_id, projections in optional_projections.items()
+                if int(handle_id) in values
+                and predicate_expression is not None
+                and predicate_expression.op == "ne"
+                for projection in projections
+            )
+            return replace(
+                block, body=body, orelse=orelse,
+                predicate_expression=predicate_expression,
+                entry_record_projections=tuple(dict.fromkeys((
+                    *block.entry_record_projections, *entry,
+                ))),
+            )
+        if isinstance(block, LoopBlock):
+            return replace(block, body=attach_optional(block.body))
+        if isinstance(block, WhileBlock):
+            return replace(
+                block,
+                condition=attach_optional(block.condition),
+                body=attach_optional(block.body),
+            )
+        if isinstance(block, CallBlock):
+            return replace(block, callee=attach_optional(block.callee))
+        return block
+
+    control = replace(control, root=attach_optional(control.root))
+    return (
+        control,
+        tuple(dict.fromkeys(bindings)),
+        tuple(dict.fromkeys(fields)),
+    )
+
+
+def _sequence_row_operations(
+    graph_obj: Any,
+    sequence_declarations: Iterable[tuple[int, str, int, bool]],
+) -> tuple[tuple[Any, ...], ...]:
+    """Recover positional reads/writes of fixed-width sequence rows."""
+
+    widths = {
+        int(sequence_id): int(column_count)
+        for sequence_id, _policy, column_count, _writable
+        in sequence_declarations
+        if int(column_count) > 1
+    }
+    if not widths:
+        return ()
+    identities = graph_obj.graph.get("identity_table") or {}
+    resident_by_value = {
+        int(value_id): int(sequence_id)
+        for sequence_id in widths
+        for history in identities.values()
+        if int(sequence_id) in set(map(int, history))
+        for value_id in history
+    }
+    resident_by_value.update({sequence_id: sequence_id for sequence_id in widths})
+    changed = True
+    aliases = _loop_carried_storage_aliases(graph_obj)
+    while changed:
+        changed = False
+        for alias_id, source_id in aliases.items():
+            resident = resident_by_value.get(int(source_id))
+            if resident is not None and resident_by_value.get(int(alias_id)) != resident:
+                resident_by_value[int(alias_id)] = resident
+                changed = True
+        for node_id, data in graph_obj.nodes(data=True):
+            if str(data.get("op") or data.get("type") or "").casefold() not in {
+                "phi", "loopresult", "loopexit",
+            }:
+                continue
+            residents = {
+                resident_by_value[int(graph_obj.nodes[parent].get(
+                    "value_id", parent
+                ))]
+                for parent, role in data.get("parents") or ()
+                if str(role) not in {"control", "test"}
+                and parent in graph_obj
+                and int(graph_obj.nodes[parent].get(
+                    "value_id", parent
+                )) in resident_by_value
+            }
+            if len(residents) == 1:
+                value_id = int(data.get("value_id", node_id))
+                resident = next(iter(residents))
+                if resident_by_value.get(value_id) != resident:
+                    resident_by_value[value_id] = resident
+                    changed = True
+
+    def roles(data: Mapping[str, Any]) -> dict[str, int]:
+        return {
+            str(role): int(parent)
+            for parent, role in data.get("parents") or ()
+            if parent in graph_obj
+        }
+
+    def value_id(node_id: int) -> int:
+        return int(graph_obj.nodes[node_id].get("value_id", node_id))
+
+    def integer_literal(node_id: int) -> int | None:
+        data = graph_obj.nodes[node_id]
+        expression = data.get("expr_obj")
+        literal = (
+            expression.value if isinstance(expression, ast.Constant)
+            else (data.get("attributes") or {}).get(
+                "value", data.get("constant")
+            )
+        )
+        return (
+            int(literal)
+            if isinstance(literal, int) and not isinstance(literal, bool)
+            else None
+        )
+
+    operations: list[tuple[Any, ...]] = []
+    for node_id, data in sorted(graph_obj.nodes(data=True)):
+        kind = str(data.get("op") or data.get("type") or "").casefold()
+        node_roles = roles(data)
+        if kind == "indexed":
+            outer_id = node_roles.get("base")
+            column_node = node_roles.get("index")
+            if outer_id is None or column_node is None:
+                continue
+            outer = graph_obj.nodes[outer_id]
+            if str(outer.get("op") or outer.get("type") or "").casefold() != "indexed":
+                continue
+            outer_roles = roles(outer)
+            base_node = outer_roles.get("base")
+            row_index_node = outer_roles.get("index")
+            if base_node is None or row_index_node is None:
+                continue
+            sequence_id = resident_by_value.get(value_id(base_node))
+            column = integer_literal(column_node)
+            if (
+                sequence_id is None or column is None or column < 0
+                or column >= widths[sequence_id]
+            ):
+                continue
+            operations.append((
+                "load", value_id(node_id), int(sequence_id),
+                value_id(row_index_node), integer_literal(row_index_node),
+                int(column), value_id(outer_id),
+            ))
+        elif kind == "indexedstore":
+            base_node = node_roles.get("base")
+            row_index_node = node_roles.get("index")
+            row_value_node = node_roles.get("value")
+            if base_node is None or row_index_node is None or row_value_node is None:
+                continue
+            sequence_id = resident_by_value.get(value_id(base_node))
+            row_attributes = graph_obj.nodes[row_value_node].get("attributes") or {}
+            leaves = tuple(map(
+                int, row_attributes.get("aggregate_leaf_value_ids", ())
+            ))
+            if (
+                sequence_id is None
+                or row_attributes.get("aggregate_kind") != "tuple"
+                or len(leaves) != widths[sequence_id]
+            ):
+                continue
+            operations.append((
+                "store", value_id(node_id), int(sequence_id),
+                value_id(row_index_node), integer_literal(row_index_node),
+                leaves, value_id(row_value_node),
+            ))
+    return tuple(operations)
+
+
+def _sequence_column_dtype_contracts(
+    graph_obj: Any,
+    sequence_declarations: Iterable[tuple[int, str, int, bool]],
+) -> dict[int, tuple[str, ...]]:
+    """Recover fixed-row column dtypes from authored annotations.
+
+    A declaration such as ``runs: list[tuple[int, int]]`` is a physical
+    contract for both resident columns, not merely evidence that the row has
+    width two.  Keep that contract beside the compile artifact so row loads,
+    stores, and append helpers share one type before target inference runs.
+    """
+
+    declared = {
+        int(sequence_id): int(column_count)
+        for sequence_id, _policy, column_count, _writable
+        in sequence_declarations
+    }
+    if not declared:
+        return {}
+    identities = graph_obj.graph.get("identity_table") or {}
+    scalar_dtypes = {
+        "bool": "bool",
+        "int": "int64",
+        "float": "float64",
+    }
+    contracts: dict[int, tuple[str, ...]] = {}
+    for parameter_name, annotation in (
+        _current_authored_parameter_annotations(graph_obj).items()
+    ):
+        contract = _authored_sequence_annotation_contract(annotation)
+        if contract is None:
+            continue
+        _policy, _column_count, _writable, dtypes = contract
+        sequence_id = next((
+            int(value_id)
+            for value_id in identities.get(str(parameter_name), ())
+            if int(value_id) in declared
+        ), None)
+        if (
+            sequence_id is not None
+            and len(dtypes) == declared[int(sequence_id)]
+        ):
+            contracts[int(sequence_id)] = tuple(map(str, dtypes))
+    for parameter_name, record in dict(
+        graph_obj.graph.get("parameter_sequence_record_abi") or {}
+    ).items():
+        dtypes = tuple(
+            dtype
+            for field in dict(record.get("fields") or {}).values()
+            for dtype in (
+                ("bool", str(field.get("dtype") or "unknown"))
+                if bool(field.get("optional"))
+                else (str(field.get("dtype") or "unknown"),)
+            )
+        )
+        if not dtypes:
+            continue
+        sequence_id = next((
+            int(value_id)
+            for value_id in identities.get(str(parameter_name), ())
+            if int(value_id) in declared
+        ), None)
+        if (
+            sequence_id is not None
+            and len(dtypes) == declared[int(sequence_id)]
+        ):
+            contracts[int(sequence_id)] = dtypes
+    for binding_name, annotation in dict(
+        graph_obj.graph.get("type_annotations") or {}
+    ).items():
+        if not isinstance(annotation, str) or not annotation.strip():
+            continue
+        try:
+            outer = ast.parse(annotation, mode="eval").body
+        except SyntaxError:
+            continue
+        if not isinstance(outer, ast.Subscript):
+            continue
+        row = outer.slice
+        if not isinstance(row, ast.Subscript):
+            continue
+        tuple_name = row.value
+        if not (
+            isinstance(tuple_name, ast.Name) and tuple_name.id in {"tuple", "Tuple"}
+            or isinstance(tuple_name, ast.Attribute)
+            and tuple_name.attr in {"tuple", "Tuple"}
+        ):
+            continue
+        columns = (
+            tuple(row.slice.elts)
+            if isinstance(row.slice, ast.Tuple)
+            else (row.slice,)
+        )
+        dtypes: list[str] = []
+        for column in columns:
+            spelling = (
+                column.id if isinstance(column, ast.Name)
+                else column.attr if isinstance(column, ast.Attribute)
+                else ""
+            )
+            dtype = scalar_dtypes.get(str(spelling))
+            if dtype is None:
+                dtypes = []
+                break
+            dtypes.append(dtype)
+        if not dtypes:
+            continue
+        history = tuple(map(int, identities.get(str(binding_name), ())))
+        sequence_id = next(
+            (value_id for value_id in history if value_id in declared), None
+        )
+        if sequence_id is None or len(dtypes) != declared[sequence_id]:
+            continue
+        contracts[int(sequence_id)] = tuple(dtypes)
+    def literal_dtype(value: Any) -> str | None:
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, int):
+            return "int64"
+        if isinstance(value, float):
+            return "float64"
+        if isinstance(value, str):
+            return "int64"
+        return None
+
+    for node_id, data in graph_obj.nodes(data=True):
+        value_id = int(data.get("value_id", node_id))
+        if value_id not in declared:
+            continue
+        items = (data.get("attributes") or {}).get(
+            "compile_time_mapping_items"
+        )
+        if items is None:
+            continue
+        rows = tuple(items)
+        if not rows:
+            continue
+        key_dtypes = {literal_dtype(key) for key, _item in rows}
+        value_dtypes = {literal_dtype(item) for _key, item in rows}
+        if None not in key_dtypes | value_dtypes and (
+            len(key_dtypes) == len(value_dtypes) == 1
+        ):
+            contracts[value_id] = (
+                next(iter(key_dtypes)), next(iter(value_dtypes))
+            )
+    return contracts
+
+
+def _authored_source_sequence_ids(
+    graph_obj: Any,
+    sequence_declarations: Iterable[tuple[int, str, int, bool]],
+) -> tuple[int, ...]:
+    """Identify resident arenas whose initial contents come from the caller."""
+
+    declared = {
+        int(sequence_id) for sequence_id, *_rest in sequence_declarations
+    }
+    if not declared:
+        return ()
+    identity = graph_obj.graph.get("identity_table") or {}
+    source_ids = {
+        int(value_id)
+        for parameter_name in graph_obj.graph.get("function_parameters") or ()
+        for value_id in identity.get(str(parameter_name), ())
+        if int(value_id) in declared
+    }
+    self_fields = {
+        str(field_name)
+        for field_name, receipt in dict(
+            dict(
+                (graph_obj.graph.get("parameter_record_abi") or {}).get(
+                    "self"
+                ) or {}
+            ).get("fields") or {}
+        ).items()
+        if str(receipt.get("storage") or "") == "span"
+    }
+    for node_id, data in graph_obj.nodes(data=True):
+        value_id = int(data.get("value_id", node_id))
+        if value_id not in declared:
+            continue
+        attributes = data.get("attributes") or {}
+        if str(attributes.get("binding_kind") or "") in {
+            "parameter", "closure", "external",
+        }:
+            source_ids.add(value_id)
+            continue
+        operation = str(data.get("op") or data.get("type") or "").casefold()
+        if (
+            operation == "getattr"
+            and str(attributes.get("attribute") or "") in self_fields
+        ):
+            source_ids.add(value_id)
+    return tuple(sorted(source_ids))
+
+
+def _linked_authored_parameter_aliases(
+    caller: Any,
+    callee: Any,
+    caller_graph: Any,
+    callee_graph: Any,
+    argument_bindings: Any,
+    caller_record_table: Any = None,
+    callee_record_table: Any = None,
+) -> dict[str, str]:
+    """Map a linked callee formal onto an outer authored formal exactly.
+
+    Method record fields retain their local spelling (usually ``self``).
+    When the exact PlanCall binding says an authored caller parameter such as
+    ``body`` supplies that receiver, the public ABI must expose
+    ``body.field`` rather than ``self.field``.  Only deterministic formal
+    identities participate; later same-spelling SSA versions are not aliases.
+    """
+
+    def identities(
+        function: Any, graph: Any, record_table: Any,
+    ) -> dict[int, str]:
+        metadata = dict(getattr(function, "metadata", {}) or {})
+        found = {
+            int(value_id): str(name)
+            for name, value_id in metadata.get("parameter_names", ())
+        }
+        graph_metadata = (
+            dict(getattr(graph, "graph", {}) or {})
+            if graph is not None else {}
+        )
+        identity_table = dict(graph_metadata.get("identity_table") or {})
+        parameter_roots = {
+            *map(str, dict(metadata.get("parameter_record_abi") or {})),
+            *map(str, dict(metadata.get("parameter_value_abi") or {})),
+            *map(str, graph_metadata.get("function_parameters", ()) or ()),
+        }
+        for name in sorted(parameter_roots):
+            history = tuple(identity_table.get(name, ()))
+            if history:
+                found.setdefault(int(history[0]), name)
+        # Method shells can remove the shapeless aggregate formal after all
+        # fields are projected. The record descriptor still owns its exact
+        # deterministic aggregate identity even when the final shell no
+        # longer carries the ProcessGraph identity catalogue.
+        records = dict(getattr(record_table, "records", {}) or {})
+        for name, receipt in dict(
+            metadata.get("parameter_record_abi") or {}
+        ).items():
+            identity = str(dict(receipt or {}).get("identity") or "")
+            candidates = [
+                int(record_id)
+                for record_id, descriptor in records.items()
+                if str(getattr(descriptor, "identity", "")) == identity
+            ]
+            if len(candidates) == 1:
+                found.setdefault(candidates[0], str(name))
+        return found
+
+    caller_names = identities(caller, caller_graph, caller_record_table)
+    callee_names = identities(callee, callee_graph, callee_record_table)
+    aliases: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for caller_id, callee_id in argument_bindings:
+        caller_name = caller_names.get(int(caller_id))
+        callee_name = callee_names.get(int(callee_id))
+        if caller_name is None or callee_name is None:
+            continue
+        previous = aliases.setdefault(callee_name, caller_name)
+        if previous != caller_name:
+            ambiguous.add(callee_name)
+    for name in ambiguous:
+        aliases.pop(name, None)
+    return aliases
+
+
+def _bind_sequence_storage_members(
+    storage_bindings: dict[int, int],
+    callee_sequence: Any,
+    caller_sequence: Any,
+) -> bool:
+    """Bind every physical member of one exact sequence argument."""
+
+    if (
+        callee_sequence is None
+        or caller_sequence is None
+        or len(callee_sequence.column_value_ids)
+        != len(caller_sequence.column_value_ids)
+    ):
+        return False
+    storage_bindings.update(zip(
+        map(int, callee_sequence.column_value_ids),
+        map(int, caller_sequence.column_value_ids),
+    ))
+    storage_bindings[int(callee_sequence.length_address_id)] = int(
+        caller_sequence.length_address_id
+    )
+    storage_bindings[int(callee_sequence.capacity_value_id)] = int(
+        caller_sequence.capacity_value_id
+    )
+    for attribute in ("status_address_id", "live_flags_value_id"):
+        callee_member = getattr(callee_sequence, attribute, None)
+        caller_member = getattr(caller_sequence, attribute, None)
+        if callee_member is not None and caller_member is not None:
+            storage_bindings[int(callee_member)] = int(caller_member)
+    return True
+
+
+def _sequence_length_values(
+    graph_obj: Any,
+    sequence_declarations: Iterable[tuple[int, str, int, bool]],
+    aliases: Mapping[int, int] | Iterable[tuple[int, int]] = (),
+) -> dict[int, int]:
+    """Map authored ``len(sequence)`` results to resident descriptors."""
+
+    declared = {
+        int(sequence_id)
+        for sequence_id, _policy, _columns, _writable
+        in sequence_declarations
+    }
+    resident = {value_id: value_id for value_id in declared}
+    resident.update({
+        int(alias): int(source)
+        for alias, source in dict(aliases).items()
+    })
+    changed = True
+    while changed:
+        changed = False
+        for alias, source in tuple(resident.items()):
+            target = resident.get(int(source))
+            if target is not None and resident.get(int(alias)) != target:
+                resident[int(alias)] = int(target)
+                changed = True
+    values = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Name)
+            and expression.func.id == "len"
+        ):
+            continue
+        arguments = tuple(
+            int(parent)
+            for parent, role in data.get("parents") or ()
+            if str(role).startswith("arg:") and parent in graph_obj
+        )
+        if len(arguments) != 1:
+            continue
+        argument_id = int(graph_obj.nodes[arguments[0]].get(
+            "value_id", arguments[0]
+        ))
+        sequence_id = resident.get(argument_id)
+        if sequence_id in declared:
+            values[int(data.get("value_id", node_id))] = int(sequence_id)
+    return values
+
+
 def _class_surface_ssa_program(
     compilation: Any,
     artifact_name: str,
@@ -2647,6 +6387,7 @@ def _class_surface_ssa_program(
     )
     from .glsl_deployment_strategy import _walk_planned_shells
     from .precompile_to_ssa import (
+        SSALoweringShortfall,
         lower_control_sections_to_ssa,
         resolve_sequence_schemas,
     )
@@ -2661,6 +6402,7 @@ def _class_surface_ssa_program(
     all_sequence_tables: dict[str, Any] = {}
     all_record_tables: dict[str, Any] = {}
     all_reference_tables: dict[str, Any] = {}
+    module_metadata: dict[str, Any] = {}
     machine_control_links: list[Any] = []
     machine_indirect_links: list[Any] = []
     pending_call_records: list[tuple[str, Any, Any, Any, Any]] = []
@@ -2699,12 +6441,33 @@ def _class_surface_ssa_program(
     section_outputs: dict[str, tuple[Any, ...]] = {}
     export_symbols: list[str] = []
     lowering_failures: list[tuple[str, Any]] = []
-    planned_shells = tuple(_walk_planned_shells(
+    discovered_planned_shells = tuple(_walk_planned_shells(
         compilation.deployment,
         include_function_registry=not bool(getattr(
             compilation.deployment, "runtime_closure_only", False
         )),
     ))
+    planned_shells = tuple(
+        shell
+        for shell in discovered_planned_shells
+        for planned_graph in (
+            getattr(getattr(shell, "process_graph", None), "G", None),
+        )
+        for function_reference in (
+            None if planned_graph is None
+            else planned_graph.graph.get("function_ref"),
+        )
+        if not (
+            function_reference is not None
+            and source_function_table is not None
+            and source_function_table.entry(
+                int(function_reference)
+            ).metadata.get("host_ssa_module") is not None
+            and bool(source_function_table.entry(
+                int(function_reference)
+            ).metadata.get("host_repository_ssa_complete", False))
+        )
+    )
     source_name_references: dict[str, set[int]] = {}
     for planned_shell in planned_shells:
         planned_graph = getattr(
@@ -2729,6 +6492,9 @@ def _class_surface_ssa_program(
             if host_module is None or host_root is None:
                 continue
             all_functions.update(host_module.functions)
+            section_outputs.update(dict(
+                entry.metadata.get("host_ssa_outputs") or {}
+            ))
             function_symbols[int(entry.reference.address)] = str(host_root)
             all_tensor_tables.update(getattr(host_module, "tensor_tables", {}))
             all_sequence_tables.update(getattr(host_module, "sequence_tables", {}))
@@ -2842,6 +6608,7 @@ def _class_surface_ssa_program(
             sequence_declarations, _sequence_memberships, _table_lookups,
             _table_lookup_defaults, _table_stores, table_deletions,
             retained_sequence_ids, nested_sequence_ids, _nested_record_fields,
+            tombstone_sequence_ids,
         ) = _field_slot_ops(
             graph_obj,
             retained_storage_identities=frozenset(retained_storage_identities),
@@ -2851,6 +6618,7 @@ def _class_surface_ssa_program(
             "sequence_declarations": sequence_declarations,
             "sequence_initializations": sequence_initializations,
             "table_deletions": table_deletions,
+            "deletion_sequence_ids": tombstone_sequence_ids,
             "retained_sequence_ids": retained_sequence_ids,
             "nested_sequence_ids": nested_sequence_ids,
         })
@@ -2872,6 +6640,65 @@ def _class_surface_ssa_program(
         )
         if function_name is None:
             continue
+        if os.environ.get("TURING_DEBUG_BUILTIN_SELECTION"):
+            for _node_id, _node_data in graph_obj.nodes(data=True):
+                _expression = _node_data.get("expr_obj")
+                _is_selection_call = (
+                    isinstance(_expression, ast.Call)
+                    and (
+                        isinstance(_expression.func, ast.Name)
+                        and _expression.func.id in {"next", "sum", "bytes"}
+                        or isinstance(_expression.func, ast.Attribute)
+                        and _expression.func.attr == "pack"
+                    )
+                )
+                if not (
+                    _is_selection_call
+                    or isinstance(_expression, (ast.GeneratorExp, ast.comprehension))
+                ):
+                    continue
+                print(
+                    "DEBUGBUILTIN "
+                    f"fn={function_name} node={int(_node_id)} "
+                    f"value={_node_data.get('value_id', _node_id)} "
+                    f"expr={ast.unparse(_expression)!r} "
+                    f"parents={tuple(_node_data.get('parents') or ())!r} "
+                    f"children={tuple(_node_data.get('children') or ())!r} "
+                    f"attrs={dict(_node_data.get('attributes') or {})!r}",
+                    file=sys.stderr,
+                )
+                if _is_selection_call:
+                    _frontier = [
+                        int(parent)
+                        for parent, _role in _node_data.get("parents") or ()
+                    ]
+                    _seen = set()
+                    for _depth in range(4):
+                        _next_frontier = []
+                        for _related_id in _frontier:
+                            if (
+                                _related_id in _seen
+                                or _related_id not in graph_obj
+                            ):
+                                continue
+                            _seen.add(_related_id)
+                            _related = graph_obj.nodes[_related_id]
+                            _related_expression = _related.get("expr_obj")
+                            print(
+                                "DEBUGBUILTINANCESTOR "
+                                f"fn={function_name} depth={_depth} "
+                                f"node={_related_id} "
+                                f"kind={_related.get('type')!r} "
+                                f"expr={None if _related_expression is None else ast.unparse(_related_expression)!r} "
+                                f"parents={tuple(_related.get('parents') or ())!r} "
+                                f"attrs={dict(_related.get('attributes') or {})!r}",
+                                file=sys.stderr,
+                            )
+                            _next_frontier.extend(
+                                int(parent)
+                                for parent, _role in _related.get("parents") or ()
+                            )
+                        _frontier = _next_frontier
         if program_abi and not graph_obj.graph.get("parameter_record_abi"):
             selected = _record_receipts_for_function(
                 program_abi,
@@ -2948,13 +6775,108 @@ def _class_surface_ssa_program(
         # at its real lexical marker.
         from .control_source import overlay_scheduled_control
         from .glsl_deployment_strategy import (
+            _ast_source_signature,
             _ordinary_conditional_control_programs,
+            _source_control_expression,
         )
+        def _source_conditional_ids(block):
+            from .control_source import (
+                CallBlock, ConditionalBlock, LoopBlock, ParallelDeployment,
+                SequenceBlock, StateMachineTick, WhileBlock,
+            )
+            found = set()
+            if isinstance(block, ConditionalBlock):
+                if block.source_node_id is not None:
+                    found.add(int(block.source_node_id))
+                found.update(_source_conditional_ids(block.body))
+                if block.orelse is not None:
+                    found.update(_source_conditional_ids(block.orelse))
+            elif isinstance(block, SequenceBlock):
+                for child in block.blocks:
+                    found.update(_source_conditional_ids(child))
+            elif isinstance(block, LoopBlock):
+                found.update(_source_conditional_ids(block.body))
+            elif isinstance(block, WhileBlock):
+                found.update(_source_conditional_ids(block.condition))
+                found.update(_source_conditional_ids(block.body))
+            elif isinstance(block, CallBlock):
+                found.update(_source_conditional_ids(block.callee))
+            elif isinstance(block, ParallelDeployment):
+                for lane in block.lanes:
+                    found.update(_source_conditional_ids(lane))
+            elif isinstance(block, StateMachineTick):
+                for _case, body in block.cases:
+                    found.update(_source_conditional_ids(body))
+                if block.default is not None:
+                    found.update(_source_conditional_ids(block.default))
+            return found
+
+        def _lowered_source_control_ids(block):
+            from .control_source import (
+                CallBlock, ConditionalBlock, LoopBlock, ParallelDeployment,
+                SequenceBlock, StateMachineTick, WhileBlock,
+            )
+            found = set()
+            if isinstance(block, ConditionalBlock):
+                if block.source_node_id is not None:
+                    found.add(int(block.source_node_id))
+                found.update(_lowered_source_control_ids(block.body))
+                if block.orelse is not None:
+                    found.update(_lowered_source_control_ids(block.orelse))
+            elif isinstance(block, SequenceBlock):
+                for child in block.blocks:
+                    found.update(_lowered_source_control_ids(child))
+            elif isinstance(block, LoopBlock):
+                if block.source_loop_node_id is not None:
+                    found.add(int(block.source_loop_node_id))
+                found.update(_lowered_source_control_ids(block.body))
+            elif isinstance(block, WhileBlock):
+                if block.source_loop_node_id is not None:
+                    found.add(int(block.source_loop_node_id))
+                found.update(_lowered_source_control_ids(block.condition))
+                found.update(_lowered_source_control_ids(block.body))
+            elif isinstance(block, CallBlock):
+                found.update(_lowered_source_control_ids(block.callee))
+            elif isinstance(block, ParallelDeployment):
+                for lane in block.lanes:
+                    found.update(_lowered_source_control_ids(lane))
+            elif isinstance(block, StateMachineTick):
+                for _case, body in block.cases:
+                    found.update(_lowered_source_control_ids(body))
+                if block.default is not None:
+                    found.update(_lowered_source_control_ids(block.default))
+            return found
+
+        represented_conditionals = _source_conditional_ids(control.root)
         conditional_controls = _ordinary_conditional_control_programs(
             graph,
             control.region_indices,
             getattr(shell, "dispatch_subgraphs", ()),
         )
+        if represented_conditionals:
+            from .control_source import ConditionalBlock, SequenceBlock
+
+            def represented(program):
+                return any(
+                    isinstance(block, ConditionalBlock)
+                    and block.source_node_id is not None
+                    and int(block.source_node_id) in represented_conditionals
+                    for block in program.root.blocks
+                )
+
+            conditional_controls = tuple(
+                program
+                for program in conditional_controls
+                if not represented(program)
+            )
+        specialized_conditional_node_ids = tuple(dict.fromkeys(
+            int(node_id) for node_id in (
+                *control.specialized_conditional_node_ids,
+                *tuple(graph_obj.graph.get(
+                    "structurally_specialized_conditional_node_ids", ()
+                )),
+            )
+        ))
         from .control_source import SequenceBlock, StatementBlock
         lowered_conditional_count = 0
         if conditional_controls:
@@ -3024,9 +6946,9 @@ def _class_surface_ssa_program(
                 conditional_of, conditional_controls
             ))
             source_expressions = {
-                int(block.source_node_id): graph_obj.nodes[
-                    int(block.source_node_id)
-                ].get("expr_obj")
+                int(block.source_node_id): _source_control_expression(
+                    graph_obj, int(block.source_node_id)
+                )
                 for block in conditional_blocks
                 if block is not None and block.source_node_id is not None
             }
@@ -3050,14 +6972,17 @@ def _class_surface_ssa_program(
                     if expression is None:
                         continue
                     descendants = {
-                        id(member) for statement in (
+                        _ast_source_signature(member) for statement in (
                             *expression.body, *expression.orelse
                         ) for member in ast.walk(statement)
                     }
                     child_expression = source_expressions.get(
                         int(child.source_node_id)
                     )
-                    if child_expression is not None and id(child_expression) in descendants:
+                    if (
+                        child_expression is not None
+                        and _ast_source_signature(child_expression) in descendants
+                    ):
                         span = int(getattr(
                             expression, "end_lineno", expression.lineno
                         )) - int(expression.lineno)
@@ -3132,6 +7057,71 @@ def _class_surface_ssa_program(
                     f"{function_name!r}: {duplicates!r}"
                 )
             lowered_conditional_count = len(conditional_controls)
+        control, lexical_sequence_shortfalls = _install_lexical_sequence_mutations(
+            control,
+            graph,
+            getattr(shell, "dispatch_subgraphs", ()),
+        )
+        control, lexical_query_shortfalls = _install_lexical_sequence_queries(
+            control,
+            graph,
+            getattr(shell, "dispatch_subgraphs", ()),
+        )
+        control = _attach_graph_control_expressions(control, graph_obj)
+        # Query placement initially sees only predicate result ids.  Once the
+        # structured expression is attached, reschedule so a conditional such
+        # as ``optional_row is None`` exposes its dependency on the row handle
+        # produced by ``next(generator, None)``.
+        control = replace(
+            control,
+            root=_schedule_sequence_query_dependencies(control.root),
+        )
+        (
+            control,
+            record_sequence_bindings,
+            record_sequence_projection_fields,
+        ) = _record_sequence_projection_bindings(graph_obj, control)
+        if record_sequence_bindings:
+            control = replace(
+                control,
+                projected_iterable_bindings=tuple(dict.fromkeys((
+                    *control.projected_iterable_bindings,
+                    *record_sequence_bindings,
+                ))),
+            )
+        if os.environ.get("TURING_DEBUG_CALL_PLACEMENT"):
+            from .control_source import (
+                CallBlock as _DebugCallBlock,
+                ConditionalBlock as _DebugConditionalBlock,
+                LoopBlock as _DebugLoopBlock,
+                SequenceBlock as _DebugSequenceBlock,
+                WhileBlock as _DebugWhileBlock,
+            )
+
+            def _debug_calls(block, scope=()):
+                if isinstance(block, _DebugCallBlock):
+                    print(
+                        "DEBUGCALLPLACE "
+                        f"fn={function_name} callsite={block.callsite_id} "
+                        f"scope={scope!r}",
+                        file=sys.stderr,
+                    )
+                    _debug_calls(block.callee, (*scope, ("call", block.callsite_id)))
+                elif isinstance(block, _DebugSequenceBlock):
+                    for child in block.blocks:
+                        _debug_calls(child, scope)
+                elif isinstance(block, _DebugConditionalBlock):
+                    _debug_calls(block.body, (*scope, ("if", block.source_node_id, "body")))
+                    if block.orelse is not None:
+                        _debug_calls(block.orelse, (*scope, ("if", block.source_node_id, "orelse")))
+                elif isinstance(block, _DebugLoopBlock):
+                    _debug_calls(block.body, (*scope, ("loop", block.source_loop_node_id)))
+                elif isinstance(block, _DebugWhileBlock):
+                    _debug_calls(block.condition, scope)
+                    _debug_calls(block.body, (*scope, ("while", block.source_loop_node_id)))
+
+            _debug_calls(control.root)
+        lowered_conditional_count = len(_source_conditional_ids(control.root))
         function_reference = graph_obj.graph.get("function_ref")
         qualified_name = None
         if function_reference is not None and source_function_table is not None:
@@ -3167,7 +7157,17 @@ def _class_surface_ssa_program(
         # store. In whole-program precompile mode the field-op region is never
         # built (gated behind ``not precompile_only``), so recover the field ops
         # from the process graph and hand them to the lowerer as slot access.
-        self_id, field_ops, const_sources, field_count, field_names, record_identity, sequence_initializations, field_aliases, sequence_declarations, sequence_memberships, table_lookups, table_lookup_defaults, table_stores, table_deletions, retained_sequence_ids, nested_sequence_ids, nested_record_fields = _field_slot_ops(
+        constant_struct_packs = _constant_struct_pack_materializations(
+            graph_obj
+        )
+        constant_byte_literals = _constant_byte_literal_materializations(
+            graph_obj
+        )
+        constant_byte_sequences = tuple(dict.fromkeys((
+            *constant_byte_literals,
+            *constant_struct_packs,
+        )))
+        self_id, field_ops, const_sources, field_count, field_names, record_identity, sequence_initializations, field_aliases, sequence_declarations, sequence_memberships, table_lookups, table_lookup_defaults, table_stores, table_deletions, retained_sequence_ids, nested_sequence_ids, nested_record_fields, _tombstone_sequence_ids = _field_slot_ops(
             graph_obj,
             retained_storage_identities=frozenset(retained_storage_identities),
             # A contract-declared keyed field is a lookup table, but it is a
@@ -3185,6 +7185,14 @@ def _class_surface_ssa_program(
                 if str(_field.get("storage") or "") == "keyed"
             ),
         )
+        sequence_initializations = tuple(dict.fromkeys((
+            *sequence_initializations,
+            *(
+                (int(value_id), f"literal_bytes={payload.hex()}", 1)
+                for value_id, payload, _node_id, _identity
+                in constant_byte_sequences
+            ),
+        )))
         from .hierarchical_plan import PlanCall
 
         local_plan_calls = tuple(
@@ -3192,6 +7200,474 @@ def _class_surface_ssa_program(
             for item in getattr(shell, "hierarchy_plan", ()).items
             if isinstance(item, PlanCall)
         )
+        sequence_call_result_kinds: dict[int, str] = {}
+        return_sequence_kind_by_reference: dict[int, str] = {}
+        if source_function_table is not None:
+            for entry in source_function_table:
+                host_module = entry.metadata.get("host_ssa_module")
+                host_root = entry.metadata.get("host_ssa_root")
+                host_function = (
+                    None if host_module is None or host_root is None
+                    else host_module.functions.get(str(host_root))
+                )
+                if host_function is not None:
+                    returned_ids = {
+                        int(argument.id)
+                        for block in host_function.blocks.values()
+                        for instruction in block.instrs
+                        if str(instruction.op).casefold() in {"ret", "return"}
+                        for argument in instruction.args
+                    }
+                    returned_materializations = {
+                        str(record.get("extraction_identity"))
+                        for record in host_function.metadata.get(
+                            "extraction_materializations", ()
+                        )
+                        if int(record.get("source_sequence_id", -1))
+                        in returned_ids
+                    }
+                    returned_kind = next((
+                        kind
+                        for identity, kind in (
+                            ("builtins.bytes", "bytes"),
+                            ("builtins.bytearray", "bytearray"),
+                            ("builtins.list", "list"),
+                        )
+                        if identity in returned_materializations
+                    ), None)
+                    if returned_kind is not None:
+                        return_sequence_kind_by_reference[
+                            int(entry.reference.address)
+                        ] = returned_kind
+                entry_graph = getattr(entry, "graph", None)
+                entry_graph_obj = getattr(entry_graph, "G", None)
+                if entry_graph_obj is None:
+                    continue
+                candidates = []
+                for root_id in getattr(entry_graph, "roots", ()):
+                    if int(root_id) not in entry_graph_obj:
+                        continue
+                    root_attributes = (
+                        entry_graph_obj.nodes[int(root_id)].get("attributes")
+                        or {}
+                    )
+                    kind = root_attributes.get("aggregate_kind")
+                    if kind in {"list", "bytes", "bytearray"}:
+                        candidates.append(str(kind))
+                if len(set(candidates)) == 1:
+                    return_sequence_kind_by_reference[
+                        int(entry.reference.address)
+                    ] = candidates[0]
+        callsite_shells = getattr(shell, "callsite_function_shells", {})
+        transformed_call_source_ids: set[int] = set()
+        transformed_parameters_by_reference: dict[int, set[int]] = {}
+        for planned_call in local_plan_calls:
+            child_shell = callsite_shells.get(int(planned_call.callsite_id))
+            child_graph = getattr(
+                getattr(child_shell, "process_graph", None), "G", None
+            )
+            if child_graph is None:
+                continue
+            function_reference = child_graph.graph.get("function_ref")
+            if function_reference is None:
+                continue
+            transformed_source_names = {
+                str(source_name)
+                for _result_id, _source_id, source_name, transform
+                in _bytes_join_source_transforms(child_graph)
+                if str(transform) in {"row_count", "join_bytes"}
+            }
+            transformed_parameters_by_reference.setdefault(
+                int(function_reference), set()
+            ).update(
+                int(value_id)
+                for source_name in transformed_source_names
+                for value_id in (
+                    child_graph.graph.get("identity_table") or {}
+                ).get(source_name, ())
+            )
+        for planned_call in local_plan_calls:
+            child_shell = callsite_shells.get(int(planned_call.callsite_id))
+            child_graph = getattr(
+                getattr(child_shell, "process_graph", None), "G", None
+            )
+            if child_graph is None:
+                continue
+            transformed_callee_ids = transformed_parameters_by_reference.get(
+                int(child_graph.graph.get("function_ref", -1)), set()
+            )
+            transformed_call_source_ids.update(
+                int(caller_id)
+                for caller_id, callee_id
+                in planned_call.argument_bindings
+                if int(callee_id) in transformed_callee_ids
+            )
+            child_kind_by_value = _sequence_value_kinds(
+                child_graph,
+                return_sequence_kind_by_reference=(
+                    return_sequence_kind_by_reference
+                ),
+            )
+            for callee_id, caller_id in planned_call.result_bindings:
+                child_kind = child_kind_by_value.get(int(callee_id))
+                if child_kind is not None:
+                    sequence_call_result_kinds[int(caller_id)] = child_kind
+        for call_node_id, call_data in graph_obj.nodes(data=True):
+            call_attributes = call_data.get("attributes") or {}
+            reference = call_attributes.get(
+                "callee_ref", call_attributes.get("method_ref")
+            )
+            if reference is None:
+                continue
+            return_kind = return_sequence_kind_by_reference.get(int(reference))
+            if return_kind is not None:
+                sequence_call_result_kinds.setdefault(
+                    int(call_data.get("value_id", call_node_id)),
+                    return_kind,
+                )
+        utf8_encode_aliases = (
+            *_authored_text_parameter_transforms(graph_obj),
+            *_utf8_encode_aliases(graph_obj),
+        )
+        bytes_join_transforms = _bytes_join_source_transforms(graph_obj)
+        scalar_source_transforms = _scalar_source_transforms(
+            graph_obj, (*utf8_encode_aliases, *bytes_join_transforms),
+        )
+        sequence_source_transforms = {
+            int(source_id): {
+                "source_name": str(source_name),
+                "transform": str(transform),
+            }
+            for _result_id, source_id, source_name, transform
+            in (*utf8_encode_aliases, *bytes_join_transforms)
+        }
+        source_transform_aliases = {
+            int(result_id): (int(source_id), "bytes")
+            for result_id, source_id, _source_name, _transform
+            in (
+                *utf8_encode_aliases,
+                *(
+                    record for record in bytes_join_transforms
+                    if str(record[3]) == "join_bytes"
+                ),
+            )
+        }
+        (
+            control,
+            conditional_sequence_aliases,
+            conditional_sequence_destinations,
+        ) = _promote_conditional_sequence_aliases(
+            control,
+            graph_obj,
+            call_result_kinds=sequence_call_result_kinds,
+            structural_aliases=source_transform_aliases,
+        )
+        (
+            sequence_concats,
+            sequence_concat_aliases,
+            sequence_singleton_values,
+        ) = _sequence_concat_ops(
+            graph_obj,
+            call_result_kinds=sequence_call_result_kinds,
+            structural_aliases={
+                **source_transform_aliases,
+                **conditional_sequence_aliases,
+            },
+        )
+        structural_byte_sequence_ids = tuple(
+            int(value_id)
+            for (
+                result_id, lhs_id, rhs_id, _kind,
+                lhs_scalar, rhs_scalar,
+            ) in sequence_concats
+            for value_id in (
+                int(result_id),
+                *(() if lhs_scalar is not None else (int(lhs_id),)),
+                *(() if rhs_scalar is not None else (int(rhs_id),)),
+            )
+        )
+        singleton_scalar_ids = {
+            int(value_id)
+            for (
+                _result_id, _lhs_id, _rhs_id, _kind,
+                lhs_scalar, rhs_scalar,
+            ) in sequence_concats
+            for value_id in (lhs_scalar, rhs_scalar)
+            if value_id is not None
+        }
+        node_by_value = {
+            int(data.get("value_id", node_id)): int(node_id)
+            for node_id, data in graph_obj.nodes(data=True)
+        }
+        if os.environ.get("TURING_DEBUG_SEQUENCE_CONCAT"):
+            for value_id in sorted(singleton_scalar_ids):
+                node_id = node_by_value.get(value_id)
+                data = graph_obj.nodes.get(node_id, {})
+                print(
+                    "DEBUGSINGLETON "
+                    f"fn={graph_obj.graph.get('function_name')} "
+                    f"value={value_id} node={node_id} "
+                    f"type={data.get('type')!r} op={data.get('op')!r} "
+                    f"expr={ast.dump(data.get('expr_obj'), include_attributes=False) if isinstance(data.get('expr_obj'), ast.AST) else None!r} "
+                    f"parents={tuple(data.get('parents') or ())!r} "
+                    f"histories={tuple((name, tuple(history)) for name, history in (graph_obj.graph.get('identity_table') or {}).items() if value_id in tuple(map(int, history)))!r}",
+                    file=sys.stderr,
+                )
+        singleton_name_aliases: dict[int, int] = {}
+        for value_id in singleton_scalar_ids:
+            data = graph_obj.nodes.get(node_by_value.get(value_id), {})
+            expression = data.get("expr_obj")
+            if not (
+                isinstance(expression, (ast.List, ast.Tuple, ast.Set))
+                and len(expression.elts) == 1
+            ):
+                continue
+            leaf_nodes = tuple(
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role).startswith("elts") and int(parent) in graph_obj
+            )
+            if len(leaf_nodes) == 1:
+                leaf_node = leaf_nodes[0]
+                singleton_name_aliases[int(value_id)] = int(
+                    graph_obj.nodes[leaf_node].get("value_id", leaf_node)
+                )
+        for history in (graph_obj.graph.get("identity_table") or {}).values():
+            ordered = tuple(map(int, history))
+            inputs = tuple(
+                value_id for value_id in ordered
+                if value_id in node_by_value
+                and str(graph_obj.nodes[node_by_value[value_id]].get(
+                    "type", ""
+                )).casefold() == "input"
+            )
+            if len(inputs) != 1:
+                continue
+            source_id = int(inputs[0])
+            for value_id in ordered:
+                if value_id not in singleton_scalar_ids or value_id == source_id:
+                    continue
+                data = graph_obj.nodes.get(node_by_value.get(value_id), {})
+                expression = data.get("expr_obj")
+                if isinstance(expression, ast.Name) and isinstance(
+                    expression.ctx, ast.Load
+                ):
+                    singleton_name_aliases[int(value_id)] = source_id
+        if conditional_sequence_destinations:
+            sequence_declarations = tuple(
+                (
+                    int(sequence_id), str(policy), int(columns),
+                    True if int(sequence_id) in set(
+                        conditional_sequence_destinations
+                    ) else bool(writable),
+                )
+                for sequence_id, policy, columns, writable
+                in sequence_declarations
+            )
+        declared_sequence_ids = {
+            int(sequence_id)
+            for sequence_id, _policy, _columns, _writable
+            in sequence_declarations
+        }
+        concat_result_ids = {
+            int(result_id)
+            for result_id, _lhs, _rhs, _kind, _lhs_scalar, _rhs_scalar
+            in sequence_concats
+        }
+        for sequence_id in sorted(
+            set(structural_byte_sequence_ids) - concat_result_ids
+        ):
+            if sequence_id not in declared_sequence_ids:
+                sequence_declarations = (*sequence_declarations, (
+                    int(sequence_id), "duplicates", 1, False,
+                ))
+                declared_sequence_ids.add(int(sequence_id))
+        from .control_source import (
+            CallBlock as _ControlCallBlock,
+            ConditionalBlock as _ControlConditionalBlock,
+            LoopBlock as _ControlLoopBlock,
+            SequenceBlock as _ControlSequenceBlock,
+            SequenceMutationBlock as _ControlSequenceMutationBlock,
+            SequenceQueryBlock as _ControlSequenceQueryBlock,
+            WhileBlock as _ControlWhileBlock,
+        )
+
+        def _generated_sequence_ids(block):
+            found = set()
+            mutations = ()
+            if isinstance(block, _ControlSequenceMutationBlock):
+                mutations = (block.mutation,)
+            elif isinstance(block, (_ControlLoopBlock, _ControlWhileBlock)):
+                mutations = block.sequence_mutations
+                if isinstance(block, _ControlWhileBlock):
+                    found.update(_generated_sequence_ids(block.condition))
+                found.update(_generated_sequence_ids(block.body))
+            elif isinstance(block, _ControlSequenceQueryBlock):
+                found.add(int(block.sequence_value_id))
+            elif isinstance(block, _ControlSequenceBlock):
+                for child in block.blocks:
+                    found.update(_generated_sequence_ids(child))
+            elif isinstance(block, _ControlConditionalBlock):
+                found.update(_generated_sequence_ids(block.body))
+                if block.orelse is not None:
+                    found.update(_generated_sequence_ids(block.orelse))
+            elif isinstance(block, _ControlCallBlock):
+                found.update(_generated_sequence_ids(block.callee))
+            for mutation in mutations:
+                sequence_id = int(mutation.sequence_value_id)
+                sequence_data = graph_obj.nodes.get(sequence_id, {})
+                sequence_attributes = sequence_data.get("attributes") or {}
+                if (
+                    sequence_data.get("type") == "LoopResult"
+                    and sequence_attributes.get("result_kind") == "collection"
+                ):
+                    found.add(sequence_id)
+            return found
+
+        generated_sequence_ids = _generated_sequence_ids(control.root)
+        materialized_sequence_columns: dict[int, int] = {}
+        for _node_id, data in graph_obj.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            column_count = int(attributes.get("sequence_column_count", 1))
+            if column_count <= 1:
+                continue
+            for source_value_id in attributes.get(
+                "materialized_source_value_ids", ()
+            ):
+                materialized_sequence_columns[int(source_value_id)] = max(
+                    column_count,
+                    materialized_sequence_columns.get(
+                        int(source_value_id), 1
+                    ),
+                )
+        for sequence_id in sorted(generated_sequence_ids):
+            if sequence_id not in declared_sequence_ids:
+                sequence_declarations = (*sequence_declarations, (
+                    int(sequence_id), "duplicates",
+                    materialized_sequence_columns.get(int(sequence_id), 1),
+                    True,
+                ))
+                declared_sequence_ids.add(int(sequence_id))
+        for call_result_id in sorted(sequence_call_result_kinds):
+            if call_result_id not in declared_sequence_ids:
+                sequence_declarations = (*sequence_declarations, (
+                    int(call_result_id), "duplicates", 1, True,
+                ))
+                declared_sequence_ids.add(int(call_result_id))
+        for source_id in sorted(sequence_source_transforms):
+            if source_id not in declared_sequence_ids:
+                sequence_declarations = (*sequence_declarations, (
+                    int(source_id), "duplicates", 1, False,
+                ))
+                declared_sequence_ids.add(int(source_id))
+        initialized_sequence_ids = {
+            int(sequence_id)
+            for sequence_id, _policy, _columns in sequence_initializations
+        }
+        for sequence_id in sorted(generated_sequence_ids):
+            if sequence_id not in initialized_sequence_ids:
+                sequence_initializations = (*sequence_initializations, (
+                    int(sequence_id), "duplicates", 1,
+                ))
+                initialized_sequence_ids.add(int(sequence_id))
+        for (
+            result_id, _lhs_id, _rhs_id, _kind, _lhs_scalar, _rhs_scalar,
+        ) in sequence_concats:
+            if int(result_id) not in declared_sequence_ids:
+                sequence_declarations = (*sequence_declarations, (
+                    int(result_id), "duplicates", 1, True,
+                ))
+                declared_sequence_ids.add(int(result_id))
+            if int(result_id) not in initialized_sequence_ids:
+                sequence_initializations = (*sequence_initializations, (
+                    int(result_id), "duplicates", 1,
+                ))
+                initialized_sequence_ids.add(int(result_id))
+        declared_column_counts = {
+            int(sequence_id): int(column_count)
+            for sequence_id, _policy, column_count, _writable
+            in sequence_declarations
+        }
+        sequence_initializations = tuple(
+            (
+                int(sequence_id), str(policy),
+                declared_column_counts.get(int(sequence_id), int(column_count)),
+            )
+            for sequence_id, policy, column_count in sequence_initializations
+        )
+        joined_sequence_ids = _joined_byte_sequence_ids(
+            graph_obj,
+            call_result_kinds=sequence_call_result_kinds,
+            declared_sequence_ids=declared_sequence_ids,
+            structural_byte_sequence_ids=structural_byte_sequence_ids,
+            transformed_call_source_ids=transformed_call_source_ids,
+        )
+
+        def _control_sequence_mutations(block):
+            """Yield every resident mutation retained by the coordinator."""
+
+            if isinstance(block, _ControlSequenceMutationBlock):
+                yield block.mutation
+            elif isinstance(block, (_ControlLoopBlock, _ControlWhileBlock)):
+                yield from block.sequence_mutations
+                if isinstance(block, _ControlWhileBlock):
+                    yield from _control_sequence_mutations(block.condition)
+                yield from _control_sequence_mutations(block.body)
+            elif isinstance(block, _ControlSequenceBlock):
+                for child in block.blocks:
+                    yield from _control_sequence_mutations(child)
+            elif isinstance(block, _ControlConditionalBlock):
+                yield from _control_sequence_mutations(block.body)
+                if block.orelse is not None:
+                    yield from _control_sequence_mutations(block.orelse)
+            elif isinstance(block, _ControlCallBlock):
+                yield from _control_sequence_mutations(block.callee)
+
+        # A source collection expression and the storage used by its retained
+        # loop are deliberately distinct SSA identities.  The mutation's
+        # effect identity is their authored correlation: propagate the joined
+        # list[bytes] representation to the generated storage rather than
+        # recovering it from a name or allocating an unrelated slot.
+        joined_set = set(map(int, joined_sequence_ids))
+        control_mutations = tuple(_control_sequence_mutations(control.root))
+        changed = True
+        while changed:
+            changed = False
+            for mutation in control_mutations:
+                if int(mutation.effect_node_id) not in joined_set:
+                    continue
+                sequence_id = int(mutation.sequence_value_id)
+                if sequence_id not in joined_set:
+                    joined_set.add(sequence_id)
+                    changed = True
+        joined_sequence_ids = tuple(sorted(joined_set))
+        joined_literal_mutations = _joined_list_literal_mutations(
+            graph_obj, joined_sequence_ids
+        )
+        if joined_literal_mutations:
+            control, joined_literal_shortfalls = (
+                _install_lexical_sequence_mutations(
+                    control,
+                    graph,
+                    getattr(shell, "dispatch_subgraphs", ()),
+                    extra_mutations=joined_literal_mutations,
+                )
+            )
+            lexical_sequence_shortfalls = (
+                *lexical_sequence_shortfalls,
+                *joined_literal_shortfalls,
+            )
+        for sequence_id in joined_sequence_ids:
+            if int(sequence_id) not in declared_sequence_ids:
+                sequence_declarations = (*sequence_declarations, (
+                    int(sequence_id), "duplicates", 1, True,
+                ))
+                declared_sequence_ids.add(int(sequence_id))
+            if int(sequence_id) not in initialized_sequence_ids:
+                sequence_initializations = (*sequence_initializations, (
+                    int(sequence_id), "duplicates", 1,
+                ))
+                initialized_sequence_ids.add(int(sequence_id))
         identities = graph_obj.graph.get("identity_table") or {}
         region_output_value_ids = {
             int(region_index): tuple(map(
@@ -3206,14 +7682,134 @@ def _class_surface_ssa_program(
             **dict(graph_obj.graph.get("planner_specializations") or {}),
         }
         parameter_value_dtypes = {}
+        constant_values = {}
+        singleton_concat_value_ids = {
+            int(value_id)
+            for (
+                _result_id, _lhs_id, _rhs_id, _kind,
+                lhs_scalar, rhs_scalar,
+            ) in sequence_concats
+            for value_id in (lhs_scalar, rhs_scalar)
+            if value_id is not None
+        }
+        required_root_output_value_ids = []
+        root_sequence_materializations = []
+        for root_id in tuple(getattr(shell.process_graph, "roots", ())):
+            if int(root_id) not in graph_obj:
+                continue
+            root_data = graph_obj.nodes[int(root_id)]
+            root_attributes = root_data.get("attributes") or {}
+            # ``bytes(local_sequence)`` is an immutable materialization of
+            # storage owned by this call.  At the native boundary the caller
+            # receives that same arena plus its length; no observable alias to
+            # the dead local bytearray escapes, so a second copy is unnecessary.
+            # Keep the conversion's authored root as authority while returning
+            # the exact resident sequence that the loop populated.
+            if (
+                root_attributes.get("producer_kind")
+                == "aggregate_materialization"
+                and root_attributes.get("aggregate_kind") == "bytes"
+            ):
+                sources = tuple(
+                    int(parent)
+                    for parent, role in root_data.get("parents") or ()
+                    if str(role).startswith("arg:") and int(parent) in graph_obj
+                )
+                if len(sources) == 1:
+                    source_sequence_id = int(
+                        graph_obj.nodes[sources[0]].get(
+                            "value_id", sources[0]
+                        )
+                    )
+                    required_root_output_value_ids.append(source_sequence_id)
+                    root_sequence_materializations.append({
+                        "source_node_id": int(root_id),
+                        "source_sequence_id": source_sequence_id,
+                        "extraction_identity": root_attributes.get(
+                            "extraction_identity"
+                        ),
+                        "lowering": "immutable-local-sequence-view",
+                    })
+                    continue
+            required_root_output_value_ids.append(int(
+                root_data.get("value_id", root_id)
+            ))
+            root_value_id = int(root_data.get("value_id", root_id))
+            concat_kind = next((
+                kind
+                for (
+                    result_id, _lhs_id, _rhs_id, kind,
+                    _lhs_scalar, _rhs_scalar,
+                ) in sequence_concats
+                if int(result_id) == root_value_id
+            ), None)
+            if concat_kind is not None:
+                root_sequence_materializations.append({
+                    "source_node_id": int(root_id),
+                    "source_sequence_id": root_value_id,
+                    "extraction_identity": f"builtins.{concat_kind}",
+                    "lowering": "immutable-sequence-concatenation",
+                })
         def scalar_fact_dtype(fact):
             if isinstance(fact, bool):
                 return "bool"
             if isinstance(fact, int):
-                return "int"
+                # An observed Python integer refines type, not machine width.
+                # Keep it aligned with the authored ``int`` annotation and
+                # the repository's fixed-width Python-integer ABI.
+                return "int64"
             if isinstance(fact, float):
                 return "float64"
             return None
+
+        annotation_dtypes: dict[str, str] = {}
+        function_identity = str(
+            graph_obj.graph.get("function_name") or function_name
+        )
+        authored_annotations = dict(
+            (
+                graph_obj.graph.get("function_parameter_annotations") or {}
+            ).get(function_identity, {})
+        )
+        for parameter_name, annotation in authored_annotations.items():
+            spelling = str(annotation).strip()
+            dtype = {
+                "bool": "bool",
+                "int": "int64",
+                "float": "float64",
+            }.get(spelling)
+            if dtype is not None:
+                annotation_dtypes[str(parameter_name)] = dtype
+        if function_reference is not None and source_function_table is not None:
+            try:
+                source_entry = source_function_table.entry(
+                    int(function_reference)
+                )
+            except (KeyError, TypeError, ValueError):
+                source_entry = None
+            callable_object = (
+                None if source_entry is None
+                else getattr(source_entry, "python_callable", None)
+            )
+            if callable_object is not None:
+                try:
+                    source_signature = inspect.signature(callable_object)
+                except (TypeError, ValueError):
+                    source_signature = None
+                if source_signature is not None:
+                    for parameter in source_signature.parameters.values():
+                        annotation = parameter.annotation
+                        spelling = (
+                            annotation if isinstance(annotation, str)
+                            else getattr(annotation, "__name__", "")
+                        )
+                        dtype = {
+                            "bool": "bool",
+                            "int": "int64",
+                            "float": "float64",
+                        }.get(str(spelling))
+                        if dtype is not None:
+                            annotation_dtypes[str(parameter.name)] = dtype
 
         for parameter_name in tuple(
             graph_obj.graph.get("function_parameters") or ()
@@ -3224,7 +7820,30 @@ def _class_surface_ssa_program(
             )
             if history and fact_dtype is not None:
                 parameter_value_dtypes[int(history[0])] = fact_dtype
+            if history and str(parameter_name) in annotation_dtypes:
+                parameter_value_dtypes.setdefault(
+                    int(history[0]), annotation_dtypes[str(parameter_name)]
+                )
         for value_id, data in graph_obj.nodes(data=True):
+            if str(data.get("type") or "").casefold() in {
+                "constant", "const",
+            } or str(data.get("op") or "").casefold() == "const":
+                attributes = data.get("attributes") or {}
+                literal = (
+                    attributes["value"]
+                    if "value" in attributes
+                    else data.get("constant")
+                )
+                materialized_value_id = int(data.get("value_id", value_id))
+                if (
+                    materialized_value_id in singleton_concat_value_ids
+                    and isinstance(literal, (list, tuple, bytes, bytearray))
+                    and len(literal) == 1
+                ):
+                    literal = literal[0]
+                constant_values[materialized_value_id] = (
+                    _copy_literal_payload(literal)
+                )
             if str(data.get("type") or "").casefold() != "input":
                 continue
             parameter_name = str(
@@ -3234,6 +7853,23 @@ def _class_surface_ssa_program(
             fact_dtype = scalar_fact_dtype(fact)
             if fact_dtype is not None:
                 parameter_value_dtypes[int(value_id)] = fact_dtype
+        # A receiver field read is a physical input just as surely as a named
+        # scalar parameter.  Carry its declared record dtype into region
+        # planning before the field-slot load is injected; otherwise the
+        # numerical region defaults to float64 even when the enclosing record
+        # correctly emits an int64/bool slot.
+        self_record_fields = dict(
+            (
+                (graph_obj.graph.get("parameter_record_abi") or {})
+                .get("self") or {}
+            ).get("fields") or {}
+        )
+        for _kind, value_id, slot in field_ops:
+            if not (0 <= int(slot) < len(field_names)):
+                continue
+            field = dict(self_record_fields.get(field_names[int(slot)]) or {})
+            if field.get("dtype") is not None:
+                parameter_value_dtypes[int(value_id)] = str(field["dtype"])
         # A free-function record assignment already has an exact dependency
         # edge: SetAttr(object=<parameter>, value=<producer>).  Preserve that
         # producer identity across the region/control call boundary so the
@@ -3275,13 +7911,28 @@ def _class_surface_ssa_program(
                     for parent, role in parents
                     if str(role) == "value" and parent in graph_obj
                 )
+        # All structural/materialization passes have now had their say about
+        # lexical placement.  Reassert query-producer dominance at this final
+        # control boundary so a source-position insertion cannot separate a
+        # generator from the query that materializes its scalar result.
+        control = replace(
+            control,
+            root=_schedule_sequence_query_dependencies(control.root),
+        )
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
                 hierarchy_plan=getattr(shell, "hierarchy_plan", None),
-                preloaded_value_aliases=_loop_carried_storage_aliases(
-                    graph_obj
-                ),
+                preloaded_value_aliases={
+                    **_loop_carried_storage_aliases(graph_obj),
+                    **{
+                        int(value_id): int(resident_id)
+                        for value_id, (resident_id, _kind)
+                        in conditional_sequence_aliases.items()
+                    },
+                    **dict(sequence_concat_aliases),
+                    **singleton_name_aliases,
+                },
                 control_name=symbol,
                 identity_table=dict(graph_obj.graph.get("identity_table") or {}),
                 function_outputs=tuple(
@@ -3291,6 +7942,10 @@ def _class_surface_ssa_program(
                     graph_obj.graph.get("function_parameters") or ()
                 ),
                 value_dtypes=parameter_value_dtypes,
+                constant_values=constant_values,
+                required_output_value_ids=tuple(dict.fromkeys(
+                    required_root_output_value_ids
+                )),
                 region_output_value_ids=region_output_value_ids,
                 record_field_write_value_ids=tuple(dict.fromkeys(
                     parameter_record_write_value_ids
@@ -3301,9 +7956,34 @@ def _class_surface_ssa_program(
                 field_count=field_count,
                 field_names=field_names,
                 record_identity=record_identity,
+                record_field_dtypes={
+                    str(field_name): str(field["dtype"])
+                    for field_name, field in dict(
+                        (
+                            (graph_obj.graph.get("parameter_record_abi") or {})
+                            .get("self") or {}
+                        ).get("fields") or {}
+                    ).items()
+                    if field.get("dtype") is not None
+                },
+                record_field_mutability={
+                    str(field_name): bool(field.get("mutable", False))
+                    for field_name, field in dict(
+                        (
+                            (graph_obj.graph.get("parameter_record_abi") or {})
+                            .get("self") or {}
+                        ).get("fields") or {}
+                    ).items()
+                },
                 sequence_initializations=sequence_initializations,
                 field_aliases=field_aliases,
                 sequence_declarations=sequence_declarations,
+                sequence_column_dtypes=_sequence_column_dtype_contracts(
+                    graph_obj, sequence_declarations
+                ),
+                source_sequence_ids=_authored_source_sequence_ids(
+                    graph_obj, sequence_declarations
+                ),
                 sequence_memberships=sequence_memberships,
                 table_lookups=table_lookups,
                 table_lookup_defaults=table_lookup_defaults,
@@ -3311,8 +7991,11 @@ def _class_surface_ssa_program(
                 table_deletions=table_deletions,
                 retained_sequence_ids=retained_sequence_ids,
                 nested_sequence_ids=nested_sequence_ids,
+                joined_sequence_ids=joined_sequence_ids,
+                joined_singleton_values=sequence_singleton_values,
                 nested_record_fields=nested_record_fields,
                 sequence_augassigns=_sequence_augassign_ops(graph_obj),
+                sequence_concats=sequence_concats,
                 sequence_append_fills=_sequence_append_fill_ops(graph_obj),
                 sequence_append_slices=_sequence_append_slice_ops(graph_obj),
                 sequence_bit_packs=_sequence_bit_pack_ops(graph_obj),
@@ -3323,8 +8006,24 @@ def _class_surface_ssa_program(
                 sequence_inplace_bit_pack_calls=(
                     _sequence_inplace_bit_pack_call_ops(graph)
                 ),
+                sequence_row_operations=_sequence_row_operations(
+                    graph_obj, sequence_declarations
+                ),
                 nested_row_projections=_nested_row_projection_ops(
                     graph_obj, control
+                ),
+                sequence_length_values=_sequence_length_values(
+                    graph_obj,
+                    sequence_declarations,
+                    {
+                        **_loop_carried_storage_aliases(graph_obj),
+                        **{
+                            int(value_id): int(resident_id)
+                            for value_id, (resident_id, _kind)
+                            in conditional_sequence_aliases.items()
+                        },
+                        **dict(sequence_concat_aliases),
+                    },
                 ),
                 string_table=string_table,
                 tensor_ssa_reference=tensor_ssa_reference,
@@ -3333,9 +8032,139 @@ def _class_surface_ssa_program(
         )
         if shortfalls:
             lowering_failures.extend((symbol, item) for item in shortfalls)
+        lowering_failures.extend(
+            (
+                symbol,
+                SSALoweringShortfall(
+                    "control",
+                    "sequence-mutation-guard",
+                    symbol,
+                    "authored sequence mutation has no retained predicate "
+                    f"identity: effect_node_id={effect_id}",
+                ),
+            )
+            for effect_id in lexical_sequence_shortfalls
+        )
+        lowering_failures.extend(
+            (
+                symbol,
+                SSALoweringShortfall(
+                    "control",
+                    "sequence-query",
+                    symbol,
+                    "generator consumer has no safe resident query lowering: "
+                    f"call_node_id={call_id}",
+                ),
+            )
+            for call_id in lexical_query_shortfalls
+        )
         all_functions.update(module_ir.functions)
         lowered_control = module_ir.functions.get(symbol)
         if lowered_control is not None:
+            lowered_control.metadata["source_function_reference"] = (
+                None if function_reference is None
+                else int(function_reference)
+            )
+            lowered_control.metadata["source_qualified_name"] = (
+                str(qualified_name or function_name)
+            )
+            lowered_control.metadata["sequence_source_transforms"] = tuple(
+                (
+                    int(sequence_id),
+                    str(record["source_name"]),
+                    str(record["transform"]),
+                )
+                for sequence_id, record in sorted(
+                    sequence_source_transforms.items()
+                )
+            )
+            lowered_control.metadata["scalar_source_transforms"] = tuple(
+                scalar_source_transforms
+            )
+            joined_set = set(map(int, joined_sequence_ids))
+            joined_identity_aliases: dict[int, int] = {}
+            for _name, history in (
+                graph_obj.graph.get("identity_table") or {}
+            ).items():
+                ordered = tuple(map(int, history))
+                residents = tuple(
+                    value_id for value_id in ordered
+                    if value_id in joined_set
+                )
+                if not residents:
+                    continue
+                resident = int(residents[-1])
+                joined_identity_aliases.update(
+                    (int(value_id), resident) for value_id in ordered
+                )
+            lowered_control.metadata[
+                "joined_sequence_identity_aliases"
+            ] = tuple(sorted(joined_identity_aliases.items()))
+            sequence_table = lowered_control.metadata.get("sequence_table")
+            sequence_descriptors = (
+                {} if sequence_table is None else sequence_table.sequences
+            )
+            ret_value_ids = {
+                int(argument.id)
+                for block in lowered_control.blocks.values()
+                for instruction in block.instrs
+                if str(instruction.op).casefold() in {"ret", "return"}
+                for argument in instruction.args
+            }
+            extraction_materializations = []
+            sequence_materialization_aliases = dict(
+                map(lambda pair: (int(pair[0]), int(pair[1])), sequence_concat_aliases)
+            )
+            for node_id, node_data in graph_obj.nodes(data=True):
+                attributes = node_data.get("attributes") or {}
+                sequence_id = int(node_data.get("value_id", node_id))
+                descriptor = sequence_descriptors.get(sequence_id)
+                if (
+                    attributes.get("extraction_identity") == "builtins.bytes"
+                    and attributes.get("producer_kind")
+                    == "aggregate_materialization"
+                    and sequence_id in sequence_materialization_aliases
+                ):
+                    extraction_materializations.append({
+                        "source_node_id": int(node_id),
+                        "source_sequence_id": sequence_id,
+                        "resident_sequence_id": int(
+                            sequence_materialization_aliases[sequence_id]
+                        ),
+                        "extraction_identity": "builtins.bytes",
+                        "lowering": "immutable-sequence-view",
+                    })
+                if (
+                    attributes.get("producer_kind") == "aggregate"
+                    and attributes.get("aggregate_kind") == "bytearray"
+                    and descriptor is not None
+                    and descriptor.writable
+                    and attributes.get("extraction_identity") is not None
+                ):
+                    extraction_materializations.append({
+                        "source_node_id": int(node_id),
+                        "source_sequence_id": sequence_id,
+                        "extraction_identity": str(
+                            attributes["extraction_identity"]
+                        ),
+                        "lowering": "writable-sequence-arena",
+                    })
+            extraction_materializations.extend(
+                dict(record)
+                for record in root_sequence_materializations
+                if record.get("extraction_identity") is not None
+                and int(record["source_sequence_id"])
+                in sequence_descriptors
+                and int(record["source_sequence_id"]) in ret_value_ids
+            )
+            extraction_materializations.extend({
+                "source_node_id": int(node_id),
+                "source_sequence_id": int(value_id),
+                "extraction_identity": str(identity),
+                "lowering": "compile-time-constant-sequence",
+                "byte_count": len(payload),
+            } for value_id, payload, node_id, identity in constant_struct_packs
+              if int(value_id) in sequence_descriptors)
             source_output_value_ids = tuple(dict.fromkeys(
                 int(history[-1])
                 for name in tuple(
@@ -3348,9 +8177,112 @@ def _class_surface_ssa_program(
                 ),)
                 if history
             ))
+            lowered_source_value_ids = set(
+                _lowered_source_control_ids(control.root)
+            )
+            # Loop targets are definitions owned by the control coordinator,
+            # not public inputs.  ``ControlSSABuilder`` realizes each of
+            # these identities from its resident iterable (or an exact
+            # projected/static/closure-backed spelling) at the top of every
+            # iteration.  Account for those authored definitions alongside
+            # the loop node itself; otherwise a downstream call that consumes
+            # the target makes the completeness audit report a phantom input
+            # even though the target already has a concrete SSA producer.
+            lowered_source_value_ids.update(
+                int(target_id)
+                for bindings in (
+                    control.iterable_bindings,
+                    control.static_iterable_bindings,
+                    control.closure_iterable_bindings,
+                    control.projected_iterable_bindings,
+                )
+                for _iterable_id, target_id, *_rest in bindings
+            )
+            # Collection bindings name the per-iteration source first; the
+            # coordinator writes that exact value into resident collection
+            # storage at the indexed destination.
+            lowered_source_value_ids.update(
+                int(source_value_id)
+                for source_value_id, _resident_id, _induction, _start
+                in control.collection_bindings
+            )
+            for mutation in control_mutations:
+                effect_id = int(mutation.effect_node_id)
+                lowered_source_value_ids.add(effect_id)
+                effect_data = graph_obj.nodes.get(effect_id, {})
+                lowered_source_value_ids.update(
+                    int(graph_obj.nodes[parent].get("value_id", parent))
+                    for parent, role in effect_data.get("parents") or ()
+                    if str(role).startswith("arg:") and parent in graph_obj
+                )
+            for operation in _sequence_row_operations(
+                graph_obj, sequence_declarations
+            ):
+                lowered_source_value_ids.add(int(operation[1]))
+                lowered_source_value_ids.add(int(operation[-1]))
+            for materialization in extraction_materializations:
+                lowered_source_value_ids.update(
+                    int(materialization[key])
+                    for key in (
+                        "source_node_id", "source_sequence_id",
+                        "resident_sequence_id",
+                    )
+                    if materialization.get(key) is not None
+                )
+            # A declared record parameter is represented by the physical
+            # scalar/span fields materialized above.  Its original object
+            # identity is deliberately absent from the machine ABI, but it is
+            # no longer an unlowered source value.  This used to special-case
+            # ``self`` and consequently rejected an equally complete annotated
+            # parameter such as ``body: CodeBuilder``.
+            identities = graph_obj.graph.get("identity_table") or {}
+            for parameter_name in dict(
+                graph_obj.graph.get("parameter_record_abi") or {}
+            ):
+                lowered_source_value_ids.update(map(
+                    int, identities.get(str(parameter_name), ()),
+                ))
+                lowered_source_value_ids.update(
+                    int(data.get("value_id", node_id))
+                    for node_id, data in graph_obj.nodes(data=True)
+                    if str(data.get("type") or "").casefold() == "input"
+                    and str((data.get("attributes") or {}).get(
+                        "binding_name", ""
+                    )) == str(parameter_name)
+                )
+            # The structural shell is lowered through the assigned hierarchy,
+            # so its machine values use the hierarchy's sole global SSA
+            # identity while the source graph ledger above is still local to
+            # this closure.  Preserve both forms in this diagnostic/accounting
+            # set.  This is an exact correlation from the deterministic value
+            # table, not an ID remint or a name-based alias.
+            hierarchy_values = getattr(
+                shell, "hierarchy_value_table", None,
+            )
+            hierarchy_plan = getattr(shell, "hierarchy_plan", None)
+            if hierarchy_values is not None and hierarchy_plan is not None:
+                closure_id = int(hierarchy_plan.closure_id)
+                globalized_lowered_ids = set()
+                for value_id in lowered_source_value_ids:
+                    try:
+                        globalized_lowered_ids.add(
+                            hierarchy_values.global_id(closure_id, value_id)
+                        )
+                    except KeyError:
+                        pass
+                lowered_source_value_ids.update(globalized_lowered_ids)
             lowered_control.metadata.update({
-                "source_conditional_count": len(conditional_controls),
-                "lowered_conditional_count": lowered_conditional_count,
+                "source_conditional_count": (
+                    lowered_conditional_count
+                    + len(specialized_conditional_node_ids)
+                ),
+                "lowered_conditional_count": (
+                    lowered_conditional_count
+                    + len(specialized_conditional_node_ids)
+                ),
+                "specialized_conditional_node_ids": (
+                    specialized_conditional_node_ids
+                ),
                 "source_output_value_ids": source_output_value_ids,
                 "parameter_record_abi": copy.deepcopy(
                     graph_obj.graph.get("parameter_record_abi") or {}
@@ -3358,6 +8290,21 @@ def _class_surface_ssa_program(
                 "parameter_value_abi": copy.deepcopy(
                     graph_obj.graph.get("parameter_value_abi") or {}
                 ),
+                "parameter_sequence_record_abi": copy.deepcopy(
+                    graph_obj.graph.get("parameter_sequence_record_abi") or {}
+                ),
+                "record_sequence_projection_fields": (
+                    record_sequence_projection_fields
+                ),
+                "record_sequence_projection_bindings": tuple(
+                    record_sequence_bindings
+                ),
+                "extraction_materializations": tuple(
+                    extraction_materializations
+                ),
+                "lowered_source_value_ids": tuple(sorted(
+                    lowered_source_value_ids
+                )),
             })
         all_tensor_tables.update(
             getattr(module_ir, "tensor_tables", {})
@@ -3517,6 +8464,20 @@ def _class_surface_ssa_program(
         pending_call_feed_ids.setdefault(str(caller_symbol), set()).update(
             map(int, caller.metadata.get("source_output_value_ids", ()))
         )
+    # Keep an exact liveness receipt before expanding these seeds to their
+    # dependency closure.  A numerical region can publish one of these values
+    # before the source-linked Call is installed in its final control block.
+    # The late pure-region DCE must therefore not decide that projection is
+    # dead merely from the temporarily incomplete instruction use-list.  This
+    # is semantic accounting, not a cache: the ids are the deterministic SSA
+    # identities already present in the authored graph and are rebuilt on
+    # every compilation.
+    for caller_symbol, required_ids in pending_call_feed_ids.items():
+        caller = all_functions.get(str(caller_symbol))
+        if caller is not None and required_ids:
+            caller.metadata["required_source_value_ids"] = tuple(
+                sorted(map(int, required_ids))
+            )
     # Public structural expressions (BoolOp, tuple/record construction, field
     # publication) are not themselves numerical regions. Retain their exact
     # operand closure so every numerical ancestor survives until structural
@@ -3694,12 +8655,16 @@ def _class_surface_ssa_program(
     ] = {}
     def function_values(function: Any) -> dict[int, Any]:
         values = {int(value.id): value for value in function.args}
-        values.update({
-            int(instruction.res.id): instruction.res
-            for block in function.blocks.values()
-            for instruction in block.instrs
-            if instruction.res is not None
-        })
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.res is not None:
+                    # Arguments are the canonical object for an authored ABI
+                    # identity. A provisional synthetic result can briefly
+                    # share its integer before the collision-freshening pass;
+                    # it must not shadow the argument in record/call wiring.
+                    values.setdefault(
+                        int(instruction.res.id), instruction.res
+                    )
         return values
 
     def recover_structural_source_outputs(
@@ -3876,6 +8841,36 @@ def _class_surface_ssa_program(
                     value_id, operation, "carried-value"
                 ))
                 return None
+            if operation in {"int", "float", "bool"}:
+                operands = tuple(
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role).startswith("arg:")
+                )
+                if len(operands) != 1:
+                    structural_shortfalls.append((
+                        value_id, operation, "cast-arity"
+                    ))
+                    return None
+                operand = ensure_structural_value(operands[0])
+                if operand is None:
+                    structural_shortfalls.append((
+                        value_id, operation, f"operand:{operands[0]}"
+                    ))
+                    return None
+                target_dtype = {
+                    "int": "int64", "float": "float64", "bool": "bool",
+                }[operation]
+                result = SSAValue(value_id, dtype=target_dtype)
+                insertions.append(Instr(
+                    "Cast", [operand], result,
+                    attributes={
+                        "structural_operation": operation,
+                        "target_dtype": target_dtype,
+                    },
+                ))
+                values[value_id] = result
+                return result
             canonical = {
                 "add": "add", "sub": "sub", "mul": "mul",
                 "div": "truediv", "truediv": "truediv",
@@ -4033,12 +9028,20 @@ def _class_surface_ssa_program(
         identities = graph.graph.get("identity_table") or {}
         record_table = all_record_tables.get(symbol)
         returned_record_layouts = []
-        named_output_ids = {
-            str(name): int(value_id)
-            for name, value_id in (
-                function.metadata.get("named_outputs") or ()
+        named_output_ids = {}
+        for name, value_id in function.metadata.get("named_outputs") or ():
+            name = str(name)
+            value_id = int(value_id)
+            history = tuple(map(int, identities.get(name, ())))
+            # A named-output hint sometimes still points at the authored
+            # parameter Input. The identity ledger is the source of truth:
+            # when the hint is one member of that deterministic SSA chain,
+            # its final member is the current spelling. A carried/region phi
+            # can legitimately sit outside the lexical history, so preserve
+            # such a resolved value unchanged.
+            named_output_ids[name] = (
+                history[-1] if history and value_id in history else value_id
             )
-        }
         for output_name in tuple(graph.graph.get("function_outputs") or ()):
             history = tuple(identities.get(str(output_name), ()))
             if not history:
@@ -4289,22 +9292,62 @@ def _class_surface_ssa_program(
         # public Ret value, but must not be added to Ret merely because a call
         # consumes them.  This is common for authored boolean combinations
         # passed as keyword arguments.
+        authored_parameter_ids = {
+            int(value_id)
+            for _name, value_id in function.metadata.get(
+                "parameter_names", ()
+            )
+        }
         for required_id in sorted(pending_call_feed_ids.get(symbol, ())):
-            if int(required_id) in values:
-                continue
+            required_id = int(required_id)
+            if required_id in values:
+                existing = values[required_id]
+                # Region projection can provisionally externalize a value
+                # which is actually a structural source expression.  If the
+                # projection is later folded away, retaining that placeholder
+                # turns an internal expression into a public ABI argument
+                # (observed for ``sleb(int(data_offset))``).  Claim only an
+                # exact planned-region result, never an authored parameter or
+                # physical program-ABI slot.  Prefer a real same-identity
+                # instruction result when one already exists; otherwise let
+                # the structural graph reconstruction below emit its producer.
+                accounting = dict(existing.accounting or {})
+                claimable = (
+                    existing in function.args
+                    and required_id not in authored_parameter_ids
+                    and bool(accounting.get("ssa_call_result_from"))
+                    and not accounting.get("program_abi_storage")
+                    and not accounting.get("compiler_frame_storage")
+                    and not accounting.get("linked_call_frame_storage")
+                )
+                if not claimable:
+                    continue
+                function.args.remove(existing)
+                produced = next((
+                    instruction.res
+                    for block in function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.res is not None
+                    and int(instruction.res.id) == required_id
+                ), None)
+                if produced is not None:
+                    values[required_id] = produced
+                    continue
+                values.pop(required_id, None)
             operation = str(
-                graph.nodes.get(int(required_id), {}).get("op")
-                or graph.nodes.get(int(required_id), {}).get("type")
+                graph.nodes.get(required_id, {}).get("op")
+                or graph.nodes.get(required_id, {}).get("type")
                 or ""
             ).casefold()
             if operation in {
                 "boolop", "constant", "const", "loopresult", "loopexit",
-                "identity", "add", "sub", "mul", "div", "truediv",
+                "identity", "int", "float", "bool",
+                "add", "sub", "mul", "div", "truediv",
                 "greater", "gt", "less", "lt", "greaterequal",
                 "greater_equal", "lessequal", "less_equal", "equal", "eq",
                 "notequal", "not_equal",
             }:
-                ensure_structural_value(int(required_id))
+                ensure_structural_value(required_id)
         # A named output the builder already resolved through its name
         # history stands in the Ret under the carried phi's id, which the
         # graph's identity table cannot know -- so the recovery above may
@@ -4501,6 +9544,856 @@ def _class_surface_ssa_program(
               for node_id, data in graph.nodes(data=True)),
         ), default=0)
         table = all_record_tables.setdefault(symbol, SSARecordTable())
+        pooled_scalar_columns: dict[tuple[str, str], SSAValue] = {}
+
+        def record_field_candidates(
+            owner_ids: set[int], field_name: str,
+        ) -> tuple[int, ...]:
+            """Find attribute or constant-key ``record.get`` field reads."""
+
+            candidates = []
+            for node_id, data in graph.nodes(data=True):
+                operation = str(
+                    data.get("type") or data.get("op") or ""
+                ).casefold()
+                parents = tuple(data.get("parents") or ())
+                if operation == "getattr" and str(
+                    (data.get("attributes") or {}).get("attribute")
+                ) == str(field_name) and any(
+                    int(parent) in owner_ids
+                    and str(role) in {"value", "object", "base"}
+                    for parent, role in parents
+                ):
+                    candidates.append(int(data.get("value_id", node_id)))
+                    continue
+                if operation != "get" or not any(
+                    int(parent) in owner_ids
+                    and str(role) in {"operand", "value", "object", "base"}
+                    for parent, role in parents
+                ):
+                    continue
+                expression = data.get("expr_obj")
+                key = (
+                    expression.args[0].value
+                    if isinstance(expression, ast.Call)
+                    and expression.args
+                    and isinstance(expression.args[0], ast.Constant)
+                    else None
+                )
+                if str(key) == str(field_name):
+                    candidates.append(int(data.get("value_id", node_id)))
+            return tuple(dict.fromkeys(candidates))
+
+        def indexed_value_candidates(owner_ids: set[int]) -> tuple[int, ...]:
+            """Find row values selected from one declared keyed field."""
+
+            candidates = []
+            for node_id, data in graph.nodes(data=True):
+                operation = str(
+                    data.get("type") or data.get("op") or ""
+                ).casefold()
+                if operation != "indexed":
+                    continue
+                if not any(
+                    int(graph.nodes[parent].get("value_id", parent))
+                    in owner_ids
+                    and str(role) in {
+                        "value", "base", "operand", "object",
+                    }
+                    for parent, role in (data.get("parents") or ())
+                    if parent in graph
+                ):
+                    continue
+                candidates.append(int(data.get("value_id", node_id)))
+            return tuple(dict.fromkeys(candidates))
+
+        def accepted_isinstance_tokens(expression: Any) -> tuple[str, ...]:
+            """Return exact lexical type identities from isinstance arg 2."""
+
+            if not (
+                isinstance(expression, ast.Call)
+                and isinstance(expression.func, ast.Name)
+                and expression.func.id == "isinstance"
+                and len(expression.args) >= 2
+            ):
+                return ()
+
+            def identity(node: ast.AST) -> str | None:
+                if isinstance(node, ast.Name):
+                    return {
+                        "tuple": "builtins.tuple",
+                        "list": "builtins.list",
+                        "set": "builtins.set",
+                        "dict": "builtins.dict",
+                    }.get(node.id, node.id)
+                if isinstance(node, ast.Attribute):
+                    owner = identity(node.value)
+                    return None if owner is None else f"{owner}.{node.attr}"
+                return None
+
+            accepted = expression.args[1]
+            members = (
+                tuple(accepted.elts)
+                if isinstance(accepted, (ast.Tuple, ast.List, ast.Set))
+                else (accepted,)
+            )
+            return tuple(filter(None, (identity(member) for member in members)))
+
+        def materialize_nested_record(
+            schema_name: str,
+            owner_ids: set[int],
+            descriptor_id: int,
+            parameter_name: str,
+            field_path: str,
+            active: tuple[str, ...] = (),
+            row_handle_id: int | None = None,
+        ) -> None:
+            """Expand one schema-known nested record into physical leaves.
+
+            The IDs are the deterministic source/SSA identities already on
+            the GetAttr chain.  A record container never receives a transient
+            slot number and never crosses the native ABI; only its scalar,
+            span, or reference leaves do.
+            """
+
+            nonlocal next_physical_id
+
+            if schema_name in active:
+                raise ValueError(
+                    "cyclic nested program ABI record "
+                    f"{' -> '.join((*active, schema_name))}"
+                )
+            try:
+                schema = dict(abi_records[str(schema_name)])
+            except KeyError as error:
+                raise ValueError(
+                    f"unknown nested program ABI record {schema_name!r}"
+                ) from error
+            schema_identity = str(schema.get("identity") or schema_name)
+            nested_fields = []
+            for nested_name, nested_field in dict(
+                schema.get("fields") or {}
+            ).items():
+                candidates = record_field_candidates(
+                    owner_ids, str(nested_name)
+                )
+                if not candidates:
+                    continue
+                nested_storage = str(nested_field.get("storage") or "")
+                nested_path = f"{field_path}.{nested_name}"
+                if nested_storage == "record":
+                    child_schema = str(nested_field.get("record") or "")
+                    child_id = min(candidates)
+                    materialize_nested_record(
+                        child_schema,
+                        set(map(int, candidates)),
+                        child_id,
+                        parameter_name,
+                        nested_path,
+                        (*active, schema_name),
+                        row_handle_id,
+                    )
+                    child_receipt = dict(abi_records[child_schema])
+                    nested_fields.append(SSARecordFieldDescriptor(
+                        str(nested_name),
+                        SSARecordFieldStorage.RECORD,
+                        storage_identity=f"{schema_identity}.{nested_name}",
+                        value_ids=(),
+                        record_id=child_id,
+                        dtype=str(
+                            child_receipt.get("identity") or child_schema
+                        ),
+                        writable=False,
+                    ))
+                    continue
+                if nested_storage == "keyed":
+                    key_encoding = str(
+                        nested_field.get("key_encoding") or "string_token"
+                    )
+                    value_record = nested_field.get("value_record")
+                    value_identity = nested_field.get("value_identity")
+                    parts = {
+                        "length": ("scalar", "int64", 0),
+                        "keys": ("span", "int64", 1),
+                        **({} if value_identity == "key" else {
+                            "values": (
+                                "span",
+                                str(nested_field.get("dtype") or "float64"),
+                                1,
+                            ),
+                        }),
+                    }
+                    part_ids: dict[str, int] = {}
+                    for part_name, (
+                        part_storage, part_dtype, part_rank,
+                    ) in parts.items():
+                        part_id = next_physical_id
+                        next_physical_id += 1
+                        part_ids[part_name] = part_id
+                        part_value = SSAValue(
+                            part_id,
+                            dtype=part_dtype,
+                            accounting={
+                                "program_abi_record": schema_identity,
+                                "program_abi_parameter": str(parameter_name),
+                                "program_abi_field": (
+                                    f"{nested_path}.{part_name}"
+                                ),
+                                "program_abi_storage": part_storage,
+                                "program_abi_rank": part_rank,
+                                "program_abi_mutable": bool(
+                                    nested_field.get("mutable", False)
+                                ),
+                                "program_abi_field_written": False,
+                                "program_abi_keyed_owner": nested_path,
+                                "program_abi_keyed_part": part_name,
+                                "program_abi_key_encoding": key_encoding,
+                                "program_abi_value_record": value_record,
+                            },
+                        )
+                        function.args.append(part_value)
+                        values[part_id] = part_value
+                        nested_fields.append(SSARecordFieldDescriptor(
+                            f"{nested_name}.{part_name}",
+                            SSARecordFieldStorage.SCALAR
+                            if part_storage == "scalar"
+                            else SSARecordFieldStorage.SPAN,
+                            storage_identity=(
+                                f"{schema_identity}.{nested_name}."
+                                f"{part_name}"
+                            ),
+                            value_ids=(part_id,),
+                            dtype=part_dtype,
+                            writable=bool(nested_field.get("mutable", False)),
+                        ))
+                    if value_identity == "key":
+                        part_ids["values"] = part_ids["keys"]
+                    for value_id in candidates:
+                        mapping = values.get(int(value_id))
+                        if mapping is None:
+                            mapping = SSAValue(int(value_id))
+                            function.args.append(mapping)
+                            values[int(value_id)] = mapping
+                        mapping.accounting = {
+                            **dict(mapping.accounting or {}),
+                            "program_abi_record": schema_identity,
+                            "program_abi_parameter": str(parameter_name),
+                            "program_abi_field": nested_path,
+                            "program_abi_storage": "keyed",
+                            "program_abi_keyed_length": part_ids["length"],
+                            "program_abi_keyed_keys": part_ids["keys"],
+                            "program_abi_keyed_values": part_ids["values"],
+                            "program_abi_key_encoding": key_encoding,
+                            "program_abi_value_record": value_record,
+                            "program_abi_value_identity": value_identity,
+                        }
+                    if value_record is not None:
+                        for row_id in indexed_value_candidates(set(candidates)):
+                            materialize_nested_record(
+                                str(value_record), {int(row_id)}, int(row_id),
+                                parameter_name, f"{nested_path}[]",
+                                (*active, schema_name),
+                                int(row_id),
+                            )
+                    continue
+                nested_dtype = nested_field.get("dtype")
+                nested_rank = int(nested_field.get("rank", 0))
+                mutable = bool(nested_field.get("mutable", False))
+                token_vocabulary = tuple(map(
+                    str, nested_field.get("token_vocabulary") or (),
+                ))
+                physical_ids = []
+                if nested_storage == "table" and row_handle_id is not None:
+                    columns = tuple(
+                        dict(column)
+                        for column in nested_field.get("columns") or ()
+                    )
+                    reachable = set(map(int, candidates))
+                    changed = True
+                    while changed:
+                        changed = False
+                        for candidate_node, candidate_data in graph.nodes(
+                            data=True
+                        ):
+                            operation = str(
+                                candidate_data.get("type")
+                                or candidate_data.get("op") or ""
+                            ).casefold()
+                            if operation not in {"boolop", "phi"}:
+                                continue
+                            if not any(
+                                int(graph.nodes[parent].get(
+                                    "value_id", parent
+                                )) in reachable
+                                for parent, _role in (
+                                    candidate_data.get("parents") or ()
+                                )
+                                if parent in graph
+                            ):
+                                continue
+                            value_id = int(candidate_data.get(
+                                "value_id", candidate_node
+                            ))
+                            if value_id not in reachable:
+                                reachable.add(value_id)
+                                changed = True
+                    projected = {
+                        int((value.accounting or {})[
+                            "projected_row_source_id"
+                        ]): []
+                        for value in function.args
+                        if (value.accounting or {}).get(
+                            "projected_row_source_id"
+                        ) is not None
+                    }
+                    for value in function.args:
+                        accounting = value.accounting or {}
+                        source_id = accounting.get("projected_row_source_id")
+                        if source_id is None:
+                            continue
+                        projected.setdefault(int(source_id), []).append((
+                            int(accounting.get("projected_row_column") or 0),
+                            value,
+                        ))
+                    sequence_id = next((
+                        source_id for source_id in projected
+                        if source_id in reachable
+                    ), None)
+                    if sequence_id is not None and columns:
+                        column_arenas = []
+                        for column in columns:
+                            arena = SSAValue(
+                                next_physical_id,
+                                dtype=str(column["dtype"]),
+                                accounting={
+                                    "program_abi_record": schema_identity,
+                                    "program_abi_parameter": str(
+                                        parameter_name
+                                    ),
+                                    "program_abi_field": (
+                                        f"{nested_path}.columns."
+                                        f"{column['name']}"
+                                    ),
+                                    "program_abi_storage": "span",
+                                    "program_abi_rank": 1,
+                                    "program_abi_mutable": mutable,
+                                    "program_abi_field_written": False,
+                                    "program_abi_row_identity": (
+                                        "deterministic_graph_node_id"
+                                    ),
+                                    "program_abi_token_vocabulary": tuple(
+                                        map(str, column.get(
+                                            "token_vocabulary"
+                                        ) or ())
+                                    ),
+                                },
+                            )
+                            next_physical_id += 1
+                            function.args.append(arena)
+                            values[int(arena.id)] = arena
+                            column_arenas.append(arena)
+                        lengths = SSAValue(
+                            next_physical_id, dtype="int64",
+                            accounting={
+                                "program_abi_record": schema_identity,
+                                "program_abi_parameter": str(parameter_name),
+                                "program_abi_field": f"{nested_path}.lengths",
+                                "program_abi_storage": "span",
+                                "program_abi_rank": 1,
+                                "program_abi_mutable": mutable,
+                                "program_abi_field_written": False,
+                                "program_abi_row_identity": (
+                                    "deterministic_graph_node_id"
+                                ),
+                            },
+                        )
+                        next_physical_id += 1
+                        stride = SSAValue(
+                            next_physical_id, dtype="int64",
+                            accounting={
+                                "program_abi_record": schema_identity,
+                                "program_abi_parameter": str(parameter_name),
+                                "program_abi_field": (
+                                    f"{nested_path}.row_stride"
+                                ),
+                                "program_abi_storage": "scalar",
+                                "program_abi_rank": 0,
+                                "program_abi_mutable": False,
+                                "program_abi_field_written": False,
+                            },
+                        )
+                        next_physical_id += 1
+                        function.args.extend((lengths, stride))
+                        values[int(lengths.id)] = lengths
+                        values[int(stride.id)] = stride
+                        row_handle = values[int(row_handle_id)]
+                        row_offset = SSAValue(next_physical_id, dtype="int64")
+                        next_physical_id += 1
+                        setup = [Instr(
+                            "Mul", [row_handle, stride], row_offset,
+                            attributes={
+                                "binding": "program_abi_child_table_row",
+                                "program_abi_field": nested_path,
+                            },
+                        )]
+                        pointers = []
+                        for column, arena in zip(columns, column_arenas):
+                            pointer = SSAValue(
+                                next_physical_id, dtype=str(column["dtype"])
+                            )
+                            next_physical_id += 1
+                            setup.append(Instr(
+                                "GetElementPtr", [arena, row_offset], pointer,
+                                attributes={
+                                    "binding": (
+                                        "program_abi_child_table_column"
+                                    ),
+                                    "program_abi_field": nested_path,
+                                    "program_abi_column": str(column["name"]),
+                                },
+                            ))
+                            pointers.append(pointer)
+                        length_pointer = SSAValue(
+                            next_physical_id, dtype="int64"
+                        )
+                        next_physical_id += 1
+                        length = SSAValue(next_physical_id, dtype="int64")
+                        next_physical_id += 1
+                        setup.extend((
+                            Instr(
+                                "GetElementPtr", [lengths, row_handle],
+                                length_pointer,
+                                attributes={
+                                    "binding": (
+                                        "program_abi_child_table_length"
+                                    ),
+                                    "program_abi_field": nested_path,
+                                },
+                            ),
+                            Instr(
+                                "Load", [length_pointer], length,
+                                attributes={
+                                    "binding": (
+                                        "program_abi_child_table_extent"
+                                    ),
+                                    "program_abi_field": nested_path,
+                                },
+                            ),
+                        ))
+                        inserted = False
+                        for block in function.blocks.values():
+                            for index, instruction in enumerate(
+                                tuple(block.instrs)
+                            ):
+                                if (
+                                    instruction.res is not None
+                                    and int(instruction.res.id)
+                                    == int(row_handle_id)
+                                ):
+                                    block.instrs[index + 1:index + 1] = setup
+                                    inserted = True
+                                    break
+                            if inserted:
+                                break
+                        if inserted:
+                            aliases = set(reachable)
+                            projected_ids = {
+                                int(value.id)
+                                for _column, value in projected[sequence_id]
+                            }
+                            extent_results: dict[int, SSAValue] = {}
+                            for block in function.blocks.values():
+                                for instruction in block.instrs:
+                                    if (
+                                        instruction.attributes.get("binding")
+                                        == "iterable_extent"
+                                        and instruction.args
+                                        and int(instruction.args[0].id)
+                                        == int(sequence_id)
+                                        and instruction.res is not None
+                                    ):
+                                        extent_results[int(
+                                            instruction.res.id
+                                        )] = length
+                            for block in function.blocks.values():
+                                kept = []
+                                for instruction in block.instrs:
+                                    if (
+                                        instruction.attributes.get("binding")
+                                        == "iterable_extent"
+                                        and instruction.res is not None
+                                        and int(instruction.res.id)
+                                        in extent_results
+                                    ):
+                                        continue
+                                    refreshed = []
+                                    for argument in instruction.args:
+                                        argument_id = int(argument.id)
+                                        replacement = extent_results.get(
+                                            argument_id
+                                        )
+                                        if replacement is None and (
+                                            argument_id in aliases
+                                        ):
+                                            replacement = pointers[0]
+                                        if replacement is None:
+                                            projected_column = next((
+                                                column
+                                                for column, value in projected[
+                                                    sequence_id
+                                                ]
+                                                if int(value.id) == argument_id
+                                            ), None)
+                                            if projected_column is not None:
+                                                replacement = pointers[
+                                                    projected_column
+                                                ]
+                                        refreshed.append(
+                                            replacement or argument
+                                        )
+                                    instruction.args = refreshed
+                                    kept.append(instruction)
+                                block.instrs = kept
+                            dropped = aliases | projected_ids | set(
+                                extent_results
+                            )
+                            function.args = [
+                                argument for argument in function.args
+                                if int(argument.id) not in dropped
+                            ]
+                            sequence_table = all_sequence_tables.setdefault(
+                                symbol, SSASequenceTable()
+                            )
+                            sequence_table.register(SSASequenceDescriptor(
+                                int(sequence_id),
+                                tuple(int(pointer.id) for pointer in pointers),
+                                int(length_pointer.id), int(stride.id),
+                                column_dtypes=tuple(
+                                    str(column["dtype"])
+                                    for column in columns
+                                ),
+                                key_columns=(), writable=mutable,
+                            ))
+                            nested_fields.append(SSARecordFieldDescriptor(
+                                str(nested_name),
+                                SSARecordFieldStorage.SEQUENCE,
+                                storage_identity=(
+                                    f"{schema_identity}.{nested_name}"
+                                ),
+                                sequence_id=int(sequence_id),
+                                dtype="row",
+                                writable=mutable,
+                            ))
+                            continue
+                    # A declared table that cannot yet be correlated to the
+                    # authored iterable stays an explicit reference frontier;
+                    # it must never disappear merely because its schema was
+                    # recognized.
+                    nested_storage = "reference"
+                    nested_dtype = None
+                    nested_rank = 0
+                if nested_storage == "scalar" and row_handle_id is not None:
+                    # A field of a keyed value-record is a column selected by
+                    # the row handle returned from the keyed lookup.  The row
+                    # handle is the existing deterministic node identity; no
+                    # frame-local slot or renumbering is introduced here.
+                    candidate_ids = tuple(map(int, candidates))
+                    producers = {
+                        int(instruction.res.id)
+                        for block in function.blocks.values()
+                        for instruction in block.instrs
+                        if instruction.res is not None
+                    }
+                    if not any(
+                        candidate_id in producers
+                        for candidate_id in candidate_ids
+                    ):
+                        column_key = (schema_identity, str(nested_name))
+                        column = pooled_scalar_columns.get(column_key)
+                        if column is None:
+                            column = SSAValue(
+                                next_physical_id,
+                                dtype=(
+                                    None if nested_dtype is None
+                                    else str(nested_dtype)
+                                ),
+                                accounting={
+                                    "program_abi_record": schema_identity,
+                                    "program_abi_parameter": str(
+                                        parameter_name
+                                    ),
+                                    "program_abi_field": (
+                                        f"{nested_path}.column"
+                                    ),
+                                    "program_abi_storage": "span",
+                                    "program_abi_rank": 1,
+                                    "program_abi_mutable": mutable,
+                                    "program_abi_field_written": False,
+                                    "program_abi_row_identity": (
+                                        "deterministic_graph_node_id"
+                                    ),
+                                    "program_abi_token_vocabulary": (
+                                        token_vocabulary
+                                    ),
+                                },
+                            )
+                            next_physical_id += 1
+                            pooled_scalar_columns[column_key] = column
+                            function.args.append(column)
+                            values[int(column.id)] = column
+                        row_handle = values.get(int(row_handle_id))
+                        if row_handle is not None:
+                            result_id = candidate_ids[0]
+                            pointer = SSAValue(
+                                next_physical_id,
+                                dtype=(
+                                    None if nested_dtype is None
+                                    else str(nested_dtype)
+                                ),
+                                accounting={
+                                    "program_abi_record_column_pointer": True,
+                                },
+                            )
+                            next_physical_id += 1
+                            result = SSAValue(
+                                result_id,
+                                dtype=(
+                                    None if nested_dtype is None
+                                    else str(nested_dtype)
+                                ),
+                                accounting={
+                                    "program_abi_record": schema_identity,
+                                    "program_abi_parameter": str(
+                                        parameter_name
+                                    ),
+                                    "program_abi_field": nested_path,
+                                    "program_abi_storage": "scalar",
+                                    "program_abi_rank": 0,
+                                    "program_abi_mutable": mutable,
+                                    "program_abi_field_written": False,
+                                    "program_abi_row_handle": int(
+                                        row_handle_id
+                                    ),
+                                    "program_abi_token_vocabulary": (
+                                        token_vocabulary
+                                    ),
+                                },
+                            )
+                            setup = [
+                                Instr(
+                                    "GetElementPtr", [column, row_handle],
+                                    pointer,
+                                    attributes={
+                                        "binding": (
+                                            "program_abi_record_column"
+                                        ),
+                                        "program_abi_field": nested_path,
+                                    },
+                                ),
+                                Instr(
+                                    "Load", [pointer], result,
+                                    attributes={
+                                        "binding": (
+                                            "program_abi_record_field"
+                                        ),
+                                        "program_abi_field": nested_path,
+                                    },
+                                ),
+                            ]
+                            predicate_ids: set[int] = set()
+                            if token_vocabulary:
+                                aliases = set(candidate_ids)
+                                for test_node_id, test_data in graph.nodes(
+                                    data=True
+                                ):
+                                    expression = test_data.get("expr_obj")
+                                    accepted = accepted_isinstance_tokens(
+                                        expression
+                                    )
+                                    if not accepted or not any(
+                                        int(graph.nodes[parent].get(
+                                            "value_id", parent
+                                        )) in aliases
+                                        and str(role).startswith("arg:0")
+                                        for parent, role in (
+                                            test_data.get("parents") or ()
+                                        )
+                                        if parent in graph
+                                    ):
+                                        continue
+                                    if not all(
+                                        token in token_vocabulary
+                                        for token in accepted
+                                    ):
+                                        continue
+                                    predicate_id = int(test_data.get(
+                                        "value_id", test_node_id
+                                    ))
+                                    if predicate_id in producers:
+                                        continue
+                                    comparisons = []
+                                    for token in accepted:
+                                        encoded = (
+                                            token_vocabulary.index(token) + 1
+                                        )
+                                        constant = SSAValue(
+                                            next_physical_id, dtype="int64"
+                                        )
+                                        next_physical_id += 1
+                                        compared = SSAValue(
+                                            next_physical_id, dtype="bool"
+                                        )
+                                        next_physical_id += 1
+                                        setup.extend((
+                                            Instr(
+                                                "Const", [], constant,
+                                                attributes={
+                                                    "value": encoded,
+                                                    "program_abi_vocabulary_token": token,
+                                                },
+                                            ),
+                                            Instr(
+                                                "Eq", [result, constant],
+                                                compared,
+                                                attributes={
+                                                    "program_abi_vocabulary_type_test": True,
+                                                    "program_abi_field": nested_path,
+                                                },
+                                            ),
+                                        ))
+                                        comparisons.append(compared)
+                                    combined = comparisons[0]
+                                    for position, compared in enumerate(
+                                        comparisons[1:], start=1
+                                    ):
+                                        merged = SSAValue(
+                                            predicate_id
+                                            if position == len(comparisons) - 1
+                                            else next_physical_id,
+                                            dtype="bool",
+                                        )
+                                        if int(merged.id) == next_physical_id:
+                                            next_physical_id += 1
+                                        setup.append(Instr(
+                                            "Or", [combined, compared], merged,
+                                            attributes={
+                                                "program_abi_vocabulary_type_test": True,
+                                                "program_abi_field": nested_path,
+                                            },
+                                        ))
+                                        combined = merged
+                                    if len(comparisons) == 1:
+                                        # Preserve the authored predicate ID
+                                        # while keeping the comparison result
+                                        # itself an ordinary SSA boolean.
+                                        final = SSAValue(
+                                            predicate_id, dtype="bool"
+                                        )
+                                        setup.append(Instr(
+                                            "Copy", [combined], final,
+                                            attributes={
+                                                "program_abi_vocabulary_type_test": True,
+                                                "program_abi_field": nested_path,
+                                            },
+                                        ))
+                                        combined = final
+                                    predicate_ids.add(predicate_id)
+                                    values[predicate_id] = combined
+                            inserted = False
+                            for block in function.blocks.values():
+                                for index, instruction in enumerate(
+                                    tuple(block.instrs)
+                                ):
+                                    if (
+                                        instruction.res is not None
+                                        and int(instruction.res.id)
+                                        == int(row_handle_id)
+                                    ):
+                                        block.instrs[index + 1:index + 1] = setup
+                                        inserted = True
+                                        break
+                                if inserted:
+                                    break
+                            if not inserted:
+                                entry = function.blocks.get("entry")
+                                if entry is not None:
+                                    entry.instrs[0:0] = setup
+                                    inserted = True
+                            if inserted:
+                                aliases = set(candidate_ids)
+                                for block in function.blocks.values():
+                                    for instruction in block.instrs:
+                                        if instruction in setup:
+                                            continue
+                                        instruction.args = [
+                                            result
+                                            if int(argument.id) in aliases
+                                            else argument
+                                            for argument in instruction.args
+                                        ]
+                                function.args = [
+                                    argument for argument in function.args
+                                    if int(argument.id) not in (
+                                        aliases | predicate_ids
+                                    )
+                                ]
+                                for candidate_id in candidate_ids:
+                                    values.pop(candidate_id, None)
+                                values[result_id] = result
+                                physical_ids.append(result_id)
+                for value_id in candidates:
+                    if physical_ids:
+                        break
+                    value = values.get(int(value_id))
+                    if value is None:
+                        value = SSAValue(
+                            int(value_id),
+                            dtype=(
+                                None if nested_dtype is None
+                                else str(nested_dtype)
+                            ),
+                        )
+                        function.args.append(value)
+                        values[int(value_id)] = value
+                    elif (
+                        value.dtype in {None, "unknown"}
+                        and nested_dtype is not None
+                    ):
+                        value.dtype = str(nested_dtype)
+                    value.accounting = {
+                        **dict(value.accounting or {}),
+                        "program_abi_record": schema_identity,
+                        "program_abi_parameter": str(parameter_name),
+                        "program_abi_field": nested_path,
+                        "program_abi_storage": nested_storage,
+                        "program_abi_rank": nested_rank,
+                        "program_abi_mutable": mutable,
+                        "program_abi_field_written": False,
+                        "program_abi_token_vocabulary": token_vocabulary,
+                    }
+                    physical_ids.append(int(value_id))
+                descriptor_storage = {
+                    "scalar": SSARecordFieldStorage.SCALAR,
+                    "span": SSARecordFieldStorage.SPAN,
+                    "reference": SSARecordFieldStorage.REFERENCE,
+                }.get(nested_storage)
+                if descriptor_storage is None:
+                    continue
+                nested_fields.append(SSARecordFieldDescriptor(
+                    str(nested_name),
+                    descriptor_storage,
+                    storage_identity=f"{schema_identity}.{nested_name}",
+                    value_ids=tuple(physical_ids),
+                    dtype=(
+                        None if nested_dtype is None else str(nested_dtype)
+                    ),
+                    writable=mutable,
+                ))
+            if nested_fields and descriptor_id not in table.records:
+                table.register(SSARecordDescriptor(
+                    int(descriptor_id), schema_identity, tuple(nested_fields),
+                ))
+
         for parameter_name, record in declared_records.items():
             demanded_fields = record_field_demands.get(
                 (str(symbol), str(parameter_name)), set()
@@ -4611,10 +10504,19 @@ def _class_surface_ssa_program(
                     # identically. The mapping's own value keeps its identity
                     # and names the three slots, so the consumers that still
                     # read it can be resolved against them.
+                    key_encoding = str(
+                        field.get("key_encoding") or "string_token"
+                    )
+                    value_record = field.get("value_record")
+                    value_identity = field.get("value_identity")
                     parts = {
                         "length": ("scalar", "int64", 0),
                         "keys": ("span", "int64", 1),
-                        "values": ("span", str(field.get("dtype") or "float64"), 1),
+                        **({} if value_identity == "key" else {
+                            "values": (
+                                "span", str(field.get("dtype") or "float64"), 1,
+                            ),
+                        }),
                     }
                     part_ids: dict[str, int] = {}
                     for part_name, (
@@ -4636,6 +10538,8 @@ def _class_surface_ssa_program(
                                 "program_abi_field_written": False,
                                 "program_abi_keyed_owner": str(field_name),
                                 "program_abi_keyed_part": part_name,
+                                "program_abi_key_encoding": key_encoding,
+                                "program_abi_value_record": value_record,
                             },
                         )
                         function.args.append(part_value)
@@ -4652,6 +10556,8 @@ def _class_surface_ssa_program(
                             dtype=part_dtype,
                             writable=bool(mutable),
                         ))
+                    if value_identity == "key":
+                        part_ids["values"] = part_ids["keys"]
                     for value_id in candidate_ids:
                         mapping = values.get(int(value_id))
                         if mapping is None:
@@ -4671,11 +10577,45 @@ def _class_surface_ssa_program(
                             "program_abi_keyed_length": part_ids["length"],
                             "program_abi_keyed_keys": part_ids["keys"],
                             "program_abi_keyed_values": part_ids["values"],
+                            "program_abi_key_encoding": key_encoding,
+                            "program_abi_value_record": value_record,
+                            "program_abi_value_identity": value_identity,
                         }
+                    if value_record is not None:
+                        for row_id in indexed_value_candidates(set(candidate_ids)):
+                            materialize_nested_record(
+                                str(value_record), {int(row_id)}, int(row_id),
+                                str(parameter_name), f"{field_name}[]",
+                                row_handle_id=int(row_id),
+                            )
+                    continue
+                if storage == "record":
+                    nested_schema = str(field.get("record") or "")
+                    nested_record_id = min(candidate_ids)
+                    materialize_nested_record(
+                        nested_schema,
+                        set(map(int, candidate_ids)),
+                        nested_record_id,
+                        str(parameter_name),
+                        str(field_name),
+                    )
+                    nested_receipt = dict(abi_records[nested_schema])
+                    fields.append(SSARecordFieldDescriptor(
+                        str(field_name),
+                        SSARecordFieldStorage.RECORD,
+                        storage_identity=f"{record['identity']}.{field_name}",
+                        value_ids=(),
+                        record_id=nested_record_id,
+                        dtype=str(
+                            nested_receipt.get("identity") or nested_schema
+                        ),
+                        writable=False,
+                    ))
                     continue
                 field_written = str(field_name) in written_fields
                 dtype = field.get("dtype")
                 rank = int(field.get("rank", 0))
+                fixed_length = field.get("fixed_length")
                 physical_ids = []
                 for value_id in candidate_ids:
                     value = values.get(value_id)
@@ -4683,6 +10623,10 @@ def _class_surface_ssa_program(
                         value = SSAValue(
                             value_id,
                             dtype=None if dtype is None else str(dtype),
+                            shape=(
+                                (int(fixed_length),)
+                                if fixed_length is not None else ()
+                            ),
                             accounting={
                                 "program_abi_record": str(record["identity"]),
                                 "program_abi_parameter": str(parameter_name),
@@ -4691,13 +10635,18 @@ def _class_surface_ssa_program(
                                 "program_abi_rank": rank,
                                 "program_abi_mutable": mutable,
                                 "program_abi_field_written": field_written,
+                                "program_abi_fixed_length": fixed_length,
                             },
                         )
                         function.args.append(value)
                         values[value_id] = value
                     else:
-                        if value.dtype in {None, "unknown"} and dtype is not None:
+                        if dtype is not None:
+                            # The explicit program ABI is authoritative over
+                            # the graph domain's numerical default.
                             value.dtype = str(dtype)
+                        if fixed_length is not None:
+                            value.shape = (int(fixed_length),)
                         value.accounting = {
                             **dict(value.accounting or {}),
                             "program_abi_record": str(record["identity"]),
@@ -4707,18 +10656,14 @@ def _class_surface_ssa_program(
                             "program_abi_rank": rank,
                             "program_abi_mutable": mutable,
                             "program_abi_field_written": field_written,
+                            "program_abi_fixed_length": fixed_length,
                         }
                     physical_ids.append(value_id)
                 descriptor_storage = {
                     "scalar": SSARecordFieldStorage.SCALAR,
                     "span": SSARecordFieldStorage.SPAN,
-                    "record": SSARecordFieldStorage.RECORD,
                     "reference": SSARecordFieldStorage.REFERENCE,
                 }[storage]
-                if descriptor_storage is SSARecordFieldStorage.RECORD:
-                    # Nested-record correlation needs its own exact descriptor
-                    # id; do not manufacture one from an attribute occurrence.
-                    continue
                 fields.append(SSARecordFieldDescriptor(
                     str(field_name),
                     descriptor_storage,
@@ -4805,8 +10750,35 @@ def _class_surface_ssa_program(
                             "Const", [], value, attributes={"value": default},
                         ))
                         values[value_id] = value
-                if value_id is not None and int(value_id) not in values:
-                    source = graph.nodes.get(int(value_id), {})
+                source = (
+                    {} if value_id is None
+                    else graph.nodes.get(int(value_id), {})
+                )
+                source_attributes = dict(source.get("attributes") or {})
+                physical_value_ids = (
+                    () if value_id is None else (int(value_id),)
+                )
+                if (
+                    value_id is not None
+                    and str(field.get("storage")) == "span"
+                    and field.get("fixed_length") is not None
+                    and source_attributes.get("aggregate_kind") == "tuple"
+                ):
+                    leaves = tuple(map(
+                        int,
+                        source_attributes.get("aggregate_leaf_value_ids") or (),
+                    ))
+                    if len(leaves) == int(field["fixed_length"]):
+                        # A fixed tuple is already an ordered vector of authored
+                        # scalar identities. Keep those identities as the
+                        # field's physical slots; there is no container object,
+                        # allocation, or transient aggregate id in repository
+                        # SSA.
+                        physical_value_ids = leaves
+                for physical_value_id in physical_value_ids:
+                    if int(physical_value_id) in values:
+                        continue
+                    source = graph.nodes.get(int(physical_value_id), {})
                     source_attributes = dict(source.get("attributes") or {})
                     if str(
                         source.get("type") or source.get("op") or ""
@@ -4817,7 +10789,7 @@ def _class_surface_ssa_program(
                             "value", source.get("constant")
                         )
                         value = SSAValue(
-                            int(value_id), dtype=field.get("dtype"),
+                            int(physical_value_id), dtype=field.get("dtype"),
                             accounting={
                                 "program_abi_constructor_literal": str(
                                     field_name
@@ -4828,14 +10800,17 @@ def _class_surface_ssa_program(
                         constants.append(Instr(
                             "Const", [], value, attributes={"value": literal},
                         ))
-                        values[int(value_id)] = value
-                if value_id is None or int(value_id) not in values:
+                        values[int(physical_value_id)] = value
+                if not physical_value_ids or any(
+                    int(physical_value_id) not in values
+                    for physical_value_id in physical_value_ids
+                ):
                     continue
-                value_id = int(value_id)
-                value = values[value_id]
                 dtype = field.get("dtype")
-                if value.dtype in {None, "unknown"} and dtype is not None:
-                    value.dtype = str(dtype)
+                for physical_value_id in physical_value_ids:
+                    value = values[int(physical_value_id)]
+                    if value.dtype in {None, "unknown"} and dtype is not None:
+                        value.dtype = str(dtype)
                 if str(field["storage"]) == "keyed":
                     # The constructor argument here is a mapping literal, which
                     # is three physical slots (length, key tokens, values), not
@@ -4855,11 +10830,11 @@ def _class_surface_ssa_program(
                 fields.append(SSARecordFieldDescriptor(
                     str(field_name), storage,
                     storage_identity=f"{record['identity']}.{field_name}",
-                    value_ids=(value_id,),
+                    value_ids=tuple(map(int, physical_value_ids)),
                     dtype=None if dtype is None else str(dtype),
                     writable=bool(field.get("mutable", False)),
                 ))
-                physical_layout.append(value_id)
+                physical_layout.extend(map(int, physical_value_ids))
             if fields:
                 table.register(SSARecordDescriptor(
                     record_id, str(record["identity"]), tuple(fields),
@@ -4876,6 +10851,123 @@ def _class_surface_ssa_program(
             function.metadata["record_return_layouts"] = tuple(layouts)
         if not table.records:
             all_record_tables.pop(symbol, None)
+
+    def materialize_record_phis(symbol: str) -> None:
+        """Lower a control merge of like records to phis of physical fields.
+
+        A record id is compile-time correlation, not a runtime object handle.
+        Therefore an SSA Phi cannot select the conceptual record ids. It must
+        select each corresponding physical field slot under the same incoming
+        predecessor labels and publish a new record correlation for the merge
+        result.
+        """
+
+        function = all_functions.get(symbol)
+        table = all_record_tables.get(symbol)
+        if function is None or table is None:
+            return
+        values = function_values(function)
+        next_value_id = 1 + max(values, default=0)
+        layouts = dict(function.metadata.get("record_return_layouts", ()))
+        changed = True
+        while changed:
+            changed = False
+            for block in function.blocks.values():
+                rebuilt = []
+                for instruction in block.instrs:
+                    if instruction.op != "Phi" or instruction.res is None:
+                        rebuilt.append(instruction)
+                        continue
+                    result_id = int(instruction.res.id)
+                    if result_id in table.records or not instruction.args:
+                        rebuilt.append(instruction)
+                        continue
+                    incoming = tuple(
+                        table.records.get(int(argument.id))
+                        for argument in instruction.args
+                    )
+                    if any(record is None for record in incoming):
+                        rebuilt.append(instruction)
+                        continue
+                    first = incoming[0]
+                    signatures = tuple(
+                        (
+                            field.name, field.storage, field.storage_identity,
+                            len(field.value_ids), field.dtype,
+                        )
+                        for field in first.fields
+                    )
+                    if any(
+                        record.identity != first.identity
+                        or tuple(
+                            (
+                                field.name, field.storage,
+                                field.storage_identity,
+                                len(field.value_ids), field.dtype,
+                            )
+                            for field in record.fields
+                        ) != signatures
+                        for record in incoming[1:]
+                    ):
+                        rebuilt.append(instruction)
+                        continue
+                    if any(
+                        int(value_id) not in values
+                        for record in incoming
+                        for field in record.fields
+                        for value_id in field.value_ids
+                    ):
+                        rebuilt.append(instruction)
+                        continue
+                    merged_fields = []
+                    merged_layout = []
+                    for field_index, source_field in enumerate(first.fields):
+                        merged_ids = []
+                        for slot_index in range(len(source_field.value_ids)):
+                            arguments = [
+                                values[int(record.fields[field_index].value_ids[
+                                    slot_index
+                                ])]
+                                for record in incoming
+                            ]
+                            result = SSAValue(
+                                next_value_id,
+                                dtype=source_field.dtype or arguments[0].dtype,
+                                shape=arguments[0].shape,
+                                accounting={
+                                    "record_phi": result_id,
+                                    "record_field": source_field.name,
+                                    "record_field_slot": slot_index,
+                                },
+                            )
+                            next_value_id += 1
+                            attributes = dict(instruction.attributes or {})
+                            attributes.update({
+                                "record_phi": result_id,
+                                "record_field": source_field.name,
+                                "record_field_slot": slot_index,
+                                "initial_value_id": int(arguments[0].id),
+                            })
+                            rebuilt.append(Instr(
+                                "Phi", arguments, result,
+                                arg_roles=list(instruction.arg_roles),
+                                attributes=attributes,
+                                source_span=instruction.source_span,
+                            ))
+                            values[int(result.id)] = result
+                            merged_ids.append(int(result.id))
+                            merged_layout.append(int(result.id))
+                        merged_fields.append(replace(
+                            source_field, value_ids=tuple(merged_ids)
+                        ))
+                    table.register(SSARecordDescriptor(
+                        result_id, first.identity, tuple(merged_fields),
+                    ))
+                    layouts[result_id] = tuple(merged_layout)
+                    changed = True
+                block.instrs = rebuilt
+        if layouts:
+            function.metadata["record_return_layouts"] = tuple(layouts.items())
 
     def resolve_keyed_mapping_iterables(symbol: str, graph: Any) -> None:
         """Bind ``d.items()``/``.keys()``/``.values()`` to the mapping's slots.
@@ -4981,8 +11073,15 @@ def _class_surface_ssa_program(
         # mapping is always exactly full, so capacity IS the length; the
         # status cell stays an ordinary frame-allocated scalar.
         parts_by_owner: dict[str, dict[str, int]] = {}
+        owner_by_mapping: dict[int, str] = {}
         for value in function.args:
             accounting = value.accounting or {}
+            if accounting.get("program_abi_storage") == "keyed" and (
+                accounting.get("program_abi_field") is not None
+            ):
+                owner_by_mapping[int(value.id)] = str(
+                    accounting["program_abi_field"]
+                )
             owner = accounting.get("program_abi_keyed_owner")
             part = accounting.get("program_abi_keyed_part")
             if owner is None or part is None:
@@ -5014,7 +11113,13 @@ def _class_surface_ssa_program(
                 sequence_id = int(
                     instruction.attributes.get("sequence_id", -1)
                 )
-                owner = field_of_sequence.get(sequence_id)
+                # The mapping value's deterministic SSA identity is the
+                # authoritative correlation.  Attribute spelling alone loses
+                # the containing record path (``nodes`` versus ``G.nodes``)
+                # and can bind a same-spelled field from another record.
+                owner = owner_by_mapping.get(
+                    sequence_id, field_of_sequence.get(sequence_id)
+                )
                 if owner is None:
                     continue
                 # The slots this lookup must walk may not exist in this frame
@@ -5058,6 +11163,41 @@ def _class_surface_ssa_program(
 
     for source_symbol, source_graph in source_graphs_by_symbol.items():
         materialize_program_abi_record_literals(source_symbol, source_graph)
+
+    for source_symbol in source_graphs_by_symbol:
+        materialize_record_phis(source_symbol)
+
+    # Literals are source-independent SSA producers. Record materialization
+    # can introduce them after control lowering (notably tuple field leaves
+    # used as Phi inputs); leaving those Const instructions beside the final
+    # Ret makes earlier branch uses read uninitialized storage. Hoist every
+    # function-local literal to its entry block, where it dominates every CFG
+    # path. This changes placement only, never identity or value.
+    for function in all_functions.values():
+        if not function.blocks:
+            continue
+        constants = []
+        seen_constant_ids = set()
+        for block in function.blocks.values():
+            retained = []
+            for instruction in block.instrs:
+                if (
+                    str(instruction.op).casefold() in {"const", "constant"}
+                    and instruction.res is not None
+                ):
+                    value_id = int(instruction.res.id)
+                    if value_id in seen_constant_ids:
+                        raise ValueError(
+                            "one SSA constant identity is produced more than "
+                            f"once in {function.name!r}: value={value_id}"
+                        )
+                    seen_constant_ids.add(value_id)
+                    constants.append(instruction)
+                else:
+                    retained.append(instruction)
+            block.instrs[:] = retained
+        entry = next(iter(function.blocks.values()))
+        entry.instrs[0:0] = constants
 
     for source_symbol, source_graph in source_graphs_by_symbol.items():
         recover_structural_source_outputs(source_symbol, source_graph)
@@ -6115,39 +12255,38 @@ def _class_surface_ssa_program(
         child_graph = getattr(
             getattr(child_shell, "process_graph", None), "G", None
         )
-        caller_aliases: dict[int, int] = {}
-        for history in (caller_graph.graph.get("identity_table") or {}).values():
-            canonical = next((
-                int(value_id) for value_id in reversed(history)
-                if any(
-                    int(value.id) == int(value_id)
-                    for value in all_functions[caller_symbol].args
-                )
-                or any(
-                    instruction.res is not None
-                    and int(instruction.res.id) == int(value_id)
-                    for block in all_functions[caller_symbol].blocks.values()
-                    for instruction in block.instrs
-                )
-            ), None)
-            if canonical is not None:
-                for value_id in history:
-                    caller_aliases[int(value_id)] = int(canonical)
+        structural_caller_aliases: dict[int, int] = {}
+        if planned_call.enclosing_loop_ids:
+            carried_by_source: dict[int, list[int]] = {}
+            for carried in (
+                all_functions[caller_symbol].metadata.get(
+                    "carried_port_values", {}
+                ) or {}
+            ).values():
+                accounting = dict(getattr(carried, "accounting", None) or {})
+                source_id = accounting.get("source_value_id")
+                if source_id is not None:
+                    carried_by_source.setdefault(int(source_id), []).append(
+                        int(carried.id)
+                    )
+            structural_caller_aliases = {
+                source_id: candidates[0]
+                for source_id, candidates in carried_by_source.items()
+                if len(set(candidates)) == 1
+            }
         exact_bindings = {
-            int(callee): caller_aliases.get(int(caller), int(caller))
+            int(callee): structural_caller_aliases.get(
+                int(caller), int(caller)
+            )
             for caller, callee in planned_call.argument_bindings
         }
+        # An identity-table history is a sequence of distinct SSA versions of
+        # one authored spelling, not an alias class. Planned call bindings
+        # already carry the exact deterministic value ids at the callsite;
+        # mapping every earlier version to whichever later result happens to
+        # be materialized changes program order (for example ``a = f(a)``
+        # becomes ``a = f(a_after)``). Never infer frame aliases by spelling.
         identity_aliases: dict[int, int] = {}
-        if child_graph is not None:
-            for history in (child_graph.graph.get("identity_table") or {}).values():
-                bound = next((
-                    exact_bindings[int(value_id)]
-                    for value_id in history
-                    if int(value_id) in exact_bindings
-                ), None)
-                if bound is not None:
-                    for value_id in history:
-                        identity_aliases[int(value_id)] = int(bound)
         default_literals: dict[int, Any] = {}
         if child_graph is not None and callee_function is not None:
             for value in callee_function.args:
@@ -6239,6 +12378,15 @@ def _class_surface_ssa_program(
             caller_result_sequences = all_sequence_tables.setdefault(
                 caller_symbol, SSASequenceTable()
             )
+            parameter_aliases = _linked_authored_parameter_aliases(
+                all_functions[caller_symbol],
+                callee_function,
+                caller_graph,
+                child_graph,
+                planned_call.argument_bindings,
+                caller_result_records,
+                callee_result_records,
+            )
             caller_values = function_values(all_functions[caller_symbol])
             # Only ids a node EXPLICITLY declares. The old fallback to
             # ``node_id`` reached ProcessGraph's node keys, which are ``id()``
@@ -6268,7 +12416,15 @@ def _class_surface_ssa_program(
                 source = function_values(callee_function).get(
                     old_id, SSAValue(old_id)
                 )
+                source_parameter = dict(
+                    getattr(source, "accounting", {}) or {}
+                ).get("program_abi_parameter")
                 value = clone_value(source, new_id, accounting={
+                    **({
+                        "program_abi_parameter": parameter_aliases[
+                            str(source_parameter)
+                        ],
+                    } if str(source_parameter) in parameter_aliases else {}),
                     "returned_record_storage": str(callee_symbol),
                     "callsite_id": int(planned_call.callsite_id),
                 })
@@ -6276,6 +12432,56 @@ def _class_surface_ssa_program(
                 caller_values[new_id] = value
                 result_storage_bindings[old_id] = new_id
                 return new_id
+
+            # A returned sequence can be a frame-owned result without being
+            # nested in a record.  When both sides already publish exact
+            # descriptors, correlate every physical member now so the callee
+            # writes directly into the caller's result arena.  This is the
+            # sequence analogue of the record-field mapping below and avoids
+            # inventing an unrelated workspace plus a fictitious return
+            # value for ``return bytes(out)``.
+            for callee_result_id, caller_result_id in (
+                planned_call.result_bindings
+            ):
+                callee_sequence = (
+                    None if callee_result_sequences is None
+                    else callee_result_sequences.by_id(int(callee_result_id))
+                )
+                caller_sequence = caller_result_sequences.by_id(
+                    int(caller_result_id)
+                )
+                if callee_sequence is None or caller_sequence is None:
+                    continue
+                if (
+                    len(callee_sequence.column_value_ids)
+                    != len(caller_sequence.column_value_ids)
+                    or tuple(callee_sequence.key_columns)
+                    != tuple(caller_sequence.key_columns)
+                ):
+                    continue
+                callee_members = (
+                    *callee_sequence.column_value_ids,
+                    callee_sequence.length_address_id,
+                    callee_sequence.capacity_value_id,
+                    *((callee_sequence.status_address_id,)
+                      if callee_sequence.status_address_id is not None else ()),
+                    *((callee_sequence.live_flags_value_id,)
+                      if callee_sequence.live_flags_value_id is not None else ()),
+                )
+                caller_members = (
+                    *caller_sequence.column_value_ids,
+                    caller_sequence.length_address_id,
+                    caller_sequence.capacity_value_id,
+                    *((caller_sequence.status_address_id,)
+                      if caller_sequence.status_address_id is not None else ()),
+                    *((caller_sequence.live_flags_value_id,)
+                      if caller_sequence.live_flags_value_id is not None else ()),
+                )
+                if len(callee_members) != len(caller_members):
+                    continue
+                result_storage_bindings.update(zip(
+                    map(int, callee_members), map(int, caller_members),
+                ))
 
             for callee_result_id, caller_result_id in (
                 planned_call.result_bindings
@@ -6452,6 +12658,82 @@ def _class_surface_ssa_program(
             if bound_record_pairs:
                 receiver_record, callee_record = bound_record_pairs[0]
         storage_bindings = dict(result_storage_bindings)
+        # A source parameter transformed through ``list(source)`` and
+        # ``b"".join`` has two physical sequence views in the callee. When
+        # the source is itself a compiler-resident local ``list[bytes]``, bind
+        # those views to its logical-count arena and deterministic flattened
+        # companion instead of allocating empty, unrelated call-frame slots.
+        if callee_function is not None:
+            caller_function = all_functions[caller_symbol]
+            caller_joined_views = dict(
+                caller_function.metadata.get("joined_sequence_views", ())
+            )
+            caller_joined_aliases = dict(
+                caller_function.metadata.get(
+                    "joined_sequence_identity_aliases", ()
+                )
+            )
+            caller_sequences = all_sequence_tables.get(caller_symbol)
+            callee_sequences = all_sequence_tables.get(callee_symbol)
+            callee_parameter_ids = {
+                str(name): int(value_id)
+                for name, value_id in callee_function.metadata.get(
+                    "parameter_names", ()
+                )
+            }
+
+            def bind_sequence_members(callee_sequence, caller_sequence):
+                _bind_sequence_storage_members(
+                    storage_bindings, callee_sequence, caller_sequence
+                )
+
+            if caller_sequences is not None and callee_sequences is not None:
+                # A planned argument binding names the sequence's data value,
+                # but the callable ABI owns the complete descriptor.  Carry
+                # its length/capacity/status storage across the same exact
+                # binding or the callee receives a valid pointer paired with
+                # freshly zeroed extents (for example ``_section(payload)``
+                # after ``payload = _vector(types)``).
+                for caller_id, callee_id in planned_call.argument_bindings:
+                    bind_sequence_members(
+                        callee_sequences.by_id(int(callee_id)),
+                        caller_sequences.by_id(
+                            int(structural_caller_aliases.get(
+                                int(caller_id), int(caller_id)
+                            ))
+                        ),
+                    )
+                for transform_sequence_id, source_name, transform in (
+                    callee_function.metadata.get(
+                        "sequence_source_transforms", ()
+                    )
+                ):
+                    callee_parameter_id = callee_parameter_ids.get(
+                        str(source_name)
+                    )
+                    caller_source_id = (
+                        None if callee_parameter_id is None
+                        else exact_bindings.get(int(callee_parameter_id))
+                    )
+                    if caller_source_id is None:
+                        continue
+                    outer_id = int(caller_joined_aliases.get(
+                        int(caller_source_id), int(caller_source_id)
+                    ))
+                    flat_id = caller_joined_views.get(outer_id)
+                    if flat_id is None:
+                        continue
+                    caller_view_id = (
+                        outer_id if str(transform) == "row_count"
+                        else int(flat_id) if str(transform) == "join_bytes"
+                        else None
+                    )
+                    if caller_view_id is None:
+                        continue
+                    bind_sequence_members(
+                        callee_sequences.by_id(int(transform_sequence_id)),
+                        caller_sequences.by_id(int(caller_view_id)),
+                    )
         for bound_record, candidate in bound_record_pairs:
             caller_fields = {
                 field.storage_identity: field
@@ -7190,8 +13472,64 @@ def _class_surface_ssa_program(
                 operation = str(
                     data.get("op") or data.get("type") or ""
                 ).casefold()
+                attributes = data.get("attributes") or {}
+                if (
+                    operation == "call"
+                    and str(attributes.get("static_python_reference") or "")
+                    == "len"
+                ):
+                    sequence_id = next((
+                        int(parent)
+                        for parent, role in data.get("parents") or ()
+                        if str(role) in {"arg:0", "operand", "value"}
+                    ), None)
+                    sequence_table = all_sequence_tables.get(caller_symbol)
+                    descriptor = (
+                        None if sequence_id is None or sequence_table is None
+                        else sequence_table.by_id(sequence_id)
+                    )
+                    sequence_aliases = {
+                        int(alias): int(resident)
+                        for alias, resident in dict(
+                            caller.metadata.get("value_aliases", {})
+                        ).items()
+                    }
+                    seen_aliases: set[int] = set()
+                    while (
+                        descriptor is None
+                        and
+                        sequence_id is not None
+                        and int(sequence_id) in sequence_aliases
+                        and int(sequence_id) not in seen_aliases
+                    ):
+                        seen_aliases.add(int(sequence_id))
+                        sequence_id = sequence_aliases[int(sequence_id)]
+                        descriptor = (
+                            None if sequence_table is None
+                            else sequence_table.by_id(sequence_id)
+                        )
+                    descriptor = (
+                        None if sequence_id is None or sequence_table is None
+                        else descriptor
+                    )
+                    length_address = (
+                        None if descriptor is None
+                        else values.get(int(descriptor.length_address_id))
+                    )
+                    if length_address is None:
+                        return None
+                    result = SSAValue(source_id, dtype="int64")
+                    prelude.append(Instr(
+                        "Load", [length_address], result,
+                        attributes={
+                            "binding": "sequence_len_call_feed",
+                            "sequence_id": int(sequence_id),
+                        },
+                    ))
+                    values[source_id] = result
+                    return result
                 if operation == "getattr":
-                    attribute = str((data.get("attributes") or {}).get(
+                    attribute = str(attributes.get(
                         "attribute", ""
                     ))
                     receiver_id = next((
@@ -7467,6 +13805,15 @@ def _class_surface_ssa_program(
                     else all_functions.get(record.callee_symbol)
                 )
                 if callee is not None:
+                    parameter_aliases = _linked_authored_parameter_aliases(
+                        caller,
+                        callee,
+                        caller_graph,
+                        source_graphs_by_symbol.get(str(record.callee_symbol)),
+                        record.argument_bindings,
+                        all_record_tables.get(str(caller_symbol)),
+                        all_record_tables.get(str(record.callee_symbol)),
+                    )
                     current_frame_ids = {
                         int(argument.id) for argument in callee.args
                     }
@@ -7522,6 +13869,10 @@ def _class_surface_ssa_program(
                             field_name = argument_accounting.get(
                                 "program_abi_field"
                             )
+                            if parameter_name is not None:
+                                parameter_name = parameter_aliases.get(
+                                    str(parameter_name), str(parameter_name)
+                                )
                             if parameter_name is not None and field_name is not None:
                                 field_key = (str(parameter_name), str(field_name))
                             existing_storage = None
@@ -7548,6 +13899,11 @@ def _class_surface_ssa_program(
                                     argument,
                                     next_value_id,
                                     accounting={
+                                        **({
+                                            "program_abi_parameter": str(
+                                                parameter_name
+                                            ),
+                                        } if parameter_name is not None else {}),
                                         "linked_call_frame_storage": str(
                                             record.callee_symbol
                                         ),
@@ -8135,6 +14491,30 @@ def _class_surface_ssa_program(
                     int(value_id): (str(kind), source)
                     for value_id, kind, source in record.frame_bindings
                 }
+                # A scheduled marker inside a loop/branch has already bound
+                # authored caller ids to the exact resident values at that
+                # lexical point (for example a loop target's current indexed
+                # load).  Frame records retain the stable authored ids; use
+                # this plan-owned correlation when building the native call
+                # instead of asking the function-wide value table for a
+                # pre-loop spelling that may not exist.
+                scheduled_sources: dict[int, SSAValue] = {}
+                marker = next((
+                    instruction
+                    for block in caller.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.attributes.get("plan_callsite_marker")
+                    and int(instruction.attributes.get(
+                        "plan_callsite_id", -1
+                    )) == int(record.callsite_id)
+                ), None)
+                if marker is not None:
+                    scheduled_sources = {
+                        int(caller_id): argument
+                        for (caller_id, _callee_id), argument in zip(
+                            record.argument_bindings, marker.args
+                        )
+                    }
                 if eligible:
                     call_arguments = []
                     constants = []
@@ -8339,12 +14719,93 @@ def _class_surface_ssa_program(
                                     "callee_value_ids"
                                 ]:
                                     pooled_argument_ids[int(callee_id)] = pointer
+                    scalar_source_transforms = {
+                        int(value_id): (str(source_name), str(transform))
+                        for value_id, source_name, transform
+                        in callee.metadata.get("scalar_source_transforms", ())
+                    }
+                    callee_sequence_table = all_sequence_tables.get(
+                        str(record.callee_symbol)
+                    )
+                    sequence_source_transforms = tuple(
+                        (
+                            int(sequence_id), str(source_name), str(transform)
+                        )
+                        for sequence_id, source_name, transform
+                        in callee.metadata.get(
+                            "sequence_source_transforms", ()
+                        )
+                    )
+                    callee_argument_positions = {
+                        int(argument.id): index
+                        for index, argument in enumerate(callee.args)
+                    }
                     for argument in callee.args:
                         if int(argument.id) in pooled_argument_ids:
                             call_arguments.append(
                                 pooled_argument_ids[int(argument.id)]
                             )
                             continue
+                        scalar_transform = scalar_source_transforms.get(
+                            int(argument.id)
+                        )
+                        if (
+                            scalar_transform is not None
+                            and scalar_transform[1] in {
+                                "materialized_length", "sequence_length",
+                            }
+                            and callee_sequence_table is not None
+                        ):
+                            source_name = scalar_transform[0]
+                            source_sequence_id = next((
+                                sequence_id
+                                for sequence_id, candidate_source, transform
+                                in sequence_source_transforms
+                                if candidate_source == source_name
+                                and transform == "row_count"
+                            ), None)
+                            source_sequence = (
+                                None if source_sequence_id is None
+                                else callee_sequence_table.by_id(
+                                    int(source_sequence_id)
+                                )
+                            )
+                            length_position = (
+                                None if source_sequence is None
+                                else callee_argument_positions.get(int(
+                                    source_sequence.length_address_id
+                                ))
+                            )
+                            if (
+                                length_position is not None
+                                and length_position < len(call_arguments)
+                            ):
+                                derived_length = SSAValue(
+                                    next_value_id,
+                                    dtype=str(argument.dtype or "int64"),
+                                    accounting={
+                                        "linked_scalar_source_transform": (
+                                            scalar_transform[1]
+                                        ),
+                                        "source_name": source_name,
+                                    },
+                                )
+                                next_value_id += 1
+                                constants.append(Instr(
+                                    "Load",
+                                    [call_arguments[int(length_position)]],
+                                    derived_length,
+                                    attributes={
+                                        "binding": (
+                                            "linked_scalar_source_transform"
+                                        ),
+                                        "source_transform": (
+                                            scalar_transform[1]
+                                        ),
+                                    },
+                                ))
+                                call_arguments.append(derived_length)
+                                continue
                         binding = binding_by_callee.get(int(argument.id))
                         if binding is None:
                             eligible = False
@@ -8353,7 +14814,11 @@ def _class_surface_ssa_program(
                         if kind in {
                             "caller_value", "caller_alias", "caller_storage"
                         }:
-                            value = resolve_call_feed(int(source), constants)
+                            value = scheduled_sources.get(int(source))
+                            if value is None:
+                                value = resolve_call_feed(
+                                    int(source), constants
+                                )
                             if value is None and kind == "caller_storage":
                                 # A structural-record cleanup may remove a
                                 # shapeless argument whose numeric id happens
@@ -8399,14 +14864,115 @@ def _class_surface_ssa_program(
                             eligible = False
                             break
                 if eligible:
+                    aliased_return_argument_index = None
+                    result_frame_sync: list[Instr] = []
                     if returns_value:
                         _callee_result_id, caller_result_id = result_binding
                         callee_output = callee_outputs[0]
-                        result = values.get(int(caller_result_id), SSAValue(
-                            int(caller_result_id),
-                            dtype=callee_output.dtype,
-                            shape=callee_output.shape,
-                        ))
+                        # A directly returned mutable aggregate (for example
+                        # ``return bytes(out)``) is represented by the same
+                        # repository value as the callee's sequence column.
+                        # Its storage already crosses the call frame as an
+                        # inout argument; manufacturing a second scalar/array
+                        # result makes native backends pass one actual more
+                        # than the callee declares.  Preserve the semantic
+                        # caller result id for scheduling, but make the Call
+                        # result alias the exact frame argument that owns the
+                        # returned storage.
+                        aliased_return_argument_index = next((
+                            index
+                            for index, argument in enumerate(callee.args)
+                            if int(argument.id) == int(_callee_result_id)
+                            and index < len(call_arguments)
+                            and binding_by_callee.get(int(argument.id), (None,))[0]
+                            in {
+                                "caller_value", "caller_alias", "caller_storage"
+                            }
+                        ), None)
+                        if aliased_return_argument_index is not None:
+                            result = call_arguments[
+                                int(aliased_return_argument_index)
+                            ]
+                            callee_sequence_table = all_sequence_tables.get(
+                                str(record.callee_symbol)
+                            )
+                            caller_sequence_table = all_sequence_tables.get(
+                                str(record.caller)
+                            )
+                            callee_result_sequence = (
+                                None if callee_sequence_table is None
+                                else callee_sequence_table.by_id(
+                                    int(_callee_result_id)
+                                )
+                            )
+                            caller_result_sequence = (
+                                None if caller_sequence_table is None
+                                else caller_sequence_table.by_id(
+                                    int(caller_result_id)
+                                )
+                            )
+                            if (
+                                callee_result_sequence is not None
+                                and caller_result_sequence is not None
+                            ):
+                                length_argument_index = next((
+                                    index
+                                    for index, argument in enumerate(callee.args)
+                                    if int(argument.id) == int(
+                                        callee_result_sequence.length_address_id
+                                    )
+                                ), None)
+                                caller_length_address = values.get(int(
+                                    caller_result_sequence.length_address_id
+                                ))
+                                if (
+                                    length_argument_index is not None
+                                    and length_argument_index < len(call_arguments)
+                                    and caller_length_address is not None
+                                ):
+                                    returned_length = SSAValue(
+                                        next_value_id, dtype="int64",
+                                        accounting={
+                                            "linked_sequence_result_length": True,
+                                            "callsite_id": int(
+                                                record.callsite_id
+                                            ),
+                                        },
+                                    )
+                                    next_value_id += 1
+                                    result_frame_sync.extend((
+                                        Instr(
+                                            "Load",
+                                            [call_arguments[
+                                                int(length_argument_index)
+                                            ]],
+                                            returned_length,
+                                            attributes={
+                                                "binding": (
+                                                    "linked_sequence_result_length"
+                                                )
+                                            },
+                                        ),
+                                        Instr(
+                                            "Store",
+                                            [
+                                                returned_length,
+                                                caller_length_address,
+                                            ],
+                                            None,
+                                            attributes={
+                                                "binding": (
+                                                    "linked_sequence_result_length"
+                                                )
+                                            },
+                                        ),
+                                    ))
+                        else:
+                            result = values.get(int(caller_result_id), SSAValue(
+                                int(caller_result_id),
+                                dtype=callee_output.dtype,
+                                shape=callee_output.shape,
+                            ))
                         # The caller-side placeholder may predate source-call
                         # linking and therefore carry no useful type.  A
                         # resolved call's physical result contract is the
@@ -8482,6 +15048,13 @@ def _class_surface_ssa_program(
                             "source_linked": True,
                             "plan_callsite_id": record.callsite_id,
                             "callee_reference": record.callee_reference,
+                            **({
+                                "ssa_output_argument": int(
+                                    aliased_return_argument_index
+                                ),
+                                "result_aliases_frame": True,
+                                "semantic_result_id": int(caller_result_id),
+                            } if aliased_return_argument_index is not None else {}),
                             **({
                                 "result_convention": "ssa.aggregate",
                                 "output_ids": tuple(
@@ -8565,7 +15138,8 @@ def _class_surface_ssa_program(
                             ))
                             values[int(caller_id)] = output
                     native_sequence = [
-                        *constants, native_call, *aggregate_unpack
+                        *constants, native_call, *result_frame_sync,
+                        *aggregate_unpack
                     ]
                     # A source-linked call inside a loop is scheduled by the
                     # reducer's lexical call anchor within that exact loop
@@ -8932,6 +15506,26 @@ def _class_surface_ssa_program(
                                 break
                     if inserted:
                         if returns_physical_result:
+                            if aliased_return_argument_index is not None:
+                                # Consumers were lowered against the authored
+                                # call-result identity.  Once the call is
+                                # placed, redirect those uses to the proven
+                                # frame-owned storage.  Identity matching is
+                                # sufficient here: a repository function has
+                                # one SSA producer per value id, and the call
+                                # linker has just established their exact
+                                # result correlation.
+                                for block in caller.blocks.values():
+                                    for instruction in block.instrs:
+                                        if instruction is native_call:
+                                            continue
+                                        instruction.args = [
+                                            result
+                                            if int(argument.id)
+                                            == int(caller_result_id)
+                                            else argument
+                                            for argument in instruction.args
+                                        ]
                             caller.args = [
                                 value for value in caller.args
                                 if int(value.id) != int(caller_result_id)
@@ -9448,6 +16042,22 @@ def _class_surface_ssa_program(
     # never the conceptual Python record handle.
     for function_name, function in all_functions.items():
         available = set(function_values(function))
+        available.update(map(
+            int, function.metadata.get("lowered_source_value_ids", ())
+        ))
+        value_aliases = {
+            int(alias): int(source)
+            for alias, source in dict(
+                function.metadata.get("value_aliases", {})
+            ).items()
+        }
+        changed_aliases = True
+        while changed_aliases:
+            changed_aliases = False
+            for alias, source in value_aliases.items():
+                if source in available and alias not in available:
+                    available.add(alias)
+                    changed_aliases = True
         graph = source_graphs_by_symbol.get(function_name)
         record_table = all_record_tables.get(function_name)
         if graph is not None and record_table is not None:
@@ -9483,6 +16093,32 @@ def _class_surface_ssa_program(
                             for value_id in field.value_ids)
                 ):
                     available.add(int(node_id))
+            # Fixed aggregates disappear as runtime objects once a record
+            # field correlates their ordered leaves. Mark the authored tuple
+            # identity satisfied only when every leaf is physically present;
+            # this keeps semantic accounting exact without manufacturing an
+            # aggregate slot merely to silence the frontier.
+            changed_aggregates = True
+            while changed_aggregates:
+                changed_aggregates = False
+                for node_id, data in graph.nodes(data=True):
+                    attributes = dict(data.get("attributes") or {})
+                    if attributes.get("aggregate_kind") not in {
+                        "tuple", "list",
+                    }:
+                        continue
+                    leaves = tuple(map(
+                        int,
+                        attributes.get("aggregate_leaf_value_ids") or (),
+                    ))
+                    value_id = int(data.get("value_id", node_id))
+                    if (
+                        leaves
+                        and all(leaf in available for leaf in leaves)
+                        and value_id not in available
+                    ):
+                        available.add(value_id)
+                        changed_aggregates = True
         shortfalls = tuple(
             row for row in function.metadata.get(
                 "structural_output_shortfalls", ()
@@ -9739,8 +16375,16 @@ def _class_surface_ssa_program(
     )
     for function in all_functions.values():
         parts_by_owner: dict[str, dict[str, Any]] = {}
+        key_identity_owners: set[str] = set()
         for value in function.args:
             accounting = value.accounting or {}
+            if (
+                accounting.get("program_abi_value_identity") == "key"
+                and accounting.get("program_abi_field") is not None
+            ):
+                key_identity_owners.add(str(
+                    accounting["program_abi_field"]
+                ))
             owner_name = accounting.get("program_abi_keyed_owner")
             part_name = accounting.get("program_abi_keyed_part")
             if owner_name is None or part_name is None:
@@ -9748,6 +16392,10 @@ def _class_surface_ssa_program(
             parts_by_owner.setdefault(str(owner_name), {})[
                 str(part_name)
             ] = value
+        for owner_name in key_identity_owners:
+            parts = parts_by_owner.get(owner_name)
+            if parts is not None and "keys" in parts:
+                parts["values"] = parts["keys"]
         if not parts_by_owner:
             continue
         replaced_storage_ids: set[int] = set()
@@ -9884,6 +16532,200 @@ def _class_surface_ssa_program(
                         if position not in set(dropped_positions)
                     ]
 
+    # Reconcile public source provenance after the linked-frame fixed point.
+    # Storage may be allocated during initial discovery or during a later
+    # callee-growth round; doing this once over the final call records makes
+    # the exact ``body -> self`` binding authoritative regardless of which
+    # round minted the slot. Conflicting correlations remain unresolved.
+    for caller_symbol, records in call_records.items():
+        caller = all_functions.get(str(caller_symbol))
+        caller_graph = source_graphs_by_symbol.get(str(caller_symbol))
+        if caller is None:
+            continue
+        correlated_names: dict[int, set[str]] = {}
+        for record in records:
+            callee_symbol = str(record.callee_symbol or "")
+            callee = all_functions.get(callee_symbol)
+            if callee is None:
+                continue
+            aliases = _linked_authored_parameter_aliases(
+                caller,
+                callee,
+                caller_graph,
+                source_graphs_by_symbol.get(callee_symbol),
+                record.argument_bindings,
+                all_record_tables.get(str(caller_symbol)),
+                all_record_tables.get(callee_symbol),
+            )
+            callee_arguments = {
+                int(argument.id): argument for argument in callee.args
+            }
+            caller_arguments_by_id = {
+                int(argument.id): argument for argument in caller.args
+            }
+            frame_map = {
+                int(callee_id): int(caller_id)
+                for callee_id, kind, caller_id in record.frame_bindings
+                if str(kind) in {
+                    "caller_storage", "caller_value", "caller_alias",
+                }
+            }
+            # A linked physical frame is not ABI-complete until its aggregate
+            # descriptors travel with it. Propagate only descriptors whose
+            # every resident member has an exact frame binding.
+            callee_sequences = all_sequence_tables.get(callee_symbol)
+            caller_sequences = all_sequence_tables.setdefault(
+                str(caller_symbol), SSASequenceTable()
+            )
+            if callee_sequences is not None:
+                for descriptor in callee_sequences.sequences.values():
+                    required_ids = {
+                        int(descriptor.sequence_id),
+                        *map(int, descriptor.column_value_ids),
+                        int(descriptor.length_address_id),
+                        int(descriptor.capacity_value_id),
+                        *((int(descriptor.status_address_id),)
+                          if descriptor.status_address_id is not None else ()),
+                        *((int(descriptor.live_flags_value_id),)
+                          if descriptor.live_flags_value_id is not None else ()),
+                    }
+                    pool = descriptor.child_table_pool
+                    if pool is not None:
+                        required_ids.update({
+                            *map(int, pool.column_value_ids),
+                            int(pool.length_value_id),
+                            int(pool.capacity_value_id),
+                            int(pool.row_stride_value_id),
+                            *((int(pool.status_value_id),)
+                              if pool.status_value_id is not None else ()),
+                            *((int(pool.live_flags_value_id),)
+                              if pool.live_flags_value_id is not None else ()),
+                        })
+                    if not required_ids.issubset(frame_map):
+                        continue
+                    mapped_columns = tuple(
+                        frame_map[int(value_id)]
+                        for value_id in descriptor.column_value_ids
+                    )
+                    if not any(
+                        (caller_arguments_by_id.get(value_id).accounting or {})
+                        .get("program_abi_parameter")
+                        for value_id in mapped_columns
+                        if caller_arguments_by_id.get(value_id) is not None
+                    ):
+                        # Private linked scratch remains workspace. A source
+                        # sequence needs descriptor propagation so the outer
+                        # caller can initialize its length/capacity contract.
+                        continue
+                    caller_sequences.register(SSASequenceDescriptor(
+                        sequence_id=frame_map[int(descriptor.sequence_id)],
+                        column_value_ids=mapped_columns,
+                        length_address_id=frame_map[int(
+                            descriptor.length_address_id
+                        )],
+                        capacity_value_id=frame_map[int(
+                            descriptor.capacity_value_id
+                        )],
+                        status_address_id=(
+                            None if descriptor.status_address_id is None else
+                            frame_map[int(descriptor.status_address_id)]
+                        ),
+                        column_dtypes=tuple(descriptor.column_dtypes),
+                        key_columns=tuple(descriptor.key_columns),
+                        live_flags_value_id=(
+                            None if descriptor.live_flags_value_id is None else
+                            frame_map[int(descriptor.live_flags_value_id)]
+                        ),
+                        capacity_policy=descriptor.capacity_policy,
+                        writable=bool(descriptor.writable),
+                        child_table_pool=map_child_pool(pool, frame_map),
+                    ))
+            callee_records = all_record_tables.get(callee_symbol)
+            caller_records = all_record_tables.setdefault(
+                str(caller_symbol), SSARecordTable()
+            )
+            record_map = {
+                int(callee_id): int(caller_id)
+                for caller_id, callee_id in record.argument_bindings
+            }
+            if callee_records is not None:
+                for descriptor in callee_records.records.values():
+                    caller_record_id = record_map.get(int(
+                        descriptor.record_id
+                    ))
+                    if caller_record_id is None:
+                        continue
+                    fields = []
+                    for field in descriptor.fields:
+                        if (
+                            any(int(value_id) not in frame_map
+                                for value_id in field.value_ids)
+                            or field.sequence_id is not None
+                            and int(field.sequence_id) not in frame_map
+                            or field.record_id is not None
+                            and int(field.record_id) not in record_map
+                        ):
+                            fields = []
+                            break
+                        fields.append(SSARecordFieldDescriptor(
+                            name=field.name,
+                            storage=field.storage,
+                            storage_identity=field.storage_identity,
+                            value_ids=tuple(
+                                frame_map[int(value_id)]
+                                for value_id in field.value_ids
+                            ),
+                            sequence_id=(
+                                None if field.sequence_id is None else
+                                frame_map[int(field.sequence_id)]
+                            ),
+                            record_id=(
+                                None if field.record_id is None else
+                                record_map[int(field.record_id)]
+                            ),
+                            offset=field.offset,
+                            dtype=field.dtype,
+                            writable=field.writable,
+                        ))
+                    if fields:
+                        caller_records.register(SSARecordDescriptor(
+                            caller_record_id,
+                            str(descriptor.identity),
+                            tuple(fields),
+                        ))
+            if not aliases:
+                continue
+            for callee_id, kind, caller_id in record.frame_bindings:
+                if str(kind) != "caller_storage":
+                    continue
+                callee_argument = callee_arguments.get(int(callee_id))
+                parameter_name = (
+                    None if callee_argument is None else
+                    (callee_argument.accounting or {}).get(
+                        "program_abi_parameter"
+                    )
+                )
+                mapped_name = aliases.get(str(parameter_name))
+                if mapped_name is not None:
+                    correlated_names.setdefault(
+                        int(caller_id), set()
+                    ).add(str(mapped_name))
+        caller_arguments = {
+            int(argument.id): argument for argument in caller.args
+        }
+        for value_id, names in correlated_names.items():
+            if len(names) != 1 or value_id not in caller_arguments:
+                continue
+            value = caller_arguments[value_id]
+            accounting = dict(value.accounting or {})
+            if accounting.get("program_abi_parameter") is None:
+                continue
+            value.accounting = {
+                **accounting,
+                "program_abi_parameter": next(iter(names)),
+                "linked_parameter_provenance": "exact_argument_binding",
+            }
+
     # A declared record field keeps its storage identity across the call frame.
     # The contract states `height` as a rank-2 span, but a callee's formal
     # parameter was built before that contract was materialized, so it arrived
@@ -9966,6 +16808,169 @@ def _class_surface_ssa_program(
                 accounting.pop(frame_local, None)
             value.accounting = accounting
 
+    # A schema-token scalar is the one-element case of the compiler's token
+    # chains.  Translate adjacent authored string constants through the exact
+    # ordered vocabulary carried by the physical field.  This is deliberately
+    # not ``string_token`` hashing: the receipt is the reversible encoder and
+    # its one-based index is collision-free within that declared vocabulary.
+    vocabulary_lowerings = []
+    for function_symbol, function in all_functions.items():
+        producers = {
+            int(instruction.res.id): instruction
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        }
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.op not in {"Eq", "Ne"} or len(
+                    instruction.args
+                ) != 2:
+                    continue
+                for token_value, literal_value in (
+                    (instruction.args[0], instruction.args[1]),
+                    (instruction.args[1], instruction.args[0]),
+                ):
+                    vocabulary = tuple(map(str, (
+                        (token_value.accounting or {}).get(
+                            "program_abi_token_vocabulary"
+                        ) or ()
+                    )))
+                    literal = producers.get(int(literal_value.id))
+                    if (
+                        not vocabulary
+                        or literal is None
+                        or literal.op != "string_token"
+                    ):
+                        continue
+                    text = literal.attributes.get("text")
+                    if not isinstance(text, str) or text not in vocabulary:
+                        continue
+                    encoded = vocabulary.index(text) + 1
+                    literal.op = "Const"
+                    literal.attributes = {
+                        "value": encoded,
+                        "program_abi_vocabulary_token": text,
+                        "program_abi_vocabulary": vocabulary,
+                    }
+                    if literal.res is not None:
+                        literal.res.dtype = "int64"
+                    if token_value.dtype in {None, "unknown", "float64"}:
+                        token_value.dtype = "int64"
+                    vocabulary_lowerings.append({
+                        "function": str(function_symbol),
+                        "field": (token_value.accounting or {}).get(
+                            "program_abi_field"
+                        ),
+                        "token": text,
+                        "encoded": encoded,
+                    })
+                    break
+    if vocabulary_lowerings:
+        module_metadata["program_abi_vocabulary_lowerings"] = tuple(
+            vocabulary_lowerings
+        )
+
+    # Call-frame linking can be the first point at which a provisional region
+    # result becomes a physical formal.  Reconcile that late surface with the
+    # authored graph before final identities/DCE: a scalar cast feeding a
+    # source-linked call is an internal producer, never a caller-supplied ABI
+    # slot.  Earlier structural recovery cannot claim this case because the
+    # placeholder does not exist in ``function.args`` until linking finishes.
+    # Reuse the exact SSAValue object already held by consumers so every use
+    # keeps its deterministic identity while acquiring one real definition.
+    for function_symbol, function in all_functions.items():
+        graph = source_graphs_by_symbol.get(str(function_symbol))
+        if graph is None or not function.blocks:
+            continue
+        required_ids = set(map(
+            int, function.metadata.get("required_source_value_ids", ())
+        ))
+        authored_parameter_ids = {
+            int(value_id)
+            for _name, value_id in function.metadata.get(
+                "parameter_names", ()
+            )
+        }
+        values = function_values(function)
+        produced_ids = {
+            int(instruction.res.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        }
+        recovered = []
+        for placeholder in tuple(function.args):
+            value_id = int(placeholder.id)
+            accounting = dict(placeholder.accounting or {})
+            result_source = accounting.get("ssa_call_result_from")
+            if (
+                value_id not in required_ids
+                or value_id in authored_parameter_ids
+                or not result_source
+                or value_id in produced_ids
+                or accounting.get("program_abi_storage")
+                or accounting.get("compiler_frame_storage")
+                or accounting.get("linked_call_frame_storage")
+            ):
+                continue
+            data = graph.nodes.get(value_id, {})
+            operation = str(
+                data.get("op") or data.get("type") or ""
+            ).casefold()
+            if operation not in {"int", "float", "bool"}:
+                continue
+            operands = tuple(
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role).startswith("arg:")
+            )
+            if len(operands) != 1:
+                continue
+            operand = values.get(operands[0])
+            # Hoisting is exact only for an authored formal: it dominates all
+            # control paths and scalar conversion has no side effects.  A
+            # locally produced operand needs lexical placement evidence and
+            # is deliberately left to the ordinary frontier instead.
+            if operand is None or operand not in function.args:
+                continue
+            function.args = [
+                argument for argument in function.args
+                if int(argument.id) != value_id
+            ]
+            target_dtype = {
+                "int": "int64", "float": "float64", "bool": "bool",
+            }[operation]
+            placeholder.dtype = target_dtype
+            placeholder.accounting = {
+                key: value
+                for key, value in accounting.items()
+                if key != "ssa_call_result_from"
+            }
+            placeholder.accounting.update({
+                "recovered_structural_source": operation,
+                "source_value_id": int(operand.id),
+            })
+            entry = next(iter(function.blocks.values()))
+            insertion_index = 0
+            while (
+                insertion_index < len(entry.instrs)
+                and entry.instrs[insertion_index].op in {"Const", "const"}
+            ):
+                insertion_index += 1
+            entry.instrs.insert(insertion_index, Instr(
+                "Cast", [operand], placeholder,
+                attributes={
+                    "structural_operation": operation,
+                    "target_dtype": target_dtype,
+                    "late_call_feed_recovery": True,
+                },
+            ))
+            produced_ids.add(value_id)
+            recovered.append((value_id, int(operand.id), operation))
+        if recovered:
+            function.metadata["recovered_late_call_feeds"] = tuple(recovered)
+
     # Literal construction is pure. Source ingestion intentionally retains
     # strings, empty tuples, debug labels, and optional markers long enough
     # for structural planning. After call frames and public returns are fixed,
@@ -10006,12 +17011,52 @@ def _class_surface_ssa_program(
     # ``dynamic`` marks entries whose extent is not compile-time known;
     # those are the heap participants.
     for function in all_functions.values():
+        # Every physical member of a resident sequence is an intentional
+        # caller-provided frame slot. Local lists/bytearrays need the same
+        # declared workspace ABI as storage passed through a linked call; an
+        # anonymous formal is never an acceptable way to smuggle that arena
+        # across the native boundary. The deterministic SSA identity remains
+        # unchanged -- this adds only its physical ABI role.
+        sequence_table = all_sequence_tables.get(str(function.name))
+        arguments_by_id = {
+            int(argument.id): argument for argument in function.args
+        }
+        if sequence_table is not None:
+            for sequence_id, descriptor in sorted(
+                sequence_table.sequences.items()
+            ):
+                members = (
+                    *descriptor.column_value_ids,
+                    descriptor.length_address_id,
+                    descriptor.capacity_value_id,
+                    *((descriptor.status_address_id,)
+                      if descriptor.status_address_id is not None else ()),
+                    *((descriptor.live_flags_value_id,)
+                      if descriptor.live_flags_value_id is not None else ()),
+                )
+                for member_index, value_id in enumerate(members):
+                    argument = arguments_by_id.get(int(value_id))
+                    if argument is None:
+                        continue
+                    accounting = dict(argument.accounting or {})
+                    if not any(accounting.get(key) not in {None, ""} for key in (
+                        "program_abi_parameter",
+                        "linked_call_frame_storage",
+                        "returned_record_storage",
+                    )):
+                        argument.accounting = {
+                            **accounting,
+                            "compiler_frame_storage": str(function.name),
+                            "compiler_frame_sequence_id": int(sequence_id),
+                            "compiler_frame_member": int(member_index),
+                        }
         declared_storage = []
         for argument in function.args:
             accounting = dict(argument.accounting or {})
             owner = (
                 accounting.get("linked_call_frame_storage")
                 or accounting.get("returned_record_storage")
+                or accounting.get("compiler_frame_storage")
             )
             if not owner:
                 continue
@@ -10039,7 +17084,9 @@ def _class_surface_ssa_program(
     # Here the module is final, so a constant that lost its last arithmetic
     # consumer still materializes wherever an output ledger names it.
     from .ir_identities import (
+        deduplicate_constants,
         drop_dead_pure_region_calls,
+        eliminate_common_subexpressions,
         reduce_constant_exponent_pow,
     )
 
@@ -10048,6 +17095,84 @@ def _class_surface_ssa_program(
     # results nothing reads (the materialized comprehension ``range``) must
     # not force a backend to spell code nothing runs.
     drop_dead_pure_region_calls(all_functions)
+    # Catalogue 3 then 2.3, and the ORDER is the content: two identical
+    # expressions are invisible to sharing while their equal constants are
+    # separate values, so CSE run first finds one duplicate where run second
+    # it finds thirteen. Both are exactly result-preserving -- the surviving
+    # instruction computes the same operation on the same operands -- so
+    # neither asks the work contract for permission.
+    #
+    # These earn their keep on the six backends with no -O2 behind them.
+    # Measured on the signal cores, LLVM finds the same redundancy itself and
+    # the native timing does not move; the emitted SSA is 12-15% smaller
+    # either way, and that is what Fortran, C, GLSL, SPIR-V, WGSL and WASM
+    # actually consume.
+    deduplicate_constants(all_functions)
+    eliminate_common_subexpressions(all_functions)
+
+    # Sequence descriptors are the canonical physical ABI.  A source value
+    # may have been captured provisionally by a numerical region before its
+    # resident sequence schema was known, producing another SSAValue object
+    # with the same deterministic identity but a generic float dtype.  Reconcile
+    # every occurrence by identity after linking so backend declarations and
+    # call frames cannot disagree with the sequence table.
+    for function_name, function in all_functions.items():
+        table = all_sequence_tables.get(function_name)
+        if table is None:
+            continue
+        canonical_dtypes = {
+            int(value_id): str(dtype)
+            for descriptor in table.sequences.values()
+            for value_id, dtype in zip(
+                descriptor.column_value_ids, descriptor.column_dtypes
+            )
+            if dtype not in {None, "", "unknown"}
+        }
+        if not canonical_dtypes:
+            continue
+        values = [*function.args]
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                values.extend(instruction.args)
+                if instruction.res is not None:
+                    values.append(instruction.res)
+        for value in values:
+            dtype = canonical_dtypes.get(int(value.id))
+            if dtype is not None:
+                value.dtype = dtype
+
+    # Sequence helper calls are physical ABI operations.  Their row argument
+    # often inlines the producer expression, so updating only the Call's
+    # SSAValue occurrence leaves the producer spelling at its provisional
+    # integer width.  Correlate by deterministic value identity and apply the
+    # helper formal's declared element type to every occurrence in the caller.
+    for function in all_functions.values():
+        occurrences: dict[int, list[SSAValue]] = {}
+        for value in function.args:
+            occurrences.setdefault(int(value.id), []).append(value)
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                for value in instruction.args:
+                    occurrences.setdefault(int(value.id), []).append(value)
+                if instruction.res is not None:
+                    occurrences.setdefault(
+                        int(instruction.res.id), []
+                    ).append(instruction.res)
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if not instruction.attributes.get("ssa_sequence_operation"):
+                    continue
+                callee = all_functions.get(str(
+                    instruction.attributes.get("callee") or ""
+                ))
+                if callee is None:
+                    continue
+                for actual, formal in zip(instruction.args, callee.args):
+                    dtype = str(formal.dtype or "")
+                    if dtype in {"", "unknown"}:
+                        continue
+                    for occurrence in occurrences.get(int(actual.id), ()):
+                        occurrence.dtype = dtype
 
     return (
         IRModule(
@@ -10071,6 +17196,7 @@ def _class_surface_ssa_program(
             machine_indirect_table=(
                 SSAMachineIndirectTable(tuple(machine_indirect_links))
             ),
+            metadata=module_metadata,
         ),
         {
             name: emit_outputs(name, function)
@@ -10136,11 +17262,494 @@ def _emit_class_surface_module(
     return emitted, export_symbols
 
 
+def _normalize_top_level_guard_returns(
+    tree: ast.Module,
+    target_names: Iterable[str],
+) -> tuple[dict[str, Any], ...]:
+    """Give selected functions one exit without inventing control semantics.
+
+    Repository control regions are owned by branch bodies.  A top-level guard
+    whose body contains only an early ``return`` therefore has no numerical
+    region to own and historically disappeared before SSA control lowering.
+    For compiler-bootstrap targets, rewrite only that canonical guard form to
+    assignments to a private result followed by one final return.  ProcessGraph
+    can then retain both arms as ordinary nested control.  The authored source
+    and its hash remain the public compilation receipt; this is a deterministic
+    compiler-complementary AST normalization recorded separately below.
+    """
+
+    requested = {str(name) for name in target_names if str(name)}
+    if not requested:
+        return ()
+    receipts: list[dict[str, Any]] = []
+
+    def selected(qualified_name: str, simple_name: str) -> bool:
+        return qualified_name in requested or simple_name in requested
+
+    def normalize_function(
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        qualified_name: str,
+    ) -> None:
+        if not selected(qualified_name, node.name) or not node.body:
+            return
+        if not isinstance(node.body[-1], ast.Return):
+            return
+        terminal = node.body[-1]
+        if terminal.value is None:
+            return
+
+        occupied = {
+            candidate.id
+            for candidate in ast.walk(node)
+            if isinstance(candidate, ast.Name)
+        }
+        result_name = "__turing_single_exit_result"
+        suffix = 0
+        while result_name in occupied:
+            suffix += 1
+            result_name = f"__turing_single_exit_result_{suffix}"
+
+        guard_lines: list[int] = []
+
+        def result_assignment(statement: ast.Return) -> ast.Assign:
+            assignment = ast.Assign(
+                targets=[ast.Name(id=result_name, ctx=ast.Store())],
+                value=statement.value,
+            )
+            return ast.copy_location(assignment, statement)
+
+        def nest(statements: list[ast.stmt]) -> list[ast.stmt] | None:
+            for index, statement in enumerate(statements[:-1]):
+                if not (
+                    isinstance(statement, ast.If)
+                    and not statement.orelse
+                    and statement.body
+                    and isinstance(statement.body[-1], ast.Return)
+                    and statement.body[-1].value is not None
+                ):
+                    continue
+                tail = nest(statements[index + 1 :])
+                if tail is None:
+                    tail = [
+                        *statements[index + 1 : -1],
+                        result_assignment(statements[-1]),
+                    ]
+                guarded_return = statement.body[-1]
+                rewritten = ast.If(
+                    test=statement.test,
+                    body=[
+                        *statement.body[:-1],
+                        result_assignment(guarded_return),
+                    ],
+                    orelse=tail,
+                )
+                ast.copy_location(rewritten, statement)
+                guard_lines.append(int(getattr(statement, "lineno", 0)))
+                return [*statements[:index], rewritten]
+            return None
+
+        rewritten_body = nest(list(node.body))
+        if rewritten_body is None:
+            return
+        final_return = ast.copy_location(
+            ast.Return(value=ast.Name(id=result_name, ctx=ast.Load())),
+            terminal,
+        )
+        node.body = [*rewritten_body, final_return]
+        receipts.append({
+            "function": qualified_name,
+            "result_name": result_name,
+            "guard_count": len(guard_lines),
+            "source_lines": tuple(sorted(guard_lines)),
+        })
+
+    def walk_scope(statements: Iterable[ast.stmt], prefix: str = "") -> None:
+        for statement in statements:
+            if isinstance(statement, ast.ClassDef):
+                qualified = (
+                    f"{prefix}.{statement.name}" if prefix else statement.name
+                )
+                walk_scope(statement.body, qualified)
+            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualified = (
+                    f"{prefix}.{statement.name}" if prefix else statement.name
+                )
+                normalize_function(statement, qualified)
+                # Nested definitions retain their authored lexical identity.
+                walk_scope(statement.body, f"{qualified}.<locals>")
+
+    walk_scope(tree.body)
+    if receipts:
+        ast.fix_missing_locations(tree)
+    return tuple(receipts)
+
+
+def _lower_resolved_process_graph_deployment(
+    graph: Any,
+    entrypoint: str | None,
+    *,
+    dependency_seeds: tuple[str, ...] = (),
+    selected_function_references: tuple[int, ...] | None = None,
+    activation_function_references: tuple[int, ...] | None = None,
+    name: str | None = None,
+    runtime_closure_only: bool = True,
+    tensor_ssa_reference: Any = None,
+    linked_source_region_ssa: Mapping[
+        tuple[str, ...], tuple[Any, Mapping[str, Any], Mapping[str, Any]]
+    ] | None = None,
+    subdivision_request: Mapping[str, Any] | None = None,
+    allow_authored_source_callees: bool = False,
+    progress: Callable[[str], None] | None = None,
+):
+    """Lower an already reduced ProcessGraph through the canonical backend path.
+
+    ``selected_function_references`` is the bootstrap boundary: it names one
+    dependency-closed compilation unit from a recorded plan.  Supplying it
+    prevents the deployment planner from recursively instantiating unrelated
+    FunctionTable members, while retaining their authored graph
+    representations for later units and source fallback.
+    """
+
+    from types import SimpleNamespace
+
+    from .glsl_deployment_strategy import strategize_shell_deployment
+    from .shell_reference_tables import (
+        build_class_navigation_table,
+        build_map_dependency_regions,
+    )
+
+    def report(message: str) -> None:
+        if progress is not None:
+            progress(message)
+
+    whole_source = entrypoint is None and selected_function_references is None
+    deployment_graph = graph
+    if selected_function_references is not None:
+        selected = tuple(dict.fromkeys(map(int, selected_function_references)))
+        if not selected:
+            raise ValueError("a resolved ProcessGraph unit cannot be empty")
+        selected_names = tuple(
+            str(graph.function_table.entry(reference).qualified_name)
+            for reference in selected
+        )
+        activation = tuple(dict.fromkeys(map(
+            int,
+            activation_function_references or selected,
+        )))
+        if not set(activation).issubset(selected):
+            raise ValueError(
+                "resolved ProcessGraph activation references must belong to "
+                "the retained runtime unit closure"
+            )
+        activation_names = tuple(
+            str(graph.function_table.entry(reference).qualified_name)
+            for reference in activation
+        )
+        graph.G.graph["compile_targets"] = activation_names
+        map_ir = dict(graph.G.graph.get("map_ir") or {})
+        map_ir["dependency_regions"] = {
+            "runtime": selected,
+            "mapped": (),
+            "retained": selected,
+            "map_only": (),
+            "bindings": (),
+        }
+        graph.G.graph["map_ir"] = map_ir
+        if allow_authored_source_callees:
+            selected_set = set(selected)
+            for entry in graph.function_table:
+                if int(entry.reference.address) in selected_set:
+                    continue
+                if entry.metadata.get("host_repository_ssa_complete"):
+                    continue
+                entry.metadata["implementation_kind"] = (
+                    "authored-source-fallback"
+                )
+        # The resolved project graph is a source catalogue, not another
+        # executable body of the selected function.  Give deployment an empty
+        # module shell carrying the same FunctionTable and metadata; it will
+        # instantiate only the selected function shells below.  This is the
+        # key memory/linearity cut: the worker retains authored graphs for
+        # linking and fallback without scheduling all catalogue nodes again.
+        from .process_graph_fusion import extract_clean_process_subgraph
+
+        deployment_graph = extract_clean_process_subgraph(graph, ())
+        runtime_closure_only = True
+        entrypoint = activation_names[0]
+    elif runtime_closure_only and not whole_source:
+        dependency_regions = build_map_dependency_regions(
+            graph,
+            str(entrypoint),
+            extra_seeds=dependency_seeds,
+        )
+        map_ir = dict(graph.G.graph.get("map_ir") or {})
+        map_ir["dependency_regions"] = {
+            "runtime": dependency_regions.runtime,
+            "mapped": dependency_regions.mapped,
+            "retained": dependency_regions.retained,
+            "map_only": dependency_regions.map_only,
+            "bindings": dependency_regions.bindings,
+        }
+        graph.G.graph["map_ir"] = map_ir
+
+    report("ssa-source: selecting complete control/operator deployment")
+    deployment_type = strategize_shell_deployment(
+        deployment_graph,
+        backend="fortran",
+        runtime_closure_only=(runtime_closure_only and not whole_source),
+    )
+    report("ssa-source: instantiating complete control/operator deployment")
+    deployment = deployment_type(profiling=False, shell_language="glsl")
+    deployment.prepare_complete_catalogue = whole_source
+    report("ssa-source: validating resolved ProcessGraph call topology")
+    deployment.compile_process_graph(prepare_ephemerals=False)
+    if subdivision_request is not None:
+        from .glsl_deployment_strategy import (
+            _structural_region_program_from_subgraph,
+            _walk_planned_shells,
+        )
+
+        subdivision_kind = str(
+            subdivision_request.get("kind") or "loop-control-owner"
+        )
+        requested_regions = tuple(sorted(map(
+            int, subdivision_request.get("region_indices") or (),
+        )))
+        requested_names = set(map(
+            str, subdivision_request.get("qualified_names") or (),
+        ))
+        requested_references = tuple(map(
+            int, subdivision_request.get("function_references") or (),
+        ))
+        if subdivision_kind == "function-shell":
+            if len(requested_references) != 1:
+                raise ValueError(
+                    "function-shell subdivision requires exactly one "
+                    "function reference"
+                )
+            requested_reference = int(requested_references[0])
+            target = deployment.function_shells.get(requested_reference)
+            if target is None:
+                deployment_reference = deployment.process_graph.G.graph.get(
+                    "function_ref"
+                )
+                if deployment_reference == requested_reference:
+                    target = deployment
+            if target is None:
+                raise ValueError(
+                    "function-shell subdivision cannot find its selected "
+                    f"shell reference {requested_reference}"
+                )
+            target_graph = target.process_graph.G
+            target_name = str(
+                target_graph.graph.get("qualified_name")
+                or target_graph.graph.get("function_name")
+                or ""
+            )
+            requested_regions = tuple(range(len(target.dispatch_subgraphs)))
+            report(
+                "ssa-source: extracting deterministic function-shell "
+                f"subdivision {target_name} regions {requested_regions}"
+            )
+            return {
+                region_index: _structural_region_program_from_subgraph(
+                    target.dispatch_subgraphs[region_index]
+                )
+                for region_index in requested_regions
+            }
+
+        requested_loop = int(subdivision_request["loop_node_id"])
+        matches = []
+        for target in _walk_planned_shells(
+            deployment, include_function_registry=True,
+        ):
+            target_graph = target.process_graph.G
+            target_name = str(
+                target_graph.graph.get("qualified_name")
+                or target_graph.graph.get("function_name")
+                or ""
+            )
+            if requested_names and target_name not in requested_names and not any(
+                name.endswith("." + target_name) for name in requested_names
+            ):
+                continue
+            reduction = next((
+                item for item in target.loop_shader_reductions
+                if int(item.loop_node_id) == requested_loop
+            ), None)
+            if reduction is None:
+                continue
+            owned_regions = set(map(int, reduction.region_indices))
+            if not set(requested_regions).issubset(owned_regions):
+                raise ValueError(
+                    "subdivision request names regions outside its loop "
+                    f"owner: requested={requested_regions!r} "
+                    f"owned={tuple(sorted(owned_regions))!r}"
+                )
+            matches.append((target_name, target))
+        if len(matches) != 1:
+            raise ValueError(
+                "subdivision request must resolve exactly one planned shell; "
+                f"matched={tuple(name for name, _target in matches)!r}"
+            )
+        target_name, target = matches[0]
+        report(
+            "ssa-source: extracting deterministic subdivision integral "
+            f"{target_name} loop {requested_loop} regions {requested_regions}"
+        )
+        return {
+            region_index: _structural_region_program_from_subgraph(
+                target.dispatch_subgraphs[region_index]
+            )
+            for region_index in requested_regions
+        }
+    report("ssa-source: planning complete control/operator graph")
+    deployment.prepare_graph_precompile(
+        progress=report,
+        structural_ssa_only=True,
+    )
+    compilation = SimpleNamespace(
+        deployment=deployment,
+        class_navigation=build_class_navigation_table(graph),
+    )
+    report("ssa-source: lowering full planned source to repository SSA")
+    artifact_name = _identifier(str(name or entrypoint or "whole_source"))
+    module, outputs, exports = _class_surface_ssa_program(
+        compilation,
+        artifact_name,
+        tensor_ssa_reference=tensor_ssa_reference,
+    )
+    if linked_source_region_ssa:
+        from .precompile_to_ssa import link_verified_source_region_integrals
+
+        region_link_receipts = link_verified_source_region_integrals(
+            module, outputs, linked_source_region_ssa,
+        )
+        linked_count = sum(
+            receipt.get("status") == "linked"
+            for receipt in region_link_receipts
+        )
+        if linked_count:
+            report(
+                f"ssa-source: linked {linked_count} verified source region(s)"
+            )
+    return module, outputs, exports
+
+
+def extract_resolved_process_graph_subdivision_programs(
+    graph: Any,
+    integral: Mapping[str, Any],
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> Mapping[int, Any]:
+    """Extract exact planner regions without lowering the blocked owner."""
+
+    references = tuple(map(int, integral.get("function_references") or ()))
+    if not references:
+        raise ValueError("subdivision integral has no function reference")
+    return _lower_resolved_process_graph_deployment(
+        graph,
+        None,
+        selected_function_references=references,
+        activation_function_references=references,
+        name="subdivision_integral",
+        runtime_closure_only=True,
+        subdivision_request=integral,
+        # Every subdivision is deliberately smaller than its recorded
+        # dependency closure. Calls outside the cut remain authored source;
+        # the child is never allowed to make them implicit native launches.
+        allow_authored_source_callees=True,
+        progress=progress,
+    )
+
+
+def lower_resolved_process_graph_unit_to_ssa(
+    graph: Any,
+    function_references: Iterable[int],
+    *,
+    linked_repository_ssa: Mapping[
+        int, tuple[Any, str, Mapping[str, Any]]
+    ] | None = None,
+    authored_dependency_references: Iterable[int] = (),
+    name: str | None = None,
+    tensor_ssa_reference: Any = None,
+    allow_function_shell_cut: bool = False,
+    progress: Callable[[str], None] | None = None,
+):
+    """Compile one exact unit from a serialized post-reduction ProcessGraph."""
+
+    from .compilation_units import record_compilation_unit_plan
+
+    selected = tuple(sorted(set(map(int, function_references))))
+    plan = record_compilation_unit_plan(graph)
+    matching = tuple(
+        unit for unit in plan.units
+        if tuple(sorted(unit.function_references)) == selected
+    )
+    if len(matching) == 1:
+        selected_unit = matching[0]
+        selected_names = tuple(selected_unit.qualified_names)
+        selected_record = selected_unit.to_mapping()
+    elif allow_function_shell_cut and len(selected) == 1:
+        selected_unit = None
+        selected_names = (
+            str(graph.function_table.entry(selected[0]).qualified_name),
+        )
+        selected_record = {
+            "qualified_names": list(selected_names),
+            "function_references": list(selected),
+            "dependency_units": [],
+            "recursive": False,
+            "kind": "authored-function-shell-cut",
+        }
+    else:
+        raise ValueError(
+            "selected references must exactly match one recorded "
+            f"compilation unit; got {selected!r}"
+        )
+    for reference, (linked_module, linked_root, linked_outputs) in dict(
+        linked_repository_ssa or {}
+    ).items():
+        entry = graph.function_table.entry(int(reference))
+        entry.metadata.update({
+            "host_ssa_module": linked_module,
+            "host_ssa_root": str(linked_root),
+            "host_ssa_outputs": dict(linked_outputs),
+            "host_repository_ssa_complete": True,
+            "host_machine_state_complete": False,
+            "host_ssa_blockers": (),
+            "host_ssa_hard_blockers": (),
+            "host_ssa_legalization_shortfalls": (),
+            "host_ssa_unresolved_dependencies": (),
+            "implementation_kind": "linked-repository-ssa",
+            "implementation_variants": ("repository-ssa",),
+        })
+    module, outputs, exports = _lower_resolved_process_graph_deployment(
+        graph,
+        selected_names[0],
+        selected_function_references=tuple(dict.fromkeys((
+            *selected, *map(int, authored_dependency_references),
+        ))),
+        activation_function_references=selected,
+        name=name,
+        runtime_closure_only=True,
+        tensor_ssa_reference=tensor_ssa_reference,
+        allow_authored_source_callees=allow_function_shell_cut,
+        progress=progress,
+    )
+    module.metadata["compilation_unit_plan"] = plan.to_mapping()
+    module.metadata["compiled_process_graph_unit"] = selected_record
+    return module, outputs, exports
+
+
 def lower_ast_source_to_ssa(
     source: str,
     entrypoint: str | None = None,
     *,
     python_bindings: Mapping[str, Any] | None = None,
+    external_class_field_aggregate_kinds: Mapping[
+        tuple[str, str], str
+    ] | None = None,
     dependency_seeds: tuple[str, ...] = (),
     retain: Any = (),
     tensor_code_references: Mapping[str, Callable[..., Any]] | None = None,
@@ -10152,6 +17761,17 @@ def lower_ast_source_to_ssa(
     source_language: str = "python",
     extraction_contract: Any = None,
     linked_process_graphs: Mapping[str, Any] | None = None,
+    linked_repository_ssa: Mapping[
+        str, tuple[Any, str] | tuple[Any, str, Mapping[str, Any]]
+    ] | None = None,
+    linked_source_region_ssa: Mapping[
+        tuple[str, ...], tuple[Any, Mapping[str, Any], Mapping[str, Any]]
+    ] | None = None,
+    compilation_unit_plan_sink: (
+        Callable[[Mapping[str, Any]], None] | None
+    ) = None,
+    resolved_process_graph_sink: Callable[[Any], None] | None = None,
+    stop_after_compilation_unit_plan: bool = False,
 ):
     """Ingest one complete authored program and lower it directly to SSA.
 
@@ -10177,9 +17797,16 @@ def lower_ast_source_to_ssa(
         reduce_abstract_tensor_topology,
     )
     from ..transmogrifier.graph.graph_express2 import ProcessGraph
-    from .glsl_deployment_strategy import strategize_shell_deployment
+    from .glsl_deployment_strategy import (
+        _lower_python_scalar_intrinsics,
+        _resolve_grounded_method_references,
+        strategize_shell_deployment,
+    )
     from .loop_interchange import interchange_reduction_loops
-    from .shell_reference_tables import build_class_navigation_table
+    from .shell_reference_tables import (
+        build_class_navigation_table,
+        build_map_dependency_regions,
+    )
     from .work_contract import active_contract
 
     def report(message: str) -> None:
@@ -10203,6 +17830,60 @@ def lower_ast_source_to_ssa(
             f"{len(interchange.decisions)} reduction nest(s)"
         )
     tree = ast.parse(source)
+    # No selected root is the canonical whole-source mode.  It deliberately
+    # disables runtime-closure pruning so module statements, every authored
+    # definition, and their configured dependency domains remain eligible.
+    compile_targets = (
+        () if entrypoint is None else (str(entrypoint), *map(str, dependency_seeds))
+    )
+    whole_source = entrypoint is None
+    single_exit_receipts = _normalize_top_level_guard_returns(
+        tree, compile_targets,
+    )
+    if single_exit_receipts:
+        report(
+            "ssa-source: normalized return-only guards in "
+            f"{len(single_exit_receipts)} selected function(s)"
+        )
+    inferred_record_views = _authored_dataclass_record_views(tree)
+    inferred_record_schemas = _authored_complete_record_schemas(tree)
+    inferred_sequence_record_views = _authored_sequence_record_views(
+        tree, inferred_record_schemas,
+    )
+    linked_repository_ssa = {
+        str(function_name): (
+            value[0], str(value[1]), dict(value[2]) if len(value) > 2 else {}
+        )
+        for function_name, value in dict(linked_repository_ssa or {}).items()
+    }
+    if linked_repository_ssa:
+        linked_definitions = []
+
+        def register_linkable_definition(node, qualified_name):
+            linked_definitions.append((qualified_name, node))
+            for member in node.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    register_linkable_definition(
+                        member, f"{qualified_name}.<locals>.{member.name}",
+                    )
+
+        for statement in tree.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                register_linkable_definition(statement, statement.name)
+            elif isinstance(statement, ast.ClassDef):
+                for member in statement.body:
+                    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        register_linkable_definition(
+                            member, f"{statement.name}.{member.name}",
+                        )
+        for qualified_name, node in linked_definitions:
+            linked = linked_repository_ssa.get(qualified_name)
+            if linked is None:
+                continue
+            linked_module, linked_root, linked_outputs = linked
+            node._linked_repository_ssa_module = linked_module
+            node._linked_repository_ssa_root = linked_root
+            node._linked_repository_ssa_outputs = linked_outputs
     extraction_policy = extraction_contract
     if extraction_policy is None:
         # The work contract may embed the whole extraction policy; a
@@ -10217,13 +17898,6 @@ def lower_ast_source_to_ssa(
             raise TypeError(
                 "extraction_contract must be a path or ExtractionContract"
             )
-    # No selected root is the canonical whole-source mode.  It deliberately
-    # disables runtime-closure pruning so module statements, every authored
-    # definition, and their configured dependency domains remain eligible.
-    compile_targets = (
-        () if entrypoint is None else (str(entrypoint), *map(str, dependency_seeds))
-    )
-    whole_source = entrypoint is None
     graph = ProcessGraph(
         materialize_memory=False,
         boundary_namespace=boundary_namespace,
@@ -10241,6 +17915,9 @@ def lower_ast_source_to_ssa(
         report("ssa-source: registering authored ProcessGraph functions")
         link_process_graph_functions(graph, linked_process_graphs)
     graph.python_bindings = dict(python_bindings or {})
+    graph.G.graph["external_class_field_aggregate_kinds"] = dict(
+        external_class_field_aggregate_kinds or {}
+    )
     report("ssa-source: building complete ProcessGraph source closure")
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(
@@ -10259,9 +17936,14 @@ def lower_ast_source_to_ssa(
             retain=retain,
             progress=report,
         )
-    if extraction_policy is not None and (
-        extraction_policy.program_abi.records
-        or extraction_policy.program_abi.values
+    if (
+        (extraction_policy is not None and (
+            extraction_policy.program_abi.records
+            or extraction_policy.program_abi.values
+        ))
+        or inferred_record_views
+        or inferred_record_schemas
+        or inferred_sequence_record_views
     ):
         # Type the physical Python/native boundary before topology reduction.
         # This is declarative ABI information only: it does not instantiate a
@@ -10275,23 +17957,54 @@ def lower_ast_source_to_ssa(
             function_name = str(
                 function_graph.graph.get("function_name") or entry.name
             )
-            records = extraction_policy.program_abi.records_for_function(
-                function_name,
-                method_owner=function_graph.graph.get("method_owner"),
-                parameters=function_graph.graph.get("function_parameters") or (),
+            method_owner = function_graph.graph.get("method_owner")
+            qualified_function_name = (
+                f"{method_owner}.{function_name}"
+                if method_owner else function_name
+            )
+            records = (
+                {}
+                if extraction_policy is None else
+                extraction_policy.program_abi.records_for_function(
+                    function_name,
+                    method_owner=function_graph.graph.get("method_owner"),
+                    parameters=(
+                        function_graph.graph.get("function_parameters") or ()
+                    ),
+                )
             )
             parameters = set(map(
                 str, function_graph.graph.get("function_parameters") or ()
             ))
             selected = {
+                parameter: dict(record)
+                for parameter, record in inferred_record_views.get(
+                    qualified_function_name, {}
+                ).items()
+                if parameter in parameters
+            }
+            selected.update({
                 parameter: record.receipt()
                 for parameter, record in records.items()
                 if parameter in parameters
-            }
+            })
             if selected:
                 function_graph.graph["parameter_record_abi"] = selected
-            values = extraction_policy.program_abi.values_for_function(
-                function_name
+            selected_sequence_records = copy.deepcopy(dict(
+                inferred_sequence_record_views.get(
+                    qualified_function_name, {}
+                )
+            ))
+            if selected_sequence_records:
+                function_graph.graph["parameter_sequence_record_abi"] = (
+                    selected_sequence_records
+                )
+            values = (
+                {}
+                if extraction_policy is None else
+                extraction_policy.program_abi.values_for_function(
+                    function_name
+                )
             )
             selected_values = {
                 parameter: binding.receipt()
@@ -10300,13 +18013,43 @@ def lower_ast_source_to_ssa(
             }
             if selected_values:
                 function_graph.graph["parameter_value_abi"] = selected_values
-        graph.G.graph["program_abi"] = extraction_policy.program_abi.receipt()
+        program_abi_receipt = (
+            {"records": {}, "bindings": (), "values": ()}
+            if extraction_policy is None else
+            extraction_policy.program_abi.receipt()
+        )
+        # Explicit contracts remain authoritative. Source-derived schemas fill
+        # only classes whose complete dataclass layout is present in this
+        # authored compilation unit, making their constructors structural SSA
+        # without adding project-specific entries to the extraction contract.
+        program_abi_receipt["records"] = {
+            **inferred_record_schemas,
+            **dict(program_abi_receipt.get("records") or {}),
+        }
+        graph.G.graph["program_abi"] = program_abi_receipt
     graph.G.graph["compile_targets"] = tuple(dict.fromkeys(compile_targets))
+    for intrinsic_graph in (
+        graph,
+        *(getattr(entry, "graph", None) for entry in graph.function_table),
+    ):
+        if getattr(intrinsic_graph, "G", None) is not None:
+            _lower_python_scalar_intrinsics(intrinsic_graph)
     report("ssa-source: reducing source topology")
     reduce_abstract_tensor_topology(graph)
-    if extraction_policy is not None and (
-        extraction_policy.program_abi.records
-        or extraction_policy.program_abi.values
+    for intrinsic_graph in (
+        graph,
+        *(getattr(entry, "graph", None) for entry in graph.function_table),
+    ):
+        if getattr(intrinsic_graph, "G", None) is not None:
+            _lower_python_scalar_intrinsics(intrinsic_graph)
+    if (
+        (extraction_policy is not None and (
+            extraction_policy.program_abi.records
+            or extraction_policy.program_abi.values
+        ))
+        or inferred_record_views
+        or inferred_record_schemas
+        or inferred_sequence_record_views
     ):
         # Reduction extracts fresh per-function graphs from the complete
         # source graph. Reattach the declarative ABI to those canonical
@@ -10321,23 +18064,52 @@ def lower_ast_source_to_ssa(
             function_name = str(
                 function_graph.graph.get("function_name") or entry.name
             )
+            method_owner = function_graph.graph.get("method_owner")
+            qualified_function_name = (
+                f"{method_owner}.{function_name}"
+                if method_owner else function_name
+            )
             parameters = set(map(
                 str, function_graph.graph.get("function_parameters") or ()
             ))
-            records = extraction_policy.program_abi.records_for_function(
-                function_name,
-                method_owner=function_graph.graph.get("method_owner"),
-                parameters=parameters,
+            records = (
+                {}
+                if extraction_policy is None else
+                extraction_policy.program_abi.records_for_function(
+                    function_name,
+                    method_owner=function_graph.graph.get("method_owner"),
+                    parameters=parameters,
+                )
             )
             selected = {
+                parameter: dict(record)
+                for parameter, record in inferred_record_views.get(
+                    qualified_function_name, {}
+                ).items()
+                if parameter in parameters
+            }
+            selected.update({
                 parameter: record.receipt()
                 for parameter, record in records.items()
                 if parameter in parameters
-            }
+            })
             if selected:
                 function_graph.graph["parameter_record_abi"] = selected
-            values = extraction_policy.program_abi.values_for_function(
-                function_name
+            selected_sequence_records = copy.deepcopy(dict(
+                inferred_sequence_record_views.get(
+                    qualified_function_name, {}
+                )
+            ))
+            if selected_sequence_records:
+                function_graph.graph["parameter_sequence_record_abi"] = (
+                    selected_sequence_records
+                )
+            values = (
+                {}
+                if extraction_policy is None else
+                extraction_policy.program_abi.values_for_function(
+                    function_name
+                )
             )
             selected_values = {
                 parameter: binding.receipt()
@@ -10355,29 +18127,39 @@ def lower_ast_source_to_ssa(
 
         report("ssa-source: resolving authored ProcessGraph calls")
         link_process_graph_functions(graph, linked_process_graphs)
-    report("ssa-source: planning complete control/operator graph")
-    deployment_type = strategize_shell_deployment(
-        graph,
-        backend="fortran",
-        runtime_closure_only=(runtime_closure_only and not whole_source),
-    )
-    deployment = deployment_type(profiling=False, shell_language="glsl")
-    deployment.prepare_complete_catalogue = whole_source
-    deployment.compile_process_graph(prepare_ephemerals=False)
-    deployment.prepare_graph_precompile(
-        progress=report,
-        structural_ssa_only=True,
-    )
-    compilation = SimpleNamespace(
-        deployment=deployment,
-        class_navigation=build_class_navigation_table(graph),
-    )
-    report("ssa-source: lowering full planned source to repository SSA")
+    # Hierarchy construction consumes the canonical post-reduction function
+    # graphs, not necessarily the graph instance later visited by recursive
+    # shell specialization. Resolve ABI-declared method receivers here, after
+    # their record contracts were reattached and before the compilation-unit
+    # and call plans snapshot the graph. The operation is idempotent and still
+    # requires an exact/unique receiver class.
+    for function_entry in graph.function_table:
+        function_graph = getattr(function_entry, "graph", None)
+        if getattr(function_graph, "G", None) is not None:
+            _resolve_grounded_method_references(function_graph)
+    from .compilation_units import record_compilation_unit_plan
+
+    report("ssa-source: dividing resolved project into compilation units")
+    compilation_unit_plan = record_compilation_unit_plan(graph)
+    if compilation_unit_plan_sink is not None:
+        compilation_unit_plan_sink(compilation_unit_plan.to_mapping())
+    if resolved_process_graph_sink is not None:
+        resolved_process_graph_sink(graph)
+    if stop_after_compilation_unit_plan:
+        # Planning is a first-class bootstrap product. The caller requested
+        # the exact post-reduction cut and must not pay for, or accidentally
+        # claim, deployment/SSA work beyond that boundary.
+        return None, {}, ()
     artifact_name = _identifier(str(name or entrypoint or "whole_source"))
-    module, outputs, exports = _class_surface_ssa_program(
-        compilation,
-        artifact_name,
+    module, outputs, exports = _lower_resolved_process_graph_deployment(
+        graph,
+        entrypoint,
+        dependency_seeds=dependency_seeds,
+        name=artifact_name,
+        runtime_closure_only=runtime_closure_only,
         tensor_ssa_reference=tensor_ssa_reference,
+        linked_source_region_ssa=linked_source_region_ssa,
+        progress=progress,
     )
     decision_records = tuple({
         "identity": str(decision.identity),
@@ -10396,6 +18178,67 @@ def lower_ast_source_to_ssa(
         "decisions": decision_records,
     }
     module.metadata["loop_interchange"] = receipt
+    module.metadata["single_exit_guard_normalization"] = (
+        single_exit_receipts
+    )
+    module.metadata["compilation_unit_plan"] = compilation_unit_plan.to_mapping()
+    if extraction_policy is not None:
+        extraction_boundaries = tuple(
+            dict(item)
+            for item in graph.G.graph.get("extraction_boundary_calls", ())
+        )
+        materialized_identities: dict[str, int] = {}
+        for function in module.functions.values():
+            for record in function.metadata.get(
+                "extraction_materializations", ()
+            ):
+                identity = record.get("extraction_identity")
+                if identity is not None:
+                    materialized_identities[str(identity)] = (
+                        materialized_identities.get(str(identity), 0) + 1
+                    )
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    identity = instruction.attributes.get(
+                        "extraction_identity"
+                    )
+                    if identity is not None:
+                        materialized_identities[str(identity)] = (
+                            materialized_identities.get(str(identity), 0) + 1
+                        )
+        remaining = dict(materialized_identities)
+        unmaterialized_boundaries = []
+        for boundary in extraction_boundaries:
+            contract = dict(boundary.get("extraction_contract") or {})
+            identity = str(contract.get("identity") or "")
+            if identity and remaining.get(identity, 0) > 0:
+                remaining[identity] -= 1
+            else:
+                unmaterialized_boundaries.append(boundary)
+        unresolved_call_records = tuple(
+            {
+                "caller": str(record.caller),
+                "callsite_id": int(record.callsite_id),
+                "callee": str(record.callee_symbol or record.callee_name),
+            }
+            for records in module.call_table.values()
+            for record in records
+            if record.resolution == "unresolved"
+        )
+        module.metadata["extraction_boundary_accounting"] = {
+            "occurrences": extraction_boundaries,
+            "materialized_identity_counts": materialized_identities,
+            "unmaterialized": tuple(unmaterialized_boundaries),
+            "unresolved_call_records": unresolved_call_records,
+            "repository_ssa_complete": not (
+                unmaterialized_boundaries or unresolved_call_records
+            ),
+        }
+        module.metadata["extraction_contract"] = {
+            "fingerprint": str(getattr(extraction_policy, "fingerprint", "")),
+            "path": str(getattr(extraction_policy, "path", "")),
+            "decisions": list(extraction_policy.receipts()),
+        }
     for decision in decision_records:
         function = module.functions.get(
             f"{artifact_name}__{_identifier(decision['function'])}"

@@ -17,7 +17,10 @@ from .standard_object_product import (
 )
 
 
-def _capture(method: str) -> MethodGraphCapture:
+def _capture(
+    method: str, parameters: Mapping[str, object] | None = None,
+) -> MethodGraphCapture:
+    parameters = dict(parameters or {})
     program = SSATensorProgram(f"standard_blas_{method}")
 
     def inputs(**shapes):
@@ -64,18 +67,22 @@ def _capture(method: str) -> MethodGraphCapture:
     )
 
 
-def blas_graph_captures() -> Mapping[str, Callable[[], MethodGraphCapture]]:
+def blas_graph_captures() -> Mapping[
+    str, Callable[[Mapping[str, object]], MethodGraphCapture]
+]:
     """Fresh semantic captures for every method in the canonical catalog."""
 
     return {
-        method.name: (lambda name=method.name: _capture(name))
+        method.name: (
+            lambda parameters, name=method.name: _capture(name, parameters)
+        )
         for method in BLAS_LIBRARY.methods
     }
 
 
 def blas_standard_object(
     *,
-    specializations: Mapping[str, Sequence[Mapping[str, int]]] | None = None,
+    specializations: Mapping[str, Sequence[Mapping[str, object]]] | None = None,
 ) -> StandardObject:
     """Return BLAS through the same adapter later used by ``linalg``."""
 

@@ -1275,6 +1275,10 @@ def _lower_process_graph_to_compilation(
                 link_process_graph_functions,
             )
             link_process_graph_functions(graph, linked_process_graphs)
+        from ....compiler.compilation_units import record_compilation_unit_plan
+
+        _report("aot: dividing resolved project into compilation units")
+        record_compilation_unit_plan(graph)
         _report("aot: propagating bound planner specializations")
         propagate_bound_planner_specializations(
             graph,

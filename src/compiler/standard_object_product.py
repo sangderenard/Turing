@@ -13,11 +13,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import ast
 import hashlib
+from itertools import product
 import json
 from pathlib import Path
 import pickle
 from typing import Any, Callable, Mapping, Sequence
 
+from ..common.tensors.source_realization import authored_source_realization
 from .kernel_bank import CompiledVariant, KernelBank, KernelSpec
 from .llvm_training_runtime import (
     BrowserGraphReverse,
@@ -69,12 +71,15 @@ class MethodGraphCapture:
 class StandardMethod:
     name: str
     kernel: KernelSpec | None
-    capture_graph: Callable[[], MethodGraphCapture]
-    specializations: tuple[Mapping[str, int], ...] = ()
+    capture_graph: Callable[[Mapping[str, Any]], MethodGraphCapture]
+    specializations: tuple[Mapping[str, Any], ...] = ()
+    baseline_parameters: Mapping[str, Any] | None = None
     authored_source: str | None = None
     installation: str | None = None
 
     def __post_init__(self) -> None:
+        if self.baseline_parameters is None:
+            object.__setattr__(self, "baseline_parameters", {})
         if self.kernel is not None and self.name != self.kernel.name:
             raise ValueError(
                 f"method {self.name!r} must name kernel {self.kernel.name!r}"
@@ -82,10 +87,6 @@ class StandardMethod:
         if self.kernel is None and not self.authored_source:
             raise ValueError(
                 f"graph-forward method {self.name!r} requires authored source"
-            )
-        if self.kernel is None and self.specializations:
-            raise ValueError(
-                f"graph-forward method {self.name!r} cannot yet specialize"
             )
 
     @property
@@ -123,7 +124,7 @@ class CompiledStandardMethod:
     parametric_forward: CompiledVariant | NativeGraphForward
     parametric_reverse: NativeGraphReverse
     browser_reverse: BrowserGraphReverse | None
-    specialized_forwards: tuple[CompiledVariant, ...]
+    specialized_forwards: tuple[CompiledVariant | NativeGraphForward, ...]
 
 
 @dataclass(frozen=True)
@@ -155,6 +156,8 @@ def _variant_record(variant: CompiledVariant) -> dict[str, Any]:
 def _forward_record(
     forward: CompiledVariant | NativeGraphForward,
     root: Path,
+    *,
+    specialized: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if isinstance(forward, CompiledVariant):
         return {"kind": "kernel_bank", **_variant_record(forward)}
@@ -169,7 +172,7 @@ def _forward_record(
         "input_value_ids": dict(forward.input_value_ids),
         "output_value_ids": list(forward.output_value_ids),
         "artifact": record,
-        "specialized": {},
+        "specialized": dict(specialized or {}),
     }
 
 
@@ -303,6 +306,7 @@ def cook_standard_object(
     directory: str | Path,
     contract: str | None = None,
     reverse_backends: Sequence[str] = ("native", "wasm"),
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> StandardObjectProduct:
     """Compile and publish one complete standard numerical object.
 
@@ -312,6 +316,15 @@ def cook_standard_object(
     specialization can never make an otherwise incomplete method publishable.
     """
 
+    def report(stage: str, **details: Any) -> None:
+        if progress is not None:
+            progress({
+                "stage": stage,
+                "object": spec.identity,
+                **details,
+            })
+
+    report("object_start", method_count=len(spec.methods))
     selected_reverse_backends = tuple(dict.fromkeys(
         str(backend).strip().lower() for backend in reverse_backends
     ))
@@ -343,7 +356,13 @@ def cook_standard_object(
     compiled: dict[str, CompiledStandardMethod] = {}
 
     for method in spec.methods:
-        capture = method.capture_graph()
+        report("method_start", method=method.name)
+        # This is an architectural boundary, not an adapter convention.  A
+        # standard object is always one closed compilation of recursively
+        # authored source.  Installed/baked objects may serve an eager caller,
+        # but may never become interior calls in this capture.
+        with authored_source_realization():
+            capture = method.capture_graph(dict(method.baseline_parameters))
         forward = (
             bank.get(method.name, contract=contract, specialized=None)
             if method.kernel is not None else compile_native_graph_forward(
@@ -354,6 +373,11 @@ def cook_standard_object(
                 directory=root / "forward-graph" / method.name,
             )
         )
+        report(
+            "forward_complete", method=method.name,
+            parameters=dict(method.baseline_parameters),
+            key=forward.key,
+        )
         reverse = compile_native_graph_reverse(
             capture.output,
             bindings=capture.bindings,
@@ -362,6 +386,11 @@ def cook_standard_object(
             directory=root / "reverse" / method.name,
             unit_output_seed=False,
         )
+        report(
+            "reverse_complete", method=method.name,
+            parameters=dict(method.baseline_parameters),
+            artifact=reverse.name,
+        )
         browser_reverse = (
             compile_graph_reverse_to_wasm(
                 reverse,
@@ -369,17 +398,61 @@ def cook_standard_object(
             )
             if "wasm" in selected_reverse_backends else None
         )
-        specializations = tuple(
-            bank.get(
-                method.name,
-                contract=contract,
-                specialized=dict(parameters),
-            )
-            for parameters in method.specializations
-        ) if method.kernel is not None else ()
+        if method.kernel is not None:
+            kernel_variants = []
+            for index, parameters in enumerate(method.specializations):
+                report(
+                    "specialization_start", method=method.name,
+                    parameters=dict(parameters), index=index,
+                    count=len(method.specializations),
+                )
+                kernel_variants.append(bank.get(
+                    method.name,
+                    contract=contract,
+                    specialized=dict(parameters),
+                ))
+                report(
+                    "specialization_complete", method=method.name,
+                    parameters=dict(parameters), index=index,
+                    count=len(method.specializations),
+                    key=kernel_variants[-1].key,
+                )
+            specializations = tuple(kernel_variants)
+        else:
+            graph_variants = []
+            for index, parameters in enumerate(method.specializations):
+                report(
+                    "specialization_start", method=method.name,
+                    parameters=dict(parameters), index=index,
+                    count=len(method.specializations),
+                )
+                with authored_source_realization():
+                    specialized_capture = method.capture_graph(dict(parameters))
+                digest = hashlib.sha256(_canonical(dict(parameters))).hexdigest()[:12]
+                graph_variants.append(compile_native_graph_forward(
+                    specialized_capture.output,
+                    bindings=specialized_capture.bindings,
+                    source=method.source,
+                    name=(
+                        f"{spec.identity.replace('.', '_')}__{method.name}"
+                        f"__{digest}"
+                    ),
+                    directory=(
+                        root / "forward-graph" / method.name
+                        / f"specialized-{index:04d}-{digest}"
+                    ),
+                ))
+                report(
+                    "specialization_complete", method=method.name,
+                    parameters=dict(parameters), index=index,
+                    count=len(method.specializations),
+                    key=graph_variants[-1].key,
+                )
+            specializations = tuple(graph_variants)
         compiled[method.name] = CompiledStandardMethod(
             method, forward, reverse, browser_reverse, specializations,
         )
+        report("method_complete", method=method.name)
 
     browser_loader_source = (
         _browser_reverse_javascript()
@@ -403,6 +476,8 @@ def cook_standard_object(
                 "wasm" in selected_reverse_backends
             ),
             "specializations_are_optional_overlays": True,
+            "realization": "recursive_authored_source",
+            "interior_compiled_artifact_calls": False,
         },
         **({
             "browser_loader_source_sha256": hashlib.sha256(
@@ -416,7 +491,11 @@ def cook_standard_object(
                 "source_sha256": hashlib.sha256(
                     method.source.encode("utf-8")
                 ).hexdigest(),
+                "source_revision": hashlib.sha256(
+                    method.source.encode("utf-8")
+                ).hexdigest(),
                 "installation": method.installation,
+                "baseline_parameters": dict(method.baseline_parameters),
                 "parametric_forward_key": compiled[method.name].parametric_forward.key,
                 "reverse_input_value_ids": {
                     str(key): int(value) for key, value in
@@ -434,8 +513,7 @@ def cook_standard_object(
                     compiled[method.name].parametric_reverse.seed_value_ids.items()
                 },
                 "specializations": [
-                    dict(variant.specialized)
-                    for variant in compiled[method.name].specialized_forwards
+                    dict(parameters) for parameters in method.specializations
                 ],
             }
             for method in spec.methods
@@ -446,7 +524,8 @@ def cook_standard_object(
             for row in (
                 {
                     "method": method.name,
-                    "parameters": {},
+                    "parameters": dict(method.baseline_parameters),
+                    "baseline": True,
                     "key": compiled[method.name].parametric_forward.key,
                     "kind": (
                         "captured_graph"
@@ -459,11 +538,19 @@ def cook_standard_object(
                 *(
                     {
                         "method": method.name,
-                        "parameters": dict(variant.specialized),
+                        "parameters": dict(parameters),
+                        "baseline": False,
                         "key": variant.key,
-                        "kind": "kernel_bank",
+                        "kind": (
+                            "captured_graph"
+                            if isinstance(variant, NativeGraphForward)
+                            else "kernel_bank"
+                        ),
                     }
-                    for variant in compiled[method.name].specialized_forwards
+                    for parameters, variant in zip(
+                        method.specializations,
+                        compiled[method.name].specialized_forwards,
+                    )
                 ),
             )
         ],
@@ -484,7 +571,8 @@ def cook_standard_object(
         "artifacts": {
             method.name: {
                 "parametric_forward": _forward_record(
-                    compiled[method.name].parametric_forward, root
+                    compiled[method.name].parametric_forward, root,
+                    specialized=method.baseline_parameters,
                 ),
                 "parametric_reverse": _reverse_artifact_record(
                     compiled[method.name].parametric_reverse, root
@@ -495,8 +583,15 @@ def cook_standard_object(
                     ),
                 } if compiled[method.name].browser_reverse is not None else {}),
                 "specialized_forwards": [
-                    _variant_record(variant) for variant in
-                    compiled[method.name].specialized_forwards
+                    (
+                        _forward_record(variant, root, specialized=parameters)
+                        if isinstance(variant, NativeGraphForward)
+                        else _variant_record(variant)
+                    )
+                    for parameters, variant in zip(
+                        method.specializations,
+                        compiled[method.name].specialized_forwards,
+                    )
                 ],
             }
             for method in spec.methods
@@ -510,6 +605,7 @@ def cook_standard_object(
         newline="\n",
     )
     temporary.replace(manifest_path)
+    report("object_complete", product_id=product_id, manifest=str(manifest_path))
     return StandardObjectProduct(root, manifest_path, manifest, compiled)
 
 
@@ -517,8 +613,14 @@ def mathematical_sublibrary_object(
     library: Any,
     *,
     kernels: Mapping[str, KernelSpec] | None,
-    graph_captures: Mapping[str, Callable[[], MethodGraphCapture]],
-    specializations: Mapping[str, Sequence[Mapping[str, int]]] | None = None,
+    graph_captures: Mapping[
+        str, Callable[[Mapping[str, Any]], MethodGraphCapture]
+    ],
+    specializations: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+    parameter_domains: Mapping[
+        str, Mapping[str, Sequence[Any]]
+    ] | None = None,
+    baseline_parameters: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> StandardObject:
     """Adapt a canonical mathematical sublibrary without copying its catalog."""
 
@@ -533,6 +635,32 @@ def mathematical_sublibrary_object(
             f"extras={sorted(extras)!r}"
         )
     matrix = dict(specializations or {})
+    domains = dict(parameter_domains or {})
+    baselines = {
+        str(name): dict(parameters)
+        for name, parameters in dict(baseline_parameters or {}).items()
+    }
+    overlap = set(matrix) & set(domains)
+    if overlap:
+        raise ValueError(
+            f"methods cannot provide both rows and parameter domains: {sorted(overlap)!r}"
+        )
+    for method_name, axes in domains.items():
+        method = library.method(method_name)
+        axis_names = tuple(axes)
+        values = tuple(tuple(axes[name]) for name in axis_names)
+        if any(not items for items in values):
+            raise ValueError(f"{method.identity} parameter domains cannot be empty")
+        matrix[method_name] = tuple(
+            dict(zip(axis_names, combination))
+            for combination in product(*values)
+        )
+    for method_name, baseline in baselines.items():
+        library.method(method_name)
+        matrix[method_name] = tuple(
+            row for row in matrix.get(method_name, ())
+            if dict(row) != baseline
+        )
     return StandardObject(
         name=str(library.name),
         identity=str(library.identity),
@@ -542,6 +670,7 @@ def mathematical_sublibrary_object(
                 kernel_map.get(name),
                 graph_captures[name],
                 tuple(matrix.get(name, ())),
+                baseline_parameters=baselines.get(name, {}),
                 authored_source=str(library.method(name).source),
                 installation=library.method(name).installation,
             )
@@ -558,8 +687,10 @@ def standard_object_from_source(
     entrypoint: str,
     feeds: Mapping[str, Any],
     kernels: Mapping[str, KernelSpec],
-    graph_captures: Mapping[str, Callable[[], MethodGraphCapture]],
-    specializations: Mapping[str, Sequence[Mapping[str, int]]] | None = None,
+    graph_captures: Mapping[
+        str, Callable[[Mapping[str, Any]], MethodGraphCapture]
+    ],
+    specializations: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ) -> StandardObject:
     """Batch-ingest one authored class surface and its numerical recipes."""
 

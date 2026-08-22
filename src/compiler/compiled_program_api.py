@@ -72,6 +72,11 @@ class Parameter:
     # Exact runtime dimensions for a shape-dynamic array. ``extent`` remains
     # as the rank-one/backward-compatible spelling.
     extents: tuple[str, ...] = ()
+    # A scalar may be a deterministic projection of an authored input rather
+    # than the input itself (for example ``len(text.encode("utf-8"))``).  The
+    # projection is part of the public ABI contract; wrappers must not infer
+    # it from an anonymous SSA spelling or silently supply a placeholder.
+    source_transform: str | None = None
 
     def to_mapping(self) -> dict[str, Any]:
         mapping: dict[str, Any] = {
@@ -90,6 +95,8 @@ class Parameter:
             mapping["extents"] = list(self.extents)
         if self.source_name is not None:
             mapping["source_name"] = self.source_name
+        if self.source_transform is not None:
+            mapping["source_transform"] = self.source_transform
         return mapping
 
 
@@ -165,6 +172,7 @@ def describe_fortran_function(
     kind: str = "numerical",
     note: str | None = None,
     source_names: Mapping[int, str] | None = None,
+    source_transforms: Mapping[int, str] | None = None,
     dynamic_array_extents: Mapping[int, str] | None = None,
     dynamic_array_dimensions: Mapping[int, Sequence[str]] | None = None,
     array_argument_ids: Iterable[int] = (),
@@ -179,6 +187,7 @@ def describe_fortran_function(
 
     parameters: list[Parameter] = []
     source_names = dict(source_names or {})
+    source_transforms = dict(source_transforms or {})
     dynamic_array_extents = {
         int(value_id): str(extent)
         for value_id, extent in dict(dynamic_array_extents or {}).items()
@@ -212,19 +221,21 @@ def describe_fortran_function(
             or int(value.id) in array_argument_ids
         )
         accounting = dict(value.accounting or {})
-        workspace = (
-            not accounting.get("program_abi_parameter")
-            and (
-                accounting.get("linked_call_frame_storage") is not None
-                or accounting.get("returned_record_storage") is not None
-            )
-        )
-        dimensions = dynamic_array_dimensions.get(int(value.id), ())
         authored_source_name = source_names.get(int(value.id))
         if authored_source_name is None and accounting.get("program_abi_parameter"):
             authored_source_name = str(accounting["program_abi_parameter"])
             if accounting.get("program_abi_field"):
                 authored_source_name += "." + str(accounting["program_abi_field"])
+        workspace = (
+            authored_source_name is None
+            and not accounting.get("program_abi_parameter")
+            and (
+                accounting.get("linked_call_frame_storage") is not None
+                or accounting.get("returned_record_storage") is not None
+                or accounting.get("compiler_frame_storage") is not None
+            )
+        )
+        dimensions = dynamic_array_dimensions.get(int(value.id), ())
         parameters.append(
             Parameter(
                 name=f"t{value.id}",
@@ -263,6 +274,7 @@ def describe_fortran_function(
                 ),
                 extents=dimensions,
                 source_name=authored_source_name,
+                source_transform=source_transforms.get(int(value.id)),
             )
         )
     for value in outputs:
@@ -290,6 +302,7 @@ def describe_fortran_function(
                 ),
                 extents=dimensions,
                 source_name=source_names.get(int(value.id)),
+                source_transform=source_transforms.get(int(value.id)),
             )
         )
     return EntryPoint(

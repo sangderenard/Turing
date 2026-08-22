@@ -55,6 +55,30 @@ def test_process_graph_planner_keeps_shared_multi_output_producer_in_one_region(
     assert lowered.outputs == {"sine": 4, "cosine": 5}
 
 
+def test_string_control_comparison_never_becomes_numeric_dispatch_region():
+    program = FusedProgram(
+        version=1,
+        feeds={1},
+        steps=[
+            OpStep(
+                0, "tensor_from_list", [],
+                attrs={"values": "delete"}, result_id=2,
+            ),
+            OpStep(1, "equal", [1, 2], result_id=3),
+        ],
+        outputs={"selected": 3},
+    )
+    graph = fused_program_to_process_graph(program)
+
+    plan = plan_process_graph_dispatches(
+        graph,
+        BackendFusionProfile("glsl", frozenset(GLSL_OPS)),
+    )
+
+    assert plan.regions == ()
+    assert 3 in plan.uncovered_nodes
+
+
 def test_multi_output_glsl_emitter_writes_all_results_in_one_shader():
     source = emit_multi_output_program_source(
         _branched_program(),

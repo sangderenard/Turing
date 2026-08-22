@@ -25,6 +25,8 @@ from src.compiler.loop_composer import (
     planned_collection_bindings,
 )
 from src.compiler.glsl_deployment_strategy import (
+    _fold_callsite_structural_values,
+    _resolve_grounded_method_references,
     propagate_bound_planner_specializations,
     strategize_shell_deployment,
 )
@@ -317,6 +319,265 @@ def test_mutable_public_parameter_is_not_a_planner_specialization():
     )
 
 
+def test_structural_fold_does_not_specialize_a_public_parameter_default():
+    graph = _function_graph(
+        "def map_block_bytes(capacity: int = 8) -> int:\n"
+        "    return 16 + int(capacity) * 24\n",
+        "map_block_bytes",
+    )
+    input_id = next(
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "capacity"
+    )
+
+    _fold_callsite_structural_values(graph)
+
+    assert input_id in graph.G
+    assert graph.G.nodes[input_id]["type"] == "Input"
+    assert graph.G.out_degree(input_id) > 0
+
+
+def test_grounded_method_resolution_uses_declared_parameter_record_identity():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse("""
+class CodeBuilder:
+    def to_body(self):
+        return 1
+
+def run(body: CodeBuilder):
+    return body.to_body()
+"""))
+    reduce_abstract_tensor_topology(graph)
+    run_graph = graph.function_table.entry("run").graph
+    method_ref = graph.G.graph["class_table"]["CodeBuilder"]["methods"][
+        "to_body"
+    ]
+    run_graph.G.graph["parameter_record_abi"] = {
+        "body": {"identity": "CodeBuilder", "fields": {}},
+    }
+    for _node_id, data in run_graph.G.nodes(data=True):
+        attributes = dict(data.get("attributes") or {})
+        if isinstance(data.get("expr_obj"), ast.Call):
+            attributes.pop("method_ref", None)
+            attributes.pop("callee_ref", None)
+        if (
+            data.get("type") == "Input"
+            and attributes.get("binding_name") == "body"
+        ):
+            attributes.pop("class_ref", None)
+        data["attributes"] = attributes
+
+    _resolve_grounded_method_references(run_graph)
+
+    call = next(
+        data
+        for _node_id, data in run_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+    )
+    assert call["attributes"]["method_ref"] == method_ref
+    assert call["attributes"]["method_resolution"] == "receiver-class-ref"
+
+
+def test_structural_fold_follows_declared_nested_record_schema():
+    graph = _function_graph(
+        "def read_flag(graph):\n"
+        "    if isinstance(graph.G.enabled, bool):\n"
+        "        return graph.G.enabled\n"
+        "    return False\n",
+        "read_flag",
+    )
+    graph.G.graph["parameter_record_abi"] = {
+        "graph": {
+            "identity": "CompilerProcessGraph",
+            "fields": {
+                "G": {
+                    "storage": "record", "dtype": None, "rank": 0,
+                    "mutable": False, "record": "CompilerDiGraph",
+                },
+            },
+        },
+    }
+    graph.G.graph["program_abi"] = {
+        "records": {
+            "CompilerProcessGraph": graph.G.graph[
+                "parameter_record_abi"
+            ]["graph"],
+            "CompilerDiGraph": {
+                "identity": "CompilerDiGraph",
+                "fields": {
+                    "enabled": {
+                        "storage": "scalar", "dtype": "bool", "rank": 0,
+                        "mutable": False,
+                    },
+                },
+            },
+        },
+        "bindings": [],
+        "values": [],
+    }
+
+    _fold_callsite_structural_values(graph)
+
+    assert not any(
+        data.get("type") == "If" for _node_id, data in graph.G.nodes(data=True)
+    )
+    assert len(graph.G.graph[
+        "structurally_specialized_conditional_node_ids"
+    ]) == 1
+    assert any(
+        (data.get("attributes") or {}).get("attribute") == "enabled"
+        for _node_id, data in graph.G.nodes(data=True)
+    )
+
+
+def test_structural_fold_follows_keyed_record_row_schema():
+    graph = _function_graph(
+        "def read_kind(graph, node_id):\n"
+        "    data = graph.G.nodes[node_id]\n"
+        "    if isinstance(data.get('kind'), int):\n"
+        "        return data.get('kind')\n"
+        "    return -1\n",
+        "read_kind",
+    )
+    graph.G.graph["parameter_record_abi"] = {
+        "graph": {
+            "identity": "CompilerProcessGraph",
+            "fields": {
+                "G": {
+                    "storage": "record", "dtype": None, "rank": 0,
+                    "mutable": False, "record": "CompilerDiGraph",
+                },
+            },
+        },
+    }
+    graph.G.graph["program_abi"] = {
+        "records": {
+            "CompilerProcessGraph": graph.G.graph[
+                "parameter_record_abi"
+            ]["graph"],
+            "CompilerDiGraph": {
+                "identity": "CompilerDiGraph",
+                "fields": {
+                    "nodes": {
+                        "storage": "keyed", "dtype": "int64", "rank": 1,
+                        "key_encoding": "integer_identity",
+                        "value_record": "CompilerNode",
+                    },
+                },
+            },
+            "CompilerNode": {
+                "identity": "CompilerNode",
+                "fields": {
+                    "kind": {
+                        "storage": "scalar", "dtype": "int64", "rank": 0,
+                        "mutable": False,
+                    },
+                },
+            },
+        },
+        "bindings": [],
+        "values": [],
+    }
+
+    _fold_callsite_structural_values(graph)
+
+    assert not any(
+        data.get("type") == "If" for _node_id, data in graph.G.nodes(data=True)
+    )
+    assert any(
+        str(data.get("op") or data.get("type")).casefold() == "get"
+        for _node_id, data in graph.G.nodes(data=True)
+    )
+
+
+def test_structural_fold_does_not_treat_row_reference_fact_as_its_value():
+    graph = _function_graph(
+        "def inspect_row(graph, node_id):\n"
+        "    data = graph.G.nodes[node_id]\n"
+        "    if data.get('type') == 'Constant':\n"
+        "        return True\n"
+        "    if isinstance(data.get('expr_obj'), tuple):\n"
+        "        return True\n"
+        "    return False\n",
+        "inspect_row",
+    )
+    graph.G.graph["parameter_record_abi"] = {
+        "graph": {
+            "identity": "CompilerProcessGraph",
+            "fields": {
+                "G": {
+                    "storage": "record", "record": "CompilerDiGraph",
+                },
+            },
+        },
+    }
+    graph.G.graph["program_abi"] = {
+        "records": {
+            "CompilerProcessGraph": graph.G.graph[
+                "parameter_record_abi"
+            ]["graph"],
+            "CompilerDiGraph": {
+                "identity": "CompilerDiGraph",
+                "fields": {
+                    "nodes": {
+                        "storage": "keyed", "dtype": "int64", "rank": 1,
+                        "value_record": "CompilerNode",
+                    },
+                },
+            },
+            "CompilerNode": {
+                "identity": "CompilerNode",
+                "fields": {
+                    "type": {"storage": "reference"},
+                    "expr_obj": {"storage": "reference"},
+                },
+            },
+        },
+        "bindings": [],
+        "values": [],
+    }
+    authored_if_nodes = sum(
+        data.get("type") == "If"
+        for _node_id, data in graph.G.nodes(data=True)
+    )
+
+    _fold_callsite_structural_values(graph)
+
+    assert sum(
+        data.get("type") == "If"
+        for _node_id, data in graph.G.nodes(data=True)
+    ) == authored_if_nodes
+
+
+def test_structural_fold_retains_singleton_aggregate_leaf_identity():
+    graph = _function_graph(
+        "def packet(payload: bytes) -> bytes:\n"
+        "    return payload + bytes([11])\n",
+        "packet",
+    )
+    aggregate_id = next(
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("aggregate_kind") == "list"
+    )
+    leaf_ids = tuple(
+        (graph.G.nodes[aggregate_id].get("attributes") or {}).get(
+            "aggregate_leaf_value_ids", ()
+        )
+    )
+
+    _fold_callsite_structural_values(graph)
+
+    attributes = graph.G.nodes[aggregate_id]["attributes"]
+    assert graph.G.nodes[aggregate_id]["constant"] == [11]
+    assert attributes["structural_specialization"] is True
+    assert attributes["aggregate_kind"] == "list"
+    assert tuple(attributes["aggregate_leaf_value_ids"]) == leaf_ids
+
+
 def test_loop_composer_keeps_larger_range_in_glsl_source():
     graph = _function_graph(
         "def kernel(x):\n"
@@ -445,6 +706,20 @@ def test_iterable_loop_recovers_authored_attribute_after_parent_edge_loss():
     assert graph.G.nodes[plan.loop.iterable_node]["type"] == "GetAttr"
 
 
+def test_parameter_default_does_not_evaporate_runtime_iterable():
+    graph = _function_graph(
+        "def kernel(items=()):\n"
+        "    return tuple(item for item in items)\n",
+        "kernel",
+    )
+
+    plan, = _glsl_composer().discover(graph)
+
+    assert plan.loop.iterable_constant is None
+    assert plan.loop.trip_count is None
+    assert plan.strategy not in {LoopStrategy.CONSTANT, LoopStrategy.UNROLL}
+
+
 def test_reducer_does_not_create_loop_ports_before_planning():
     graph = _function_graph(
         "def kernel(items):\n"
@@ -530,6 +805,9 @@ def test_raise_guard_inside_retained_loop_becomes_lexical_validation():
     assert reduction.collapsible
     assert "Raise" not in reduction.blockers
     assert reduction.control_program is not None
+    assert reduction.control_program.root.source_loop_node_id == (
+        plans[0].loop.node_id
+    )
     root = reduction.control_program.root
     assert isinstance(root, LoopBlock)
     assert isinstance(root.body, SequenceBlock)
@@ -744,6 +1022,26 @@ def test_comprehension_result_is_resident_sequence_for_following_loop():
     ).get("producer_kind") == "sequence_materialization"
 
 
+def test_comprehension_clause_has_no_statement_body_for_return_analysis():
+    graph = _function_graph(
+        "def kernel(values):\n"
+        "    return [value for value in values if value]\n",
+        "kernel",
+    )
+    composer = _glsl_composer()
+    comprehension_ids = tuple(
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.comprehension)
+    )
+
+    assert comprehension_ids
+    assert all(
+        composer.describe(graph, node_id).source_type == "comprehension"
+        for node_id in comprehension_ids
+    )
+
+
 def test_indexed_table_store_is_memory_effect_not_value_carried_phi():
     graph = _function_graph(
         "def kernel(values):\n"
@@ -796,6 +1094,91 @@ def test_sequence_mutation_no_longer_uses_index_publication_shortcut():
 
     assert renamed.mode is LoopStateEffectMode.SEQUENCE_MUTATION
     assert planned_collection_bindings(graph, loop) == ()
+
+
+def test_mapping_update_becomes_deterministic_table_item_mutation():
+    graph = _function_graph(
+        "def kernel(rows):\n"
+        "    table = {}\n"
+        "    for key, value in rows:\n"
+        "        table.update({key: value})\n"
+        "    return table\n",
+        "kernel",
+    )
+    plan, = _glsl_composer().compose(graph)
+    effect, = plan.loop.state_effects
+
+    assert effect.mode is LoopStateEffectMode.MAPPING_MUTATION
+    assert plan.strategy is not LoopStrategy.UNROLL
+
+    plan, = materialize_retained_loop_ports(graph, (plan,))
+    reduction, = analyze_shader_loop_reductions(
+        graph, (plan,), (plan.loop.body_nodes,),
+    )
+    mutation, = reduction.control_program.root.sequence_mutations
+
+    assert mutation.operator == "update"
+    assert mutation.argument_kind == "mapping_items"
+    assert mutation.policy == "unique"
+    assert mutation.argument_value_ids == (0, 2)
+
+
+def test_mapping_pop_none_preserves_optional_result_identity():
+    graph = _function_graph(
+        "def kernel(rows):\n"
+        "    table = {}\n"
+        "    for key, value in rows:\n"
+        "        previous = table.pop(key, None)\n"
+        "    return table\n",
+        "kernel",
+    )
+    plan, = _glsl_composer().compose(graph)
+    effect, = plan.loop.state_effects
+
+    assert effect.mode is LoopStateEffectMode.MAPPING_MUTATION
+
+    plan, = materialize_retained_loop_ports(graph, (plan,))
+    reduction, = analyze_shader_loop_reductions(
+        graph, (plan,), (plan.loop.body_nodes,),
+    )
+    mutation, = reduction.control_program.root.sequence_mutations
+
+    assert mutation.operator == "pop"
+    assert mutation.argument_kind == "mapping_pop_default_none"
+    assert len(mutation.argument_value_ids) == 2
+
+
+def test_sequence_mutation_expression_resolves_deterministic_value_identity():
+    graph = _function_graph(
+        "def kernel(values):\n"
+        "    results = []\n"
+        "    for value in values:\n"
+        "        results.append(value + 1)\n"
+        "    return results\n",
+        "kernel",
+    )
+    plan, = _glsl_composer().compose(graph)
+    plan, = materialize_retained_loop_ports(graph, (plan,))
+    effect, = plan.loop.state_effects
+    original_argument, = effect.argument_value_ids
+    deterministic_value_id = max(map(int, graph.G.nodes)) + 1000
+    assert deterministic_value_id not in graph.G
+    graph.G.nodes[int(original_argument)]["value_id"] = deterministic_value_id
+    renamed_effect = replace(
+        effect, argument_value_ids=(deterministic_value_id,),
+    )
+    plan = replace(
+        plan,
+        loop=replace(plan.loop, state_effects=(renamed_effect,)),
+    )
+
+    reduction, = analyze_shader_loop_reductions(
+        graph, (plan,), (plan.loop.body_nodes,),
+    )
+    mutation, = reduction.control_program.root.sequence_mutations
+
+    assert mutation.argument_value_ids == (deterministic_value_id,)
+    assert mutation.argument_expressions[0].value_id == deterministic_value_id
 
 
 def test_extend_mutation_is_explicit_sequence_effect_not_index_publication():
@@ -1080,7 +1463,12 @@ def test_list_comprehension_extend_retains_eager_materialized_source():
     outer_control = reductions[outer_index].control_program
 
     assert comprehension_control is not None
-    assert comprehension_control.collection_bindings
+    assert comprehension_control.collection_bindings == ()
+    comprehension_mutation, = comprehension_control.root.sequence_mutations
+    assert comprehension_mutation.operator == "append"
+    assert comprehension_mutation.sequence_value_id == (
+        plans[comprehension_index].loop.iteration_outputs[0].result_value_id
+    )
     mutation, = outer_control.root.sequence_mutations
     assert mutation.operator == "extend"
     assert mutation.argument_kind == "sequence"

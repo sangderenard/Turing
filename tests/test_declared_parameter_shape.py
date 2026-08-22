@@ -21,6 +21,7 @@ and the operation stops being scalar-spelled.
 """
 from __future__ import annotations
 
+import ast
 import pathlib
 import warnings
 
@@ -31,9 +32,13 @@ yaml = pytest.importorskip("yaml")
 from src.compiler.extraction_contract import (
     ExtractionContract,
     ExtractionContractError,
+    ProgramABIContract,
     ProgramABIField,
 )
-from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+from src.compiler.fortran_c_shell import (
+    _normalize_top_level_guard_returns,
+    lower_ast_source_to_ssa,
+)
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 BASE_CONTRACT = REPO / "extraction_contracts" / "program_extraction.yaml"
@@ -73,6 +78,104 @@ def test_extents_must_agree_with_rank():
         )
 
 
+def test_nested_record_field_names_its_exact_schema():
+    field = ProgramABIField.from_mapping(
+        "probe", {"storage": "record", "record": "NodeTable"},
+    )
+
+    assert field.record == "NodeTable"
+    assert field.receipt() == {
+        "storage": "record",
+        "dtype": None,
+        "rank": 0,
+        "mutable": False,
+        "record": "NodeTable",
+    }
+
+
+def test_nested_record_field_cannot_omit_its_schema():
+    with pytest.raises(ExtractionContractError, match="record is required"):
+        ProgramABIField.from_mapping("probe", {"storage": "record"})
+
+
+def test_nested_record_schema_must_exist_in_the_same_contract():
+    with pytest.raises(ExtractionContractError, match="unknown record 'Missing'"):
+        ProgramABIContract.from_mapping({
+            "records": {
+                "Outer": {
+                    "fields": {
+                        "inner": {"storage": "record", "record": "Missing"},
+                    },
+                },
+            },
+            "bindings": [],
+            "values": [],
+        })
+
+
+def test_keyed_integer_identity_preserves_existing_deterministic_ids():
+    field = ProgramABIField.from_mapping("probe", {
+        "storage": "keyed", "dtype": "int64", "rank": 1,
+        "key_encoding": "integer_identity",
+    })
+
+    assert field.key_encoding == "integer_identity"
+    assert field.receipt()["key_encoding"] == "integer_identity"
+
+
+def test_keyed_values_can_name_a_record_row_schema():
+    contract = ProgramABIContract.from_mapping({
+        "records": {
+            "Node": {
+                "fields": {"kind": {"storage": "scalar", "dtype": "int64"}},
+            },
+            "Graph": {
+                "fields": {
+                    "nodes": {
+                        "storage": "keyed", "dtype": "int64", "rank": 1,
+                        "key_encoding": "integer_identity",
+                        "value_record": "Node",
+                    },
+                },
+            },
+        },
+        "bindings": [],
+        "values": [],
+    })
+
+    assert contract.records["Graph"].fields["nodes"].value_record == "Node"
+
+
+def test_keyed_record_can_use_deterministic_key_as_row_identity():
+    contract = ProgramABIContract.from_mapping({
+        "records": {
+            "Node": {"fields": {
+                "kind": {"storage": "scalar", "dtype": "int64"},
+            }},
+            "Graph": {"fields": {"nodes": {
+                "storage": "keyed", "dtype": "int64", "rank": 1,
+                "key_encoding": "integer_identity",
+                "value_record": "Node", "value_identity": "key",
+            }}},
+        },
+        "bindings": [], "values": [],
+    })
+
+    field = contract.records["Graph"].fields["nodes"]
+    assert field.value_identity == "key"
+    assert field.receipt()["value_identity"] == "key"
+
+
+def test_scalar_token_vocabulary_is_ordered_reversible_not_hashed():
+    field = ProgramABIField.from_mapping("probe", {
+        "storage": "scalar", "dtype": "int64",
+        "token_vocabulary": ["Constant", "Input"],
+    })
+
+    assert field.token_vocabulary == ("Constant", "Input")
+    assert field.receipt()["token_vocabulary"] == ["Constant", "Input"]
+
+
 @pytest.mark.parametrize("bad", [[0], [-1], [2.5], ["4"]])
 def test_an_extent_must_be_a_positive_integer(bad):
     with pytest.raises(ExtractionContractError):
@@ -83,6 +186,87 @@ def test_an_extent_must_be_a_positive_integer(bad):
 
 
 # -- end to end through the compiler ---------------------------------------
+
+def test_single_exit_normalization_is_targeted_and_records_authored_guards():
+    tree = ast.parse(
+        "def selected(x):\n"
+        "    if x < 0:\n"
+        "        return 1\n"
+        "    return 2\n\n"
+        "def adjacent(x):\n"
+        "    if x < 0:\n"
+        "        return 3\n"
+        "    return 4\n"
+    )
+
+    receipt = _normalize_top_level_guard_returns(tree, ("selected",))
+
+    assert receipt == ({
+        "function": "selected",
+        "result_name": "__turing_single_exit_result",
+        "guard_count": 1,
+        "source_lines": (2,),
+    },)
+    selected, adjacent = tree.body
+    assert sum(isinstance(node, ast.Return) for node in ast.walk(selected)) == 1
+    assert sum(isinstance(node, ast.Return) for node in ast.walk(adjacent)) == 2
+
+
+def test_nested_return_guards_keep_path_specific_phi_inputs():
+    source = (
+        "def guarded(x):\n"
+        "    if x < 0:\n"
+        "        return 1\n"
+        "    if x == 0:\n"
+        "        return 2\n"
+        "    if x == 1:\n"
+        "        return 3\n"
+        "    return 4\n"
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        module, _outputs, _ = lower_ast_source_to_ssa(
+            source, "guarded", name="guarded_single_exit",
+        )
+
+    function = next(
+        value for name, value in module.functions.items()
+        if name.endswith("__guarded")
+    )
+    assert function.metadata["source_conditional_count"] == 3
+    assert function.metadata["lowered_conditional_count"] == 3
+    instructions = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+    constants = {
+        instruction.attributes.get("value"): int(instruction.res.id)
+        for instruction in instructions
+        if instruction.op == "Const"
+        and instruction.res is not None
+        and (instruction.res.accounting or {}).get("authored_constant")
+    }
+    phis = [instruction for instruction in instructions if instruction.op == "Phi"]
+    assert len(phis) == 3
+    inner = next(
+        phi for phi in phis
+        if {int(value.id) for value in phi.args}
+        == {constants[3], constants[4]}
+    )
+    middle = next(
+        phi for phi in phis
+        if [int(value.id) for value in phi.args]
+        == [constants[2], int(inner.res.id)]
+    )
+    outer = next(
+        phi for phi in phis if phi is not inner and phi is not middle
+    )
+    assert [int(value.id) for value in outer.args] == [
+        constants[1], int(middle.res.id),
+    ]
+    assert sum(instruction.op == "Ret" for instruction in instructions) == 1
+
 
 def _contract(tmp_path, values):
     raw = yaml.safe_load(BASE_CONTRACT.read_text(encoding="utf-8"))
@@ -171,3 +355,216 @@ def test_rank_alone_is_not_enough(tmp_path):
     formals, operands = _lowered(tmp_path, values, "rankonly")
     assert all(shape == () for shape in formals.values())
     assert operands[0][1] == ()
+
+
+def test_nested_record_leaf_becomes_the_only_physical_input(tmp_path):
+    raw = yaml.safe_load(BASE_CONTRACT.read_text(encoding="utf-8"))
+    raw["program_abi"] = {
+        "records": {
+            "CompilerProcessGraph": {
+                "identity": "CompilerProcessGraph",
+                "fields": {
+                    "G": {"storage": "record", "record": "CompilerDiGraph"},
+                },
+            },
+            "CompilerDiGraph": {
+                "identity": "CompilerDiGraph",
+                "fields": {
+                    "enabled": {
+                        "storage": "scalar", "dtype": "bool",
+                        "mutable": False,
+                    },
+                },
+            },
+        },
+        "bindings": [{
+            "function": "read_flag", "parameter": "graph",
+            "record": "CompilerProcessGraph",
+        }],
+        "values": [],
+    }
+    path = tmp_path / "nested-record.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        module, _outputs, _ = lower_ast_source_to_ssa(
+            "def read_flag(graph):\n"
+            "    if isinstance(graph.G.enabled, bool):\n"
+            "        return graph.G.enabled\n"
+            "    return False\n",
+            "read_flag",
+            name="nested_record",
+            extraction_contract=ExtractionContract(path),
+        )
+
+    function_name = next(
+        name for name in module.functions if name.endswith("__read_flag")
+    )
+    function = module.functions[function_name]
+    assert [
+        (value.dtype, value.accounting["program_abi_field"])
+        for value in function.args
+    ] == [("bool", "G.enabled")]
+    records = module.record_tables[function_name].records
+    outer = next(
+        record for record in records.values()
+        if record.identity == "CompilerProcessGraph"
+    )
+    nested = records[outer.fields[0].record_id]
+    assert nested.identity == "CompilerDiGraph"
+    assert nested.fields[0].value_ids == (function.args[0].id,)
+
+
+def test_keyed_record_scalar_field_loads_from_deterministic_row_column(
+    tmp_path,
+):
+    raw = yaml.safe_load(BASE_CONTRACT.read_text(encoding="utf-8"))
+    raw["program_abi"] = {
+        "records": {
+            "CompilerProcessGraph": {
+                "identity": "CompilerProcessGraph",
+                "fields": {
+                    "G": {"storage": "record", "record": "CompilerDiGraph"},
+                },
+            },
+            "CompilerDiGraph": {
+                "identity": "CompilerDiGraph",
+                "fields": {
+                    "nodes": {
+                        "storage": "keyed", "dtype": "int64", "rank": 1,
+                        "key_encoding": "integer_identity",
+                        "value_record": "CompilerNode",
+                        "value_identity": "key",
+                    },
+                },
+            },
+            "CompilerNode": {
+                "identity": "CompilerNode",
+                "fields": {
+                    "kind": {"storage": "scalar", "dtype": "int64"},
+                },
+            },
+        },
+        "bindings": [{
+            "function": "read_kind", "parameter": "graph",
+            "record": "CompilerProcessGraph",
+        }],
+        "values": [],
+    }
+    path = tmp_path / "keyed-record-row.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        module, _outputs, _ = lower_ast_source_to_ssa(
+            "def read_kind(graph, node_id):\n"
+            "    data = graph.G.nodes[node_id]\n"
+            "    return data.get('kind')\n",
+            "read_kind",
+            name="keyed_record_row",
+            extraction_contract=ExtractionContract(path),
+        )
+
+    function_name = next(
+        name for name in module.functions if name.endswith("__read_kind")
+    )
+    function = module.functions[function_name]
+    columns = [
+        value for value in function.args
+        if (value.accounting or {}).get("program_abi_field")
+        == "G.nodes[].kind.column"
+    ]
+    assert len(columns) == 1
+    assert columns[0].dtype == "int64"
+    field_loads = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding")
+        == "program_abi_record_field"
+    ]
+    assert len(field_loads) == 1
+    assert field_loads[0].attributes["program_abi_field"] == (
+        "G.nodes[].kind"
+    )
+    row_record = module.record_tables[function_name].records[
+        int(field_loads[0].res.accounting["program_abi_row_handle"])
+    ]
+    assert row_record.identity == "CompilerNode"
+    assert row_record.fields[0].value_ids == (field_loads[0].res.id,)
+    keys = next(
+        value for value in function.args
+        if (value.accounting or {}).get("program_abi_field")
+        == "G.nodes.keys"
+    )
+    lookup = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("keyed_lookup_owner") == "G.nodes"
+    )
+    assert int(lookup.args[0].id) == int(keys.id)
+    assert int(lookup.args[1].id) == int(keys.id)
+
+
+def test_keyed_record_vocabulary_lowers_isinstance_to_exact_token_tests(
+    tmp_path,
+):
+    raw = yaml.safe_load(BASE_CONTRACT.read_text(encoding="utf-8"))
+    raw["program_abi"] = {
+        "records": {
+            "Graph": {"identity": "Graph", "fields": {
+                "nodes": {
+                    "storage": "keyed", "dtype": "int64", "rank": 1,
+                    "key_encoding": "integer_identity",
+                    "value_record": "Node", "value_identity": "key",
+                },
+            }},
+            "Node": {"identity": "Node", "fields": {
+                "expr_obj": {
+                    "storage": "scalar", "dtype": "int64",
+                    "token_vocabulary": ["builtins.tuple", "builtins.list"],
+                },
+            }},
+        },
+        "bindings": [{
+            "function": "is_aggregate", "parameter": "graph",
+            "record": "Graph",
+        }],
+        "values": [],
+    }
+    path = tmp_path / "vocabulary-type-test.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        module, _outputs, _ = lower_ast_source_to_ssa(
+            "def is_aggregate(graph, node_id):\n"
+            "    data = graph.nodes[node_id]\n"
+            "    return isinstance(data.get('expr_obj'), (tuple, list))\n",
+            "is_aggregate",
+            name="vocabulary_type_test",
+            extraction_contract=ExtractionContract(path),
+        )
+
+    function_name = next(
+        name for name in module.functions if name.endswith("__is_aggregate")
+    )
+    function = module.functions[function_name]
+    tests = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("program_abi_vocabulary_type_test")
+    ]
+    assert [instruction.op for instruction in tests] == ["Eq", "Eq", "Or"]
+    constants = {
+        instruction.attributes.get("program_abi_vocabulary_token"):
+            instruction.attributes.get("value")
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("program_abi_vocabulary_token")
+    }
+    assert constants == {"builtins.tuple": 1, "builtins.list": 2}
+    assert not any(
+        (value.accounting or {}).get("program_abi_storage") == "reference"
+        for value in function.args
+    )

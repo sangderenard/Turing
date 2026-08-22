@@ -52,6 +52,31 @@ exit:
 """
 
 
+def test_fortran_api_describes_scalar_source_projection():
+    text = SSAValue(0, dtype="unknown")
+    encoded_length = SSAValue(5, dtype="int64")
+    function = Function("projection", [text, encoded_length], {
+        "entry": BasicBlock("entry", [Instr("Ret", [], None)], []),
+    }, metadata={
+        "parameter_names": (("text", 0),),
+        "scalar_source_transforms": ((5, "text", "utf8_length"),),
+    })
+
+    emitted = emit_module(
+        IRModule({"projection": function}),
+        name="scalar_source_projection",
+        extra_roots=("projection",),
+    )
+
+    assert emitted.complete
+    parameters = {
+        parameter.name: parameter
+        for parameter in emitted.api.entry_point("projection").parameters
+    }
+    assert parameters["t5"].source_name == "text"
+    assert parameters["t5"].source_transform == "utf8_length"
+
+
 def test_fortran_call_folds_nested_row_address_to_array_section():
     child = SSAValue(0, "int", (12,))
     offset = SSAValue(1, "int")
@@ -205,6 +230,23 @@ def test_fortran_nested_bitwise_operands_use_one_integer_kind():
     assert "iand(int(" in source
 
 
+def test_fortran_repository_right_shift_preserves_signed_source_semantics():
+    value = SSAValue(0, "int")
+    amount = SSAValue(1, "int")
+    result = SSAValue(2, "int")
+    function = Function(
+        "signed_shift",
+        [value, amount],
+        {"entry": BasicBlock("entry", [Instr("Shr", [value, amount], result)])},
+    )
+
+    emitted = emit_function(function, outputs=[result])
+
+    assert emitted.complete, [item.format() for item in emitted.shortfalls]
+    assert "shifta(" in emitted.source
+    assert "shiftr(" not in emitted.source
+
+
 def test_repository_integer_or_is_not_coerced_through_logical_merge():
     left = SSAValue(0, "int", ())
     right = SSAValue(1, "int", ())
@@ -220,6 +262,62 @@ def test_repository_integer_or_is_not_coerced_through_logical_merge():
     assert emitted.complete, [item.format() for item in emitted.shortfalls]
     assert "ior(" in emitted.source
     assert "merge(" not in emitted.source
+
+
+def test_fortran_truthiness_of_inlined_bitmask_compares_with_zero():
+    value = SSAValue(0, "int")
+    bit = SSAValue(1, "int")
+    # Control-expression lowering may record the intermediate as bool because
+    # Python consumes it through truthiness; its producer still defines an
+    # integer bit mask.
+    mask = SSAValue(2, "bool")
+    absent = SSAValue(3, "bool")
+    function = Function(
+        "bitmask_not",
+        [value, bit],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("bitand", [value, bit], mask),
+                    Instr("LNot", [mask], absent),
+                ],
+            )
+        },
+    )
+
+    emitted = emit_function(function, outputs=[absent])
+
+    assert emitted.complete, [item.format() for item in emitted.shortfalls]
+    assert "== 0_c_int64_t" in emitted.source
+    assert ".not. int(iand(" not in emitted.source
+
+
+def test_fortran_logical_composition_truth_converts_inlined_bitmask():
+    value = SSAValue(0, "int")
+    bit = SSAValue(1, "int")
+    flag = SSAValue(2, "bool")
+    mask = SSAValue(3, "bool")
+    result = SSAValue(4, "bool")
+    function = Function(
+        "bitmask_and_flag",
+        [value, bit, flag],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("bitand", [value, bit], mask),
+                    Instr("LAnd", [mask, flag], result),
+                ],
+            )
+        },
+    )
+
+    emitted = emit_function(function, outputs=[result])
+
+    assert emitted.complete, [item.format() for item in emitted.shortfalls]
+    assert "/= 0_c_int64_t" in emitted.source
+    assert ".and." in emitted.source
 
 
 # ---------------------------------------------------------------- Fortran
@@ -627,6 +725,69 @@ def test_argument_assigned_by_linked_result_is_an_inout_slot():
 
     assert "intent(inout) :: t20" in source
     assert "intent(in), value :: t20" not in source
+
+
+def test_linked_sequence_result_may_publish_into_explicit_frame_slot():
+    formal_output = SSAValue(1, "int64", (8,))
+    callee = Function("produce", [formal_output], {
+        "entry": BasicBlock("entry", [Instr("Ret", [], SSAValue(90))]),
+    })
+    caller_output = SSAValue(7, "int64", (8,))
+    semantic_result = SSAValue(40, "aggregate")
+    caller = Function("consume", [caller_output], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "Call", [caller_output], semantic_result,
+                attributes={
+                    "callee": "produce",
+                    "ssa_output_argument": 0,
+                    "result_aliases_frame": True,
+                },
+            ),
+            Instr("Ret", [], SSAValue(91)),
+        ]),
+    })
+
+    emitted = emit_module(
+        IRModule({"produce": callee, "consume": caller}),
+        outputs={"produce": [formal_output]},
+        extra_roots=("consume",),
+    )
+
+    assert emitted.complete, [item.format() for item in emitted.shortfalls]
+    assert "call produce(extent_8, t7)" in emitted.source
+    assert "UNSUPPORTED Call" not in emitted.source
+
+
+def test_linked_sequence_result_declares_non_public_frame_as_local_array():
+    formal_output = SSAValue(1, "int64", (8,))
+    callee = Function("produce_local", [formal_output], {
+        "entry": BasicBlock("entry", [Instr("Ret", [], SSAValue(90))]),
+    })
+    caller_frame = SSAValue(7, "int64", (8,))
+    caller = Function("consume_local", [], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "Call", [caller_frame], caller_frame,
+                attributes={
+                    "callee": "produce_local",
+                    "ssa_output_argument": 0,
+                    "result_aliases_frame": True,
+                },
+            ),
+            Instr("Ret", [], SSAValue(91)),
+        ]),
+    })
+
+    emitted = emit_module(
+        IRModule({"produce_local": callee, "consume_local": caller}),
+        outputs={"produce_local": [formal_output]},
+        extra_roots=("consume_local",),
+    )
+
+    assert emitted.complete, [item.format() for item in emitted.shortfalls]
+    assert "integer(c_int64_t) :: t7(extent_8)" in emitted.source
+    assert "call produce_local(extent_8, t7)" in emitted.source
 
 
 def test_fortran_shortens_internal_procedure_names_but_preserves_bind_symbol():

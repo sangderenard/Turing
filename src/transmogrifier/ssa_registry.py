@@ -39,6 +39,9 @@ class Handler(Enum):
     # zero input so callers can explicitly select their architecture's
     # undefined/preserved destination behavior without an eager trap.
     MsbIndex      = "MsbIndex"
+    # Python integer magnitude width. Unlike MsbIndex this is defined for
+    # zero and negative operands: ``(-n).bit_length() == n.bit_length()``.
+    BitLength     = "BitLength"
     # Interleave the low half of two 128-bit bit patterns at an explicit lane
     # width. This is a machine-neutral vector permutation, not numeric fusion.
     VectorUnpackLow = "VectorUnpackLow"

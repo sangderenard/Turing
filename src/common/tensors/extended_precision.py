@@ -1,11 +1,18 @@
 """N-double arithmetic as a shim in the operator dispatch.
 
-An extended value is an ordinary tensor plus a tuple of correction tensors in
-``_limbs``: the value it denotes is the exact sum of all of them, and every
-limb is a plain tensor of the base dtype. Nothing here introduces a new dtype,
-a new backend entry point, or a new opcode -- every step is built from ``+``,
-``-`` and ``*`` on the base dtype, which is why the shim can sit above the
-backend unwrap and serve every backend at once.
+An extended value is an ORDINARY TENSOR whose last dimension carries its
+limbs, interleaved at stride ``limbs``: the value it denotes is the exact sum
+of them, and every limb is a plain slice of the base dtype. Nothing here
+introduces a new dtype, a new wrapper, or a new opcode -- every step is built
+from ``+``, ``-`` and ``*`` on the base dtype, which is why this can sit in
+the operator dispatch and serve every backend at once.
+
+Limbs as CHANNELS is what makes it fit. The return type never changes -- an
+operator hands back a tensor, as it always did, merely wider -- so no caller
+learns a new type and no dispatch grows a case for one. A four-channel pixel
+at two limbs is eight in the last dimension read with stride two, so RGBA
+keeps striding and the precision rides alongside it. Widening is a shape
+change and collapsing is a strided sum, both ordinary tensor work.
 
 ``n`` is a parameter, not a fixed choice of two. One limb is ordinary
 arithmetic and the shim declines; two is double-double; four is quad-double;
@@ -43,8 +50,6 @@ not in workarounds here.
 
 from __future__ import annotations
 
-import threading
-from contextlib import contextmanager
 from typing import Any, Sequence
 
 # Dekker's splitting constant for binary64: 2**27 + 1.
@@ -52,13 +57,6 @@ _SPLIT = 134217729.0
 
 # Beyond this the expansion is the wrong representation; see the module note.
 SENSIBLE_LIMIT = 8
-
-_state = threading.local()
-
-
-# --------------------------------------------------------------------------
-# the precision parameter
-
 
 def limbs_for_digits(digits: int) -> int:
     """Limbs needed to carry ``digits`` decimal digits."""
@@ -69,67 +67,97 @@ def limbs_for_digits(digits: int) -> int:
     return int(min(max(needed, 1), SENSIBLE_LIMIT))
 
 
-def active_limbs() -> int:
-    """The ambient precision: 1 unless a ``precision`` block is open."""
-
-    return int(getattr(_state, "limbs", 1) or 1)
+# --------------------------------------------------------------------------
+# the representation: limbs are CHANNELS, in the last dimension
 
 
-@contextmanager
-def precision(limbs: int):
-    """Ask every operator inside this block for ``limbs``-double arithmetic.
+def limb(value: Any, index: int, limbs: int) -> Any:
+    """Limb ``index`` of an interleaved value -- stride ``limbs``, last axis.
 
-    This is the "supplied or nonzero" switch: with it open the dispatch shim
-    promotes plain operands and realises the requested precision; with it shut
-    the shim declines and the ordinary path runs untouched.
+    Interleaved rather than planar: every step of an expansion uses one
+    value's limbs together, so they belong adjacent. A four-channel pixel at
+    two limbs is eight in the last dimension read with stride two, which is
+    why RGBA keeps working -- the channels are still there, just striding.
     """
 
+    if int(limbs) <= 1:
+        return value
+    return value[..., int(index)::int(limbs)]
+
+
+def interleave(parts: Sequence) -> Any:
+    """``k`` parts of shape ``(..., C)`` into one ``(..., C*k)``."""
+
+    from .abstraction import AbstractTensor
+
+    parts = list(parts)
+    if len(parts) == 1:
+        return parts[0]
+    stacked = AbstractTensor.stack(parts, dim=-1)
+    shape = list(stacked.shape)
+    return stacked.reshape(*shape[:-2], int(shape[-2]) * int(shape[-1]))
+
+
+def widen(value: Any, limbs: int) -> Any:
+    """Promote to ``limbs`` limbs: the value, then zeros beside it."""
+
     limbs = int(limbs)
-    if limbs < 1:
-        raise ValueError(f"precision needs at least one limb, got {limbs}")
-    previous = getattr(_state, "limbs", 1)
-    _state.limbs = limbs
-    try:
-        yield limbs
-    finally:
-        _state.limbs = previous
+    if limbs <= 1:
+        return value
+    zero = plain(value, "mul", 0.0)
+    wide = interleave([value] + [zero] * (limbs - 1))
+    wide.limbs = limbs
+    return wide
 
 
-def _expanding() -> bool:
-    return getattr(_state, "active", False)
+def narrow(value: Any, limbs: int) -> Any:
+    """Collapse the limbs back to one channel per value."""
 
-
-class _Expansion:
-    """While held, the shim declines so limb arithmetic runs as plain ops."""
-
-    def __enter__(self):
-        self.previous = getattr(_state, "active", False)
-        _state.active = True
-        return self
-
-    def __exit__(self, *_):
-        _state.active = self.previous
-        return False
+    limbs = int(limbs)
+    if limbs <= 1:
+        return value
+    total = limb(value, 0, limbs)
+    for index in range(1, limbs):
+        total = plain(total, "add", limb(value, index, limbs))
+    total.limbs = 1
+    return total
 
 
 # --------------------------------------------------------------------------
 # error-free transformations
 
 
+def plain(left: Any, op: str, right: Any) -> Any:
+    """One operator at a SINGLE limb -- the calculator's primitive layer.
+
+    The transformations below are the implementation of extended precision, so
+    they cannot themselves be extended: asking the calculator for its default
+    width here would call this code to implement it, without end. Spelling the
+    width explicitly says that outright, and needs no ambient flag to say it
+    -- which matters because an ambient flag is exactly what does not survive
+    into a compiled program.
+    """
+
+    from .abstraction import AbstractTensor
+
+    return AbstractTensor._apply_operator(left, op, left, right, limbs=1)
+
+
 def two_sum(a, b):
     """Knuth: ``a + b == s + e`` exactly, for any a and b."""
 
-    s = a + b
-    shifted = s - a
-    return s, (a - (s - shifted)) + (b - shifted)
+    s = plain(a, "add", b)
+    shifted = plain(s, "sub", a)
+    return s, plain(plain(a, "sub", plain(s, "sub", shifted)), "add",
+                    plain(b, "sub", shifted))
 
 
 def _split(a):
     """Dekker: halve a significand into non-overlapping pieces."""
 
-    c = a * _SPLIT
-    high = c - (c - a)
-    return high, a - high
+    c = plain(a, "mul", _SPLIT)
+    high = plain(c, "sub", plain(c, "sub", a))
+    return high, plain(a, "sub", high)
 
 
 def two_product(a, b):
@@ -140,10 +168,13 @@ def two_product(a, b):
     substitution is the compiler's job.
     """
 
-    p = a * b
+    p = plain(a, "mul", b)
     ah, al = _split(a)
     bh, bl = _split(b)
-    return p, (((ah * bh - p) + ah * bl) + al * bh) + al * bl
+    error = plain(plain(ah, "mul", bh), "sub", p)
+    error = plain(error, "add", plain(ah, "mul", bl))
+    error = plain(error, "add", plain(al, "mul", bh))
+    return p, plain(error, "add", plain(al, "mul", bl))
 
 
 # --------------------------------------------------------------------------
@@ -184,11 +215,11 @@ def renormalise(terms: Sequence, limbs: int) -> list:
         kept.append(carry)
         rest = tail
     while len(kept) < limbs:
-        kept.append(kept[-1] * 0.0)
+        kept.append(plain(kept[-1], "mul", 0.0))
     # Whatever is left lies below the requested precision; folding it into the
     # last limb keeps the result the nearest representable value.
     for leftover in rest:
-        kept[-1] = kept[-1] + leftover
+        kept[-1] = plain(kept[-1], "add", leftover)
     return kept
 
 
@@ -199,7 +230,7 @@ def add_expansions(left: Sequence, right: Sequence, limbs: int) -> list:
 
 
 def negate(terms: Sequence) -> list:
-    return [-term for term in terms]
+    return [plain(term, "mul", -1.0) for term in terms]
 
 
 def multiply_expansions(left: Sequence, right: Sequence, limbs: int) -> list:
@@ -228,7 +259,7 @@ def _lead(terms: Sequence):
 
     if len(terms) == 1:
         return terms[0]
-    return terms[0] + terms[1]
+    return plain(terms[0], "add", terms[1])
 
 
 def divide_expansions(left: Sequence, right: Sequence, limbs: int) -> list:
@@ -247,7 +278,7 @@ def divide_expansions(left: Sequence, right: Sequence, limbs: int) -> list:
         # slot with the real value one place down. Reading only slot zero then
         # yields a zero quotient digit and the pass is wasted -- which is why
         # division gained a limb only every other width.
-        digit = _lead(remainder) / _lead(right)
+        digit = plain(_lead(remainder), "truediv", _lead(right))
         quotient.append(digit)
         product = multiply_expansions([digit], right, limbs + 2)
         remainder = add_expansions(remainder, negate(product), limbs + 2)
@@ -258,102 +289,38 @@ def divide_expansions(left: Sequence, right: Sequence, limbs: int) -> list:
 # carrying limbs on a tensor
 
 
-def limb_count(value: Any) -> int:
-    return 1 + len(getattr(value, "_limbs", ()))
-
-
-def carries_limbs(value: Any) -> bool:
-    return bool(getattr(value, "_limbs", ()))
-
-
-def attach(leading: Any, corrections: Sequence) -> Any:
-    leading._limbs = tuple(corrections)
-    return leading
-
-
 def limbs_of(value: Any, width: int, like: Any) -> list:
-    """Every operand as a list of exactly ``width`` limbs."""
+    """An operand as ``width`` ordinary tensors, one per limb.
 
-    if hasattr(value, "_limbs") or hasattr(value, "shape"):
-        terms = [value] + list(getattr(value, "_limbs", ()))
-    else:
-        terms = [like * 0.0 + value]
-    zero = like * 0.0
-    while len(terms) < width:
-        terms.append(zero)
-    return terms[:width]
+    A tensor operand is assumed ALREADY widened -- the promotion happens once
+    at the boundary and the width travels with the value after that, so an
+    operator does not re-promote and cannot double-count. A scalar has no
+    channels to stride, so it becomes its own leading limb and zeros.
 
-
-def extended(value: Any, limbs: int = 2, correction: Any = None) -> Any:
-    """Promote a plain tensor to an extended one.
-
-    Returns a fresh head so promoting an operand never mutates it -- reusing a
-    promoted tensor as though it were still plain is otherwise an easy and
-    very confusing mistake.
+    What comes back are ordinary tensors with nothing attached, which is why
+    the arithmetic below cannot re-enter this: each one asks its operators for
+    the default single limb.
     """
 
-    with _Expansion():
-        head = value + 0.0
-        corrections = [value * 0.0 for _ in range(max(limbs - 1, 0))]
-        if correction is not None and corrections:
-            corrections[0] = correction
-    return attach(head, corrections)
+    if hasattr(value, "shape"):
+        # A tensor says how wide it already is. Slicing a plain tensor at
+        # stride ``width`` would hand back an EMPTY limb for every channel
+        # past the first, which is the shape error that makes this the one
+        # thing a tensor cannot be left to guess about itself.
+        held = int(getattr(value, "limbs", 1) or 1)
+        if held < width:
+            value = widen(narrow(value, held) if held > 1 else value, width)
+        return [limb(value, index, width) for index in range(width)]
+    seed = limb(like, 0, width)
+    zero = plain(seed, "mul", 0.0)
+    return ([plain(zero, "add", value)]
+            + [zero for _ in range(width - 1)])
 
 
-def constant(like: Any, high: float, low: float = 0.0,
-             limbs: int = 2) -> Any:
-    """An extended constant from a value a double could not hold.
+def to_float_list(value: Any, limbs: int) -> list:
+    """Every limb as plain Python floats, for handing to exact arithmetic."""
 
-    Baked coefficients are the obvious case: the exact Taylor coefficient of a
-    core is not representable, so the bake keeps the remainder and this puts
-    both halves back together as one extended operand.
-    """
-
-    with _Expansion():
-        head = like * 0.0 + high
-        rest = [like * 0.0 + low]
-        rest += [like * 0.0 for _ in range(max(limbs - 2, 0))]
-    return attach(head, rest)
-
-
-def constant_limbs(like: Any, parts: Sequence) -> Any:
-    """An extended constant from a value decomposed into any number of limbs.
-
-    Two limbs cap a coefficient at about 32 digits. A core asked to converge
-    below that needs its coefficients carried to whatever width the target
-    implies, so the count is a parameter here rather than a constant.
-    """
-
-    with _Expansion():
-        head = like * 0.0 + float(parts[0])
-        rest = [like * 0.0 + float(part) for part in parts[1:]]
-    return attach(head, rest)
-
-
-def pair(high: Any, low: Any) -> Any:
-    """An extended value from two tensors already holding the halves."""
-
-    with _Expansion():
-        head = high + 0.0
-        rest = [low + 0.0]
-    return attach(head, rest)
-
-
-def collapse(value: Any) -> Any:
-    """Round an extended value back to a single limb."""
-
-    with _Expansion():
-        total = value + 0.0
-        for limb in getattr(value, "_limbs", ()):
-            total = total + limb
-    return total
-
-
-def to_float_list(value: Any) -> list:
-    """Exact Python floats of every limb, for handing to arbitrary precision."""
-
-    limbs = [value] + list(getattr(value, "_limbs", ()))
-    return [limb.tolist() for limb in limbs]
+    return [limb(value, index, limbs).tolist() for index in range(int(limbs))]
 
 
 # --------------------------------------------------------------------------
@@ -365,18 +332,35 @@ _REVERSED = {"radd", "rsub", "rmul", "rtruediv"}
 _HANDLED = _DIRECT | _REVERSED | {"neg"}
 
 
-def apply(op: str, left: Any, right: Any):
-    """The dispatch shim. Returns the extended result, or None to decline.
+def apply(op: str, left: Any, right: Any, *, limbs: int = 1,
+          accumulator: Any = None, accumulate_output: bool = False):
+    """The limb work, driven by ARGUMENTS, returning an ordinary tensor.
 
-    Declining is the common case and costs a couple of attribute lookups, so a
-    build that never asks for extended precision pays essentially nothing.
+    ``limbs`` is what the caller will ACCEPT, which is not what the operands
+    carry. Two 2-limb values have a 4-limb exact product, and down a chain
+    that grows without bound, so renormalising to ``limbs`` IS the precision
+    choice: the operands say what is available, this says what is kept.
+
+    It is a parameter rather than ambient state because ambient state does not
+    survive compilation -- whatever sets it is a store nothing in the program
+    reads, so it is deleted as dead and every operator lowers single-limb while
+    appearing to have honoured the request.
+
+    The result is a TENSOR, not a pair or a wrapper. Limbs live in the last
+    dimension at stride ``limbs``, so widening is a shape change and every
+    return type stays what it was. That is what lets this sit in the operator
+    dispatch at all.
+
+    ``accumulator`` takes the exact intermediate instead of it being
+    renormalised away, so a chain pays the truncation once at the end rather
+    than at every step; ``accumulate_output`` hands the accumulator back so
+    the caller can keep chaining exactly.
     """
 
-    if _expanding() or op not in _HANDLED:
+    if op not in _HANDLED:
         return None
-
-    width = max(active_limbs(), limb_count(left), limb_count(right))
-    if width <= 1:
+    width = int(limbs or 1)
+    if width <= 1 and accumulator is None:
         return None
     if width > SENSIBLE_LIMIT:
         raise ValueError(
@@ -384,29 +368,45 @@ def apply(op: str, left: Any, right: Any):
             f"this representation is the wrong one -- carry an integer "
             f"significand in fixed point instead"
         )
-
     like = left if hasattr(left, "shape") else right
     if not hasattr(like, "shape"):
         return None
 
-    with _Expansion():
-        if op == "neg":
-            return attach(*_head_and_tail(negate(limbs_of(left, width, like))))
+    if op == "neg":
+        pieces = negate(limbs_of(left, width, like))
+    else:
         first = limbs_of(left, width, like)
         second = limbs_of(right, width, like)
         if op in _REVERSED:
             first, second = second, first
         base = op[1:] if op in _REVERSED else op.lstrip("i")
         if base == "add":
-            result = add_expansions(first, second, width)
+            pieces = add_expansions(first, second, width)
         elif base == "sub":
-            result = add_expansions(first, negate(second), width)
+            pieces = add_expansions(first, negate(second), width)
         elif base == "mul":
-            result = multiply_expansions(first, second, width)
+            pieces = multiply_expansions(first, second, width)
         else:
-            result = divide_expansions(first, second, width)
-    return attach(*_head_and_tail(result))
+            pieces = divide_expansions(first, second, width)
+
+    if accumulator is not None:
+        for piece in pieces:
+            accumulator.absorb(piece)
+        if accumulate_output:
+            return accumulator
+        pieces = accumulator.to_expansion(width)
+    result = interleave(pieces)
+    result.limbs = width
+    return result
 
 
-def _head_and_tail(terms: Sequence):
-    return terms[0], tuple(terms[1:])
+
+
+def constant(like: Any, parts: Sequence, limbs: int) -> Any:
+    """A constant whose limbs the caller derived, laid out as channels."""
+
+    from .abstraction import AbstractTensor
+
+    seed = plain(limb(like, 0, limbs), "mul", 0.0)
+    return interleave([plain(seed, "add", float(part))
+                       for part in parts[:limbs]])

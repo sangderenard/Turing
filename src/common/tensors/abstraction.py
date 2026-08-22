@@ -2457,7 +2457,33 @@ class AbstractTensor:
 
         return matmul(self, other)
 
-    def _apply_operator(self, op: str, left: Any, right: Any):
+    #: How many limb channels this tensor's last dimension carries. One is a
+    #: plain tensor -- the overwhelming case -- and nothing about it differs
+    #: from before. Higher means the last dimension is ``channels * limbs``
+    #: interleaved at stride ``limbs``.
+    #:
+    #: It has to be carried rather than inferred: a last dimension of six is
+    #: six channels, or three at two limbs, and no shape distinguishes them.
+    #: The COUNT is metadata, the DATA is the shape -- which is what keeps the
+    #: return type an ordinary tensor.
+    limbs: int = 1
+
+    #: How wide the calculator works when nobody says otherwise. Two limbs is
+    #: double the dtype: the intermediate is exact to about twice the working
+    #: precision and the result is collapsed back, so a caller sees the same
+    #: shape and the same type it always did -- only correctly rounded. This
+    #: is the FMA bargain applied to every operator: compute wide, round once.
+    #:
+    #: ``simple`` (one limb) is the old behaviour, for paths that would rather
+    #: have the speed; ``extreme`` keeps the limbs instead of collapsing, for
+    #: a caller that means to keep chaining exactly and pay the rounding once
+    #: at the end.
+    CALCULATOR_LIMBS = 2
+
+    def _apply_operator(self, op: str, left: Any, right: Any, *,
+                        limbs: int | None = None, accumulator: Any = None,
+                        accumulate_output: bool = False,
+                        collapse: bool = True):
         """
         Arithmetic with bool tensors:
         - if mixing with floats/complex -> cast bool to float
@@ -2474,19 +2500,38 @@ class AbstractTensor:
         elif isinstance(right, AbstractTensor) and isinstance(left, (list, tuple)):
             left = right.ensure_tensor(left)       # instead of get_tensor(... Faculty.NUMPY)
 
-        # N-double shim. An operand carrying ``_limbs`` denotes the sum of its
-        # limbs, and the expansion below is written in ordinary tensor
-        # arithmetic -- so it records on the tape as the chain that actually
-        # produced the value, and the gradient flows through it with no
-        # separate derivative to maintain. It sits HERE, above the backend
-        # unwrap, because every step is built from + - * on the base dtype:
-        # one implementation covers every backend. Declining costs one
-        # attribute lookup, so single-limb work pays essentially nothing.
-        from .extended_precision import apply as _extended_apply
+        # N-double work, driven by ARGUMENTS. ``limbs`` is what this call will
+        # accept: the operands say what precision is available, this says what
+        # is kept, and the renormalisation to it IS the precision choice --
+        # two 2-limb values have a 4-limb exact product, so without a stated
+        # ceiling a chain grows without bound.
+        #
+        # It is a parameter rather than ambient state for a reason that only
+        # shows up once compiled. A thread-local is invisible to the compiler:
+        # whatever sets it is a store nothing in the program reads, so the
+        # store is deleted as dead and every operator lowers single-limb while
+        # appearing to have honoured the request. An argument is in the tree.
+        #
+        # It sits HERE, above the backend unwrap, because every step is built
+        # from + - * on the base dtype, so one implementation covers every
+        # backend; and because the expansion is ordinary tensor arithmetic it
+        # records on the tape as the chain that actually produced the value.
+        # The recursion is bounded by the default: the expansion's own
+        # arithmetic asks for one limb and so cannot re-enter.
+        width = int(self.CALCULATOR_LIMBS if limbs is None else limbs)
+        if width > 1 or accumulator is not None:
+            from .extended_precision import apply as _extended_apply
 
-        extended_result = _extended_apply(op, left, right)
-        if extended_result is not None:
-            return extended_result
+            extended_result = _extended_apply(
+                op, left, right, limbs=width, accumulator=accumulator,
+                accumulate_output=accumulate_output,
+            )
+            if extended_result is not None:
+                if collapse and not accumulate_output:
+                    from .extended_precision import narrow
+
+                    return narrow(extended_result, width)
+                return extended_result
 
         # Record first using the original operand wrappers so parameter identity
         # is preserved on the tape (ids match actual model params).

@@ -1,7 +1,9 @@
+import ast
 import ctypes
 import os
 from pathlib import Path
 
+import networkx as nx
 import pytest
 
 from src.compiler.ir_sequence_tables import (
@@ -16,6 +18,7 @@ from src.compiler.ir_sequence_tables import (
     lower_sequence_prepend_packed_bytes,
     lower_sequence_extend,
     lower_sequence_insert,
+    schedule_joined_sequence_mutations,
     lower_table_delete,
     lower_table_lookup,
     lower_table_store,
@@ -33,7 +36,12 @@ from src.compiler.precompile_to_ssa import (
 from src.compiler.ssa_fortran_backend import FortranEmissionError, emit_module
 from src.compiler.ssa_fortran_backend import fortran_compiler
 from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
-from src.compiler.fortran_c_shell import compile_fortran_module_c_shell
+from src.compiler.fortran_c_shell import (
+    _authored_complete_record_schemas,
+    _authored_dataclass_record_views,
+    _scalar_source_transforms,
+    compile_fortran_module_c_shell,
+)
 from src.transmogrifier.ssa import (
     BasicBlock,
     Function,
@@ -57,6 +65,313 @@ def _ops(function):
         for block in function.blocks.values()
         for instruction in block.instrs
     ]
+
+
+def test_record_table_merges_complementary_views_of_same_record_identity():
+    table = SSARecordTable()
+    first = SSARecordFieldDescriptor(
+        "left", SSARecordFieldStorage.SCALAR, value_ids=(2,), dtype="int64",
+    )
+    second = SSARecordFieldDescriptor(
+        "right", SSARecordFieldStorage.SCALAR, value_ids=(3,), dtype="int64",
+    )
+
+    table.register(SSARecordDescriptor(1, "Frame", (first,)))
+    merged = table.register(SSARecordDescriptor(1, "Frame", (second,)))
+
+    assert merged.fields == (first, second)
+    assert table.records[1] is merged
+
+
+def test_record_table_still_rejects_conflicting_views_of_same_field():
+    table = SSARecordTable()
+    table.register(SSARecordDescriptor(1, "Frame", (
+        SSARecordFieldDescriptor(
+            "value", SSARecordFieldStorage.SCALAR,
+            value_ids=(2,), dtype="int64",
+        ),
+    )))
+
+    with pytest.raises(ValueError, match="conflicting SSA record descriptor 1"):
+        table.register(SSARecordDescriptor(1, "Frame", (
+            SSARecordFieldDescriptor(
+                "value", SSARecordFieldStorage.SCALAR,
+                value_ids=(3,), dtype="int64",
+            ),
+        )))
+
+
+def test_joined_sequence_update_is_scheduled_after_concat_source():
+    count_status = SSAValue(10, "int32")
+    flat_status = SSAValue(11, "int32")
+    source_status = SSAValue(12, "int32")
+    count = Instr(
+        "Call", [], count_status,
+        attributes={
+            "ssa_sequence_operation": "append_joined_count",
+            "source_effect_node_id": 90,
+        },
+    )
+    extend = Instr(
+        "Call", [], flat_status,
+        attributes={
+            "ssa_sequence_operation": "extend_joined_bytes",
+            "source_effect_node_id": 90,
+            "joined_source_sequence_id": 50,
+        },
+    )
+    function = Function("joined", [], {"entry": BasicBlock("entry", [
+        count,
+        extend,
+        Instr("Store", [count_status, SSAValue(20)], None),
+        Instr("Store", [flat_status, SSAValue(21)], None),
+        Instr("Store", [SSAValue(22), SSAValue(23)], None,
+              attributes={"sequence_id": 50,
+                          "binding": "ssa_sequence_expression_reset"}),
+        Instr("Call", [], source_status,
+              attributes={"sequence_id": 50,
+                          "ssa_sequence_operation": "append_slice"}),
+        Instr("Store", [source_status, SSAValue(24)], None),
+    ])})
+
+    assert schedule_joined_sequence_mutations(function) == 1
+
+    instructions = function.blocks["entry"].instrs
+    assert instructions.index(count) > next(
+        index for index, instruction in enumerate(instructions)
+        if instruction.res is source_status
+    )
+    assert instructions.index(extend) == instructions.index(count) + 1
+    assert extend.attributes["joined_sequence_scheduled_after_source"] == 50
+
+
+def test_scalar_sequence_projections_retain_exact_authored_source_binding():
+    graph = nx.DiGraph()
+    graph.add_node(0, value_id=0, attributes={
+        "binding_kind": "parameter", "binding_name": "text",
+    })
+    graph.add_node(3, value_id=3, attributes={})
+    graph.add_node(
+        5,
+        value_id=5,
+        expr_obj=ast.Call(
+            func=ast.Name(id="len", ctx=ast.Load()),
+            args=[ast.Name(id="encoded", ctx=ast.Load())],
+            keywords=[],
+        ),
+        parents=[(3, "arg:0")],
+        attributes={},
+    )
+    graph.add_node(10, value_id=10, attributes={
+        "binding_kind": "parameter", "binding_name": "payload",
+    })
+    graph.add_node(
+        11,
+        value_id=11,
+        expr_obj=ast.Call(
+            func=ast.Name(id="len", ctx=ast.Load()),
+            args=[ast.Name(id="payload", ctx=ast.Load())],
+            keywords=[],
+        ),
+        parents=[(10, "arg:0")],
+        attributes={},
+    )
+
+    assert _scalar_source_transforms(
+        graph, ((3, 0, "text", "utf8"),)
+    ) == (
+        (5, "text", "utf8_length"),
+        (11, "payload", "sequence_length"),
+    )
+
+
+def test_authored_dataclass_method_gets_only_its_exact_field_view():
+    views = _authored_dataclass_record_views(ast.parse("""
+from dataclasses import dataclass, field
+
+@dataclass
+class Builder:
+    mode: str
+    count: int
+    locals: list[int] = field(default_factory=list)
+    code: bytearray = field(default_factory=bytearray)
+
+    def finish(self):
+        return bytes(self.code) + bytes(self.locals)
+"""))
+
+    assert views["Builder.finish"] == {
+        "self": {
+            "identity": "Builder",
+            "fields": {
+                "code": {
+                    "storage": "span", "dtype": "int64", "rank": 1,
+                    "mutable": False,
+                    "aggregate_kind": "bytearray",
+                },
+                "locals": {
+                    "storage": "span", "dtype": "int64", "rank": 1,
+                    "mutable": False,
+                    "aggregate_kind": "list",
+                },
+            },
+        }
+    }
+
+
+def test_authored_ordinary_class_infers_only_proven_receiver_state():
+    views = _authored_dataclass_record_views(ast.parse("""
+class Builder:
+    def __init__(self, first_value_id, opaque):
+        self.next_value_id = int(first_value_id)
+        self.opaque = opaque
+
+    def fresh(self):
+        value = self.next_value_id
+        self.next_value_id += 1
+        return value
+
+    def delegated(self):
+        return self.fresh()
+
+    def unsupported(self):
+        return self.opaque
+"""))
+
+    expected = {
+        "self": {
+            "identity": "Builder",
+            "fields": {
+                "next_value_id": {
+                    "storage": "scalar", "dtype": "int64", "rank": 0,
+                    "mutable": True,
+                },
+            },
+        }
+    }
+    assert views["Builder.fresh"] == expected
+    assert views["Builder.delegated"] == expected
+    assert "Builder.unsupported" not in views
+
+
+def test_authored_dataclass_annotation_infers_exact_parameter_fields():
+    views = _authored_dataclass_record_views(ast.parse("""
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Limits:
+    group_count: tuple[int, int, int]
+    invocations: int
+    opaque: object
+
+def choose(work: int, *, limits: Limits):
+    return min(work, limits.group_count[0], limits.invocations)
+"""))
+
+    assert views["choose"]["limits"] == {
+        "identity": "Limits",
+        "fields": {
+            "group_count": {
+                "storage": "span", "dtype": "int64", "rank": 1,
+                "mutable": False, "aggregate_kind": "tuple",
+                "fixed_length": 3,
+            },
+            "invocations": {
+                "storage": "scalar", "dtype": "int64", "rank": 0,
+                "mutable": False,
+            },
+        },
+    }
+
+
+def test_annotated_parameter_method_inherits_the_callee_record_view():
+    views = _authored_dataclass_record_views(ast.parse("""
+from dataclasses import dataclass, field
+
+@dataclass
+class Builder:
+    label: str
+    locals: list[int] = field(default_factory=list)
+    code: bytearray = field(default_factory=bytearray)
+
+    def finish(self):
+        return bytes(self.locals) + bytes(self.code)
+
+def emit(body: Builder):
+    return body.finish()
+"""))
+
+    assert views["emit"]["body"] == {
+        "identity": "Builder",
+        "fields": {
+            "code": {
+                "storage": "span", "dtype": "int64", "rank": 1,
+                "mutable": False, "aggregate_kind": "bytearray",
+            },
+            "locals": {
+                "storage": "span", "dtype": "int64", "rank": 1,
+                "mutable": False, "aggregate_kind": "list",
+            },
+        },
+    }
+
+
+def test_authored_constructor_schema_requires_every_field_and_keeps_tuple_slots():
+    schemas = _authored_complete_record_schemas(ast.parse("""
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Plan:
+    count: int
+    geometry: tuple[int, int, int]
+
+@dataclass
+class Partial:
+    count: int
+    opaque: object
+"""))
+
+    assert schemas == {
+        "Plan": {
+            "identity": "Plan",
+            "source_derived": True,
+            "fields": {
+                "count": {
+                    "storage": "scalar", "dtype": "int64", "rank": 0,
+                    "mutable": False,
+                },
+                "geometry": {
+                    "storage": "span", "dtype": "int64", "rank": 1,
+                    "mutable": False, "aggregate_kind": "tuple",
+                    "fixed_length": 3,
+                },
+            },
+        },
+    }
+
+
+def test_authored_schema_keeps_literal_vocabulary_and_optional_scalar_tag():
+    schemas = _authored_complete_record_schemas(ast.parse("""
+from dataclasses import dataclass
+from typing import Literal
+
+@dataclass(frozen=True)
+class ImportRow:
+    kind: Literal["func", "memory"]
+    minimum: int | None = None
+"""))
+
+    assert schemas["ImportRow"]["fields"] == {
+        "kind": {
+            "storage": "scalar", "dtype": "int64", "rank": 0,
+            "mutable": False,
+            "token_vocabulary": ("func", "memory"),
+        },
+        "minimum": {
+            "storage": "scalar", "dtype": "int64", "rank": 0,
+            "mutable": False, "optional": True, "default": None,
+        },
+    }
 
 
 def _sequence(sequence_id, base, *, key_columns=(), live=False, dynamic=False):
@@ -87,6 +402,35 @@ def test_list_descriptor_allows_duplicates_and_lowers_direct_memory_insert():
     assert {"GetElementPtr", "Store", "Load", "Lt", "CondBr"} <= set(_ops(function))
     assert function.metadata["allows_duplicates"] is True
     assert function.metadata["ssa_sequence_operation"] == "append"
+
+
+def test_sequence_helper_fresh_ids_reserve_non_argument_descriptor_identities():
+    descriptor = SSASequenceDescriptor(
+        sequence_id=46,
+        column_value_ids=(46,),
+        length_address_id=71,
+        capacity_value_id=72,
+        status_address_id=73,
+        column_dtypes=("int64",),
+    )
+
+    function = lower_sequence_append(descriptor).functions[0]
+    reserved = {46, 71, 72, 73}
+    helper_inputs = {
+        value.id for value in function.args
+        if value.id not in {46, 71, 72}
+    }
+    helper_results = {
+        instruction.res.id
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None
+    }
+
+    assert helper_inputs
+    assert helper_inputs.isdisjoint(reserved)
+    assert helper_results.isdisjoint(reserved)
+    assert min(helper_inputs | helper_results) == max(reserved) + 1
 
 
 def test_set_descriptor_retains_linear_unique_key_and_live_row_policy():
@@ -578,6 +922,105 @@ def test_empty_aggregate_const_becomes_explicit_sequence_arena_argument():
     )
     assert emitted.api.metadata["sequence_tables"] == {
         function.name: [{**descriptor.to_mapping(), "source_names": []}]
+    }
+
+
+def test_initialized_literal_table_replaces_structural_dict_with_frame_arena():
+    arena = SSAValue(60, "int64")
+    index = SSAValue(70, "int64")
+    address = SSAValue(71, "ptr")
+    value = SSAValue(72, "int64")
+    function = Function(
+        "literal_table",
+        [],
+        {"entry": BasicBlock("entry", [
+            Instr("Const", [], arena, attributes={"value": {"i32": 127}}),
+            Instr("Const", [], index, attributes={"value": 0}),
+            Instr(
+                "GetElementPtr", [arena, index], address,
+                attributes={"binding": "ssa_sequence_literal_table"},
+            ),
+            Instr("Const", [], value, attributes={"value": 127}),
+            Instr(
+                "Store", [value, address], None,
+                attributes={"binding": "ssa_sequence_literal_table"},
+            ),
+            Instr("Ret", [], None),
+        ])},
+    )
+    descriptor = _sequence(60, 60, key_columns=(0,))
+
+    lower_sequence_aggregate_constants(
+        {function.name: function},
+        {function.name: SSASequenceTable({60: descriptor})},
+    )
+
+    assert not any(
+        instruction.op == "Const"
+        and isinstance(instruction.attributes.get("value"), dict)
+        for instruction in function.blocks["entry"].instrs
+    )
+    assert [argument.id for argument in function.args] == [60]
+    assert function.args[0].accounting == {
+        "sequence_arena": True,
+        "compile_time_initialized": True,
+    }
+    assert function.metadata["sequence_aggregate_inputs"] == (60,)
+
+
+def test_sequence_return_surface_correlates_output_with_storage_descriptor():
+    arena = SSAValue(60, "int64", (8,))
+    length = SSAValue(61, "int64", (1,))
+    capacity = SSAValue(62, "int64")
+    function = Function(
+        "return_bytes",
+        [arena, length, capacity],
+        {"entry": BasicBlock("entry", [Instr("Ret", [arena], None)])},
+        metadata={
+            "extraction_materializations": ({
+                "source_sequence_id": 60,
+                "extraction_identity": "builtins.bytes",
+                "lowering": "immutable-local-sequence-view",
+            },),
+        },
+    )
+    descriptor = _sequence(60, 60)
+    module = IRModule(
+        {function.name: function},
+        sequence_tables={
+            function.name: SSASequenceTable({60: descriptor})
+        },
+    )
+
+    emitted = emit_module(
+        module,
+        name="sequence_return_probe",
+        outputs={function.name: (arena,)},
+        extra_roots=(function.name,),
+    )
+
+    assert emitted.complete, [item.format() for item in emitted.shortfalls]
+    assert emitted.api.metadata["sequence_output_surfaces"] == {
+        function.name: [{
+            "output_index": 0,
+            "sequence_id": 60,
+            "materialization_identity": "builtins.bytes",
+        }]
+    }
+    assert emitted.api.metadata["sequence_runtime_bindings"] == {
+        function.name: [{
+            "sequence_id": 60,
+            "column_parameters": ["t60"],
+            "local_column_value_ids": [],
+            "length_parameter": "t61",
+            "capacity_parameter": "t62",
+            "status_parameter": None,
+            "extent_parameters": {
+                "extent_1": "unit",
+                "extent_8": "capacity",
+            },
+            "status_values": {},
+        }]
     }
 
 

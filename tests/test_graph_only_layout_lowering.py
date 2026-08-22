@@ -85,6 +85,20 @@ def test_graph_only_reshape_builds_region_and_emits_wasm():
     assert module.complete, module.shortfall_report()
 
 
+def test_graph_only_region_preserves_deterministic_boundary_identities():
+    program = _graph_only_regions(
+        _RESHAPE_SOURCE, "decode_block", "decode_block",
+    )[0].program
+
+    identity_tokens = (program.extras or {}).get("ssa_identity_tokens", {})
+
+    assert identity_tokens
+    assert set(identity_tokens) <= {
+        *program.feeds, *program.outputs.values(),
+    }
+    assert all(tuple(tokens) for tokens in identity_tokens.values())
+
+
 def test_graph_only_tobytes_builds_region_and_emits_wasm():
     regions = _graph_only_regions(_TOBYTES_SOURCE, "emit_state", "emit_state")
     assert regions, "graph-only path produced no structural region programs"

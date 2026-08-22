@@ -18,6 +18,7 @@ from typing import Any
 
 from .blas import BLAS_ROLES, BLASRole
 from .abstraction_methods import trigonometry as _trigonometry_surface
+from . import linalg as _linalg_surface
 
 
 CATALOG_SCHEMA = "turing.mathematical-library.v1"
@@ -217,10 +218,70 @@ TRIGONOMETRY_LIBRARY = MathematicalSubLibrary(
     methods=_trigonometry_methods(),
 )
 
+
+def _function_namespace_methods(
+    module: Any,
+    *,
+    library: str,
+    installation: str,
+) -> tuple[MathematicalMethod, ...]:
+    """Turn any source module's declared public functions into one catalog."""
+
+    declared = getattr(module, "__all__", None)
+    names = tuple(declared) if declared is not None else tuple(
+        name for name, value in vars(module).items()
+        if not name.startswith("_") and inspect.isfunction(value)
+    )
+    methods = []
+    for level, name in enumerate(names):
+        function = getattr(module, name)
+        if not inspect.isfunction(function):
+            raise TypeError(
+                f"{module.__name__} declares non-function method {name!r}"
+            )
+        source = inspect.getsource(function)
+        signature = inspect.signature(function)
+        parameters = tuple(
+            MathematicalParameter(
+                parameter.name,
+                (
+                    "tensor"
+                    if parameter.name.lower() in {"a", "b", "x"}
+                    else "parameter"
+                ),
+                "read",
+            )
+            for parameter in signature.parameters.values()
+        )
+        methods.append(MathematicalMethod(
+            name=name,
+            identity=f"{library}.{name}",
+            level=level,
+            parameters=parameters,
+            result={"kind": "runtime"},
+            source_symbol=f"{function.__module__}.{name}",
+            source=source,
+            source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            abstract_operators=(name,),
+            installation=installation,
+        ))
+    return tuple(methods)
+
+
+LINALG_LIBRARY = MathematicalSubLibrary(
+    name="linalg",
+    identity="linalg",
+    methods=_function_namespace_methods(
+        _linalg_surface,
+        library="linalg",
+        installation="namespace_operator:linalg",
+    ),
+)
+
 TURING_MATHEMATICAL_LIBRARY = MathematicalLibrary(
     name="Turing mathematical library",
     identity="turing.math",
-    libraries=(BLAS_LIBRARY, TRIGONOMETRY_LIBRARY),
+    libraries=(BLAS_LIBRARY, TRIGONOMETRY_LIBRARY, LINALG_LIBRARY),
 )
 
 
@@ -306,6 +367,7 @@ class AbstractTensorMathematicalLibrary:
         self.catalog = TURING_MATHEMATICAL_LIBRARY
         self.blas = AbstractTensorBLAS(tensor_type)
         self.trigonometry = AbstractTensorTrigonometry(tensor_type)
+        self.linalg = tensor_type.linalg
 
     @property
     def libraries(self) -> tuple[str, ...]:
@@ -427,6 +489,7 @@ def install_abstract_tensor_mathematical_library(
     setattr(tensor_type, "math", namespace)
     setattr(tensor_type, "blas", namespace.blas)
     setattr(tensor_type, "trigonometry", namespace.trigonometry)
+    setattr(tensor_type, "linalg", namespace.linalg)
 
     def install_compiled(cls, product):
         installed = AbstractTensorProviderMathematicalLibrary(cls, product)
@@ -439,6 +502,8 @@ def install_abstract_tensor_mathematical_library(
         setattr(cls, "math", installed)
         setattr(cls, "blas", installed.blas)
         setattr(cls, "trigonometry", installed.trigonometry)
+        if hasattr(installed, "linalg"):
+            setattr(cls, "linalg", installed.linalg)
         return product
 
     def use_semantic(cls):
@@ -452,6 +517,7 @@ def install_abstract_tensor_mathematical_library(
         setattr(cls, "math", semantic)
         setattr(cls, "blas", semantic.blas)
         setattr(cls, "trigonometry", semantic.trigonometry)
+        setattr(cls, "linalg", semantic.linalg)
         return semantic
 
     setattr(

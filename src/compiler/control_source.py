@@ -60,6 +60,17 @@ class ConditionalBlock:
     # arm the same id as ``initial_value_id``.
     carried_aliases: tuple[tuple[int, int, int, int], ...] = ()
     source_node_id: int | None = None
+    # Resident sequences cannot be merged as scalar SSA values.  Each tuple
+    # has the same (true, false, initial, merged) shape as ``carried_aliases``;
+    # lowering replaces the initial arena from the selected branch and keeps
+    # the merged spelling correlated with that one storage descriptor.
+    carried_sequence_aliases: tuple[tuple[int, int, int, int], ...] = ()
+    # (origin sequence, selected row handle, result value, physical column,
+    # dtype).  These loads are valid only in the selected arm and therefore
+    # belong at conditional entry, never beside the optional query itself.
+    entry_record_projections: tuple[
+        tuple[int, int, int, int, str], ...
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -73,6 +84,11 @@ class ControlSequenceMutation:
     policy: str | None = None
     argument_kind: str = "value"
     predicate_expression: ControlExpression | None = None
+    # Expressions aligned with ``argument_value_ids``.  A non-None entry
+    # proves how a coordinator scalar is computed inside the selected arm,
+    # preventing its result ID from becoming an invented function argument.
+    argument_expressions: tuple[ControlExpression | None, ...] = ()
+    extraction_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +127,14 @@ class LoopBlock:
     # negative step; keeping this explicit prevents C/SSA renderers from
     # silently applying a forward-only comparison to an adjoint loop.
     comparison: str = "lt"
+    # Terminal source exits run after resident effects for the iteration.  A
+    # planner may populate this only for a return proven to be in tail
+    # position; ordinary break/continue remain lexically embedded in body.
+    terminal_controls: tuple["LoopControlBlock", ...] = ()
+    # Exact authored ProcessGraph loop identity.  Like WhileBlock's identity,
+    # this survives scheduling so verification can prove that source loops
+    # became CFG loops rather than merely observing generic Phi/Lt blocks.
+    source_loop_node_id: int | None = None
 
     def __post_init__(self) -> None:
         preference = str(self.schedule_preference).lower()
@@ -149,6 +173,7 @@ class WhileBlock:
     # Control IR lets the SSA linker place that call in the authored while
     # body instead of guessing from a later result consumer.
     source_loop_node_id: int | None = None
+    terminal_controls: tuple["LoopControlBlock", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -163,10 +188,13 @@ class LoopControlBlock:
     predicate_value_id: int | None = None
     expect_true: bool = True
     predicate_expression: ControlExpression | None = None
+    source_action: str | None = None
 
     def __post_init__(self) -> None:
         if self.action not in {"break", "continue"}:
             raise ValueError("loop control action must be break or continue")
+        if self.source_action not in {None, "break", "continue", "loop-return"}:
+            raise ValueError("unknown source loop-control action")
 
 
 @dataclass(frozen=True)
@@ -263,6 +291,39 @@ class ValidationBlock:
     predicate_value_id: int
     error_code: int
     expect_true: bool = True
+    predicate_expression: ControlExpression | None = None
+    extraction_identity: str | None = None
+
+
+@dataclass(frozen=True)
+class SequenceMutationBlock:
+    """One lexical resident-sequence effect outside implicit loop storage."""
+
+    mutation: ControlSequenceMutation
+
+
+@dataclass(frozen=True)
+class SequenceQueryBlock:
+    """Read one scalar fact from a resident sequence at lexical position."""
+
+    result_value_id: int
+    sequence_value_id: int
+    operation: str
+    default_value_id: int | None = None
+    source_call_node_id: int | None = None
+    extraction_identity: str | None = None
+    result_alias_ids: tuple[int, ...] = ()
+    producer_loop_node_id: int | None = None
+    # A first-or-default query over a derived record sequence yields a tagged
+    # integer row handle.  The default arm uses -1 and subsequent source
+    # ``is [not] None`` tests consume that tag.
+    row_handle: bool = False
+
+    def __post_init__(self) -> None:
+        if self.operation not in {"length", "first_or_default"}:
+            raise ValueError("unknown resident sequence query")
+        if self.operation == "first_or_default" and self.default_value_id is None:
+            raise ValueError("first_or_default requires an explicit default")
 
 
 @dataclass(frozen=True)
@@ -293,6 +354,8 @@ ControlBlock = (
     | ParallelDeployment
     | CallBlock
     | ValidationBlock
+    | SequenceMutationBlock
+    | SequenceQueryBlock
     | StreamPublishBlock
 )
 
@@ -347,6 +410,11 @@ class ControlProgram:
     projected_iterable_bindings: tuple[
         tuple[int, int, str, object], ...
     ] = ()
+    # Source ``if`` nodes whose complete arm effects are represented by a
+    # specialized control form (for example, predicated resident mutations
+    # plus a loop-return edge), rather than by a ConditionalBlock.  These are
+    # semantic-accounting identities, not permission to omit either arm.
+    specialized_conditional_node_ids: tuple[int, ...] = ()
 
 
 def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[int]:
@@ -388,10 +456,21 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
             values.add(int(mutation.sequence_value_id))
             values.update(int(value_id) for value_id in mutation.argument_value_ids)
             expression_values(mutation.predicate_expression)
+            for expression in mutation.argument_expressions:
+                expression_values(expression)
 
     def visit(block: ControlBlock) -> None:
         if isinstance(block, ValidationBlock):
             values.add(int(block.predicate_value_id))
+            expression_values(block.predicate_expression)
+        elif isinstance(block, SequenceMutationBlock):
+            mutation_values((block.mutation,))
+        elif isinstance(block, SequenceQueryBlock):
+            values.add(int(block.result_value_id))
+            values.update(int(value_id) for value_id in block.result_alias_ids)
+            values.add(int(block.sequence_value_id))
+            if block.default_value_id is not None:
+                values.add(int(block.default_value_id))
         elif isinstance(block, StreamPublishBlock):
             values.add(int(block.value_id))
             if block.count_value_id is not None:
@@ -405,6 +484,7 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
             values.add(int(block.predicate_value_id))
             expression_values(block.predicate_expression)
             carried_values(block.carried_aliases)
+            carried_values(block.carried_sequence_aliases)
             visit(block.body)
             if block.orelse is not None:
                 visit(block.orelse)
@@ -412,6 +492,8 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
             carried_values(block.carried_aliases)
             mutation_values(block.sequence_mutations)
             visit(block.body)
+            for terminal in block.terminal_controls:
+                visit(terminal)
         elif isinstance(block, WhileBlock):
             values.add(int(block.predicate_value_id))
             expression_values(block.predicate_expression)
@@ -419,6 +501,8 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
             mutation_values(block.sequence_mutations)
             visit(block.condition)
             visit(block.body)
+            for terminal in block.terminal_controls:
+                visit(terminal)
         elif isinstance(block, LoopControlBlock):
             if block.predicate_value_id is not None:
                 values.add(int(block.predicate_value_id))
@@ -735,6 +819,23 @@ def render_control_block(
             f"    turing_validation_error({int(block.error_code)}u);",
             "}",
         )
+    if isinstance(block, SequenceMutationBlock):
+        mutation = block.mutation
+        return (
+            f"turing_sequence_{mutation.operator}(value_{int(mutation.sequence_value_id)});",
+        )
+    if isinstance(block, SequenceQueryBlock):
+        if block.operation == "length":
+            return (
+                f"value_{int(block.result_value_id)} = "
+                f"turing_sequence_length(value_{int(block.sequence_value_id)});",
+            )
+        return (
+            f"value_{int(block.result_value_id)} = "
+            f"turing_sequence_first_or_default("
+            f"value_{int(block.sequence_value_id)}, "
+            f"value_{int(block.default_value_id)});",
+        )
     if isinstance(block, StreamPublishBlock):
         count = (
             "-1"
@@ -921,6 +1022,7 @@ def compose_region_code(
                 block.predicate_expression,
                 block.carried_aliases,
                 block.source_node_id,
+                block.carried_sequence_aliases,
             )
         if isinstance(block, LoopBlock):
             return LoopBlock(
@@ -937,6 +1039,9 @@ def compose_region_code(
                 recursion_region_id=block.recursion_region_id,
                 schedule_preference=block.schedule_preference,
                 sequence_mutations=block.sequence_mutations,
+                comparison=block.comparison,
+                terminal_controls=block.terminal_controls,
+                source_loop_node_id=block.source_loop_node_id,
             )
         if isinstance(block, WhileBlock):
             return WhileBlock(
@@ -950,8 +1055,13 @@ def compose_region_code(
                 predicate_expression=block.predicate_expression,
                 sequence_mutations=block.sequence_mutations,
                 source_loop_node_id=block.source_loop_node_id,
+                terminal_controls=block.terminal_controls,
             )
         if isinstance(block, LoopControlBlock):
+            return block
+        if isinstance(block, SequenceMutationBlock):
+            return block
+        if isinstance(block, SequenceQueryBlock):
             return block
         if isinstance(block, StateMachineTick):
             return StateMachineTick(
@@ -1000,6 +1110,9 @@ def compose_region_code(
         recursion_regions=program.recursion_regions,
         deployment_regions=program.deployment_regions,
         projected_iterable_bindings=program.projected_iterable_bindings,
+        specialized_conditional_node_ids=(
+            program.specialized_conditional_node_ids
+        ),
     )
 
 
@@ -1060,6 +1173,14 @@ def project_control_regions(
                     )
                 ),
                 block.source_node_id,
+                tuple(
+                    carried for carried in block.carried_sequence_aliases
+                    if retained_values is None
+                    or all(
+                        int(value_id) in retained_values
+                        for value_id in carried
+                    )
+                ),
             )
         if isinstance(block, LoopBlock):
             body = project(block.body)
@@ -1103,6 +1224,13 @@ def project_control_regions(
                 recursion_region_id=block.recursion_region_id,
                 schedule_preference=block.schedule_preference,
                 sequence_mutations=block.sequence_mutations,
+                comparison=block.comparison,
+                terminal_controls=tuple(
+                    projected
+                    for terminal in block.terminal_controls
+                    if (projected := project(terminal)) is not None
+                ),
+                source_loop_node_id=block.source_loop_node_id,
             )
         if isinstance(block, WhileBlock):
             condition = project(block.condition)
@@ -1137,10 +1265,16 @@ def project_control_regions(
                 predicate_expression=block.predicate_expression,
                 sequence_mutations=block.sequence_mutations,
                 source_loop_node_id=block.source_loop_node_id,
+                terminal_controls=tuple(
+                    projected
+                    for terminal in block.terminal_controls
+                    if (projected := project(terminal)) is not None
+                ),
             )
         if isinstance(block, LoopControlBlock):
             if (
                 block.predicate_value_id is not None
+                and block.predicate_expression is None
                 and retained_values is not None
                 and int(block.predicate_value_id) not in retained_values
             ):
@@ -1180,6 +1314,10 @@ def project_control_regions(
                 block.result_bindings,
             )
         if isinstance(block, ValidationBlock):
+            return block
+        if isinstance(block, SequenceMutationBlock):
+            return block
+        if isinstance(block, SequenceQueryBlock):
             return block
         if isinstance(block, StreamPublishBlock):
             return block
@@ -1305,6 +1443,7 @@ def project_control_regions(
             for binding in program.projected_iterable_bindings
             if str(binding[2]) in active_inductions
         ),
+        program.specialized_conditional_node_ids,
     )
 
 
@@ -1346,6 +1485,7 @@ def overlay_scheduled_control(
     projected_iterable_bindings = []
     recursion_regions = []
     deployment_regions = []
+    specialized_conditional_node_ids = []
     controls = tuple(controls)
     controlled_sets = tuple(
         frozenset(control.region_indices) for control in controls
@@ -1421,6 +1561,7 @@ def overlay_scheduled_control(
                     block.predicate_expression,
                     block.carried_aliases,
                     block.source_node_id,
+                    block.carried_sequence_aliases,
                 ),
                 body_consumed or else_consumed,
             )
@@ -1445,6 +1586,9 @@ def overlay_scheduled_control(
                     recursion_region_id=block.recursion_region_id,
                     schedule_preference=block.schedule_preference,
                     sequence_mutations=block.sequence_mutations,
+                    comparison=block.comparison,
+                    terminal_controls=block.terminal_controls,
+                    source_loop_node_id=block.source_loop_node_id,
                 ),
                 consumed,
             )
@@ -1473,6 +1617,7 @@ def overlay_scheduled_control(
                     predicate_expression=block.predicate_expression,
                     sequence_mutations=block.sequence_mutations,
                     source_loop_node_id=block.source_loop_node_id,
+                    terminal_controls=block.terminal_controls,
                 ),
                 condition_consumed or body_consumed,
             )
@@ -1624,6 +1769,9 @@ def overlay_scheduled_control(
             replace(region, region_id=deployment_base + offset)
             for offset, region in enumerate(control.deployment_regions)
         )
+        specialized_conditional_node_ids.extend(
+            control.specialized_conditional_node_ids
+        )
         if not controlled:
             continue
         missing = set(controlled) - set(order)
@@ -1727,7 +1875,115 @@ def overlay_scheduled_control(
         projected_iterable_bindings=tuple(
             dict.fromkeys(projected_iterable_bindings)
         ),
+        specialized_conditional_node_ids=tuple(dict.fromkeys(
+            int(node_id) for node_id in specialized_conditional_node_ids
+        )),
     )
+
+
+def place_validations_after_region_producers(
+    program: ControlProgram,
+    validations: Iterable[ValidationBlock],
+    *,
+    predicate_regions: Mapping[int, int],
+) -> ControlProgram:
+    """Place each guard after the region that computes its predicate.
+
+    Validation is lexical compiled control, not an entrypoint precondition.
+    In particular, a predicate can itself be the output of an earlier
+    numerical region.  Prefixing every guard to ``program.root`` reads that
+    result before it exists and quietly turns the canonical SSA identity into
+    an invented public argument.  Correlate by the existing value identity
+    and splice the guard directly after the unique scheduled region marker.
+
+    A predicate with no numerical producer is already an authored input (or a
+    control expression over authored inputs), so its guard remains an entry
+    prelude.  A predicate reported in two regions is not a schedule at all and
+    is refused rather than guessed.
+    """
+
+    pending_by_region: dict[int, list[ValidationBlock]] = {}
+    prelude: list[ValidationBlock] = []
+    for validation in validations:
+        region = predicate_regions.get(int(validation.predicate_value_id))
+        if region is None:
+            prelude.append(validation)
+        else:
+            pending_by_region.setdefault(int(region), []).append(validation)
+
+    placed: set[int] = set()
+
+    def marker(line: str) -> int | None:
+        prefix = "__scheduled_region_"
+        suffix = "__"
+        if not (line.startswith(prefix) and line.endswith(suffix)):
+            return None
+        try:
+            return int(line[len(prefix):-len(suffix)])
+        except ValueError:
+            return None
+
+    def visit(block: ControlBlock) -> ControlBlock:
+        if isinstance(block, StatementBlock):
+            expanded: list[ControlBlock] = []
+            residual: list[str] = []
+            for line in block.lines:
+                residual.append(line)
+                region = marker(line)
+                if region is None or region not in pending_by_region:
+                    continue
+                expanded.append(StatementBlock(tuple(residual)))
+                residual = []
+                if region in placed:
+                    raise ValueError(
+                        "scheduled region marker occurs more than once while "
+                        f"placing validation predicates: region={region}"
+                    )
+                expanded.extend(pending_by_region[region])
+                placed.add(region)
+            if residual:
+                expanded.append(StatementBlock(tuple(residual)))
+            if len(expanded) == 1:
+                return expanded[0]
+            return SequenceBlock(tuple(expanded))
+        if isinstance(block, SequenceBlock):
+            return replace(block, blocks=tuple(map(visit, block.blocks)))
+        if isinstance(block, ConditionalBlock):
+            return replace(
+                block,
+                body=visit(block.body),
+                orelse=(visit(block.orelse) if block.orelse is not None else None),
+            )
+        if isinstance(block, LoopBlock):
+            return replace(block, body=visit(block.body))
+        if isinstance(block, WhileBlock):
+            return replace(
+                block,
+                condition=visit(block.condition),
+                body=visit(block.body),
+            )
+        if isinstance(block, StateMachineTick):
+            return replace(
+                block,
+                cases=tuple((value, visit(body)) for value, body in block.cases),
+                default=(visit(block.default) if block.default is not None else None),
+            )
+        if isinstance(block, ParallelDeployment):
+            return replace(block, lanes=tuple(map(visit, block.lanes)))
+        if isinstance(block, CallBlock):
+            return replace(block, callee=visit(block.callee))
+        return block
+
+    root = visit(program.root)
+    missing = set(pending_by_region) - placed
+    if missing:
+        raise ValueError(
+            "validation predicate producer regions are absent from the "
+            f"scheduled control tree: regions={sorted(missing)!r}"
+        )
+    if prelude:
+        root = SequenceBlock((*prelude, root))
+    return replace(program, root=root)
 
 
 def render_control_program(
@@ -1885,6 +2141,8 @@ __all__ = [
     "RecursionRegion",
     "RegionCode",
     "SequenceBlock",
+    "SequenceMutationBlock",
+    "SequenceQueryBlock",
     "StateMachineTick",
     "StatementBlock",
     "StreamPublishBlock",

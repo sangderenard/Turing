@@ -97,7 +97,8 @@ def compile_native_graph_forward(
 ) -> NativeGraphForward:
     """Compile the SSA graph produced by an existing AbstractTensor method."""
 
-    from ..transmogrifier.ssa import IRModule
+    from ..transmogrifier.ssa import IRModule, Instr
+    from ..transmogrifier.ssa_registry import Handler
     from .ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
 
     output_items = tuple(output) if isinstance(output, (tuple, list)) else (output,)
@@ -110,6 +111,22 @@ def compile_native_graph_forward(
     if any(getattr(value, "program", None) is not program for value in values):
         raise TypeError("compiled graph forward outputs must share one program")
     function = program.function
+    has_return = any(
+        instruction.op in {"Ret", "ret", "Return", "return"}
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+    if not has_return:
+        block = function.blocks.get("entry") or next(iter(function.blocks.values()))
+        block.instrs.append(Instr(
+            Handler.Ret.value,
+            [value.value for value in values],
+            None,
+        ))
+        function.metadata["named_outputs"] = tuple(
+            (f"result_{index}", int(value.value.id))
+            for index, value in enumerate(values)
+        )
     emitted = emit_ssa_function_to_llvm(
         IRModule({function.name: function}),
         function.name,
@@ -215,8 +232,6 @@ def compile_native_graph_reverse(
     from .ssa_llvm_backend import compile_artifact, emit_ssa_function_to_llvm
 
     wrt = tuple(map(int, wrt_value_ids))
-    if not wrt:
-        raise ValueError("compiled graph reverse requires at least one wrt value")
     if len(set(wrt)) != len(wrt):
         raise ValueError(f"compiled graph reverse repeats wrt values: {wrt!r}")
 

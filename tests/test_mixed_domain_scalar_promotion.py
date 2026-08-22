@@ -167,3 +167,40 @@ def test_integer_only_operation_stays_integral(tmp_path):
     execution.run()
     produced = np.asarray(execution.buffers[int(result.id)]).reshape(-1)[0]
     assert int(produced) == 42
+
+
+@pytest.mark.parametrize(("gate", "expected"), [(0.0, 0), (1.0, 7)])
+def test_promoted_float_register_is_reconciled_to_declared_integer_result(
+    gate, expected, tmp_path,
+):
+    """A compiler index may be multiplied by a numeric predicate.
+
+    The operation executes in the promoted floating domain, then converts
+    back to the result cell's declared integer type before storing.  Keeping
+    the declared type as the register type produced invalid LLVM of the form
+    ``store i32 %double_register`` during compiler self-bootstrap.
+    """
+
+    index = SSAValue(3000, dtype="int", shape=())
+    predicate = SSAValue(3001, dtype="float64", shape=())
+    result = SSAValue(3002, dtype="int", shape=())
+    function = Function(
+        "program",
+        [index, predicate],
+        {
+            "entry": BasicBlock("entry", [
+                Instr("Mul", [index, predicate], result),
+                Instr("Ret", [result], None),
+            ])
+        },
+    )
+    artifact = emit_ssa_function_to_llvm(IRModule({"program": function}), "program")
+    assert artifact.shortfalls == (), artifact.shortfalls
+    native = compile_artifact(artifact, directory=tmp_path / f"gate-{expected}")
+    execution = prepare_artifact_execution(native, {
+        int(index.id): np.asarray([7], dtype=np.int64),
+        int(predicate.id): np.asarray([gate], dtype=np.float64),
+    })
+    execution.run()
+    produced = np.asarray(execution.buffers[int(result.id)]).reshape(-1)[0]
+    assert int(produced) == expected

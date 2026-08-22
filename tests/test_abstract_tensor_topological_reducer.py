@@ -16,6 +16,34 @@ from src.common.tensors.abstract_nn.token_lexicon import CompilerTokenLexicon
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
 
+def test_tuple_comprehension_publishes_fixed_resident_row_width():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse("""
+def rows(values: list[int]):
+    return [(value, value + 1) for value in values]
+"""))
+
+    reduce_abstract_tensor_topology(graph)
+    executable = graph.function_table.entry("rows").graph.G
+    materializer_id, materializer = next(
+        (node_id, data)
+        for node_id, data in executable.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.ListComp)
+    )
+
+    assert materializer["attributes"]["sequence_column_count"] == 2
+
+    from src.compiler.fortran_c_shell import _field_slot_ops
+
+    declarations = _field_slot_ops(executable)[8]
+    assert next(
+        columns
+        for sequence_id, _policy, columns, _writable in declarations
+        if sequence_id == materializer_id
+    ) == 2
+
+
 def test_ingestion_identity_ledger_versions_authored_rebindings_before_ssa():
     graph = ProcessGraph(materialize_memory=False)
     with contextlib.redirect_stdout(io.StringIO()):
@@ -643,6 +671,239 @@ def run(value):
     assert calls["worker.apply(value)"]["attributes"]["method_ref"] == (
         method_ref
     )
+
+
+def test_field_aggregate_contract_follows_an_authored_method_result():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Value:
+    def __init__(self):
+        self.accounting = {}
+
+class Builder:
+    def fresh_value(self) -> Value:
+        return Value()
+
+    def lower(self, rows):
+        for row in rows:
+            value = self.fresh_value()
+            value.accounting.update({"row": row})
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("lower").graph
+    field = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+        and ast.unparse(data["expr_obj"]) == "value.accounting"
+    )
+
+    assert field["attributes"]["aggregate_kind"] == "dict"
+    assert field["attributes"]["record_field"] == ("Value", "accounting")
+    loop = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    )
+    effect, = loop["attributes"]["loop_state_effects"]
+    assert effect["operator"] == "update"
+    assert effect["effect_mode"] == "mapping_mutation"
+    assert effect["sequence_policy"] == "unique"
+
+
+def test_setdefault_result_retains_nested_collection_identity_in_a_loop():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def group_rows(rows):
+    groups = {}
+    for key, value in rows:
+        group = groups.setdefault(key, set())
+        group.add(value)
+    return groups
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("group_rows").graph
+    loop = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    )
+    effects = {
+        effect["operator"]: effect
+        for effect in loop["attributes"]["loop_state_effects"]
+    }
+
+    assert effects["setdefault"]["effect_mode"] == "mapping_mutation"
+    assert effects["add"]["effect_mode"] == "sequence_mutation"
+    assert effects["add"]["sequence_policy"] == "unique"
+
+
+def test_imported_dataclass_field_factory_is_a_record_aggregate_contract():
+    from src.transmogrifier.ssa import SSAValue
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"SSAValue": SSAValue}
+    module = ast.parse(
+        """
+from src.transmogrifier.ssa import SSAValue
+
+def make_value() -> SSAValue:
+    return SSAValue(1)
+
+def kernel(rows):
+    for row in rows:
+        value = make_value()
+        value.accounting.update({"row": row})
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("kernel").graph
+    field = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+        and ast.unparse(data["expr_obj"]) == "value.accounting"
+    )
+    loop = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    )
+    effect, = loop["attributes"]["loop_state_effects"]
+
+    assert field["attributes"]["aggregate_kind"] == "dict"
+    assert field["attributes"]["record_field"] == ("SSAValue", "accounting")
+    assert effect["effect_mode"] == "mapping_mutation"
+
+
+def test_annotated_mapping_field_retains_key_and_record_value_contract():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class SSAValue:
+    pass
+
+class Builder:
+    def __init__(self):
+        self.external_values: dict[int, SSAValue | None] = {}
+
+    def restore(self, key: int, previous: SSAValue | None):
+        self.external_values[key] = previous
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("restore").graph
+    field = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+        and ast.unparse(data["expr_obj"]) == "self.external_values"
+    )
+
+    assert field["attributes"]["mapping_key_dtype"] == "int64"
+    assert field["attributes"]["mapping_value_dtype"] == "int64"
+    assert field["attributes"]["mapping_value_record"] == "SSAValue"
+    assert field["attributes"]["mapping_value_optional"] is True
+
+
+def test_lazy_class_mapping_initialization_types_phi_and_setdefault():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Groups:
+    def add_rows(self, rows):
+        groups = getattr(self, "_groups", None)
+        if groups is None:
+            groups = {}
+            self._groups = groups
+        for key, value in rows:
+            group = groups.setdefault(key, set())
+            group.add(value)
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("add_rows").graph
+    phi = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "Phi" and data.get("label") == "groups"
+    )
+    loop = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    )
+    effects = {
+        effect["operator"]: effect
+        for effect in loop["attributes"]["loop_state_effects"]
+    }
+
+    assert phi["attributes"]["aggregate_kind"] == "dict"
+    assert phi["attributes"]["mapping_value_aggregate_kind"] == "set"
+    assert effects["setdefault"]["effect_mode"] == "mapping_mutation"
+    assert effects["add"]["effect_mode"] == "sequence_mutation"
+
+
+def test_mapping_pop_requires_tombstone_storage_without_duplicate_deletion():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+class Builder:
+    def __init__(self):
+        self.external_values = {}
+
+    def lower(self, keys):
+        for key in keys:
+            previous = self.external_values.pop(key, None)
+            if previous is not None:
+                pass
+"""
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    executable = graph.function_table.entry("lower").graph.G
+    external_values = next(
+        int(data.get("value_id", node_id))
+        for node_id, data in executable.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Attribute)
+        and ast.unparse(data["expr_obj"]) == "self.external_values"
+    )
+
+    from src.compiler.fortran_c_shell import _field_slot_ops
+
+    contract = _field_slot_ops(executable)
+    table_deletions = contract[13]
+    tombstone_sequence_ids = contract[17]
+
+    assert table_deletions == ()
+    assert tombstone_sequence_ids == (external_values,)
 
 
 def test_descendant_loop_owns_its_sequence_mutation_effect():

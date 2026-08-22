@@ -94,6 +94,67 @@ program_abi:
         error_channels: {storage: keyed, dtype: float64, mutable: true}
         hard_failure: {storage: scalar, dtype: bool, mutable: true, default: false}
         advanced_dt: {storage: scalar, dtype: float64, mutable: true, default: null}
+    # Compiler bootstrap boundary.  The graph and its nested DiGraph are
+    # structural records; their deterministic SSA/node identities are never
+    # renumbered at this boundary.  ``nodes`` and graph metadata remain named
+    # references until the tagged columnar node/property tables are lowered --
+    # keeping those leaves explicit makes the next bootstrap frontier honest.
+    CompilerProcessGraph:
+      identity: src.transmogrifier.graph.graph_express2.ProcessGraph
+      fields:
+        G: {storage: record, record: CompilerDirectedGraph, mutable: false}
+        roots: {storage: span, dtype: int64, rank: 1, mutable: true}
+        levels: {storage: reference, mutable: true}
+        function_table: {storage: reference, mutable: false}
+    CompilerDirectedGraph:
+      identity: networkx.classes.digraph.DiGraph
+      fields:
+        # Deterministic SSA node id -> dense node-row handle.  The key is the
+        # existing id itself; it is never hashed, interned, or renumbered.
+        nodes: {storage: keyed, dtype: int64, rank: 1, key_encoding: integer_identity, value_record: CompilerNode, value_identity: key, mutable: true}
+        graph: {storage: record, record: CompilerGraphMetadata, mutable: true}
+    # The row reached by G.nodes[deterministic_node_id].  These are the exact
+    # source-facing fields consumed by the first bootstrap targets.  Opaque
+    # leaves stay explicit references until their tagged/token-chain column
+    # layouts are installed; they must not be mistaken for native scalars.
+    CompilerNode:
+      identity: turing.compiler.CompilerNode
+      fields:
+        # One lexical token, encoded by its explicit one-based vocabulary
+        # position.  This is a length-one token chain, not a hash; the ordered
+        # vocabulary is carried in every contract/artifact receipt.
+        type:
+          storage: scalar
+          dtype: int64
+          mutable: false
+          token_vocabulary: [Constant, Const, const, StaticReference, Input]
+        attributes: {storage: record, record: CompilerNodeAttributes, mutable: false}
+        # Runtime AST class tag.  The authored isinstance checks are lowered
+        # to equality against these same exact vocabulary positions.
+        expr_obj:
+          storage: scalar
+          dtype: int64
+          mutable: false
+          token_vocabulary: [ast.Tuple, ast.List, ast.Set, ast.Dict]
+        parents:
+          storage: table
+          rank: 1
+          mutable: false
+          columns:
+            - {name: parent_id, dtype: int64}
+            - {name: role_token, dtype: int64}
+    CompilerNodeAttributes:
+      identity: turing.compiler.CompilerNodeAttributes
+      fields:
+        binding_name: {storage: reference, mutable: false}
+    CompilerGraphMetadata:
+      identity: turing.compiler.CompilerGraphMetadata
+      fields:
+        # This first physical view is a presence table.  Its string-token keys
+        # answer the membership query used by source-static classification;
+        # tagged specialization payloads remain a later field, so no Python
+        # object is smuggled through this table.
+        planner_specializations: {storage: keyed, dtype: int64, rank: 1, key_encoding: string_token, mutable: false}
   bindings:
     - {function: "*", parameter: state, record: SymbolicFluidGridState}
     - {function: "*", parameter: targets, record: Targets}
@@ -101,6 +162,12 @@ program_abi:
     - {function: "*", parameter: ctrl, record: STController}
     - {function: "*", parameter: metrics, record: Metrics}
     - {function: "*coerce_metrics", parameter: value, record: Metrics}
+    - {function: _dependency_order, parameter: graph, record: CompilerProcessGraph}
+    - {function: _source_static_value, parameter: graph, record: CompilerProcessGraph}
+    - {function: _source_static_literal, parameter: graph, record: CompilerProcessGraph}
+    - {function: _tensor_descriptor, parameter: graph, record: CompilerProcessGraph}
+    - {function: _is_ast_metadata_node, parameter: graph, record: CompilerProcessGraph}
+    - {function: _semantic_children, parameter: graph, record: CompilerProcessGraph}
   # Native scalar entry values have an explicit source-language type.  This
   # makes authored type-preserving guards deterministic during preprocessing;
   # the compiler does not guess whether a float64 slot is still a Python or

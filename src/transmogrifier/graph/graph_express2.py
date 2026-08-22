@@ -21,6 +21,7 @@ from ..ilpscheduler import ILPScheduler
 from ..function_table import ExternalFunctionTable, FunctionTable
 from .node_special_cases import (
     annotate_types,
+    inline_context_managers,
     expand_ellipsis_subscripts,
     fold_constant_getattr,
     hoist_walrus_assignments,
@@ -1102,6 +1103,78 @@ def _ast_local_constructor_bindings(definition, bindings):
     return resolved
 
 
+_UNRESOLVED_LITERAL = object()
+
+
+def _is_resolved_literal(value):
+    if isinstance(value, (type(None), bool, int, float, complex, str, bytes)):
+        return True
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return all(_is_resolved_literal(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            _is_resolved_literal(key) and _is_resolved_literal(item)
+            for key, item in value.items()
+        )
+    return False
+
+
+def _resolved_ast_literal(node, bindings):
+    """Evaluate only literal structure and previously proven literal names.
+
+    ``ast.literal_eval`` intentionally rejects names.  Module constants often
+    organize an immutable table from earlier scalar constants, though, and
+    treating that table as a runtime external severs its source semantics at
+    every compiled function boundary.  This evaluator remains deliberately
+    non-executing: there are no attributes, subscripts, calls, or comprehensions.
+    """
+
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        value = bindings.get(node.id, _UNRESOLVED_LITERAL)
+        if value is not _UNRESOLVED_LITERAL and _is_resolved_literal(value):
+            return value
+        return _UNRESOLVED_LITERAL
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        values = tuple(_resolved_ast_literal(item, bindings) for item in node.elts)
+        if any(value is _UNRESOLVED_LITERAL for value in values):
+            return _UNRESOLVED_LITERAL
+        if isinstance(node, ast.Tuple):
+            return values
+        if isinstance(node, ast.List):
+            return list(values)
+        try:
+            return set(values)
+        except TypeError:
+            return _UNRESOLVED_LITERAL
+    if isinstance(node, ast.Dict):
+        keys = tuple(_resolved_ast_literal(item, bindings) for item in node.keys)
+        values = tuple(
+            _resolved_ast_literal(item, bindings) for item in node.values
+        )
+        if any(item is _UNRESOLVED_LITERAL for item in (*keys, *values)):
+            return _UNRESOLVED_LITERAL
+        try:
+            return dict(zip(keys, values))
+        except TypeError:
+            return _UNRESOLVED_LITERAL
+    if isinstance(node, ast.UnaryOp):
+        operand = _resolved_ast_literal(node.operand, bindings)
+        if operand is _UNRESOLVED_LITERAL:
+            return _UNRESOLVED_LITERAL
+        try:
+            if isinstance(node.op, ast.UAdd):
+                return +operand
+            if isinstance(node.op, ast.USub):
+                return -operand
+            if isinstance(node.op, ast.Invert):
+                return ~operand
+        except TypeError:
+            pass
+    return _UNRESOLVED_LITERAL
+
+
 def _import_ast_bindings(tree, bindings, package=None):
     """Make imports and literal module constants visible to source discovery."""
 
@@ -1149,9 +1222,8 @@ def _import_ast_bindings(tree, bindings, package=None):
             continue
         if value_node is None:
             continue
-        try:
-            value = ast.literal_eval(value_node)
-        except (TypeError, ValueError, SyntaxError):
+        value = _resolved_ast_literal(value_node, resolved)
+        if value is _UNRESOLVED_LITERAL:
             continue
         if isinstance(statement, ast.Assign):
             for target in statement.targets:
@@ -1447,7 +1519,14 @@ def _expand_unresolved_ast_parents(
         return tuple(calls)
 
     def root_definition(identity):
-        parts = tuple(part for part in str(identity).split(".") if part)
+        # ``<locals>`` is Python's durable lexical-name separator, not an AST
+        # definition. Accept the same qualified spelling used by FunctionTable
+        # identities so nested authored functions can be pursued as bounded
+        # compilation units without renaming or lifting their source.
+        parts = tuple(
+            part for part in str(identity).split(".")
+            if part and part != "<locals>"
+        )
         if not parts:
             return None
         candidates = [
@@ -3107,6 +3186,52 @@ class ProcessGraph:
                 "build_from_ast expects an AST node, a filename, or a source string"
             )
 
+        def _context_definition(call):
+            """The ``FunctionDef`` a context expression names, or ``None``.
+
+            Resolution lives here rather than in the rewrite because only the
+            ingesting tree knows how its own names bind. A manager that cannot
+            be read keeps its ``with``, which keeps whatever blocker it had --
+            silently dropping an unreadable context is the failure to avoid.
+            """
+
+            holder = call.func
+            if not (isinstance(holder, ast.Attribute)
+                    and isinstance(holder.value, ast.Name)):
+                return None
+            module = None
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    for alias in node.names:
+                        if (alias.asname or alias.name) == holder.value.id:
+                            module = f"{node.module}.{alias.name}"
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if (alias.asname
+                                or alias.name.split(".")[0]) == holder.value.id:
+                            module = alias.name
+            if module is None:
+                return None
+            try:
+                target = getattr(
+                    importlib.import_module(module), holder.attr, None,
+                )
+                # A @contextmanager wraps the generator that holds the halves.
+                target = getattr(target, "__wrapped__", target)
+                body = ast.parse(
+                    textwrap.dedent(inspect.getsource(target))
+                ).body
+            except Exception:  # noqa: BLE001 -- unreadable is not fatal
+                return None
+            return body[0] if body and isinstance(
+                body[0], ast.FunctionDef) else None
+
+        # A context manager is a get/set on a slot, not control flow, so it is
+        # turned into the statements it already is the moment the AST arrives
+        # -- the same treatment the walrus gets below, and for the same reason:
+        # nothing downstream should have to learn the construct.
+        tree = inline_context_managers(tree, _context_definition)
+
         retained = () if retain is None else (
             (retain,) if inspect.isclass(retain) else tuple(retain)
         )
@@ -3190,6 +3315,48 @@ class ProcessGraph:
         # nodes ProcessGraph is about to ingest; do not create a second AST
         # ingestion path or infer process topology from them.
         self.G.graph["map_ir"] = _map_ir_from_ast(tree)
+        # Parameter annotations are part of the authored ABI, not live
+        # Python-callable state.  Preserve their exact AST spellings per
+        # lexical function so repository-SSA linking can type a detached
+        # callee long after ``python_callable`` has deliberately been removed.
+        function_parameter_annotations = {}
+        for definition in getattr(tree, "body", ()):
+            functions = (
+                (definition,)
+                if isinstance(
+                    definition, (ast.FunctionDef, ast.AsyncFunctionDef)
+                )
+                else tuple(
+                    member for member in definition.body
+                    if isinstance(
+                        member, (ast.FunctionDef, ast.AsyncFunctionDef)
+                    )
+                )
+                if isinstance(definition, ast.ClassDef)
+                else ()
+            )
+            for function in functions:
+                identity = (
+                    f"{definition.name}.{function.name}"
+                    if isinstance(definition, ast.ClassDef)
+                    else function.name
+                )
+                arguments = function.args
+                parameters = (
+                    *arguments.posonlyargs,
+                    *arguments.args,
+                    *arguments.kwonlyargs,
+                    *((arguments.vararg,) if arguments.vararg else ()),
+                    *((arguments.kwarg,) if arguments.kwarg else ()),
+                )
+                function_parameter_annotations[str(identity)] = {
+                    str(parameter.arg): ast.unparse(parameter.annotation)
+                    for parameter in parameters
+                    if parameter.annotation is not None
+                }
+        self.G.graph["function_parameter_annotations"] = (
+            function_parameter_annotations
+        )
         if retained_identities:
             self.G.graph["map_ir"]["selected_class_identities"] = tuple(
                 dict.fromkeys(retained_identities)

@@ -360,7 +360,44 @@ class SSARecordTable:
     def register(self, descriptor: SSARecordDescriptor) -> SSARecordDescriptor:
         existing = self.records.get(descriptor.record_id)
         if existing is not None and existing != descriptor:
-            raise ValueError(f"conflicting SSA record descriptor {descriptor.record_id}")
+            compatible_identity = existing.identity == descriptor.identity
+            existing_fields = {field.name: field for field in existing.fields}
+            incoming_fields = {field.name: field for field in descriptor.fields}
+            compatible_overlap = all(
+                existing_fields[name] == incoming_fields[name]
+                for name in existing_fields.keys() & incoming_fields.keys()
+            )
+            compatible_pool = (
+                existing.instance_pool is None
+                or descriptor.instance_pool is None
+                or existing.instance_pool == descriptor.instance_pool
+            )
+            if compatible_identity and compatible_overlap and compatible_pool:
+                # One caller record is observed through several pursued
+                # callees, each of which legitimately projects only the
+                # fields it touches. Merge those complementary views under
+                # the already-correlated record id; this is not an id
+                # collision and no field spelling is reinterpreted.
+                descriptor = SSARecordDescriptor(
+                    descriptor.record_id,
+                    descriptor.identity,
+                    (
+                        *existing.fields,
+                        *(
+                            field for field in descriptor.fields
+                            if field.name not in existing_fields
+                        ),
+                    ),
+                    existing.instance_pool or descriptor.instance_pool,
+                )
+            else:
+                raise ValueError(
+                    f"conflicting SSA record descriptor {descriptor.record_id}: "
+                    f"existing_identity={existing.identity!r} "
+                    f"existing_fields={tuple(field.name for field in existing.fields)!r} "
+                    f"incoming_identity={descriptor.identity!r} "
+                    f"incoming_fields={tuple(field.name for field in descriptor.fields)!r}"
+                )
         self.records[descriptor.record_id] = descriptor
         return descriptor
 

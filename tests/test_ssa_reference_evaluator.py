@@ -65,6 +65,25 @@ def test_unknown_instruction_raises_rather_than_guessing():
         SSAReferenceEvaluator(_Module()).run("f", {0: 1.0})
 
 
+def test_scalar_bit_shift_uses_the_planners_canonical_spelling():
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    left = SSAValue(0, dtype="int64")
+    count = SSAValue(1, dtype="int64")
+    result = SSAValue(2, dtype="int64")
+    block = BasicBlock("entry", [
+        Instr("shl", [left, count], result),
+        Instr("Ret", [result], None),
+    ])
+
+    class _Module:
+        functions = {"f": Function("f", [left, count], {"entry": block})}
+
+    evaluated = SSAReferenceEvaluator(_Module()).run("f", {0: 3, 1: 4})
+
+    assert int(evaluated.returned[0]) == 48
+
+
 def test_reading_an_undefined_value_raises():
     """A use its definition does not dominate is a defect, not a zero."""
     from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue

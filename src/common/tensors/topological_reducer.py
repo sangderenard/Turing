@@ -876,6 +876,9 @@ def _normalize_lexical_values(
     closure_aggregate_kinds: dict[str, str] | None = None,
     method_owner: str | None = None,
     class_field_aggregate_kinds: Mapping[tuple[str, str], str] | None = None,
+    class_field_mapping_contracts: Mapping[
+        tuple[str, str], Mapping[str, Any]
+    ] | None = None,
 ) -> None:
     """Resolve unique lexical occurrences into a monotonic value DAG.
 
@@ -929,6 +932,7 @@ def _normalize_lexical_values(
         graph.G.graph["_class_navigation_table"] = navigation_table
     parameter_class_names: dict[str, str] = {}
     parameter_aggregate_kinds: dict[str, str] = {}
+    parameter_sequence_record_widths: dict[str, int] = {}
     known_class_identities = {
         record.identity for record in navigation_table.classes
     }
@@ -950,6 +954,22 @@ def _normalize_lexical_values(
             }
         ):
             parameter_aggregate_kinds[argument.arg] = annotation.id
+    for parameter_name, record in dict(
+        graph.G.graph.get("parameter_sequence_record_abi") or {}
+    ).items():
+        # NOT named ``fields``: this function also closes over
+        # ``static_reference_node``, which calls ``dataclasses.fields``. A
+        # local of that name here makes ``fields`` a local of the WHOLE
+        # enclosing scope, so the nested call resolves to this cell instead
+        # of the import and raises "cannot access free variable 'fields'"
+        # on any path that reaches the nested function before this loop.
+        record_fields = tuple(dict(record.get("fields") or {}))
+        if not record_fields:
+            continue
+        parameter_aggregate_kinds[str(parameter_name)] = str(
+            record.get("aggregate_kind") or "tuple"
+        )
+        parameter_sequence_record_widths[str(parameter_name)] = len(record_fields)
     # Source pursuit records an explicitly constructed local aggregate by
     # its class (``opt_subs = {}`` -> ``opt_subs: dict``).  For a nested
     # function that name is captured runtime storage, not a compile-time
@@ -1105,7 +1125,8 @@ def _normalize_lexical_values(
                     (0,) if aggregate_kind in {"set", "dict"} else ()
                 ),
                 "sequence_column_count": (
-                    2 if aggregate_kind == "dict" else 1
+                    2 if aggregate_kind == "dict" else
+                    parameter_sequence_record_widths.get(name, 1)
                 ),
                 "sequence_writable": aggregate_kind not in {"tuple", "bytes"},
             })
@@ -1164,10 +1185,28 @@ def _normalize_lexical_values(
         existing = static_constant_nodes.get(name)
         if existing is not None:
             return existing
+        attributes = {"value": value, "binding_name": name}
+        if isinstance(value, dict) and all(
+            isinstance(key, (bool, int, float, str))
+            and isinstance(item, (bool, int, float, str))
+            for key, item in value.items()
+        ):
+            # Keep an immutable module mapping as structural source, not an
+            # opaque scalar constant.  The repository-SSA lowerer materializes
+            # these exact rows into a local keyed table, so dynamic source keys
+            # use the same lookup path as ordinary authored dictionaries.
+            attributes.update({
+                "producer_kind": "compile_time_mapping",
+                "aggregate_kind": "dict",
+                "sequence_key_columns": (0,),
+                "sequence_column_count": 2,
+                "sequence_writable": False,
+                "compile_time_mapping_items": tuple(value.items()),
+            })
         node_id = new_node(
             "Constant",
             name,
-            attributes={"value": value, "binding_name": name},
+            attributes=attributes,
         )
         static_constant_nodes[name] = node_id
         return node_id
@@ -1379,6 +1418,34 @@ def _normalize_lexical_values(
                 })
             if isinstance(expression, (ast.ListComp, ast.SetComp)):
                 value_id = resolve_expression(expression.elt)
+                if (
+                    isinstance(value_id, int)
+                    and value_id in graph.G
+                    and node_id in graph.G
+                ):
+                    value_attributes = (
+                        graph.G.nodes[value_id].get("attributes") or {}
+                    )
+                    row_leaves = tuple(map(
+                        int,
+                        value_attributes.get(
+                            "aggregate_leaf_value_ids", ()
+                        ),
+                    ))
+                    if (
+                        value_attributes.get("aggregate_kind") == "tuple"
+                        and len(row_leaves) > 1
+                    ):
+                        # A comprehension over a tuple expression authors a
+                        # fixed-width resident row sequence.  Publish that
+                        # width at normalization time, where the element and
+                        # its aggregate leaves are both known; leaving the
+                        # default width of one makes every downstream backend
+                        # see an impossible two-value insertion into a scalar
+                        # arena.
+                        graph.G.nodes[node_id].setdefault(
+                            "attributes", {}
+                        )["sequence_column_count"] = len(row_leaves)
                 for generator in expression.generators:
                     generator_id = id(generator)
                     if (
@@ -1717,18 +1784,33 @@ def _normalize_lexical_values(
                             graph.G.nodes[attribute_id].setdefault(
                                 "attributes", {}
                             )["attribute_slot"] = (class_identity, slot)
-                field_kind = (
-                    (class_field_aggregate_kinds or {}).get((
-                        str(method_owner), str(expression.attr)
-                    ))
+                receiver_attributes = (
+                    graph.G.nodes[receiver].get("attributes") or {}
+                )
+                receiver_class = (
+                    str(method_owner)
                     if (
                         method_owner is not None
                         and isinstance(expression.value, ast.Name)
                         and expression.value.id in {"self", "cls"}
                     )
-                    else None
+                    else receiver_attributes.get(
+                        "result_class_ref",
+                        receiver_attributes.get("class_ref"),
+                    )
+                )
+                field_kind = (
+                    (class_field_aggregate_kinds or {}).get((
+                        str(receiver_class), str(expression.attr)
+                    ))
+                    if receiver_class is not None else None
                 )
                 if field_kind is not None:
+                    mapping_contract = dict(
+                        (class_field_mapping_contracts or {}).get((
+                            str(receiver_class), str(expression.attr)
+                        )) or {}
+                    )
                     graph.G.nodes[attribute_id].setdefault(
                         "attributes", {}
                     ).update({
@@ -1742,8 +1824,9 @@ def _normalize_lexical_values(
                         ),
                         "sequence_writable": field_kind != "tuple",
                         "record_field": (
-                            str(method_owner), str(expression.attr)
+                            str(receiver_class), str(expression.attr)
                         ),
+                        **mapping_contract,
                     })
                 # An ordinary attribute access on a resolved receiver is a
                 # real reference-operator node -- ``_replace_inputs`` above
@@ -2118,6 +2201,62 @@ def _normalize_lexical_values(
                             f"kw:{keyword.arg}" if keyword.arg else "kwargs",
                         ))
                 _replace_inputs(graph, node_id, tuple(resolved_inputs))
+                if (
+                    isinstance(expression.func, ast.Attribute)
+                    and expression.func.attr == "setdefault"
+                    and len(expression.args) >= 2
+                ):
+                    default_id = resolve_expression(expression.args[1])
+                    default_attributes = (
+                        graph.G.nodes[default_id].get("attributes") or {}
+                        if isinstance(default_id, int) and default_id in graph.G
+                        else {}
+                    )
+                    default_kind = default_attributes.get("aggregate_kind")
+                    if default_kind is not None:
+                        call_attributes.update({
+                            "producer_kind": "mapping_default_result",
+                            "aggregate_kind": default_kind,
+                            "sequence_key_columns": tuple(
+                                default_attributes.get(
+                                    "sequence_key_columns", ()
+                                )
+                            ),
+                            "sequence_column_count": int(
+                                default_attributes.get(
+                                    "sequence_column_count", 1
+                                )
+                            ),
+                            "sequence_writable": bool(
+                                default_attributes.get(
+                                    "sequence_writable", True
+                                )
+                            ),
+                        })
+                        receiver_id = resolve_expression(
+                            expression.func.value
+                        )
+                        if isinstance(receiver_id, int) and receiver_id in graph.G:
+                            receiver_contract = graph.G.nodes[
+                                receiver_id
+                            ].setdefault("attributes", {})
+                            receiver_contract[
+                                "mapping_value_aggregate_kind"
+                            ] = default_kind
+                            key_id = resolve_expression(expression.args[0])
+                            key_attributes = (
+                                graph.G.nodes[key_id].get("attributes") or {}
+                                if isinstance(key_id, int) and key_id in graph.G
+                                else {}
+                            )
+                            key_leaves = tuple(
+                                key_attributes.get(
+                                    "aggregate_leaf_value_ids", ()
+                                )
+                            )
+                            receiver_contract[
+                                "mapping_key_column_count"
+                            ] = max(1, len(key_leaves))
 
         # A named callee already represented by a function-table reference is
         # not a runtime value.  Its arguments still are.
@@ -2890,13 +3029,40 @@ def _normalize_lexical_values(
                         and isinstance(body_value, int)
                         and isinstance(else_value, int)
                     ):
+                        merged_attributes = {
+                            "binding_name": name,
+                            "source_conditional_id": id(body_statement),
+                        }
+                        body_attributes = (
+                            graph.G.nodes[body_value].get("attributes") or {}
+                        )
+                        else_attributes = (
+                            graph.G.nodes[else_value].get("attributes") or {}
+                        )
+                        body_kind = body_attributes.get("aggregate_kind")
+                        if (
+                            body_kind is not None
+                            and body_kind == else_attributes.get(
+                                "aggregate_kind"
+                            )
+                        ):
+                            merged_attributes.update({
+                                key: body_attributes[key]
+                                for key in (
+                                    "aggregate_kind",
+                                    "sequence_key_columns",
+                                    "sequence_column_count",
+                                    "sequence_writable",
+                                )
+                                if key in body_attributes
+                            })
+                            merged_attributes["producer_kind"] = (
+                                "aggregate_phi"
+                            )
                         merged_value = new_node(
                             "Phi",
                             name,
-                            attributes={
-                                "binding_name": name,
-                                "source_conditional_id": id(body_statement),
-                            },
+                            attributes=merged_attributes,
                             parents=(
                                 (test_value, "test"),
                                 (body_value, "body"),
@@ -3027,7 +3193,7 @@ def _normalize_lexical_values(
                 for child in source_child_nodes(node):
                     yield from current_loop_walk(child)
 
-            state_effect_calls = tuple(
+            discarded_effect_calls = tuple(
                 expression_statement.value
                 for nested_statement in body_statement.body
                 for expression_statement in current_loop_walk(
@@ -3046,6 +3212,26 @@ def _normalize_lexical_values(
                     )
                 )
             )
+            # Mapping operations can both mutate and return a value.  Unlike
+            # append/update used as bare statements, ``pop`` and
+            # ``setdefault`` commonly occur inside an assignment or test.
+            # Keep the original call identity so lowering must satisfy both
+            # the state transition and its result.
+            result_effect_calls = tuple(
+                member
+                for nested_statement in body_statement.body
+                for member in current_loop_walk(nested_statement)
+                if (
+                    isinstance(member, ast.Call)
+                    and isinstance(member.func, ast.Attribute)
+                    and member.func.attr in {"pop", "setdefault"}
+                    and isinstance(member.func.value, (ast.Name, ast.Attribute))
+                )
+            )
+            state_effect_calls = tuple(dict.fromkeys((
+                *discarded_effect_calls,
+                *result_effect_calls,
+            )))
             # Parameter bindings are materialized lazily at their first
             # lexical read, so a parameter first touched INSIDE the loop is
             # absent from the pre-loop snapshot -- and a name missing from
@@ -3310,13 +3496,21 @@ def _normalize_lexical_values(
                             )
                         )
                     )
+                    mapping_mutation = (
+                        aggregate_kind == "dict"
+                        and call.func.attr in {"update", "pop", "setdefault"}
+                        and state_attributes.get("sequence_writable", True)
+                    )
                     state_effects.append({
                         "state_name": name,
                         "operator": call.func.attr,
                         "effect_mode": (
                             "sequence_mutation"
                             if sequence_mutation
-                            else "opaque"
+                            else (
+                                "mapping_mutation"
+                                if mapping_mutation else "opaque"
+                            )
                         ),
                         "sequence_policy": sequence_policy,
                         "argument_kind": (
@@ -3947,7 +4141,182 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         for member in class_definition.body:
             if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 method_owners[id(member)] = class_definition.name
-    class_field_aggregate_kinds: dict[tuple[str, str], str] = {}
+    class_field_aggregate_kinds: dict[tuple[str, str], str] = {
+        (str(owner), str(field)): str(kind)
+        for (owner, field), kind in dict(
+            graph.G.graph.get("external_class_field_aggregate_kinds") or {}
+        ).items()
+    }
+    class_field_mapping_contracts: dict[
+        tuple[str, str], dict[str, Any]
+    ] = {}
+
+    def _annotation_storage(annotation: ast.AST) -> dict[str, Any]:
+        """Return the exact scalar/record handle stated by one annotation."""
+
+        if isinstance(annotation, ast.BinOp) and isinstance(
+            annotation.op, ast.BitOr
+        ):
+            concrete = tuple(
+                member for member in (annotation.left, annotation.right)
+                if not (
+                    isinstance(member, ast.Constant)
+                    and member.value is None
+                )
+                and not (
+                    isinstance(member, ast.Name) and member.id == "None"
+                )
+            )
+            if len(concrete) == 1:
+                return {
+                    **_annotation_storage(concrete[0]),
+                    "optional": True,
+                }
+        name = (
+            annotation.id if isinstance(annotation, ast.Name)
+            else annotation.attr if isinstance(annotation, ast.Attribute)
+            else ""
+        )
+        dtype = {
+            "bool": "bool", "int": "int64", "float": "float64",
+        }.get(str(name))
+        if dtype is not None:
+            return {"dtype": dtype}
+        if name:
+            # Repository records cross table boundaries by a deterministic
+            # integer row handle; their physical fields remain described by
+            # the record table rather than being collapsed into this scalar.
+            return {"dtype": "int64", "record": str(name)}
+        return {}
+
+    def _mapping_annotation(annotation: ast.AST | None) -> dict[str, Any]:
+        if not isinstance(annotation, ast.Subscript):
+            return {}
+        container = (
+            annotation.value.id
+            if isinstance(annotation.value, ast.Name)
+            else annotation.value.attr
+            if isinstance(annotation.value, ast.Attribute)
+            else ""
+        )
+        if str(container).casefold() not in {"dict", "mapping", "mutablemapping"}:
+            return {}
+        columns = (
+            tuple(annotation.slice.elts)
+            if isinstance(annotation.slice, ast.Tuple)
+            else (annotation.slice,)
+        )
+        if len(columns) != 2:
+            return {}
+        key = _annotation_storage(columns[0])
+        value = _annotation_storage(columns[1])
+        if key.get("dtype") is None or value.get("dtype") is None:
+            return {}
+        return {
+            "mapping_key_dtype": str(key["dtype"]),
+            "mapping_value_dtype": str(value["dtype"]),
+            **({
+                "mapping_value_record": str(value["record"]),
+            } if value.get("record") is not None else {}),
+            "mapping_value_optional": bool(value.get("optional", False)),
+        }
+
+    # AST ingestion normalizes an annotated assignment into its executable
+    # assignment form, but MapIR deliberately retains the authored annotation
+    # as schema data.  Read that durable copy; it is the exact cross-function
+    # source of truth for fields declared in ``__init__``.
+    for class_record in tuple(
+        (graph.G.graph.get("map_ir") or {}).get("objects") or ()
+    ):
+        class_name = str(class_record.get("class_identity") or "")
+        for field_record in tuple(class_record.get("attributes") or ()):
+            annotation = field_record.get("annotation")
+            if not class_name or not annotation:
+                continue
+            try:
+                annotation_node = ast.parse(
+                    str(annotation), mode="eval"
+                ).body
+            except SyntaxError:
+                continue
+            contract = _mapping_annotation(annotation_node)
+            if contract:
+                class_field_mapping_contracts[(
+                    class_name, str(field_record.get("name") or ""),
+                )] = contract
+
+    for class_name, definition in class_definitions.items():
+        for member in definition.body:
+            candidates: list[ast.AnnAssign] = []
+            if isinstance(member, ast.AnnAssign):
+                candidates.append(member)
+            elif isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                candidates.extend(
+                    node for node in ast.walk(member)
+                    if isinstance(node, ast.AnnAssign)
+                )
+            for declaration in candidates:
+                field_name = (
+                    declaration.target.id
+                    if isinstance(declaration.target, ast.Name)
+                    else declaration.target.attr
+                    if (
+                        isinstance(declaration.target, ast.Attribute)
+                        and isinstance(declaration.target.value, ast.Name)
+                        and declaration.target.value.id in {"self", "cls"}
+                    )
+                    else None
+                )
+                if field_name is None:
+                    continue
+                contract = _mapping_annotation(declaration.annotation)
+                if contract:
+                    class_field_mapping_contracts[
+                        (str(class_name), str(field_name))
+                    ] = contract
+    # The FunctionTable's retained method definitions are the authoritative
+    # source bodies.  Some ingestion paths retain a skeletal ClassDef while
+    # storing the complete method AST separately, so survey those definitions
+    # as well instead of making the class wrapper a hidden prerequisite.
+    for definition_id, class_name in method_owners.items():
+        definition = function_definitions.get(int(definition_id))
+        if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for declaration in (
+            node for node in ast.walk(definition)
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Attribute)
+            and isinstance(node.target.value, ast.Name)
+            and node.target.value.id in {"self", "cls"}
+        ):
+            contract = _mapping_annotation(declaration.annotation)
+            if contract:
+                class_field_mapping_contracts[
+                    (str(class_name), str(declaration.target.attr))
+                ] = contract
+
+    # Imported dataclasses are legitimate authored record contracts even when
+    # their class bodies are intentionally outside this compilation unit.
+    # Read only declared dataclass metadata; do not instantiate the class or
+    # invoke its factories.  The factory identity is enough to establish the
+    # resident aggregate kind deterministically.
+    for binding_name, bound_value in dict(
+        getattr(graph, "python_bindings", {}) or {}
+    ).items():
+        if not isinstance(bound_value, type) or not is_dataclass(bound_value):
+            continue
+        for declared_field in fields(bound_value):
+            factory = declared_field.default_factory
+            aggregate_kind = next((
+                kind.__name__
+                for kind in (list, set, dict, tuple)
+                if factory is kind
+            ), None)
+            if aggregate_kind is not None:
+                class_field_aggregate_kinds.setdefault(
+                    (str(binding_name), str(declared_field.name)),
+                    aggregate_kind,
+                )
 
     def aggregate_expression_kind(expression: ast.AST | None) -> str | None:
         if isinstance(expression, (ast.List, ast.ListComp)):
@@ -4160,6 +4529,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 else:
                     continue
                 kind = aggregate_expression_kind(value)
+                if kind is None and isinstance(value, ast.Name):
+                    kind = local_aggregate_kinds_by_function.get(
+                        id(member), {}
+                    ).get(value.id)
                 if (
                     kind is None
                     and isinstance(value, ast.Call)
@@ -4332,6 +4705,29 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         )
                     }
                     if hasattr(statement, "_process_graph_boundary")
+                    else {}
+                ),
+                **(
+                    {
+                        "host_ssa_module": getattr(
+                            statement, "_linked_repository_ssa_module"
+                        ),
+                        "host_ssa_root": str(getattr(
+                            statement, "_linked_repository_ssa_root"
+                        )),
+                        "host_ssa_outputs": dict(getattr(
+                            statement, "_linked_repository_ssa_outputs", {}
+                        )),
+                        "host_repository_ssa_complete": True,
+                        "host_machine_state_complete": False,
+                        "host_ssa_blockers": (),
+                        "host_ssa_hard_blockers": (),
+                        "host_ssa_legalization_shortfalls": (),
+                        "host_ssa_unresolved_dependencies": (),
+                        "implementation_kind": "linked-repository-ssa",
+                        "implementation_variants": ("repository-ssa",),
+                    }
+                    if hasattr(statement, "_linked_repository_ssa_module")
                     else {}
                 ),
             },
@@ -4585,14 +4981,22 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     }
     returned_class_by_reference: dict[int, str] = {}
     def returned_class(definition: Any) -> str | None:
+        if isinstance(definition, int) and definition in graph.G:
+            definition = graph.G.nodes[definition].get("expr_obj")
         if not isinstance(
             definition, (ast.FunctionDef, ast.AsyncFunctionDef)
         ):
             return None
+        known_record_classes = {
+            str(owner) for owner, _field in class_field_aggregate_kinds
+        }
         declared_class = (
             definition.returns.id
             if isinstance(definition.returns, ast.Name)
-            and definition.returns.id in graph.G.graph["class_table"]
+            and (
+                definition.returns.id in graph.G.graph["class_table"]
+                or definition.returns.id in known_record_classes
+            )
             else None
         )
         returned_classes = {
@@ -4633,7 +5037,15 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             if not isinstance(expression, ast.Call):
                 continue
             attributes = call_data.setdefault("attributes", {})
-            callee_reference = attributes.get("callee_ref")
+            # Method calls can already have their exact source reference even
+            # when the later generic call-correlation pass has not mirrored
+            # it into ``callee_ref`` yet.  Both fields name the same function
+            # table entry; refusing ``method_ref`` here loses the returned
+            # object's class and therefore every field-storage contract on a
+            # value such as ``self.fresh_value().accounting``.
+            callee_reference = attributes.get(
+                "callee_ref", attributes.get("method_ref")
+            )
             returned_class = (
                 None if callee_reference is None
                 else returned_class_by_reference.get(int(callee_reference))
@@ -5913,6 +6325,25 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 ),
                 statement,
             )
+        # Normalize attributes with returned receiver classes already
+        # attached.  This lets a field on an authored method result inherit
+        # the class's aggregate/storage contract just like ``self.field``.
+        propagate_returned_receiver_types(function_graph.G)
+        local_mapping_contracts = dict(class_field_mapping_contracts)
+        local_owner = method_owners.get(node_id)
+        if local_owner is not None:
+            for declaration in (
+                candidate for candidate in ast.walk(normalization_statement)
+                if isinstance(candidate, ast.AnnAssign)
+                and isinstance(candidate.target, ast.Attribute)
+                and isinstance(candidate.target.value, ast.Name)
+                and candidate.target.value.id in {"self", "cls"}
+            ):
+                contract = _mapping_annotation(declaration.annotation)
+                if contract:
+                    local_mapping_contracts[
+                        (str(local_owner), str(declaration.target.attr))
+                    ] = contract
         _normalize_lexical_values(
             function_graph,
             normalization_statement,
@@ -5922,6 +6353,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             closure_aggregate_kinds(node_id),
             method_owner=method_owners.get(node_id),
             class_field_aggregate_kinds=class_field_aggregate_kinds,
+            class_field_mapping_contracts=local_mapping_contracts,
         )
         generator_yields = tuple(
             node_id

@@ -37,7 +37,7 @@ EXPECTED: dict[int, str] = {
     11: "PASSED",      # a default fills its slot; an override displaces it
     12: "PASSED",      # declaration order survives against the alphabet
     13: "PASSED",      # transposed arguments stay distinct (anti-symmetric)
-    14: "MATERIALIZE", # a thrice-rebound parameter name does not materialize
+    14: "PASSED",      # exact call ids no longer alias whole name histories
     15: "PASSED",      # int literals + int parameter meeting float arithmetic
     16: "PASSED",      # authored if: FIXED at the root -- every graph node
                        # is born with constant=None, and _constant_value

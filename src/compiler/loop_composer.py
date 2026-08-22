@@ -146,6 +146,7 @@ class LoopDescriptor:
     condition_nodes: tuple[int, ...]
     break_nodes: tuple[tuple[int, int | None, bool], ...] = ()
     continue_nodes: tuple[tuple[int, int | None, bool], ...] = ()
+    return_nodes: tuple[tuple[int, int | None, bool], ...] = ()
     target_bindings: tuple[tuple[str, int], ...] = ()
     carried_bindings: tuple[tuple[str, int, int], ...] = ()
     start: Any = None
@@ -187,6 +188,11 @@ class LoopShaderReduction:
     control_program: ControlProgram | None = None
     preferred_shell: str = "glsl"
     dispatch_closure_count: int = 0
+    # Numerical regions whose complete semantics are emitted by the control
+    # program itself (for example a filtered-comprehension predicate lowered
+    # as a predicated resident append).  They remain compilation artifacts for
+    # provenance, but the outer shell must not schedule them a second time.
+    structurally_owned_region_indices: tuple[int, ...] = ()
 
 
 def planned_collection_bindings(
@@ -496,7 +502,7 @@ def evaporate_unrolled_loops(
             continue
         selected_plans = group or (plan,)
         loop = selected_plans[0].loop
-        # Sequence mutations are resident memory effects, not values that can
+        # Collection mutations are resident memory effects, not values that can
         # be replaced by cloning the loop body's numerical producer cone. The
         # evaporator expands indexed publications and comprehension
         # materializers explicitly below; until it likewise emits one
@@ -504,7 +510,10 @@ def evaporate_unrolled_loops(
         # delete the mutation. Preserve iterative control so ordinary
         # sequence-SSA lowering owns the complete effect.
         if any(
-            effect.mode is LoopStateEffectMode.SEQUENCE_MUTATION
+            effect.mode in {
+                LoopStateEffectMode.SEQUENCE_MUTATION,
+                LoopStateEffectMode.MAPPING_MUTATION,
+            }
             for member in selected_plans
             for effect in member.loop.state_effects
         ):
@@ -524,10 +533,13 @@ def evaporate_unrolled_loops(
                     for member in group
                 )
             )
-            specializations = {
-                **dict(graph.G.graph.get("parameter_defaults") or {}),
-                **dict(graph.G.graph.get("planner_specializations") or {}),
-            }
+            # A Python default describes how a missing call argument is
+            # supplied; it does not freeze that parameter for every call.
+            # Only an explicit planner specialization may make a parameter-
+            # dependent iterable source-static and therefore evaporatable.
+            specializations = dict(
+                graph.G.graph.get("planner_specializations") or {}
+            )
             assignments: list[dict[int, object]] = []
 
             def expand_generator(
@@ -1307,7 +1319,10 @@ def materialize_retained_loop_ports(
 
         effects = []
         for effect in loop.state_effects:
-            if effect.mode is LoopStateEffectMode.SEQUENCE_MUTATION:
+            if effect.mode in {
+                LoopStateEffectMode.SEQUENCE_MUTATION,
+                LoopStateEffectMode.MAPPING_MUTATION,
+            }:
                 # The sequence descriptor points at caller-owned arena,
                 # length and status cells.  append/add/extend mutate those
                 # cells in place, so manufacturing a LoopStatePort here
@@ -1832,6 +1847,37 @@ class LoopComposer:
 
         loop_controls: list[tuple[str, int, int | None, bool]] = []
 
+        def terminal_return_expressions(
+            statements: Iterable[ast.stmt],
+        ) -> set[int]:
+            statements = tuple(statements)
+            if not statements:
+                return set()
+            terminal = statements[-1]
+            if isinstance(terminal, ast.Return):
+                return {id(terminal)}
+            if isinstance(terminal, ast.If):
+                return {
+                    *terminal_return_expressions(terminal.body),
+                    *terminal_return_expressions(terminal.orelse),
+                }
+            return set()
+
+        loop_statements = (
+            tuple(expression.body)
+            if isinstance(expression, (ast.For, ast.While, ast.AsyncFor))
+            else ()
+        )
+        terminal_return_ids = terminal_return_expressions(loop_statements)
+        for candidate in ast.walk(expression):
+            if isinstance(candidate, ast.If):
+                terminal_return_ids.update(
+                    terminal_return_expressions(candidate.body)
+                )
+                terminal_return_ids.update(
+                    terminal_return_expressions(candidate.orelse)
+                )
+
         def collect_loop_controls(
             statements: Iterable[ast.stmt],
             guard: tuple[int, bool] | None = None,
@@ -1847,6 +1893,33 @@ class LoopComposer:
                             "break" if isinstance(statement, ast.Break)
                             else "continue",
                             statement_id,
+                            None if guard is None else guard[0],
+                            True if guard is None else guard[1],
+                        ))
+                    continue
+                if isinstance(statement, ast.Return) and statement.value is not None:
+                    return_value_id = graph_node_for_ast(statement.value)
+                    condition_id = (
+                        graph_node_for_ast(expression.test)
+                        if isinstance(expression, ast.While) else None
+                    )
+                    condition_is_true = False
+                    if condition_id is not None:
+                        known, condition_value = _constant(graph, condition_id)
+                        condition_is_true = bool(known and condition_value is True)
+                    # A return from an unconditional loop whose value is the
+                    # callable's sole public root is a terminal loop exit. It
+                    # may branch to the function epilogue without executing a
+                    # distinct post-loop authored path.
+                    if (
+                        condition_is_true
+                        and id(statement) in terminal_return_ids
+                        and return_value_id is not None
+                        and tuple(map(int, graph.roots)) == (int(return_value_id),)
+                    ):
+                        loop_controls.append((
+                            "loop-return",
+                            int(return_value_id),
                             None if guard is None else guard[0],
                             True if guard is None else guard[1],
                         ))
@@ -2131,14 +2204,7 @@ class LoopComposer:
         if count is None and iterator_kind != "arithmetic_sequence":
             iterable_constant = _static_iterable_expression(
                 iterator_expression,
-                {
-                    **dict(
-                        graph.G.graph.get("parameter_defaults") or {}
-                    ),
-                    **dict(
-                        graph.G.graph.get("planner_specializations") or {}
-                    ),
-                },
+                dict(graph.G.graph.get("planner_specializations") or {}),
             )
             if iterable_constant is not None:
                 count = len(iterable_constant)
@@ -2288,9 +2354,6 @@ class LoopComposer:
         ):
             filtered = []
             specializations = dict(
-                graph.G.graph.get("parameter_defaults") or {}
-            )
-            specializations.update(
                 graph.G.graph.get("planner_specializations") or {}
             )
             for item in iterable_constant:
@@ -2335,6 +2398,11 @@ class LoopComposer:
                 (node_id, predicate_id, expect_true)
                 for kind, node_id, predicate_id, expect_true in loop_controls
                 if kind == "continue"
+            ),
+            return_nodes=tuple(
+                (node_id, predicate_id, expect_true)
+                for kind, node_id, predicate_id, expect_true in loop_controls
+                if kind == "loop-return"
             ),
             target_bindings=tuple(
                 (
@@ -2682,6 +2750,11 @@ class LoopComposer:
                     for _node_id, predicate_id, _expect_true
                     in loop.break_nodes
                     if predicate_id is not None
+                ) + tuple(
+                    predicate_id
+                    for _node_id, predicate_id, _expect_true
+                    in loop.return_nodes
+                    if predicate_id is not None
                 ),
                 continue_value_ids=tuple(
                     predicate_id
@@ -2766,10 +2839,33 @@ def analyze_shader_loop_reductions(
     )
     reductions = []
     identity_table = graph.G.graph.get("identity_table") or {}
-    planner_constants = {
-        **dict(graph.G.graph.get("parameter_defaults") or {}),
-        **dict(graph.G.graph.get("planner_specializations") or {}),
+    nodes_by_value = {
+        int(data.get("value_id", node_id)): data
+        for node_id, data in graph.G.nodes(data=True)
     }
+    node_ids_by_value = {
+        int(data.get("value_id", node_id)): int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+    }
+
+    def expanded_row_arguments(value_ids: Iterable[int]) -> tuple[int, ...]:
+        """Expose fixed aggregate leaves as sequence row columns."""
+
+        expanded: list[int] = []
+        for value_id in map(int, value_ids):
+            data = nodes_by_value.get(value_id, {})
+            attributes = data.get("attributes") or {}
+            leaf_ids = tuple(map(
+                int, attributes.get("aggregate_leaf_value_ids", ())
+            ))
+            if attributes.get("aggregate_kind") == "tuple" and leaf_ids:
+                expanded.extend(leaf_ids)
+            else:
+                expanded.append(value_id)
+        return tuple(expanded)
+    planner_constants = dict(
+        graph.G.graph.get("planner_specializations") or {}
+    )
 
     def specialized_input_value(data: Mapping[str, Any]) -> object | None:
         attributes = data.get("attributes") or {}
@@ -2859,13 +2955,27 @@ def analyze_shader_loop_reductions(
         node_id = int(node_id)
         if node_id in visiting:
             return ControlExpression("value", value_id=node_id)
-        data = graph.G.nodes[node_id]
-        if node_id in carried_initial_value_ids:
+        # State-effect and aggregate records speak in deterministic SSA value
+        # identities, while loop/control membership speaks in graph node
+        # identities.  They often coincide, but topology reduction may remove
+        # the original graph node while retaining its canonical value on a
+        # replacement node. Resolve through the graph's explicit ``value_id``
+        # correlation; never treat the old integer as an alias or remint it.
+        resolved_node_id = (
+            node_id
+            if node_id in graph.G
+            else node_ids_by_value.get(node_id)
+        )
+        if resolved_node_id is None:
             return ControlExpression("value", value_id=node_id)
-        known, literal = _constant(graph, node_id)
+        data = graph.G.nodes[int(resolved_node_id)]
+        value_id = int(data.get("value_id", node_id))
+        if value_id in carried_initial_value_ids:
+            return ControlExpression("value", value_id=value_id)
+        known, literal = _constant(graph, int(resolved_node_id))
         if known and isinstance(literal, (bool, int, float)):
             return ControlExpression(
-                "const", value_id=node_id, literal=literal
+                "const", value_id=value_id, literal=literal
             )
         expression = data.get("expr_obj")
         op = str(data.get("op") or data.get("type") or "").lower()
@@ -2881,17 +2991,17 @@ def analyze_shader_loop_reductions(
             # latch and produces the next while predicate.
             return ControlExpression(
                 "sequence_nonempty",
-                (ControlExpression("value", value_id=node_id),),
-                value_id=node_id,
+                (ControlExpression("value", value_id=value_id),),
+                value_id=value_id,
                 literal=attributes.get("aggregate_kind") in {"dict", "set"},
             )
         if data.get("type") == "Input":
             specialized = specialized_input_value(data)
             if specialized is not None:
                 return ControlExpression(
-                    "const", value_id=node_id, literal=specialized
+                    "const", value_id=value_id, literal=specialized
                 )
-            return ControlExpression("value", value_id=node_id)
+            return ControlExpression("value", value_id=value_id)
         if isinstance(expression, ast.BoolOp):
             operator_name = "and" if isinstance(expression.op, ast.And) else "or"
             values = [
@@ -2908,22 +3018,24 @@ def analyze_shader_loop_reductions(
             result = values[0]
             for value in values[1:]:
                 result = ControlExpression(
-                    operator_name, (result, value), value_id=node_id
+                    operator_name, (result, value), value_id=value_id
                 )
             return result
         operation = {
             "add": "add", "sub": "sub", "mul": "mul",
             "div": "div", "truediv": "div",
             "less": "lt", "lt": "lt",
-            "lessequal": "le", "le": "le",
+            "lessequal": "le", "less_equal": "le", "le": "le",
             "greater": "gt", "gt": "gt",
-            "greaterequal": "ge", "ge": "ge",
+            "greaterequal": "ge", "greater_equal": "ge", "ge": "ge",
             "equal": "eq", "eq": "eq",
-            "notequal": "ne", "ne": "ne",
+            "notequal": "ne", "not_equal": "ne", "ne": "ne",
             "logical_and": "and", "land": "and",
             "logical_or": "or", "lor": "or",
             "logical_not": "not", "lnot": "not",
             "neg": "neg", "usub": "neg",
+            "bitand": "bitand", "bitor": "bitor",
+            "bitxor": "bitxor", "shl": "shl", "shr": "shr",
             "item": "item", "float": "float",
             "int": "int", "bool": "bool",
         }.get(op)
@@ -2933,7 +3045,7 @@ def analyze_shader_loop_reductions(
                     "float": "float", "int": "int", "bool": "bool"
                 }.get(expression.func.id)
         if operation is None:
-            return ControlExpression("value", value_id=node_id)
+            return ControlExpression("value", value_id=value_id)
         ignored_roles = {"callee", "ops", "operator"}
         operands = tuple(
             operand
@@ -2952,12 +3064,48 @@ def analyze_shader_loop_reductions(
         if len(operands) < arity:
             return None
         return ControlExpression(
-            operation, operands[:arity], value_id=node_id
+            operation, operands[:arity], value_id=value_id
         )
 
     plans_by_loop_id = {
         int(plan.loop.node_id): plan for plan in plans
     }
+
+    def expanded_loop_body_nodes(
+        loop: LoopDescriptor,
+        visiting: frozenset[int] = frozenset(),
+    ) -> tuple[int, ...]:
+        """Include the authored work owned by structurally nested loops.
+
+        Statement loops already receive their complete AST subtree from
+        discovery.  A comprehension is different: each ``generator`` clause
+        is a sibling field of the materializer AST, and a nested collection
+        comprehension inside its element is represented by its own loop
+        descriptor.  The outer descriptor therefore contains the child loop
+        node but not necessarily the child's numerical body nodes.  Region
+        compartmentalization then gave the outer control only its local
+        markers while the hierarchy correctly declared the child nested,
+        leaving no lexical marker at which overlay could insert it.
+
+        Expand through the compiler's authored loop-containment relation,
+        retaining encounter order.  This is identity correlation, not a
+        region-number offset: the child loop's real graph node is the proof
+        of containment and its own descriptor supplies the exact body IDs.
+        """
+
+        loop_id = int(loop.node_id)
+        if loop_id in visiting:
+            raise ValueError("cyclic authored loop containment")
+        expanded: list[int] = []
+        for member in map(int, loop.body_nodes):
+            expanded.append(member)
+            child = plans_by_loop_id.get(member)
+            if child is not None:
+                expanded.extend(expanded_loop_body_nodes(
+                    child.loop, visiting | {loop_id},
+                ))
+        return tuple(dict.fromkeys(expanded))
+
     routed_generator_mutations: dict[
         int, list[ControlSequenceMutation]
     ] = {}
@@ -3017,6 +3165,7 @@ def analyze_shader_loop_reductions(
                         "and", (predicate_expression, predicate)
                     )
                 )
+            yielded_arguments = expanded_row_arguments((yielded_value_id,))
             routed_generator_mutations.setdefault(
                 generator_loop_id, []
             ).append(ControlSequenceMutation(
@@ -3025,7 +3174,7 @@ def analyze_shader_loop_reductions(
                     "add"
                     if effect.sequence_policy == "unique" else "append"
                 ),
-                argument_value_ids=(yielded_value_id,),
+                argument_value_ids=yielded_arguments,
                 effect_node_id=int(effect.effect_node_id),
                 policy=effect.sequence_policy,
                 argument_kind="value",
@@ -3158,10 +3307,11 @@ def analyze_shader_loop_reductions(
             for _name, _expression, uniforms in dynamic_bounds
             for value_id in uniforms
         ))
-        body = set(loop.body_nodes)
+        nested_body_nodes = expanded_loop_body_nodes(loop)
+        body = set(nested_body_nodes)
         lexical_position = {
             int(node_id): position
-            for position, node_id in enumerate(loop.body_nodes)
+            for position, node_id in enumerate(nested_body_nodes)
         }
         expression_nodes = {
             id(data.get("expr_obj")): int(node_id)
@@ -3344,23 +3494,67 @@ def analyze_shader_loop_reductions(
                     if producer in body_region_positions
                 ),
             ))
+        condition = set(map(int, loop.condition_nodes))
+        structurally_owned_region_indices: tuple[int, ...] = ()
+        if loop.iteration_outputs and condition:
+            # A retained comprehension publishes through a predicated append
+            # below. Its filter is evaluated inside the loop from the loaded
+            # target row. Leaving the same predicate region in the flat
+            # schedule executes it outside the loop and can give a later
+            # reduction/validation false ownership of the loop's region.
+            def expression_value_ids(expression: ControlExpression | None):
+                if expression is None:
+                    return frozenset()
+                found = {
+                    int(expression.value_id)
+                    for _ in (0,)
+                    if expression.value_id is not None
+                }
+                for operand in expression.operands:
+                    found.update(expression_value_ids(operand))
+                return frozenset(found)
+
+            structurally_owned_values = frozenset().union(*(
+                expression_value_ids(structured_control_expression(node_id))
+                for node_id in sorted(condition)
+            ))
+            predicate_regions = {
+                index
+                for index, nodes in enumerate(regions)
+                if condition.intersection(map(int, nodes))
+                and frozenset(map(int, nodes)).issubset(
+                    structurally_owned_values
+                )
+            }
+            structurally_owned_region_indices = tuple(sorted(predicate_regions))
+            body_region_indices = tuple(
+                index for index in body_region_indices
+                if index not in predicate_regions
+            )
+            body_region_positions = {
+                index: position
+                for index, position in body_region_positions.items()
+                if index in body_region_indices
+            }
         import os as _os, sys as _sys
         if _os.environ.get("TURING_DEBUG_LOOP_ORDER"):
             _fn = graph.G.graph.get("function_name")
+            _loop_expr = graph.G.nodes[int(loop.node_id)].get("expr_obj")
             print(
                 f"DEBUGLOOP fn={_fn} loop_node={int(loop.node_id)} "
+                f"source={ast.unparse(_loop_expr) if isinstance(_loop_expr, ast.AST) else None!r} "
                 f"body_region_indices={body_region_indices} "
                 f"body_region_positions={body_region_positions} "
                 f"region_dependencies_edges={list(region_dependencies.edges())} "
                 f"region_members={ {i: tuple(regions[i]) for i in body_region_indices} }",
                 file=_sys.stderr,
             )
-        condition = set(map(int, loop.condition_nodes))
         condition_region_indices = tuple(
             index
             for index, nodes in enumerate(regions)
             if condition.intersection(nodes)
             and index not in body_region_indices
+            and not loop.iteration_outputs
         )
         region_indices = tuple(dict.fromkeys((
             *condition_region_indices,
@@ -3372,8 +3566,106 @@ def analyze_shader_loop_reductions(
             else None
         )
         sequence_mutations = []
+        expression_nodes = {
+            id(data.get("expr_obj")): int(node_id)
+            for node_id, data in graph.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.AST)
+        }
+        branch_memberships: dict[int, set[tuple[int, str]]] = {}
+        def arm_has_terminal_return(statements: Iterable[ast.stmt]) -> bool:
+            statements = tuple(statements)
+            if not statements:
+                return False
+            terminal = statements[-1]
+            if isinstance(terminal, ast.Return):
+                return True
+            if isinstance(terminal, ast.If):
+                return (
+                    arm_has_terminal_return(terminal.body)
+                    or arm_has_terminal_return(terminal.orelse)
+                )
+            return False
+        for owner_id, owner in graph.G.nodes(data=True):
+            conditional = owner.get("expr_obj")
+            if not isinstance(conditional, ast.If):
+                continue
+            for arm, statements in (
+                ("body", conditional.body),
+                ("orelse", conditional.orelse),
+            ):
+                for statement in statements:
+                    for member in ast.walk(statement):
+                        member_id = expression_nodes.get(id(member))
+                        if member_id is not None and member_id != int(owner_id):
+                            branch_memberships.setdefault(
+                                member_id, set()
+                            ).add((int(owner_id), arm))
+        # A terminal arm guards the lexical fallthrough just as surely as an
+        # explicit ``else``.  In ``if done: return; out.append(x)``, the append
+        # is semantically in the false arm even though Python source does not
+        # indent it there.  Record that control fact so terminal returns can be
+        # moved after predicated resident effects without executing fallthrough
+        # work on the returning path.
+        if isinstance(graph.G.nodes[int(loop.node_id)].get("expr_obj"), ast.While):
+            loop_expression = graph.G.nodes[int(loop.node_id)]["expr_obj"]
+            for position, statement in enumerate(loop_expression.body):
+                if not isinstance(statement, ast.If):
+                    continue
+                body_terminal = arm_has_terminal_return(statement.body)
+                orelse_terminal = arm_has_terminal_return(statement.orelse)
+                if body_terminal == orelse_terminal:
+                    continue
+                owner_id = node_for_expression(statement)
+                if owner_id is None:
+                    continue
+                surviving_arm = "orelse" if body_terminal else "body"
+                for later in loop_expression.body[position + 1:]:
+                    for member in ast.walk(later):
+                        member_id = expression_nodes.get(id(member))
+                        if member_id is not None:
+                            branch_memberships.setdefault(
+                                int(member_id), set()
+                            ).add((int(owner_id), surviving_arm))
+
+        def mutation_predicate(effect_node_id: int):
+            candidates = []
+            for owner_id, arm in branch_memberships.get(
+                int(effect_node_id), ()
+            ):
+                if int(owner_id) not in loop.body_nodes:
+                    continue
+                owner = graph.G.nodes.get(int(owner_id), {})
+                if not isinstance(owner.get("expr_obj"), ast.If):
+                    continue
+                predicate_id = next((
+                    int(parent)
+                    for parent, role in owner.get("parents") or ()
+                    if str(role) == "test"
+                ), None)
+                if predicate_id is not None:
+                    candidates.append((int(owner_id), str(arm), predicate_id))
+            if not candidates:
+                return None
+            predicates = []
+            for _owner_id, arm, predicate_id in sorted(candidates):
+                predicate = structured_control_expression(int(predicate_id))
+                if predicate is None:
+                    continue
+                predicates.append(
+                    predicate
+                    if arm == "body"
+                    else ControlExpression("not", (predicate,))
+                )
+            result = predicates[0]
+            for predicate in predicates[1:]:
+                result = ControlExpression("and", (result, predicate))
+            return result
+
         for effect in loop.state_effects:
-            if effect.mode is not LoopStateEffectMode.SEQUENCE_MUTATION:
+            if effect.mode not in {
+                LoopStateEffectMode.SEQUENCE_MUTATION,
+                LoopStateEffectMode.MAPPING_MUTATION,
+            }:
                 continue
             if int(effect.effect_node_id) in routed_effect_nodes:
                 continue
@@ -3422,18 +3714,144 @@ def analyze_shader_loop_reductions(
                         else "sequence"
                     )
                 )
+            mutation_arguments = expanded_row_arguments(
+                effect.argument_value_ids
+            )
+            if (
+                effect.mode is LoopStateEffectMode.MAPPING_MUTATION
+                and effect.operator == "update"
+                and len(effect.argument_value_ids) == 1
+            ):
+                mapping_node = nodes_by_value.get(
+                    int(effect.argument_value_ids[0]), {}
+                )
+                mapping_attributes = mapping_node.get("attributes") or {}
+                leaves = tuple(map(
+                    int,
+                    mapping_attributes.get("aggregate_leaf_value_ids", ()),
+                ))
+                if mapping_attributes.get("aggregate_kind") == "dict":
+                    midpoint = len(leaves) // 2
+                    mutation_arguments = tuple(
+                        value_id
+                        for pair in zip(
+                            leaves[:midpoint], leaves[midpoint:]
+                        )
+                        for value_id in pair
+                    )
+            mapping_argument_kind = None
+            if effect.mode is LoopStateEffectMode.MAPPING_MUTATION:
+                mapping_argument_kind = f"mapping_{effect.operator}"
+                if effect.operator == "update":
+                    mapping_argument_kind = "mapping_items"
+                elif (
+                    effect.operator == "pop"
+                    and len(effect.argument_value_ids) == 2
+                ):
+                    default_node_id = node_ids_by_value.get(
+                        int(effect.argument_value_ids[1])
+                    )
+                    default_known, default_literal = (
+                        (False, None)
+                        if default_node_id is None
+                        else _constant(graph, int(default_node_id))
+                    )
+                    if default_known and default_literal is None:
+                        mapping_argument_kind = "mapping_pop_default_none"
             sequence_mutations.append(ControlSequenceMutation(
                 sequence_value_id=int(effect.state_input_id),
                 operator=str(effect.operator),
-                argument_value_ids=tuple(effect.argument_value_ids),
+                argument_value_ids=mutation_arguments,
                 effect_node_id=int(effect.effect_node_id),
                 policy=policy,
-                argument_kind=argument_kind,
+                argument_kind=(mapping_argument_kind or argument_kind),
+                predicate_expression=mutation_predicate(
+                    int(effect.effect_node_id)
+                ),
+                argument_expressions=tuple(
+                    structured_control_expression(int(value_id))
+                    for value_id in mutation_arguments
+                ),
+                extraction_identity=(
+                    (graph.G.nodes[int(effect.effect_node_id)].get(
+                        "attributes"
+                    ) or {}).get("extraction_identity")
+                    if int(effect.effect_node_id) in graph.G else None
+                ),
             ))
         sequence_mutations.extend(
             routed_generator_mutations.get(int(loop.node_id), ())
         )
+        # A retained comprehension is a compacting sequence producer, not an
+        # induction-indexed array write.  In particular, a filtered generator
+        # must advance its output length only for accepted elements.  Publish
+        # every iteration output through the same append ABI used by authored
+        # lists, with the comprehension predicates attached to the effect.
+        output_predicate = None
+        for condition_id in loop.condition_nodes:
+            predicate = (
+                structured_control_expression(int(condition_id))
+                or ControlExpression("value", value_id=int(condition_id))
+            )
+            output_predicate = (
+                predicate
+                if output_predicate is None
+                else ControlExpression("and", (output_predicate, predicate))
+            )
+        sequence_mutations.extend(
+            ControlSequenceMutation(
+                sequence_value_id=int(output.result_value_id),
+                operator="append",
+                argument_value_ids=expanded_row_arguments((output.value_id,)),
+                effect_node_id=int(output.materializer_node_id),
+                policy="duplicates",
+                argument_kind="value",
+                predicate_expression=output_predicate,
+                argument_expressions=tuple(
+                    structured_control_expression(int(value_id))
+                    for value_id in expanded_row_arguments((output.value_id,))
+                ),
+            )
+            for output in loop.iteration_outputs
+        )
         sequence_mutations = tuple(sequence_mutations)
+        represented_effect_nodes = {
+            int(mutation.effect_node_id) for mutation in sequence_mutations
+        }
+        represented_effect_nodes.update(
+            int(node_id)
+            for controls in (
+                loop.break_nodes, loop.continue_nodes, loop.return_nodes,
+            )
+            for node_id, _predicate_id, _expect_true in controls
+        )
+
+        def statement_is_specialized(statement: ast.stmt) -> bool:
+            # A nested conditional requires its own composed predicate; its
+            # descendants cannot make the outer branch complete by accident.
+            if isinstance(statement, ast.If):
+                return False
+            descendant_ids = {
+                int(node_id)
+                for member in ast.walk(statement)
+                for node_id in (node_for_expression(member),)
+                if node_id is not None
+            }
+            return bool(descendant_ids.intersection(represented_effect_nodes))
+
+        specialized_conditional_node_ids = tuple(
+            int(node_id)
+            for node_id in loop.body_nodes
+            if node_id in graph.G
+            and isinstance(graph.G.nodes[node_id].get("expr_obj"), ast.If)
+            and all(
+                statement_is_specialized(statement)
+                for statement in (
+                    *graph.G.nodes[node_id]["expr_obj"].body,
+                    *graph.G.nodes[node_id]["expr_obj"].orelse,
+                )
+            )
+        )
         blockers = []
         if plan.strategy not in {
             LoopStrategy.NATIVE_SOURCE,
@@ -3554,13 +3972,14 @@ def analyze_shader_loop_reductions(
             (
                 lexical_position[node_id],
                 LoopControlBlock(
-                    action,
+                    "break" if action == "loop-return" else action,
                     predicate_value_id,
                     expect_true,
                     (
                         None if predicate_value_id is None
                         else structured_control_expression(predicate_value_id)
                     ),
+                    source_action=action,
                 ),
             )
             for action, controls in (
@@ -3577,6 +3996,18 @@ def analyze_shader_loop_reductions(
                     predicate_value_id,
                     error_code=node_id,
                     expect_true=expect_true,
+                    predicate_expression=structured_control_expression(
+                        predicate_value_id
+                    ),
+                    extraction_identity=(
+                        f"builtins.{expression.exc.func.id}"
+                        if isinstance((expression := graph.G.nodes[node_id].get(
+                            "expr_obj"
+                        )), ast.Raise)
+                        and isinstance(expression.exc, ast.Call)
+                        and isinstance(expression.exc.func, ast.Name)
+                        else None
+                    ),
                 ),
             )
             for node_id, predicate_value_id, expect_true in validations
@@ -3609,6 +4040,19 @@ def analyze_shader_loop_reductions(
                 body_items, key=lambda item: item[0]
             )
         ))
+        terminal_controls = tuple(
+            LoopControlBlock(
+                "break",
+                predicate_value_id,
+                expect_true,
+                (
+                    None if predicate_value_id is None
+                    else structured_control_expression(predicate_value_id)
+                ),
+                source_action="loop-return",
+            )
+            for _node_id, predicate_value_id, expect_true in loop.return_nodes
+        )
 
         def planned_root():
             # The materialized ports (name -> LoopResult id) are the graph's
@@ -3661,6 +4105,7 @@ def analyze_shader_loop_reductions(
                     predicate_expression=while_predicate_expression,
                     sequence_mutations=sequence_mutations,
                     source_loop_node_id=int(loop.node_id),
+                    terminal_controls=terminal_controls,
                 )
             return LoopBlock(
                 induction=induction_name,
@@ -3708,6 +4153,8 @@ def analyze_shader_loop_reductions(
                     )
                 ),
                 sequence_mutations=sequence_mutations,
+                terminal_controls=terminal_controls,
+                source_loop_node_id=int(loop.node_id),
             )
         trip_count = loop.trip_count
         removed = (
@@ -3813,14 +4260,18 @@ def analyze_shader_loop_reductions(
                         and loop.iterable_constant is not None
                     )
                     else (),
-                    collection_bindings=planned_collection_bindings(
-                        graph,
-                        loop,
-                        frozenset(
-                            node_id
-                            for region in regions
-                            for node_id in region
-                        ),
+                    collection_bindings=(
+                        ()
+                        if loop.iteration_outputs
+                        else planned_collection_bindings(
+                            graph,
+                            loop,
+                            frozenset(
+                                node_id
+                                for region in regions
+                                for node_id in region
+                            ),
+                        )
                     ),
                     closure_iterable_bindings=(
                         (
@@ -3850,6 +4301,9 @@ def analyze_shader_loop_reductions(
                     projected_iterable_bindings=(
                         projected_iterable_bindings
                     ),
+                    specialized_conditional_node_ids=(
+                        specialized_conditional_node_ids
+                    ),
                     recursion_regions=tuple(
                         region
                         for region in recursion_regions
@@ -3860,6 +4314,9 @@ def analyze_shader_loop_reductions(
             ),
             preferred_shell=("c" if prefer_c_dispatch else "glsl"),
             dispatch_closure_count=len(region_indices),
+            structurally_owned_region_indices=(
+                structurally_owned_region_indices
+            ),
         ))
     return tuple(reductions)
 

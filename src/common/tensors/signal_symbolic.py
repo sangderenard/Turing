@@ -293,17 +293,6 @@ def order_to_degree(name: str, count: int) -> int:
 # Compilation
 
 
-def evaluate(program: SymbolicProgram, argument: Any, limbs: int = 2) -> Any:
-    """Run a compiled core at ``limbs`` width and collapse to one value."""
-
-    from . import extended_precision as xp
-
-    with xp.precision(limbs):
-        promoted = argument + 0.0
-        result = program.callable(**program.supply(promoted, limbs))
-    return xp.collapse(result)
-
-
 # --------------------------------------------------------------------------
 # Transcendental CONSTANTS, derived from the same series as the functions
 
@@ -676,9 +665,11 @@ def reduce_argument(values: Any, magnitude: float, limbs: int = 2,
     values = (values if isinstance(values, AbstractTensor)
               else AbstractTensor.get_tensor(values))
     quotient = ((values * (1.0 / whole)) + INTEGER_SHIFTER) - INTEGER_SHIFTER
-    with xp.precision(limbs):
-        reduced = values + 0.0
-        multiplier = quotient + 0.0
-        for piece in pieces:
-            reduced = reduced - multiplier * piece
+    # Promoted once, at the boundary. After that the width travels with the
+    # operands -- an n-limb value times a plain one is n-limb work -- so no
+    # ambient switch has to be open for the arithmetic to be wide.
+    reduced = xp.widen(values, limbs)
+    multiplier = xp.widen(quotient, limbs)
+    for piece in pieces:
+        reduced = reduced - multiplier * piece
     return reduced, quotient
