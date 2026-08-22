@@ -185,6 +185,33 @@ that `ssa_self_check.run_all` diagnosed in one call.
 
    Still to do behind it: the six inverse functions themselves, now that
    their `g / sqrt(...)` rules have a `sqrt` to call.
+
+1b. **In-kernel range reduction — measured boundary** (`0b2a396` and after).
+   The `frexp` gap is narrower than it looked. Three probes:
+
+   | shape | result |
+   |---|---|
+   | `while v >= 1.0:` unbounded | **HANGS** the compiler, 10 min, no module |
+   | `for j in range(6):` with `if`/`else`, ONE carried scalar | **admits, correct** |
+   | same, TWO carried scalars (`v` and `s`) | compiles, **fails verification** by 494 on a 500-magnitude input |
+
+   So branching inside a bounded loop is fine; it is the *unbounded* trip
+   count that hangs, and a *second* loop-carried scalar mutated in a branch
+   that miscompiles. Admission caught the last one — the oracle earned its
+   keep. That points at the frozen-carried defect
+   `ssa_self_check.suspicious_loop_invariant_formals` exists to flag; run it
+   on the module before believing any multi-accumulator kernel.
+
+   A one-accumulator reduction is therefore available today, which is enough
+   for a self-contained `sqrt` if the scale is recovered without a second
+   carried variable.
+
+1c. **Quadratic-quotient reverses — DONE** (`0b2a396`). The six inverse rules
+   split: `atan` and `atanh` are `g / (1 +- x*x)`, pure arithmetic, needing no
+   core at all — authored and admitted at 1.05 and 3.12 ulp. The other four
+   are `root_quotient`, blocked not on the derivative but on the RADICAND:
+   `1-x*x` on [0,1], `x*x+1` unbounded above, `x*x-1` from zero, none in the
+   mantissa band the `sqrt` kernel takes. One gap, four methods.
 2. **Hyperbolic kernels.** `sinh`/`cosh`/`tanh` need their cores emitted plus
    `exp` inlined for the out-of-band identity. `exp` is authored, so this is
    unblocked.
