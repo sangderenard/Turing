@@ -1257,3 +1257,18 @@ def blas_kernel_specs() -> dict[str, KernelSpec]:
 
 def open_blas_bank(root: str | Path = "build/kernel_bank") -> KernelBank:
     return KernelBank(root, blas_kernel_specs())
+
+
+def open_signal_bank(quality: str = "draft",
+                     root: str | Path | None = None) -> KernelBank:
+    """The signal pack's bank, opened the way the BLAS pack's is.
+
+    Quality names a whole core set, and cores baked to different targets are
+    different kernels rather than different arguments to one -- so the quality
+    belongs in the ROOT, giving each set its own variants, manifests and
+    routing log, rather than in a key that would let two of them collide.
+    """
+    from src.common.tensors.signal_kernels import signal_kernel_specs
+
+    base = Path(root) if root is not None else Path("build") / "signal_bank"
+    return KernelBank(base / str(quality), signal_kernel_specs(str(quality)))

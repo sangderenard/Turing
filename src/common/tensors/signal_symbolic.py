@@ -293,107 +293,6 @@ def order_to_degree(name: str, count: int) -> int:
 # Compilation
 
 
-@dataclass(frozen=True)
-class SymbolicProgram:
-    """One core as compiled structure plus the numbers it takes."""
-
-    name: str
-    order: int
-    structure: str | None
-    #: Parameter names the materialised function expects, in call order.
-    parameters: tuple[str, ...]
-    #: The exact rational coefficients, in the order the parameters name them.
-    coefficients: tuple
-    source: str
-    callable: Any
-
-    def supply(self, argument: Any, limbs: int) -> dict:
-        """Bind the argument and coefficients for a call at ``limbs`` width."""
-
-        from . import extended_precision as xp
-
-        # An odd/even core is a polynomial in z**2 -- that is what carries the
-        # parity. A factored or unstructured core is a polynomial in z itself,
-        # and squaring its variable would silently evaluate the wrong function.
-        squared = self.structure in ("odd", "even")
-        base = argument * argument if squared else argument
-        bound = {"z": argument, "s": base}
-        for index, coefficient in enumerate(self.coefficients):
-            bound[f"c{index}"] = xp.constant_limbs(
-                argument, limb_decomposition(coefficient, limbs)
-            )
-        return {name: bound[name] for name in self.parameters}
-
-
-def _horner(count: int) -> sympy.Expr:
-    """Horner over SYMBOLIC coefficients in the structural variable."""
-
-    square = sympy.Symbol("s")
-    names = [sympy.Symbol(f"c{index}") for index in range(count)]
-    expression = names[-1]
-    for symbol in reversed(names[:-1]):
-        expression = symbol + square * expression
-    return expression
-
-
-@lru_cache(maxsize=256)
-def compile_core(name: str, order: int) -> SymbolicProgram:
-    """Derive, structure, and compile one core to AbstractTensor Python.
-
-    The coefficients enter as SYMBOLS and stay symbols all the way through the
-    compiler, so the emitted source holds no float literal and the same
-    artefact serves every precision.
-    """
-
-    from ...compiler.symbolic_equation_compiler import compile_sympy_equations
-    from ...compiler.ssa_python_materializer import materialize_function_body
-
-    coefficients = structured_coefficients(name, order)
-    structure = TRANSCENDENTALS[name]["structure"]
-    body_expression = _horner(len(coefficients))
-    if structure in ("odd", "factored"):
-        body_expression = sympy.Symbol("z") * body_expression
-
-    compiled = compile_sympy_equations(
-        [sympy.Eq(sympy.Symbol("y"), body_expression)],
-        name=f"{name}_core",
-    )
-    statements, needs_math = materialize_function_body(
-        compiled.function, tensor_vocabulary=True,
-    )
-    if needs_math:
-        raise RuntimeError(
-            f"{name}: materialised body wants the math module, which means a "
-            f"scalar opcode reached a tensor program"
-        )
-
-    assigned, loaded = set(), set()
-    for node in ast.walk(ast.Module(body=statements, type_ignores=[])):
-        if isinstance(node, ast.Name):
-            (assigned if isinstance(node.ctx, ast.Store) else loaded).add(node.id)
-    parameters = tuple(sorted(loaded - assigned))
-
-    function = ast.FunctionDef(
-        name=f"{name}_core",
-        args=ast.arguments(
-            posonlyargs=[], args=[ast.arg(arg=each) for each in parameters],
-            kwonlyargs=[], kw_defaults=[], defaults=[],
-        ),
-        body=statements, decorator_list=[], returns=None, type_params=[],
-    )
-    module = ast.fix_missing_locations(
-        ast.Module(body=[function], type_ignores=[])
-    )
-    source = ast.unparse(module)
-    namespace: dict = {}
-    exec(compile(module, f"<{name}_core>", "exec"), namespace)
-    return SymbolicProgram(
-        name=name, order=order, structure=structure, parameters=parameters,
-        coefficients=coefficients, source=source,
-        callable=namespace[f"{name}_core"],
-    )
-
-
 def evaluate(program: SymbolicProgram, argument: Any, limbs: int = 2) -> Any:
     """Run a compiled core at ``limbs`` width and collapse to one value."""
 
@@ -499,42 +398,6 @@ def constant_limbs(name: str, limbs: int = 2, scale: Fraction | None = None
 
 # --------------------------------------------------------------------------
 # Exact evaluation: the reference every measurement needs
-
-
-@lru_cache(maxsize=128)
-def reference_program(name: str, radius: float, digits: int = 40):
-    """A high-accuracy evaluator that IS the compiled program, run wider.
-
-    There is exactly one implementation of every function here: the one SymPy
-    derived and the compiler turned into AbstractTensor Python. A reference
-    written any other way -- an arbitrary-precision library, a rational
-    re-implementation of the same series -- is a SECOND implementation, and
-    then a disagreement between them names no culprit.
-
-    So the reference is the same program at a longer order and more limbs.
-    Comparing a shipping configuration against a wider one measures exactly
-    what shipping costs: truncation and arithmetic width, the two things the
-    configuration chose. Whether the IDENTITY itself is right is a separate
-    question, and identities are what answer it -- a wrong identity has to
-    survive round trips through unrelated compositions, which an error would
-    have to be elaborately harmonised to do.
-
-    Returns a callable taking a tensor and giving back the extended result
-    with every limb intact.
-    """
-
-    from . import extended_precision as xp
-
-    count = order_for(name, max(abs(float(radius)), 1e-9), digits=digits)
-    program = compile_core(name, order_to_degree(name, count))
-    limbs = xp.limbs_for_digits(digits)
-
-    def evaluate_reference(argument: Any) -> Any:
-        with xp.precision(limbs):
-            promoted = argument + 0.0
-            return program.callable(**program.supply(promoted, limbs))
-
-    return evaluate_reference
 
 
 @lru_cache(maxsize=128)
@@ -658,52 +521,6 @@ PRESETS: dict[str, Preset] = {
 }
 
 
-def build(name: str, preset: str | Preset | None = None) -> SymbolicProgram:
-    """Compile one core at a preset, order derived from the preset's target.
-
-    The default is ``ulp_match``: the fewest limbs that return the
-    correctly-rounded double for THIS core, searched rather than declared.
-    Defaulting to a named width would be a guess about every core at once,
-    and the search costs seconds at bake time to remove it.
-    """
-
-    if preset is None:
-        chosen = ulp_matched(name)
-    else:
-        chosen = preset if isinstance(preset, Preset) else PRESETS[str(preset)]
-    radius = CORE_RADII.get(name, 1.0)
-    count = order_for(name, radius, digits=chosen.digits)
-    return compile_core(name, order_to_degree(name, count))
-
-
-def run(program: SymbolicProgram, argument: Any,
-        preset: str | Preset | None = None) -> Any:
-    """Evaluate a compiled core at a preset's arithmetic width."""
-
-    from . import extended_precision as xp
-
-    if preset is None:
-        chosen = ulp_matched(program.name)
-    else:
-        chosen = preset if isinstance(preset, Preset) else PRESETS[str(preset)]
-    with xp.precision(chosen.limbs):
-        promoted = argument + 0.0
-        result = program.callable(**program.supply(promoted, chosen.limbs))
-    settled_value = xp.collapse(result)
-    if not chosen.rounding_test:
-        return settled_value
-
-    # Ziv, in its cheap form: recompute one limb wider and see whether the
-    # double answer moves. If it does not, the result was already settled and
-    # no wider evaluation can change it. This DETECTS the unsettled cases; it
-    # does not prove none exist, which needs the hardest-to-round bounds.
-    wider = chosen.limbs + 1
-    with xp.precision(wider):
-        promoted = argument + 0.0
-        again = xp.collapse(program.callable(**program.supply(promoted, wider)))
-    return again
-
-
 #: Each core's own interval half-width, which sizes its order.
 CORE_RADII: dict[str, float] = {
     "sin": 0.7853981633974483, "cos": 0.7853981633974483,
@@ -718,75 +535,6 @@ CORE_RADII: dict[str, float] = {
 
 #: Digits a limb is worth when sizing an order to an arithmetic width.
 DIGITS_PER_LIMB_ESTIMATE = 15.95
-
-
-def ulp_matched(name: str, radius: float | None = None,
-                samples: int = 401, ceiling: int = 6) -> Preset:
-    """The FEWEST limbs that return the correctly-rounded double, per core.
-
-    A global limb count is a guess dressed as a policy: too wide for one core,
-    too narrow for another, and nothing about a core's identity says which it
-    is. So it is searched per core against the independent oracle, and the
-    answer is the first width that matches every sampled point.
-
-    The order is not searched alongside it. Each width has an arithmetic floor
-    near ``1e-16*limbs``, and sizing truncation below the floor the arithmetic
-    already imposes buys nothing -- so the order FOLLOWS from the width, and
-    the width is the only thing that moves.
-
-    Matching on a sample is an OBSERVATION, not a proof: a tie can still fall
-    the wrong way somewhere unsampled. ``exact_preset`` is the stronger claim.
-    """
-
-    import numpy as _np
-
-    from . import extended_precision as xp
-    from .abstraction import AbstractTensor
-
-    radius = float(CORE_RADII[name] if radius is None else radius)
-    points = _np.linspace(-radius * 0.98, radius * 0.98, int(samples))
-    points = points[_np.abs(points) > 1e-12]
-    oracle = exact_evaluator(name, radius, digits=40)
-    truth = _np.array([float(oracle(float(value))) for value in points])
-    tensor = AbstractTensor.get_tensor(points)
-
-    for limbs in range(1, int(ceiling) + 1):
-        digits = int(DIGITS_PER_LIMB_ESTIMATE * limbs)
-        count = order_for(name, radius, digits=digits)
-        program = compile_core(name, order_to_degree(name, count))
-        with xp.precision(limbs):
-            promoted = tensor + 0.0
-            produced = program.callable(**program.supply(promoted, limbs))
-        got = _np.asarray(xp.collapse(produced).tolist(), dtype=float).ravel()
-        if _np.array_equal(got, truth):
-            return Preset(
-                f"ulp_match:{name}", digits=digits, limbs=limbs,
-                note=f"{count} coefficients, matched on {points.size} points",
-            )
-    raise ValueError(
-        f"{name}: no width up to {ceiling} limbs matched the oracle; the "
-        f"interval or the identity is at fault, not the arithmetic"
-    )
-
-
-def exact_preset(name: str, radius: float | None = None) -> Preset:
-    """Correct rounding as a SEARCH, not a sampled observation.
-
-    ``ulp_matched`` reports a width that agreed everywhere it looked. This
-    keeps widening until the double answer stops moving -- Ziv's criterion.
-    Once a wider evaluation cannot change the result, the result is settled
-    and further width buys literally nothing. That is the
-    return-on-investment limit.
-    """
-
-    base = ulp_matched(name, radius)
-    return Preset(f"exact:{name}", digits=base.digits + 16,
-                  limbs=base.limbs + 1, rounding_test=True,
-                  note="widened past the matched width and verified settled")
-
-
-# --------------------------------------------------------------------------
-# Argument reduction: the constant, split so the multiply cannot round
 
 
 def _zero_low_bits(value: float, drop: int) -> float:

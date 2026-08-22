@@ -85,15 +85,10 @@ def use_signal_kernels(quality: str = "draft") -> str:
     route is forward-only. ``use_signal_math`` remains the differentiable one.
     """
 
-    from pathlib import Path
-
-    from ..signal_kernels import signal_kernel_specs
-    from ....compiler.kernel_bank import KernelBank, LaunchCoordinator
+    from ....compiler.kernel_bank import LaunchCoordinator, open_signal_bank
 
     global _IMPLEMENTATION, _QUALITY, _LAUNCHER
-    specs = signal_kernel_specs(str(quality))
-    bank = KernelBank(Path("build") / "signal_bank" / str(quality), specs)
-    _LAUNCHER = LaunchCoordinator(bank)
+    _LAUNCHER = LaunchCoordinator(open_signal_bank(str(quality)))
     _IMPLEMENTATION, _QUALITY = "signal_kernels", str(quality)
     return _IMPLEMENTATION
 
