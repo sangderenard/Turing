@@ -1,5 +1,34 @@
 # Compiler bootstrap structural frontier handoff — 2026-08-22
 
+## Superseding autonomous route
+
+The manual parent-unit procedure below is retained only as failure evidence.
+Do not select or relaunch unit 47. Commit `6d8919a` makes the bootstrap creep a
+compiler-owned fixed-point process: it discovers the authored catalogue,
+compiles with isolated resource-bounded workers, emits and verifies native
+products, exposes only receipt-proven deployments to the next worker pass,
+reuses verified source-region seeds, and automatically crawls every persisted
+failed-unit ProcessGraph subdivision plan. It records a terminal frontier
+instead of asking a person to choose the next unit.
+
+The unattended entry point is:
+
+```powershell
+python -m tools.compile_project_catalogue `
+  --source src/compiler/precompile_to_ssa.py `
+  --output build/compiler-bootstrap-creep `
+  --creep-project `
+  --jobs 4 `
+  --max-total-gb 48 `
+  --worker-reserve-gb 8 `
+  --max-worker-gb 12 `
+  --unit-timeout-seconds 1800
+```
+
+`creep-progress.json` is the live durable state and `manifest.json` is the
+fixed-point product. The limits are policy inputs to the automatic scheduler,
+not instructions to manually choose work.
+
 ## Terminal parent result
 
 The parent compile terminated without publishing `unit.json` or `failure.json`.
@@ -207,7 +236,7 @@ Known unrelated focused-suite noise:
 Do not use those as evidence against the structural verifier without first
 repairing or constraining their artifact fixtures.
 
-## Exact next actions after v363 terminates
+## Historical next actions (superseded)
 
 1. Preserve and inspect `unit.json`, `failure.json`, repository SSA, and the
    last `compile-progress.json`; do not rerun before reading them.
@@ -225,4 +254,7 @@ repairing or constraining their artifact fixtures.
 6. Run only focused compiler/bootstrap regression gates; the repository's full
    suite is not a safe baseline.
 
-No commit or staging was performed in this handoff.
+These steps describe the investigation that led to the autonomous controller;
+they are not the current operating procedure. The structural work was
+checkpointed in `839a40d`, the first automatic subdivision crawl in `de8ec68`,
+and the self-feeding project/bootstrap controller in `6d8919a`.
