@@ -172,8 +172,19 @@ that `ssa_self_check.run_all` diagnosed in one call.
 
 ## 6. What is left, in order
 
-1. **`sqrt` kernel.** Unblocks the six inverse functions — every one of their
-   backward rules is `g / sqrt(...)`, currently classified `unsupported`.
+1. ~~**`sqrt` kernel.**~~ **DONE** (`13eeaa9`) — seeded Newton, 7 coefficients
+   and 2 steps, admitted at p95 0.79 / max 1.00 ulp. Takes an argument already
+   reduced to `[0.25, 1)`; the caller supplies the even binade. That boundary
+   is forced: exponent extraction inside a kernel needs a `frexp` the authored
+   vocabulary lacks, and a **data-dependent `while` loop HUNGS the compiler**
+   — ten minutes, no module. Do not retry it.
+
+   The lesson generalises past `sqrt`: a self-correcting iteration beats a
+   better polynomial. 48 coefficients gave 328 ulp; 7 coefficients plus two
+   Newton steps gave 0.79. Look for a fixed point before reaching for degree.
+
+   Still to do behind it: the six inverse functions themselves, now that
+   their `g / sqrt(...)` rules have a `sqrt` to call.
 2. **Hyperbolic kernels.** `sinh`/`cosh`/`tanh` need their cores emitted plus
    `exp` inlined for the out-of-band identity. `exp` is authored, so this is
    unblocked.
