@@ -15,6 +15,7 @@ from src.compiler.project_compilation_product import (
     DEFAULT_PROJECT_EXTRACTION_CONTRACT,
     compile_project_call,
     compile_project_product,
+    compile_process_graph_creep,
     compile_process_graph_subdivision_integral,
     compile_process_graph_subdivision_plan,
     compile_resolved_process_graph_plan,
@@ -195,6 +196,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--creep-resolved-plan", action="store_true",
+        help=(
+            "autonomously crawl a resolved plan and every strictly deeper "
+            "bounded subdivision until sealed or at an explicit fixed point"
+        ),
+    )
+    parser.add_argument(
+        "--max-subdivision-depth", type=int, default=32,
+        help="maximum automatic creep depth (default: 32)",
+    )
+    parser.add_argument(
         "--linked-planned-unit", action="append", default=[],
         help=argparse.SUPPRESS,
     )
@@ -234,6 +246,53 @@ def main(argv: Sequence[str] | None = None) -> int:
             "stage": "compiler_bootstrap_activation",
             "products": [item.to_mapping() for item in activations],
         }, sort_keys=True), flush=True)
+
+    if arguments.creep_resolved_plan:
+        if arguments.compile_resolved_plan or arguments.compile_subdivision_plan:
+            parser.error(
+                "--creep-resolved-plan cannot be combined with a one-level crawl"
+            )
+        if (
+            arguments.resolved_process_graph is None
+            or arguments.process_graph_plan is None
+        ):
+            parser.error(
+                "--creep-resolved-plan requires --resolved-process-graph "
+                "and --process-graph-plan"
+            )
+        manifest = compile_process_graph_creep(
+            arguments.resolved_process_graph,
+            arguments.process_graph_plan,
+            arguments.output,
+            jobs=arguments.jobs,
+            max_total_resident_bytes=(
+                None if arguments.max_total_gb is None
+                else int(arguments.max_total_gb * 1024 ** 3)
+            ),
+            worker_resident_reservation_bytes=int(
+                arguments.worker_reserve_gb * 1024 ** 3
+            ),
+            max_worker_memory_bytes=(
+                None if arguments.max_worker_gb == 0
+                else int(arguments.max_worker_gb * 1024 ** 3)
+            ),
+            unit_timeout_seconds=(
+                None if arguments.unit_timeout_seconds == 0
+                else arguments.unit_timeout_seconds
+            ),
+            max_subdivision_depth=arguments.max_subdivision_depth,
+            progress=lambda event: print(
+                json.dumps(event, sort_keys=True), flush=True,
+            ),
+        )
+        print(json.dumps({
+            "status": manifest["status"],
+            "rounds": len(manifest["rounds"]),
+            "verified_products": len(manifest["verified_products"]),
+            "fixed_points": len(manifest["fixed_points"]),
+            "manifest": str(arguments.output.resolve() / "manifest.json"),
+        }, sort_keys=True), flush=True)
+        return 0 if manifest["status"] == "sealed" else 1
 
     if arguments.compile_resolved_plan:
         if (

@@ -5946,6 +5946,231 @@ def compile_process_graph_subdivision_plan(
     return manifest
 
 
+def compile_process_graph_creep(
+    graph_path: str | Path,
+    plan_path: str | Path,
+    directory: str | Path,
+    *,
+    python_executable: str | Path = sys.executable,
+    jobs: int | None = None,
+    max_total_resident_bytes: int | None = None,
+    worker_resident_reservation_bytes: int = DEFAULT_WORKER_RESERVATION_BYTES,
+    max_worker_memory_bytes: int | None = DEFAULT_WORKER_LIMIT_BYTES,
+    unit_timeout_seconds: float | None = DEFAULT_UNIT_TIMEOUT_SECONDS,
+    max_subdivision_depth: int = 32,
+    progress: Callable[[Mapping[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Autonomously crawl bounded units and every strictly deeper cut.
+
+    The ordinary resolved/subdivision crawlers deliberately seal one level at
+    a time.  This driver is the missing compiler-owned feedback loop: terminal
+    worker receipts become the next subdivision plan without requiring a
+    person to select an index or invoke another command.  Plan identities are
+    remembered across the complete run, so a resource-bound minimum integral
+    cannot enqueue itself forever; that fixed point is published as an exact
+    terminal frontier.
+
+    Verified artifacts are inventoried but never promoted merely because they
+    compiled.  Installation remains receipt-gated by the compiler bootstrap
+    runtime, and workers inherit whatever verified products that runtime has
+    activated through its environment.
+    """
+
+    resolved_path = Path(graph_path).resolve()
+    unit_plan_path = Path(plan_path).resolve()
+    root = Path(directory).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    depth_limit = int(max_subdivision_depth)
+    if depth_limit < 0:
+        raise ValueError("maximum subdivision depth must be non-negative")
+
+    def report(stage: str, **details: Any) -> None:
+        if progress is not None:
+            progress({"stage": stage, **details})
+
+    def plan_identity(path: Path, kind: str) -> tuple[str, tuple[tuple[str, ...], ...]]:
+        source = json.loads(path.read_text(encoding="utf-8"))
+        if kind == "resolved":
+            identities = tuple(
+                tuple(map(str, unit.get("qualified_names") or ()))
+                for unit in source.get("units") or ()
+            )
+        else:
+            identities = tuple(sorted(
+                tuple(map(str, integral.get("identity_token_chain") or ()))
+                for integral in source.get("integrals") or ()
+            ))
+        digest = hashlib.sha256(json.dumps(
+            {"kind": kind, "identities": identities},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        return digest, identities
+
+    queue: list[dict[str, Any]] = [{
+        "kind": "resolved",
+        "plan": unit_plan_path,
+        "depth": 0,
+        "parent_round": None,
+    }]
+    seen: dict[str, dict[str, Any]] = {}
+    rounds: list[dict[str, Any]] = []
+    fixed_points: list[dict[str, Any]] = []
+    verified_products: list[dict[str, Any]] = []
+
+    def write_progress() -> None:
+        _atomic_json(root / "creep-progress.json", {
+            "schema": "turing.compiler-creep-progress.v1",
+            "resolved_process_graph": resolved_path.as_posix(),
+            "process_graph_unit_plan": unit_plan_path.as_posix(),
+            "max_subdivision_depth": depth_limit,
+            "pending": [{
+                **item,
+                "plan": Path(item["plan"]).as_posix(),
+            } for item in queue],
+            "rounds": rounds,
+            "fixed_points": fixed_points,
+            "verified_products": verified_products,
+        })
+
+    write_progress()
+    while queue:
+        item = queue.pop(0)
+        kind = str(item["kind"])
+        source_plan = Path(item["plan"]).resolve()
+        depth = int(item["depth"])
+        identity, identities = plan_identity(source_plan, kind)
+        previous = seen.get(identity)
+        if previous is not None:
+            fixed_points.append({
+                "kind": "repeated-subdivision-plan",
+                "plan_kind": kind,
+                "plan_identity": identity,
+                "depth": depth,
+                "first_depth": int(previous["depth"]),
+                "identity_token_chains": [list(chain) for chain in identities],
+                "action": (
+                    "add-a-smaller-complete-integral-boundary-or-lowering-abi"
+                ),
+            })
+            write_progress()
+            continue
+        if depth > depth_limit:
+            fixed_points.append({
+                "kind": "maximum-subdivision-depth",
+                "plan_kind": kind,
+                "plan_identity": identity,
+                "depth": depth,
+                "identity_token_chains": [list(chain) for chain in identities],
+                "action": "raise-depth-only-after-proving-strictly-smaller-cuts",
+            })
+            write_progress()
+            continue
+        seen[identity] = {"depth": depth, "plan": source_plan.as_posix()}
+        round_index = len(rounds)
+        round_root = root / (
+            f"round_{round_index:03d}_resolved"
+            if kind == "resolved" else
+            f"round_{round_index:03d}_subdivision_{identity[:12]}"
+        )
+        report(
+            "creep_round_start", round=round_index, kind=kind,
+            depth=depth, plan=source_plan.as_posix(),
+        )
+        common = {
+            "python_executable": python_executable,
+            "jobs": jobs,
+            "max_total_resident_bytes": max_total_resident_bytes,
+            "worker_resident_reservation_bytes": (
+                worker_resident_reservation_bytes
+            ),
+            "max_worker_memory_bytes": max_worker_memory_bytes,
+            "unit_timeout_seconds": unit_timeout_seconds,
+            "progress": lambda event, round_index=round_index: report(
+                "creep_worker", round=round_index, event=dict(event),
+            ),
+        }
+        if kind == "resolved":
+            product = compile_resolved_process_graph_plan(
+                resolved_path, source_plan, round_root, **common,
+            )
+            product_records = tuple(product.get("units") or ())
+            child_name = product.get("subdivision_integrals")
+        else:
+            product = compile_process_graph_subdivision_plan(
+                source_plan, round_root, **common,
+            )
+            product_records = tuple(product.get("integrals") or ())
+            child_name = product.get("subdivision_integrals")
+        for record_index, record_value in enumerate(product_records):
+            record = dict(record_value)
+            if record.get("status") != "verified":
+                continue
+            compartment_root = (
+                round_root / "units" / f"unit_{record_index:03d}"
+                if kind == "resolved" else
+                round_root / "integrals" / f"integral_{record_index:03d}"
+            )
+            verified_products.append({
+                "round": round_index,
+                "kind": kind,
+                "root": compartment_root.as_posix(),
+                "qualified_names": list(
+                    record.get("qualified_names")
+                    or (record.get("unit") or {}).get("qualified_names")
+                    or ()
+                ),
+                "identity_token_chain": list(
+                    (record.get("integral") or {}).get(
+                        "identity_token_chain", ()
+                    )
+                ),
+                "status": "verified",
+            })
+        round_record = {
+            "round": round_index,
+            "kind": kind,
+            "depth": depth,
+            "plan": source_plan.as_posix(),
+            "plan_identity": identity,
+            "product": round_root.as_posix(),
+            "counts": dict(product.get("counts") or {}),
+            "child_integral_count": int(
+                product.get("subdivision_integral_count") or 0
+            ),
+        }
+        rounds.append(round_record)
+        if child_name:
+            child_plan = round_root / str(child_name)
+            queue.append({
+                "kind": "subdivision",
+                "plan": child_plan,
+                "depth": depth + 1,
+                "parent_round": round_index,
+            })
+        report("creep_round_finish", **round_record)
+        write_progress()
+
+    counts: dict[str, int] = {}
+    for round_record in rounds:
+        for status, count in dict(round_record.get("counts") or {}).items():
+            counts[str(status)] = counts.get(str(status), 0) + int(count)
+    manifest = {
+        "schema": "turing.compiler-creep-product.v1",
+        "resolved_process_graph": resolved_path.as_posix(),
+        "resolved_process_graph_sha256": _file_sha256(resolved_path),
+        "process_graph_unit_plan": unit_plan_path.as_posix(),
+        "process_graph_unit_plan_sha256": _file_sha256(unit_plan_path),
+        "max_subdivision_depth": depth_limit,
+        "rounds": rounds,
+        "counts": counts,
+        "verified_products": verified_products,
+        "fixed_points": fixed_points,
+        "status": "frontier" if fixed_points or counts.get("failed", 0) else "sealed",
+    }
+    _atomic_json(root / "manifest.json", manifest)
+    return manifest
+
+
 def dependency_ordered_records(
     root: Path,
     records: Sequence[Mapping[str, Any]],
@@ -6758,6 +6983,7 @@ __all__ = [
     "UNIT_ARTIFACT_SCHEMA",
     "compile_project_call",
     "compile_project_product",
+    "compile_process_graph_creep",
     "compile_process_graph_subdivision_integral",
     "compile_process_graph_subdivision_plan",
     "compilation_creep_frontier",

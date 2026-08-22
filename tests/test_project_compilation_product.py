@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from src.compiler.project_compilation_product import (
     compilation_creep_frontier,
+    compile_process_graph_creep,
     compile_process_graph_subdivision_plan,
     compile_resolved_process_graph_unit,
     compiler_toolchain_fingerprint,
@@ -91,6 +92,88 @@ def test_empty_subdivision_plan_seals_a_bounded_product(tmp_path):
     assert manifest["subdivision_integral_count"] == 0
     assert json.loads(
         (tmp_path / "product" / "manifest.json").read_text(encoding="utf-8")
+    ) == manifest
+
+
+def test_compiler_creep_crawls_nested_plans_and_stops_repeated_cut(
+    tmp_path, monkeypatch,
+):
+    graph = tmp_path / "resolved.pkl"
+    graph.write_bytes(b"resolved")
+    plan = tmp_path / "units.json"
+    plan.write_text(json.dumps({
+        "schema": "turing.compilation-unit-plan.v1",
+        "units": [{"qualified_names": ["Compiler.root"]}],
+    }), encoding="utf-8")
+    child = {
+        "schema": "turing.process-graph-subdivision-plan.v1",
+        "resolved_process_graph": graph.as_posix(),
+        "process_graph_unit_plan": plan.as_posix(),
+        "integrals": [{
+            "identity_token_chain": [
+                "process-graph-subdivision", "Compiler.root",
+                "function-shell",
+            ],
+            "qualified_names": ["Compiler.root"],
+        }],
+    }
+    calls = []
+
+    def write_json(path, value):
+        path.write_text(
+            json.dumps(value), encoding="utf-8", newline="\n",
+        )
+
+    def resolved(_graph, _plan, output, **_kwargs):
+        calls.append("resolved")
+        output.mkdir(parents=True, exist_ok=True)
+        write_json(output / "subdivision-integrals.json", child)
+        return {
+            "counts": {"failed": 1},
+            "units": [{"status": "failed"}],
+            "subdivision_integral_count": 1,
+            "subdivision_integrals": "subdivision-integrals.json",
+        }
+
+    def subdivision(_plan, output, **_kwargs):
+        calls.append("subdivision")
+        output.mkdir(parents=True, exist_ok=True)
+        write_json(output / "subdivision-integrals.json", child)
+        return {
+            "counts": {"verified": 1},
+            "integrals": [{
+                "status": "verified",
+                "qualified_names": ["Compiler.root"],
+                "integral": child["integrals"][0],
+            }],
+            "subdivision_integral_count": 1,
+            "subdivision_integrals": "subdivision-integrals.json",
+        }
+
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product."
+        "compile_resolved_process_graph_plan",
+        resolved,
+    )
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product."
+        "compile_process_graph_subdivision_plan",
+        subdivision,
+    )
+
+    manifest = compile_process_graph_creep(
+        graph, plan, tmp_path / "creep", max_subdivision_depth=8,
+    )
+
+    assert calls == ["resolved", "subdivision"]
+    assert len(manifest["rounds"]) == 2
+    assert len(manifest["verified_products"]) == 1
+    assert manifest["fixed_points"][0]["kind"] == (
+        "repeated-subdivision-plan"
+    )
+    assert manifest["status"] == "frontier"
+    assert json.loads(
+        (tmp_path / "creep" / "manifest.json").read_text(encoding="utf-8")
     ) == manifest
 
 
