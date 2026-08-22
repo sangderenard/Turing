@@ -17786,6 +17786,17 @@ def lower_ast_source_to_ssa(
     before choosing Fortran or another backend.
     """
 
+    from .compiler_bootstrap_runtime import (
+        activate_registered_compiler_bootstraps,
+    )
+
+    bootstrap_activations = activate_registered_compiler_bootstraps()
+    if progress is not None and bootstrap_activations:
+        progress(
+            "bootstrap: activated "
+            f"{len(bootstrap_activations)} registered compiler deployment(s)"
+        )
+
     import contextlib
     import io
     from types import SimpleNamespace

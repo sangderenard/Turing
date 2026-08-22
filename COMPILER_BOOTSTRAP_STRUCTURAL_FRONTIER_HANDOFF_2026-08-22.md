@@ -29,6 +29,16 @@ python -m tools.compile_project_catalogue `
 fixed-point product. The limits are policy inputs to the automatic scheduler,
 not instructions to manually choose work.
 
+Successful creep now atomically publishes installable products to
+`build/compiler-bootstrap-registry.json`. The canonical
+`lower_ast_source_to_ssa` entrypoint reads that pinned registry on first use in
+each process, re-proves every receipt and artifact hash, and installs only
+source-revision-matched deployments. Registry or source drift is a recorded
+non-fatal refusal: authored Python remains active. The current local registry
+contains the verified `plan_compute_dispatch` product, and a fresh canonical
+compile followed by a WebGPU deployment decision has demonstrated one native
+post-activation call with zero post-activation fallbacks.
+
 ## Terminal parent result
 
 The parent compile terminated without publishing `unit.json` or `failure.json`.

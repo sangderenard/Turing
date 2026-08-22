@@ -212,6 +212,11 @@ def test_project_bootstrap_creep_feeds_only_newly_verified_products(
         "src.compiler.project_compilation_product.compile_project_product",
         compile_round,
     )
+    monkeypatch.setattr(
+        "src.compiler.compiler_bootstrap_runtime."
+        "publish_compiler_bootstrap_products",
+        lambda _paths: tmp_path / "registry.json",
+    )
 
     manifest = compile_project_bootstrap_creep(
         source, tmp_path / "creep", max_rounds=8,

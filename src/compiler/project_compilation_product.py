@@ -7382,6 +7382,13 @@ def compile_project_bootstrap_creep(
             else "frontier"
         ),
     }
+    if active_products:
+        from .compiler_bootstrap_runtime import (
+            publish_compiler_bootstrap_products,
+        )
+
+        registry_path = publish_compiler_bootstrap_products(active_products)
+        manifest["compiler_bootstrap_registry"] = registry_path.as_posix()
     _atomic_json(root / "manifest.json", manifest)
     write_progress(str(manifest["status"]))
     return manifest

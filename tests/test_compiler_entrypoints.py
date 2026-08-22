@@ -6,11 +6,27 @@ from src.compiler.fortran_c_shell import (
     lower_ast_source_to_ssa,
 )
 from src.common.tensors.accelerator_backends.aot_compile import compile_ast_aot
+from src.compiler import compiler_bootstrap_runtime
 
 
 def test_complete_source_ssa_is_the_declared_canonical_compiler():
     assert CANONICAL_SOURCE_COMPILER.endswith(".lower_ast_source_to_ssa")
     assert lower_ast_source_to_ssa.__canonical_source_compiler__ is True
+
+
+def test_canonical_compiler_activates_the_durable_bootstrap_registry(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        compiler_bootstrap_runtime,
+        "activate_registered_compiler_bootstraps",
+        lambda: calls.append("activate") or (),
+    )
+
+    lower_ast_source_to_ssa("def identity(value):\n    return value\n", "identity")
+
+    assert calls == ["activate"]
 
 
 def test_legacy_whole_source_entries_are_deprecated_before_they_do_work():

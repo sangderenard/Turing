@@ -12,13 +12,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ast
+import hashlib
 import json
 import os
 from pathlib import Path
+import threading
 from typing import Any, Callable
 
 
 COMPILER_BOOTSTRAP_PRODUCTS_ENV = "TURING_COMPILER_BOOTSTRAP_PRODUCTS"
+COMPILER_BOOTSTRAP_REGISTRY_ENV = "TURING_COMPILER_BOOTSTRAP_REGISTRY"
+COMPILER_BOOTSTRAP_REGISTRY_SCHEMA = "turing.compiler-bootstrap-registry.v1"
 
 
 @dataclass(frozen=True)
@@ -146,6 +150,130 @@ _ACTIVATION_ADAPTERS: dict[str, Callable[..., tuple[Any, Callable[..., Any]]]] =
     "qualified-scalar-call-v1": _activate_qualified_scalar,
 }
 _ACTIVE_DEPLOYMENTS: dict[tuple[str, str], Callable[..., Any]] = {}
+_REGISTRY_ACTIVATION_LOCK = threading.RLock()
+_ACTIVATED_REGISTRY_SHA256: str | None = None
+_REGISTRY_FAILURES: list[dict[str, str]] = []
+
+
+def compiler_bootstrap_registry_path(value: str | Path | None = None) -> Path:
+    """Return the local durable registry used by normal compiler entrypoints."""
+
+    selected = (
+        os.environ.get(COMPILER_BOOTSTRAP_REGISTRY_ENV, "")
+        if value is None else str(value)
+    )
+    if selected:
+        return Path(selected).resolve()
+    return (
+        Path(__file__).resolve().parents[2]
+        / "build" / "compiler-bootstrap-registry.json"
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def publish_compiler_bootstrap_products(
+    paths,
+    *,
+    registry_path: str | Path | None = None,
+) -> Path:
+    """Atomically pin installable verified products for future compilers."""
+
+    from .project_compilation_product import open_project_compilation_product
+
+    records = []
+    for raw_path in dict.fromkeys(Path(path).resolve() for path in paths):
+        product = open_project_compilation_product(raw_path)
+        manifest_path = product.root / "manifest.json"
+        source_path = Path(str(product.manifest.get("source") or ""))
+        source_sha256 = str(product.manifest.get("source_sha256") or "")
+        if (
+            not source_path.is_file()
+            or not source_sha256
+            or _file_sha256(source_path) != source_sha256
+        ):
+            continue
+        installable = []
+        for qualified_name, link_value in sorted(product.links.items()):
+            link = dict(link_value)
+            if link.get("kind") == "source-region-integral":
+                continue
+            library = product.root / str(link.get("native_library") or "")
+            api = product.root / str(link.get("native_api") or "")
+            receipt_path = library.parent / "native-verification.json"
+            if (
+                not library.is_file()
+                or not api.is_file()
+                or not receipt_path.is_file()
+            ):
+                continue
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            adapter = str(receipt.get("activation_adapter") or "")
+            if (
+                receipt.get("status") != "verified"
+                or adapter not in _ACTIVATION_ADAPTERS
+                or str(receipt.get("api_sha256") or "") != _file_sha256(api)
+                or str(receipt.get("library_sha256") or "")
+                != _file_sha256(library)
+            ):
+                continue
+            installable.append({
+                "qualified_name": str(qualified_name),
+                "activation_adapter": adapter,
+                "verification_receipt": receipt_path.relative_to(
+                    product.root
+                ).as_posix(),
+            })
+        if not installable:
+            continue
+        records.append({
+            "product": product.root.as_posix(),
+            "manifest_sha256": _file_sha256(manifest_path),
+            "source_sha256": source_sha256,
+            "installable": installable,
+        })
+    destination = compiler_bootstrap_registry_path(registry_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": COMPILER_BOOTSTRAP_REGISTRY_SCHEMA,
+        "products": records,
+    }
+    temporary = destination.with_name(destination.name + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8", newline="\n",
+    )
+    os.replace(temporary, destination)
+    return destination
+
+
+def registered_compiler_bootstrap_product_paths(
+    registry_path: str | Path | None = None,
+) -> tuple[Path, ...]:
+    """Load only products whose pinned manifests still match byte-for-byte."""
+
+    path = compiler_bootstrap_registry_path(registry_path)
+    if not path.is_file():
+        return ()
+    registry = json.loads(path.read_text(encoding="utf-8"))
+    if registry.get("schema") != COMPILER_BOOTSTRAP_REGISTRY_SCHEMA:
+        raise ValueError("unsupported compiler bootstrap registry schema")
+    selected = []
+    for record in registry.get("products") or ():
+        product = Path(str(record.get("product") or "")).resolve()
+        manifest = product / "manifest.json"
+        if (
+            not manifest.is_file()
+            or _file_sha256(manifest)
+            != str(record.get("manifest_sha256") or "")
+        ):
+            raise ValueError(
+                f"registered compiler product changed or vanished: {product}"
+            )
+        selected.append(product)
+    return tuple(dict.fromkeys(selected))
 
 
 def compiler_bootstrap_product_paths(value: str | None = None) -> tuple[Path, ...]:
@@ -189,6 +317,27 @@ def activate_compiler_bootstrap_products(paths=None) -> tuple[CompilerBootstrapA
             adapter_name = str(receipt.get("activation_adapter") or "")
             if not adapter_name:
                 continue
+            deployment_key = (
+                product.root.as_posix(), str(qualified_name),
+            )
+            existing = _ACTIVE_DEPLOYMENTS.get(deployment_key)
+            if existing is not None:
+                verification = dict(getattr(
+                    existing, "__turing_native_verification__", {},
+                ))
+                activations.append(CompilerBootstrapActivation(
+                    product=product.root.as_posix(),
+                    qualified_name=str(qualified_name),
+                    adapter=adapter_name,
+                    status=str(verification.get("status") or ""),
+                    native_probe_count=int(
+                        verification.get("native_probe_count") or 0
+                    ),
+                    fallback_probe_count=int(
+                        verification.get("fallback_probe_count") or 0
+                    ),
+                ))
+                continue
             try:
                 adapter = _ACTIVATION_ADAPTERS[adapter_name]
             except KeyError as error:
@@ -202,9 +351,9 @@ def activate_compiler_bootstrap_products(paths=None) -> tuple[CompilerBootstrapA
                 deployed,
                 targeted_source_fallback=True,
             )
-            _ACTIVE_DEPLOYMENTS[(
-                product.root.as_posix(), str(qualified_name),
-            )] = installed.__turing_deployed_callable__
+            _ACTIVE_DEPLOYMENTS[deployment_key] = (
+                installed.__turing_deployed_callable__
+            )
             verification = dict(
                 installed.__turing_deployed_callable__.__turing_native_verification__
             )
@@ -217,6 +366,83 @@ def activate_compiler_bootstrap_products(paths=None) -> tuple[CompilerBootstrapA
                 fallback_probe_count=int(verification.get("fallback_probe_count") or 0),
             ))
     return tuple(activations)
+
+
+def activate_registered_compiler_bootstraps(
+    registry_path: str | Path | None = None,
+) -> tuple[CompilerBootstrapActivation, ...]:
+    """Activate the current pinned registry once per registry revision.
+
+    A stale or source-incompatible product never prevents compilation. Its
+    refusal is retained in runtime state and the authored Python callable
+    remains authoritative.
+    """
+
+    global _ACTIVATED_REGISTRY_SHA256
+
+    path = compiler_bootstrap_registry_path(registry_path)
+    registry_digest = _file_sha256(path) if path.is_file() else "absent"
+    with _REGISTRY_ACTIVATION_LOCK:
+        if registry_digest == _ACTIVATED_REGISTRY_SHA256:
+            return ()
+        failures = []
+        activations = []
+        try:
+            registry = (
+                {"schema": COMPILER_BOOTSTRAP_REGISTRY_SCHEMA, "products": []}
+                if not path.is_file()
+                else json.loads(path.read_text(encoding="utf-8"))
+            )
+            if registry.get("schema") != COMPILER_BOOTSTRAP_REGISTRY_SCHEMA:
+                raise ValueError("unsupported compiler bootstrap registry schema")
+            selected_records = tuple(registry.get("products") or ())
+        except Exception as error:
+            failures.append({
+                "product": "",
+                "error_type": type(error).__name__,
+                "error": str(error),
+            })
+            selected_records = ()
+        for record in selected_records:
+            product_path = Path(str(record.get("product") or "")).resolve()
+            try:
+                manifest = product_path / "manifest.json"
+                if (
+                    not manifest.is_file()
+                    or _file_sha256(manifest)
+                    != str(record.get("manifest_sha256") or "")
+                ):
+                    raise ValueError(
+                        "registered compiler product changed or vanished: "
+                        f"{product_path}"
+                    )
+                activations.extend(
+                    activate_compiler_bootstrap_products((product_path,))
+                )
+            except Exception as error:
+                failures.append({
+                    "product": product_path.as_posix(),
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                })
+        _REGISTRY_FAILURES[:] = failures
+        _ACTIVATED_REGISTRY_SHA256 = registry_digest
+        return tuple(activations)
+
+
+def compiler_bootstrap_registry_state() -> dict[str, Any]:
+    """Expose registry selection and non-fatal activation refusals."""
+
+    path = compiler_bootstrap_registry_path()
+    return {
+        "schema": "turing.compiler-bootstrap-registry-state.v1",
+        "registry": path.as_posix(),
+        "registry_sha256": (
+            _file_sha256(path) if path.is_file() else None
+        ),
+        "activated_registry_sha256": _ACTIVATED_REGISTRY_SHA256,
+        "failures": list(_REGISTRY_FAILURES),
+    }
 
 
 def compiler_bootstrap_runtime_state() -> tuple[dict[str, Any], ...]:
@@ -258,10 +484,17 @@ def compiler_bootstrap_runtime_state() -> tuple[dict[str, Any], ...]:
 
 
 __all__ = [
+    "COMPILER_BOOTSTRAP_REGISTRY_ENV",
+    "COMPILER_BOOTSTRAP_REGISTRY_SCHEMA",
     "COMPILER_BOOTSTRAP_PRODUCTS_ENV",
     "CompilerBootstrapActivation",
     "activate_compiler_bootstrap_products",
+    "activate_registered_compiler_bootstraps",
+    "compiler_bootstrap_registry_path",
+    "compiler_bootstrap_registry_state",
     "compiler_bootstrap_runtime_state",
     "compiler_bootstrap_product_paths",
+    "publish_compiler_bootstrap_products",
+    "registered_compiler_bootstrap_product_paths",
     "set_compiler_bootstrap_products",
 ]
