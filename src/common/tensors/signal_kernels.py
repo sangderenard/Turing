@@ -74,14 +74,38 @@ def _horner_expression(variable: str, coefficients: tuple[float, ...]) -> str:
     return expression
 
 
-def _require_structured(cores: _signal.CoreSet) -> tuple[Any, Any]:
-    sine, cosine = cores["sin"], cores["cos"]
-    if sine.family != "structured" or cosine.family != "structured":
+def core_expression(core: Any, argument: str, square: str) -> str:
+    """One core's evaluation as source, in whatever form it was baked.
+
+    The selector picks a family per core on measured evidence, so a kernel
+    cannot assume one. ``exact`` and ``structured`` share a form -- the parity
+    is in the expression, evaluated in the SQUARE of the argument -- and
+    differ only in where their coefficients came from. ``series`` is a plain
+    Horner in the argument itself. Emitting the wrong one silently computes a
+    different function, so this refuses anything it does not know rather than
+    guessing a form.
+    """
+
+    if core.family in ("exact", "structured"):
+        polynomial = _horner_expression(square, core.values)
+        if core.structure == "odd":
+            return f"{argument} * {polynomial}"
+        if core.structure == "even":
+            return polynomial
         raise ValueError(
-            "circular kernel source needs structured cores; got "
-            f"{sine.family!r}/{cosine.family!r}"
+            f"{core.core} is {core.structure!r}; the circular kernel emits "
+            f"only odd and even forms"
         )
-    return sine, cosine
+    if core.family == "series":
+        shifted = (
+            argument if not core.centre
+            else f"({argument} - {_literal(core.centre)})"
+        )
+        return _horner_expression(shifted, core.values)
+    raise ValueError(
+        f"{core.core} was baked as {core.family!r}, which this kernel cannot "
+        f"emit; bake it exact, structured or series"
+    )
 
 
 def _reduction_lines(cores: _signal.CoreSet, phase: str) -> str:
@@ -95,7 +119,7 @@ def _reduction_lines(cores: _signal.CoreSet, phase: str) -> str:
     polynomial is ever asked to be accurate across its own root.
     """
 
-    sine, cosine = _require_structured(cores)
+    sine, cosine = cores["sin"], cores["cos"]
     return (
         f"        v = x[i]{phase}\n"
         f"        t = v * {_literal(1.0 / math.tau)}\n"
@@ -105,8 +129,8 @@ def _reduction_lines(cores: _signal.CoreSet, phase: str) -> str:
         f"        w = k * 0.25\n"
         f"        q = k - (w - (w % 1.0)) * 4.0\n"
         f"        u = r * r\n"
-        f"        sp = r * {_horner_expression('u', sine.values)}\n"
-        f"        cp = {_horner_expression('u', cosine.values)}\n"
+        f"        sp = {core_expression(sine, 'r', 'u')}\n"
+        f"        cp = {core_expression(cosine, 'r', 'u')}\n"
     )
 
 
@@ -155,17 +179,14 @@ def exp_kernel_source(core: Any) -> str:
     truncation.
     """
 
-    if core.family != "series":
-        raise ValueError(
-            f"exp kernel wants a series core, got {core.family!r}"
-        )
+
     return (
         "\ndef exp(x, y, n):\n"
         "    for i in range(n):\n"
         f"        s = x[i] * {_literal(1.0 / math.log(2.0))} + 0.5\n"
         "        k = s - (s % 1.0)\n"
         f"        r = x[i] - k * {_literal(math.log(2.0))}\n"
-        f"        y[i] = {_horner_expression('r', core.values)} * (2.0 ** k)\n"
+        f"        y[i] = {core_expression(core, 'r', 'r * r')} * (2.0 ** k)\n"
         "    return y\n"
     )
 
@@ -383,6 +404,7 @@ _FORWARD_SOURCE: Mapping[str, Callable[[Any], str]] = {
     "sin": lambda cores: circular_kernel_source(cores, "sin"),
     "cos": lambda cores: circular_kernel_source(cores, "cos"),
     "tan": tan_kernel_source,
+    "exp": lambda cores: exp_kernel_source(cores["exp"]),
 }
 
 
@@ -447,13 +469,19 @@ def signal_kernel_specs(quality: str = DEFAULT_KERNEL_QUALITY, *,
     specs = {name: kernel_spec(cores, name) for name in _FORWARD_SOURCE}
     if include_vjp:
         for name in _FORWARD_SOURCE:
-            if vjp_plan(name)[0] == "identity":
+            # Only the plans this module can author. `identity` is bypassed by
+            # design; `unsupported` is a rule shape it will not guess at.
+            if vjp_plan(name)[0] not in ("partner", "output"):
                 continue
-            specs[f"{name}_vjp"] = vjp_spec(cores, name)
+            try:
+                specs[f"{name}_vjp"] = vjp_spec(cores, name)
+            except ValueError:
+                continue
     return specs
 
 
 __all__ = [
+    "core_expression",
     "DEFAULT_KERNEL_QUALITY",
     "output_vjp_source",
     "tan_kernel_source",
