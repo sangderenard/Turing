@@ -131,7 +131,14 @@ CORE_RANGES: Mapping[str, CoreRange] = {
                      "octant reduction; cos serves the other half"),
     "cos": CoreRange(-QUARTER_PI, QUARTER_PI, "even", 0.0,
                      "octant reduction; |cos| >= sqrt(2)/2 here, no zero"),
-    "atan": CoreRange(0.0, 1.0, "odd", 0.0, "x -> 1/x above one"),
+    # Narrowed on the error map's evidence. The residual climbed toward the
+    # interval's top (8.7 -> 24.0 ulp across eighths), and the exact series
+    # simply does not converge on [0,1] -- 8.2e12 ulp at order 21. At
+    # tan(pi/8) it reaches 0.84 ulp in EIGHTEEN coefficients, so the narrower
+    # interval is cheaper as well as better. The classic two-way split, found
+    # by measuring rather than by looking it up.
+    "atan": CoreRange(0.0, math.tan(math.pi / 8.0), "odd", 0.0,
+                      "x -> (x-1)/(x+1) above tan(pi/8), 1/x above one"),
     "asin": CoreRange(-0.5, 0.5, "odd", 0.0, "half-angle reduction above 1/2"),
     "exp": CoreRange(-0.5 * LN2, 0.5 * LN2, None, 0.0, "x = k*ln2 + r"),
     "expm1": CoreRange(-0.5 * LN2, 0.5 * LN2, "factored", 0.0,
@@ -145,8 +152,11 @@ CORE_RANGES: Mapping[str, CoreRange] = {
                       "own core; the exp identity cancels near zero"),
     "cosh": CoreRange(-1.0, 1.0, "even", 0.0,
                       "own core; keeps cosh(0) = 1 exact"),
-    "tanh": CoreRange(-1.0, 1.0, "odd", 0.0, "own core; saturates outside"),
-    "asinh": CoreRange(-1.0, 1.0, "odd", 0.0, "own core; log identity outside"),
+    # Also narrowed on the map: 2.3e6 ulp on [-1,1], 0.76 at half that, in
+    # sixteen coefficients instead of twenty-one that fail.
+    "tanh": CoreRange(-0.5, 0.5, "odd", 0.0, "own core; exp form outside"),
+    # 9.1e11 ulp on [-1,1]; 0.86 at half that.
+    "asinh": CoreRange(-0.5, 0.5, "odd", 0.0, "own core; log identity outside"),
     "atanh": CoreRange(-0.5, 0.5, "odd", 0.0,
                        "own core; log1p identity outside"),
     "sinc": CoreRange(-3.0, 3.0, "even", 0.0,
@@ -1201,18 +1211,36 @@ class SignalMath:
         return (_tensor(value) * 0.0 + HALF_PI) - self.asin(value)
 
     def atan(self, value: Any) -> Any:
-        """Own odd core on [0, 1]; ``atan(x) = pi/2 - atan(1/x)`` above one."""
+        """Two-way split, both halves chosen by the error map.
+
+        ``atan(x) = pi/2 - atan(1/x)`` brings any magnitude down to [0, 1],
+        and ``atan(x) = pi/4 + atan((x-1)/(x+1))`` brings [tan(pi/8), 1] down
+        to [-tan(pi/8), 0]. The second split is not decoration: the exact
+        series does not converge on [0, 1] at all -- 8.2e12 ulp at order 21 --
+        and reaches 0.84 ulp on [0, tan(pi/8)] in EIGHTEEN coefficients. The
+        narrower interval is both cheaper and better, which is what the
+        per-eighth error map predicted when it showed the residual climbing
+        toward the interval's top.
+        """
 
         value = _tensor(value)
         sign = _sign(value)
         magnitude = _magnitude(value)
+
+        # First split: reciprocal, down to [0, 1].
         outer = magnitude > 1.0
         safe = _where(outer, magnitude, magnitude * 0.0 + 1.0)
-        reduced = _where(outer, 1.0 / safe, magnitude)
+        folded = _where(outer, 1.0 / safe, magnitude)
+
+        # Second split: down to [-tan(pi/8), tan(pi/8)]. The core is odd, so
+        # the negative argument the shift produces needs no further handling.
+        upper = folded > math.tan(math.pi / 8.0)
+        shifted = (folded - 1.0) / (folded + 1.0)
+        reduced = _where(upper, shifted, folded)
         core = evaluate_core(reduced, self.cores["atan"])
-        extended = _where(
-            outer, (core * 0.0 + HALF_PI) - core, core,
-        )
+        inner = _where(upper, core + QUARTER_PI, core)
+
+        extended = _where(outer, (inner * 0.0 + HALF_PI) - inner, inner)
         return sign * extended
 
     def atan2(self, imaginary: Any, real: Any) -> Any:
@@ -1360,7 +1388,9 @@ class SignalMath:
         """Own odd core on [-1, 1]; a saturating form outside."""
 
         value = _tensor(value)
-        inner = _magnitude(value) <= 1.0
+        # Band follows the CORE's interval, which the error map narrowed from
+        # 1.0 to 0.5: 2.3e6 ulp against 0.76, in fewer coefficients.
+        inner = _magnitude(value) <= 0.5
         safe = _where(inner, value, value * 0.0)
         near = evaluate_core(safe, self.cores["tanh"])
         outer = _where(inner, value * 0.0 + 1.0, value)
@@ -1382,7 +1412,8 @@ class SignalMath:
         """Own odd core on [-1, 1]; ``log(x + sqrt(x*x + 1))`` outside."""
 
         value = _tensor(value)
-        inner = _magnitude(value) <= 1.0
+        # Band follows the narrowed core: 9.1e11 ulp on [-1,1], 0.86 on half.
+        inner = _magnitude(value) <= 0.5
         safe = _where(inner, value, value * 0.0)
         near = evaluate_core(safe, self.cores["asinh"])
         outer = _where(inner, value * 0.0 + 1.0, _magnitude(value))

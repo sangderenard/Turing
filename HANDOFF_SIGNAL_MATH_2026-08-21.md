@@ -257,6 +257,41 @@ amplification factor is exactly where the validity domain comes from.
 
 ---
 
+## 8. Filed idea: a triangle solver as the identity search's test harness
+
+Given partial triangle data — some vertices, some edges, some angles — fill in
+the rest by choosing the best-conditioned derivation path, and report the
+propagated error budget beside each answer.
+
+**Why this one first.** The identity set is closed and tiny (angle sum, law of
+cosines, law of sines, Heron, coordinate distance), so the combinatorial
+explosion that makes equality saturation risky does not happen at this size —
+the derivation closure can be brute-forced. And there is GROUND TRUTH, which
+almost no other domain offers: Kahan's rearrangement is the known-correct
+answer for needle triangles. That gives a falsifiable acceptance test —
+*does the search rediscover Kahan without being told?* If it does, the scoring
+machinery can be trusted on domains where nobody has worked out the answer.
+
+**The stake, measured** on `a=7, b=7, c=2e-8`:
+
+    naive Heron          rel err 6.08e-09     Kahan rearrangement   rel err 0.00e+00
+    law of cosines       rel err 1.00e+00     half-angle identity   rel err 0.00e+00
+
+The law of cosines returns exactly zero for an angle of 2.86e-09 — total loss,
+no warning — and both fixes are pure rearrangement of the same identity.
+
+**Do not promise "symbolic perfect".** Triangle quantities involve roots and
+inverse trig and are irrational in general; exactness requires carrying
+symbolic expressions and evaluating once at the end. The achievable goal is
+the best-conditioned path plus a stated budget.
+
+**Two correctness matters that are not numerics:** the SSA case has two valid
+triangles and the solver must return both or refuse, never pick; and
+near-degenerate inputs should report the amplification rather than return a
+plausible number.
+
+---
+
 ## 7. Running it
 
     python -m tools.signal_math_survey          # accuracy/cost map, all cores
