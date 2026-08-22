@@ -206,6 +206,25 @@ _OUTPUT_RULE = re.compile(
 )
 
 
+#: Derivatives that are a signed reciprocal of a QUADRATIC in the argument:
+#: ``atan`` -> ``g / (1 + x*x)``, ``atanh`` -> ``g / (1 - x*x)``. These need
+#: no core at all -- they are arithmetic -- which is why they land before
+#: their own forwards do.
+_QUOTIENT_RULE = re.compile(
+    r"^gx = unbroadcast\((-?)g / \(1 ([+-]) x\*x\), x\.shape\)$"
+)
+
+#: The same shape but through a square root: ``asin``, ``acos``, ``asinh``,
+#: ``acosh``. Blocked, and not on the derivative -- their radicands are
+#: ``1-x*x`` on [0,1], ``x*x+1`` unbounded above and ``x*x-1`` from zero, none
+#: of which sit in the mantissa band the sqrt kernel takes. Inlining sqrt
+#: needs in-kernel range reduction, which is the same ``frexp`` gap the sqrt
+#: kernel itself is bounded by.
+_ROOT_QUOTIENT_RULE = re.compile(
+    r"^gx = unbroadcast\((-?)g / sqrt\((.+)\), x\.shape\)$"
+)
+
+
 def vjp_plan(name: str) -> tuple[str, str]:
     """How ``name``'s reverse should be obtained, and why.
 
@@ -243,6 +262,10 @@ def vjp_plan(name: str) -> tuple[str, str]:
         return "partner", text
     if _OUTPUT_RULE.match(text):
         return "output", text
+    if _QUOTIENT_RULE.match(text):
+        return "quotient", text
+    if _ROOT_QUOTIENT_RULE.match(text):
+        return "root_quotient", text
     return "unsupported", text
 
 
@@ -443,6 +466,30 @@ def sqrt_kernel_source(seed: tuple[float, ...],
     return "".join(body)
 
 
+def quotient_vjp_source(name: str) -> str:
+    """A VJP that is a signed reciprocal of a quadratic -- pure arithmetic.
+
+    ``atan`` and ``atanh`` differentiate to ``g / (1 +- x*x)``, which needs no
+    core, no reduction and no table. They are therefore authorable before
+    their own forwards are, and their accuracy is whatever the division and
+    one multiply-add give -- which is why the sign and the operator are taken
+    from the authored rule rather than written out here: the only thing this
+    function contributes is the loop.
+    """
+
+    plan, rule = vjp_plan(name)
+    if plan != "quotient":
+        raise ValueError(f"{name} is not a quadratic-quotient rule: {plan}")
+    sign, operator = _QUOTIENT_RULE.match(rule).groups()
+    return (
+        f"\ndef {name}_vjp(x, g, d, n):\n"
+        "    for i in range(n):\n"
+        "        v = x[i]\n"
+        f"        d[i] = {sign}g[i] / (1.0 {operator} v * v)\n"
+        "    return d\n"
+    )
+
+
 def kernel_reference(source: str, name: str) -> Callable[..., Any]:
     """The oracle: the same source, executed as Python.
 
@@ -496,10 +543,12 @@ def vjp_spec(cores: _signal.CoreSet, name: str):
             f"{name} is an identity over other methods and is bypassed, not "
             f"baked: {rule}"
         )
-    source = (
-        output_vjp_source(cores, name) if plan == "output"
-        else circular_vjp_source(cores, name)
-    )
+    if plan == "quotient":
+        source = quotient_vjp_source(name)
+    elif plan == "output":
+        source = output_vjp_source(cores, name)
+    else:
+        source = circular_vjp_source(cores, name)
     return KernelSpec(
         name=f"{name}_vjp", source=source, function_name=f"{name}_vjp",
         reference=kernel_reference(source, f"{name}_vjp"),
@@ -530,7 +579,7 @@ def signal_kernel_specs(quality: str = DEFAULT_KERNEL_QUALITY, *,
         for name in _FORWARD_SOURCE:
             # Only the plans this module can author. `identity` is bypassed by
             # design; `unsupported` is a rule shape it will not guess at.
-            if vjp_plan(name)[0] not in ("partner", "output"):
+            if vjp_plan(name)[0] not in ("partner", "output", "quotient"):
                 continue
             try:
                 specs[f"{name}_vjp"] = vjp_spec(cores, name)
@@ -540,6 +589,7 @@ def signal_kernel_specs(quality: str = DEFAULT_KERNEL_QUALITY, *,
 
 
 __all__ = [
+    "quotient_vjp_source",
     "SQRT_NEWTON_STEPS",
     "sqrt_kernel_source",
     "sqrt_seed",
