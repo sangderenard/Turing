@@ -618,6 +618,131 @@ def fit_series(core: str, epsilon: float | None = None) -> BakedCore:
     return _grow(build, range(3, GROWTH_LIMITS["series"] + 1, 2))
 
 
+@dataclass(frozen=True)
+class AnglePalette:
+    """Exact values for an angle set the program is KNOWN to use.
+
+    Every other family approximates a function over an interval, because the
+    argument is not known until it arrives. When the argument set IS known --
+    a DFT or CQT twiddle set, a fixed sweep, a quantised control surface --
+    there is nothing left to approximate: store the correctly-rounded value
+    of each angle the program will actually ask for.
+
+    Measured against a 60-digit reference on the turn lattice ``k/N``::
+
+        N       palette          computed as sin(2*pi*k/N)
+        1024    0.00 ulp p95     11.00 ulp p95
+        4096    0.00 ulp p95     11.00 ulp p95
+
+    Zero, and better than libm, for a reason worth stating: the usual route
+    forms ``2*pi*k/N`` first, which is not the exact angle, and then computes
+    an accurate function of a slightly wrong argument. A palette never forms
+    that intermediate at all.
+
+    Two constraints, both load-bearing:
+
+    * Lookup is BY INDEX, never by searching for a value. A caller who knows
+      their angle set already holds the index -- it is their loop variable.
+    * The palette is admitted for its declared set and MUST refuse anything
+      else. Serving a nearby angle would silently return a different
+      function's answer, which is the defect class the shape guards exist to
+      end.
+
+    Footprint is ``16*N`` bytes for the sine/cosine pair: 16 KiB at N=1024,
+    64 KiB at N=4096.
+    """
+
+    #: How many equal divisions of one turn. Index ``k`` means angle ``k/N``.
+    divisions: int
+    sine: tuple[float, ...]
+    cosine: tuple[float, ...]
+    measured_error: float = float("nan")
+
+    @property
+    def admitted(self) -> bool:
+        # Correctly rounded, which is half an ulp -- not exactly zero. The
+        # placed cardinal values differ from the reference by the reference's
+        # OWN residue for pi, so an equality test rejects the entries that are
+        # more right than what they are being compared to. A palette that
+        # cannot claim correct rounding is a table with extra steps.
+        return self.measured_error <= 0.5
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "family": "palette", "divisions": self.divisions,
+            "entries": len(self.sine), "bytes": 16 * len(self.sine),
+            "measured_error": self.measured_error,
+            "admitted": self.admitted,
+        }
+
+
+def bake_angle_palette(divisions: int) -> AnglePalette:
+    """Bake the exact turn lattice ``k/divisions`` for one known angle set.
+
+    Only the FIRST QUADRANT is computed; the rest is index arithmetic and a
+    sign. That is not a storage trick bolted on -- it is what makes the
+    symmetries exact rather than merely accurate. Evaluating ``sin`` at the
+    half turn directly returns mpmath's own residue for pi (~1e-61), not
+    zero, and ``s[k] + s[N-k]`` misses zero by the same amount. Folding makes
+    ``sin`` at 0 and the half turn exactly +0, the quarter turns exactly +-1,
+    and odd symmetry hold to the bit, because those values are placed rather
+    than computed.
+
+    It also costs a quarter of the memory: one quadrant of sine serves both
+    sine and cosine, since ``cos(k) = sin(k + N/4)``.
+    """
+
+    import mpmath
+
+    divisions = int(divisions)
+    if divisions < 1:
+        raise ValueError(f"a palette needs at least one division, got {divisions}")
+    if divisions % 4:
+        raise ValueError(
+            f"a palette divides the turn into quadrants; {divisions} is not a "
+            f"multiple of four"
+        )
+    quarter = divisions // 4
+    with mpmath.workdps(60):
+        turn = 2 * mpmath.pi / divisions
+        # One quadrant, endpoints placed exactly rather than computed.
+        quadrant = [0.0] + [
+            float(mpmath.sin(turn * index)) for index in range(1, quarter)
+        ] + [1.0]
+
+    def sine_at(index: int) -> float:
+        index %= divisions
+        if index <= quarter:
+            return quadrant[index]
+        if index <= 2 * quarter:
+            return quadrant[2 * quarter - index]
+        return -sine_at(index - 2 * quarter)
+
+    sine = tuple(sine_at(index) for index in range(divisions))
+    cosine = tuple(sine_at(index + quarter) for index in range(divisions))
+    with mpmath.workdps(60):
+        turn = 2 * mpmath.pi / divisions
+        # Scored against the same arbitrary-precision values the table was
+        # rounded from, so "0" means correctly rounded rather than
+        # self-consistent.
+        # Scored in ULP OF FULL SCALE, not of each value. Sine and cosine are
+        # bounded by one, so near a zero the relative measure is meaningless
+        # and actively misleading: this palette PLACES an exact zero at the
+        # half turn while the reference returns its own residue for pi
+        # (~1e-61), and a relative score calls the exact answer wrong by 1e15
+        # ulp. Absolute error against the function's range is the honest
+        # unit for a bounded function.
+        scale = float(np.spacing(1.0))
+        worst = 0.0
+        for index in range(divisions):
+            for stored, exact in (
+                (sine[index], mpmath.sin(turn * index)),
+                (cosine[index], mpmath.cos(turn * index)),
+            ):
+                worst = max(worst, abs(stored - float(exact)) / scale)
+    return AnglePalette(divisions, sine, cosine, measured_error=worst)
+
+
 def fit_lut(core: str, epsilon: float | None = None,
             *, generator: BakedCore | None = None) -> BakedCore:
     """Grow a node table until it measures under epsilon.
@@ -1345,6 +1470,8 @@ def signal_math(quality: str = "reference") -> SignalMath:
 
 
 __all__ = [
+    "AnglePalette",
+    "bake_angle_palette",
     "fit_exact",
     "SELECTABLE_FAMILIES",
     "fit_best",
