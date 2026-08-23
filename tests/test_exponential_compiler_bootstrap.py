@@ -68,6 +68,56 @@ def test_work_batches_are_smallest_ready_and_dependency_first(tmp_path):
     assert all(record["authored_call_count"] == 1 for record in batches)
 
 
+def test_usage_priority_puts_hot_compiler_chain_first_without_reordering_it():
+    records = [
+        {"source": "cold.py", "entries": ["cold"], "batch_index": 0,
+         "dependency_batch_indices": [],
+         "estimated_authored_bytes": 1, "estimated_ast_nodes": 1},
+        {"source": "hot.py", "entries": ["hot_leaf"], "batch_index": 0,
+         "dependency_batch_indices": [],
+         "estimated_authored_bytes": 20, "estimated_ast_nodes": 4},
+        {"source": "hot.py", "entries": ["hot_parent"], "batch_index": 1,
+         "dependency_batch_indices": [0],
+         "estimated_authored_bytes": 30, "estimated_ast_nodes": 6},
+    ]
+    usage = [{
+        "source": "hot.py", "qualified_name": "hot_parent",
+        "call_count": 100, "inclusive_seconds": 4.0,
+    }]
+
+    ordered = exponential.prioritize_compiler_work_batches(records, usage)
+
+    assert [item["entries"][0] for item in ordered] == [
+        "hot_leaf", "hot_parent", "cold",
+    ]
+
+
+def test_legacy_state_migration_rebuilds_call_batches_and_preserves_seed(
+    tmp_path,
+):
+    source_root = tmp_path / "compiler"
+    source_root.mkdir()
+    source = source_root / "one.py"
+    source.write_text("def one():\n    return 1\n", encoding="utf-8")
+    seed = tmp_path / "seed"
+    arguments = argparse.Namespace(source_root=source_root, jobs=1)
+    legacy = {
+        "schema": exponential.LEGACY_STATE_SCHEMA,
+        "sources": [{
+            "source": source.resolve().as_posix(),
+            "seed_product": seed.as_posix(),
+        }],
+        "waves": [{"generation": 0}],
+    }
+
+    migrated = exponential._migrate_legacy_state(legacy, arguments)
+
+    assert migrated["schema"] == exponential.STATE_SCHEMA
+    assert migrated["sources"][0]["entries"] == ["one"]
+    assert migrated["sources"][0]["seed_product"] == seed.as_posix()
+    assert migrated["migration"]["preserved_wave_count"] == 1
+
+
 def test_catalogue_revision_check_finds_noncurrent_changed_source(tmp_path):
     first = tmp_path / "first.py"
     second = tmp_path / "second.py"

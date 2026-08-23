@@ -38,6 +38,7 @@ from src.compiler.project_compilation_product import (
 STATE_SCHEMA = "turing.exponential-compiler-bootstrap-state.v2"
 LEGACY_STATE_SCHEMA = "turing.exponential-compiler-bootstrap-state.v1"
 WAVE_SCHEMA = "turing.exponential-compiler-bootstrap-wave.v1"
+COMPILER_USAGE_TRACE_ROOT_ENV = "TURING_COMPILER_USAGE_TRACE_ROOT"
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -68,6 +69,130 @@ def _unused_wave_root(root: Path, generation: int) -> Path:
         if not candidate.exists():
             return candidate
         attempt += 1
+
+
+def _compiler_usage_records(root: Path) -> list[dict[str, Any]]:
+    """Merge per-process usage traces without confusing parallel workers."""
+
+    merged: dict[tuple[str, str], list[float]] = {}
+    for path in sorted(root.rglob("compiler-usage.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            continue
+        if payload.get("schema") != "turing.compiler-usage-trace.v1":
+            continue
+        for record in payload.get("records") or ():
+            key = (
+                str(record.get("source") or ""),
+                str(record.get("qualified_name") or ""),
+            )
+            if not all(key):
+                continue
+            target = merged.setdefault(key, [0.0, 0.0])
+            target[0] += int(record.get("call_count") or 0)
+            target[1] += float(record.get("inclusive_seconds") or 0.0)
+    return [{
+        "source": key[0],
+        "qualified_name": key[1],
+        "call_count": int(values[0]),
+        "inclusive_seconds": float(values[1]),
+    } for key, values in sorted(merged.items())]
+
+
+def prioritize_compiler_work_batches(
+    records: Sequence[dict[str, Any]],
+    usage_records: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Order hot observed work first behind only its real prerequisites."""
+
+    usage = {
+        (str(item["source"]), str(item["qualified_name"])): (
+            float(item.get("inclusive_seconds") or 0.0),
+            int(item.get("call_count") or 0),
+        )
+        for item in usage_records
+    }
+    by_identity = {
+        (str(record["source"]), int(record.get("batch_index") or 0)): record
+        for record in records
+    }
+    dependencies = {}
+    for identity, record in by_identity.items():
+        declared = record.get("dependency_batch_indices")
+        indices = (
+            tuple(range(identity[1]))
+            if declared is None else tuple(map(int, declared))
+        )
+        dependencies[identity] = {
+            (identity[0], index)
+            for index in indices
+            if (identity[0], index) in by_identity
+        }
+    dependents = {identity: set() for identity in by_identity}
+    for identity, required in dependencies.items():
+        for prerequisite in required:
+            dependents[prerequisite].add(identity)
+    direct_usage = {}
+    for identity, record in by_identity.items():
+        observed = [
+            usage.get((str(record["source"]), str(name)), (0.0, 0))
+            for name in record.get("entries") or ()
+        ]
+        direct_usage[identity] = (
+            sum(item[0] for item in observed),
+            sum(item[1] for item in observed),
+        )
+
+    downstream_cache = {}
+
+    def downstream_usage(identity):
+        cached = downstream_cache.get(identity)
+        if cached is not None:
+            return cached
+        descendants = {identity}
+        pending = list(dependents[identity])
+        while pending:
+            candidate = pending.pop()
+            if candidate in descendants:
+                continue
+            descendants.add(candidate)
+            pending.extend(dependents[candidate])
+        result = (
+            sum(direct_usage[item][0] for item in descendants),
+            sum(direct_usage[item][1] for item in descendants),
+        )
+        downstream_cache[identity] = result
+        return result
+
+    ordered = []
+    emitted = set()
+    pending = set(by_identity)
+    while pending:
+        ready = [
+            identity for identity in pending
+            if dependencies[identity] <= emitted
+        ]
+        candidates = ready or list(pending)
+
+        def priority(identity):
+            record = by_identity[identity]
+            seconds, calls = downstream_usage(identity)
+            return (
+                0 if calls else 1,
+                -seconds,
+                -calls,
+                int(record.get("estimated_authored_bytes") or 0),
+                int(record.get("estimated_ast_nodes") or 0),
+                str(record["source"]),
+                int(record.get("batch_index") or 0),
+            )
+
+        selected = min(candidates, key=priority)
+        ordered.append(by_identity[selected])
+        pending.remove(selected)
+        emitted.add(selected)
+    return ordered
 
 
 def discover_compiler_catalogues(source_root: str | Path) -> list[dict[str, Any]]:
@@ -183,6 +308,11 @@ def discover_compiler_work_batches(
             tuple(ordered[offset:offset + width])
             for offset in range(0, len(ordered), width)
         ]
+        batch_index_by_name = {
+            name: batch_index
+            for batch_index, entries in enumerate(batches)
+            for name in entries
+        }
         per_source.append((
             min(weights.get(name, (len(source.encode("utf-8")), 0)) for name in names),
             path,
@@ -201,6 +331,12 @@ def discover_compiler_work_batches(
                 "source_bytes": len(source.encode("utf-8")),
                 "entries": list(entries),
                 "batch_index": batch_index,
+                "dependency_batch_indices": sorted({
+                    batch_index_by_name[dependency]
+                    for name in entries
+                    for dependency in dependencies.get(name, ())
+                    if batch_index_by_name[dependency] != batch_index
+                }),
                 "authored_call_count": len(entries),
                 "estimated_authored_bytes": sum(weights[name][0] for name in entries),
                 "estimated_ast_nodes": sum(weights[name][1] for name in entries),
@@ -213,35 +349,10 @@ def discover_compiler_work_batches(
                 "last_deep_retry_registry_sha256": None,
             })
         source_batches.append(batch_records)
-    # Each source is a widening chain: its next batch becomes eligible only
-    # after the preceding (smaller/dependency-earlier) batch has published.
-    # Across those chains, always select the smallest eligible batch.  This
-    # is deterministic best-first traversal without sacrificing the join
-    # boundary between a leaf batch and the wider work that can consume it.
-    records = []
-    available = [
-        (batch_records, 0)
-        for batch_records in source_batches if batch_records
-    ]
-    while available:
-        selected_position = min(range(len(available)), key=lambda position: (
-            int(available[position][0][available[position][1]][
-                "estimated_authored_bytes"
-            ]),
-            int(available[position][0][available[position][1]][
-                "estimated_ast_nodes"
-            ]),
-            str(available[position][0][available[position][1]]["source"]),
-            int(available[position][0][available[position][1]]["batch_index"]),
-        ))
-        batch_records, batch_index = available[selected_position]
-        records.append(batch_records[batch_index])
-        next_index = batch_index + 1
-        if next_index == len(batch_records):
-            available.pop(selected_position)
-        else:
-            available[selected_position] = (batch_records, next_index)
-    return records
+    return prioritize_compiler_work_batches(
+        [record for batch_records in source_batches for record in batch_records],
+        (),
+    )
 
 
 def _normalized_outcome(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -409,6 +520,9 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
                 "failures": [dict(failure) for failure in error.failures],
             } if isinstance(error, NativeInstallationRequiredError) else {}),
         }
+    usage_records = _compiler_usage_records(wave_root)
+    if usage_records:
+        result["compiler_usage"] = usage_records
     _atomic_json(wave_root / "wave-result.json", result)
     print(json.dumps({
         "stage": "generation_exit",
@@ -451,22 +565,6 @@ def _migrate_legacy_state(
         str(record.get("source") or ""): dict(record)
         for record in state.get("sources") or ()
     }
-
-
-def _changed_catalogue_source(state: dict[str, Any]) -> Path | None:
-    """Return the first deterministically ordered source changed on disk."""
-
-    expected = {}
-    for record in state.get("sources") or ():
-        expected.setdefault(
-            str(record.get("source") or ""),
-            str(record.get("source_sha256") or ""),
-        )
-    for raw_path, expected_digest in sorted(expected.items()):
-        path = Path(raw_path).resolve()
-        if not path.is_file() or _sha256(path) != expected_digest:
-            return path
-    return None
     sources = discover_compiler_work_batches(
         arguments.source_root, batch_size=arguments.jobs,
     )
@@ -488,6 +586,34 @@ def _changed_catalogue_source(state: dict[str, Any]) -> Path | None:
             "preserved_wave_count": len(state.get("waves") or ()),
         },
     }
+
+
+def _changed_catalogue_source(state: dict[str, Any]) -> Path | None:
+    """Return the first deterministically ordered source changed on disk."""
+
+    expected = {}
+    for record in state.get("sources") or ():
+        expected.setdefault(
+            str(record.get("source") or ""),
+            str(record.get("source_sha256") or ""),
+        )
+    for raw_path, expected_digest in sorted(expected.items()):
+        path = Path(raw_path).resolve()
+        if not path.is_file() or _sha256(path) != expected_digest:
+            return path
+    return None
+
+
+def _retire_usage_priority(
+    state: dict[str, Any], *, changed_source: Path, generation: int,
+) -> None:
+    usage = state.pop("compiler_usage", None)
+    if usage is not None:
+        state.setdefault("compiler_usage_history", []).append({
+            **dict(usage),
+            "retired_generation": int(generation),
+            "changed_source": changed_source.as_posix(),
+        })
 
 
 def _supervise(arguments: argparse.Namespace) -> int:
@@ -517,6 +643,11 @@ def _supervise(arguments: argparse.Namespace) -> int:
         if state.get("status") == "hard-failed":
             changed_source = _changed_catalogue_source(state)
             if changed_source is not None:
+                _retire_usage_priority(
+                    state,
+                    changed_source=changed_source,
+                    generation=int(state["generation"]),
+                )
                 prior_failure = dict(state.get("hard_failure") or {})
                 state.setdefault("resolved_hard_failures", []).append({
                     **prior_failure,
@@ -549,6 +680,11 @@ def _supervise(arguments: argparse.Namespace) -> int:
         ):
             changed_source = _changed_catalogue_source(state)
             if changed_source is not None:
+                _retire_usage_priority(
+                    state,
+                    changed_source=changed_source,
+                    generation=int(state["generation"]),
+                )
                 state["sources"] = discover_compiler_work_batches(
                     arguments.source_root, batch_size=arguments.jobs,
                 )
@@ -626,6 +762,14 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 command,
                 cwd=Path(__file__).resolve().parents[1],
                 check=False,
+                env={
+                    **os.environ,
+                    **({
+                        COMPILER_USAGE_TRACE_ROOT_ENV: str(
+                            arguments.source_root.resolve()
+                        ),
+                    } if not state.get("compiler_usage") else {}),
+                },
             )
             result_path = wave_root / "wave-result.json"
             result = (
@@ -666,6 +810,30 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 }
                 _atomic_json(state_path, state)
                 break
+            usage_records = list(result.get("compiler_usage") or ())
+            if usage_records and not state.get("compiler_usage"):
+                state["compiler_usage"] = {
+                    "schema": "turing.compiler-bootstrap-usage-priority.v1",
+                    "generation": generation,
+                    "records": usage_records,
+                }
+                completed_prefix = list(state["sources"][:cursor + 1])
+                pending = prioritize_compiler_work_batches(
+                    state["sources"][cursor + 1:], usage_records,
+                )
+                state["sources"] = [*completed_prefix, *pending]
+                sources = state["sources"]
+                source_record = sources[cursor]
+                _atomic_json(state_path, state)
+                print(json.dumps({
+                    "stage": "compiler_usage_priority",
+                    "generation": generation,
+                    "observed_callables": len(usage_records),
+                    "pending_batches": len(pending),
+                    "next_entries": (
+                        list(pending[0].get("entries") or ()) if pending else []
+                    ),
+                }, sort_keys=True), flush=True)
             last_outcomes = dict(source_record.get("last_outcomes") or {})
             previous_outcome = last_outcomes.get(mode)
             current_outcome = result.get("outcome_sha256")

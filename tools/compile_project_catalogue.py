@@ -7,6 +7,7 @@ import atexit
 import json
 import os
 from pathlib import Path
+import sys
 import time
 import traceback
 from typing import Sequence
@@ -24,6 +25,73 @@ from src.compiler.project_compilation_product import (
     process_memory_bytes,
     publish_process_graph_subdivision_plan,
 )
+
+
+COMPILER_USAGE_TRACE_ROOT_ENV = "TURING_COMPILER_USAGE_TRACE_ROOT"
+
+
+class _CompilerUsageProfiler:
+    """Low-allocation call census for authored compiler functions."""
+
+    def __init__(self, source_root: Path, destination: Path):
+        self.source_root = source_root.resolve()
+        self.destination = destination.resolve()
+        self.prefix = os.path.normcase(str(self.source_root) + os.sep)
+        self.code_keys = {}
+        self.active = {}
+        self.records = {}
+
+    def _key(self, frame):
+        code = frame.f_code
+        cached = self.code_keys.get(code)
+        if cached is not None:
+            return cached
+        filename = os.path.normcase(os.path.abspath(code.co_filename))
+        key = (
+            (Path(filename).resolve().as_posix(), str(code.co_qualname))
+            if filename.startswith(self.prefix) else ()
+        )
+        self.code_keys[code] = key
+        return key
+
+    def __call__(self, frame, event, _argument):
+        if event == "call":
+            key = self._key(frame)
+            if key:
+                self.active[id(frame)] = (key, time.perf_counter())
+        elif event == "return":
+            active = self.active.pop(id(frame), None)
+            if active is not None:
+                key, started = active
+                record = self.records.setdefault(key, [0, 0.0])
+                record[0] += 1
+                record[1] += time.perf_counter() - started
+
+    def start(self) -> None:
+        sys.setprofile(self)
+
+    def finish(self) -> None:
+        sys.setprofile(None)
+        payload = {
+            "schema": "turing.compiler-usage-trace.v1",
+            "source_root": self.source_root.as_posix(),
+            "process_id": os.getpid(),
+            "records": [{
+                "source": source,
+                "qualified_name": qualified_name,
+                "call_count": int(values[0]),
+                "inclusive_seconds": float(values[1]),
+            } for (source, qualified_name), values in sorted(
+                self.records.items()
+            )],
+        }
+        self.destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.destination.with_name(self.destination.name + ".tmp")
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8", newline="\n",
+        )
+        os.replace(temporary, self.destination)
 
 
 def _publish_bootstrap_runtime_state(
@@ -224,6 +292,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args(argv)
+
+    usage_profiler = None
+    usage_root = os.environ.get(COMPILER_USAGE_TRACE_ROOT_ENV)
+    if usage_root:
+        usage_profiler = _CompilerUsageProfiler(
+            Path(usage_root), arguments.output / "compiler-usage.json",
+        )
+        usage_profiler.start()
+        atexit.register(usage_profiler.finish)
 
     from src.compiler.compiler_bootstrap_runtime import (
         activate_compiler_bootstrap_products,
