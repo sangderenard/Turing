@@ -81,6 +81,26 @@ will not fire under `prove`.
 runs after planning and computes, per surviving operation: the operating
 width from the fused batch, and the return width from the actual consumer.
 
+**Lane closures exist; nothing produces one for precision.**
+SSA already has them, and more rigorously than a declaration would: `Deploy`
+and `Join` are registered operators (Deploy fans DOWN to lanes, Join fans UP
+from them), `deployment_ssa_binding.py` gives Deploy an `ssa.deploy_token`
+result and Join the lane live-outs as operands, and before binding it PROVES
+the independence the region record claims -- no value defined in one lane
+consumed by a sibling -- reporting and refusing rather than silently
+repairing. `ControlDeploymentRegion` is explicitly backend-neutral and grants
+permission rather than obligation, with serial always valid, which is exactly
+"up to this many lanes, architecture decides".
+
+Only `loop_composer.py:967` builds one, so lanes come from loops and nowhere
+else. The precision connection is real but narrow: limbs are NOT independent
+in general -- two_sum's error propagates limb to limb, which is the mechanism
+-- but the operations stamped `precision_form` are exactly the ones where
+they are. Negation flips each limb's sign and power-of-two scaling shifts
+each limb's exponent; neither reads a neighbour. Those two qualify for lane
+regions over the limb channel, and the binding pass would prove it rather
+than believe it.
+
 ## Correctness work not yet done
 
 **The prove-vs-fast comparison has never been run.**
