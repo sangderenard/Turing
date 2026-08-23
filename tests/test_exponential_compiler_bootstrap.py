@@ -303,6 +303,85 @@ def test_supervisor_stops_on_any_failed_wave(tmp_path, monkeypatch):
     assert state["hard_failure"]["error"] == "lowering failed"
 
 
+def test_startup_hard_fails_oldest_current_unsuccessful_archive_and_prioritizes_it(
+    tmp_path, monkeypatch,
+):
+    source_root = tmp_path / "compiler"
+    source_root.mkdir()
+    cold = source_root / "cold.py"
+    failed = source_root / "failed.py"
+    cold.write_text("def cold():\n    return 0\n", encoding="utf-8")
+    failed.write_text("def failed():\n    return 1\n", encoding="utf-8")
+    contract = tmp_path / "contract.json"
+    contract.write_text("{}", encoding="utf-8")
+    output = tmp_path / "bootstrap"
+    output.mkdir()
+    sources = exponential.discover_compiler_work_batches(
+        source_root, batch_size=1,
+    )
+    sources.sort(key=lambda item: item["source"] == failed.resolve().as_posix())
+    wave_root = output / "waves" / "generation_00000"
+    wave_root.mkdir(parents=True)
+    result_path = wave_root / "wave-result.json"
+    result_path.write_text(json.dumps({
+        "schema": exponential.WAVE_SCHEMA,
+        "status": "complete",
+        "generation": 0,
+        "source": failed.resolve().as_posix(),
+        "source_sha256": exponential._sha256(failed),
+        "entries": ["failed"],
+        "outcome": {
+            "status": "frontier",
+            "installed_qualified_names": [],
+            "creep_frontier": [{
+                "qualified_name": "failed",
+                "status": "partial",
+                "action": "materialize-required-source-values",
+            }],
+            "native_verification_frontier": [],
+            "unit_counts": {"partial": 1},
+        },
+    }), encoding="utf-8")
+    (output / "bootstrap-state.json").write_text(json.dumps({
+        "schema": exponential.STATE_SCHEMA,
+        "status": "running",
+        "source_root": source_root.as_posix(),
+        "generation": 1,
+        "sweep": 0,
+        "cursor": 1,
+        "batch_size": 1,
+        "sweep_progress": True,
+        "sources": sources,
+        "waves": [{
+            "generation": 0,
+            "source": failed.resolve().as_posix(),
+            "result": result_path.resolve().as_posix(),
+        }],
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        exponential.subprocess, "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("startup archive failure must precede a new worker")
+        ),
+    )
+    arguments = argparse.Namespace(
+        source_root=source_root, output=output, jobs=1,
+        max_total_gb=16.0, worker_reserve_gb=4.0,
+        max_worker_gb=6.0, unit_timeout_seconds=60.0,
+        minimum_compile_seconds_before_widening=30.0,
+        max_generations=8, max_sweeps=4, extraction_contract=contract,
+    )
+
+    assert exponential._supervise(arguments) == 1
+    state = json.loads(
+        (output / "bootstrap-state.json").read_text(encoding="utf-8")
+    )
+    assert state["status"] == "hard-failed"
+    assert state["hard_failure"]["archive_generation"] == 0
+    assert state["sources"][0]["entries"] == ["failed"]
+    assert state["cursor"] == 0
+
+
 def test_revised_source_resumes_a_persisted_hard_failure(
     tmp_path, monkeypatch,
 ):

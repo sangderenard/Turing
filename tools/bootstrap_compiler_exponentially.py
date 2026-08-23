@@ -619,6 +619,98 @@ def _retire_usage_priority(
         })
 
 
+def _prioritize_failed_work(
+    records: Sequence[dict[str, Any]], failure: dict[str, Any],
+) -> list[dict[str, Any]]:
+    source = str(failure.get("source") or "")
+    entries = tuple(map(str, failure.get("entries") or ()))
+    if not source or not entries:
+        return list(records)
+    # Feed the failed batch through the ordinary dependency-aware scheduler.
+    # Its real prerequisites stay ahead of it; unrelated work moves behind it.
+    return prioritize_compiler_work_batches(records, [{
+        "source": source,
+        "qualified_name": name,
+        "call_count": 10 ** 18,
+        "inclusive_seconds": 10 ** 18,
+    } for name in entries])
+
+
+def _archived_unsuccessful_wave(
+    state: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return the oldest current-source archive that was not installed."""
+
+    for wave in sorted(
+        state.get("waves") or (),
+        key=lambda item: int(item.get("generation") or 0),
+    ):
+        source = Path(str(wave.get("source") or "")).resolve()
+        result_path = Path(str(wave.get("result") or "")).resolve()
+        result = (
+            json.loads(result_path.read_text(encoding="utf-8"))
+            if result_path.is_file() else {}
+        )
+        archived_digest = str(result.get("source_sha256") or "")
+        if (
+            not source.is_file()
+            or (archived_digest and _sha256(source) != archived_digest)
+        ):
+            # A source revision supersedes that archived outcome.  The normal
+            # catalogue refresh will schedule the revised work independently.
+            continue
+        outcome = dict(result.get("outcome") or {})
+        archived_frontier = (
+            *(outcome.get("creep_frontier") or ()),
+            *(outcome.get("native_verification_frontier") or ()),
+            *(result.get("failures") or ()),
+        )
+        entries = tuple(map(str, result.get("entries") or ())) or tuple(
+            dict.fromkeys(
+                str(record.get("qualified_name") or "")
+                for record in archived_frontier
+                if record.get("qualified_name")
+            )
+        )
+        installed = set(map(
+            str, outcome.get("installed_qualified_names") or (),
+        ))
+        unit_counts = dict(outcome.get("unit_counts") or {})
+        succeeded = bool(
+            result.get("status") == "complete"
+            and outcome.get("status") == "sealed"
+            and not outcome.get("creep_frontier")
+            and not outcome.get("native_verification_frontier")
+            and not int(unit_counts.get("failed") or 0)
+            and not int(unit_counts.get("partial") or 0)
+            and set(entries) <= installed
+        )
+        if succeeded:
+            continue
+        failures = []
+        for record in archived_frontier:
+            failures.append(dict(record))
+        if not failures:
+            failures = [{
+                "qualified_name": name,
+                "status": str(outcome.get("status") or result.get("status") or "missing"),
+                "reason": "archived compiler item was not sealed and installed",
+            } for name in entries]
+        return {
+            "source": source.as_posix(),
+            "entries": list(entries),
+            "error_type": "ArchivedBootstrapItemUnsuccessful",
+            "error": (
+                "oldest current-source archived compiler item did not finish "
+                "as a sealed, receipt-installed native deployment"
+            ),
+            "failures": failures,
+            "archive_generation": int(wave.get("generation") or 0),
+            "result": result_path.as_posix(),
+        }
+    return None
+
+
 def _supervise(arguments: argparse.Namespace) -> int:
     root = arguments.output.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -643,6 +735,24 @@ def _supervise(arguments: argparse.Namespace) -> int:
             _atomic_json(state_path, state)
         if state.get("schema") != STATE_SCHEMA:
             raise ValueError("unsupported exponential bootstrap state schema")
+        if state.get("status") != "hard-failed":
+            archived_failure = _archived_unsuccessful_wave(state)
+            if archived_failure is not None:
+                state["sources"] = _prioritize_failed_work(
+                    state["sources"], archived_failure,
+                )
+                state["cursor"] = 0
+                state["status"] = "hard-failed"
+                state["hard_failure"] = archived_failure
+                _atomic_json(state_path, state)
+                print(json.dumps({
+                    "stage": "archived_failure_detected",
+                    **archived_failure,
+                    "priority_entries": [
+                        list(record.get("entries") or ())
+                        for record in state["sources"][:3]
+                    ],
+                }, sort_keys=True), flush=True)
         if state.get("status") == "hard-failed":
             changed_source = _changed_catalogue_source(state)
             if changed_source is not None:
@@ -658,8 +768,10 @@ def _supervise(arguments: argparse.Namespace) -> int:
                     "resume_generation": int(state["generation"]),
                 })
                 state.pop("hard_failure", None)
-                state["sources"] = discover_compiler_work_batches(
+                state["sources"] = _prioritize_failed_work(
+                    discover_compiler_work_batches(
                     arguments.source_root, batch_size=arguments.jobs,
+                    ), prior_failure,
                 )
                 state["status"] = "running"
                 state["cursor"] = 0
