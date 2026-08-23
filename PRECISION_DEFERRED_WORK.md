@@ -52,13 +52,24 @@ ordinary subtraction, and it is what took `expm1` to 1.75 ulp with no core.
 It must never fire on a guess — where it is wrong it is wrong silently and
 by the entire residual.
 
-**No `fma` primitive exists.**
-Nothing in `src/compiler/` or `src/common/tensors/` defines one, so the
-fused `two_product` variant cannot be authored in Python and compiled. Per
-the machine-head authority hierarchy this belongs at the InstructionSpec +
-scalar-decoder layer, not bolted onto a backend. Until then `two_product`
-has one variant, and the fused/split bit-agreement claim is untested rather
-than false.
+**The fused `two_product` needs a flag, not an `fma` primitive.**
+Recorded here earlier as blocked on a missing primitive. That was wrong.
+Two routes already exist and neither needs SSA to spell `fma`:
+
+* `ssa_llvm_backend.py:459` attaches LLVM's `contract` flag PER INSTRUCTION,
+  and `_CONTRACT_ELIGIBLE` is `{Add, Sub, Mul}` -- exactly the operations
+  the dual uses. SSA presents the lane structure (`Mul` then `Sub`) and
+  LLVM forms the fma itself.
+* `_BUILTIN_TARGETS` in `backend_intrinsics.py` is keyed
+  `(backend, semantic_family)` and holds `blas.gemm` today. A
+  `precision.two_product` family plus a target per backend is the same
+  node-swap protocol, and GLSL/WGSL/C each have a native `fma()` to name.
+
+The real work is that ONE flag serves both directions: withheld at the
+primal (where contraction breaks Knuth's precondition) and granted at the
+dual (where contraction IS the identity). `contraction_across_the_primal`
+in the refusal table and `two_product_kernel` in the identity table are the
+same mechanism seen from two sides.
 
 **The superaccumulator kernel is unwritten.**
 `exact_accumulation_over_long_chain` names it; nothing provides it.
