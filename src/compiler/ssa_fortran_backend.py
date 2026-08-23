@@ -96,6 +96,11 @@ _BINARY: dict[str, str] = {
     "Div": "({0} / {1})",
     "Pow": "({0} ** {1})",
     "Mod": "modulo({0}, {1})",
+    # F2018's IEEE_ARITHMETIC intrinsic, the same module this lane already
+    # reaches for ieee_is_nan and ieee_value. Older compilers predate it,
+    # so a target that rejects this is a real shortfall rather than a
+    # reason to expand it into a multiply and an add.
+    "Fma": "ieee_fma({0}, {1}, {2})",
     "FloorDiv": "floor({0} / {1})",
     "Eq": "({0} == {1})",
     "Ne": "({0} /= {1})",

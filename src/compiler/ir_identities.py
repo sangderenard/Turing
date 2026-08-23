@@ -1158,6 +1158,45 @@ PRECISION_SECTION_OBLIGATIONS = (
 )
 
 
+#: What each destination actually delivers, as opposed to what it emits.
+#:
+#: The four lanes present a UNIFIED FRONT: every one of them accepts `Fma`
+#: and produces something, so a program compiles on all four and no caller
+#: has to write four versions. This table is what keeps that front from
+#: becoming a lie. Emitting is not meeting: WebAssembly has no fma
+#: instruction and expands into a multiply and an add, which rounds twice,
+#: so it does not declare FMA_MANDATORY -- and a precision section asking
+#: for one is refused HERE, before emission, rather than discovered later
+#: in a residual that came back zero.
+#:
+#: Ordinary code is unaffected by that refusal. Code that merely wanted the
+#: accuracy of an fma gets the arithmetic on every lane; only code whose
+#: correctness depends on the single rounding is turned away, and only where
+#: the single rounding is not available.
+BACKEND_PRECISION_CAPABILITIES: dict[str, tuple[str, ...]] = {
+    # C99 `fma`, and `#pragma STDC FP_CONTRACT OFF`. Both in the language.
+    "c": (FMA_MANDATORY, SECTION_ISOLATION),
+    # @llvm.fma.f64 is the operation, not a licence to fuse. Isolation is
+    # withholding the fast-math flags, which are already per-instruction.
+    "llvm": (FMA_MANDATORY, SECTION_ISOLATION),
+    # IEEE_FMA is F2018 and the lane already uses IEEE_ARITHMETIC. Fortran
+    # forbids reassociating a parenthesised expression, which is most of
+    # isolation, but offers no way to withdraw contraction specifically --
+    # so the obligation is not claimed rather than half-claimed.
+    "fortran": (FMA_MANDATORY,),
+    # No fma instruction exists. It emits, it does not deliver.
+    "wasm": (),
+}
+
+
+def unmet_precision_obligations(contract, backend: str) -> tuple[str, ...]:
+    """What ``backend`` cannot honour for one section. Empty means it may."""
+
+    return contract.unmet_by(
+        BACKEND_PRECISION_CAPABILITIES.get(str(backend).casefold(), ())
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class PrecisionSectionContract:
     """What one precision section presents, and what it requires of a host.
@@ -1252,8 +1291,21 @@ def precision_section_contracts(functions) -> tuple[PrecisionSectionContract, ..
                     # carry a width without yet knowing its element type, and
                     # reading the element off whichever instruction happened
                     # to be widest loses one that a neighbour does know.
+                    #
+                    # The RESULT VALUE is asked before the instruction. An
+                    # operation named at ingestion keeps whatever element its
+                    # attributes were stamped with -- usually none, since the
+                    # declaration gives limbs and no type -- while the carry
+                    # pass resolves the element onto the value from its dtype.
+                    # Reading only the attributes reports None for a section
+                    # whose element is perfectly well known.
                     if element is None:
-                        element = each.attributes.get("precision_element")
+                        result = each.res
+                        element = (
+                            (result.accounting or {}).get("precision_element")
+                            or (result.dtype if result is not None else None)
+                            if result is not None else None
+                        ) or each.attributes.get("precision_element")
                 contracts.append(PrecisionSectionContract(
                     function=str(name),
                     value_ids=tuple(

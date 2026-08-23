@@ -26,6 +26,16 @@ _BINARY: dict[str, str] = {
     "Sub": "{out} = fsub double {0}, {1}",
     "Mul": "{out} = fmul double {0}, {1}",
     "Div": "{out} = fdiv double {0}, {1}",
+    # The intrinsic, deliberately NOT the `contract` flag on a separate
+    # fmul/fadd. A flag PERMITS fusion, so whether it happens depends on the
+    # named target and the optimizer; `@llvm.fma.f64` is the operation
+    # itself and rounds once wherever it lands. `Fma` is absent from
+    # _CONTRACT_ELIGIBLE for the same reason -- it is already fused, and
+    # there is nothing left to license.
+    "Fma": (
+        "{out} = call double @llvm.fma.f64"
+        "(double {0}, double {1}, double {2})"
+    ),
     # Python's % is FLOORED for floats too; frem alone is C sign semantics.
     "Mod": (
         "{out}.rem = frem double {0}, {1}\n"

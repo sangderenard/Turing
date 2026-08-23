@@ -202,6 +202,27 @@ def emit_ssa_function_to_wasm(
                 )
             else:
                 wat_operation = f"local.get $t{args[0]}"
+        elif op.casefold() == "fma" and len(args) == 3:
+            # WebAssembly HAS NO FMA INSTRUCTION, and this is the expansion
+            # into a multiply and an add -- which rounds twice and is
+            # therefore NOT an fma. Emitted anyway so the four lanes present
+            # the same operation and a program compiles here at all, but the
+            # difference is not cosmetic: on a precision dual, where the
+            # whole value of the fma is that `a * b - fl(a * b)` keeps the
+            # residual, two roundings return exactly zero.
+            #
+            # So this lane does not declare FMA_MANDATORY in
+            # BACKEND_PRECISION_CAPABILITIES, and a precision section asking
+            # for it is told before emission rather than after. Ordinary
+            # code that merely wanted the accuracy gets the arithmetic it
+            # asked for; precision code gets refused. Both are correct, and
+            # the ledger is what tells them apart.
+            get(args[0]); get(args[1]); builder.op("mul")
+            get(args[2]); builder.op("add")
+            wat_operation = (
+                f"local.get $t{args[0]} local.get $t{args[1]} f64.mul "
+                f"local.get $t{args[2]} f64.add"
+            )
         elif op in {"Add", "Sub", "Mul", "Div", "Max", "Min"} and len(args) == 2:
             get(args[0]); get(args[1]); builder.op(op.lower())
             wat_operation = f"local.get $t{args[0]} local.get $t{args[1]} f64.{op.lower()}"

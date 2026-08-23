@@ -17084,9 +17084,7 @@ def _class_surface_ssa_program(
     # Here the module is final, so a constant that lost its last arithmetic
     # consumer still materializes wherever an output ledger names it.
     from .ir_identities import (
-        deduplicate_constants,
         drop_dead_pure_region_calls,
-        eliminate_common_subexpressions,
         reduce_constant_exponent_pow,
     )
 
@@ -17095,20 +17093,6 @@ def _class_surface_ssa_program(
     # results nothing reads (the materialized comprehension ``range``) must
     # not force a backend to spell code nothing runs.
     drop_dead_pure_region_calls(all_functions)
-    # Catalogue 3 then 2.3, and the ORDER is the content: two identical
-    # expressions are invisible to sharing while their equal constants are
-    # separate values, so CSE run first finds one duplicate where run second
-    # it finds thirteen. Both are exactly result-preserving -- the surviving
-    # instruction computes the same operation on the same operands -- so
-    # neither asks the work contract for permission.
-    #
-    # These earn their keep on the six backends with no -O2 behind them.
-    # Measured on the signal cores, LLVM finds the same redundancy itself and
-    # the native timing does not move; the emitted SSA is 12-15% smaller
-    # either way, and that is what Fortran, C, GLSL, SPIR-V, WGSL and WASM
-    # actually consume.
-    deduplicate_constants(all_functions)
-    eliminate_common_subexpressions(all_functions)
 
     # Sequence descriptors are the canonical physical ABI.  A source value
     # may have been captured provisionally by a numerical region before its
