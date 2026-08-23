@@ -41,6 +41,27 @@ WAVE_SCHEMA = "turing.exponential-compiler-bootstrap-wave.v1"
 COMPILER_USAGE_TRACE_ROOT_ENV = "TURING_COMPILER_USAGE_TRACE_ROOT"
 
 
+def _compiler_implementation_sha256() -> str:
+    """Fingerprint the implementation which decided a compiler-unit result."""
+
+    repository = Path(__file__).resolve().parents[1]
+    paths = [
+        *sorted((repository / "src" / "compiler").rglob("*.py")),
+        *sorted((repository / "src" / "transmogrifier").rglob("*.py")),
+        repository / "tools" / "compile_project_catalogue.py",
+        Path(__file__).resolve(),
+    ]
+    digest = hashlib.sha256()
+    for path in paths:
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        digest.update(path.relative_to(repository).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _atomic_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
@@ -538,6 +559,7 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             "process_id": os.getpid(),
             "source": arguments.source.resolve().as_posix(),
             "source_sha256": _sha256(arguments.source.resolve()),
+            "compiler_implementation_sha256": _compiler_implementation_sha256(),
             "entries": list(arguments.entry),
             "workers_joined": True,
             "mode": "deep-retry" if arguments.deep_retry else "bounded",
@@ -562,6 +584,8 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             "generation": int(arguments.generation),
             "process_id": os.getpid(),
             "source": arguments.source.resolve().as_posix(),
+            "source_sha256": _sha256(arguments.source.resolve()),
+            "compiler_implementation_sha256": _compiler_implementation_sha256(),
             "entries": list(arguments.entry),
             "workers_joined": True,
             "mode": "deep-retry" if arguments.deep_retry else "bounded",
@@ -722,9 +746,16 @@ def _archived_failed_wave(
             if result_path.is_file() else {}
         )
         archived_digest = str(result.get("source_sha256") or "")
+        archived_implementation = str(
+            result.get("compiler_implementation_sha256") or ""
+        )
         if (
             not source.is_file()
             or (archived_digest and _sha256(source) != archived_digest)
+            # A legacy receipt has no compiler provenance, so it cannot prove
+            # a lowering failure still applies after compiler code changed.
+            or not archived_implementation
+            or archived_implementation != _compiler_implementation_sha256()
         ):
             # A source revision supersedes that archived outcome.  The normal
             # catalogue refresh will schedule the revised work independently.
@@ -838,8 +869,8 @@ def _supervise(arguments: argparse.Namespace) -> int:
             _atomic_json(state_path, state)
         if state.get("schema") != STATE_SCHEMA:
             raise ValueError("unsupported exponential bootstrap state schema")
+        archived_failure = _archived_failed_wave(state)
         if state.get("status") != "hard-failed":
-            archived_failure = _archived_failed_wave(state)
             if archived_failure is not None:
                 state["sources"] = _prioritize_failed_work(
                     state["sources"], archived_failure,
@@ -868,6 +899,30 @@ def _supervise(arguments: argparse.Namespace) -> int:
                         for record in state["sources"][:3]
                     ],
                 }, sort_keys=True), flush=True)
+        elif archived_failure is None:
+            # The archived cause belonged to a different compiler revision
+            # (or predates compiler provenance).  It must be retried, not held
+            # forever as a failure of unchanged authored source.
+            prior_failure = dict(state.get("hard_failure") or {})
+            state.setdefault("resolved_hard_failures", []).append({
+                **prior_failure,
+                "resolved_by_compiler_revision": _compiler_implementation_sha256(),
+                "resume_generation": int(state["generation"]),
+            })
+            state.pop("hard_failure", None)
+            state["status"] = "running"
+            state["cursor"] = 0
+            state["sweep_progress"] = True
+            state["catalogue_refresh"] = {
+                "generation": int(state["generation"]),
+                "reason": "hard-failure-compiler-revised",
+            }
+            _atomic_json(state_path, state)
+            print(json.dumps({
+                "stage": "hard_failure_resume",
+                **state["catalogue_refresh"],
+                "batch_count": len(state["sources"]),
+            }, sort_keys=True), flush=True)
         if state.get("status") == "hard-failed":
             changed_source = _changed_catalogue_source(state)
             if changed_source is not None:

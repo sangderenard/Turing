@@ -327,9 +327,12 @@ def test_startup_hard_fails_oldest_archived_failure_and_prioritizes_it(
         "schema": exponential.WAVE_SCHEMA,
         "status": "complete",
         "generation": 0,
-        "source": failed.resolve().as_posix(),
-        "source_sha256": exponential._sha256(failed),
-        "entries": ["failed"],
+            "source": failed.resolve().as_posix(),
+            "source_sha256": exponential._sha256(failed),
+            "compiler_implementation_sha256": (
+                exponential._compiler_implementation_sha256()
+            ),
+            "entries": ["failed"],
         "outcome": {
             "status": "frontier",
             "installed_qualified_names": [],
@@ -420,6 +423,25 @@ def test_later_installed_archive_supersedes_an_older_frontier(tmp_path):
         })
 
     assert exponential._archived_failed_wave({"waves": waves}) is None
+
+
+def test_archived_failure_without_compiler_provenance_is_stale(tmp_path):
+    source = tmp_path / "stage.py"
+    source.write_text("def stage():\n    return 1\n", encoding="utf-8")
+    result = tmp_path / "wave.json"
+    result.write_text(json.dumps({
+        "status": "failed",
+        "source": source.resolve().as_posix(),
+        "source_sha256": exponential._sha256(source),
+        "entries": ["stage"],
+        "hard_failure": True,
+    }), encoding="utf-8")
+
+    assert exponential._archived_failed_wave({"waves": [{
+        "generation": 0,
+        "source": source.resolve().as_posix(),
+        "result": result.resolve().as_posix(),
+    }]}) is None
 
 
 def test_partial_archive_is_state_not_failure(tmp_path):
