@@ -531,3 +531,222 @@ def carry_precision_through_ssa(functions) -> int:
                 break
             changed_total += changed
     return changed_total
+
+
+@dataclasses.dataclass(frozen=True)
+class PrecisionIdentity:
+    """One reduction the precision operations admit, and why it is true.
+
+    ``requires`` is what must exist before it may fire -- a proven fact on a
+    value, or a kernel the bank can serve. An empty tuple is unconditional.
+    ``exact`` means the rewrite changes no bit of the result; an inexact one
+    would need the work contract's licence, and there are none here on
+    purpose: every entry below is a theorem, not a trade.
+    """
+
+    name: str
+    matches: tuple[str, ...]
+    exact: bool
+    requires: tuple[str, ...]
+    effect: str
+    justification: str
+
+
+#: The identity table for the precision reduction phase.
+#:
+#: Ordered by what they save, cheapest evidence first. An expansion operation
+#: is expensive -- a two-limb product is seven flops before renormalisation --
+#: so the identities proving one ISN'T NEEDED are worth more than any that
+#: make one faster, and they come first.
+PRECISION_IDENTITIES: tuple[PrecisionIdentity, ...] = (
+    PrecisionIdentity(
+        name="negation_is_per_limb",
+        matches=("precision_neg",),
+        exact=True,
+        requires=(),
+        effect="negate each limb; no error-free transformation at all",
+        justification=(
+            "Negation is exact in every binary floating-point format: it "
+            "flips a sign bit and cannot round. An expansion is the sum of "
+            "its limbs, so negating each limb negates the sum exactly and "
+            "preserves nonoverlapping-ness. precision_neg is therefore "
+            "never an expansion operation, only a channel-wise sign flip."
+        ),
+    ),
+    PrecisionIdentity(
+        name="subtraction_is_addition_of_negation",
+        matches=("precision_sub",),
+        exact=True,
+        requires=("negation_is_per_limb",),
+        effect="rewrite sub(a, b) to add(a, neg(b))",
+        justification=(
+            "Exact because the negation it introduces is exact. Its value "
+            "is not speed -- it is that a destination implements four "
+            "operations instead of five, and the subtraction path cannot "
+            "drift from the addition path because there is only one."
+        ),
+    ),
+    PrecisionIdentity(
+        name="exact_identity_element",
+        matches=("precision_add", "precision_mul"),
+        exact=True,
+        requires=("constant_operand",),
+        effect="add(x, 0) -> x; mul(x, 1) -> x",
+        justification=(
+            "Only against a literal exact zero or one. A value that merely "
+            "ROUNDS to zero or one is not an identity element: adding a "
+            "denormal changes the low limb even when it cannot change the "
+            "high one, and that low limb is the entire point of the "
+            "representation. Signed zero also disqualifies -- x + (-0.0) is "
+            "x except when x is -0.0 -- so the literal must be +0.0."
+        ),
+    ),
+    PrecisionIdentity(
+        name="scaling_by_power_of_two",
+        matches=("precision_mul",),
+        exact=True,
+        requires=("constant_operand",),
+        effect="scale every limb by the power of two; no transformation",
+        justification=(
+            "Multiplication by a power of two only shifts the exponent, so "
+            "it is exact for every limb independently and preserves the "
+            "nonoverlapping property that makes the limbs a valid "
+            "expansion. This is what makes Cody-Waite argument reduction "
+            "affordable: its range-reduction scalings cost nothing."
+        ),
+    ),
+    PrecisionIdentity(
+        name="sterbenz_cancellation",
+        matches=("precision_sub",),
+        exact=True,
+        requires=("operand_range_fact",),
+        effect="collapse to an ordinary Sub",
+        justification=(
+            "Sterbenz's lemma: if b/2 <= a <= 2b then a - b is exactly "
+            "representable, so the dual is provably zero and computing it "
+            "is computing zero the long way. This is the identity that took "
+            "expm1 to 1.75 ulp with no core at all. It needs a proven range "
+            "on both operands -- catalogue section 5's fact slot -- and must "
+            "never fire on a guess, because where it is wrong it is wrong "
+            "silently and by the whole residual."
+        ),
+    ),
+    PrecisionIdentity(
+        name="single_renormalisation_per_chain",
+        matches=("precision_add", "precision_sub"),
+        exact=True,
+        requires=("chain_internal_consumers",),
+        effect="renormalise once at the end of a chain, not per operation",
+        justification=(
+            "renorm(renorm(a + b) + c) == renorm(a + b + c). Renormalisation "
+            "redistributes limbs into nonoverlapping form; it does not "
+            "change the value the expansion represents, so an intermediate "
+            "one is needed only if something READS the intermediate. A "
+            "chain of n additions therefore needs one renormalisation, not "
+            "n. This is the largest win available here, and it became "
+            "visible only once precision propagated along a chain -- before "
+            "that every operation looked isolated and each one paid."
+        ),
+    ),
+    PrecisionIdentity(
+        name="exact_accumulation_over_long_chain",
+        matches=("precision_add",),
+        exact=True,
+        requires=("chain_internal_consumers", "kernel:superaccumulator"),
+        effect="accumulate into a fixed-point superaccumulator",
+        justification=(
+            "Past some chain length, not renormalising at all beats "
+            "renormalising once: an accumulator wide enough to span the "
+            "exponent range absorbs each term in constant time with no "
+            "rounding whatsoever, and is read out once. It is exact for ANY "
+            "number of terms and any conditioning, which a fixed-width "
+            "expansion is not -- so this is also the only entry here that "
+            "improves accuracy rather than merely preserving it."
+        ),
+    ),
+    PrecisionIdentity(
+        name="two_product_kernel",
+        matches=("precision_mul",),
+        exact=True,
+        requires=("kernel:two_product",),
+        effect="call the banked two_product kernel for the dual",
+        justification=(
+            "The dual of a product is Dekker's splitting -- six multiplies "
+            "and several adds -- or, where the hardware has a fused "
+            "multiply-add, the single instruction fma(a, b, -p). Both are "
+            "exact and they agree bit for bit, so this is variant selection "
+            "rather than a licence to be inexact. Making it a BANKED KERNEL "
+            "rather than a backend rule is what makes that claim checkable: "
+            "the bank verifies every variant against the spec's oracle "
+            "before serving it, so the fused variant is proven equal to the "
+            "split one rather than trusted because a capability flag was set."
+        ),
+    ),
+)
+
+
+#: Identities true over the reals and false over floating point.
+#:
+#: Recorded because a reduction phase that does not know them will find them:
+#: each is a rewrite some optimizer already performs, and each destroys the
+#: representation silently. This is the table's other half -- knowing what
+#: must NOT reduce is the same knowledge as knowing what may.
+PRECISION_REFUSALS: tuple[PrecisionIdentity, ...] = (
+    PrecisionIdentity(
+        name="cancellation_of_added_term",
+        matches=("precision_add", "precision_sub"),
+        exact=False,
+        requires=("never",),
+        effect="REFUSED: (a + b) - b is not a",
+        justification=(
+            "The whole representation exists because a + b loses bits that "
+            "b cannot give back. This rewrite is exactly the assumption "
+            "that no bits were lost, which is the assumption the limbs "
+            "exist to deny."
+        ),
+    ),
+    PrecisionIdentity(
+        name="reassociation_of_the_dual",
+        matches=("precision_add", "precision_sub", "precision_mul"),
+        exact=False,
+        requires=("never",),
+        effect="REFUSED: the error term must keep its written association",
+        justification=(
+            "A dual expression is algebraically zero -- that is what makes "
+            "it the error term -- so ANY reassociating simplifier folds it "
+            "away entirely. Knuth's and Dekker's proofs hold for one "
+            "specific order of operations and for no other. The primal may "
+            "be reassociated freely; the dual may not be touched at all."
+        ),
+    ),
+    PrecisionIdentity(
+        name="contraction_across_the_primal",
+        matches=("precision_add", "precision_sub"),
+        exact=False,
+        requires=("never",),
+        effect="REFUSED: the primal must not fuse with its own producers",
+        justification=(
+            "two_sum requires s to be the correctly rounded sum of exactly "
+            "its two operands. If an operand was itself a product and the "
+            "multiply-add contracts, s becomes the rounded value of a "
+            "different expression while the dual computes its residual "
+            "against the materialised operand, and the pair no longer sums "
+            "to what it claims. Reassociation of the primal is safe; "
+            "contraction across it is not, and the distinction is exactly "
+            "one flag on one instruction."
+        ),
+    ),
+    PrecisionIdentity(
+        name="distribution_over_addition",
+        matches=("precision_mul",),
+        exact=False,
+        requires=("never",),
+        effect="REFUSED: a * (b + c) is not a * b + a * c",
+        justification=(
+            "Two roundings on the right against one on the left, and the "
+            "limb counts differ: the distributed form needs a wider "
+            "expansion to hold the same value. Over the reals it is free; "
+            "here it changes both the result and the storage it requires."
+        ),
+    ),
+)
