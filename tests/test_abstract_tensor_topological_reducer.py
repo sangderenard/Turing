@@ -1607,6 +1607,43 @@ def convert(value):
     )
 
 
+def test_try_else_consumes_the_successful_body_value_before_path_merge():
+    """A try's structural else edge must not feed back through its value merge."""
+
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def report(value, sink):
+    computed = None
+    try:
+        computed = int(value)
+    except Exception as error:
+        detail = str(error)
+    else:
+        sink(computed)
+    return computed
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("report").graph.G
+
+    assert nx.is_directed_acyclic_graph(function_graph)
+    try_node = next(
+        node_id for node_id, data in function_graph.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Try)
+    )
+    else_call = next(
+        (node_id, data) for node_id, data in function_graph.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and getattr(data["expr_obj"].func, "id", None) == "sink"
+    )
+    assert try_node not in {
+        parent for parent, _role in else_call[1].get("parents", ())
+    }
+
+
 def test_generator_expression_target_does_not_leak_into_later_same_named_loop():
     # A comprehension/generator-expression `for` target has owned its own
     # scope since Python 3.0 -- it is never visible outside the

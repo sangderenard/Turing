@@ -3294,13 +3294,25 @@ def _normalize_lexical_values(
                     )
                 )
             ]
+            # ``else`` belongs exclusively to the successful body path.  It
+            # must therefore see that body's lexical definitions *before* the
+            # successful and handler environments merge for code after the
+            # whole try.  Merging first can bind a body value to the enclosing
+            # Try node; an else call consuming it then points back to the Try
+            # which structurally owns that call, fabricating a cycle.
+            environment.clear()
+            environment.update(body_environment)
+            for nested in body_statement.orelse:
+                reduce_statement(nested)
+            successful_environment = dict(environment)
+
             # Only control-flow paths that can reach the statement following
             # the try participate in its lexical-value merge.  A handler
             # ending in raise/return has no continuation edge and therefore
             # cannot turn values assigned by the successful body into
             # invented external inputs.
             environments = [
-                body_environment,
+                successful_environment,
                 *continuing_handler_environments,
             ]
             environment.clear()
@@ -3328,8 +3340,6 @@ def _normalize_lexical_values(
                         # resolution a Phi would, without inventing a second
                         # node or a synthetic "did-raise" boolean.
                         environment[name] = id(body_statement)
-            for nested in body_statement.orelse:
-                reduce_statement(nested)
             for nested in body_statement.finalbody:
                 reduce_statement(nested)
             return id(body_statement)
