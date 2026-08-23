@@ -1465,6 +1465,32 @@ def lower_precision_operations(functions) -> dict:
                 negated = put("Neg", (product,), a)
                 return product, put(FMA, (a, b, negated), a)
 
+            def collapse(parts_of, original):
+                """Define the ORIGINAL value as the sum of its limbs.
+
+                The expanded operation drops out of the stream, so nothing
+                would define the value it used to produce -- and a declared
+                output, a buffer order or a Ret still names that id. An
+                undefined output buffer reads as zero, which is a plausible
+                number and therefore the worst possible failure.
+
+                Reusing the id rather than rewriting every consumer means
+                metadata that names values, and not just instruction
+                operands, keeps working without this pass having to know
+                what all of it is.
+                """
+
+                total = parts_of[0]
+                for each in parts_of[1:-1]:
+                    total = put("Add", (total, each), total)
+                emitted.append(Instr(
+                    "Add", [total, parts_of[-1]], original,
+                    attributes={
+                        PRECISION_SECTION_ATTRIBUTE: True,
+                        "lowered_from": "precision.collapse",
+                    },
+                ))
+
             for instruction in block.instrs:
                 operation = str(instruction.op)
                 if operation not in expandable or instruction.res is None:
@@ -1474,9 +1500,9 @@ def lower_precision_operations(functions) -> dict:
                 if operation == neg_name:
                     # Exact per limb: a sign flip cannot round.
                     source = parts(instruction.args[0])
-                    limbs[int(instruction.res.id)] = [
-                        put("Neg", (each,), each) for each in source
-                    ]
+                    negated = [put("Neg", (each,), each) for each in source]
+                    limbs[int(instruction.res.id)] = negated
+                    collapse(negated, instruction.res)
                     counts[operation] += 1
                     continue
 
@@ -1503,37 +1529,9 @@ def lower_precision_operations(functions) -> dict:
 
                 high, error = quick_two_sum(high, error)
                 limbs[int(instruction.res.id)] = [high, error]
+                collapse([high, error], instruction.res)
                 counts[operation] += 1
 
             block.instrs = emitted
 
-        # A limbed value read by something that was not expanded wants a
-        # single number: sum the limbs, high first, which is the value the
-        # expansion represents.
-        if limbs:
-            for block in function.blocks.values():
-                rebuilt: list = []
-                for instruction in block.instrs:
-                    for position, argument in enumerate(instruction.args):
-                        parts_of = limbs.get(int(argument.id))
-                        if not parts_of:
-                            continue
-                        total = parts_of[0]
-                        for each in parts_of[1:]:
-                            collapsed = SSAValue(
-                                next_id, dtype=total.dtype, shape=(),
-                                device=total.device,
-                            )
-                            next_id += 1
-                            rebuilt.append(Instr(
-                                "Add", [total, each], collapsed,
-                                attributes={
-                                    PRECISION_SECTION_ATTRIBUTE: True,
-                                    "lowered_from": "precision.collapse",
-                                },
-                            ))
-                            total = collapsed
-                        instruction.args[position] = total
-                    rebuilt.append(instruction)
-                block.instrs = rebuilt
     return counts
