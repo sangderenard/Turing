@@ -2580,11 +2580,96 @@ def partition_authored_source(
 
 
 def discover_authored_calls(source: str) -> tuple[AuthoredCall, ...]:
-    """Return every independently addressable authored function."""
+    """Return every independently addressable implemented function.
+
+    ``pass`` and ``...`` remain valid concrete no-op implementations. On a
+    ``typing.Protocol``, ``abstractmethod``, or ``overload`` surface, however,
+    that body is only a declaration. Treating one as compilable used to
+    produce an empty native subroutine and falsely label it complete.
+    """
+
+    module = ast.parse(source)
+
+    def terminal_name(expression: ast.expr) -> str:
+        if isinstance(expression, ast.Name):
+            return expression.id
+        if isinstance(expression, ast.Attribute):
+            return expression.attr
+        return ""
+
+    def declaration_body(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        body = list(node.body)
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            body.pop(0)
+        return (
+            len(body) == 1
+            and (
+                isinstance(body[0], ast.Pass)
+                or (
+                    isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and body[0].value.value is Ellipsis
+                )
+            )
+        )
+
+    protocol_names = {"Protocol"}
+    declaration_decorators = {"overload", "abstractmethod"}
+    for statement in module.body:
+        if not isinstance(statement, ast.ImportFrom):
+            continue
+        if statement.module in {"typing", "typing_extensions"}:
+            protocol_names.update(
+                alias.asname or alias.name
+                for alias in statement.names if alias.name == "Protocol"
+            )
+            declaration_decorators.update(
+                alias.asname or alias.name
+                for alias in statement.names if alias.name == "overload"
+            )
+        elif statement.module == "abc":
+            declaration_decorators.update(
+                alias.asname or alias.name
+                for alias in statement.names if alias.name == "abstractmethod"
+            )
+    protocol_classes = {
+        statement.name
+        for statement in module.body
+        if isinstance(statement, ast.ClassDef)
+        and any(
+            terminal_name(base) in protocol_names for base in statement.bases
+        )
+    }
+    declarations = set()
+    for statement in module.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            decorators = {
+                terminal_name(item) for item in statement.decorator_list
+            }
+            if declaration_body(statement) and decorators & declaration_decorators:
+                declarations.add(statement.name)
+        elif isinstance(statement, ast.ClassDef):
+            for member in statement.body:
+                if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                decorators = {
+                    terminal_name(item) for item in member.decorator_list
+                }
+                if declaration_body(member) and (
+                    statement.name in protocol_classes
+                    or bool(decorators & declaration_decorators)
+                ):
+                    declarations.add(f"{statement.name}.{member.name}")
 
     calls = [
         AuthoredCall(name, int(definition.node.lineno), definition.kind)
         for name, definition in _authored_definitions(source).items()
+        if name not in declarations
     ]
     return tuple(sorted(calls, key=lambda item: (item.qualified_name, item.line)))
 

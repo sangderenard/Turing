@@ -204,6 +204,77 @@ def test_supervisor_stops_on_native_installation_hard_failure(
     assert not (output / "supervisor.lock").exists()
 
 
+def test_revised_source_resumes_a_persisted_hard_failure(
+    tmp_path, monkeypatch,
+):
+    source_root = tmp_path / "compiler"
+    source_root.mkdir()
+    source = source_root / "one.py"
+    source.write_text("def one():\n    return 1\n", encoding="utf-8")
+    contract = tmp_path / "contract.json"
+    contract.write_text("{}", encoding="utf-8")
+    output = tmp_path / "bootstrap"
+    output.mkdir()
+    old_sources = exponential.discover_compiler_work_batches(
+        source_root, batch_size=1,
+    )
+    (output / "bootstrap-state.json").write_text(json.dumps({
+        "schema": exponential.STATE_SCHEMA,
+        "status": "hard-failed",
+        "source_root": source_root.as_posix(),
+        "generation": 4,
+        "sweep": 0,
+        "cursor": 0,
+        "batch_size": 1,
+        "sweep_progress": False,
+        "sources": old_sources,
+        "waves": [],
+        "hard_failure": {"error": "old failure"},
+    }), encoding="utf-8")
+    source.write_text("def one():\n    return 2\n", encoding="utf-8")
+    launches = []
+
+    def run(command, **_kwargs):
+        launches.append(tuple(command))
+        wave_root = Path(command[command.index("--output") + 1])
+        wave_root.mkdir(parents=True)
+        (wave_root / "wave-result.json").write_text(json.dumps({
+            "schema": exponential.WAVE_SCHEMA,
+            "status": "complete",
+            "generation": 4,
+            "process_id": 4000,
+            "source": source.as_posix(),
+            "workers_joined": True,
+            "registry_changed": False,
+            "outcome_sha256": "stable",
+        }), encoding="utf-8")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(exponential.subprocess, "run", run)
+    arguments = argparse.Namespace(
+        source_root=source_root,
+        output=output,
+        jobs=1,
+        max_total_gb=16.0,
+        worker_reserve_gb=4.0,
+        max_worker_gb=6.0,
+        unit_timeout_seconds=60.0,
+        minimum_compile_seconds_before_widening=30.0,
+        max_generations=5,
+        max_sweeps=4,
+        extraction_contract=contract,
+    )
+
+    assert exponential._supervise(arguments) == 1
+    assert len(launches) == 1
+    state = json.loads(
+        (output / "bootstrap-state.json").read_text(encoding="utf-8")
+    )
+    assert state["status"] == "frontier"
+    assert "hard_failure" not in state
+    assert state["resolved_hard_failures"][0]["error"] == "old failure"
+
+
 def test_timed_out_unit_gets_one_fresh_process_unbounded_retry(
     tmp_path, monkeypatch,
 ):

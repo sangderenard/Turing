@@ -514,6 +514,34 @@ def _supervise(arguments: argparse.Namespace) -> int:
             _atomic_json(state_path, state)
         if state.get("schema") != STATE_SCHEMA:
             raise ValueError("unsupported exponential bootstrap state schema")
+        if state.get("status") == "hard-failed":
+            changed_source = _changed_catalogue_source(state)
+            if changed_source is not None:
+                prior_failure = dict(state.get("hard_failure") or {})
+                state.setdefault("resolved_hard_failures", []).append({
+                    **prior_failure,
+                    "resolved_by_source_change": changed_source.as_posix(),
+                    "resume_generation": int(state["generation"]),
+                })
+                state.pop("hard_failure", None)
+                state["sources"] = discover_compiler_work_batches(
+                    arguments.source_root, batch_size=arguments.jobs,
+                )
+                state["status"] = "running"
+                state["cursor"] = 0
+                state["batch_size"] = int(arguments.jobs)
+                state["sweep_progress"] = True
+                state["catalogue_refresh"] = {
+                    "generation": int(state["generation"]),
+                    "changed_source": changed_source.as_posix(),
+                    "reason": "hard-failure-source-revised",
+                }
+                _atomic_json(state_path, state)
+                print(json.dumps({
+                    "stage": "hard_failure_resume",
+                    **state["catalogue_refresh"],
+                    "batch_count": len(state["sources"]),
+                }, sort_keys=True), flush=True)
         while (
             state["status"] == "running"
             and int(state["generation"]) < int(arguments.max_generations)

@@ -47,6 +47,29 @@ def test_compiler_toolchain_fingerprint_is_deterministic_and_auditable():
     assert "src/common/tensors/topological_reducer.py" in paths
 
 
+def test_authored_call_discovery_excludes_declarations_without_python_jobs():
+    source = (
+        "from typing import Protocol\n\n"
+        "class Surface(Protocol):\n"
+        "    def ellipsis_only(self) -> bool: ...\n\n"
+        "    def pass_only(self):\n"
+        "        'declaration docstring'\n"
+        "        pass\n\n"
+        "    def implemented(self):\n"
+        "        return 1\n\n"
+        "def module_function():\n"
+        "    return 2\n\n"
+        "def concrete_no_op():\n"
+        "    pass\n"
+    )
+
+    assert [call.qualified_name for call in discover_authored_calls(source)] == [
+        "Surface.implemented",
+        "concrete_no_op",
+        "module_function",
+    ]
+
+
 def test_resolved_unit_refuses_a_stale_compiler_toolchain_plan(tmp_path):
     graph_path = tmp_path / "graph.pkl"
     graph_path.write_bytes(b"not reached")
