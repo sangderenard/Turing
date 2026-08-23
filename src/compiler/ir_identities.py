@@ -929,16 +929,32 @@ def reduce_precision_operations(functions) -> dict:
                         except (AttributeError, TypeError, ValueError):
                             continue
 
+        precision_ops = frozenset(PRECISION_SINGULAR_NAMES.values())
         for block in function.blocks.values():
             for instruction in block.instrs:
-                if str(instruction.op) != add_name or instruction.res is None:
+                if (
+                    str(instruction.op) not in precision_ops
+                    or instruction.res is None
+                ):
                     continue
                 result = int(instruction.res.id)
                 consumers = readers.get(result, ())
+                # A renormalisation is needed where a value ESCAPES, not
+                # between every pair of operations.
+                #
+                # The rule used to require the single consumer to be another
+                # ADD, which is the shape a sum chain has and the shape a
+                # Horner never has: there every add feeds a multiply, so the
+                # identity matched nothing on the most common expression in
+                # the whole signal pack -- 0 of 8 identities fired on a sine
+                # core. Any precision operation can consume an unrenormalised
+                # pair; what cannot is anything else, because outside the
+                # section the pair is just two doubles whose sum is the
+                # value.
                 internal = (
                     result not in protected
                     and len(consumers) == 1
-                    and str(consumers[0].op) == add_name
+                    and str(consumers[0].op) in precision_ops
                 )
                 instruction.attributes["precision_renormalise"] = not internal
                 if internal:
@@ -1824,7 +1840,16 @@ def lower_precision_operations(functions) -> dict:
                         if tail:
                             error = put("Add", (error, tail[0]), error)
 
-                high, error = quick_two_sum(high, error)
+                # Honour the renormalisation decision the identity phase
+                # already made. It writes `precision_renormalise` and this
+                # was reading it nowhere, so every operation renormalised
+                # whatever the rule concluded -- the rule existed, fired,
+                # and was ignored. Absent means renormalise, so a module
+                # that never ran the identity phase behaves as before.
+                if instruction.attributes.get(
+                    "precision_renormalise", True
+                ):
+                    high, error = quick_two_sum(high, error)
                 limbs[int(instruction.res.id)] = [high, error]
                 collapse([high, error], instruction.res)
                 counts[operation] += 1
