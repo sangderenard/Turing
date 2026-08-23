@@ -254,6 +254,55 @@ def test_supervisor_stops_on_native_installation_hard_failure(
     assert not (output / "supervisor.lock").exists()
 
 
+def test_supervisor_stops_on_any_failed_wave(tmp_path, monkeypatch):
+    source_root = tmp_path / "compiler"
+    source_root.mkdir()
+    source = source_root / "one.py"
+    source.write_text("def one(value):\n    return value + 1\n", encoding="utf-8")
+    contract = tmp_path / "contract.json"
+    contract.write_text("{}", encoding="utf-8")
+    output = tmp_path / "bootstrap"
+
+    def run(command, **_kwargs):
+        wave_root = Path(command[command.index("--output") + 1])
+        wave_root.mkdir(parents=True)
+        (wave_root / "wave-result.json").write_text(json.dumps({
+            "schema": exponential.WAVE_SCHEMA,
+            "status": "failed",
+            "generation": 0,
+            "process_id": 3001,
+            "source": source.as_posix(),
+            "workers_joined": True,
+            "error_type": "ValueError",
+            "error": "lowering failed",
+        }), encoding="utf-8")
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(exponential.subprocess, "run", run)
+    arguments = argparse.Namespace(
+        source_root=source_root,
+        output=output,
+        jobs=2,
+        max_total_gb=16.0,
+        worker_reserve_gb=4.0,
+        max_worker_gb=6.0,
+        unit_timeout_seconds=60.0,
+        minimum_compile_seconds_before_widening=30.0,
+        max_generations=8,
+        max_sweeps=4,
+        extraction_contract=contract,
+    )
+
+    assert exponential._supervise(arguments) == 1
+    state = json.loads(
+        (output / "bootstrap-state.json").read_text(encoding="utf-8")
+    )
+    assert state["status"] == "hard-failed"
+    assert state["cursor"] == 0
+    assert state["hard_failure"]["error_type"] == "ValueError"
+    assert state["hard_failure"]["error"] == "lowering failed"
+
+
 def test_revised_source_resumes_a_persisted_hard_failure(
     tmp_path, monkeypatch,
 ):

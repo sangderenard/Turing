@@ -515,7 +515,10 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             "error": str(error),
             "traceback": traceback.format_exc(),
             "registry_before_sha256": registry_before,
-            "hard_failure": isinstance(error, NativeInstallationRequiredError),
+            # A failed wave is terminal.  Recoverable subdivision and resource
+            # deferral must be represented explicitly as partial/deferred
+            # outcomes, never smuggled through a generic failure receipt.
+            "hard_failure": True,
             **({
                 "failures": [dict(failure) for failure in error.failures],
             } if isinstance(error, NativeInstallationRequiredError) else {}),
@@ -784,7 +787,10 @@ def _supervise(arguments: argparse.Namespace) -> int:
                     "error": f"generation exited with {completed.returncode}",
                 }
             )
-            if result.get("hard_failure"):
+            if (
+                result.get("hard_failure")
+                or result.get("status") != "complete"
+            ):
                 state["waves"].append({
                     "generation": generation,
                     "source": source.as_posix(),

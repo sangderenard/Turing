@@ -7590,6 +7590,19 @@ def compile_project_bootstrap_creep(
             for record in product.get("automatic_native_verification") or ()
         }
         native_completion_failures = []
+        for unit in product.get("units") or ():
+            if unit.get("status") != "failed":
+                continue
+            error_type = str(unit.get("error_type") or "")
+            error = str(unit.get("error") or "")
+            reason = ": ".join(part for part in (error_type, error) if part)
+            native_completion_failures.append({
+                "qualified_name": str(
+                    unit.get("qualified_name") or "<unknown>"
+                ),
+                "stage": "compiler-unit",
+                "reason": reason or "compiler unit reported failed",
+            })
         for qualified_name in sorted(completed_names):
             verification = verification_by_name.get(qualified_name)
             if verification is None or verification.get("status") != "verified":

@@ -336,7 +336,40 @@ def test_project_bootstrap_hard_fails_a_complete_python_fallback(
     assert progress["status"] == "hard-failed"
 
 
-def test_project_bootstrap_creep_automatically_crawls_failed_unit_plan(
+def test_project_bootstrap_hard_fails_an_explicitly_failed_compiler_unit(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "compiler_part.py"
+    source.write_text("def root(value):\n    return value\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.compile_project_product",
+        lambda _source, _output, **_kwargs: {
+            "units": [{
+                "qualified_name": "root",
+                "status": "failed",
+                "error_type": "ValueError",
+                "error": "semantic boundary was not lowered",
+            }],
+            "automatic_native_verification": [],
+            "creep_frontier": [],
+        },
+    )
+
+    try:
+        compile_project_bootstrap_creep(
+            source, tmp_path / "creep", max_rounds=1,
+        )
+    except NativeInstallationRequiredError as error:
+        assert error.failures == ({
+            "qualified_name": "root",
+            "stage": "compiler-unit",
+            "reason": "ValueError: semantic boundary was not lowered",
+        },)
+    else:
+        raise AssertionError("failed compiler unit did not hard fail")
+
+
+def test_project_bootstrap_creep_automatically_crawls_partial_unit_plan(
     tmp_path, monkeypatch,
 ):
     source = tmp_path / "compiler_part.py"
@@ -352,7 +385,7 @@ def test_project_bootstrap_creep_automatically_crawls_failed_unit_plan(
         return {
             "units": [{
                 "qualified_name": "root",
-                "status": "failed",
+                "status": "partial",
                 "path": "units/root",
                 "process_graph_unit_plan": (
                     "units/root/process-graph-units.json"
@@ -414,7 +447,7 @@ def test_project_bootstrap_creep_defers_a_timed_out_unit_retry(
         return {
             "units": [{
                 "qualified_name": "root",
-                "status": "failed",
+                "status": "partial",
                 "error_type": "ResourceLimitExceeded",
                 "error": "unit exceeded 300.000s elapsed time",
                 "path": "units/root",
@@ -470,7 +503,7 @@ def test_project_bootstrap_creep_crawls_strict_children_before_widening(
         return {
             "units": [{
                 "qualified_name": "root",
-                "status": "failed",
+                "status": "partial",
                 "error_type": "ResourceLimitExceeded",
                 "error": "unit exceeded 300.000s elapsed time",
                 "path": "units/root",
