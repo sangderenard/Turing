@@ -1436,6 +1436,77 @@ def lower_precision_operations(functions) -> dict:
     # feeding a width-n operation is a width-n parameter. That also keeps
     # this honest about parameters that are declared and never used at
     # precision: they stay one scalar, because nothing needs more.
+    # -- precision arrays: channel-strided limbs ---------------------------
+    #
+    # An ARRAY of precision values is one ordinary array whose element i,
+    # limb k lives at flat index i * limbs + k. One SSA value, so it can be
+    # passed and RETURNED like any other array -- which is what the scalar
+    # representation cannot do, and why every precision result until now had
+    # to collapse into a single double on the way out.
+    #
+    # The arithmetic is unchanged: limbs are loaded into scalars, operated on
+    # per limb, and stored back. Only the accessors widen. That keeps the one
+    # representation every backend can already hold and avoids asking any of
+    # them to understand an aggregate.
+    #
+    # An array is recognised by USE, not by shape -- inside a region a passed
+    # array has shape () and is told apart only by being the base of a
+    # GetElementPtr. A base whose Load feeds a precision operation is a
+    # precision array; so is one whose Store carries a limbed value.
+    precision_arrays: dict[str, dict[int, int]] = {}
+    for name, function in functions.items():
+        bases: dict[int, int] = {}
+        for block in function.blocks.values():
+            pointers: dict[int, int] = {}
+            for instruction in block.instrs:
+                if (
+                    str(instruction.op) == "GetElementPtr"
+                    and instruction.args and instruction.res is not None
+                ):
+                    pointers[int(instruction.res.id)] = int(
+                        instruction.args[0].id
+                    )
+            loaded: dict[int, int] = {}
+            for instruction in block.instrs:
+                if (
+                    str(instruction.op) == "Load" and instruction.args
+                    and instruction.res is not None
+                    and int(instruction.args[0].id) in pointers
+                ):
+                    loaded[int(instruction.res.id)] = pointers[
+                        int(instruction.args[0].id)
+                    ]
+            produced: dict[int, int] = {}
+            for instruction in block.instrs:
+                width = max(
+                    int(instruction.attributes.get("precision_limbs") or 1), 1
+                )
+                if str(instruction.op) in expandable and width > 1:
+                    for argument in instruction.args:
+                        base = loaded.get(int(argument.id))
+                        if base is not None:
+                            bases[base] = max(bases.get(base, 1), width)
+                    if instruction.res is not None:
+                        produced[int(instruction.res.id)] = width
+            # The destination side. An array that is only ever WRITTEN --
+            # every output array is -- has no Load to be recognised by, and
+            # would otherwise collapse its limbs on the way out, which is the
+            # single thing that has capped every precision result so far.
+            for instruction in block.instrs:
+                if (
+                    str(instruction.op) == "Store"
+                    and len(instruction.args) >= 2
+                    and int(instruction.args[0].id) in produced
+                    and int(instruction.args[1].id) in pointers
+                ):
+                    base = pointers[int(instruction.args[1].id)]
+                    bases[base] = max(
+                        bases.get(base, 1),
+                        produced[int(instruction.args[0].id)],
+                    )
+        if bases:
+            precision_arrays[str(name)] = bases
+
     parameter_widths: dict[str, dict[int, int]] = {}
     for name, function in functions.items():
         formal_ids = {int(value.id) for value in function.args}
@@ -1625,8 +1696,90 @@ def lower_precision_operations(functions) -> dict:
                     original.accounting.pop("precision_limbs", None)
                     original.accounting.pop("precision_element", None)
 
+            arrays = precision_arrays.get(str(function_name)) or {}
+            # pointer value id -> (base array id, index value)
+            addressed: dict[int, tuple] = {}
+
+            def constant(number: int):
+                nonlocal next_id
+                value = SSAValue(next_id, dtype="int", shape=())
+                next_id += 1
+                emitted.append(Instr("Const", [], value, attributes={
+                    "constant": int(number),
+                    PRECISION_SECTION_ATTRIBUTE: True,
+                }))
+                return value
+
+            def channel(base, index, width: int, position: int):
+                """Address element ``index`` limb ``position``, stride ``width``.
+
+                Flat index ``index * width + position``. Said with Mul, Add
+                and Const, which every destination already supplies, rather
+                than with a new operator seven backends would each have to
+                implement.
+                """
+
+                scaled = put("Mul", (index, constant(width)), index)
+                flat = (
+                    scaled if position == 0
+                    else put("Add", (scaled, constant(position)), index)
+                )
+                return put("GetElementPtr", (base, flat), index)
+
             for instruction in block.instrs:
                 operation = str(instruction.op)
+
+                if (
+                    operation == "GetElementPtr" and len(instruction.args) >= 2
+                    and instruction.res is not None
+                ):
+                    addressed[int(instruction.res.id)] = (
+                        instruction.args[0], instruction.args[1],
+                    )
+                    emitted.append(instruction)
+                    continue
+
+                if (
+                    operation == "Load" and instruction.args
+                    and instruction.res is not None
+                ):
+                    where = addressed.get(int(instruction.args[0].id))
+                    width = arrays.get(int(where[0].id)) if where else None
+                    if width and width > 1:
+                        base, index = where
+                        limbs[int(instruction.res.id)] = [
+                            put("Load", (channel(base, index, width, position),),
+                                instruction.res)
+                            for position in range(width)
+                        ]
+                        continue
+                    emitted.append(instruction)
+                    continue
+
+                if operation == "Store" and len(instruction.args) >= 2:
+                    where = addressed.get(int(instruction.args[1].id))
+                    width = arrays.get(int(where[0].id)) if where else None
+                    stored = limbs.get(int(instruction.args[0].id))
+                    if width and width > 1 and stored:
+                        base, index = where
+                        for position in range(width):
+                            emitted.append(Instr(
+                                "Store",
+                                [
+                                    stored[position] if position < len(stored)
+                                    else stored[-1],
+                                    channel(base, index, width, position),
+                                ],
+                                None,
+                                attributes={
+                                    PRECISION_SECTION_ATTRIBUTE: True,
+                                    "lowered_from": "precision.store",
+                                },
+                            ))
+                        continue
+                    emitted.append(instruction)
+                    continue
+
                 if operation not in expandable or instruction.res is None:
                     emitted.append(instruction)
                     continue
