@@ -1490,6 +1490,19 @@ def lower_precision_operations(functions) -> dict:
                         "lowered_from": "precision.collapse",
                     },
                 ))
+                # The limb channel the carry pass put on this value is now
+                # STALE and actively harmful. It described a value whose
+                # limbs lived on a trailing axis; lowering has just made
+                # them separate scalars, and the value left here holds one
+                # number. A backend that believes the shape builds an ABI
+                # around an array -- Fortran demanded an integer extent
+                # parameter per lowered value and the call wrote through a
+                # null pointer. LLVM ignored the shape and worked, which is
+                # exactly how a disagreement like this stays hidden.
+                original.shape = tuple(original.shape or ())[:-1]
+                if original.accounting:
+                    original.accounting.pop("precision_limbs", None)
+                    original.accounting.pop("precision_element", None)
 
             for instruction in block.instrs:
                 operation = str(instruction.op)
