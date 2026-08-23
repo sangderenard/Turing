@@ -41,6 +41,21 @@ DEFAULT_PROJECT_EXTRACTION_CONTRACT = (
 )
 
 
+class NativeInstallationRequiredError(RuntimeError):
+    """A bootstrap unit claimed completion without a live native replacement."""
+
+    def __init__(self, failures: Iterable[Mapping[str, Any]]):
+        self.failures = tuple(dict(failure) for failure in failures)
+        names = ", ".join(
+            str(failure.get("qualified_name") or "<unknown>")
+            for failure in self.failures
+        )
+        super().__init__(
+            "compiler bootstrap completed Python units without verified native "
+            f"installation: {names}"
+        )
+
+
 def compiler_toolchain_fingerprint() -> dict[str, Any]:
     """Hash the authored compiler implementation that gives a frozen plan meaning.
 
@@ -7340,6 +7355,7 @@ def compile_project_bootstrap_creep(
     write_progress("running")
     for round_index in range(round_limit):
         round_root = root / f"round_{round_index:03d}"
+        round_root.mkdir(parents=True, exist_ok=True)
         report(
             "bootstrap_creep_round_start", round=round_index,
             active_product_count=len(active_products),
@@ -7366,6 +7382,89 @@ def compile_project_bootstrap_creep(
                 event=dict(event),
             ),
         )
+        completed_names = {
+            str(unit["qualified_name"])
+            for unit in product.get("units") or ()
+            if unit.get("status") == "complete"
+        }
+        verification_by_name = {
+            str(record["qualified_name"]): dict(record)
+            for record in product.get("automatic_native_verification") or ()
+        }
+        native_completion_failures = []
+        for qualified_name in sorted(completed_names):
+            verification = verification_by_name.get(qualified_name)
+            if verification is None or verification.get("status") != "verified":
+                native_completion_failures.append({
+                    "qualified_name": qualified_name,
+                    "stage": "native-verification",
+                    "reason": (
+                        "no automatic native verification record"
+                        if verification is None else
+                        str(verification.get("reason") or verification.get("status"))
+                    ),
+                })
+        activations = ()
+        if not native_completion_failures and completed_names:
+            from .compiler_bootstrap_runtime import (
+                activate_compiler_bootstrap_products,
+            )
+
+            try:
+                activations = activate_compiler_bootstrap_products((round_root,))
+            except Exception as error:
+                native_completion_failures.append({
+                    "qualified_name": ",".join(sorted(completed_names)),
+                    "stage": "native-installation",
+                    "reason": f"{type(error).__name__}: {error}",
+                })
+            else:
+                activation_by_name = {
+                    activation.qualified_name: activation
+                    for activation in activations
+                }
+                for qualified_name in sorted(completed_names):
+                    activation = activation_by_name.get(qualified_name)
+                    if (
+                        activation is None
+                        or activation.status != "verified"
+                        or activation.native_probe_count < 1
+                        or activation.fallback_probe_count != 0
+                    ):
+                        native_completion_failures.append({
+                            "qualified_name": qualified_name,
+                            "stage": "native-installation",
+                            "reason": (
+                                "no receipt-backed native activation"
+                                if activation is None else
+                                "activation did not prove an exclusively native probe path"
+                            ),
+                        })
+        completion_requirement = {
+            "schema": "turing.bootstrap-native-completion-requirement.v1",
+            "status": "failed" if native_completion_failures else "satisfied",
+            "completed_qualified_names": sorted(completed_names),
+            "activated_qualified_names": sorted(
+                activation.qualified_name for activation in activations
+            ),
+            "failures": native_completion_failures,
+        }
+        product["native_completion_requirement"] = completion_requirement
+        _atomic_json(round_root / "manifest.json", product)
+        if native_completion_failures:
+            failure = {
+                **completion_requirement,
+                "source": source_file.as_posix(),
+                "round": round_index,
+            }
+            _atomic_json(round_root / "native-installation-failure.json", failure)
+            rounds.append({
+                "round": round_index,
+                "product": round_root.as_posix(),
+                "hard_failure": failure,
+            })
+            write_progress("hard-failed")
+            raise NativeInstallationRequiredError(native_completion_failures)
         verified_names = {
             str(record["qualified_name"])
             for record in product.get("automatic_native_verification") or ()
@@ -7537,6 +7636,7 @@ __all__ = [
     "AuthoredCall",
     "DEFAULT_PROJECT_EXTRACTION_CONTRACT",
     "LINK_TABLE_SCHEMA",
+    "NativeInstallationRequiredError",
     "PROJECT_PRODUCT_SCHEMA",
     "ProjectCompilationProduct",
     "SOURCE_REGION_INTEGRAL_SCHEMA",

@@ -28,6 +28,7 @@ from typing import Any, Sequence
 
 from src.compiler.project_compilation_product import (
     DEFAULT_PROJECT_EXTRACTION_CONTRACT,
+    NativeInstallationRequiredError,
     compile_project_bootstrap_creep,
     discover_authored_calls,
     authored_call_dependencies,
@@ -403,6 +404,10 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             "error": str(error),
             "traceback": traceback.format_exc(),
             "registry_before_sha256": registry_before,
+            "hard_failure": isinstance(error, NativeInstallationRequiredError),
+            **({
+                "failures": [dict(failure) for failure in error.failures],
+            } if isinstance(error, NativeInstallationRequiredError) else {}),
         }
     _atomic_json(wave_root / "wave-result.json", result)
     print(json.dumps({
@@ -607,6 +612,32 @@ def _supervise(arguments: argparse.Namespace) -> int:
                     "error": f"generation exited with {completed.returncode}",
                 }
             )
+            if result.get("hard_failure"):
+                state["waves"].append({
+                    "generation": generation,
+                    "source": source.as_posix(),
+                    "status": "hard-failed",
+                    "process_id": result.get("process_id"),
+                    "workers_joined": bool(result.get("workers_joined")),
+                    "progressed": False,
+                    "registry_changed": False,
+                    "outcome_sha256": None,
+                    "mode": mode,
+                    "scheduled_deep_retry": False,
+                    "result": result_path.as_posix(),
+                })
+                state["generation"] = generation + 1
+                state["status"] = "hard-failed"
+                state["hard_failure"] = {
+                    "source": source.as_posix(),
+                    "entries": list(selected_entries),
+                    "error_type": result.get("error_type"),
+                    "error": result.get("error"),
+                    "failures": list(result.get("failures") or ()),
+                    "result": result_path.as_posix(),
+                }
+                _atomic_json(state_path, state)
+                break
             last_outcomes = dict(source_record.get("last_outcomes") or {})
             previous_outcome = last_outcomes.get(mode)
             current_outcome = result.get("outcome_sha256")

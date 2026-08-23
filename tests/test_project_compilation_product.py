@@ -7,6 +7,7 @@ import pickle
 from types import SimpleNamespace
 
 from src.compiler.project_compilation_product import (
+    NativeInstallationRequiredError,
     compilation_creep_frontier,
     compile_project_bootstrap_creep,
     compile_process_graph_creep,
@@ -198,7 +199,7 @@ def test_project_bootstrap_creep_feeds_only_newly_verified_products(
         return {
             "units": [{
                 "qualified_name": "leaf",
-                "status": "complete",
+                "status": "complete" if verified else "partial",
                 "source_region_integrals": [],
             }],
             "automatic_native_verification": [{
@@ -216,6 +217,16 @@ def test_project_bootstrap_creep_feeds_only_newly_verified_products(
         "src.compiler.compiler_bootstrap_runtime."
         "publish_compiler_bootstrap_products",
         lambda _paths: tmp_path / "registry.json",
+    )
+    monkeypatch.setattr(
+        "src.compiler.compiler_bootstrap_runtime."
+        "activate_compiler_bootstrap_products",
+        lambda _paths: (SimpleNamespace(
+            qualified_name="leaf",
+            status="verified",
+            native_probe_count=3,
+            fallback_probe_count=0,
+        ),),
     )
 
     prior_seed = tmp_path / "previous-generation"
@@ -236,6 +247,53 @@ def test_project_bootstrap_creep_feeds_only_newly_verified_products(
     ).resolve()
     assert manifest["installed_qualified_names"] == ["leaf"]
     assert manifest["fixed_point"]["kind"] == "no-new-proven-deployments"
+
+
+def test_project_bootstrap_hard_fails_a_complete_python_fallback(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "compiler_part.py"
+    source.write_text("def leaf(value):\n    return value + 1\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.compile_project_product",
+        lambda _source, _output, **_kwargs: {
+            "units": [{
+                "qualified_name": "leaf",
+                "status": "complete",
+                "source_region_integrals": [],
+            }],
+            "automatic_native_verification": [{
+                "qualified_name": "leaf",
+                "status": "unsupported",
+                "reason": "ABI not implemented",
+            }],
+            "creep_frontier": [],
+        },
+    )
+
+    try:
+        compile_project_bootstrap_creep(
+            source, tmp_path / "creep", max_rounds=1,
+        )
+    except NativeInstallationRequiredError as error:
+        assert error.failures == ({
+            "qualified_name": "leaf",
+            "stage": "native-verification",
+            "reason": "ABI not implemented",
+        },)
+    else:
+        raise AssertionError("completed Python fallback did not hard fail")
+
+    failure = json.loads((
+        tmp_path / "creep" / "round_000" / "native-installation-failure.json"
+    ).read_text(encoding="utf-8"))
+    assert failure["status"] == "failed"
+    assert failure["completed_qualified_names"] == ["leaf"]
+    progress = json.loads(
+        (tmp_path / "creep" / "creep-progress.json").read_text(encoding="utf-8")
+    )
+    assert progress["status"] == "hard-failed"
 
 
 def test_project_bootstrap_creep_automatically_crawls_failed_unit_plan(
