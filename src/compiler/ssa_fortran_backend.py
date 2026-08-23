@@ -96,11 +96,6 @@ _BINARY: dict[str, str] = {
     "Div": "({0} / {1})",
     "Pow": "({0} ** {1})",
     "Mod": "modulo({0}, {1})",
-    # F2018's IEEE_ARITHMETIC intrinsic, the same module this lane already
-    # reaches for ieee_is_nan and ieee_value. Older compilers predate it,
-    # so a target that rejects this is a real shortfall rather than a
-    # reason to expand it into a multiply and an add.
-    "Fma": "ieee_fma({0}, {1}, {2})",
     "FloorDiv": "floor({0} / {1})",
     "Eq": "({0} == {1})",
     "Ne": "({0} /= {1})",
@@ -260,6 +255,19 @@ _REDUCTION: dict[str, str] = {
 
 # Binary operators whose result shape is meant to differ from their operands',
 # so conforming the operands to the result would be wrong.
+#: Three-operand intrinsics. Kept out of ``_BINARY`` deliberately: five
+#: other sites read membership there as "elementwise with two operands" --
+#: conforming, broadcast decisions, the capability sets -- and every one of
+#: them would be wrong about a ternary.
+#:
+#: ``ieee_fma`` is F2018, from the IEEE_ARITHMETIC module this lane already
+#: opens for ieee_is_nan, and it is elemental, so it conforms over arrays
+#: the same way an operator does. A compiler predating F2018 rejects it,
+#: which is a real shortfall and not a reason to expand into a multiply and
+#: an add: that rounds twice, and on a precision dual two roundings return
+#: exactly zero.
+_TERNARY: dict[str, str] = {"Fma": "ieee_fma({0}, {1}, {2})"}
+
 _SHAPE_CHANGING_BINARY = frozenset({"MatMul", "matmul"})
 
 # Operators that take LOGICAL operands natively, so a boolean reaching them
@@ -363,7 +371,7 @@ def supported_tensor_operations() -> frozenset[str]:
             "long_cast", "to_dtype", "cpu", "tolist",
         })
     )
-    scalar = frozenset(_BINARY) | frozenset(_UNARY)
+    scalar = frozenset(_BINARY) | frozenset(_UNARY) | frozenset(_TERNARY)
     registered |= frozenset(
         row.name
         for row in TENSOR_SSA_OPERATORS
@@ -3156,6 +3164,8 @@ class _FunctionEmitter:
                 return f"count({args[0]})"
             args = self._numeric(instr, args)
             return _REDUCTION[op].format(*args)
+        if op in _TERNARY and len(args) == 3:
+            return _TERNARY[op].format(*self._numeric(instr, args))
         if op in _BINARY and len(args) == 2:
             template = _BINARY[op]
             # Shape first, then type. Conforming subscripts an operand to
