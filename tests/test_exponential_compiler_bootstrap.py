@@ -303,7 +303,7 @@ def test_supervisor_stops_on_any_failed_wave(tmp_path, monkeypatch):
     assert state["hard_failure"]["error"] == "lowering failed"
 
 
-def test_startup_hard_fails_oldest_current_unsuccessful_archive_and_prioritizes_it(
+def test_startup_hard_fails_oldest_archived_failure_and_prioritizes_it(
     tmp_path, monkeypatch,
 ):
     source_root = tmp_path / "compiler"
@@ -335,11 +335,11 @@ def test_startup_hard_fails_oldest_current_unsuccessful_archive_and_prioritizes_
             "installed_qualified_names": [],
             "creep_frontier": [{
                 "qualified_name": "failed",
-                "status": "partial",
-                "action": "materialize-required-source-values",
+                "status": "failed",
+                "action": "resolve-compiler-semantic-boundary",
             }],
             "native_verification_frontier": [],
-            "unit_counts": {"partial": 1},
+            "unit_counts": {"failed": 1},
         },
     }), encoding="utf-8")
     (output / "bootstrap-state.json").write_text(json.dumps({
@@ -392,10 +392,10 @@ def test_later_installed_archive_supersedes_an_older_frontier(tmp_path):
             "status": "frontier",
             "installed_qualified_names": [],
             "creep_frontier": [{
-                "qualified_name": "stage", "status": "partial",
+                "qualified_name": "stage", "status": "failed",
             }],
             "native_verification_frontier": [],
-            "unit_counts": {"partial": 1},
+            "unit_counts": {"failed": 1},
         },
         {
             "status": "sealed",
@@ -419,7 +419,36 @@ def test_later_installed_archive_supersedes_an_older_frontier(tmp_path):
             "result": result.resolve().as_posix(),
         })
 
-    assert exponential._archived_unsuccessful_wave({"waves": waves}) is None
+    assert exponential._archived_failed_wave({"waves": waves}) is None
+
+
+def test_partial_archive_is_state_not_failure(tmp_path):
+    source = tmp_path / "stage.py"
+    source.write_text("def stage():\n    return 1\n", encoding="utf-8")
+    result = tmp_path / "wave.json"
+    result.write_text(json.dumps({
+        "status": "complete",
+        "source_sha256": exponential._sha256(source),
+        "entries": ["stage"],
+        "outcome": {
+            "status": "frontier",
+            "installed_qualified_names": [],
+            "creep_frontier": [{
+                "qualified_name": "stage",
+                "status": "partial",
+                "action": "materialize-required-source-values",
+            }],
+            "native_verification_frontier": [],
+            "unit_counts": {"partial": 1},
+        },
+    }), encoding="utf-8")
+    state = {"waves": [{
+        "generation": 0,
+        "source": source.resolve().as_posix(),
+        "result": result.resolve().as_posix(),
+    }]}
+
+    assert exponential._archived_failed_wave(state) is None
 
 
 def test_revised_source_resumes_a_persisted_hard_failure(

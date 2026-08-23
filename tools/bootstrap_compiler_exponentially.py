@@ -636,10 +636,10 @@ def _prioritize_failed_work(
     } for name in entries])
 
 
-def _archived_unsuccessful_wave(
+def _archived_failed_wave(
     state: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Return the oldest current-source archive that was not installed."""
+    """Return the oldest unresolved archive carrying explicit failure."""
 
     archives = []
     for wave in sorted(
@@ -661,22 +661,32 @@ def _archived_unsuccessful_wave(
             # catalogue refresh will schedule the revised work independently.
             continue
         outcome = dict(result.get("outcome") or {})
-        archived_frontier = (
-            *(outcome.get("creep_frontier") or ()),
-            *(outcome.get("native_verification_frontier") or ()),
-            *(result.get("failures") or ()),
-        )
-        entries = tuple(map(str, result.get("entries") or ())) or tuple(
-            dict.fromkeys(
-                str(record.get("qualified_name") or "")
-                for record in archived_frontier
-                if record.get("qualified_name")
+        explicit_records = tuple(
+            dict(record) for record in (
+                *(outcome.get("creep_frontier") or ()),
+                *(outcome.get("native_verification_frontier") or ()),
+                *(result.get("failures") or ()),
             )
+            if str(record.get("status") or "") in {"failed", "unsupported"}
+        )
+        explicit_entries = tuple(dict.fromkeys(
+            str(record.get("qualified_name") or "")
+            for record in explicit_records
+            if record.get("qualified_name")
+        ))
+        entries = explicit_entries or tuple(
+            map(str, result.get("entries") or ())
         )
         installed = set(map(
             str, outcome.get("installed_qualified_names") or (),
         ))
         unit_counts = dict(outcome.get("unit_counts") or {})
+        explicitly_failed = bool(
+            result.get("status") == "failed"
+            or wave.get("status") in {"failed", "hard-failed"}
+            or int(unit_counts.get("failed") or 0)
+            or explicit_records
+        )
         succeeded = bool(
             result.get("status") == "complete"
             and outcome.get("status") == "sealed"
@@ -686,31 +696,31 @@ def _archived_unsuccessful_wave(
             and not int(unit_counts.get("partial") or 0)
             and set(entries) <= installed
         )
-        failures = []
-        for record in archived_frontier:
-            failures.append(dict(record))
-        if not failures:
+        failures = list(explicit_records)
+        if explicitly_failed and not failures:
             failures = [{
                 "qualified_name": name,
-                "status": str(outcome.get("status") or result.get("status") or "missing"),
-                "reason": "archived compiler item was not sealed and installed",
+                "status": "failed",
+                "reason": str(
+                    result.get("error") or "archived compiler item failed"
+                ),
             } for name in entries]
         archives.append({
             "source": source.as_posix(),
             "entries": list(entries),
             "installed": sorted(installed),
             "succeeded": succeeded,
-            "error_type": "ArchivedBootstrapItemUnsuccessful",
+            "explicitly_failed": explicitly_failed,
+            "error_type": "ArchivedBootstrapItemFailure",
             "error": (
-                "oldest current-source archived compiler item did not finish "
-                "as a sealed, receipt-installed native deployment"
+                "oldest current-source archived compiler item explicitly failed"
             ),
             "failures": failures,
             "archive_generation": int(wave.get("generation") or 0),
             "result": result_path.as_posix(),
         })
     for position, archive in enumerate(archives):
-        if archive["succeeded"]:
+        if not archive["explicitly_failed"]:
             continue
         required = set(archive["entries"])
         superseded = any(
@@ -723,7 +733,7 @@ def _archived_unsuccessful_wave(
             continue
         return {
             key: value for key, value in archive.items()
-            if key not in {"installed", "succeeded"}
+            if key not in {"installed", "succeeded", "explicitly_failed"}
         }
     return None
 
@@ -753,7 +763,7 @@ def _supervise(arguments: argparse.Namespace) -> int:
         if state.get("schema") != STATE_SCHEMA:
             raise ValueError("unsupported exponential bootstrap state schema")
         if state.get("status") != "hard-failed":
-            archived_failure = _archived_unsuccessful_wave(state)
+            archived_failure = _archived_failed_wave(state)
             if archived_failure is not None:
                 state["sources"] = _prioritize_failed_work(
                     state["sources"], archived_failure,
