@@ -1333,3 +1333,53 @@ def precision_section_contracts(functions) -> tuple[PrecisionSectionContract, ..
                     obligations=PRECISION_SECTION_OBLIGATIONS,
                 ))
     return tuple(contracts)
+
+
+#: Stamped on every instruction inside a precision section, and the one thing
+#: about the section that must reach a destination.
+PRECISION_SECTION_ATTRIBUTE = "precision_section"
+
+
+def mark_precision_sections(functions) -> int:
+    """Stamp each precision section's instructions so emission can see it.
+
+    The OPERATOR does not survive: `precision_mul` and its siblings exist to
+    be recognised, propagated along, and reduced against, and are then
+    expanded into an error-free transformation before any destination is
+    reached. That is deliberate -- it is why no backend implements them.
+
+    But the expansion is plain Add/Sub/Mul that looks like everybody else's,
+    and an optimiser has no way to tell a Dekker split from the same
+    expression written by someone who would be glad to see it folded. So the
+    section boundary has to survive in the operator's place, and this is what
+    carries it.
+
+    Stamping the instruction rather than recording a range is what makes it
+    survive: an expansion that inherits its source's attributes stays marked
+    without anything having to re-derive where the section went, and a pass
+    that moves an instruction cannot silently move it out of its section.
+
+    Returns the number of instructions marked.
+    """
+
+    wanted: dict[str, set[int]] = {}
+    for contract in precision_section_contracts(functions):
+        wanted.setdefault(contract.function, set()).update(contract.value_ids)
+
+    marked = 0
+    for name, function in functions.items():
+        inside = wanted.get(str(name))
+        if not inside:
+            continue
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    instruction.res is not None
+                    and int(instruction.res.id) in inside
+                    and not instruction.attributes.get(
+                        PRECISION_SECTION_ATTRIBUTE
+                    )
+                ):
+                    instruction.attributes[PRECISION_SECTION_ATTRIBUTE] = True
+                    marked += 1
+    return marked

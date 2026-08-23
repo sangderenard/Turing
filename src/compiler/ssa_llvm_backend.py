@@ -462,11 +462,31 @@ def _annotate_noalias(
     return annotated
 
 
-def scalar_likeness(operation: str) -> str | None:
+def scalar_likeness(
+    operation: str, *, precision_section: bool = False,
+) -> str | None:
+    """The LLVM spelling of one scalar operation.
+
+    ``precision_section`` withholds the ``contract`` flag no matter what the
+    work contract licenses. This is the precision SECTION surviving into
+    emission, and it has to: the operator that identified the arithmetic --
+    ``precision_mul`` and its siblings -- is expanded away before a backend
+    sees anything, so what arrives here is plain Add/Sub/Mul that looks
+    exactly like everyone else's.
+
+    Contraction there is not an optimisation, it is a wrong answer. An
+    error-free transformation requires its primal to be the correctly
+    rounded result of exactly its two operands; fuse it with whatever
+    produced one of them and the residual is computed against a value the
+    primal no longer represents. The flag was already per-instruction, so
+    honouring the section costs one condition.
+    """
+
     template = _BINARY.get(operation) or _UNARY.get(operation)
     if (
         template is not None
         and operation in _CONTRACT_ELIGIBLE
+        and not precision_section
         and _fma_contract_enabled()
     ):
         template = template.replace(" double ", " contract double ", 1)
@@ -2635,7 +2655,12 @@ def _emit_repository_call_module(
                 )
                 continue
 
-            template = scalar_likeness(operation)
+            template = scalar_likeness(
+                operation,
+                precision_section=bool(
+                    instruction.attributes.get("precision_section")
+                ),
+            )
             if (
                 template is not None
                 and result is not None
@@ -4091,7 +4116,12 @@ def emit_ssa_function_to_llvm(
                 scalars[result_id] = (register, target_type)
                 continue
 
-            template = scalar_likeness(str(operation))
+            template = scalar_likeness(
+                str(operation),
+                precision_section=bool(
+                    instruction.attributes.get("precision_section")
+                ),
+            )
             if template is not None:
                 # The declared result type is the authority on the evaluation
                 # domain. Widening an integer result to double and storing it
