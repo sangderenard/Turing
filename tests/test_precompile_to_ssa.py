@@ -23,6 +23,7 @@ from src.compiler.control_source import (
     overlay_scheduled_control,
 )
 from src.compiler.precompile_to_ssa import (
+    _inject_field_slot_access,
     _materialize_control_constants,
     ResolvedSequenceSchema,
     find_ssa_cycles,
@@ -59,6 +60,40 @@ def _program(*steps):
             for value_id in value_ids
         },
     )
+
+
+def test_field_receiver_uses_typed_columns_only_for_heterogeneous_slots():
+    """Mixed receiver scalars retain one logical slot map, not tagged values."""
+
+    control = Function(
+        "Receiver__report",
+        [SSAValue(2, dtype="bool"), SSAValue(7, dtype="int64")],
+        {"entry": BasicBlock("entry", [
+            Instr("Return", [SSAValue(2, dtype="bool")], None),
+        ])},
+    )
+    lowered, locations = _inject_field_slot_access(
+        control,
+        self_value_id=10,
+        non_self_param_ids=(7,),
+        field_ops=(("read", 2, 0), ("write", 7, 1)),
+        field_count=2,
+        output_value_ids=(2,),
+        field_dtypes={0: "bool", 1: "int64"},
+    )
+
+    assert locations == {0: (10, 0, "bool"), 1: (11, 0, "int64")}
+    assert [(value.id, value.dtype, value.shape) for value in lowered.args] == [
+        (10, "bool", (1,)), (11, "int64", (1,)), (7, "int64", ()),
+    ]
+    assert lowered.metadata["receiver_field_locations"] == (
+        (0, 10, 0, "bool"), (1, 11, 0, "int64"),
+    )
+    geps = [
+        instruction for instruction in lowered.blocks["entry"].instrs
+        if instruction.op == "GetElementPtr"
+    ]
+    assert [instruction.args[0].id for instruction in geps] == [10, 11]
 
 
 def test_structural_integral_lowers_resident_mapping_store_not_numeric_slots():

@@ -1809,11 +1809,11 @@ class ProjectCompilationProduct:
         authored_callable: Callable[..., Any],
         probes: Sequence[Sequence[Any] | Mapping[str, Any]],
     ) -> Callable[..., Any]:
-        """Verify a method whose receiver is one homogeneous scalar record.
+        """Verify a method whose receiver is a typed scalar-record layout.
 
         The emitted record table, not a Python class-name convention, defines
-        the receiver's physical field order and offsets.  Mixed scalar dtypes,
-        nested records, spans, references, and ambiguous outputs are refused.
+        the receiver's physical field order and typed column offsets. Nested
+        records, spans, references, and ambiguous outputs are refused.
         Mutable fields are copied back only when the emitted descriptor marks
         them writable.
         """
@@ -1865,19 +1865,20 @@ class ProjectCompilationProduct:
             raise ValueError(
                 "scalar-record verifier refuses non-scalar or untyped fields"
             )
-        field_dtypes = {str(field["dtype"]) for field in fields}
-        if len(field_dtypes) != 1:
-            raise ValueError(
-                "scalar-record verifier requires one homogeneous field dtype"
-            )
         parameters = tuple(map(dict, entry.get("parameters") or ()))
-        receiver_name = f"t{int(record['record_id'])}"
-        receiver = next((
-            parameter for parameter in parameters
-            if str(parameter.get("name")) == receiver_name
-        ), None)
-        if receiver is None or not receiver.get("shape"):
-            raise ValueError("native API does not expose the receiver slot arena")
+        receiver_ids = tuple(sorted({
+            int(field["value_ids"][0]) for field in fields
+        }))
+        receivers = {
+            value_id: next((
+                parameter for parameter in parameters
+                if str(parameter.get("name")) == f"t{value_id}"
+            ), None)
+            for value_id in receiver_ids
+        }
+        if any(receiver is None or not receiver.get("shape")
+               for receiver in receivers.values()):
+            raise ValueError("native API does not expose every receiver column")
         outputs = tuple(
             parameter for parameter in parameters
             if parameter.get("role") == "output"
@@ -1895,20 +1896,30 @@ class ProjectCompilationProduct:
             "c_uint8": ctypes.c_uint8,
         }
         try:
-            receiver_type = ctypes_types[str(receiver["ctypes"])]
+            receiver_types = {
+                value_id: ctypes_types[str(receiver["ctypes"])]
+                for value_id, receiver in receivers.items()
+            }
             output_type = ctypes_types[str(outputs[0]["ctypes"])]
         except KeyError as error:
             raise ValueError(
                 f"unsupported scalar native type {error.args[0]!r}"
             ) from error
-        field_count = max(
-            int(field.get("offset", index))
-            for index, field in enumerate(fields)
-        ) + 1
-        if tuple(map(int, receiver.get("shape") or ())) != (field_count,):
-            raise ValueError(
-                "receiver shape does not match its record field offsets"
-            )
+        column_field_counts = {
+            value_id: max(
+                int(field.get("offset", index))
+                for index, field in enumerate(fields)
+                if int(field["value_ids"][0]) == value_id
+            ) + 1
+            for value_id in receiver_ids
+        }
+        for value_id, receiver in receivers.items():
+            if tuple(map(int, receiver.get("shape") or ())) != (
+                column_field_counts[value_id],
+            ):
+                raise ValueError(
+                    "receiver column shape does not match its record field offsets"
+                )
         authored_descriptor = getattr(
             authored_callable, "__turing_authored_source_callable__",
             authored_callable,
@@ -1927,7 +1938,9 @@ class ProjectCompilationProduct:
         direct_inputs = tuple(
             parameter for parameter in parameters
             if parameter.get("role") in {"input", "inout"}
-            and str(parameter.get("name")) != receiver_name
+            and str(parameter.get("name")) not in {
+                f"t{value_id}" for value_id in receiver_ids
+            }
         )
         direct_names = tuple(
             str(parameter.get("source_name") or "")
@@ -1972,28 +1985,34 @@ class ProjectCompilationProduct:
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
             receiver_object = bound.arguments[source_parameters[0]]
-            arena_type = receiver_type * field_count
-            arena = arena_type()
+            arenas = {
+                value_id: (receiver_types[value_id] * column_field_counts[value_id])()
+                for value_id in receiver_ids
+            }
             for index, field in enumerate(fields):
+                value_id = int(field["value_ids"][0])
                 offset = int(field.get("offset", index))
-                arena[offset] = receiver_type(
+                arenas[value_id][offset] = receiver_types[value_id](
                     getattr(receiver_object, str(field["name"]))
                 ).value
             result = output_type()
-            keepalive: list[Any] = [arena, result]
+            keepalive: list[Any] = [*arenas.values(), result]
             native_arguments = []
             for parameter in parameters:
                 parameter_name = str(parameter.get("name"))
                 role = str(parameter.get("role"))
                 if role == "extent":
                     fixed = re.fullmatch(r"extent_([1-9][0-9]*)", parameter_name)
-                    if fixed is None or int(fixed.group(1)) != field_count:
+                    if fixed is None or int(fixed.group(1)) not in set(
+                        column_field_counts.values()
+                    ):
                         raise ValueError(
-                            "receiver extent is not a fixed record-field count"
+                            "receiver extent is not a fixed record-column count"
                         )
                     native_arguments.append(int(fixed.group(1)))
-                elif parameter_name == receiver_name:
-                    native_arguments.append(arena)
+                elif parameter_name.startswith("t") and parameter_name[1:].isdigit() \
+                        and int(parameter_name[1:]) in arenas:
+                    native_arguments.append(arenas[int(parameter_name[1:])])
                 elif parameter is outputs[0]:
                     native_arguments.append(ctypes.byref(result))
                 elif role in {"input", "inout"}:
@@ -2014,10 +2033,11 @@ class ProjectCompilationProduct:
             native(*native_arguments)
             for index, field in enumerate(fields):
                 if field.get("writable"):
+                    value_id = int(field["value_ids"][0])
                     setattr(
                         receiver_object,
                         str(field["name"]),
-                        arena[int(field.get("offset", index))],
+                        arenas[value_id][int(field.get("offset", index))],
                     )
             return result.value
 

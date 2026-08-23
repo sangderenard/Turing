@@ -6164,16 +6164,20 @@ def _inject_field_slot_access(
     field_const_sources: Mapping[int, Any] | None = None,
     output_value_ids: tuple[int, ...] = (),
     dtype: str = "float64",
-) -> Function:
+    field_dtypes: Mapping[int, str] | None = None,
+) -> tuple[Function, dict[int, tuple[int, int, str]]]:
     """Rewrite a method's control function to pass instance state as a slot arena.
 
-    ``self`` becomes a sized field array. Each field read is a ``Load`` from its
-    slot (producing the value the body already consumes, so it is no longer a
-    free input); each field write is a ``Store`` of its source into the slot. The
-    parameter list is rebuilt as ``(self, *non-self params)`` -- the read field
-    values leave the signature because the loads now produce them, and ``self``
-    joins it as the object arena. A backend that indexes arrays renders the slot
-    accesses as ``self(slot + 1)`` and marks a written arena ``intent(inout)``.
+    ``self`` becomes one or more sized field columns. Each logical field slot
+    resolves through a deterministic ``(typed arena, local offset)`` location;
+    homogeneous receivers therefore retain their one-array ABI, while mixed
+    receivers use only as many typed columns as their actual fields require.
+    Each field read is a ``Load`` from that location (producing the value the
+    body already consumes, so it is no longer a free input); each field write
+    is a ``Store`` of its source into it. The parameter list is rebuilt as
+    ``(*receiver_columns, *non_self_params)``. A backend that indexes arrays
+    renders each physical access directly and marks a written column
+    ``intent(inout)``.
 
     Placement follows the schedule the graph already fixed, carried here by SSA
     data flow: a load goes right before the first instruction that consumes its
@@ -6186,7 +6190,7 @@ def _inject_field_slot_access(
     """
 
     if not control_function.blocks:
-        return control_function
+        return control_function, {}
 
     existing_ids = {int(value.id) for value in control_function.args}
     for block in control_function.blocks.values():
@@ -6208,7 +6212,37 @@ def _inject_field_slot_access(
         next_id += 1
         return value_id
 
-    self_array = SSAValue(int(self_value_id), dtype=dtype, shape=(field_count,))
+    # A receiver is physically a set of typed columns.  The traditional one
+    # arena form is the degenerate (and fastest) one-column case.  Slots keep a
+    # logical index, while this table resolves that index to (arena, offset),
+    # so mixed fields never need coercion or a tagged-object runtime.
+    slot_dtypes = {
+        int(slot): str((field_dtypes or {}).get(int(slot), dtype))
+        for _kind, _value_id, slot in field_ops
+    }
+    column_dtypes = tuple(sorted(set(slot_dtypes.values()) or {str(dtype)}))
+    slots_by_dtype = {
+        column_dtype: tuple(sorted(
+            slot for slot, slot_dtype in slot_dtypes.items()
+            if slot_dtype == column_dtype
+        ))
+        for column_dtype in column_dtypes
+    }
+    column_arrays: dict[str, SSAValue] = {}
+    for index, column_dtype in enumerate(column_dtypes):
+        arena_id = int(self_value_id) if index == 0 else fresh()
+        column_arrays[column_dtype] = SSAValue(
+            arena_id, dtype=column_dtype,
+            shape=(len(slots_by_dtype[column_dtype]),),
+        )
+    field_locations = {
+        slot: (
+            int(column_arrays[slot_dtype].id),
+            slots_by_dtype[slot_dtype].index(slot),
+            slot_dtype,
+        )
+        for slot, slot_dtype in slot_dtypes.items()
+    }
     const_sources = dict(field_const_sources or {})
     reference_sources = {
         int(value_id): dict(payload)
@@ -6222,15 +6256,17 @@ def _inject_field_slot_access(
         if kind == "write" and int(value_id) in reference_sources
     }
 
-    def slot_address(slot: int) -> tuple[list[Instr], SSAValue]:
+    def slot_address(slot: int) -> tuple[list[Instr], SSAValue, str]:
+        arena_id, offset, slot_dtype = field_locations[int(slot)]
         index = SSAValue(fresh(), dtype="int64")
         address = SSAValue(fresh())
         return (
             [
-                Instr("Const", [], index, attributes={"value": int(slot)}),
-                Instr("GetElementPtr", [self_array, index], address),
+                Instr("Const", [], index, attributes={"value": int(offset)}),
+                Instr("GetElementPtr", [column_arrays[slot_dtype], index], address),
             ],
             address,
+            slot_dtype,
         )
 
     # The blocks are already in schedule order, so number every instruction once
@@ -6277,10 +6313,10 @@ def _inject_field_slot_access(
         int(value_id) for kind, value_id, _slot in field_ops if kind == "read"
     }
     for schedule_index, (kind, value_id, slot) in enumerate(field_ops):
-        prelude, address = slot_address(slot)
+        prelude, address, slot_dtype = slot_address(slot)
         if kind == "read":
             value_dtype = (
-                "opaque_ref" if int(slot) in reference_slots else dtype
+                "opaque_ref" if int(slot) in reference_slots else slot_dtype
             )
             group = [
                 *prelude,
@@ -6302,7 +6338,7 @@ def _inject_field_slot_access(
         else:
             group = []
             reference = reference_sources.get(int(value_id))
-            source_dtype = "opaque_ref" if reference is not None else dtype
+            source_dtype = "opaque_ref" if reference is not None else slot_dtype
             # A constant field write (self.x = None / 5 / "s") has no producer
             # in the control body, so materialise its source here -- the
             # tokenizer then turns a None/str/bytes const into a token.
@@ -6331,7 +6367,7 @@ def _inject_field_slot_access(
                     Instr(
                         "Const",
                         [],
-                        SSAValue(int(value_id), dtype=dtype),
+                        SSAValue(int(value_id), dtype=slot_dtype),
                         attributes={"value": const_sources[int(value_id)]},
                     )
                 )
@@ -6372,7 +6408,10 @@ def _inject_field_slot_access(
         else set()
     )
     returned_field_values = [
-        SSAValue(int(value_id), dtype=dtype)
+        SSAValue(int(value_id), dtype=field_locations[
+            next(slot for kind, candidate, slot in field_ops
+                 if kind == "read" and int(candidate) == int(value_id))
+        ][2])
         for value_id in output_ids
         if value_id in field_read_ids and value_id not in existing_return_arg_ids
     ]
@@ -6403,8 +6442,8 @@ def _inject_field_slot_access(
 
     # ``self`` first, then the non-self parameters in declared order; the read
     # field values are no longer parameters because the loads produce them.
-    arguments = [self_array]
-    seen_argument_ids = {int(self_value_id)}
+    arguments = [column_arrays[column_dtype] for column_dtype in column_dtypes]
+    seen_argument_ids = {int(argument.id) for argument in arguments}
     for argument in control_function.args:
         argument_id = int(argument.id)
         if (
@@ -6427,8 +6466,14 @@ def _inject_field_slot_access(
         control_function.name,
         arguments,
         new_blocks,
-        metadata=dict(control_function.metadata),
-    )
+        metadata={
+            **dict(control_function.metadata),
+            "receiver_field_locations": tuple(sorted(
+                (int(slot), *location)
+                for slot, location in field_locations.items()
+            )),
+        },
+    ), field_locations
 
 
 def _schedule_loop_callsites(
@@ -8527,14 +8572,15 @@ def lower_control_sections_to_ssa(
             "record scalar slot ABI lacks dtype for fields "
             + ", ".join(undeclared_scalar_fields)
         )
-    if len(scalar_dtypes) > 1:
-        raise ValueError(
-            "heterogeneous scalar receiver fields require a columnar ABI: "
-            + ", ".join(sorted(scalar_dtypes))
-        )
     receiver_scalar_dtype = (
-        next(iter(scalar_dtypes)) if scalar_dtypes else "float64"
+        sorted(scalar_dtypes)[0] if scalar_dtypes else "float64"
     )
+    scalar_slot_dtypes = {
+        compact_slot[old_slot]: declared_field_dtypes.get(name, receiver_scalar_dtype)
+        for old_slot, name in enumerate(field_names)
+        if old_slot in compact_slot
+    }
+    scalar_field_locations: dict[int, tuple[int, int, str]] = {}
     # ``self`` is a compile-time record correlation, not an opaque runtime
     # object.  When every field is already represented by explicit sequence
     # arenas, the receiver has no remaining scalar storage and must not become
@@ -8567,7 +8613,7 @@ def lower_control_sections_to_ssa(
             for name in function_outputs
             if (identity_table or {}).get(name)
         )
-        control_function = _inject_field_slot_access(
+        control_function, scalar_field_locations = _inject_field_slot_access(
             control_function,
             self_value_id=int(self_value_id),
             non_self_param_ids=non_self_param_ids,
@@ -8576,6 +8622,7 @@ def lower_control_sections_to_ssa(
             field_count=len(scalar_slots),
             output_value_ids=output_value_ids,
             dtype=receiver_scalar_dtype,
+            field_dtypes=scalar_slot_dtypes,
         )
         # Field injection rebuilds the function but preserves its sequence
         # metadata, so refresh the table/function correlation after rewriting.
@@ -8690,8 +8737,8 @@ def lower_control_sections_to_ssa(
                         else SSARecordFieldStorage.SCALAR
                     ),
                     storage_identity=storage_identity,
-                    value_ids=(int(self_value_id),),
-                    offset=compact_slot[old_slot],
+                    value_ids=(scalar_field_locations[compact_slot[old_slot]][0],),
+                    offset=scalar_field_locations[compact_slot[old_slot]][1],
                     dtype=(
                         "opaque_ref"
                         if old_slot in reference_slots else field_dtype
