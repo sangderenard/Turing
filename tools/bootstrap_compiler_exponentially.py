@@ -47,6 +47,9 @@ def _compiler_implementation_sha256() -> str:
     repository = Path(__file__).resolve().parents[1]
     paths = [
         *sorted((repository / "src" / "compiler").rglob("*.py")),
+        # Source graph construction and lexical reduction are part of the
+        # compiler implementation even though they live below ``common``.
+        *sorted((repository / "src" / "common" / "tensors").rglob("*.py")),
         *sorted((repository / "src" / "transmogrifier").rglob("*.py")),
         repository / "tools" / "compile_project_catalogue.py",
         Path(__file__).resolve(),
