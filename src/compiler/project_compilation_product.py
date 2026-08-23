@@ -341,6 +341,8 @@ class ProjectCompilationProduct:
         probes: Sequence[Sequence[Any] | Mapping[str, Any]],
         *,
         activation_adapter: str | None = None,
+        ignored_source_parameters: Iterable[str] = (),
+        probe_factory: str | None = None,
     ) -> Callable[..., Any]:
         """Load a scalar native unit only after ABI and behavior agree.
 
@@ -414,10 +416,24 @@ class ProjectCompilationProduct:
         native_source_parameters = tuple(
             str(parameter.get("source_name") or "") for parameter in inputs
         )
-        if native_source_parameters != source_parameters:
+        if (
+            len(native_source_parameters) != len(set(native_source_parameters))
+            or not set(native_source_parameters) <= set(source_parameters)
+        ):
             raise ValueError(
-                "native ABI does not exactly match authored parameters: "
+                "native ABI does not correlate uniquely to authored parameters: "
                 f"authored={source_parameters!r}, native={native_source_parameters!r}"
+            )
+        omitted_source_parameters = tuple(
+            parameter for parameter in source_parameters
+            if parameter not in native_source_parameters
+        )
+        ignored = tuple(dict.fromkeys(map(str, ignored_source_parameters)))
+        if set(ignored) != set(omitted_source_parameters):
+            raise ValueError(
+                "native ABI omitted authored parameters without an exact "
+                "unused-source proof: "
+                f"omitted={omitted_source_parameters!r}, proven={ignored!r}"
             )
         ctypes_types = {
             "c_int32": ctypes.c_int32,
@@ -456,7 +472,7 @@ class ProjectCompilationProduct:
             bound.apply_defaults()
             native_inputs = []
             for source_name, native_type in zip(
-                source_parameters, argument_types, strict=True,
+                native_source_parameters, argument_types, strict=True,
             ):
                 value = bound.arguments[source_name]
                 converted = native_type(value)
@@ -497,6 +513,8 @@ class ProjectCompilationProduct:
             "library_sha256": hashlib.sha256(library_path.read_bytes()).hexdigest(),
             "entrypoint": entry_name,
             "authored_parameters": list(source_parameters),
+            "native_source_parameters": list(native_source_parameters),
+            "ignored_source_parameters": list(omitted_source_parameters),
             "probe_count": len(probe_records),
             "native_probe_count": int(route_counts["native"]),
             "fallback_probe_count": int(route_counts["fallback"]),
@@ -505,6 +523,7 @@ class ProjectCompilationProduct:
             **({
                 "activation_adapter": str(activation_adapter),
             } if activation_adapter is not None else {}),
+            **({"probe_factory": str(probe_factory)} if probe_factory else {}),
         }
         receipt_path = library_path.parent / "native-verification.json"
         _atomic_json(receipt_path, verification)
@@ -2044,20 +2063,15 @@ def _resolve_product_callable(
     return owner, callable_value
 
 
-def verify_project_scalar_units_automatically(
-    directory: str | Path,
-) -> tuple[dict[str, Any], ...]:
-    """Verify every emitted unit whose API proves a complete scalar surface.
+def verify_project_unit_automatically(
+    product: ProjectCompilationProduct,
+    qualified_name: str,
+) -> Callable[..., Any]:
+    """Select a verifier from emitted ABI metadata and authored contracts."""
 
-    Selection is ABI-driven. Unsupported records, arrays, methods requiring an
-    instance, and side-effecting/inout surfaces are refused by the scalar
-    verifier and remain ordinary source fallbacks. No function-name allowlist
-    participates in compiler creep.
-    """
-
+    import inspect
     from .compiled_program_api import load_api
 
-    product = open_project_compilation_product(directory)
     sample_values = {
         "c_bool": (False, True, True),
         "c_int32": (-3, 1, 5),
@@ -2066,6 +2080,146 @@ def verify_project_scalar_units_automatically(
         "c_float": (-3.25, 1.25, 4.5),
         "c_double": (-3.25, 1.25, 4.5),
     }
+    name = str(qualified_name)
+    link = dict(product.links[name])
+    source_module = str(link.get("source_module") or "")
+    if not source_module:
+        raise ValueError("unit receipt has no importable source module")
+    _owner, authored = _resolve_product_callable(source_module, name)
+    api_path = product.root / str(link.get("native_api") or "")
+    descriptor = load_api(api_path)
+    entry_name = str(link.get("native_entrypoint") or "")
+    entry = next((
+        item for item in descriptor.get("entry_points", ())
+        if str(item.get("name")) == entry_name
+    ), None)
+    if entry is None:
+        raise ValueError("native entrypoint is absent from its API")
+    parameters = tuple(entry.get("parameters") or ())
+    inputs = tuple(
+        parameter for parameter in parameters
+        if parameter.get("role") in {"input", "inout"}
+    )
+    outputs = tuple(
+        parameter for parameter in parameters
+        if parameter.get("role") in {"output", "inout"}
+    )
+    if (
+        len(outputs) != 1
+        or outputs[0].get("role") != "output"
+        or any(
+            parameter.get("shape") or parameter.get("extents")
+            or parameter.get("extent")
+            for parameter in parameters
+        )
+    ):
+        raise ValueError(
+            "emitted descriptor has no automatically provable scalar ABI; "
+            "retain source or select its record/sequence verifier"
+        )
+    domains = {}
+    for parameter in inputs:
+        source_name = str(parameter.get("source_name") or "")
+        if not source_name or "." in source_name:
+            raise ValueError("native input lacks a direct source parameter")
+        try:
+            domains[source_name] = sample_values[str(parameter["ctypes"])]
+        except KeyError as error:
+            raise ValueError(
+                f"no scalar probe domain for {error.args[0]!r}"
+            ) from error
+    if len(domains) != len(inputs):
+        raise ValueError("native scalar inputs repeat a source parameter")
+    authored_descriptor = getattr(
+        authored, "__turing_authored_source_callable__", authored,
+    )
+    authored_function = (
+        authored_descriptor.fget
+        if isinstance(authored_descriptor, property) else authored_descriptor
+    )
+    signature = inspect.signature(authored_function)
+    if any(
+        parameter.kind in {
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        }
+        for parameter in signature.parameters.values()
+    ):
+        raise ValueError(
+            "automatic scalar verification requires a finite authored "
+            "parameter surface"
+        )
+    source_parameters = tuple(
+        parameter.name for parameter in signature.parameters.values()
+        if parameter.kind in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    )
+    source_path = Path(str(product.manifest.get("source") or ""))
+    if not source_path.is_file():
+        raise ValueError("project product has no current authored source")
+    parameter_contract = authored_parameter_contract(
+        source_path.read_text(encoding="utf-8"), name,
+    )
+    used_parameters = set(map(
+        str, parameter_contract.get("used_parameters") or (),
+    ))
+    ignored = tuple(
+        parameter for parameter in source_parameters
+        if parameter not in domains
+    )
+    illegally_ignored = tuple(
+        parameter for parameter in ignored if parameter in used_parameters
+    )
+    if illegally_ignored:
+        raise ValueError(
+            "native ABI omitted source-read parameters "
+            f"{illegally_ignored!r}"
+        )
+    positional_only = tuple(
+        parameter.name for parameter in signature.parameters.values()
+        if parameter.kind == inspect.Parameter.POSITIONAL_ONLY
+    )
+    keyword_only = tuple(
+        parameter.name for parameter in signature.parameters.values()
+        if parameter.kind == inspect.Parameter.KEYWORD_ONLY
+    )
+    if positional_only and keyword_only:
+        raise ValueError(
+            "automatic scalar probes cannot mix positional-only and "
+            "keyword-only parameters"
+        )
+    probes = []
+    for probe_index in range(3):
+        values = {
+            parameter: (
+                domains[parameter][probe_index]
+                if parameter in domains else None
+            )
+            for parameter in source_parameters
+        }
+        probes.append(
+            tuple(values[parameter] for parameter in source_parameters)
+            if positional_only else values
+        )
+    return product.verify_native_scalar_callable(
+        name,
+        authored,
+        tuple(probes),
+        activation_adapter="descriptor-call-v1",
+        ignored_source_parameters=ignored,
+        probe_factory="authored-contract-scalar-v1",
+    )
+
+
+def verify_project_units_automatically(
+    directory: str | Path,
+) -> tuple[dict[str, Any], ...]:
+    """Verify emitted units through descriptor-selected, source-proven ABIs."""
+
+    product = open_project_compilation_product(directory)
     results = []
     for qualified_name, link_value in sorted(product.links.items()):
         link = dict(link_value)
@@ -2076,67 +2230,8 @@ def verify_project_scalar_units_automatically(
             "status": "unsupported",
         }
         try:
-            source_module = str(link.get("source_module") or "")
-            if not source_module:
-                raise ValueError("unit receipt has no importable source module")
-            _owner, authored = _resolve_product_callable(
-                source_module, str(qualified_name),
-            )
-            api_path = product.root / str(link.get("native_api") or "")
-            descriptor = load_api(api_path)
-            entry_name = str(link.get("native_entrypoint") or "")
-            entry = next((
-                item for item in descriptor.get("entry_points", ())
-                if str(item.get("name")) == entry_name
-            ), None)
-            if entry is None:
-                raise ValueError("native entrypoint is absent from its API")
-            parameters = tuple(entry.get("parameters") or ())
-            inputs = tuple(
-                parameter for parameter in parameters
-                if parameter.get("role") in {"input", "inout"}
-            )
-            outputs = tuple(
-                parameter for parameter in parameters
-                if parameter.get("role") in {"output", "inout"}
-            )
-            if (
-                len(outputs) != 1
-                or outputs[0].get("role") != "output"
-                or any(
-                    parameter.get("shape") or parameter.get("extents")
-                    or parameter.get("extent")
-                    for parameter in parameters
-                )
-            ):
-                raise ValueError("native API is not a pure scalar surface")
-            domains = []
-            source_names = []
-            for parameter in inputs:
-                source_name = str(parameter.get("source_name") or "")
-                if not source_name or "." in source_name:
-                    raise ValueError("native input lacks a direct source parameter")
-                try:
-                    domain = sample_values[str(parameter["ctypes"])]
-                except KeyError as error:
-                    raise ValueError(
-                        f"no scalar probe domain for {error.args[0]!r}"
-                    ) from error
-                source_names.append(source_name)
-                domains.append(domain)
-            if len(source_names) != len(set(source_names)):
-                raise ValueError("native scalar inputs repeat a source parameter")
-            probes = tuple({
-                source_name: domain[probe_index]
-                for source_name, domain in zip(
-                    source_names, domains, strict=True,
-                )
-            } for probe_index in range(3))
-            deployed = product.verify_native_scalar_callable(
-                str(qualified_name),
-                authored,
-                probes,
-                activation_adapter="qualified-scalar-call-v1",
+            deployed = verify_project_unit_automatically(
+                product, str(qualified_name),
             )
             verification = dict(deployed.__turing_native_verification__)
             record.update({
@@ -2155,6 +2250,14 @@ def verify_project_scalar_units_automatically(
             })
         results.append(record)
     return tuple(results)
+
+
+def verify_project_scalar_units_automatically(
+    directory: str | Path,
+) -> tuple[dict[str, Any], ...]:
+    """Compatibility name for descriptor-selected automatic verification."""
+
+    return verify_project_units_automatically(directory)
 
 
 def _defined_names(statement: ast.stmt) -> tuple[str, ...]:
@@ -7149,9 +7252,7 @@ def compile_project_product(
         "links": links,
     })
     if emit_native:
-        automatic_verification = list(
-            verify_project_scalar_units_automatically(root)
-        )
+        automatic_verification = list(verify_project_units_automatically(root))
         manifest["automatic_native_verification"] = automatic_verification
         verified_by_name = {
             str(item["qualified_name"]): dict(item)
@@ -7465,5 +7566,7 @@ __all__ = [
     "resident_bytes",
     "source_region_integral_accounting",
     "verify_structural_resident_table_integral",
+    "verify_project_unit_automatically",
+    "verify_project_units_automatically",
     "verify_project_scalar_units_automatically",
 ]

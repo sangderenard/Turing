@@ -155,6 +155,41 @@ def test_qualified_scalar_adapter_replays_persisted_probes(
     assert observed["activation_adapter"] == "qualified-scalar-call-v1"
 
 
+def test_descriptor_adapter_rebuilds_verification_from_authored_contract(
+    tmp_path, monkeypatch,
+):
+    owner = SimpleNamespace()
+
+    def authored(value):
+        return value + 1
+
+    deployed = lambda value: value + 1
+    observed = {}
+
+    class Product:
+        links = {"leaf": {"source_module": "compiler_leaf_module"}}
+
+    monkeypatch.setattr(
+        project_compilation_product,
+        "_resolve_product_callable",
+        lambda _module, _name: (owner, authored),
+    )
+    monkeypatch.setattr(
+        project_compilation_product,
+        "verify_project_unit_automatically",
+        lambda product, name: (
+            observed.update({"product": product, "name": name}) or deployed
+        ),
+    )
+
+    product = Product()
+    selected_owner, selected = runtime._activate_descriptor_call(product, "leaf")
+
+    assert selected_owner is owner
+    assert selected is deployed
+    assert observed == {"product": product, "name": "leaf"}
+
+
 def test_registry_pins_only_receipt_verified_installable_products(
     tmp_path, monkeypatch,
 ):

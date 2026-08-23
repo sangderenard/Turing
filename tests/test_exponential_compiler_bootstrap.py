@@ -163,9 +163,12 @@ def test_timed_out_unit_gets_one_fresh_process_unbounded_retry(
             "registry_changed": False,
             "registry_before_sha256": "registry-r1",
             "registry_after_sha256": "registry-r1",
-            "elapsed_seconds": 1.0 if deep_retry else 300.0,
+            "elapsed_seconds": 1.0,
             "outcome_sha256": "deep" if deep_retry else "bounded",
             "timed_out_entries": [] if deep_retry else ["one"],
+            "terminal_timed_out_entries": (
+                [] if deep_retry else ["one"]
+            ),
             "seed_product": (wave_root / "product" / "round_000").as_posix(),
         }
         wave_root.mkdir(parents=True)

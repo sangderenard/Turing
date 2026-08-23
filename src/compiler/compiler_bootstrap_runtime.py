@@ -145,9 +145,31 @@ def _activate_qualified_scalar(product, qualified_name: str):
     return owner, deployed
 
 
+def _activate_descriptor_call(product, qualified_name: str):
+    """Rebuild a descriptor-selected verifier from authored contracts."""
+
+    from .project_compilation_product import (
+        _resolve_product_callable,
+        verify_project_unit_automatically,
+    )
+
+    link = dict(product.links[str(qualified_name)])
+    source_module = str(link.get("source_module") or "")
+    if not source_module:
+        raise ValueError("bootstrap link has no source module")
+    owner, _authored = _resolve_product_callable(
+        source_module, str(qualified_name),
+    )
+    deployed = verify_project_unit_automatically(
+        product, str(qualified_name),
+    )
+    return owner, deployed
+
+
 _ACTIVATION_ADAPTERS: dict[str, Callable[..., tuple[Any, Callable[..., Any]]]] = {
     "compute-dispatch-record-v1": _activate_compute_dispatch,
     "qualified-scalar-call-v1": _activate_qualified_scalar,
+    "descriptor-call-v1": _activate_descriptor_call,
 }
 _ACTIVE_DEPLOYMENTS: dict[tuple[str, str], Callable[..., Any]] = {}
 _REGISTRY_ACTIVATION_LOCK = threading.RLock()

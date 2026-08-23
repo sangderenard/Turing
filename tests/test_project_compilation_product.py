@@ -1321,6 +1321,7 @@ def test_automatic_scalar_verification_is_abi_selected(
 
     class Product:
         root = tmp_path
+        manifest = {"source": (tmp_path / "source.py").as_posix()}
         links = {
             "leaf": {
                 "source_module": "compiler_leaf_module",
@@ -1331,12 +1332,15 @@ def test_automatic_scalar_verification_is_abi_selected(
 
         def verify_native_scalar_callable(
             self, qualified_name, authored, probes, *, activation_adapter=None,
+            ignored_source_parameters=(), probe_factory=None,
         ):
             observed.update({
                 "qualified_name": qualified_name,
                 "authored": authored,
                 "probes": tuple(probes),
                 "activation_adapter": activation_adapter,
+                "ignored_source_parameters": tuple(ignored_source_parameters),
+                "probe_factory": probe_factory,
             })
 
             def deployed(value):
@@ -1350,6 +1354,9 @@ def test_automatic_scalar_verification_is_abi_selected(
             return deployed
 
     (tmp_path / "leaf.api.yaml").write_text("api", encoding="utf-8")
+    (tmp_path / "source.py").write_text(
+        "def leaf(value):\n    return value + 1\n", encoding="utf-8",
+    )
     monkeypatch.setattr(
         "src.compiler.project_compilation_product."
         "open_project_compilation_product",
@@ -1380,7 +1387,145 @@ def test_automatic_scalar_verification_is_abi_selected(
     assert observed["probes"] == (
         {"value": -3}, {"value": 1}, {"value": 5},
     )
-    assert observed["activation_adapter"] == "qualified-scalar-call-v1"
+    assert observed["activation_adapter"] == "descriptor-call-v1"
+    assert observed["ignored_source_parameters"] == ()
+    assert observed["probe_factory"] == "authored-contract-scalar-v1"
+
+
+def test_automatic_scalar_verification_proves_unused_method_receiver(
+    tmp_path, monkeypatch,
+):
+    source_path = tmp_path / "source.py"
+    source_path.write_text(
+        "class Target:\n"
+        "    def available(self):\n"
+        "        return True\n",
+        encoding="utf-8",
+    )
+
+    class Target:
+        def available(self):
+            return True
+
+    observed = {}
+
+    class Product:
+        root = tmp_path
+        manifest = {"source": source_path.as_posix()}
+        links = {"Target.available": {
+            "source_module": "compiler_target_module",
+            "native_api": "available.api.yaml",
+            "native_entrypoint": "Target_available",
+        }}
+
+        def verify_native_scalar_callable(self, name, authored, probes, **kwargs):
+            observed.update({
+                "name": name,
+                "authored": authored,
+                "probes": tuple(probes),
+                **kwargs,
+            })
+
+            def deployed(_self):
+                return True
+
+            deployed.__turing_native_verification__ = {
+                "probe_count": 3,
+                "native_probe_count": 3,
+                "fallback_probe_count": 0,
+            }
+            return deployed
+
+    (tmp_path / "available.api.yaml").write_text("api", encoding="utf-8")
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product."
+        "open_project_compilation_product",
+        lambda _path: Product(),
+    )
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product._resolve_product_callable",
+        lambda _module, _name: (Target, Target.available),
+    )
+    monkeypatch.setattr(
+        "src.compiler.compiled_program_api.load_api",
+        lambda _path: {"entry_points": [{
+            "name": "Target_available",
+            "parameters": [{
+                "name": "result", "role": "output", "ctypes": "c_bool",
+            }],
+        }]},
+    )
+
+    result, = verify_project_scalar_units_automatically(tmp_path)
+
+    assert result["status"] == "verified"
+    assert observed["ignored_source_parameters"] == ("self",)
+    assert observed["probes"] == (
+        {"self": None}, {"self": None}, {"self": None},
+    )
+
+
+def test_scalar_verifier_executes_with_ast_proven_ignored_receiver(
+    tmp_path, monkeypatch,
+):
+    import ctypes
+    from src.compiler.project_compilation_product import ProjectCompilationProduct
+
+    source = "class Target:\n    def available(self):\n        return True\n"
+    source_path = tmp_path / "source.py"
+    source_path.write_text(source, encoding="utf-8")
+    native_root = tmp_path / "units" / "available" / "native"
+    native_root.mkdir(parents=True)
+    api_path = native_root / "available.api.yaml"
+    library_path = native_root / "available.dll"
+    api_path.write_text("api", encoding="utf-8")
+    library_path.write_bytes(b"native")
+
+    product = ProjectCompilationProduct(
+        root=tmp_path,
+        manifest={
+            "source": source_path.as_posix(),
+            "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+        },
+        links={"Target.available": {
+            "native_api": api_path.relative_to(tmp_path).as_posix(),
+            "native_library": library_path.relative_to(tmp_path).as_posix(),
+            "native_entrypoint": "Target_available",
+        }},
+    )
+
+    def authored(self):
+        return True
+
+    def native(output):
+        output._obj.value = True
+
+    fake_library = SimpleNamespace(Target_available=native)
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path: fake_library)
+    monkeypatch.setattr(
+        "src.compiler.compiled_program_api.load_api",
+        lambda _path: {"entry_points": [{
+            "name": "Target_available",
+            "symbol": "Target_available",
+            "parameters": [{
+                "name": "result", "role": "output", "ctypes": "c_bool",
+            }],
+        }]},
+    )
+
+    deployed = product.verify_native_scalar_callable(
+        "Target.available",
+        authored,
+        ({"self": None}, {"self": None}, {"self": None}),
+        ignored_source_parameters=("self",),
+        activation_adapter="descriptor-call-v1",
+        probe_factory="authored-contract-scalar-v1",
+    )
+
+    assert deployed(object()) is True
+    assert deployed.__turing_native_verification__["ignored_source_parameters"] == [
+        "self"
+    ]
 
 
 def _verified_install_fixture(tmp_path):

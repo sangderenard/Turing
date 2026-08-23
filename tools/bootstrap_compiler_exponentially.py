@@ -357,6 +357,13 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             and "elapsed time" in str(unit.get("error") or "")
             and unit.get("qualified_name")
         })
+        terminal_timed_out_entries = sorted({
+            str(record.get("qualified_name") or "")
+            for round_record in manifest.get("rounds") or ()
+            for record in round_record.get("process_graph_creeps") or ()
+            if record.get("status") == "deferred-timeout-retry"
+            and record.get("qualified_name")
+        })
         result = {
             "schema": WAVE_SCHEMA,
             "status": "complete",
@@ -377,6 +384,7 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
                 wave_root / "product" / "round_000"
             ).as_posix(),
             "timed_out_entries": timed_out_entries,
+            "terminal_timed_out_entries": terminal_timed_out_entries,
             "outcome": _normalized_outcome(manifest),
             "outcome_sha256": _outcome_sha256(manifest),
         }
@@ -608,11 +616,20 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 timed_out_entries = list(
                     result.get("timed_out_entries") or ()
                 )
+                terminal_timed_out_entries = set(map(
+                    str, result.get("terminal_timed_out_entries") or (),
+                ))
                 registry_revision = result.get("registry_after_sha256")
-                if (
-                    timed_out_entries
-                    and float(result.get("elapsed_seconds") or 0.0)
+                minimum_reached = (
+                    float(result.get("elapsed_seconds") or 0.0)
                     >= float(arguments.minimum_compile_seconds_before_widening)
+                )
+                retry_entries = (
+                    timed_out_entries if minimum_reached else
+                    sorted(terminal_timed_out_entries)
+                )
+                if (
+                    retry_entries
                     and (
                         not source_record.get("deep_retry_attempted")
                         or registry_revision
@@ -621,7 +638,7 @@ def _supervise(arguments: argparse.Namespace) -> int:
                         )
                     )
                 ):
-                    source_record["pending_deep_retry"] = timed_out_entries
+                    source_record["pending_deep_retry"] = retry_entries
                     scheduled_deep_retry = True
             state["waves"].append({
                 "generation": generation,
