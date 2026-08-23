@@ -48,6 +48,7 @@ pre-existing and independent of the namespace/indexing fixes on top.
 | `tests/test_site_bundle.py` (focused bundle pair) | **2 failed** | `test_program_bundle_owns_page_source_wasm_manifest_and_inventory`, `test_one_shot_bundle_packages_the_discovery_numeric_trace` — both reach WASM fidelity and fail with `ValueError: a compiled program needs at least one output`. Verified 2026-08-20 in a clean worktree at `735409d`; unrelated to the shader-region deployment stage. |
 | `tests/test_webgpu_ssa_backend.py` (deprecated-AOT quartet) | **4 failed** | `test_ast_generated_float32_program_emits_wgsl_compute`, both `test_ast_generated_loop_uses_structured_wgsl` cases, and `test_float64_is_a_named_webgpu_core_shortfall`. The deprecated `compile_ast_aot` path no longer presents the captured numerical program/cycle shape these tests expect. The first was verified 2026-08-20 in a clean worktree at `ab9a078`; the other three were exposed by a focused run the same day and do not touch direct repository-SSA GEMM/WebGPU emission. |
 | `tests/test_machine_target_languages.py` (focused pair) | **2 failed** | `test_existing_backend_operator_lists_are_exposed_without_a_fifth_copy` hard-codes 40 C operators but the shared inventory now has 50; `test_fortran_and_desktop_glsl_print_the_same_numeric_program` expects `cos(` in a Fortran artifact that no longer retains it. Verified 2026-08-20 in a clean worktree at `ab9a078`; unrelated to WebGPU benchmark emission. |
+| `tests/test_precompile_to_ssa.py` (current tree, 2026-08-23) | **1 failed, 55 passed** | `test_repeat_lowers_as_native_fortran_axis_tiling` reaches `ssa_fortran_backend.emit_module` with its documented mapping input and fails when API publication reads `module.metadata`. Discovered during the native shell-boundary regression gate; no clean-worktree ancestry comparison was commissioned. |
 
 ## The manifest — known-good at `af00599` plus the current working tree
 
@@ -56,7 +57,7 @@ These passed on 2026-08-19 and are the cheap, high-signal set. Prefer them.
 | check | result | cost |
 |---|---|---|
 | `tools/translation_scorecard.py` | 18/19 journeys equivalent; level 18 stops at materialization | ~6 s |
-| `tests/test_precompile_to_ssa.py` | 34 passed | ~4 s |
+| `tests/test_precompile_to_ssa.py` | Historical baseline: 34 passed; current-tree result is recorded above | ~7 s |
 | `tests/test_symbolic_fluid_native_runtime.py` | 1 passed | ~17 s |
 | `tests/test_abstract_tensor_indexing.py` | 2 passed | ~1 s |
 | `tests/test_ssa_fusion_regions.py` | 1 passed | ~3 s |

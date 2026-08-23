@@ -9,6 +9,32 @@ confident diagnoses during this work were wrong and only running them
 caught it — those are listed under "dead hypotheses" so nobody pays for
 them twice.
 
+## Superseding update — completed later 2026-08-23
+
+The open vertical integration and region-granularity work described below is
+now implemented:
+
+- `apply_precision_pipeline(IRModule)` is wired at the completed repository
+  SSA seam and persists its exact-identity and section-contract receipt.
+- Precision limbs now cross calls in source order. Locally derived low limbs
+  are passed intact; an ordinary scalar is promoted as `[x, +0.0, ...]`, never
+  by duplicating `x`. Canonical `SSACallRecord` ABI bindings are extended.
+- LLVM accepts the precision contract; WASM reports both missing obligations;
+  Fortran currently refuses precision because it cannot declare section
+  isolation. Earlier successful Fortran precision measurements below remain
+  historical evidence, not permission to bypass that contract.
+- The SSA lowerer is proved only for width two. Widths above two now hard-fail
+  instead of repeating a tail limb into wider storage. Eager `Precision`
+  remains N-limb; a genuine N-limb SSA expansion is still required.
+- Power-of-two scaling and delayed fixed-width renormalisation no longer fire
+  from pattern shape alone. They require exponent-range and retained-width
+  proofs respectively.
+- The Fortran host view now splices a single-callsite, straight-line,
+  outputless source region into its caller without mutating repository SSA.
+  MEASURED on the same 100,000-element width-one sine pack: **1.142
+  ns/element**, maximum error `5.55e-17` against NumPy; the old ~435 ns region
+  call is absent. Shader-oriented backends retain the region boundary.
+
 ## Where it stands
 
 Declaring a width in ordinary Python now produces double-double arithmetic,
@@ -136,10 +162,12 @@ work are the same change.
 * Four identities still unfired: `exact_identity_element` needs
   use-rewriting, `sterbenz_cancellation` needs a proven range (catalogue
   section 5), and two need the kernel bank.
-* Precision does not cross a call boundary: a call's actuals are bound
-  while parameters are widened, before any local's limbs exist, so a
-  locally derived precision value reaches the callee with its high limb
-  duplicated into the low one. The benchmark inlines cores to avoid it.
-* Four-limb coefficients are deliverable but measured no gain, because the
-  output collapses to one double. Precision arrays now remove that ceiling,
-  so the measurement is worth repeating.
+* Precision now crosses call boundaries at widths two through four. Derived
+  limbs are passed in source order, ordinary scalars are extended with exact
+  positive-zero limbs, and canonical call records are refreshed with the new
+  bindings. The former duplicated-high-limb defect is pinned by regression.
+* Widths three and four now lower into distinct SSA limbs for arithmetic,
+  calls, and channel-strided array loads/stores. Exact-rational regressions
+  show width four improves on width three for both multiplication and long
+  division. Wider than four is still refused explicitly; compiled performance
+  measurement of the wider paths remains open.

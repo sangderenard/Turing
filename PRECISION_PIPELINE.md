@@ -42,26 +42,31 @@ annotation is the whole difference.
    count on the SSA value and renames consumers, to a fixed point. Without
    this, precision stops at the first undeclared temporary.
 
-3. **Identities** — `reduce_precision_operations` fires four of the eight in
-   `PRECISION_IDENTITIES`: per-limb negation, sub-as-add-of-neg,
-   power-of-two scaling, and one renormalisation per chain. MEASURED: a
-   three-addition chain carries one renormalisation instead of three.
+3. **Identities** — `reduce_precision_operations` fires only identities whose
+   complete proof facts are present. Per-limb negation and sub-as-add-of-neg
+   are unconditional. Power-of-two scaling requires an exponent-range fact;
+   delaying fixed-width renormalisation requires a retained-width chain proof.
 
 4. **Section marking** — `mark_precision_sections` stamps every instruction
    in a section, because the operator is about to be expanded away and the
    *boundary* has to outlive it.
 
 5. **Lowering** — `lower_precision_operations` expands every `precision_*`
-   into ordinary `Mul`/`Add`/`Sub`/`Neg`/`Fma`. Afterwards none remains.
+   into ordinary `Mul`/`Div`/`Add`/`Sub`/`Neg`/`Fma`. Widths two through four
+   use the same N-limb distillation, all-pairs product, and long-division
+   algorithms as the eager tensor path. Afterwards no abstract precision
+   operator remains.
 
-6. **Emission** — an ordinary backend compile.
+6. **Emission** — each backend validates the persisted section contract before
+   compiling. Unsupported mandatory FMA or isolation is a shortfall/refusal,
+   never a quiet degradation.
 
 ## The two decisions that mattered
 
 **A precision value is one SSA value per limb, not one value with a limb
 axis.** This was the thing that blocked progress longest, and the answer was
-already on disk: the working `two_product` kernel writes its two limbs to
-two arrays. Per-limb values survive because each limb is then an ordinary
+already on disk: the working `two_product` kernel writes its high and error
+limbs separately. Per-limb values survive because each limb is then an ordinary
 scalar every backend can already hold, load and store; the channel-shaped
 alternative requires a destination to understand an aggregate before doing
 arithmetic on one, and none do.
@@ -157,12 +162,11 @@ it happens once at build time from exact rationals, via
 operation, so it should be searched upward from the smallest rather than
 chosen comfortably.
 
-**Blocked on an ABI gap.** A `Precision[n]` parameter still arrives as ONE
-scalar, while the lowering represents a precision value as n separate
-scalars. Four-limb coefficients therefore cannot be passed in yet: it needs
-a declared `Precision[n]` parameter to become n formals, which is the same
-decision the lowering already made internally and has not been extended to
-the boundary.
+**The width-two ABI gap is closed.** A widened parameter becomes one formal
+per limb and calls receive matching actual limbs. Derived precision values
+cross calls intact and ordinary values receive exact zero low limbs. The SSA
+arithmetic expansion itself is not yet N-limb: widths above two are refused
+rather than pretending the two-limb result fills a wider request.
 
 ## The signal cores, compiled
 
@@ -225,11 +229,12 @@ EVERY Fortran kernel, precision or not.
 Not the C binding: emitting internal regions without `bind(C)` changed
 428.5 against 429.3 ns, so that was reverted rather than left as an
 unmotivated change. Not the flags either -- the lane already compiles with
--O3 -march=native -flto -funroll-loops. The remaining suspects are the
-goto-form loop the emitter produces and the per-element call itself, and
-distinguishing them needs a profile or a disassembly rather than another
-hypothesis. What is certain is the shape of the fix: a region should contain
-the loop rather than BE the loop body.
+-O3 -march=native -flto -funroll-loops. The per-element call was the defect.
+The Fortran host view now applies a conservative identity that splices a
+single-callsite, straight-line, outputless source region into the caller while
+leaving repository SSA and shader deployment regions intact. MEASURED on the
+same width-one sine pack: 1.142 ns/element and `5.55e-17` maximum error
+against NumPy.
 
 On LLVM, where dispatch is free, the 24x decomposes as 6.4x more flops
 (115 against 18) times 3.7x worse throughput per flop -- 1.46 cycles per
@@ -247,20 +252,25 @@ count moved 24%.
 
 ## What remains
 
-- **Neither pass is wired into a compilation path.** They are called
-  explicitly. They go in as one transparent swap; ordering is carry → reduce
-  → mark → lower.
+- **The pipeline is wired.** The atomic order is carry → exact reduction →
+  contract derivation → mark → lower → canonical call-record refresh.
 - **Four identities are unfired.** `exact_identity_element` needs
   use-rewriting (the machinery `x**1` also wants);
   `sterbenz_cancellation` needs a proven range (catalogue section 5);
   `exact_accumulation_over_long_chain` and `two_product_kernel` need the
   bank.
-- **The width rule is fixed-width, not exact.** "Most limbs decides" gives
+- **SSA supports two, three, and four limbs end to end.** Function formals,
+  call actuals and canonical call records widen deterministically; arrays use
+  channel-strided storage; and lowered-value metadata records the distinct SSA
+  identity of every limb. Widths above four remain explicit shortfalls rather
+  than being truncated or duplicated. The eventual width rule must also
+  distinguish fixed-width from exact: "most limbs decides" gives
   `p2` for `p2 × p2`; Shewchuk's exact bound is `2mn` for a product and
   `m + n` for a sum. The current rule is the double-double preset; the
   bit-exact preset needs the other.
-- **`Div` is untested** — the one closed operation whose expansion is
-  iterative rather than a fixed transformation.
+- **`Div` now has an exact-rational width-3/4 regression.** It remains the most
+  expensive closed operation because its expansion is iterative rather than a
+  fixed transformation, so backend performance measurement is still open.
 - **Isolation is blunt away from LLVM.** LLVM withholds `contract` per
   instruction. C emits `FP_CONTRACT OFF` for the whole translation unit;
   Fortran has no mechanism and honestly declares none.

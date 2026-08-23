@@ -43,10 +43,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from src.common.tensors import signal_symbolic as _proof  # noqa: E402
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa  # noqa: E402
 from src.compiler.ir_identities import (  # noqa: E402
-    carry_precision_through_ssa,
-    lower_precision_operations,
-    mark_precision_sections,
-    reduce_precision_operations,
+    apply_precision_pipeline,
 )
 from src.compiler.ssa_llvm_backend import (  # noqa: E402
     compile_artifact,
@@ -73,14 +70,36 @@ def _pack_source(name: str, width: int) -> tuple[str, str, tuple[str, ...], int]
     reaching it.
     """
 
+    # Provision the polynomial order for the WIDTH, exactly as the eager
+    # twin does (``evaluate_proof``: digits = 16 * limbs). A hardcoded 17
+    # here once put every width on the same seventeen-digit approximation
+    # floor: the limbs bought exact evaluation of a polynomial that was
+    # never close enough to the function for the extra bits to show, and
+    # width four scored no better than width two against mpmath. The floor
+    # of 17 keeps the width-one baseline the honest double it always was.
     degree = _proof.order_to_degree(
-        name, _proof.order_for(name, _proof.CORE_RADII[name], digits=17)
+        name, _proof.order_for(
+            name, _proof.CORE_RADII[name], digits=max(17, 16 * int(width)),
+        )
     )
     body = _proof.materialised_source(name, degree)
     header = body.splitlines()[0]
     core = header.split("(")[0][4:].strip()
     parameters = tuple(re.findall(r"\w+", header.split("(")[1].split(")")[0]))
-    coefficients = tuple(p for p in parameters if p[0] == "c" and p[1:].isdigit())
+    # NUMERIC order, deliberately. The materialised header lists parameters
+    # lexicographically, which for eleven or more coefficients interleaves
+    # c10..c1x between c1 and c2 -- and the pack signature's order becomes
+    # the lowered wrapper's formal order, which `_roles` preserves and
+    # `_feeds` zips positionally against degree-ordered values. Authoring
+    # the signature in lexicographic order therefore fed c2's value to c10:
+    # every core with a two-digit coefficient computed a coefficient-
+    # scrambled polynomial, identically on every backend and at every width,
+    # while sin and sinh -- nine coefficients, where the two orders agree --
+    # scored sub-ulp and made the scrambled ops look like lane errors.
+    coefficients = tuple(sorted(
+        (p for p in parameters if p[0] == "c" and p[1:].isdigit()),
+        key=lambda p: int(p[1:]),
+    ))
 
     if width > 1:
         body = (
@@ -93,18 +112,11 @@ def _pack_source(name: str, width: int) -> tuple[str, str, tuple[str, ...], int]
     structural = "z * z" if structure in ("odd", "even") else "z"
     annotate = ": Precision[%d]" % width if width > 1 else ""
 
-    # The core is INLINED into the loop rather than called.
-    #
-    # Not a convenience: precision does not cross a call boundary yet. A
-    # call's actual arguments are bound while parameters are being widened,
-    # which is before any local's limbs have been computed, so a locally
-    # derived precision value (here `s` and `z`) arrives at the callee with
-    # its high limb duplicated into the low one. The standalone core measures
-    # 0.47 ulp; the same core reached through a call returns denormal noise.
-    #
-    # Inlining is also what a deployed kernel looks like, so this measures
-    # the intended shape rather than working around it -- but the call path
-    # is a real gap and is recorded as one.
+    # The core is INLINED into the loop because that is the deployed-kernel
+    # shape whose per-element operator cost this benchmark is intended to
+    # measure. Precision now crosses calls correctly (derived low limbs in
+    # source order and exact-zero scalar extension), but leaving a call in the
+    # timed loop would measure call coordination as part of every element.
     statements = [
         line for line in body.splitlines()[1:] if line.strip()
     ]
@@ -136,16 +148,11 @@ def build(name: str, width: int, root: pathlib.Path):
     directory = root / ("%s_w%d" % (name, width))
     directory.mkdir(parents=True, exist_ok=True)
 
-    module = lower_ast_source_to_ssa(text, entry)
-    functions = getattr(module, "functions", None) or module[0].functions
-    identities = {}
-    if width > 1:
-        carry_precision_through_ssa(functions)
-        identities = reduce_precision_operations(functions)
-        mark_precision_sections(functions)
-        lower_precision_operations(functions)
-    if not isinstance(module, IRModule):
-        module = IRModule(functions)
+    lowered = lower_ast_source_to_ssa(text, entry)
+    module = lowered if isinstance(lowered, IRModule) else lowered[0]
+    functions = module.functions
+    receipt = apply_precision_pipeline(module) if width > 1 else {}
+    identities = dict(receipt.get("identity_counts", {}))
 
     wrapper = [k for k in functions if k.endswith("__" + entry)][0]
     artifact = emit_ssa_function_to_llvm(module, wrapper)
