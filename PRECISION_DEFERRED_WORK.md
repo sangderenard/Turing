@@ -5,24 +5,35 @@ how it was established. Items marked MEASURED were run, not reasoned about —
 several of today's confident diagnoses were wrong and were caught only by
 running them, so the distinction is load-bearing.
 
-## The one structural blocker
+## What remains — smaller than it looked
 
-**Nothing lowers `precision_*` to instructions a backend has.** MEASURED:
-Fortran emits `! UNSUPPORTED precision_mul`, LLVM reports
+An earlier draft of this file called the limb channel an open design problem
+and the lowering "not yet made". That was wrong, and the evidence against it
+was already on disk.
+
+**The error-free transformations already compile, end to end.** MEASURED:
+`TWO_PRODUCT_SOURCE` — ordinary authored Python — through the canonical
+source compiler to SSA, lowered to Fortran, built by gfortran, returns the
+exact primal AND the exact residual, 0 of 2000 mismatches each, residual
+nonzero on every sample. It used Dekker splitting and no `Fma` at all, and
+`t11 - (t11 - t7)` — the algebraically-foldable half — survived into the
+emitted Fortran untouched.
+
+So no destination needs to know what a precision operation is, and the limb
+channel needs no invention: the kernel takes one array per limb (`p` and
+`e`), which IS the channel layout materialised. That question was answered
+by writing the function.
+
+**What is actually left** is to connect `precision_mul` to that already-
+working body — inline it, or emit a call to it. Until then a program that
+declares precision still stops at the backend: Fortran says
+`! UNSUPPORTED precision_mul`, LLVM reports
 `operation has no repository LLVM emission`. Both refuse rather than emit
-something wrong, which is the API behaving — but no program compiles *with*
-precision today.
+something wrong, which is the API behaving correctly; they are simply not
+yet pointed at the body that works.
 
-The fix is one SSA pass, not five operations across seven backends: expand
-each `precision_*` into its error-free transformation using ops every
-destination already has (`Mul`, `Add`, `Sub`, `Neg`, `Fma`). `Fma` was added
-for exactly this and is verified on three lanes.
-
-The hard part inside that pass is the limb channel. A precision value has
-shape `(…, limbs)` while an SSA instruction produces one result, so the
-lowering must decide how limbs become values — two scalars per operand, or
-one array the arithmetic indexes. That decision *is* the pass, and it is not
-yet made.
+The remaining judgement is inline versus call, which is a cost question
+(call overhead per element against code growth), not a correctness one.
 
 ## Working, and measured
 
