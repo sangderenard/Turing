@@ -6394,6 +6394,7 @@ def compile_project_product(
     directory: str | Path,
     *,
     entries: Iterable[str] | None = None,
+    expand_entry_dependencies: bool = True,
     python_executable: str | Path = sys.executable,
     jobs: int | None = None,
     max_total_resident_bytes: int | None = None,
@@ -6456,11 +6457,15 @@ def compile_project_product(
     _atomic_text(authored_source_path, source)
     discovered = discover_authored_calls(source)
     by_name = {call.qualified_name: call for call in discovered}
-    selected_names = dependency_ordered_authored_calls(source, (
+    requested_names = (
         tuple(call.qualified_name for call in discovered)
         if entries is None
         else tuple(dict.fromkeys(map(str, entries)))
-    ))
+    )
+    selected_names = (
+        dependency_ordered_authored_calls(source, requested_names)
+        if expand_entry_dependencies else requested_names
+    )
     unknown = tuple(name for name in selected_names if name not in by_name)
     if unknown:
         raise ValueError(f"unknown authored project calls: {unknown!r}")
@@ -7171,6 +7176,7 @@ def compile_project_bootstrap_creep(
     directory: str | Path,
     *,
     entries: Iterable[str] | None = None,
+    expand_entry_dependencies: bool = True,
     python_executable: str | Path = sys.executable,
     jobs: int | None = None,
     max_total_resident_bytes: int | None = None,
@@ -7241,6 +7247,7 @@ def compile_project_bootstrap_creep(
             source_file,
             round_root,
             entries=entries,
+            expand_entry_dependencies=expand_entry_dependencies,
             python_executable=python_executable,
             jobs=jobs,
             max_total_resident_bytes=max_total_resident_bytes,
@@ -7285,10 +7292,26 @@ def compile_project_bootstrap_creep(
         for unit in product.get("units") or ():
             if unit.get("status") == "complete":
                 continue
+            plan_name = unit.get("process_graph_unit_plan")
+            unit_name = unit.get("path")
+            plan_path = (
+                None if not plan_name else round_root / str(plan_name)
+            )
+            strict_child_plan = False
+            if plan_path is not None and plan_path.is_file():
+                try:
+                    strict_child_plan = len(
+                        json.loads(plan_path.read_text(encoding="utf-8")).get(
+                            "units", ()
+                        )
+                    ) > 1
+                except (OSError, TypeError, ValueError):
+                    strict_child_plan = False
             if (
                 not crawl_timed_out_units
                 and unit.get("error_type") == "ResourceLimitExceeded"
                 and "elapsed time" in str(unit.get("error") or "")
+                and not strict_child_plan
             ):
                 subdivision_creeps.append({
                     "qualified_name": str(
@@ -7299,15 +7322,12 @@ def compile_project_bootstrap_creep(
                     "fixed_point_count": 0,
                 })
                 continue
-            plan_name = unit.get("process_graph_unit_plan")
-            unit_name = unit.get("path")
             if not plan_name or not unit_name:
                 continue
-            plan_path = round_root / str(plan_name)
             graph_path = (
                 round_root / str(unit_name) / "resolved-process-graph.pkl"
             )
-            if not plan_path.is_file() or not graph_path.is_file():
+            if plan_path is None or not plan_path.is_file() or not graph_path.is_file():
                 continue
             qualified_name = str(unit.get("qualified_name") or "unit")
             subdivision_root = (

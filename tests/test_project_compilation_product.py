@@ -353,6 +353,60 @@ def test_project_bootstrap_creep_defers_a_timed_out_unit_retry(
     }]
 
 
+def test_project_bootstrap_creep_crawls_strict_children_before_widening(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "compiler_part.py"
+    source.write_text("def root(value):\n    return value\n", encoding="utf-8")
+
+    def compile_round(_source, output, **_kwargs):
+        unit_root = output / "units" / "root"
+        unit_root.mkdir(parents=True)
+        (unit_root / "resolved-process-graph.pkl").write_bytes(b"graph")
+        (unit_root / "process-graph-units.json").write_text(
+            json.dumps({"units": [{"qualified_names": ["leaf"]}, {
+                "qualified_names": ["root"], "dependency_units": [0],
+            }]}),
+            encoding="utf-8",
+        )
+        return {
+            "units": [{
+                "qualified_name": "root",
+                "status": "failed",
+                "error_type": "ResourceLimitExceeded",
+                "error": "unit exceeded 300.000s elapsed time",
+                "path": "units/root",
+                "process_graph_unit_plan": (
+                    "units/root/process-graph-units.json"
+                ),
+            }],
+            "automatic_native_verification": [],
+            "creep_frontier": [{"qualified_name": "root"}],
+        }
+
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.compile_project_product",
+        compile_round,
+    )
+    observed = []
+
+    def crawl(*args, **_kwargs):
+        observed.append(args)
+        return {"status": "sealed", "verified_products": [], "fixed_points": []}
+
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.compile_process_graph_creep",
+        crawl,
+    )
+
+    manifest = compile_project_bootstrap_creep(
+        source, tmp_path / "creep", max_rounds=1,
+    )
+
+    assert len(observed) == 1
+    assert manifest["rounds"][0]["process_graph_creeps"][0]["status"] == "sealed"
+
+
 def test_process_graph_workers_wait_for_terminal_dependencies_not_success():
     units = (
         {"qualified_names": ["leaf"], "dependency_units": []},

@@ -15,6 +15,7 @@ frontier change is the terminal fixed point.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -29,10 +30,12 @@ from src.compiler.project_compilation_product import (
     DEFAULT_PROJECT_EXTRACTION_CONTRACT,
     compile_project_bootstrap_creep,
     discover_authored_calls,
+    authored_call_dependencies,
 )
 
 
-STATE_SCHEMA = "turing.exponential-compiler-bootstrap-state.v1"
+STATE_SCHEMA = "turing.exponential-compiler-bootstrap-state.v2"
+LEGACY_STATE_SCHEMA = "turing.exponential-compiler-bootstrap-state.v1"
 WAVE_SCHEMA = "turing.exponential-compiler-bootstrap-wave.v1"
 
 
@@ -83,9 +86,7 @@ def discover_compiler_catalogues(source_root: str | Path) -> list[dict[str, Any]
             continue
         records.append({
             "source": path.as_posix(),
-            "source_sha256": hashlib.sha256(
-                source.encode("utf-8")
-            ).hexdigest(),
+            "source_sha256": _sha256(path),
             "source_bytes": len(source.encode("utf-8")),
             "authored_call_count": len(calls),
             "attempts": 0,
@@ -101,6 +102,144 @@ def discover_compiler_catalogues(source_root: str | Path) -> list[dict[str, Any]
         int(record["authored_call_count"]),
         str(record["source"]),
     ))
+    return records
+
+
+def _authored_call_weights(source: str) -> dict[str, tuple[int, int]]:
+    """Estimate exact authored-body size without compiling or partitioning it."""
+
+    indexed: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+
+    def add_function(node, qualified_name: str) -> None:
+        indexed[qualified_name] = node
+        for statement in node.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                add_function(
+                    statement,
+                    f"{qualified_name}.<locals>.{statement.name}",
+                )
+
+    for statement in ast.parse(source).body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            add_function(statement, statement.name)
+        elif isinstance(statement, ast.ClassDef):
+            for member in statement.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    add_function(member, f"{statement.name}.{member.name}")
+    lines = source.splitlines(keepends=True)
+    return {
+        name: (
+            sum(len(line.encode("utf-8")) for line in lines[
+                int(node.lineno) - 1:int(node.end_lineno)
+            ]),
+            sum(1 for _child in ast.walk(node)),
+        )
+        for name, node in indexed.items()
+    }
+
+
+def discover_compiler_work_batches(
+    source_root: str | Path, *, batch_size: int,
+) -> list[dict[str, Any]]:
+    """Build deterministic dependency-first, smallest-ready compiler batches."""
+
+    width = int(batch_size)
+    if width < 1:
+        raise ValueError("compiler work batch size must be positive")
+    per_source = []
+    root = Path(source_root).resolve()
+    for path in sorted(root.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+            calls = discover_authored_calls(source)
+            if not calls:
+                continue
+            weights = _authored_call_weights(source)
+            names = tuple(call.qualified_name for call in calls)
+            dependencies = authored_call_dependencies(source, names)
+        except (OSError, SyntaxError, UnicodeError):
+            continue
+        remaining = set(names)
+        emitted: set[str] = set()
+        ordered = []
+        while remaining:
+            ready = [
+                name for name in remaining
+                if set(dependencies.get(name, ())) <= emitted
+            ]
+            # A recursive SCC has no ready member; the project worker retains
+            # the exact authored cycle, so select its smallest stable member.
+            candidates = ready or list(remaining)
+            selected = min(candidates, key=lambda name: (
+                *weights.get(name, (len(source.encode("utf-8")), 0)), name,
+            ))
+            ordered.append(selected)
+            emitted.add(selected)
+            remaining.remove(selected)
+        batches = [
+            tuple(ordered[offset:offset + width])
+            for offset in range(0, len(ordered), width)
+        ]
+        per_source.append((
+            min(weights.get(name, (len(source.encode("utf-8")), 0)) for name in names),
+            path,
+            source,
+            weights,
+            batches,
+        ))
+    source_batches = []
+    for _minimum, path, source, weights, batches in per_source:
+        source_digest = _sha256(path)
+        batch_records = []
+        for batch_index, entries in enumerate(batches):
+            batch_records.append({
+                "source": path.as_posix(),
+                "source_sha256": source_digest,
+                "source_bytes": len(source.encode("utf-8")),
+                "entries": list(entries),
+                "batch_index": batch_index,
+                "authored_call_count": len(entries),
+                "estimated_authored_bytes": sum(weights[name][0] for name in entries),
+                "estimated_ast_nodes": sum(weights[name][1] for name in entries),
+                "attempts": 0,
+                "last_outcome_sha256": None,
+                "last_outcomes": {},
+                "seed_product": None,
+                "pending_deep_retry": [],
+                "deep_retry_attempted": False,
+                "last_deep_retry_registry_sha256": None,
+            })
+        source_batches.append(batch_records)
+    # Each source is a widening chain: its next batch becomes eligible only
+    # after the preceding (smaller/dependency-earlier) batch has published.
+    # Across those chains, always select the smallest eligible batch.  This
+    # is deterministic best-first traversal without sacrificing the join
+    # boundary between a leaf batch and the wider work that can consume it.
+    records = []
+    available = [
+        (batch_records, 0)
+        for batch_records in source_batches if batch_records
+    ]
+    while available:
+        selected_position = min(range(len(available)), key=lambda position: (
+            int(available[position][0][available[position][1]][
+                "estimated_authored_bytes"
+            ]),
+            int(available[position][0][available[position][1]][
+                "estimated_ast_nodes"
+            ]),
+            str(available[position][0][available[position][1]]["source"]),
+            int(available[position][0][available[position][1]]["batch_index"]),
+        ))
+        batch_records, batch_index = available[selected_position]
+        records.append(batch_records[batch_index])
+        next_index = batch_index + 1
+        if next_index == len(batch_records):
+            available.pop(selected_position)
+        else:
+            available[selected_position] = (batch_records, next_index)
     return records
 
 
@@ -177,6 +316,7 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             arguments.source,
             wave_root / "product",
             entries=arguments.entry or None,
+            expand_entry_dependencies=False,
             jobs=arguments.jobs,
             max_total_resident_bytes=(
                 None if arguments.max_total_gb is None
@@ -224,6 +364,7 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             "process_id": os.getpid(),
             "source": arguments.source.resolve().as_posix(),
             "source_sha256": _sha256(arguments.source.resolve()),
+            "entries": list(arguments.entry),
             "workers_joined": True,
             "mode": "deep-retry" if arguments.deep_retry else "bounded",
             "elapsed_seconds": time.perf_counter() - started,
@@ -246,6 +387,7 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             "generation": int(arguments.generation),
             "process_id": os.getpid(),
             "source": arguments.source.resolve().as_posix(),
+            "entries": list(arguments.entry),
             "workers_joined": True,
             "mode": "deep-retry" if arguments.deep_retry else "bounded",
             "elapsed_seconds": time.perf_counter() - started,
@@ -259,14 +401,16 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
         "stage": "generation_exit",
         **{key: result.get(key) for key in (
             "generation", "process_id", "source", "status",
-            "workers_joined", "registry_changed", "outcome_sha256",
+            "workers_joined", "registry_changed", "outcome_sha256", "mode",
         )},
     }, sort_keys=True), flush=True)
     return 0 if result["status"] == "complete" else 1
 
 
 def _initial_state(arguments: argparse.Namespace) -> dict[str, Any]:
-    sources = discover_compiler_catalogues(arguments.source_root)
+    sources = discover_compiler_work_batches(
+        arguments.source_root, batch_size=arguments.jobs,
+    )
     if not sources:
         raise ValueError(
             f"no authored compiler catalogues beneath {arguments.source_root}"
@@ -278,9 +422,42 @@ def _initial_state(arguments: argparse.Namespace) -> dict[str, Any]:
         "generation": 0,
         "sweep": 0,
         "cursor": 0,
+        "batch_size": int(arguments.jobs),
         "sweep_progress": False,
         "sources": sources,
         "waves": [],
+    }
+
+
+def _migrate_legacy_state(
+    state: dict[str, Any], arguments: argparse.Namespace,
+) -> dict[str, Any]:
+    """Expand v1 file-wide work into v2 call batches without losing evidence."""
+
+    legacy_by_source = {
+        str(record.get("source") or ""): dict(record)
+        for record in state.get("sources") or ()
+    }
+    sources = discover_compiler_work_batches(
+        arguments.source_root, batch_size=arguments.jobs,
+    )
+    for record in sources:
+        legacy = legacy_by_source.get(str(record["source"]))
+        if legacy is not None and legacy.get("seed_product"):
+            record["seed_product"] = str(legacy["seed_product"])
+    return {
+        **state,
+        "schema": STATE_SCHEMA,
+        "status": "running",
+        "cursor": 0,
+        "batch_size": int(arguments.jobs),
+        "sweep_progress": False,
+        "sources": sources,
+        "migration": {
+            "from": LEGACY_STATE_SCHEMA,
+            "kind": "deterministic-authored-call-batches",
+            "preserved_wave_count": len(state.get("waves") or ()),
+        },
     }
 
 
@@ -303,6 +480,9 @@ def _supervise(arguments: argparse.Namespace) -> int:
             json.loads(state_path.read_text(encoding="utf-8"))
             if state_path.is_file() else _initial_state(arguments)
         )
+        if state.get("schema") == LEGACY_STATE_SCHEMA:
+            state = _migrate_legacy_state(state, arguments)
+            _atomic_json(state_path, state)
         if state.get("schema") != STATE_SCHEMA:
             raise ValueError("unsupported exponential bootstrap state schema")
         while (
@@ -316,15 +496,24 @@ def _supervise(arguments: argparse.Namespace) -> int:
             source = Path(str(source_record["source"])).resolve()
             current_source_hash = _sha256(source)
             if current_source_hash != str(source_record["source_sha256"]):
-                source_record.update({
-                    "source_sha256": current_source_hash,
-                    "last_outcome_sha256": None,
-                    "last_outcomes": {},
-                    "seed_product": None,
-                    "pending_deep_retry": [],
-                    "deep_retry_attempted": False,
-                    "last_deep_retry_registry_sha256": None,
-                })
+                state["sources"] = discover_compiler_work_batches(
+                    arguments.source_root, batch_size=arguments.jobs,
+                )
+                state["cursor"] = 0
+                state["batch_size"] = int(arguments.jobs)
+                state["sweep_progress"] = True
+                state["catalogue_refresh"] = {
+                    "generation": int(state["generation"]),
+                    "changed_source": source.as_posix(),
+                    "reason": "authored-source-sha256-changed",
+                }
+                _atomic_json(state_path, state)
+                print(json.dumps({
+                    "stage": "catalogue_refresh",
+                    **state["catalogue_refresh"],
+                    "batch_count": len(state["sources"]),
+                }, sort_keys=True), flush=True)
+                continue
             generation = int(state["generation"])
             wave_root = _unused_wave_root(root, generation)
             command = [
@@ -350,12 +539,16 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 str, source_record.get("pending_deep_retry") or (),
             ))
             mode = "deep-retry" if pending_deep_retry else "bounded"
+            selected_entries = (
+                pending_deep_retry if pending_deep_retry else
+                tuple(map(str, source_record.get("entries") or ()))
+            )
             if pending_deep_retry:
                 timeout_index = command.index("--unit-timeout-seconds") + 1
                 command[timeout_index] = "0"
                 command.append("--deep-retry")
-                for qualified_name in pending_deep_retry:
-                    command.extend(("--entry", qualified_name))
+            for qualified_name in selected_entries:
+                command.extend(("--entry", qualified_name))
             print(json.dumps({
                 "stage": "generation_start",
                 "generation": generation,
@@ -363,6 +556,7 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 "source_index": cursor,
                 "source_count": len(sources),
                 "source": source.as_posix(),
+                "entries": list(selected_entries),
                 "mode": mode,
             }, sort_keys=True), flush=True)
             completed = subprocess.run(
@@ -493,7 +687,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--worker-reserve-gb", type=float, default=4.0)
     parser.add_argument("--max-worker-gb", type=float, default=4.0)
     parser.add_argument("--unit-timeout-seconds", type=float, default=300.0)
-    parser.add_argument("--max-generations", type=int, default=4096)
+    parser.add_argument("--max-generations", type=int, default=32768)
     parser.add_argument("--max-sweeps", type=int, default=8)
     parser.add_argument(
         "--minimum-compile-seconds-before-widening",

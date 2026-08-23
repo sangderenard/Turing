@@ -43,6 +43,31 @@ def test_interrupted_generation_is_preserved_under_a_new_attempt_path(tmp_path):
     )
 
 
+def test_work_batches_are_smallest_ready_and_dependency_first(tmp_path):
+    source = tmp_path / "compiler_part.py"
+    source.write_text(
+        "def large(value):\n"
+        "    first = value + 1\n"
+        "    second = first + 2\n"
+        "    third = second + 3\n"
+        "    return third\n\n"
+        "def leaf(value):\n"
+        "    return value + 1\n\n"
+        "def caller(value):\n"
+        "    return leaf(value)\n",
+        encoding="utf-8",
+    )
+
+    batches = exponential.discover_compiler_work_batches(
+        tmp_path, batch_size=1,
+    )
+    entries = [record["entries"][0] for record in batches]
+
+    assert sorted(entries) == ["caller", "large", "leaf"]
+    assert entries.index("leaf") < entries.index("caller")
+    assert all(record["authored_call_count"] == 1 for record in batches)
+
+
 def test_supervisor_joins_then_restarts_until_a_stable_sweep(
     tmp_path, monkeypatch,
 ):
