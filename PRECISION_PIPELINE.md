@@ -208,10 +208,28 @@ from 18 flops to 115 costs 4%. The arithmetic is invisible underneath the
 dispatch. LLVM inlines the same call away entirely. Verified computing
 correct values on both, so this is work being timed and not a broken call.
 
-The cause is region granularity: the planner carves the LOOP BODY into its
-own function, so it is called once per element through a bind(C) boundary
-Fortran cannot inline across. One backend papering over it is what kept it
-invisible.
+The cost is STRUCTURAL and has nothing to do with precision. MEASURED, same
+path, 1e5 elements:
+
+| body | ns/element |
+|---|---|
+| trivial `y[i] = x[i]` | 411 |
+| sin, 18 flops | 435 |
+| sin at two limbs, 115 flops | 445 |
+
+411 ns of that is per-element overhead in the region-call loop. The
+arithmetic contributes 24 ns and 34 ns -- so on Fortran, double-double costs
+about 1.4x the ordinary version, and the 190x against LLVM is a fixed tax on
+EVERY Fortran kernel, precision or not.
+
+Not the C binding: emitting internal regions without `bind(C)` changed
+428.5 against 429.3 ns, so that was reverted rather than left as an
+unmotivated change. Not the flags either -- the lane already compiles with
+-O3 -march=native -flto -funroll-loops. The remaining suspects are the
+goto-form loop the emitter produces and the per-element call itself, and
+distinguishing them needs a profile or a disassembly rather than another
+hypothesis. What is certain is the shape of the fix: a region should contain
+the loop rather than BE the loop body.
 
 On LLVM, where dispatch is free, the 24x decomposes as 6.4x more flops
 (115 against 18) times 3.7x worse throughput per flop -- 1.46 cycles per
