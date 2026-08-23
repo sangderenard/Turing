@@ -14,7 +14,7 @@ import logging
 import re
 import textwrap
 import types
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import networkx as nx
 
@@ -35,6 +35,10 @@ from ...transmogrifier.function_table import (
     ParameterTransfer,
 )
 from ...transmogrifier.ssa_registry import ast_ssa_name_map, c_ssa_name_map
+from ...transmogrifier.graph.python_special_cases import (
+    canonicalize_python_static_bindings,
+    interpret_python_static_value,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -1339,7 +1343,18 @@ def _normalize_lexical_values(
         existing = static_constant_nodes.get(name)
         if existing is not None:
             return existing
-        attributes = {"value": value, "binding_name": name}
+        python_special_case = interpret_python_static_value(
+            value,
+            path=name,
+        )
+        if python_special_case is not None:
+            value = python_special_case.constant
+            attributes = {
+                **python_special_case.attributes,
+                "binding_name": name,
+            }
+        else:
+            attributes = {"value": value, "binding_name": name}
         if isinstance(value, dict) and all(
             isinstance(key, (bool, int, float, str))
             and isinstance(item, (bool, int, float, str))
@@ -6567,6 +6582,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             delattr(statement, "_python_bindings")
         if hasattr(statement, "_python_aggregate_binding_kinds"):
             delattr(statement, "_python_aggregate_binding_kinds")
+        function_graph.python_bindings = canonicalize_python_static_bindings(
+            function_graph.python_bindings
+        )
         function_table.resolve_graph(reference, function_graph)
     # Function graphs are attached only after the earlier root-graph pass.
     # Reuse that exact provenance propagation now that every callee body is
@@ -6583,6 +6601,21 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         target = static_bindings.get(entry.name)
         if callable(target):
             external_function_table.resolve_callable(entry.reference, target)
+    graph.python_bindings = canonicalize_python_static_bindings(
+        graph.python_bindings
+    )
+    # Source discovery annotates definitions with their exact lexical Python
+    # environment.  Most annotations are removed when their function graph is
+    # finalized, but ProcessGraph.node_map deliberately retains every source
+    # occurrence.  Canonicalize any surviving environment through the same
+    # Python special case so a dead frontend annotation cannot reintroduce the
+    # live wrapper after all actual uses have become Constant leaves.
+    for expression in graph.node_map.values():
+        bindings = getattr(expression, "_python_bindings", None)
+        if isinstance(bindings, Mapping):
+            expression._python_bindings = canonicalize_python_static_bindings(
+                bindings
+            )
     return graph
 
 

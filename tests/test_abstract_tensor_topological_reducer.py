@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import io
+import re._constants
 import subprocess
 import sys
 
@@ -14,6 +15,57 @@ from src.common.tensors.topological_reducer import (
 from src.common.tensors.abstract_nn.token_encoder import decode_identity_tokens
 from src.common.tensors.abstract_nn.token_lexicon import CompilerTokenLexicon
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
+
+
+def test_python_named_integer_becomes_plain_constant_with_origin_metadata():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {
+        "ATOMIC_GROUP": re._constants.ATOMIC_GROUP,
+        "OPCODES": (
+            re._constants.ATOMIC_GROUP,
+            re._constants.SUBPATTERN,
+        ),
+    }
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse("""
+def classify(value):
+    return value == ATOMIC_GROUP
+"""))
+
+    reduce_abstract_tensor_topology(graph)
+    executable = graph.function_table.entry("classify").graph.G
+    constant = next(
+        data
+        for _node_id, data in executable.nodes(data=True)
+        if (data.get("attributes") or {}).get("binding_name")
+        == "ATOMIC_GROUP"
+    )
+
+    assert type(constant["attributes"]["value"]) is int
+    assert constant["attributes"]["value"] == int(
+        re._constants.ATOMIC_GROUP
+    )
+    assert constant["attributes"]["python_static_origins"] == ({
+        "schema": "turing.python-named-integer.v1",
+        "path": "ATOMIC_GROUP",
+        "module": "re._constants",
+        "type": "_NamedIntConstant",
+        "name": "ATOMIC_GROUP",
+        "integer_value": int(re._constants.ATOMIC_GROUP),
+    },)
+    assert graph.python_bindings["OPCODES"] == (
+        int(re._constants.ATOMIC_GROUP),
+        int(re._constants.SUBPATTERN),
+    )
+    assert all(type(value) is int for value in graph.python_bindings["OPCODES"])
+
+    from src.compiler.project_compilation_product import (
+        _dump_resolved_process_graph,
+    )
+
+    serialized = io.BytesIO()
+    _dump_resolved_process_graph(graph, serialized)
+    assert serialized.tell() > 0
 
 
 def test_tuple_comprehension_publishes_fixed_resident_row_width():

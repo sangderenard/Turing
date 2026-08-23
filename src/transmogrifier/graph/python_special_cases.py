@@ -69,6 +69,151 @@ def _call_spelling(node: ast.Call) -> str | None:
     return None
 
 
+def _named_integer_origin(value: Any, path: str) -> dict[str, Any] | None:
+    """Describe the CPython named-int wrapper category, if ``value`` is one."""
+
+    value_type = type(value)
+    if (
+        value_type is int
+        or isinstance(value, bool)
+        or not isinstance(value, int)
+        or value_type.__dict__.get("__reduce__", object()) is not None
+    ):
+        return None
+    symbolic_name = getattr(value, "name", None)
+    if not isinstance(symbolic_name, str) or not symbolic_name:
+        return None
+    return {
+        "schema": "turing.python-named-integer.v1",
+        "path": str(path),
+        "module": str(value_type.__module__),
+        "type": str(value_type.__qualname__),
+        "name": symbolic_name,
+        "integer_value": int(value),
+    }
+
+
+def canonicalize_python_static_data(
+    value: Any,
+    *,
+    path: str,
+) -> tuple[Any, tuple[dict[str, Any], ...]]:
+    """Canonicalize named integers inside one static Python value tree."""
+
+    origin = _named_integer_origin(value, path)
+    if origin is not None:
+        return int(value), (origin,)
+
+    if isinstance(value, tuple):
+        values = []
+        origins = []
+        for index, item in enumerate(value):
+            canonical, nested = canonicalize_python_static_data(
+                item,
+                path=f"{path}[{index}]",
+            )
+            values.append(canonical)
+            origins.extend(nested)
+        return (tuple(values), tuple(origins)) if origins else (value, ())
+    if isinstance(value, list):
+        values = []
+        origins = []
+        for index, item in enumerate(value):
+            canonical, nested = canonicalize_python_static_data(
+                item,
+                path=f"{path}[{index}]",
+            )
+            values.append(canonical)
+            origins.extend(nested)
+        return (values, tuple(origins)) if origins else (value, ())
+    if isinstance(value, (set, frozenset)):
+        values = []
+        origins = []
+        ordered_items = sorted(
+            value,
+            key=lambda item: (
+                str(type(item).__module__),
+                str(type(item).__qualname__),
+                repr(item),
+            ),
+        )
+        for index, item in enumerate(ordered_items):
+            canonical, nested = canonicalize_python_static_data(
+                item,
+                path=f"{path}[{index}]",
+            )
+            values.append(canonical)
+            origins.extend(nested)
+        if not origins:
+            return value, ()
+        container = frozenset if isinstance(value, frozenset) else set
+        return container(values), tuple(origins)
+    if isinstance(value, dict):
+        values = {}
+        origins = []
+        for index, (key, item) in enumerate(value.items()):
+            canonical_key, key_origins = canonicalize_python_static_data(
+                key,
+                path=f"{path}.key[{index}]",
+            )
+            canonical_item, item_origins = canonicalize_python_static_data(
+                item,
+                path=f"{path}[{key!r}]",
+            )
+            values[canonical_key] = canonical_item
+            origins.extend(key_origins)
+            origins.extend(item_origins)
+        return (values, tuple(origins)) if origins else (value, ())
+    return value, ()
+
+
+def canonicalize_python_static_bindings(
+    bindings: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return a persistence-safe copy of a Python static environment."""
+
+    return {
+        name: canonicalize_python_static_data(
+            value,
+            path=str(name),
+        )[0]
+        for name, value in bindings.items()
+    }
+
+
+def interpret_python_static_value(
+    value: Any,
+    *,
+    path: str,
+) -> SpecialCase | None:
+    """Reduce a Python-only named integer wrapper to a plain graph constant.
+
+    CPython uses private ``int`` subclasses for symbolic constants in a few
+    source modules.  Some of them deliberately set ``__reduce__ = None``;
+    retaining such a live wrapper in a resolved ProcessGraph makes ordinary
+    graph serialization try to call that non-callable reducer.  The wrapper
+    contributes no runtime behavior: its integer value is the program value
+    and its name/type are source provenance.
+
+    Keep this recognition at the Python ingestion boundary.  The reducer uses
+    the returned special case to create the ordinary ``Constant`` leaf at the
+    exact ``Name``/``Attribute`` occurrence and redirects that occurrence to
+    it.  No native boundary is introduced and source pursuit is unchanged.
+    """
+
+    canonical, origins = canonicalize_python_static_data(value, path=path)
+    if not origins:
+        return None
+    return SpecialCase(
+        "Constant",
+        {
+            "value": canonical,
+            "python_static_origins": origins,
+        },
+        canonical,
+    )
+
+
 def interpret_python_special_case(node: Any) -> SpecialCase | None:
     """Classify Python syntax without performing callable source discovery.
 
@@ -120,4 +265,10 @@ def interpret_python_special_case(node: Any) -> SpecialCase | None:
     return SpecialCase("Call", attributes, None, terminal=False)
 
 
-__all__ = ["extraction_receipt", "interpret_python_special_case"]
+__all__ = [
+    "canonicalize_python_static_bindings",
+    "canonicalize_python_static_data",
+    "extraction_receipt",
+    "interpret_python_special_case",
+    "interpret_python_static_value",
+]
