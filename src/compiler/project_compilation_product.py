@@ -7180,6 +7180,7 @@ def compile_project_bootstrap_creep(
     extraction_contract: str | Path | None = DEFAULT_PROJECT_EXTRACTION_CONTRACT,
     bootstrap_products: Iterable[str | Path] = (),
     seed_product: str | Path | None = None,
+    crawl_timed_out_units: bool = False,
     max_rounds: int = 16,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -7283,6 +7284,20 @@ def compile_project_bootstrap_creep(
         subdivision_creeps = []
         for unit in product.get("units") or ():
             if unit.get("status") == "complete":
+                continue
+            if (
+                not crawl_timed_out_units
+                and unit.get("error_type") == "ResourceLimitExceeded"
+                and "elapsed time" in str(unit.get("error") or "")
+            ):
+                subdivision_creeps.append({
+                    "qualified_name": str(
+                        unit.get("qualified_name") or "unit"
+                    ),
+                    "status": "deferred-timeout-retry",
+                    "verified_product_count": 0,
+                    "fixed_point_count": 0,
+                })
                 continue
             plan_name = unit.get("process_graph_unit_plan")
             unit_name = unit.get("path")

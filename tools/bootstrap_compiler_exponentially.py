@@ -4,6 +4,10 @@ Each generation compiles one automatically selected compiler source catalogue.
 Its bounded workers all terminate before the generation publishes a result.
 The supervisor then starts a fresh Python process, which loads the newly
 published verified-product registry before compiling the next catalogue. A
+timed-out unit is not immediately repeated by the subdivision crawler.  Once
+the bounded wave has done the configured minimum amount of work, that unit is
+retried alone, without a time ceiling but with the same memory ceiling, in the
+next fresh process.  It is retried again only after the registry advances.  A
 complete deterministic sweep with no registry, verified-region, or normalized
 frontier change is the terminal fixed point.
 """
@@ -46,6 +50,22 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _unused_wave_root(root: Path, generation: int) -> Path:
+    """Preserve an interrupted generation and select a fresh attempt path."""
+
+    base = root / "waves" / f"generation_{generation:05d}"
+    if not base.exists():
+        return base
+    attempt = 1
+    while True:
+        candidate = root / "waves" / (
+            f"generation_{generation:05d}_attempt_{attempt:03d}"
+        )
+        if not candidate.exists():
+            return candidate
+        attempt += 1
+
+
 def discover_compiler_catalogues(source_root: str | Path) -> list[dict[str, Any]]:
     """Discover nonempty authored-call catalogues in deterministic cheap-first order."""
 
@@ -70,7 +90,11 @@ def discover_compiler_catalogues(source_root: str | Path) -> list[dict[str, Any]
             "authored_call_count": len(calls),
             "attempts": 0,
             "last_outcome_sha256": None,
+            "last_outcomes": {},
             "seed_product": None,
+            "pending_deep_retry": [],
+            "deep_retry_attempted": False,
+            "last_deep_retry_registry_sha256": None,
         })
     records.sort(key=lambda record: (
         int(record["source_bytes"]),
@@ -152,6 +176,7 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
         manifest = compile_project_bootstrap_creep(
             arguments.source,
             wave_root / "product",
+            entries=arguments.entry or None,
             jobs=arguments.jobs,
             max_total_resident_bytes=(
                 None if arguments.max_total_gb is None
@@ -171,12 +196,27 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             extraction_contract=arguments.extraction_contract,
             bootstrap_products=active_products,
             seed_product=arguments.seed_product,
+            crawl_timed_out_units=False,
             max_rounds=1,
             progress=lambda event: print(
                 json.dumps(event, sort_keys=True), flush=True,
             ),
         )
         registry_after = _sha256(registry) if registry.is_file() else None
+        round_manifest_path = (
+            wave_root / "product" / "round_000" / "manifest.json"
+        )
+        round_manifest = (
+            json.loads(round_manifest_path.read_text(encoding="utf-8"))
+            if round_manifest_path.is_file() else {}
+        )
+        timed_out_entries = sorted({
+            str(unit.get("qualified_name") or "")
+            for unit in round_manifest.get("units") or ()
+            if unit.get("error_type") == "ResourceLimitExceeded"
+            and "elapsed time" in str(unit.get("error") or "")
+            and unit.get("qualified_name")
+        })
         result = {
             "schema": WAVE_SCHEMA,
             "status": "complete",
@@ -185,6 +225,7 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             "source": arguments.source.resolve().as_posix(),
             "source_sha256": _sha256(arguments.source.resolve()),
             "workers_joined": True,
+            "mode": "deep-retry" if arguments.deep_retry else "bounded",
             "elapsed_seconds": time.perf_counter() - started,
             "registry_before_sha256": registry_before,
             "registry_after_sha256": registry_after,
@@ -194,6 +235,7 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             "seed_product": (
                 wave_root / "product" / "round_000"
             ).as_posix(),
+            "timed_out_entries": timed_out_entries,
             "outcome": _normalized_outcome(manifest),
             "outcome_sha256": _outcome_sha256(manifest),
         }
@@ -205,10 +247,12 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
             "process_id": os.getpid(),
             "source": arguments.source.resolve().as_posix(),
             "workers_joined": True,
+            "mode": "deep-retry" if arguments.deep_retry else "bounded",
             "elapsed_seconds": time.perf_counter() - started,
             "error_type": type(error).__name__,
             "error": str(error),
             "traceback": traceback.format_exc(),
+            "registry_before_sha256": registry_before,
         }
     _atomic_json(wave_root / "wave-result.json", result)
     print(json.dumps({
@@ -275,10 +319,14 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 source_record.update({
                     "source_sha256": current_source_hash,
                     "last_outcome_sha256": None,
+                    "last_outcomes": {},
                     "seed_product": None,
+                    "pending_deep_retry": [],
+                    "deep_retry_attempted": False,
+                    "last_deep_retry_registry_sha256": None,
                 })
             generation = int(state["generation"])
-            wave_root = root / "waves" / f"generation_{generation:05d}"
+            wave_root = _unused_wave_root(root, generation)
             command = [
                 str(sys.executable), "-m",
                 "tools.bootstrap_compiler_exponentially",
@@ -298,6 +346,16 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 command.extend((
                     "--seed-product", str(source_record["seed_product"]),
                 ))
+            pending_deep_retry = tuple(map(
+                str, source_record.get("pending_deep_retry") or (),
+            ))
+            mode = "deep-retry" if pending_deep_retry else "bounded"
+            if pending_deep_retry:
+                timeout_index = command.index("--unit-timeout-seconds") + 1
+                command[timeout_index] = "0"
+                command.append("--deep-retry")
+                for qualified_name in pending_deep_retry:
+                    command.extend(("--entry", qualified_name))
             print(json.dumps({
                 "stage": "generation_start",
                 "generation": generation,
@@ -305,6 +363,7 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 "source_index": cursor,
                 "source_count": len(sources),
                 "source": source.as_posix(),
+                "mode": mode,
             }, sort_keys=True), flush=True)
             completed = subprocess.run(
                 command,
@@ -324,7 +383,8 @@ def _supervise(arguments: argparse.Namespace) -> int:
                     "error": f"generation exited with {completed.returncode}",
                 }
             )
-            previous_outcome = source_record.get("last_outcome_sha256")
+            last_outcomes = dict(source_record.get("last_outcomes") or {})
+            previous_outcome = last_outcomes.get(mode)
             current_outcome = result.get("outcome_sha256")
             progressed = bool(
                 result.get("registry_changed")
@@ -339,8 +399,36 @@ def _supervise(arguments: argparse.Namespace) -> int:
             source_record["attempts"] = int(source_record.get("attempts") or 0) + 1
             if current_outcome is not None:
                 source_record["last_outcome_sha256"] = str(current_outcome)
+                last_outcomes[mode] = str(current_outcome)
+                source_record["last_outcomes"] = last_outcomes
             if result.get("seed_product"):
                 source_record["seed_product"] = str(result["seed_product"])
+            scheduled_deep_retry = False
+            if mode == "deep-retry":
+                source_record["pending_deep_retry"] = []
+                source_record["deep_retry_attempted"] = True
+                source_record["last_deep_retry_registry_sha256"] = (
+                    result.get("registry_before_sha256")
+                )
+            else:
+                timed_out_entries = list(
+                    result.get("timed_out_entries") or ()
+                )
+                registry_revision = result.get("registry_after_sha256")
+                if (
+                    timed_out_entries
+                    and float(result.get("elapsed_seconds") or 0.0)
+                    >= float(arguments.minimum_compile_seconds_before_widening)
+                    and (
+                        not source_record.get("deep_retry_attempted")
+                        or registry_revision
+                        != source_record.get(
+                            "last_deep_retry_registry_sha256"
+                        )
+                    )
+                ):
+                    source_record["pending_deep_retry"] = timed_out_entries
+                    scheduled_deep_retry = True
             state["waves"].append({
                 "generation": generation,
                 "source": source.as_posix(),
@@ -350,10 +438,13 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 "progressed": progressed,
                 "registry_changed": bool(result.get("registry_changed")),
                 "outcome_sha256": current_outcome,
+                "mode": mode,
+                "scheduled_deep_retry": scheduled_deep_retry,
                 "result": result_path.as_posix(),
             })
             state["generation"] = generation + 1
-            cursor += 1
+            if not scheduled_deep_retry:
+                cursor += 1
             if cursor == len(sources):
                 if not state.get("sweep_progress"):
                     state["status"] = "fixed-point"
@@ -405,6 +496,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-generations", type=int, default=4096)
     parser.add_argument("--max-sweeps", type=int, default=8)
     parser.add_argument(
+        "--minimum-compile-seconds-before-widening",
+        type=float,
+        default=30.0,
+        help=(
+            "minimum completed bounded work before scheduling an unlimited-"
+            "time parent retry (default: 30 seconds)"
+        ),
+    )
+    parser.add_argument(
         "--extraction-contract", type=Path,
         default=DEFAULT_PROJECT_EXTRACTION_CONTRACT,
     )
@@ -412,9 +512,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--generation", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--source", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--seed-product", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--entry", action="append", default=[], help=argparse.SUPPRESS)
+    parser.add_argument("--deep-retry", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args(argv)
     if arguments.jobs < 1:
         parser.error("--jobs must be positive")
+    if arguments.minimum_compile_seconds_before_widening < 0:
+        parser.error(
+            "--minimum-compile-seconds-before-widening cannot be negative"
+        )
     if arguments.wave_worker:
         if arguments.source is None:
             parser.error("wave worker requires --source")
