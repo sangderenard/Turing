@@ -52,24 +52,26 @@ ordinary subtraction, and it is what took `expm1` to 1.75 ulp with no core.
 It must never fire on a guess — where it is wrong it is wrong silently and
 by the entire residual.
 
-**The fused `two_product` needs a flag, not an `fma` primitive.**
-Recorded here earlier as blocked on a missing primitive. That was wrong.
-Two routes already exist and neither needs SSA to spell `fma`:
+**`Fma` exists in SSA; no backend implements it.**
+Recorded here earlier as blocked on a missing primitive, which was wrong
+twice over. It was never needed for LLVM (whose `contract` flag is attached
+per instruction at `ssa_llvm_backend.py:459`, over exactly `{Add, Sub,
+Mul}`), and it was not hard to add. `ir_identities.FMA` is now a real
+operation -- `x * y + z` under exactly one rounding -- produced by
+`contract_multiply_add_to_fma`, gated on the work contract's
+`contract_multiply_add`. What remains is one spelling per backend: C's
+`fma`, GLSL's and WGSL's `fma`, LLVM's `llvm.fma`.
 
-* `ssa_llvm_backend.py:459` attaches LLVM's `contract` flag PER INSTRUCTION,
-  and `_CONTRACT_ELIGIBLE` is `{Add, Sub, Mul}` -- exactly the operations
-  the dual uses. SSA presents the lane structure (`Mul` then `Sub`) and
-  LLVM forms the fma itself.
-* `_BUILTIN_TARGETS` in `backend_intrinsics.py` is keyed
-  `(backend, semantic_family)` and holds `blas.gemm` today. A
-  `precision.two_product` family plus a target per backend is the same
-  node-swap protocol, and GLSL/WGSL/C each have a native `fma()` to name.
+Naming it beats relying on the flag: a flag PERMITS fusion, so whether it
+happens depends on the toolchain, the named target and the optimizer, and
+the six backends with no `-O2` behind them never see it. An instruction
+either is an `Fma` or is not.
 
-The real work is that ONE flag serves both directions: withheld at the
-primal (where contraction breaks Knuth's precondition) and granted at the
-dual (where contraction IS the identity). `contraction_across_the_primal`
-in the refusal table and `two_product_kernel` in the identity table are the
-same mechanism seen from two sides.
+Still owed: the rewrite is exact at a precision dual (`a * b - fl(a * b)`
+IS the residual) and inexact everywhere else, so it should fire
+unconditionally there and on licence elsewhere. That needs the dual to be
+marked, which nothing does yet -- so today it rides the general licence and
+will not fire under `prove`.
 
 **The superaccumulator kernel is unwritten.**
 `exact_accumulation_over_long_chain` names it; nothing provides it.

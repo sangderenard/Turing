@@ -933,3 +933,174 @@ def reduce_precision_operations(functions) -> dict:
                 if internal:
                     counts["single_renormalisation_per_chain"] += 1
     return counts
+
+
+#: The fused multiply-add, as repository SSA owns it.
+#:
+#: ``Fma(x, y, z)`` is ``x * y + z`` under EXACTLY ONE rounding. That single
+#: rounding is the entire content of the operation: a separate multiply and
+#: add round twice, so the two are different functions, not the same function
+#: at different speeds. Every destination has a spelling -- C's ``fma``,
+#: GLSL's and WGSL's ``fma``, LLVM's ``llvm.fma`` -- so this is a real
+#: operation to be implemented per backend rather than a hint dropped for an
+#: optimizer to notice.
+#:
+#: Naming it here rather than leaving it to LLVM's ``contract`` flag buys
+#: determinism: a flag PERMITS fusion, so whether it happens depends on the
+#: toolchain, the named target, and the optimizer's mood, and the six
+#: backends with no ``-O2`` behind them never see it at all. An instruction
+#: either is an Fma or is not.
+FMA = "Fma"
+
+
+def contract_multiply_add_to_fma(functions, licensed: bool | None = None) -> dict:
+    """Fuse ``Mul`` feeding an ``Add``/``Sub`` into :data:`FMA`, in place.
+
+    INEXACT in general, and gated accordingly -- the default asks the active
+    work contract's ``contract_multiply_add``, the same switch the LLVM
+    backend consults. Fusing removes a rounding, which USUALLY improves the
+    result and always changes it, so it is a licensed change of bits rather
+    than a free win.
+
+    The exception is the reason this exists. Where the multiply and the
+    subtraction form an error term -- ``a * b - fl(a * b)`` -- the fused
+    form is not merely more accurate but EXACTLY the residual Dekker's
+    splitting computes the long way, six multiplies and several adds
+    replaced by one instruction. There the rewrite is exact, and the
+    licence is beside the point; it needs the dual to be marked as such,
+    which is deferred work, so today it rides the general licence.
+
+    Only fires where the product is consumed by that one operation.
+    Otherwise the multiply must be kept for its other readers and fusing
+    computes it twice -- once fused, once not, at two different roundings,
+    which is worse than not fusing at all.
+
+    Returns a count per rewrite kind.
+    """
+
+    if licensed is None:
+        from .work_contract import active_contract
+
+        licensed = bool(active_contract().contract_multiply_add)
+    counts = {"add_to_fma": 0, "sub_to_fma": 0}
+    if not licensed:
+        return counts
+
+    next_id = _module_watermark(functions)
+
+    for function in functions.values():
+        protected: set[int] = set()
+        for key in ("source_output_value_ids", "required_source_value_ids"):
+            protected.update(
+                int(value_id)
+                for value_id in (function.metadata.get(key) or ())
+            )
+        for name_value in (function.metadata.get("named_outputs") or ()):
+            try:
+                protected.add(int(name_value[1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+
+        readers: dict[int, int] = {}
+        products = {}
+        fused: set[int] = set()
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                for argument in instruction.args:
+                    identity = int(argument.id)
+                    readers[identity] = readers.get(identity, 0) + 1
+                if instruction.op in ("Phi", "phi"):
+                    for _predecessor, value in (
+                        instruction.attributes.get("incoming") or ()
+                    ):
+                        try:
+                            identity = int(value.id)
+                        except (AttributeError, TypeError, ValueError):
+                            continue
+                        readers[identity] = readers.get(identity, 0) + 1
+                if (
+                    str(instruction.op) == "Mul"
+                    and len(instruction.args) == 2
+                    and instruction.res is not None
+                ):
+                    products[int(instruction.res.id)] = instruction
+
+        for block in function.blocks.values():
+            rewritten = []
+            for instruction in block.instrs:
+                operation = str(instruction.op)
+                if operation not in ("Add", "Sub") or len(instruction.args) != 2:
+                    rewritten.append(instruction)
+                    continue
+                left, right = instruction.args
+                # `Sub(c, Mul(a, b))` is deliberately not matched: it is
+                # `c - a * b`, which needs a negated multiplicand to reach
+                # this form, and that is a second rewrite wearing the first
+                # one's name.
+                product = products.get(int(left.id))
+                addend = right
+                if product is None and operation == "Add":
+                    product = products.get(int(right.id))
+                    addend = left
+                if product is None:
+                    rewritten.append(instruction)
+                    continue
+                carrier = int(product.res.id)
+                if readers.get(carrier, 0) != 1 or carrier in protected:
+                    rewritten.append(instruction)
+                    continue
+
+                factors = list(product.args)
+                if operation == "Sub":
+                    negated = SSAValue(
+                        next_id, dtype=addend.dtype,
+                        shape=tuple(addend.shape or ()),
+                        device=addend.device,
+                        accounting=dict(addend.accounting or {}),
+                    )
+                    next_id += 1
+                    rewritten.append(Instr(
+                        "Neg", [addend], negated,
+                        attributes={"lowered_from": "Sub"},
+                    ))
+                    addend = negated
+                    counts["sub_to_fma"] += 1
+                else:
+                    counts["add_to_fma"] += 1
+                instruction.op = FMA
+                instruction.args = [*factors, addend]
+                instruction.attributes["lowered_from"] = operation
+                instruction.attributes["roundings"] = 1
+                rewritten.append(instruction)
+                fused.add(carrier)
+                products.pop(carrier, None)
+            block.instrs = rewritten
+
+        # The fused multiplies are dead -- their one reader absorbed them.
+        # Established by recounting what the rewritten code actually reads,
+        # rather than by reasoning about what should now be unreferenced.
+        if fused:
+            live: set[int] = set()
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    for argument in instruction.args:
+                        live.add(int(argument.id))
+                    if instruction.op in ("Phi", "phi"):
+                        for _predecessor, value in (
+                            instruction.attributes.get("incoming") or ()
+                        ):
+                            try:
+                                live.add(int(value.id))
+                            except (AttributeError, TypeError, ValueError):
+                                continue
+            for block in function.blocks.values():
+                block.instrs = [
+                    each for each in block.instrs
+                    if not (
+                        each.res is not None
+                        and int(each.res.id) in fused
+                        and int(each.res.id) not in live
+                        and int(each.res.id) not in protected
+                    )
+                ]
+    return counts
