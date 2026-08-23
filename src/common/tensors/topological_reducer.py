@@ -481,7 +481,21 @@ def _build_precision_operator_names() -> dict:
 
 
 #: (operation, element type, limbs) -> the name a destination implements.
+#: NOT what ingestion plants. A specific name fixes an operating width and a
+#: return width, and neither is known at the point an operand is read: fusion
+#: may run a batch at a width no single operation had, and whether a result
+#: stays limbed is a property of its CONSUMER, which does not exist yet. These
+#: are computed from the surviving operations once planning has run.
 PRECISION_OPERATOR_NAMES = _build_precision_operator_names()
+
+#: What ingestion plants: one name per operation, carrying no width.
+#: Enough for an identity to know which operation this is, and -- because
+#: nothing downstream recognises it either -- enough to keep the node out of
+#: the fusion planner's induced subgraph, which is what carries it intact.
+PRECISION_SINGULAR_NAMES = {
+    operation: f"precision_{operation}"
+    for operation in PRECISION_CLOSED_OPERATIONS
+}
 
 
 def _widest_element(*declared: Optional[str]) -> Optional[str]:
@@ -515,9 +529,9 @@ def _operand_precision(graph: Any, node: ast.AST) -> tuple[int, Optional[str]]:
     ordinary value.
 
     ``Precision`` and ``Precision[n]`` are the spellings; the element type
-    comes from a second subscript when the declaration gives one, because a
-    precision operation is named for the width it is emitted at and that is
-    not derivable from the limb count.
+    comes from a second subscript when the declaration gives one, because the
+    width an operation is eventually emitted at is not derivable from the limb
+    count alone.
     """
 
     if not isinstance(node, ast.Name):
@@ -556,14 +570,16 @@ def _operand_precision(graph: Any, node: ast.AST) -> tuple[int, Optional[str]]:
 
 def _qualified_handler(prefix: str, operator: ast.AST, *, limbs: int = 1,
                        dtype: Optional[str] = None) -> str:
-    """The operator's identity, taken from the precision table when it is one.
+    """The operator's identity, singular-precision when an operand is limbed.
 
-    Most limbs and highest precision decide: the caller passes what the
-    operands declared, and the widest of each is what the name is looked up
-    with. An operand carrying limbs makes this a different operation, not the
-    same one in a mode, so it gets a name of its own -- and a name outside the
-    ordinary vocabulary is one nothing downstream has a rewrite for, which is
-    what carries it to a destination untouched.
+    Most limbs and highest precision decide what the operation IS; the caller
+    passes what the operands declared and the widest of each governs. But the
+    name planted here stays unspecific about width, because the width it is
+    finally emitted at is not yet knowable -- fusion may batch it at a width
+    no operand had, and whether it returns a limbed result depends on a
+    consumer that does not exist at this point in the walk. The measured
+    limbs and element type ride along as attributes for the pass that does
+    know, once planning has settled which operations survived unfused.
     """
 
     spelling = f"{prefix}:{type(operator).__name__.lower()}"
@@ -574,11 +590,7 @@ def _qualified_handler(prefix: str, operator: ast.AST, *, limbs: int = 1,
     width = max(int(limbs or 1), 1)
     if width <= 1:
         return canonical
-    element = _widest_element(dtype)
-    generated = PRECISION_OPERATOR_NAMES.get(
-        (str(canonical), element, width)
-    )
-    return generated if generated is not None else canonical
+    return PRECISION_SINGULAR_NAMES.get(str(canonical), canonical)
 
 
 def _c_qualified_handler(prefix: str, operator: str) -> str:
@@ -5605,14 +5617,18 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             left_limbs, left_type = _operand_precision(graph, expression.left)
             right_limbs, right_type = _operand_precision(
                 graph, expression.right)
+            operand_limbs = max(left_limbs, right_limbs)
+            operand_element = _widest_element(left_type, right_type)
             operation = _qualified_handler(
                 "binop", expression.op,
-                limbs=max(left_limbs, right_limbs),
-                dtype=_widest_element(left_type, right_type),
+                limbs=operand_limbs, dtype=operand_element,
             )
             data["type"] = operation
             data["op"] = operation
             attributes = data.setdefault("attributes", {})
+            if operand_limbs > 1:
+                attributes["precision_limbs"] = operand_limbs
+                attributes["precision_element"] = operand_element
             attributes["source_type"] = "BinOp"
             sequence_operand = (
                 expression.left
@@ -5672,7 +5688,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             )
             data["type"] = operation
             data["op"] = operation
-            data.setdefault("attributes", {})["source_type"] = "UnaryOp"
+            attributes = data.setdefault("attributes", {})
+            if operand_limbs > 1:
+                attributes["precision_limbs"] = operand_limbs
+                attributes["precision_element"] = _widest_element(operand_type)
+            attributes["source_type"] = "UnaryOp"
             _replace_inputs(
                 graph,
                 node_id,
