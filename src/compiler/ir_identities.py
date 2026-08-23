@@ -1104,3 +1104,161 @@ def contract_multiply_add_to_fma(functions, licensed: bool | None = None) -> dic
                     )
                 ]
     return counts
+
+
+# ---------------------------------------------------------------------------
+# The API between SSA Fma and precision sections.
+#
+# A precision section is a stretch of SSA whose operations carry limbs. An
+# `Fma` inside one is not the same request as an `Fma` in ordinary code: in
+# ordinary code the single rounding is an improvement a contract licenses,
+# and emitting a multiply and an add instead is merely a slower, slightly
+# different answer. Inside a precision section the single rounding IS the
+# operation -- `a * b - fl(a * b)` under two roundings is not a worse
+# residual, it is zero -- so the same instruction carries an obligation the
+# ordinary one does not.
+#
+# This is what the two sides have to agree on, stated once here so each
+# backend can later be tuned against it rather than each inventing its own
+# reading. Nothing below emits or lowers anything; it is the description a
+# destination is measured against.
+# ---------------------------------------------------------------------------
+
+#: A destination must spell `Fma(x, y, z)` with exactly one rounding, or say
+#: it cannot. Substituting a multiply and an add is the one response that is
+#: WORSE THAN REFUSING: it compiles, it runs, it returns a plausible number,
+#: and the residual it computes is identically zero. A backend without an
+#: fma instruction is not thereby disqualified from every program -- it is
+#: disqualified from this section, and saying so is the whole obligation.
+FMA_SINGLE_ROUNDING = "fma.single_rounding"
+
+#: A destination must not reassociate or contract within the section, except
+#: at instructions the section itself declares as `Fma`. Both halves matter
+#: and they pull opposite ways: the error terms are algebraically zero, so
+#: any reassociating simplifier deletes them, while the declared Fma is a
+#: contraction that must happen. "Optimize nothing here" and "optimize
+#: everything here" are both wrong; the section says which instructions are
+#: which.
+SECTION_ISOLATION = "section.no_reassociation_except_declared_fma"
+
+#: A destination may stage the section's lanes concurrently, or serially.
+#: Unlike the other two this is permission, never obligation -- serial is
+#: always a correct answer -- so a backend that ignores it is conforming,
+#: not failing.
+LANE_STAGING = "lanes.optional_concurrency"
+
+#: Every obligation a precision section can place on a destination.
+PRECISION_SECTION_OBLIGATIONS = (
+    FMA_SINGLE_ROUNDING, SECTION_ISOLATION, LANE_STAGING,
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class PrecisionSectionContract:
+    """What one precision section presents, and what it requires of a host.
+
+    Derived from the instruction stream rather than declared by an author,
+    so it cannot drift from the code it describes.
+    """
+
+    function: str
+    #: Result ids of the section's instructions, in program order.
+    value_ids: tuple[int, ...]
+    #: The precision operation names present.
+    operations: tuple[str, ...]
+    #: Result ids of instructions that are `Fma` and must stay one rounding.
+    fma_value_ids: tuple[int, ...]
+    #: Widest limb count and element type in the section.
+    limbs: int
+    element: str | None
+    obligations: tuple[str, ...]
+
+    def as_record(self) -> dict:
+        return {
+            "function": self.function,
+            "value_ids": list(self.value_ids),
+            "operations": list(self.operations),
+            "fma_value_ids": list(self.fma_value_ids),
+            "limbs": self.limbs,
+            "element": self.element,
+            "obligations": list(self.obligations),
+        }
+
+    def unmet_by(self, capabilities) -> tuple[str, ...]:
+        """Obligations a destination declaring ``capabilities`` cannot meet.
+
+        Empty means the section may be lowered there. Anything else is a
+        shortfall to report BEFORE emitting, not a degradation to discover
+        in the numbers afterwards. ``LANE_STAGING`` never appears: it is
+        permission, so no destination can fail it.
+        """
+
+        declared = frozenset(str(each) for each in capabilities)
+        required = set(self.obligations) - {LANE_STAGING}
+        if not self.fma_value_ids:
+            required.discard(FMA_SINGLE_ROUNDING)
+        return tuple(sorted(required - declared))
+
+
+def precision_section_contracts(functions) -> tuple[PrecisionSectionContract, ...]:
+    """Read the contract each precision section places on a destination.
+
+    A section is the maximal run of consecutive instructions in one block
+    that carry limbs, plus any `Fma` sitting among them. Adjacency is the
+    right criterion here rather than dataflow reachability: what a
+    destination must refrain from reoptimizing is a contiguous stretch of
+    emitted code, and an `Fma` between two limbed operations is inside the
+    stretch whether or not it consumes one of them.
+    """
+
+    from ..common.tensors.topological_reducer import PRECISION_SINGULAR_NAMES
+
+    precision_ops = frozenset(PRECISION_SINGULAR_NAMES.values())
+    contracts: list[PrecisionSectionContract] = []
+
+    for name, function in functions.items():
+        for block in function.blocks.values():
+            runs: list[list] = []
+            current: list = []
+            for instruction in block.instrs:
+                if str(instruction.op) in precision_ops or (
+                    current and str(instruction.op) == FMA
+                ):
+                    current.append(instruction)
+                    continue
+                if current:
+                    runs.append(current)
+                    current = []
+            if current:
+                runs.append(current)
+
+            for run in runs:
+                if not any(str(each.op) in precision_ops for each in run):
+                    continue
+                limbs, element = 1, None
+                for each in run:
+                    limbs = max(
+                        limbs, int(each.attributes.get("precision_limbs") or 1)
+                    )
+                    # Taken independently of the limb count: an operation can
+                    # carry a width without yet knowing its element type, and
+                    # reading the element off whichever instruction happened
+                    # to be widest loses one that a neighbour does know.
+                    if element is None:
+                        element = each.attributes.get("precision_element")
+                contracts.append(PrecisionSectionContract(
+                    function=str(name),
+                    value_ids=tuple(
+                        int(each.res.id) for each in run
+                        if each.res is not None
+                    ),
+                    operations=tuple(sorted({str(each.op) for each in run})),
+                    fma_value_ids=tuple(
+                        int(each.res.id) for each in run
+                        if str(each.op) == FMA and each.res is not None
+                    ),
+                    limbs=limbs,
+                    element=None if element is None else str(element),
+                    obligations=PRECISION_SECTION_OBLIGATIONS,
+                ))
+    return tuple(contracts)
