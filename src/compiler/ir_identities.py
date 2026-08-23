@@ -717,9 +717,7 @@ PRECISION_REFUSALS: tuple[PrecisionIdentity, ...] = (
             "it whole can fold it away entirely. Knuth's and Dekker's "
             "proofs hold for one specific order of operations and for no "
             "other; the primal may be reassociated freely, the dual may not "
-            "be touched at all.
-
-"
+            "be touched at all. "
             "MEASURED, because the stronger claim is easy to assume and was "
             "asserted here before it was checked: gfortran at -ffast-math "
             "did NOT fold a raw two_sum residual, on inputs that genuinely "
