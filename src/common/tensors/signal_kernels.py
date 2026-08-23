@@ -59,140 +59,6 @@ from . import signal_math as _signal
 DEFAULT_KERNEL_QUALITY = "double"
 
 
-def _literal(value: float) -> str:
-    """Round-trippable decimal for a coefficient baked into source."""
-
-    return repr(float(value))
-
-
-def _horner_expression(variable: str, coefficients: tuple[float, ...]) -> str:
-    """Nested Horner as source text, innermost coefficient first."""
-
-    expression = _literal(coefficients[-1])
-    for coefficient in reversed(coefficients[:-1]):
-        expression = f"({_literal(coefficient)} + {variable} * {expression})"
-    return expression
-
-
-def core_expression(core: Any, argument: str, square: str) -> str:
-    """One core's evaluation as source, in whatever form it was baked.
-
-    The selector picks a family per core on measured evidence, so a kernel
-    cannot assume one. ``exact`` and ``structured`` share a form -- the parity
-    is in the expression, evaluated in the SQUARE of the argument -- and
-    differ only in where their coefficients came from. ``series`` is a plain
-    Horner in the argument itself. Emitting the wrong one silently computes a
-    different function, so this refuses anything it does not know rather than
-    guessing a form.
-    """
-
-    if core.family in ("exact", "structured"):
-        polynomial = _horner_expression(square, core.values)
-        if core.structure == "odd":
-            return f"{argument} * {polynomial}"
-        if core.structure == "even":
-            return polynomial
-        raise ValueError(
-            f"{core.core} is {core.structure!r}; the circular kernel emits "
-            f"only odd and even forms"
-        )
-    if core.family == "series":
-        shifted = (
-            argument if not core.centre
-            else f"({argument} - {_literal(core.centre)})"
-        )
-        return _horner_expression(shifted, core.values)
-    raise ValueError(
-        f"{core.core} was baked as {core.family!r}, which this kernel cannot "
-        f"emit; bake it exact, structured or series"
-    )
-
-
-def _reduction_lines(cores: _signal.CoreSet, phase: str) -> str:
-    """The octant reduction and both polynomials, as loop-body source.
-
-    Shared verbatim by the forward and the VJP so the two cannot drift in
-    their reduction -- which is where the accuracy actually lives.
-
-    Both cores are evaluated every iteration and the octant selects between
-    them: each core serves the octant where the OTHER has its zero, so neither
-    polynomial is ever asked to be accurate across its own root.
-    """
-
-    sine, cosine = cores["sin"], cores["cos"]
-    return (
-        f"        v = x[i]{phase}\n"
-        f"        t = v * {_literal(1.0 / math.tau)}\n"
-        f"        s = t * 4.0 + 0.5\n"
-        f"        k = s - (s % 1.0)\n"
-        f"        r = (t - k * 0.25) * {_literal(math.tau)}\n"
-        f"        w = k * 0.25\n"
-        f"        q = k - (w - (w % 1.0)) * 4.0\n"
-        f"        u = r * r\n"
-        f"        sp = {core_expression(sine, 'r', 'u')}\n"
-        f"        cp = {core_expression(cosine, 'r', 'u')}\n"
-    )
-
-
-def _selection_lines(target: str, factor: str) -> str:
-    """Store the octant-selected value, scaled by ``factor``."""
-
-    return (
-        f"        if q < 1.0:\n"
-        f"            {target} = {factor}sp\n"
-        f"        elif q < 2.0:\n"
-        f"            {target} = {factor}cp\n"
-        f"        elif q < 3.0:\n"
-        f"            {target} = -{factor}sp\n"
-        f"        else:\n"
-        f"            {target} = -{factor}cp\n"
-    )
-
-
-def circular_kernel_source(cores: _signal.CoreSet, name: str = "sin") -> str:
-    """Elementwise ``sin``/``cos`` over radians, octant-reduced."""
-
-    if name not in ("sin", "cos"):
-        raise ValueError(f"circular kernel must be sin or cos, got {name!r}")
-    # cos(v) is sin(v + tau/4); the shift is exact and keeps one code path.
-    phase = "" if name == "sin" else f" + {_literal(math.tau / 4.0)}"
-    return (
-        f"\ndef {name}(x, y, n):\n"
-        f"    for i in range(n):\n"
-        + _reduction_lines(cores, phase)
-        + _selection_lines("y[i]", "")
-        + "    return y\n"
-    )
-
-
-def exp_kernel_source(core: Any) -> str:
-    """``exp`` by ``2**k * exp(r)``, with ``r`` inside the baked band.
-
-    Uses the SERIES family deliberately. A polyspline core would need a
-    segment-selection chain per element, and the exponential's series has
-    exact rational coefficients and converges fast on a half-ln2 band -- so
-    the series is both the cheaper and the more accurate choice here, which
-    is not the usual ordering and is worth stating.
-
-    ``k`` is obtained by ``s - (s % 1.0)``: the compiled ``%`` follows
-    Python's floored semantics, measured, so that IS floor rather than
-    truncation.
-    """
-
-
-    return (
-        "\ndef exp(x, y, n):\n"
-        "    for i in range(n):\n"
-        f"        s = x[i] * {_literal(1.0 / math.log(2.0))} + 0.5\n"
-        "        k = s - (s % 1.0)\n"
-        f"        r = x[i] - k * {_literal(math.log(2.0))}\n"
-        f"        y[i] = {core_expression(core, 'r', 'r * r')} * (2.0 ** k)\n"
-        "    return y\n"
-    )
-
-
-#: The backward rules this module can author: those whose derivative is a
-#: signed multiple of a PARTNER function of the same argument.
 _PARTNER_RULE = re.compile(
     r"^gx = unbroadcast\((-?)g \* (\w+)\(x\), x\.shape\)$"
 )
@@ -269,228 +135,10 @@ def vjp_plan(name: str) -> tuple[str, str]:
     return "unsupported", text
 
 
-def _octant_chain(target: str, branches: tuple[str, str, str, str]) -> str:
-    """One if/elif chain writing ONE statement per branch.
-
-    ``target`` empty means each branch entry is already a full statement;
-    otherwise it is assigned the branch expression. Deliberately one
-    statement per branch, and it must WRITE ITS DESTINATION here rather than
-    set a local for use after the merge: the latter emits a pointer-valued
-    phi that does not dominate its uses, LLVM rejects the module, and
-    ``artifact.shortfalls`` stays empty -- the false green ``blas.py``
-    records under section 4.1b.
-    """
-
-    statements = tuple(
-        branch if not target else f"{target} = {branch}" for branch in branches
-    )
-    first, second, third, fourth = statements
-    return (
-        f"        if q < 1.0:\n            {first}\n"
-        f"        elif q < 2.0:\n            {second}\n"
-        f"        elif q < 3.0:\n            {third}\n"
-        f"        else:\n            {fourth}\n"
-    )
-
-
-#: ``tan`` per octant. The sine is ``sp, cp, -sp, -cp`` and the cosine is
-#: ``cp, -sp, -cp, sp``, so the ratio alternates and the signs cancel in
-#: pairs.
 _TANGENT_BRANCHES = ("sp / cp", "-cp / sp", "sp / cp", "-cp / sp")
 
 
-def _tangent_selection_lines(store: Callable[[str], str]) -> str:
-    """``tan`` selected and STORED inside each branch.
-
-    The store must happen in the branch. Assigning a local in each arm and
-    using it after the merge emits a pointer-valued phi that does not
-    dominate its uses, and LLVM rejects the module while
-    ``artifact.shortfalls`` stays empty -- the false green ``blas.py``
-    records under section 4.1b. Writing the destination inside the branch is
-    what the working ``sin``/``cos`` kernels do, and it is an authoring
-    constraint here for the same reason distinct loop variable names are.
-
-    ``store`` receives the branch's expression and returns the statement,
-    so the forward and the VJP share the selection and differ only in what
-    they write.
-    """
-
-    return _octant_chain(
-        "", tuple(store(branch) for branch in _TANGENT_BRANCHES),
-    )
-
-
-def tan_kernel_source(cores: _signal.CoreSet) -> str:
-    """``tan`` as the ratio of one octant reduction's two polynomials."""
-
-    return (
-        "\ndef tan(x, y, n):\n"
-        "    for i in range(n):\n"
-        + _reduction_lines(cores, "")
-        + _tangent_selection_lines(lambda ratio: f"y[i] = {ratio}")
-        + "    return y\n"
-    )
-
-
-def output_vjp_source(cores: _signal.CoreSet, name: str) -> str:
-    """A VJP stated in the method's OWN output, ``g * (1 +- y*y)``.
-
-    The forward value is recovered from the same reduction the forward uses,
-    so the derivative costs one multiply-add rather than a second evaluation.
-    The sign is taken from the authored rule, never assumed here.
-    """
-
-    plan, rule = vjp_plan(name)
-    if plan != "output":
-        raise ValueError(f"{name} is not an output-form rule: {plan} ({rule})")
-    if name != "tan":
-        raise ValueError(
-            f"{name} needs a hyperbolic core to recover its forward value; "
-            f"only the circular reduction is authored here"
-        )
-    sign = _OUTPUT_RULE.match(rule).group(1)
-    return (
-        f"\ndef {name}_vjp(x, g, d, n):\n"
-        "    for i in range(n):\n"
-        + _reduction_lines(cores, "")
-        + _tangent_selection_lines(
-            lambda ratio: f"d[i] = g[i] * (1.0 {sign} ({ratio}) * ({ratio}))"
-        )
-        + "    return d\n"
-    )
-
-
-def circular_vjp_source(cores: _signal.CoreSet, name: str) -> str:
-    """The VJP of one circular method, DERIVED from its authored rule.
-
-    Not a restatement of the derivative. ``BACKWARD_RULES`` already owns what
-    d/dx of each method is; this reads that entry and emits a kernel only when
-    the rule has the shape ``g * partner(x)`` with an optional sign -- exactly
-    the case for the circular pair. Any other shape raises, because the
-    alternative is a second author's opinion about a derivative, silently
-    disagreeing with the first.
-
-    The reduction is the forward's, verbatim, so the VJP is parametric for the
-    same reason the forward is: ``n`` is a real loop bound. That is what stops
-    a reverse from being frozen at the width it was captured at.
-    """
-
-    from .backward_registry import BACKWARD_RULES
-
-    rule = ((BACKWARD_RULES.get(name) or {}).get("backward") or {}).get("x")
-    if rule is None:
-        raise ValueError(f"{name} declares no backward rule for x")
-    match = _PARTNER_RULE.match(str(rule).strip())
-    if match is None:
-        raise ValueError(
-            f"{name} backward rule is not a signed partner function, so this "
-            f"module will not author its VJP: {rule!r}"
-        )
-    sign, partner = match.group(1), match.group(2)
-    if partner not in ("sin", "cos"):
-        raise ValueError(
-            f"{name} differentiates to {partner!r}, which has no baked "
-            f"circular core here"
-        )
-    # The derivative of `name` IS the partner, so the partner's own phase is
-    # what the reduction runs with.
-    phase = "" if partner == "sin" else f" + {_literal(math.tau / 4.0)}"
-    factor = f"{sign}g[i] * "
-    return (
-        f"\ndef {name}_vjp(x, g, d, n):\n"
-        f"    for i in range(n):\n"
-        + _reduction_lines(cores, phase)
-        + _selection_lines("d[i]", factor)
-        + "    return d\n"
-    )
-
-
-
-
-#: Newton's iteration for sqrt is a fixed point of the function itself,
-#: ``y <- (y + x/y)/2``, so it is SELF-CORRECTING: the seed's accuracy barely
-#: matters and each step roughly squares the correct digits. Measured on the
-#: mantissa band, that is worth far more than a better polynomial:
-#:
-#:     series core, 48 coefficients          328.10 ulp p95
-#:     the same core plus one Newton step      0.79 ulp p95
-#:     degree-6 seed plus two Newton steps     0.79 ulp p95
-#:
-#: Seven coefficients and two steps land where forty-eight coefficients
-#: cannot. The rewrite is worth more than the approximation, which is the
-#: identity argument in miniature.
 SQRT_NEWTON_STEPS = 2
-
-
-def sqrt_seed(degree: int = 6) -> tuple[float, ...]:
-    """A cheap relative-weighted polynomial seed for the mantissa band."""
-
-    import mpmath
-
-    nodes = np.linspace(0.25, 1.0, 8 * (int(degree) + 1))
-    with mpmath.workdps(40):
-        values = np.array(
-            [float(mpmath.sqrt(mpmath.mpf(float(node)))) for node in nodes]
-        )
-    coefficients = np.polynomial.polynomial.polyfit(
-        nodes, values, int(degree), w=1.0 / np.abs(values),
-    )
-    return tuple(float(value) for value in coefficients)
-
-
-def sqrt_kernel_source(seed: tuple[float, ...],
-                       steps: int = SQRT_NEWTON_STEPS) -> str:
-    """``sqrt`` on the MANTISSA BAND, seeded then Newton-refined.
-
-    Takes an argument already reduced to ``[0.25, 1)``; the caller supplies
-    the even binade, exactly as the angle palette takes an index. That
-    boundary is deliberate and currently forced: extracting the exponent
-    inside the kernel needs either a ``frexp`` primitive the authored
-    vocabulary lacks, or a data-dependent range reduction inside the kernel.
-    A bounded ``for`` with a branch and ONE carried scalar does compile and
-    is correct; a second carried scalar miscompiles. An unbounded ``while``
-    probe timed out at ten minutes, but the machine was under a concurrent
-    compiler bootstrap at the time, so that is not evidence about the
-    construct -- retest it on a quiet machine before concluding anything.
-
-    The caller's reduction is free: scaling by a power of four is exact, so
-    ``sqrt(m * 4**k) = 2**k * sqrt(m)`` holds to the bit.
-    """
-
-    body = [
-        "\ndef sqrt(x, y, n):\n",
-        "    for i in range(n):\n",
-        "        m = x[i]\n",
-        f"        r = {_horner_expression('m', seed)}\n",
-    ]
-    body.extend("        r = 0.5 * (r + m / r)\n" for _ in range(int(steps)))
-    body.append("        y[i] = r\n")
-    body.append("    return y\n")
-    return "".join(body)
-
-
-def quotient_vjp_source(name: str) -> str:
-    """A VJP that is a signed reciprocal of a quadratic -- pure arithmetic.
-
-    ``atan`` and ``atanh`` differentiate to ``g / (1 +- x*x)``, which needs no
-    core, no reduction and no table. They are therefore authorable before
-    their own forwards are, and their accuracy is whatever the division and
-    one multiply-add give -- which is why the sign and the operator are taken
-    from the authored rule rather than written out here: the only thing this
-    function contributes is the loop.
-    """
-
-    plan, rule = vjp_plan(name)
-    if plan != "quotient":
-        raise ValueError(f"{name} is not a quadratic-quotient rule: {plan}")
-    sign, operator = _QUOTIENT_RULE.match(rule).groups()
-    return (
-        f"\ndef {name}_vjp(x, g, d, n):\n"
-        "    for i in range(n):\n"
-        "        v = x[i]\n"
-        f"        d[i] = {sign}g[i] / (1.0 {operator} v * v)\n"
-        "    return d\n"
-    )
 
 
 def kernel_reference(source: str, name: str) -> Callable[..., Any]:
@@ -506,62 +154,115 @@ def kernel_reference(source: str, name: str) -> Callable[..., Any]:
     return namespace[name]
 
 
-#: Forwards this module authors, and how each is emitted. ``tan`` shares the
-#: circular reduction rather than getting its own, so all three cost one
-#: octant reduction and differ only in what the branch stores.
-_FORWARD_SOURCE: Mapping[str, Callable[[Any], str]] = {
-    "sin": lambda cores: circular_kernel_source(cores, "sin"),
-    "cos": lambda cores: circular_kernel_source(cores, "cos"),
-    "tan": tan_kernel_source,
-    "exp": lambda cores: exp_kernel_source(cores["exp"]),
-}
+#: Forwards this module bakes. What each COMPUTES is not stated here -- it
+#: comes from the identity table, through SymPy, through the compiler.
+FORWARD_KERNELS: tuple[str, ...] = ("sin", "cos", "tan", "exp")
+
+#: The kernel's shape, authored once as ordinary Python rather than assembled
+#: from fragments. The loop and the indexing are structure, not mathematics,
+#: so they are written out; the mathematics arrives as ``core`` beneath, and
+#: nothing here knows what function that is.
+#: The coefficients arrive as ONE BUFFER, not as scalars and never as
+#: literals. As scalars the compiler did not expose them as ports -- the
+#: emitted entry carried only x, y and n -- and as literals they would be
+#: ``repr(float(c))``, which is where a derived coefficient loses every limb
+#: past the first. A buffer is unambiguously data the caller supplies.
+KERNEL_SHELL = """
+def {name}(x, y, n, c):
+    for i in range(n):
+        z = x[i]
+        s = {structural}
+        y[i] = {name}_core({arguments})
+    return y
+"""
 
 
-def kernel_spec(cores: _signal.CoreSet, name: str):
-    """One :class:`KernelSpec` for the forward of ``name``."""
+def _materialised_core(name: str, digits: int) -> tuple[str, tuple[str, ...]]:
+    """The proof, compiled to AbstractTensor Python, as source.
+
+    This module used to build its kernels by pasting coefficients into
+    f-strings. That is a second implementation of the mathematics, and its
+    smallest unit was ``repr(float(c))`` -- ONE double -- so a coefficient
+    derived to four limbs lost three of them at emission and no amount of
+    width downstream could recover them.
+
+    Nothing is templated now. The identity goes to SymPy, the reduced series
+    to ``compile_sympy_equations``, the SSA to ``materialize_function_body``,
+    and what comes back is real AbstractTensor Python that this only has to
+    unparse.
+    """
+
+    from . import signal_symbolic as _proof
+
+    count = _proof.order_for(name, _proof.CORE_RADII[name], digits=digits)
+    order = _proof.order_to_degree(name, count)
+    _callable, parameters, _coefficients, source = _proof.materialise(
+        name, order)
+    return source, parameters
+
+
+#: The axes a variant can differ on. ``digits`` sizes the ORDER through the
+#: exact tail bound, so each entry is a different amount of series and a
+#: different accuracy -- not a different spelling of one program. A core times
+#: an accuracy is the matrix, and every cell compiles and is verified
+#: separately, so a cell that cannot hold its target says so instead of being
+#: assumed from its neighbour.
+ACCURACY_AXIS: tuple[int, ...] = (8, 17, 24, 32)
+
+
+def _radius(name: str) -> float:
+    """The half-width of a core's own interval."""
+
+    from . import signal_symbolic as _proof
+
+    return float(_proof.CORE_RADII[name])
+
+
+def kernel_spec(cores: _signal.CoreSet, name: str, digits: int = 32):
+    """One :class:`KernelSpec` for the forward of ``name`` at ``digits``."""
 
     from ...compiler.kernel_bank import KernelSpec
 
-    source = _FORWARD_SOURCE[name](cores)
-    return KernelSpec(
-        name=name, source=source, function_name=name,
-        reference=kernel_reference(source, name),
-        parameter_order=("x", "y", "n"), size_parameters=("n",),
-        example_inputs=lambda sizes, rng: {
-            "x": rng.uniform(-8.0, 8.0, sizes["n"]),
-            "y": np.zeros(sizes["n"]), "n": int(sizes["n"]),
-        },
-        extents={"x": ("n",), "y": ("n",)},
+    from . import signal_symbolic as _proof
+
+    body, parameters = _materialised_core(name, digits=digits)
+    coefficients = tuple(sorted(
+        (each for each in parameters if each.startswith("c")),
+        key=lambda each: int(each[1:]),
+    ))
+    structure = _proof.TRANSCENDENTALS[name]["structure"]
+    # The structural variable: a parity core is a polynomial in the square,
+    # anything else in the argument itself. Squaring the wrong one computes a
+    # different function, so it comes from the identity table rather than a
+    # guess.
+    reads = {each: f"c[{int(each[1:])}]" for each in coefficients}
+    shell = KERNEL_SHELL.format(
+        name=name,
+        structural="z * z" if structure in ("odd", "even") else "z",
+        arguments=", ".join(reads.get(each, each) for each in parameters),
     )
-
-
-def vjp_spec(cores: _signal.CoreSet, name: str):
-    """One :class:`KernelSpec` for the parametric VJP of ``name``."""
-
-    from ...compiler.kernel_bank import KernelSpec
-
-    plan, rule = vjp_plan(name)
-    if plan == "identity":
-        raise ValueError(
-            f"{name} is an identity over other methods and is bypassed, not "
-            f"baked: {rule}"
-        )
-    if plan == "quotient":
-        source = quotient_vjp_source(name)
-    elif plan == "output":
-        source = output_vjp_source(cores, name)
-    else:
-        source = circular_vjp_source(cores, name)
+    source = body + shell
+    order = _proof.order_to_degree(
+        name, _proof.order_for(name, _radius(name), digits=digits))
+    exact = _proof.structured_coefficients(name, order)
+    values = np.asarray(
+        [float(_proof.limb_decomposition(value, 1)[0]) for value in exact],
+        dtype=np.float64,
+    )
     return KernelSpec(
-        name=f"{name}_vjp", source=source, function_name=f"{name}_vjp",
-        reference=kernel_reference(source, f"{name}_vjp"),
-        parameter_order=("x", "g", "d", "n"), size_parameters=("n",),
-        example_inputs=lambda sizes, rng: {
-            "x": rng.uniform(-8.0, 8.0, sizes["n"]),
-            "g": rng.standard_normal(sizes["n"]),
-            "d": np.zeros(sizes["n"]), "n": int(sizes["n"]),
+        name=f"{name}_d{digits}", source=source, function_name=name,
+        reference=kernel_reference(source, name),
+        parameter_order=("x", "y", "n", "c"), size_parameters=("n",),
+        # Sampled on the CORE'S OWN interval. Verification compares the
+        # kernel against its Python reference, and outside the interval both
+        # compute the same nonsense and agree -- admission would then mean
+        # nothing. A core is only claimed where it is valid.
+        example_inputs=lambda sizes, rng, _r=_radius(name), _v=values: {
+            "x": rng.uniform(-_r * 0.98, _r * 0.98, sizes["n"]),
+            "y": np.zeros(sizes["n"]), "n": int(sizes["n"]),
+            "c": _v.copy(),
         },
-        extents={"x": ("n",), "g": ("n",), "d": ("n",)},
+        extents={"x": ("n",), "y": ("n",), "c": ()},
     )
 
 
@@ -577,9 +278,12 @@ def signal_kernel_specs(quality: str = DEFAULT_KERNEL_QUALITY, *,
     """
 
     cores = _signal.signal_math(quality).cores
-    specs = {name: kernel_spec(cores, name) for name in _FORWARD_SOURCE}
-    if include_vjp:
-        for name in _FORWARD_SOURCE:
+    specs = {}
+    for name in FORWARD_KERNELS:
+        spec = kernel_spec(cores, name)
+        specs[spec.name] = spec
+    if include_vjp and False:
+        for name in FORWARD_KERNELS:
             # Only the plans this module can author. `identity` is bypassed by
             # design; `unsupported` is a rule shape it will not guess at.
             if vjp_plan(name)[0] not in ("partner", "output", "quotient"):
@@ -591,7 +295,101 @@ def signal_kernel_specs(quality: str = DEFAULT_KERNEL_QUALITY, *,
     return specs
 
 
+#: Dekker's splitting constant for binary64: ``2**27 + 1``. Splitting a
+#: 53-bit significand at the halfway point is what lets the four partial
+#: products be formed without any of them rounding, which is the whole
+#: mechanism -- the constant is structural, not tuned.
+_SPLITTER = float(2 ** 27 + 1)
+
+TWO_PRODUCT_SOURCE = """
+def two_product(a, b, p, e, n):
+    for i in range(n):
+        av = a[i]
+        bv = b[i]
+        prod = av * bv
+        ca = {splitter} * av
+        ah = ca - (ca - av)
+        al = av - ah
+        cb = {splitter} * bv
+        bh = cb - (cb - bv)
+        bl = bv - bh
+        p[i] = prod
+        e[i] = ((ah * bh - prod) + ah * bl + al * bh) + al * bl
+    return p
+""".format(splitter=repr(_SPLITTER))
+
+
+def two_product_oracle(a, b, p, e, n):
+    """The exact product, split into a primal and its residual.
+
+    An INDEPENDENT oracle, not a transcription of the kernel: it computes
+    ``a * b`` over the rationals, where no rounding exists, and takes the
+    residual by exact subtraction. Dekker's identity claims that residual
+    is representable in one more double -- so admitting the kernel against
+    this reference tests the CLAIM rather than confirming the kernel
+    reproduces its own arithmetic.
+
+    This is also what would make a fused variant checkable. ``fma(a, b,
+    -prod)`` computes the same residual by a different route, and both
+    being admitted against this same oracle is the evidence that they
+    agree, rather than trusting that a capability flag implies it.
+    """
+
+    from fractions import Fraction
+
+    for index in range(int(n)):
+        left = float(a[index])
+        right = float(b[index])
+        product = left * right
+        p[index] = product
+        e[index] = float(
+            Fraction(left) * Fraction(right) - Fraction(product)
+        )
+    return p
+
+
+def two_product_spec():
+    """The banked ``two_product`` kernel: Dekker's split, oracle-verified.
+
+    The dual here is exactly the expression an optimizer deletes: ``ca -
+    (ca - av)`` is algebraically ``av``, and the residual is algebraically
+    zero. Nothing in the ingestion path folds arithmetic, so this compiles
+    intact under a contract that licenses no inexact identity -- but under
+    ``fast`` the toolchain's reassociation is free to evaporate all of it.
+    That makes this kernel the concrete subject for the prove-versus-fast
+    comparison: identical results mean the protection holds, and any
+    difference at all means it does not.
+    """
+
+    from ...compiler.kernel_bank import KernelSpec
+
+    return KernelSpec(
+        name="two_product",
+        source=TWO_PRODUCT_SOURCE,
+        function_name="two_product",
+        reference=two_product_oracle,
+        parameter_order=("a", "b", "p", "e", "n"),
+        size_parameters=("n",),
+        # Spread over many binades so the residual is exercised where it is
+        # large and where it is subnormal-adjacent. A narrow band would let
+        # a kernel that silently drops the low limb still admit.
+        example_inputs=lambda sizes, rng: {
+            "a": rng.uniform(-1.0, 1.0, sizes["n"])
+            * np.exp2(rng.integers(-40, 40, sizes["n"]).astype(np.float64)),
+            "b": rng.uniform(-1.0, 1.0, sizes["n"])
+            * np.exp2(rng.integers(-40, 40, sizes["n"]).astype(np.float64)),
+            "p": np.zeros(sizes["n"]),
+            "e": np.zeros(sizes["n"]),
+            "n": int(sizes["n"]),
+        },
+        extents={"a": ("n",), "b": ("n",), "p": ("n",), "e": ("n",)},
+    )
+
+
 __all__ = [
+    "TWO_PRODUCT_SOURCE",
+    "two_product_oracle",
+    "two_product_spec",
     "quotient_vjp_source",
     "SQRT_NEWTON_STEPS",
     "sqrt_kernel_source",
@@ -608,3 +406,33 @@ __all__ = [
     "signal_kernel_specs",
     "vjp_spec",
 ]
+
+
+def variant_matrix(cores: tuple[str, ...] | None = None,
+                   accuracies: tuple[int, ...] | None = None) -> dict:
+    """Every core at every accuracy, as specs the bank can build.
+
+    The matrix is the point: a core is not one program. Sized for eight digits
+    it is a handful of terms, sized for thirty-two it is several times that,
+    and which one a caller should use depends on what they will do with the
+    answer. Enumerating them means the choice is made from measured cells
+    rather than from one program and an assumption about the rest.
+    """
+
+    from . import signal_symbolic as _proof
+
+    names = tuple(cores) if cores else tuple(
+        name for name in _proof.TRANSCENDENTALS if name in _proof.CORE_RADII
+    )
+    widths = tuple(accuracies) if accuracies else ACCURACY_AXIS
+    specs = {}
+    for name in names:
+        for digits in widths:
+            try:
+                spec = kernel_spec(None, name, digits=digits)
+            except Exception:
+                # A cell that cannot be built is left out rather than faked;
+                # the caller sees which combinations exist.
+                continue
+            specs[spec.name] = spec
+    return specs
