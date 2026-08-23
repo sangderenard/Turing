@@ -426,178 +426,108 @@ def drop_dead_pure_region_calls(functions) -> int:
     return removed_total
 
 
-# --------------------------------------------------------------------------
-# Redundancy: one definition per distinct value, one computation per
-# distinct expression. Catalogue sections 3 and 2.3.
+def carry_precision_through_ssa(functions) -> int:
+    """Make a precision result self-describing, then rename what reads it.
 
+    Not an identity -- nothing here is rewritten into a cheaper equivalent.
+    It lives beside them because it consumes repository SSA under the same
+    ``(functions) -> count`` shape, and because every identity written for
+    the precision operations needs this to have run first: until it does,
+    precision stops at the first undeclared temporary and a chain is only
+    ever visible as isolated operations.
 
-#: Operations whose result depends only on their operands -- no store, no
-#: call, no table traffic -- and which may therefore be shared when two of
-#: them compute the same thing.
-_PURE_FOR_SHARING = frozenset({
-    "Neg", "Add", "Sub", "Mul", "Div", "Pow", "Sqrt", "Abs",
-    "Max", "Min", "Eq", "Ne", "Lt", "Le", "Gt", "Ge", "FloorDiv", "Mod",
-    "Cast",
-})
+    Ingestion can name an operation ``precision_*`` only where the source
+    DECLARED an operand's width, because it walks the AST and no SSA value
+    exists yet to ask. The result of such an operation is a genuine limbed
+    quantity, but it is emitted as a bare scalar -- ``float64``, shape
+    ``()`` -- so the next operation cannot tell it apart from ordinary
+    arithmetic and lowers as ordinary arithmetic.
 
+    Here the values exist, so the property can live on the value the way it
+    lives on an ``AbstractTensor``: the limb count becomes a channel in the
+    LAST dimension, which is the same layout the tensor uses and the same
+    one a backend will stride. Shape alone is ambiguous -- a trailing axis
+    of 2 could be a real tensor axis -- so ``accounting`` records that the
+    axis IS limbs. The shape is the layout; the accounting is the fact.
 
-def _protected_value_ids(function) -> set[int]:
-    """Ids other machinery names BY NUMBER, whose definition must survive.
-
-    Sharing rewrites uses, so a value named only as an operand is free to be
-    redirected. A value named in metadata is not: nothing rewrites the
-    metadata, so removing its definition strands the reference.
+    Propagation then stops being inference and becomes a read: an ordinary
+    operation one of whose operands carries the limb fact is a precision
+    operation, and is renamed to say so. Iterated to a fixed point, since
+    renaming one instruction makes its result the evidence for the next.
     """
 
-    protected: set[int] = set()
-    for key in ("source_output_value_ids", "required_source_value_ids"):
-        protected.update(
-            int(value_id) for value_id in (function.metadata.get(key) or ())
-        )
-    for name_value in (function.metadata.get("named_outputs") or ()):
+    from ..common.tensors.topological_reducer import (
+        PRECISION_CLOSED_OPERATIONS, PRECISION_SINGULAR_NAMES,
+    )
+
+    singular = dict(PRECISION_SINGULAR_NAMES)
+    planted = {name: operation for operation, name in singular.items()}
+    changed_total = 0
+
+    def limbs_of(value) -> int:
         try:
-            protected.add(int(name_value[1]))
-        except (TypeError, ValueError, IndexError):
-            continue
-    for port_id, port_value in dict(
-        function.metadata.get("carried_port_values") or {}
-    ).items():
-        protected.add(int(port_id))
-        try:
-            protected.add(int(port_value.id))
-        except (AttributeError, TypeError, ValueError):
-            continue
-    return protected
+            record = value.accounting or {}
+        except AttributeError:
+            return 1
+        return max(int(record.get("precision_limbs") or 1), 1)
 
+    def carry(value, limbs: int, element: str | None) -> bool:
+        """Give one result value the limb channel and the fact."""
 
-def _resolve(replacement: dict, value):
-    """Follow a replacement chain to the surviving definition."""
+        if value is None or limbs <= 1 or limbs_of(value) == limbs:
+            return False
+        value.accounting["precision_limbs"] = int(limbs)
+        value.accounting["precision_element"] = str(
+            element or value.dtype or ""
+        ) or None
+        existing = tuple(value.shape or ())
+        # Idempotent: a re-run must not append a second channel.
+        if not existing or existing[-1] != int(limbs):
+            value.shape = (*existing, int(limbs))
+        return True
 
-    identifier = getattr(value, "id", None)
-    seen = 0
-    while identifier is not None and identifier in replacement:
-        value = replacement[identifier]
-        identifier = getattr(value, "id", None)
-        seen += 1
-        if seen > len(replacement):
-            break
-    return value
-
-
-def _rewrite_uses(function, replacement: dict) -> None:
-    if not replacement:
-        return
-    for block in function.blocks.values():
-        rewritten = []
-        for instruction in block.instrs:
-            arguments = list(instruction.args or ())
-            changed = False
-            for index, argument in enumerate(arguments):
-                settled = _resolve(replacement, argument)
-                if settled is not argument:
-                    arguments[index] = settled
-                    changed = True
-            rewritten.append(
-                dataclasses.replace(instruction, args=arguments)
-                if changed else instruction
-            )
-        block.instrs = rewritten
-
-
-def deduplicate_constants(functions) -> int:
-    """One ``Const`` definition per distinct value, per block.
-
-    Worth having for itself -- the measured kernels carry 28 and 74 ``Const``
-    instructions for 17 and 31 distinct values -- but worth much more for what
-    it UNBLOCKS. Two structurally identical expressions are invisible to
-    common-subexpression elimination while their equal constants are separate
-    values: ``Mul(v, %8)`` and ``Mul(v, %12)`` do not match when ``%8`` and
-    ``%12`` both hold 134217729.0. Measured on the same kernels, CSE alone
-    finds ONE duplicate; run after this, it finds thirteen and fifty-six.
-
-    So the two belong in this order, and the ordering is the point rather
-    than an implementation detail.
-
-    Scoped per block: a block's own earlier definition dominates every use
-    the removed one dominated, so no dominance analysis is required to know
-    the rewrite is legal.
-    """
-
-    removed = 0
     for function in functions.values():
-        protected = _protected_value_ids(function)
-        replacement: dict = {}
-        for block in function.blocks.values():
-            canonical: dict = {}
-            kept = []
-            for instruction in block.instrs:
-                value = (_constant_value(instruction)
-                         if instruction.op in ("Const", "const") else None)
-                if value is None or instruction.res is None:
-                    kept.append(instruction)
-                    continue
-                key = (repr(value), instruction.res.dtype,
-                       tuple(instruction.res.shape or ()))
-                if key in canonical and int(instruction.res.id) not in protected:
-                    replacement[int(instruction.res.id)] = canonical[key]
-                    removed += 1
-                    continue
-                canonical.setdefault(key, instruction.res)
-                kept.append(instruction)
-            block.instrs = kept
-        _rewrite_uses(function, replacement)
-    return removed
-
-
-def eliminate_common_subexpressions(functions) -> int:
-    """One computation per distinct pure expression, per block.
-
-    Exactly result-preserving: the surviving instruction computes the same
-    operation on the same operands, so every use sees the bit pattern it saw
-    before. This is not a numerics policy question and needs no contract.
-
-    Error-free transformations make this unusually profitable. ``two_product``
-    splits BOTH its operands, so squaring a value splits it twice, and a
-    double-double Horner re-splits the same argument at every step. Measured
-    on the sine cores after constant deduplication: 13 of 182 instructions in
-    the mixed kernel and 56 of 652 in the full double-double one.
-
-    Scoped per block for the same dominance reason as the constants, which
-    also keeps it away from loop-carried values: a definition hoisted across
-    a back edge would change which iteration's value a use sees, and nothing
-    here moves an instruction.
-    """
-
-    removed = 0
-    for function in functions.values():
-        protected = _protected_value_ids(function)
-        replacement: dict = {}
-        for block in function.blocks.values():
-            canonical: dict = {}
-            kept = []
-            for instruction in block.instrs:
-                if (instruction.op not in _PURE_FOR_SHARING
-                        or instruction.res is None):
-                    kept.append(instruction)
-                    continue
-                arguments = [_resolve(replacement, argument)
-                             for argument in (instruction.args or ())]
-                if arguments != list(instruction.args or ()):
-                    instruction = dataclasses.replace(
-                        instruction, args=arguments)
-                key = (
-                    instruction.op,
-                    tuple(getattr(argument, "id", repr(argument))
-                          for argument in arguments),
-                    repr(sorted((instruction.attributes or {}).items(),
-                                key=str)),
-                )
-                if key in canonical and int(instruction.res.id) not in protected:
-                    replacement[int(instruction.res.id)] = canonical[key]
-                    removed += 1
-                    continue
-                canonical.setdefault(key, instruction.res)
-                kept.append(instruction)
-            block.instrs = kept
-        _rewrite_uses(function, replacement)
-    return removed
+        while True:
+            changed = 0
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    operation = str(instruction.op)
+                    attributes = instruction.attributes
+                    if operation in planted:
+                        limbs = max(
+                            int(attributes.get("precision_limbs") or 1), 1
+                        )
+                        element = attributes.get("precision_element")
+                    elif operation in PRECISION_CLOSED_OPERATIONS:
+                        # An ordinary operation reading a limbed operand.
+                        # Most limbs and highest precision decide, exactly
+                        # as they do at ingestion.
+                        limbs = max(
+                            (limbs_of(value) for value in instruction.args),
+                            default=1,
+                        )
+                        if limbs <= 1:
+                            continue
+                        element = next(
+                            (
+                                (value.accounting or {}).get(
+                                    "precision_element"
+                                )
+                                for value in instruction.args
+                                if limbs_of(value) > 1
+                            ),
+                            None,
+                        )
+                        instruction.op = singular[operation]
+                        attributes["precision_limbs"] = int(limbs)
+                        attributes["precision_element"] = element
+                        attributes["lowered_from"] = operation
+                        changed += 1
+                    else:
+                        continue
+                    if carry(instruction.res, limbs, element):
+                        changed += 1
+            if not changed:
+                break
+            changed_total += changed
+    return changed_total
