@@ -1418,10 +1418,131 @@ def lower_precision_operations(functions) -> dict:
     counts = {name: 0 for name in expandable}
     next_id = _module_watermark(functions)
 
-    for function in functions.values():
+    # -- the boundary, brought into line with the interior ----------------
+    #
+    # A precision value is n scalars everywhere inside a function, but a
+    # declared parameter still arrived as ONE. The two representations
+    # disagreeing at the boundary is what let a four-limb coefficient be
+    # undeliverable while the arithmetic that would consume it already
+    # worked, so a parameter used at width n becomes n formals: the
+    # declared one carries the high limb and the rest are appended.
+    #
+    # Appending rather than interleaving keeps every existing position
+    # valid, so a caller that does not know about limbs is unaffected.
+    #
+    # Width is read from the operations rather than from a declaration.
+    # The declaration is gone by now -- it lives in the AST -- but an
+    # operation records the width it was recognised at, and a parameter
+    # feeding a width-n operation is a width-n parameter. That also keeps
+    # this honest about parameters that are declared and never used at
+    # precision: they stay one scalar, because nothing needs more.
+    parameter_widths: dict[str, dict[int, int]] = {}
+    for name, function in functions.items():
+        formal_ids = {int(value.id) for value in function.args}
+        widths: dict[int, int] = {}
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if str(instruction.op) not in expandable:
+                    continue
+                width = max(
+                    int(instruction.attributes.get("precision_limbs") or 1), 1
+                )
+                for argument in instruction.args:
+                    if int(argument.id) in formal_ids and width > 1:
+                        widths[int(argument.id)] = max(
+                            widths.get(int(argument.id), 1), width
+                        )
+        if widths:
+            parameter_widths[str(name)] = widths
+
+    # A callee whose formals grew needs its callers to supply the new ones,
+    # and a caller can only do that if ITS matching formal grew too. Pushing
+    # the requirement back through call sites to a fixed point is what makes
+    # the change survive the wrapper/region pair the planner emits.
+    changed = True
+    while changed:
+        changed = False
+        for name, function in functions.items():
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.op not in ("Call", "call"):
+                        continue
+                    callee = str(instruction.attributes.get("callee") or "")
+                    wanted = parameter_widths.get(callee)
+                    if not wanted:
+                        continue
+                    target = functions.get(callee)
+                    if target is None:
+                        continue
+                    formals = list(target.args)
+                    caller_formals = {int(v.id) for v in function.args}
+                    here = parameter_widths.setdefault(str(name), {})
+                    for position, formal in enumerate(formals):
+                        width = wanted.get(int(formal.id), 1)
+                        if width <= 1 or position >= len(instruction.args):
+                            continue
+                        actual = int(instruction.args[position].id)
+                        if actual in caller_formals and here.get(actual, 1) < width:
+                            here[actual] = width
+                            changed = True
+
+    seeded: dict[str, list[list]] = {}
+    for name, function in functions.items():
+        widths = parameter_widths.get(str(name)) or {}
+        if not widths:
+            continue
+        rows: list[list] = []
+        for formal in list(function.args):
+            width = widths.get(int(formal.id), 1)
+            if width <= 1:
+                continue
+            row = [formal]
+            for _index in range(1, width):
+                extra = SSAValue(
+                    next_id, dtype=formal.dtype, shape=(),
+                    device=formal.device,
+                )
+                next_id += 1
+                function.args.append(extra)
+                row.append(extra)
+            rows.append(row)
+        seeded[str(name)] = rows
+
+    # Bind the new actuals at every call, matching formal order.
+    for name, function in functions.items():
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.op not in ("Call", "call"):
+                    continue
+                callee = str(instruction.attributes.get("callee") or "")
+                rows = seeded.get(callee)
+                target = functions.get(callee)
+                if not rows or target is None:
+                    continue
+                by_head = {int(row[0].id): row for row in rows}
+                caller_rows = {
+                    int(row[0].id): row
+                    for row in (seeded.get(str(name)) or [])
+                }
+                original = list(instruction.args)
+                for position, formal in enumerate(target.args):
+                    row = by_head.get(int(formal.id))
+                    if row is None or position >= len(original):
+                        continue
+                    actual = original[position]
+                    supply = caller_rows.get(int(actual.id))
+                    for index in range(1, len(row)):
+                        instruction.args.append(
+                            supply[index] if supply and index < len(supply)
+                            else actual
+                        )
+
+    for function_name, function in functions.items():
         # value id -> its limbs, high first. Absent means an ordinary value,
         # which is simply a one-limb expansion whose low limb is zero.
         limbs: dict[int, list] = {}
+        for row in seeded.get(str(function_name), ()):  # declared parameters
+            limbs[int(row[0].id)] = list(row)
 
         for block in function.blocks.values():
             if not any(
