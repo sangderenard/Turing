@@ -570,8 +570,18 @@ def _operand_precision(graph: Any, node: ast.AST) -> tuple[int, Optional[str]]:
     comes from a second subscript when the declaration gives one, because the
     width an operation is eventually emitted at is not derivable from the limb
     count alone.
+
+    An INDEXED operand is read through to the name it indexes: ``a[i]`` where
+    ``a`` is declared carries ``a``'s width. Limbs are a channel in the last
+    dimension, so subscripting an array of precision values selects one of
+    them and does not consume that axis -- the element is as limbed as the
+    array. Without this the declaration survives only on operands spelled as
+    bare names, which excludes every kernel that walks an array, and the loss
+    is silent: the operation simply lowers as ordinary arithmetic.
     """
 
+    while isinstance(node, ast.Subscript):
+        node = node.value
     if not isinstance(node, ast.Name):
         return 1, None
     try:
