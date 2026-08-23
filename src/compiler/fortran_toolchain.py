@@ -11,19 +11,40 @@ def is_gnu_fortran(compiler: str) -> bool:
     return "gfortran" in Path(compiler).name.casefold()
 
 
-def aggressive_fortran_flags(compiler: str) -> tuple[str, ...]:
-    """High optimization without relaxing IEEE/NaN program semantics."""
+def aggressive_fortran_flags(
+    compiler: str, *, precision_sections: bool = False,
+) -> tuple[str, ...]:
+    """High optimization without relaxing IEEE/NaN program semantics.
+
+    ``precision_sections`` names the one obligation optimization flags can
+    silently break: a module carrying limb arithmetic depends on every
+    multiply and add rounding separately except where it spelled
+    ``ieee_fma`` itself. The emitted expressions are already parenthesised
+    -- Fortran forbids reassociating across parentheses -- but contraction
+    is a rewrite the language leaves to the processor, and gfortran's
+    default is ``-ffp-contract=fast``. Withdrawing it per-artifact is what
+    lets the fortran lane claim SECTION_ISOLATION honestly: an explicit
+    ``ieee_fma`` call is an intrinsic invocation, not a contraction, so it
+    survives the flag. The cost lands only on modules that carry a
+    section; everything else keeps the contraction the fast contract wants.
+    """
 
     name = Path(compiler).name.casefold()
+    contract = ("-ffp-contract=off",) if precision_sections else ()
     if "gfortran" in name:
         return (
             "-O3", "-march=native", "-flto", "-funroll-loops",
-            "-fomit-frame-pointer", "-ffree-line-length-none",
+            "-fomit-frame-pointer", "-ffree-line-length-none", *contract,
         )
     if name.startswith(("ifx", "ifort")):
-        return ("-O3", "-xHost", "-ipo")
+        # ifx spells the withdrawal through the value-safety model; there
+        # is no narrower contraction-only switch that is also honoured.
+        return (
+            "-O3", "-xHost", "-ipo",
+            *(("-fp-model=precise",) if precision_sections else ()),
+        )
     if "flang" in name:
-        return ("-O3", "-march=native", "-flto")
+        return ("-O3", "-march=native", "-flto", *contract)
     return ("-O3",)
 
 

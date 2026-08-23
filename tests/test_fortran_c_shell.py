@@ -2423,6 +2423,171 @@ def test_generated_c_shell_reads_declared_file_port_into_bound_abi_parameters():
     assert "short initial state at binary_bytes" not in source
 
 
+def test_generated_c_shell_exports_native_file_broker_without_python():
+    parameter = Parameter(
+        "status", "output", "i64", "int64_t", "c_int64",
+        "reference", (1,), None, "status",
+    )
+    api = attach_shell_io(CompiledProgramAPI(
+        "file_broker", "fortran", "run",
+        (EntryPoint("run", "run", "control", (parameter,)),),
+    ), ShellIOManifest((ShellIORequest.create("files"),)))
+    module = FortranModule("file_broker", "", api=api)
+
+    source = emit_fortran_c_shell_source(module)
+
+    for operation in (
+        "open", "read", "write", "seek", "tell", "flush", "close",
+        "stat_size",
+    ):
+        assert f"turing_shell_file_{operation}(" in source
+    assert "TURING_FILE_HANDLE_CAPACITY" in source
+    assert "turing_shell_file_close_all();" in source
+    assert "static int turing_shell_file_fail(int status)" in source
+    assert "Python.h" not in source
+    assert "PyObject" not in source
+
+
+def _native_shell_write_plan():
+    return {
+        "schema": "turing.python-shell-file-context.v1",
+        "function": "write_payload",
+        "scope": "file-scope:1:1:1",
+        "operations": (
+            {
+                "operation": "open", "sequence": 0,
+                "arguments": (
+                    {"kind": "name", "name": "path"},
+                    {"kind": "literal", "value": "wb"},
+                ),
+                "result": "file_handle",
+            },
+            {
+                "operation": "write", "sequence": 1,
+                "arguments": (
+                    {"kind": "name", "name": "file_handle"},
+                    {"kind": "name", "name": "payload"},
+                ),
+                "result": "count",
+            },
+            {
+                "operation": "flush", "sequence": 2,
+                "arguments": ({"kind": "name", "name": "file_handle"},),
+                "result": None,
+            },
+            {
+                "operation": "close", "sequence": 3,
+                "arguments": ({"kind": "name", "name": "file_handle"},),
+                "result": None,
+            },
+        ),
+    }
+
+
+def _native_shell_write_module():
+    source = """
+module native_shell_write_fortran
+  use, intrinsic :: iso_c_binding
+  implicit none
+contains
+  subroutine write_payload(path_data, path_length, payload_data, &
+      payload_length, count) bind(C, name="write_payload")
+    integer(c_int8_t), intent(in) :: path_data(512)
+    integer(c_int64_t), value :: path_length
+    integer(c_int8_t), intent(in) :: payload_data(8)
+    integer(c_int64_t), value :: payload_length
+    integer(c_int64_t), intent(out) :: count
+    count = 0_c_int64_t
+  end subroutine write_payload
+end module native_shell_write_fortran
+"""
+    parameters = (
+        Parameter(
+            "path_data", "input", "u8", "uint8_t", "c_uint8",
+            "reference", (512,), None, "path",
+        ),
+        Parameter(
+            "path_length", "input", "i64", "int64_t", "c_int64",
+            "value", source_name="path_length", source_transform="sequence_length",
+        ),
+        Parameter(
+            "payload_data", "input", "u8", "uint8_t", "c_uint8",
+            "reference", (8,), None, "payload",
+        ),
+        Parameter(
+            "payload_length", "input", "i64", "int64_t", "c_int64",
+            "value", source_name="payload_length", source_transform="sequence_length",
+        ),
+        Parameter(
+            "count", "output", "i64", "int64_t", "c_int64",
+            "reference", source_name="count",
+        ),
+    )
+    api = CompiledProgramAPI(
+        "native_shell_write_fortran", "fortran", "write_payload",
+        (EntryPoint(
+            "write_payload", "write_payload", "control", parameters,
+        ),),
+        metadata={
+            "shell_io": {
+                "boundary_plan_schema": "turing.shell-boundary-plan.v1",
+                "boundary_plans": (_native_shell_write_plan(),),
+            },
+        },
+    )
+    api = attach_shell_io(
+        api, ShellIOManifest((ShellIORequest.create("files"),)),
+    )
+    return FortranModule("native_shell_write_fortran", source, api=api)
+
+
+def test_native_shell_consumes_file_boundary_plan_outside_backend_entry():
+    module = _native_shell_write_module()
+
+    source = emit_fortran_c_shell_source(module)
+
+    assert "turing_shell_file_open(" in source
+    assert "turing_shell_file_write(" in source
+    assert "turing_shell_file_flush(" in source
+    assert "turing_shell_file_close(" in source
+    assert source.index("write_payload(") < source.index(
+        "turing_shell_file_open(", source.index("int main(")
+    )
+    assert "return turing_shell_file_fail(10);" in source
+    assert "return turing_shell_file_fail(11);" in source
+    assert "turing_shell_file_" not in module.source
+
+
+@pytest.mark.skipif(
+    fortran_compiler() is None,
+    reason="no Fortran compiler installed",
+)
+def test_native_shell_executes_file_plan_around_plain_backend_entry(tmp_path):
+    module = _native_shell_write_module()
+    destination = (tmp_path / "written-by-shell-plan.bin").resolve()
+    encoded_path = os.fsencode(destination)
+    path_data = np.zeros(512, dtype=np.uint8)
+    path_data[:len(encoded_path)] = np.frombuffer(encoded_path, dtype=np.uint8)
+    payload_data = np.frombuffer(b"shell-ok", dtype=np.uint8).copy()
+
+    artifact = compile_fortran_module_c_shell(
+        module,
+        {
+            "path": path_data,
+            "path_length": np.asarray([len(encoded_path)], dtype=np.int64),
+            "payload": payload_data,
+            "payload_length": np.asarray([len(payload_data)], dtype=np.int64),
+        },
+        tmp_path / "build",
+        name="native_shell_boundary_plan",
+    )
+    payload = json.loads(artifact.run().stdout)
+
+    assert payload["outputs"]["count"] == {"first": 8.0, "sum": 8.0}
+    assert destination.read_bytes() == b"shell-ok"
+    assert "turing_shell_file_" not in module.source
+
+
 def test_generated_c_shell_loads_and_publishes_inout_state():
     parameters = (
         Parameter(

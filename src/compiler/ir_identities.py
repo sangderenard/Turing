@@ -26,6 +26,7 @@ correctly rounded ``pow`` rounds once.
 """
 from __future__ import annotations
 
+import contextlib as _contextlib
 import dataclasses
 
 from ..transmogrifier.ssa import Instr, SSAValue
@@ -527,6 +528,47 @@ def carry_precision_through_ssa(functions) -> int:
                         continue
                     if carry(instruction.res, limbs, element):
                         changed += 1
+            # The backward half of the same fact: a value CONSUMED at width
+            # n must be PRODUCED at width n. Forward renaming alone spreads
+            # only from limbed values outward, which strands any plain
+            # subchain that merely feeds a precision operation -- the even
+            # cores' ``s = z * z`` computed both operands unlimbed, so the
+            # squaring stayed ordinary, the loads behind ``z`` were never
+            # recognised as limb-strided, and a two-limb kernel silently
+            # read the wrong elements. Renaming the defining instruction
+            # here makes its operands evidence for the next forward sweep,
+            # so the recognition walks all the way back to the loads.
+            definitions = {
+                int(instruction.res.id): instruction
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.res is not None
+            }
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if str(instruction.op) not in planted:
+                        continue
+                    limbs = max(int(
+                        instruction.attributes.get("precision_limbs") or 1
+                    ), 1)
+                    if limbs <= 1:
+                        continue
+                    element = instruction.attributes.get("precision_element")
+                    for argument in instruction.args:
+                        if limbs_of(argument) > 1:
+                            continue
+                        producer = definitions.get(int(argument.id))
+                        if (
+                            producer is None
+                            or str(producer.op)
+                            not in PRECISION_CLOSED_OPERATIONS
+                        ):
+                            continue
+                        producer.attributes["precision_limbs"] = int(limbs)
+                        producer.attributes["precision_element"] = element
+                        producer.attributes["lowered_from"] = str(producer.op)
+                        producer.op = singular[str(producer.op)]
+                        changed += 1
             if not changed:
                 break
             changed_total += changed
@@ -590,29 +632,32 @@ PRECISION_IDENTITIES: tuple[PrecisionIdentity, ...] = (
         name="exact_identity_element",
         matches=("precision_add", "precision_mul"),
         exact=True,
-        requires=("constant_operand",),
+        requires=("constant_operand", "operand_special_value_fact"),
         effect="add(x, 0) -> x; mul(x, 1) -> x",
         justification=(
-            "Only against a literal exact zero or one. A value that merely "
+            "Only against a literal exact zero or one AND proved operand "
+            "special-value facts. A value that merely "
             "ROUNDS to zero or one is not an identity element: adding a "
             "denormal changes the low limb even when it cannot change the "
             "high one, and that low limb is the entire point of the "
-            "representation. Signed zero also disqualifies -- x + (-0.0) is "
-            "x except when x is -0.0 -- so the literal must be +0.0."
+            "representation. Signed zero and NaN payload behaviour also "
+            "disqualify a blind use rewrite: even x + (+0.0) changes -0.0."
         ),
     ),
     PrecisionIdentity(
         name="scaling_by_power_of_two",
         matches=("precision_mul",),
         exact=True,
-        requires=("constant_operand",),
+        requires=("constant_operand", "exponent_range_fact"),
         effect="scale every limb by the power of two; no transformation",
         justification=(
-            "Multiplication by a power of two only shifts the exponent, so "
-            "it is exact for every limb independently and preserves the "
+            "Within a proved normal exponent range, multiplication by a "
+            "power of two only shifts the exponent, so it is exact for every "
+            "limb independently and preserves the "
             "nonoverlapping property that makes the limbs a valid "
             "expansion. This is what makes Cody-Waite argument reduction "
-            "affordable: its range-reduction scalings cost nothing."
+            "affordable. Without that range fact, overflow and gradual "
+            "underflow make the shortcut false and it must not fire."
         ),
     ),
     PrecisionIdentity(
@@ -635,17 +680,14 @@ PRECISION_IDENTITIES: tuple[PrecisionIdentity, ...] = (
         name="single_renormalisation_per_chain",
         matches=("precision_add", "precision_sub"),
         exact=True,
-        requires=("chain_internal_consumers",),
+        requires=("chain_internal_consumers", "fixed_width_chain_proof"),
         effect="renormalise once at the end of a chain, not per operation",
         justification=(
-            "renorm(renorm(a + b) + c) == renorm(a + b + c). Renormalisation "
-            "redistributes limbs into nonoverlapping form; it does not "
-            "change the value the expansion represents, so an intermediate "
-            "one is needed only if something READS the intermediate. A "
-            "chain of n additions therefore needs one renormalisation, not "
-            "n. This is the largest win available here, and it became "
-            "visible only once precision propagated along a chain -- before "
-            "that every operation looked isolated and each one paid."
+            "Renormalisation itself preserves an expansion's exact sum, but "
+            "a FIXED-width chain may discard different trailing terms when "
+            "the intermediate renormalisation moves. The shortcut therefore "
+            "requires a proof that the chain's retained width contains every "
+            "intermediate term; internal-consumer shape alone is not proof."
         ),
     ),
     PrecisionIdentity(
@@ -780,8 +822,10 @@ def reduce_precision_operations(functions) -> dict:
     reduction. It needs the same machinery that entry needs, and should
     arrive with it rather than growing a private copy here.
 
-    ``sterbenz_cancellation`` waits on a proven range (catalogue section
-    5); the two kernel entries wait on the bank.
+    ``scaling_by_power_of_two`` and ``sterbenz_cancellation`` wait on proven
+    range facts; delayed renormalisation waits on a fixed-width chain proof;
+    the two kernel entries wait on the bank. Pattern shape is never promoted
+    into numerical evidence here.
 
     Returns a count per identity name.
     """
@@ -881,6 +925,10 @@ def reduce_precision_operations(functions) -> dict:
                     scale = constants.get(int(operand.id))
                     if scale is None or not is_power_of_two(scale):
                         continue
+                    if not instruction.attributes.get(
+                        "precision_scale_exponent_range_proven"
+                    ):
+                        continue
                     instruction.attributes["precision_form"] = "scale_per_limb"
                     instruction.attributes["precision_scale"] = scale
                     counts["scaling_by_power_of_two"] += 1
@@ -955,6 +1003,9 @@ def reduce_precision_operations(functions) -> dict:
                     result not in protected
                     and len(consumers) == 1
                     and str(consumers[0].op) in precision_ops
+                    and bool(instruction.attributes.get(
+                        "precision_fixed_width_chain_proven"
+                    ))
                 )
                 instruction.attributes["precision_renormalise"] = not internal
                 if internal:
@@ -1185,6 +1236,79 @@ PRECISION_SECTION_OBLIGATIONS = (
 )
 
 
+#: The two exact spellings of ``a * b == p + e``, and who needs which.
+#:
+#: ``"fma"`` is the two-instruction form: ``e = fma(a, b, -p)``. It is the
+#: cheap spelling, and the one that makes FMA_MANDATORY appear on a section's
+#: contract, because the single rounding IS the residual.
+#:
+#: ``"split"`` is Dekker's spelling through Veltkamp splitting -- seventeen
+#: ordinary operations, no fma anywhere. Same exact residual; the theorem
+#: needs only IEEE mul/add/sub. Choosing it is how a destination with no
+#: single-rounding fma (WebAssembly; WGSL and GLSL, whose ``fma()`` is
+#: permitted to round twice) hosts a section HONESTLY: the obligation is
+#: discharged by never being incurred, and the price is instruction count,
+#: not accuracy. The eager twin lives at
+#: ``common.tensors.extended_precision.two_product`` and the two must stay
+#: instruction-for-instruction alike.
+TWO_PRODUCT_FLAVORS = ("fma", "split")
+
+
+#: The flavour the completed-module seam lowers with when its caller has no
+#: way to say. The seam sits inside the source compiler, many layers below
+#: anyone choosing a destination -- mirroring how ``active_contract()``
+#: reaches the emitters -- so the choice travels the same way: a scoped
+#: ambient value, defaulting to the cheap spelling.
+_ACTIVE_TWO_PRODUCT_FLAVOR = "fma"
+
+
+def active_two_product_flavor() -> str:
+    """The flavour ``apply_precision_pipeline`` uses when not told."""
+
+    return _ACTIVE_TWO_PRODUCT_FLAVOR
+
+
+@_contextlib.contextmanager
+def two_product_flavor_scope(flavor: str):
+    """Lower every module built inside this scope with ``flavor``."""
+
+    global _ACTIVE_TWO_PRODUCT_FLAVOR
+    if flavor not in TWO_PRODUCT_FLAVORS:
+        raise ValueError(
+            f"unknown two_product flavour {flavor!r}; "
+            f"expected one of {TWO_PRODUCT_FLAVORS}"
+        )
+    held = _ACTIVE_TWO_PRODUCT_FLAVOR
+    _ACTIVE_TWO_PRODUCT_FLAVOR = str(flavor)
+    try:
+        yield
+    finally:
+        _ACTIVE_TWO_PRODUCT_FLAVOR = held
+
+
+def _veltkamp_constant(element) -> float:
+    """The splitting constant for a limb element.
+
+    Sourced from ``extended_precision.LIMB_ELEMENTS`` so the compiler and
+    the eager twin can never disagree about it. Splitting with the wrong
+    constant does not degrade the residual, it invalidates the theorem --
+    so an unknown element is a refusal, never a default. An ABSENT element
+    is the binary64 default the whole scalar path assumes.
+    """
+
+    from ..common.tensors.extended_precision import limb_element_facts
+
+    return float(limb_element_facts(element)["split"])
+
+
+def _limb_width_ceiling(element) -> int:
+    """The widest section the repository lowering accepts for an element."""
+
+    from ..common.tensors.extended_precision import limb_element_facts
+
+    return int(limb_element_facts(element)["max_limbs"])
+
+
 #: What each destination actually delivers, as opposed to what it emits.
 #:
 #: The four lanes present a UNIFIED FRONT: every one of them accepts `Fma`
@@ -1207,12 +1331,44 @@ BACKEND_PRECISION_CAPABILITIES: dict[str, tuple[str, ...]] = {
     # withholding the fast-math flags, which are already per-instruction.
     "llvm": (FMA_MANDATORY, SECTION_ISOLATION),
     # IEEE_FMA is F2018 and the lane already uses IEEE_ARITHMETIC. Fortran
-    # forbids reassociating a parenthesised expression, which is most of
-    # isolation, but offers no way to withdraw contraction specifically --
-    # so the obligation is not claimed rather than half-claimed.
-    "fortran": (FMA_MANDATORY,),
-    # No fma instruction exists. It emits, it does not deliver.
-    "wasm": (),
+    # forbids reassociating a parenthesised expression -- and every emitted
+    # binary is parenthesised -- while contraction, the one rewrite the
+    # language leaves to the processor, is withdrawn per-artifact by the
+    # toolchain: emit_module marks a module that carries sections and
+    # aggressive_fortran_flags adds -ffp-contract=off for exactly those.
+    # An explicit ieee_fma call is an intrinsic invocation, not a
+    # contraction, so it survives the flag. Both halves together are the
+    # whole of isolation, so the claim is now whole too.
+    "fortran": (FMA_MANDATORY, SECTION_ISOLATION),
+    # No fma instruction exists -- a section that CONTAINS one is refused,
+    # because the expansion rounds twice and the residual comes back zero.
+    # Isolation, though, wasm delivers by construction: its floating point
+    # is deterministic IEEE 754 and an engine has no licence to reassociate
+    # or contract anything. So a section lowered with the "split" flavour of
+    # two_product -- no Fma to spell -- runs here honestly, just longer.
+    "wasm": (SECTION_ISOLATION,),
+    # SPIR-V spells the single rounding as GLSL.std.450 Fma and withdraws
+    # contraction per-instruction with the NoContraction decoration; both
+    # are in the assembler. Float64 limbs are fine: OpCapability Float64 is
+    # emitted on demand, and the f32-only restriction covers only the
+    # extended-instruction transcendentals a limb section never uses.
+    "spirv": (FMA_MANDATORY, SECTION_ISOLATION),
+    # WGSL's fma() is explicitly permitted to round twice, and the language
+    # offers no `precise` and no contraction control -- neither obligation
+    # can be claimed. Sections reach this lane only through the "split"
+    # flavour once an isolation story exists; until then they are refused.
+    "webgpu": (),
+    # Desktop GLSL compute (GL 4.3 + GL_ARB_gpu_shader5): the `precise`
+    # qualifier is exactly contraction-and-reassociation control -- values
+    # so qualified must be computed as written, and an fma() call on
+    # precise operands is required to be the single-rounding operation.
+    # The lane's emitter qualifies every section temporary `precise` and
+    # spells Fma as fma(), which is what makes both claims true. This key
+    # is the DESKTOP lane; the browser fragment lane is "webgl" below.
+    "glsl": (FMA_MANDATORY, SECTION_ISOLATION),
+    # GLSL ES 3.0 fragment shaders: f32 only, no fma(), `precise` is
+    # desktop 4.40+. Nothing claimable.
+    "webgl": (),
 }
 
 
@@ -1237,7 +1393,8 @@ class PrecisionSectionContract:
     value_ids: tuple[int, ...]
     #: The precision operation names present.
     operations: tuple[str, ...]
-    #: Result ids of instructions that are `Fma` and must stay one rounding.
+    #: Result ids of explicit `Fma` instructions, or abstract multiplication
+    #: operations whose exact lowering necessarily introduces one.
     fma_value_ids: tuple[int, ...]
     #: Widest limb count and element type in the section.
     limbs: int
@@ -1274,7 +1431,9 @@ class PrecisionSectionContract:
         return tuple(sorted(required - declared))
 
 
-def precision_section_contracts(functions) -> tuple[PrecisionSectionContract, ...]:
+def precision_section_contracts(
+    functions, two_product_flavor: str = "fma",
+) -> tuple[PrecisionSectionContract, ...]:
     """Read the contract each precision section places on a destination.
 
     A section is the maximal run of consecutive instructions in one block
@@ -1283,11 +1442,30 @@ def precision_section_contracts(functions) -> tuple[PrecisionSectionContract, ..
     destination must refrain from reoptimizing is a contiguous stretch of
     emitted code, and an `Fma` between two limbed operations is inside the
     stretch whether or not it consumes one of them.
+
+    ``two_product_flavor`` must match what ``lower_precision_operations``
+    will actually emit, since the contract is recorded before the lowering
+    runs and describes the instructions that WILL exist.
     """
 
     from ..common.tensors.topological_reducer import PRECISION_SINGULAR_NAMES
 
+    if two_product_flavor not in TWO_PRODUCT_FLAVORS:
+        raise ValueError(
+            f"unknown two_product flavour {two_product_flavor!r}; "
+            f"expected one of {TWO_PRODUCT_FLAVORS}"
+        )
     precision_ops = frozenset(PRECISION_SINGULAR_NAMES.values())
+    # Under the "fma" flavour, exact lowering of a multiplication or a
+    # division necessarily introduces an Fma, so those operations carry the
+    # obligation before the instruction exists. Under "split" they lower to
+    # ordinary arithmetic and incur nothing; only an EXPLICIT Fma in the
+    # stream still demands the real single rounding, because no expansion
+    # can substitute for a request the author spelled out.
+    precision_fma_ops = {
+        PRECISION_SINGULAR_NAMES["Mul"],
+        PRECISION_SINGULAR_NAMES["Div"],
+    } if two_product_flavor == "fma" else set()
     contracts: list[PrecisionSectionContract] = []
 
     for name, function in functions.items():
@@ -1342,7 +1520,10 @@ def precision_section_contracts(functions) -> tuple[PrecisionSectionContract, ..
                     operations=tuple(sorted({str(each.op) for each in run})),
                     fma_value_ids=tuple(
                         int(each.res.id) for each in run
-                        if str(each.op) == FMA and each.res is not None
+                        if (
+                            str(each.op) == FMA
+                            or str(each.op) in precision_fma_ops
+                        ) and each.res is not None
                     ),
                     limbs=limbs,
                     element=None if element is None else str(element),
@@ -1401,7 +1582,9 @@ def mark_precision_sections(functions) -> int:
     return marked
 
 
-def lower_precision_operations(functions) -> dict:
+def lower_precision_operations(
+    functions, two_product_flavor: str = "fma",
+) -> dict:
     """Expand every `precision_*` into arithmetic a destination already has.
 
     A precision value becomes ONE SSA VALUE PER LIMB, not one value with a
@@ -1418,21 +1601,38 @@ def lower_precision_operations(functions) -> dict:
     every instruction produced here so the boundary survives where the
     operator does not.
 
-    Expansions are the standard double-double ones, written out in SSA:
-    two_product via `Fma`, two_sum by Knuth, and a renormalising
-    quick_two_sum at the end of each. Returns a count per operation.
+    Expansions are the same width-N algorithms as the eager tensor path:
+    Knuth ``two_sum`` distillation for addition, every limb-pair through an
+    error-free ``two_product`` for multiplication, and digit-at-a-time
+    expansion division. Widths two through four are retained end to end.
+    Returns a count per operation.
+
+    ``two_product_flavor`` selects the exact-product spelling (see
+    ``TWO_PRODUCT_FLAVORS``): ``"fma"`` emits the two-instruction residual,
+    ``"split"`` emits Dekker's fma-free seventeen-operation form for
+    destinations that cannot deliver a single rounding.
     """
 
     from ..common.tensors.topological_reducer import PRECISION_SINGULAR_NAMES
 
+    if two_product_flavor not in TWO_PRODUCT_FLAVORS:
+        raise ValueError(
+            f"unknown two_product flavour {two_product_flavor!r}; "
+            f"expected one of {TWO_PRODUCT_FLAVORS}"
+        )
+
     add_name = PRECISION_SINGULAR_NAMES["Add"]
     sub_name = PRECISION_SINGULAR_NAMES["Sub"]
     mul_name = PRECISION_SINGULAR_NAMES["Mul"]
+    div_name = PRECISION_SINGULAR_NAMES["Div"]
     neg_name = PRECISION_SINGULAR_NAMES["neg"]
-    expandable = {add_name, sub_name, mul_name, neg_name}
+    expandable = {add_name, sub_name, mul_name, div_name, neg_name}
 
     counts = {name: 0 for name in expandable}
     next_id = _module_watermark(functions)
+    original_formals = {
+        str(name): tuple(function.args) for name, function in functions.items()
+    }
 
     # -- the boundary, brought into line with the interior ----------------
     #
@@ -1561,7 +1761,7 @@ def lower_precision_operations(functions) -> dict:
                     target = functions.get(callee)
                     if target is None:
                         continue
-                    formals = list(target.args)
+                    formals = original_formals.get(callee, tuple(target.args))
                     caller_formals = {int(v.id) for v in function.args}
                     here = parameter_widths.setdefault(str(name), {})
                     for position, formal in enumerate(formals):
@@ -1595,47 +1795,18 @@ def lower_precision_operations(functions) -> dict:
             rows.append(row)
         seeded[str(name)] = rows
 
-    # Bind the new actuals at every call, matching formal order.
-    for name, function in functions.items():
-        for block in function.blocks.values():
-            for instruction in block.instrs:
-                if instruction.op not in ("Call", "call"):
-                    continue
-                callee = str(instruction.attributes.get("callee") or "")
-                rows = seeded.get(callee)
-                target = functions.get(callee)
-                if not rows or target is None:
-                    continue
-                by_head = {int(row[0].id): row for row in rows}
-                caller_rows = {
-                    int(row[0].id): row
-                    for row in (seeded.get(str(name)) or [])
-                }
-                original = list(instruction.args)
-                for position, formal in enumerate(target.args):
-                    row = by_head.get(int(formal.id))
-                    if row is None or position >= len(original):
-                        continue
-                    actual = original[position]
-                    supply = caller_rows.get(int(actual.id))
-                    for index in range(1, len(row)):
-                        instruction.args.append(
-                            supply[index] if supply and index < len(supply)
-                            else actual
-                        )
-
     for function_name, function in functions.items():
         # value id -> its limbs, high first. Absent means an ordinary value,
         # which is simply a one-limb expansion whose low limb is zero.
         limbs: dict[int, list] = {}
+        lowered_limb_records: dict[int, tuple[int, ...]] = {}
         for row in seeded.get(str(function_name), ()):  # declared parameters
             limbs[int(row[0].id)] = list(row)
+            lowered_limb_records[int(row[0].id)] = tuple(
+                int(value.id) for value in row
+            )
 
         for block in function.blocks.values():
-            if not any(
-                str(each.op) in expandable for each in block.instrs
-            ):
-                continue
             emitted: list = []
 
             def fresh(like):
@@ -1657,6 +1828,23 @@ def lower_precision_operations(functions) -> dict:
             def parts(value):
                 return limbs.get(int(value.id), [value])
 
+            def zero(like):
+                """Materialise an exact low limb for scalar promotion.
+
+                Repeating the high limb would represent ``x + x`` rather
+                than ``x``.  A plain scalar is the expansion ``[x, +0, ...]``;
+                IEEE positive zero is exact in every supported element
+                format and therefore needs no numerical precondition.
+                """
+
+                result = fresh(like)
+                emitted.append(Instr("Const", [], result, attributes={
+                    "constant": 0.0,
+                    PRECISION_SECTION_ATTRIBUTE: True,
+                    "lowered_from": "precision.scalar_promotion",
+                }))
+                return result
+
             def two_sum(a, b):
                 s = put("Add", (a, b), a)
                 bb = put("Sub", (s, a), a)
@@ -1664,14 +1852,122 @@ def lower_precision_operations(functions) -> dict:
                 right = put("Sub", (b, bb), a)
                 return s, put("Add", (left, right), a)
 
-            def quick_two_sum(a, b):
-                s = put("Add", (a, b), a)
-                return s, put("Sub", (b, put("Sub", (s, a), a)), a)
+            splitters: dict[float, object] = {}
+
+            def splitter_for(value):
+                """One Const per block per element, not one per product."""
+
+                magnitude = _veltkamp_constant(value.dtype)
+                held = splitters.get(magnitude)
+                if held is None:
+                    held = fresh(value)
+                    emitted.append(Instr("Const", [], held, attributes={
+                        "constant": float(magnitude),
+                        PRECISION_SECTION_ATTRIBUTE: True,
+                        "lowered_from": "precision.split_constant",
+                    }))
+                    splitters[magnitude] = held
+                return held
 
             def two_product(a, b):
                 product = put("Mul", (a, b), a)
-                negated = put("Neg", (product,), a)
-                return product, put(FMA, (a, b, negated), a)
+                if two_product_flavor == "fma":
+                    negated = put("Neg", (product,), a)
+                    return product, put(FMA, (a, b, negated), a)
+                # Dekker through Veltkamp splitting: the same exact residual
+                # with no fma anywhere, for destinations that cannot deliver
+                # a single rounding. The eager twin is
+                # ``extended_precision.two_product`` / ``_split``; the
+                # operation order here mirrors it exactly so the two stay
+                # provably the same algorithm.
+                constant = splitter_for(a)
+
+                def split(value):
+                    scaled = put("Mul", (value, constant), value)
+                    high = put(
+                        "Sub",
+                        (scaled, put("Sub", (scaled, value), value)),
+                        value,
+                    )
+                    return high, put("Sub", (value, high), value)
+
+                a_high, a_low = split(a)
+                b_high, b_low = split(b)
+                error = put(
+                    "Sub", (put("Mul", (a_high, b_high), a), product), a
+                )
+                error = put(
+                    "Add", (error, put("Mul", (a_high, b_low), a)), a
+                )
+                error = put(
+                    "Add", (error, put("Mul", (a_low, b_high), a)), a
+                )
+                return product, put(
+                    "Add", (error, put("Mul", (a_low, b_low), a)), a
+                )
+
+            def expanded(value, width: int):
+                held = list(parts(value))
+                if len(held) < width:
+                    held.extend(zero(value) for _ in range(width - len(held)))
+                return held[:width]
+
+            def renormalise(terms, width: int):
+                """Distil arbitrary exact terms to ``width`` SSA limbs."""
+
+                rest = list(terms)
+                if not rest:
+                    raise ValueError("cannot renormalise an empty expansion")
+                kept = []
+                for _index in range(int(width)):
+                    if not rest:
+                        break
+                    carry = rest[-1]
+                    tail = [None] * (len(rest) - 1)
+                    for position in range(len(rest) - 2, -1, -1):
+                        carry, tail[position] = two_sum(
+                            rest[position], carry
+                        )
+                    kept.append(carry)
+                    rest = tail
+                while len(kept) < int(width):
+                    kept.append(zero(kept[-1]))
+                for leftover in rest:
+                    kept[-1] = put("Add", (kept[-1], leftover), kept[-1])
+                return kept
+
+            def add_expansions(left, right, width: int):
+                return renormalise([*left, *right], width)
+
+            def multiply_expansions(left, right, width: int):
+                products = []
+                for left_limb in left:
+                    for right_limb in right:
+                        high, low = two_product(left_limb, right_limb)
+                        products.extend((high, low))
+                return renormalise(products, width)
+
+            def lead(expansion):
+                return (
+                    expansion[0] if len(expansion) == 1
+                    else put("Add", (expansion[0], expansion[1]), expansion[0])
+                )
+
+            def divide_expansions(left, right, width: int):
+                remainder = list(left)
+                quotient = []
+                for _index in range(int(width) + 1):
+                    digit = put("Div", (lead(remainder), lead(right)), left[0])
+                    quotient.append(digit)
+                    product = multiply_expansions(
+                        [digit], right, int(width) + 2
+                    )
+                    remainder = add_expansions(
+                        remainder,
+                        [put("Neg", (term,), term) for term in product],
+                        int(width) + 2,
+                    )
+                return renormalise(quotient, width)
 
             def collapse(parts_of, original):
                 """Define the ORIGINAL value as the sum of its limbs.
@@ -1745,6 +2041,36 @@ def lower_precision_operations(functions) -> dict:
             for instruction in block.instrs:
                 operation = str(instruction.op)
 
+                if operation in ("Call", "call"):
+                    callee = str(instruction.attributes.get("callee") or "")
+                    rows = seeded.get(callee)
+                    if rows and not instruction.attributes.get(
+                        "precision_actuals_bound"
+                    ):
+                        target_formals = original_formals.get(callee, ())
+                        by_head = {int(row[0].id): row for row in rows}
+                        original_actuals = list(instruction.args)
+                        additions = []
+                        for position, formal in enumerate(target_formals):
+                            row = by_head.get(int(formal.id))
+                            if row is None or position >= len(original_actuals):
+                                continue
+                            actual = original_actuals[position]
+                            supplied = parts(actual)
+                            for index in range(1, len(row)):
+                                additions.append(
+                                    supplied[index]
+                                    if index < len(supplied)
+                                    else zero(actual)
+                                )
+                        instruction.args.extend(additions)
+                        instruction.attributes["precision_actuals_bound"] = True
+                        instruction.attributes[
+                            "precision_actual_count"
+                        ] = len(additions)
+                    emitted.append(instruction)
+                    continue
+
                 if (
                     operation == "GetElementPtr" and len(instruction.args) >= 2
                     and instruction.res is not None
@@ -1769,6 +2095,9 @@ def lower_precision_operations(functions) -> dict:
                             for position in range(width)
                         ]
                         limbs[int(instruction.res.id)] = loaded_limbs
+                        lowered_limb_records[int(instruction.res.id)] = tuple(
+                            int(value.id) for value in loaded_limbs
+                        )
                         # The original value must still be DEFINED. Not every
                         # consumer of a load from a precision array is a
                         # precision operation -- a shell computing `s = z * z`
@@ -1793,7 +2122,7 @@ def lower_precision_operations(functions) -> dict:
                                 "Store",
                                 [
                                     stored[position] if position < len(stored)
-                                    else stored[-1],
+                                    else zero(stored[0]),
                                     channel(base, index, width, position),
                                 ],
                                 None,
@@ -1812,48 +2141,441 @@ def lower_precision_operations(functions) -> dict:
 
                 if operation == neg_name:
                     # Exact per limb: a sign flip cannot round.
-                    source = parts(instruction.args[0])
+                    width = max(int(
+                        instruction.attributes.get("precision_limbs") or 2
+                    ), 2)
+                    source = expanded(instruction.args[0], width)
                     negated = [put("Neg", (each,), each) for each in source]
                     limbs[int(instruction.res.id)] = negated
+                    lowered_limb_records[int(instruction.res.id)] = tuple(
+                        int(value.id) for value in negated
+                    )
                     collapse(negated, instruction.res)
                     counts[operation] += 1
                     continue
 
-                left = parts(instruction.args[0])
-                right = parts(instruction.args[1])
+                width = max(int(
+                    instruction.attributes.get("precision_limbs") or 2
+                ), 2)
+                left = expanded(instruction.args[0], width)
+                right = expanded(instruction.args[1], width)
                 if operation == sub_name:
                     right = [put("Neg", (each,), each) for each in right]
 
                 if operation == mul_name:
-                    high, error = two_product(left[0], right[0])
-                    # The cross terms, when either operand has a low limb.
-                    for a_index, b_index in ((0, 1), (1, 0)):
-                        if len(left) > a_index and len(right) > b_index:
-                            error = put("Add", (
-                                error,
-                                put("Mul", (left[a_index], right[b_index]),
-                                    error),
-                            ), error)
+                    result_limbs = multiply_expansions(left, right, width)
+                elif operation == div_name:
+                    result_limbs = divide_expansions(left, right, width)
                 else:
-                    high, error = two_sum(left[0], right[0])
-                    for tail in (left[1:2], right[1:2]):
-                        if tail:
-                            error = put("Add", (error, tail[0]), error)
+                    result_limbs = add_expansions(left, right, width)
 
-                # Honour the renormalisation decision the identity phase
-                # already made. It writes `precision_renormalise` and this
-                # was reading it nowhere, so every operation renormalised
-                # whatever the rule concluded -- the rule existed, fired,
-                # and was ignored. Absent means renormalise, so a module
-                # that never ran the identity phase behaves as before.
-                if instruction.attributes.get(
-                    "precision_renormalise", True
-                ):
-                    high, error = quick_two_sum(high, error)
-                limbs[int(instruction.res.id)] = [high, error]
-                collapse([high, error], instruction.res)
+                limbs[int(instruction.res.id)] = result_limbs
+                lowered_limb_records[int(instruction.res.id)] = tuple(
+                    int(value.id) for value in result_limbs
+                )
+                collapse(result_limbs, instruction.res)
                 counts[operation] += 1
 
             block.instrs = emitted
 
+        if lowered_limb_records:
+            function.metadata["precision_lowered_values"] = tuple(
+                (value_id, limb_ids)
+                for value_id, limb_ids in sorted(lowered_limb_records.items())
+            )
+
     return counts
+
+
+PRECISION_PIPELINE_METADATA = "precision_pipeline"
+
+
+def _refresh_precision_call_records(module) -> int:
+    """Extend canonical call records after precision grows a scalar ABI.
+
+    The source linker owns every pre-existing binding.  Precision lowering
+    only appends formals and actuals, so this refresh preserves those records
+    byte-for-byte and adds exact caller-value bindings for the appended limb
+    positions.  No name matching or positional reconstruction of old state is
+    permitted here.
+    """
+
+    refreshed = 0
+    call_table = dict(getattr(module, "call_table", {}) or {})
+    for caller_name, records in tuple(call_table.items()):
+        caller = module.functions.get(str(caller_name))
+        if caller is None:
+            continue
+        instructions = tuple(
+            instruction
+            for block in caller.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in ("Call", "call")
+        )
+        updated = []
+        for record in records:
+            call = next((
+                instruction for instruction in instructions
+                if str(instruction.attributes.get("callee") or "")
+                == str(record.callee_symbol or "")
+                and (
+                    instruction.attributes.get("plan_callsite_id") is None
+                    or int(instruction.attributes["plan_callsite_id"])
+                    == int(record.callsite_id)
+                )
+            ), None)
+            callee = module.functions.get(str(record.callee_symbol or ""))
+            if call is None or callee is None:
+                updated.append(record)
+                continue
+
+            existing_arguments = {
+                (int(actual), int(formal))
+                for actual, formal in record.argument_bindings
+            }
+            existing_frames = {
+                int(formal): (str(kind), source)
+                for formal, kind, source in record.frame_bindings
+            }
+            additions = 0
+            for actual, formal in zip(call.args, callee.args):
+                binding = (int(actual.id), int(formal.id))
+                if binding not in existing_arguments:
+                    existing_arguments.add(binding)
+                    additions += 1
+                existing_frames.setdefault(
+                    int(formal.id), ("caller_value", int(actual.id))
+                )
+            if not additions:
+                updated.append(record)
+                continue
+            storage = tuple(dict.fromkeys((
+                *map(int, record.callee_storage_value_ids),
+                *(int(value.id) for value in callee.args),
+            )))
+            bound = set(existing_frames)
+            updated.append(dataclasses.replace(
+                record,
+                argument_bindings=tuple(sorted(existing_arguments)),
+                callee_storage_value_ids=storage,
+                frame_bindings=tuple(
+                    (formal, kind, source)
+                    for formal, (kind, source) in sorted(existing_frames.items())
+                ),
+                unresolved_frame_value_ids=tuple(
+                    value for value in record.unresolved_frame_value_ids
+                    if int(value) not in bound
+                ),
+            ))
+            refreshed += 1
+        call_table[str(caller_name)] = tuple(updated)
+    module.call_table = call_table
+    return refreshed
+
+
+def apply_precision_pipeline(
+    module, two_product_flavor: str | None = None,
+) -> dict:
+    """Run the complete exact precision lowering transaction on ``module``.
+
+    This is the sole production entry point.  It records the pre-lowering
+    section contracts before their ``precision_*`` operators disappear,
+    performs only catalogue identities marked exact, expands the arithmetic,
+    repairs the canonical call ABI, and refuses to return if an abstract
+    precision operator survived.  A durable receipt makes the transaction
+    idempotent and gives emitters the obligations they must validate.
+
+    ``two_product_flavor`` (see ``TWO_PRODUCT_FLAVORS``) chooses the exact
+    product spelling and thereby which obligations the sections record:
+    ``"fma"`` for destinations with a single-rounding fma, ``"split"`` for
+    those without one.  ``None`` defers to ``active_two_product_flavor()``,
+    which is how a caller above the completed-module seam chooses without
+    threading an argument through the source compiler.  A module is lowered
+    in ONE flavour; asking again with a different one is refused rather
+    than answered with the wrong receipt, because the instructions already
+    emitted cannot change.
+    """
+
+    from ..common.tensors.topological_reducer import PRECISION_SINGULAR_NAMES
+
+    if two_product_flavor is None:
+        two_product_flavor = active_two_product_flavor()
+    if two_product_flavor not in TWO_PRODUCT_FLAVORS:
+        raise ValueError(
+            f"unknown two_product flavour {two_product_flavor!r}; "
+            f"expected one of {TWO_PRODUCT_FLAVORS}"
+        )
+    functions = module.functions
+    prior = (getattr(module, "metadata", {}) or {}).get(
+        PRECISION_PIPELINE_METADATA
+    )
+    if prior and prior.get("status") == "lowered":
+        held = str(prior.get("two_product_flavor") or "fma")
+        if held != two_product_flavor:
+            raise ValueError(
+                f"module already lowered with two_product flavour {held!r}; "
+                f"cannot re-lower as {two_product_flavor!r} -- lower a fresh "
+                "module for the other flavour"
+            )
+        return prior
+
+    precision_ops = frozenset(PRECISION_SINGULAR_NAMES.values())
+    before = sum(
+        str(instruction.op) in precision_ops
+        for function in functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+    if not before:
+        return {
+            "schema": "precision-pipeline-v1",
+            "status": "not-present",
+            "exact_only": True,
+            "source_operations": 0,
+            "section_contracts": [],
+        }
+
+    unsupported_seeds = tuple(
+        (str(name), int(instruction.attributes.get("precision_limbs") or 1))
+        for name, function in functions.items()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if str(instruction.op) in precision_ops
+        and int(instruction.attributes.get("precision_limbs") or 1)
+        > _limb_width_ceiling(
+            instruction.attributes.get("precision_element")
+        )
+    )
+    if unsupported_seeds:
+        raise ValueError(
+            "repository SSA precision lowering refuses sections wider than "
+            "the element's proven ceiling (binary64: four limbs, binary32: "
+            "eight) instead of duplicating or discarding limbs: "
+            + repr(unsupported_seeds)
+        )
+
+    carried = carry_precision_through_ssa(functions)
+    identity_counts = reduce_precision_operations(functions)
+    contracts = precision_section_contracts(functions, two_product_flavor)
+    unsupported_widths = tuple(
+        (contract.function, contract.limbs)
+        for contract in contracts
+        if int(contract.limbs) > _limb_width_ceiling(contract.element)
+    )
+    if unsupported_widths:
+        raise ValueError(
+            "repository SSA precision lowering refuses sections wider than "
+            "the element's proven ceiling (binary64: four limbs, binary32: "
+            "eight) instead of duplicating or discarding limbs: "
+            + repr(unsupported_widths)
+        )
+    marked = mark_precision_sections(functions)
+    lowered = lower_precision_operations(functions, two_product_flavor)
+    calls_refreshed = _refresh_precision_call_records(module)
+    remaining = tuple(
+        (str(name), int(instruction.res.id) if instruction.res else None,
+         str(instruction.op))
+        for name, function in functions.items()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if str(instruction.op) in precision_ops
+    )
+    if remaining:
+        raise ValueError(
+            "precision lowering left abstract operators: " + repr(remaining)
+        )
+
+    receipt = {
+        "schema": "precision-pipeline-v1",
+        "status": "lowered",
+        "exact_only": True,
+        "two_product_flavor": two_product_flavor,
+        "source_operations": int(before),
+        "carried_facts": int(carried),
+        "identity_counts": dict(identity_counts),
+        "identity_catalogue": [
+            {
+                "name": identity.name,
+                "exact": bool(identity.exact),
+                "requires": list(identity.requires),
+                "fired": int(identity_counts.get(identity.name, 0)),
+            }
+            for identity in PRECISION_IDENTITIES
+        ],
+        "refused_identities": [identity.name for identity in PRECISION_REFUSALS],
+        "section_contracts": [contract.as_record() for contract in contracts],
+        "marked_instructions": int(marked),
+        "lowered_operations": dict(lowered),
+        "call_records_refreshed": int(calls_refreshed),
+    }
+    module.metadata[PRECISION_PIPELINE_METADATA] = receipt
+    return receipt
+
+
+def precision_backend_shortfalls(
+    module, backend: str, function_names=None,
+) -> tuple[dict, ...]:
+    """Return persisted precision obligations ``backend`` cannot deliver."""
+
+    receipt = (getattr(module, "metadata", {}) or {}).get(
+        PRECISION_PIPELINE_METADATA
+    ) or {}
+    selected = None if function_names is None else {
+        str(name) for name in function_names
+    }
+    capabilities = frozenset(BACKEND_PRECISION_CAPABILITIES.get(
+        str(backend).casefold(), ()
+    ))
+    shortfalls = []
+    for contract in receipt.get("section_contracts", ()):
+        if selected is not None and str(contract.get("function")) not in selected:
+            continue
+        required = set(map(str, contract.get("obligations", ()))) - {
+            LANE_STAGING
+        }
+        if not contract.get("fma_value_ids"):
+            required.discard(FMA_MANDATORY)
+        missing = tuple(sorted(required - capabilities))
+        if missing:
+            shortfalls.append({
+                "function": str(contract.get("function")),
+                "value_ids": tuple(map(int, contract.get("value_ids", ()))),
+                "missing": missing,
+            })
+    return tuple(shortfalls)
+
+
+def inline_host_linear_source_regions(functions) -> tuple[dict, tuple[dict, ...]]:
+    """Return a host-lane view with safe one-call source regions spliced in.
+
+    The repository keeps planned regions separate because shader deployment
+    needs a dispatchable subgraph.  A native host lane has the opposite cost:
+    an outputless loop-body region becomes one subroutine call per element.
+    This identity does not alter the repository module.  It creates replacement
+    caller/block/instruction containers only where every legality condition is
+    proved, and returns an ordinary mapping for the host emitter.
+
+    Eligible means: a compile-complementary source region, exactly one callsite,
+    one straight-line block, no published outputs, no nested call/control, an
+    exact formal/actual arity match, and no produced-ID collision in the caller.
+    Anything less stays a call.  The receipt states every splice explicitly.
+    """
+
+    view = dict(functions)
+    calls_by_callee: dict[str, list[tuple[str, str, int, object]]] = {}
+    for caller_name, caller in functions.items():
+        for block_name, block in caller.blocks.items():
+            for index, instruction in enumerate(block.instrs):
+                if instruction.op not in ("Call", "call"):
+                    continue
+                callee = str(instruction.attributes.get("callee") or "")
+                if callee:
+                    calls_by_callee.setdefault(callee, []).append((
+                        str(caller_name), str(block_name), index, instruction,
+                    ))
+
+    receipts = []
+    forbidden = {
+        "Call", "call", "Ret", "ret", "Return", "return", "Br", "br",
+        "Branch", "branch", "CondBr", "condbr", "Phi", "phi",
+    }
+    replacements: dict[tuple[str, str, int], list] = {}
+    removable = set()
+    for callee_name, occurrences in calls_by_callee.items():
+        callee = functions.get(callee_name)
+        if callee is None or len(occurrences) != 1:
+            continue
+        integral = dict(callee.metadata.get("source_region_integral") or {})
+        if not integral or tuple(integral.get("output_value_ids") or ()):
+            continue
+        if set(callee.blocks) != {"entry"}:
+            continue
+        body = callee.blocks["entry"]
+        if any(str(instruction.op) in forbidden for instruction in body.instrs):
+            continue
+        caller_name, block_name, index, call = occurrences[0]
+        if call.res is not None or len(call.args) != len(callee.args):
+            continue
+        produced = {
+            int(instruction.res.id)
+            for instruction in body.instrs if instruction.res is not None
+        }
+        formal_ids = {int(value.id) for value in callee.args}
+        available = set(formal_ids)
+        valid = True
+        for instruction in body.instrs:
+            if any(int(argument.id) not in available for argument in instruction.args):
+                valid = False
+                break
+            if instruction.res is not None:
+                available.add(int(instruction.res.id))
+        if not valid:
+            continue
+        caller = functions[caller_name]
+        occupied = {
+            int(value.id) for value in caller.args
+        } | {
+            int(instruction.res.id)
+            for caller_block in caller.blocks.values()
+            for instruction in caller_block.instrs
+            if instruction.res is not None and instruction is not call
+        }
+        if produced & occupied:
+            continue
+        substitution = {
+            int(formal.id): actual
+            for formal, actual in zip(callee.args, call.args)
+        }
+        cloned = []
+        for instruction in body.instrs:
+            cloned.append(Instr(
+                instruction.op,
+                [substitution.get(int(argument.id), argument)
+                 for argument in instruction.args],
+                instruction.res,
+                arg_roles=list(instruction.arg_roles),
+                attributes={
+                    **dict(instruction.attributes),
+                    "inlined_source_region": str(callee_name),
+                },
+                source_span=(
+                    None if instruction.source_span is None
+                    else dict(instruction.source_span)
+                ),
+            ))
+        replacements[(caller_name, block_name, index)] = cloned
+        removable.add(callee_name)
+        receipts.append({
+            "caller": caller_name,
+            "block": block_name,
+            "callee": callee_name,
+            "instruction_count": len(cloned),
+            "identity_token_chain": list(
+                integral.get("identity_token_chain") or ()
+            ),
+        })
+
+    for caller_name in {key[0] for key in replacements}:
+        caller = functions[caller_name]
+        blocks = {}
+        for block_name, block in caller.blocks.items():
+            instructions = []
+            for index, instruction in enumerate(block.instrs):
+                instructions.extend(replacements.get(
+                    (caller_name, str(block_name), index), (instruction,)
+                ))
+            blocks[block_name] = dataclasses.replace(
+                block, instrs=instructions
+            )
+        metadata = dict(caller.metadata)
+        own_receipts = tuple(
+            receipt for receipt in receipts
+            if receipt["caller"] == caller_name
+        )
+        metadata["host_linear_region_inlining"] = own_receipts
+        view[caller_name] = dataclasses.replace(
+            caller, blocks=blocks, metadata=metadata
+        )
+    for callee_name in removable:
+        view.pop(callee_name, None)
+    return view, tuple(receipts)

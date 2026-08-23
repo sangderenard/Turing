@@ -50,8 +50,81 @@ class SSAFusedProgramResult:
         return not self.shortfalls
 
 
-def ssa_function_to_fused_program(function: Function) -> SSAFusedProgramResult:
-    """Select the existing float-scalar FusedProgram subset from one function."""
+def _precision_section_shortfalls(
+    function: Function, module=None,
+) -> tuple[SSAWebGLShortfall, ...]:
+    """Refuse precision sections BEFORE the fused path can swallow them.
+
+    GLSL ES 3.0 has no fma() and no contraction control, so "webgl" claims
+    nothing in ``BACKEND_PRECISION_CAPABILITIES`` and a section reaching this
+    lane is unhostable. Refusing has to happen here: the underlying
+    FusedProgram emitter substitutes ``float x = 0.0; // unsupported`` for an
+    unknown op, and a section's expansion is plain Add/Sub/Mul that IS in the
+    scalar surface -- it would emit "successfully", the driver would remain
+    free to fold the error terms (which are algebraically zero), and the
+    residual would come back zero with nothing announcing the failure.
+
+    When the caller holds the IRModule the function came from, the pipeline
+    receipt on its metadata is authoritative and ``precision_backend_
+    shortfalls`` reads the contracts from it. This entry point is often
+    handed a bare Function, though (autogenesis does exactly that), so there
+    is a fallback with no receipt to lean on: the ``precision_section``
+    attribute stamped on every section instruction is, by ir_identities' own
+    words, "the one thing about the section that must reach a destination",
+    and it is enough to reconstruct the obligations -- every section demands
+    SECTION_ISOLATION, and FMA_MANDATORY exactly when an explicit ``Fma``
+    survives in the marked run.
+    """
+
+    from .ir_identities import (
+        BACKEND_PRECISION_CAPABILITIES,
+        FMA_MANDATORY,
+        PRECISION_SECTION_ATTRIBUTE,
+        SECTION_ISOLATION,
+        precision_backend_shortfalls,
+    )
+
+    if module is not None:
+        return tuple(
+            SSAWebGLShortfall(
+                -1, "precision_section",
+                "backend cannot honour precision obligations "
+                + repr(item["missing"]),
+            )
+            for item in precision_backend_shortfalls(
+                module, "webgl", (function.name,)
+            )
+        )
+    marked = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get(PRECISION_SECTION_ATTRIBUTE)
+    ]
+    if not marked:
+        return ()
+    required = {SECTION_ISOLATION}
+    if any(str(instruction.op) == "Fma" for instruction in marked):
+        required.add(FMA_MANDATORY)
+    missing = tuple(sorted(
+        required - set(BACKEND_PRECISION_CAPABILITIES.get("webgl", ()))
+    ))
+    if not missing:
+        return ()
+    return (SSAWebGLShortfall(
+        -1, "precision_section",
+        "backend cannot honour precision obligations " + repr(missing),
+    ),)
+
+
+def ssa_function_to_fused_program(
+    function: Function, *, module=None,
+) -> SSAFusedProgramResult:
+    """Select the existing float-scalar FusedProgram subset from one function.
+
+    ``module`` is optional and only consulted for the precision-pipeline
+    receipt on its metadata -- see ``_precision_section_shortfalls``.
+    """
 
     from .machine_dialect_ssa import (
         format_machine_dialect_occurrences,
@@ -67,6 +140,8 @@ def ssa_function_to_fused_program(function: Function) -> SSAFusedProgramResult:
             "machine-state SSA remains: "
             + format_machine_dialect_occurrences(machine_residuals)
         )
+
+    precision_shortfalls = _precision_section_shortfalls(function, module)
 
     from .evolution_metagraph import (
         EvolutionComponentRef,
@@ -121,15 +196,17 @@ def ssa_function_to_fused_program(function: Function) -> SSAFusedProgramResult:
         if evolution is not None and adapter_graph is not None:
             evolution.bind_artifact(program, adapter_graph)
             evolution.close_graph(adapter_graph)
-        return SSAFusedProgramResult(program, (SSAWebGLShortfall(
-            -1,
-            "control_flow",
-            "WebGL fragment emission requires one straight-line SSA entry block",
-        ),))
+        return SSAFusedProgramResult(program, precision_shortfalls + (
+            SSAWebGLShortfall(
+                -1,
+                "control_flow",
+                "WebGL fragment emission requires one straight-line SSA entry block",
+            ),
+        ))
 
     steps: list[OpStep] = []
     outputs: dict[str, int] = {}
-    shortfalls: list[SSAWebGLShortfall] = []
+    shortfalls: list[SSAWebGLShortfall] = list(precision_shortfalls)
     available = {value.id for value in function.args}
     instructions = function.blocks["entry"].instrs
     for index, instruction in enumerate(instructions):
@@ -253,10 +330,15 @@ def emit_ssa_webgl_fragment_module(
     function: Function,
     *,
     name: str | None = None,
+    module=None,
 ) -> WebGLFragmentModule:
-    """Emit WebGL from repository SSA and retain ordinary named shortfalls."""
+    """Emit WebGL from repository SSA and retain ordinary named shortfalls.
 
-    lowering = ssa_function_to_fused_program(function)
+    ``module`` is optional and only consulted for the precision-pipeline
+    receipt on its metadata -- see ``_precision_section_shortfalls``.
+    """
+
+    lowering = ssa_function_to_fused_program(function, module=module)
     emitted = emit_webgl_fragment_module(
         lowering.program, name=name or function.name
     )

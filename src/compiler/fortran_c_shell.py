@@ -843,6 +843,363 @@ _DISPLAY_PIXEL_FORMATS = {
 }
 
 
+_C_FILE_BROKER_SOURCE = r'''
+#define TURING_FILE_HANDLE_CAPACITY 256
+static FILE *turing_file_handles[TURING_FILE_HANDLE_CAPACITY] = {0};
+
+static char *turing_file_span_string(const uint8_t *data, int64_t length) {
+    char *text;
+    if (data == NULL || length < 0 || (uint64_t)length >= SIZE_MAX) return NULL;
+    text = (char *)malloc((size_t)length + 1);
+    if (text == NULL) return NULL;
+    memcpy(text, data, (size_t)length);
+    text[length] = '\0';
+    return text;
+}
+
+static FILE *turing_file_handle(int64_t handle) {
+    if (handle < 1 || handle >= TURING_FILE_HANDLE_CAPACITY) return NULL;
+    return turing_file_handles[handle];
+}
+
+int64_t turing_shell_file_open(
+    const uint8_t *path_data, int64_t path_length,
+    const uint8_t *mode_data, int64_t mode_length
+) {
+    char *path = turing_file_span_string(path_data, path_length);
+    char *mode = turing_file_span_string(mode_data, mode_length);
+    FILE *stream = NULL;
+    int64_t handle;
+    if (path != NULL && mode != NULL && mode_length > 0 && mode_length < 8) {
+        stream = fopen(path, mode);
+    }
+    free(path);
+    free(mode);
+    if (stream == NULL) return 0;
+    for (handle = 1; handle < TURING_FILE_HANDLE_CAPACITY; ++handle) {
+        if (turing_file_handles[handle] == NULL) {
+            turing_file_handles[handle] = stream;
+            return handle;
+        }
+    }
+    fclose(stream);
+    return 0;
+}
+
+int64_t turing_shell_file_read(
+    int64_t handle, uint8_t *destination, int64_t capacity
+) {
+    FILE *stream = turing_file_handle(handle);
+    size_t count;
+    if (stream == NULL || destination == NULL || capacity < 0) return -1;
+    count = fread(destination, 1, (size_t)capacity, stream);
+    return ferror(stream) ? -1 : (int64_t)count;
+}
+
+int64_t turing_shell_file_write(
+    int64_t handle, const uint8_t *source, int64_t length
+) {
+    FILE *stream = turing_file_handle(handle);
+    size_t count;
+    if (stream == NULL || source == NULL || length < 0) return -1;
+    count = fwrite(source, 1, (size_t)length, stream);
+    return count == (size_t)length ? (int64_t)count : -1;
+}
+
+int32_t turing_shell_file_seek(int64_t handle, int64_t offset, int32_t origin) {
+    FILE *stream = turing_file_handle(handle);
+    if (stream == NULL || origin < SEEK_SET || origin > SEEK_END) return 0;
+#if defined(_WIN32)
+    return _fseeki64(stream, offset, origin) == 0;
+#else
+    return fseeko(stream, (off_t)offset, origin) == 0;
+#endif
+}
+
+int64_t turing_shell_file_tell(int64_t handle) {
+    FILE *stream = turing_file_handle(handle);
+    if (stream == NULL) return -1;
+#if defined(_WIN32)
+    return (int64_t)_ftelli64(stream);
+#else
+    return (int64_t)ftello(stream);
+#endif
+}
+
+int32_t turing_shell_file_flush(int64_t handle) {
+    FILE *stream = turing_file_handle(handle);
+    return stream != NULL && fflush(stream) == 0;
+}
+
+int32_t turing_shell_file_close(int64_t handle) {
+    FILE *stream = turing_file_handle(handle);
+    int status;
+    if (stream == NULL) return 0;
+    turing_file_handles[handle] = NULL;
+    status = fclose(stream);
+    return status == 0;
+}
+
+int64_t turing_shell_file_stat_size(
+    const uint8_t *path_data, int64_t path_length
+) {
+    char *path = turing_file_span_string(path_data, path_length);
+    FILE *stream;
+    int64_t size = -1;
+    if (path == NULL) return -1;
+    stream = fopen(path, "rb");
+    free(path);
+    if (stream == NULL) return -1;
+#if defined(_WIN32)
+    if (_fseeki64(stream, 0, SEEK_END) == 0) size = (int64_t)_ftelli64(stream);
+#else
+    if (fseeko(stream, 0, SEEK_END) == 0) size = (int64_t)ftello(stream);
+#endif
+    fclose(stream);
+    return size;
+}
+
+static void turing_shell_file_close_all(void) {
+    int64_t handle;
+    for (handle = 1; handle < TURING_FILE_HANDLE_CAPACITY; ++handle) {
+        if (turing_file_handles[handle] != NULL) {
+            fclose(turing_file_handles[handle]);
+            turing_file_handles[handle] = NULL;
+        }
+    }
+}
+
+static int turing_shell_file_fail(int status) {
+    turing_shell_file_close_all();
+    return status;
+}
+'''
+
+
+def _requires_file_broker(module: Any) -> bool:
+    metadata = dict(getattr(module.api, "metadata", {}) or {})
+    shell_io = dict(metadata.get("shell_io") or {})
+    requirements = dict(shell_io.get("requirements") or {})
+    if shell_io.get("boundary_plans"):
+        return True
+    return any(
+        request.get("capability") == "files"
+        for request in requirements.get("requests", ())
+    )
+
+
+def _native_shell_boundary_lines(
+    module: Any,
+    entry: Any,
+    values: tuple[Any, ...],
+    slot_by_parameter: Mapping[str, int],
+    extents: Mapping[str, int],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Render file-boundary plans as native-shell C statements.
+
+    The target entry remains an ordinary numerical/control ABI. These lines
+    run in the enclosing C shell after that entry and use its already allocated
+    parameter slots. No Python file implementation and no filesystem operator
+    is admitted to Fortran/LLVM/GLSL emission.
+    """
+
+    shell_io = dict((getattr(module.api, "metadata", {}) or {}).get(
+        "shell_io"
+    ) or {})
+    plans = tuple(shell_io.get("boundary_plans") or ())
+    if not plans:
+        return (), (), ()
+    if shell_io.get("boundary_plan_schema") != "turing.shell-boundary-plan.v1":
+        raise ValueError("native shell received an unknown boundary-plan schema")
+
+    parameters_by_source: dict[str, list[Any]] = {}
+    for parameter in values:
+        parameters_by_source.setdefault(
+            str(parameter.source_name or parameter.name), []
+        ).append(parameter)
+        parameters_by_source.setdefault(str(parameter.name), []).append(parameter)
+
+    globals_: list[str] = []
+    declarations: list[str] = []
+    actions: list[str] = []
+    locals_by_name: dict[str, str] = {}
+    public_by_name = {
+        str(parameter.source_name or parameter.name): parameter
+        for parameter in values
+        if parameter.role in {"output", "inout"}
+    }
+    literal_index = 0
+
+    def local(name: str) -> str:
+        key = str(name)
+        existing = locals_by_name.get(key)
+        if existing is not None:
+            return existing
+        identifier = "turing_shell_value_" + _identifier(key)
+        if identifier in locals_by_name.values():
+            identifier += "_" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+        locals_by_name[key] = identifier
+        declarations.append(f"    int64_t {identifier} = 0;")
+        return identifier
+
+    def publish(name: str, expression: str) -> list[str]:
+        target = public_by_name.get(str(name))
+        if target is None:
+            return []
+        slot = slot_by_parameter[target.name]
+        return [
+            f"        *(({target.c_type} *)slots[{slot}]) = "
+            f"({target.c_type})({expression});"
+        ]
+
+    def scalar(operand: Mapping[str, Any]) -> str:
+        kind = str(operand.get("kind") or "")
+        if kind == "name":
+            return local(str(operand["name"]))
+        if kind == "literal" and isinstance(operand.get("value"), (int, bool)):
+            return str(int(operand["value"]))
+        raise ValueError(f"native shell cannot resolve scalar operand {operand!r}")
+
+    def span(operand: Mapping[str, Any]) -> tuple[str, str]:
+        nonlocal literal_index
+        kind = str(operand.get("kind") or "")
+        if kind in {"literal", "bytes"}:
+            if kind == "bytes":
+                payload = bytes.fromhex(str(operand.get("hex") or ""))
+            else:
+                value = operand.get("value")
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"native shell span literal must be text/bytes: {operand!r}"
+                    )
+                payload = value.encode("utf-8")
+            literal_index += 1
+            identifier = f"turing_shell_literal_{literal_index}"
+            elements = ", ".join(str(byte) for byte in payload) or "0"
+            globals_.append(
+                f"static const uint8_t {identifier}[] = {{{elements}}};"
+            )
+            return identifier, str(len(payload))
+        if kind != "name":
+            raise ValueError(f"native shell cannot resolve span operand {operand!r}")
+        source_name = str(operand["name"])
+        candidates = list(dict.fromkeys(parameters_by_source.get(source_name, ())))
+        data = next((
+            parameter for parameter in candidates
+            if str(parameter.c_type) == "uint8_t"
+            and parameter.passing == "reference"
+        ), None)
+        if data is None:
+            raise ValueError(
+                f"shell boundary name {source_name!r} has no uint8 span parameter"
+            )
+        data_slot = slot_by_parameter[data.name]
+        length_candidates = tuple(dict.fromkeys((
+            *candidates,
+            *parameters_by_source.get(source_name + "_length", ()),
+        )))
+        length = next((
+            parameter for parameter in length_candidates
+            if parameter is not data
+            and str(parameter.c_type) in {"int32_t", "int64_t"}
+            and (
+                str(parameter.source_transform or "").endswith("length")
+                or str(parameter.name).casefold().endswith("length")
+            )
+        ), None)
+        if length is not None:
+            length_slot = slot_by_parameter[length.name]
+            length_expression = (
+                f"*(({length.c_type} *)slots[{length_slot}])"
+            )
+        else:
+            length_expression = str(_element_count(data, extents))
+        return f"(const uint8_t *)slots[{data_slot}]", length_expression
+
+    for plan in plans:
+        function_name = plan.get("function")
+        if function_name not in {None, "", entry.name, entry.symbol}:
+            continue
+        operations = tuple(sorted(
+            (dict(item) for item in plan.get("operations", ())),
+            key=lambda item: int(item.get("sequence", -1)),
+        ))
+        if [int(item.get("sequence", -1)) for item in operations] != list(
+            range(len(operations))
+        ):
+            raise ValueError("shell boundary operations are not contiguous and ordered")
+        if any(str(item.get("operation")) == "read" for item in operations):
+            raise ValueError(
+                "native read boundary requires a pre-entry span publication plan"
+            )
+        for operation in operations:
+            name = str(operation.get("operation") or "")
+            arguments = tuple(operation.get("arguments") or ())
+            result_name = operation.get("result")
+            if name == "open" and len(arguments) == 2:
+                path_data, path_length = span(arguments[0])
+                mode_data, mode_length = span(arguments[1])
+                if not result_name:
+                    raise ValueError("shell file open must publish its handle")
+                target = local(str(result_name))
+                actions.append(
+                    f"        {target} = turing_shell_file_open("
+                    f"{path_data}, {path_length}, {mode_data}, {mode_length});"
+                )
+                actions.append(
+                    f"        if ({target} == 0) "
+                    "return turing_shell_file_fail(10);"
+                )
+            elif name == "write" and len(arguments) == 2:
+                handle = scalar(arguments[0])
+                data, length = span(arguments[1])
+                target = local(str(result_name or (
+                    f"discard_write_{operation.get('sequence')}"
+                )))
+                actions.append(
+                    f"        {target} = turing_shell_file_write("
+                    f"{handle}, {data}, {length});"
+                )
+                actions.append(
+                    f"        if ({target} < 0) "
+                    "return turing_shell_file_fail(11);"
+                )
+                if result_name:
+                    actions.extend(publish(str(result_name), target))
+            elif name in {"flush", "close"} and len(arguments) == 1:
+                handle = scalar(arguments[0])
+                actions.append(
+                    f"        if (!turing_shell_file_{name}({handle})) "
+                    "return turing_shell_file_fail(12);"
+                )
+            elif name == "tell" and len(arguments) == 1:
+                if not result_name:
+                    raise ValueError("shell file tell must publish its result")
+                target = local(str(result_name))
+                actions.append(
+                    f"        {target} = turing_shell_file_tell("
+                    f"{scalar(arguments[0])});"
+                )
+                actions.append(
+                    f"        if ({target} < 0) "
+                    "return turing_shell_file_fail(13);"
+                )
+                actions.extend(publish(str(result_name), target))
+            elif name == "seek" and len(arguments) in {2, 3}:
+                origin = scalar(arguments[2]) if len(arguments) == 3 else "0"
+                actions.append(
+                    "        if (!turing_shell_file_seek("
+                    f"{scalar(arguments[0])}, {scalar(arguments[1])}, "
+                    f"(int32_t)({origin}))) "
+                    "return turing_shell_file_fail(14);"
+                )
+            else:
+                raise ValueError(
+                    f"native shell does not implement boundary operation {name!r}"
+                )
+    return tuple(globals_), tuple(declarations), tuple(actions)
+
+
 def _display_configuration(module: Any, entry: Any) -> dict[str, Any] | None:
     """Resolve an optional declarative display request from the shared IO ABI.
 
@@ -1043,6 +1400,13 @@ def emit_fortran_c_shell_source(
     slot_by_parameter = {
         parameter.name: index for index, parameter in enumerate(values)
     }
+    (
+        shell_boundary_globals,
+        shell_boundary_declarations,
+        shell_boundary_actions,
+    ) = _native_shell_boundary_lines(
+        module, entry, values, slot_by_parameter, extents,
+    )
     display = _display_configuration(module, entry)
     file_ports = _system_file_configurations(module, entry)
     system_parameters = {
@@ -1436,9 +1800,14 @@ static void turing_display_close(void) {
         _C_TRACE_SOURCE if trace else "",
         "",
         "#include <stdbool.h>",
+        "#include <stddef.h>",
+        "#include <stdint.h>",
         "#include <stdio.h>",
         "#include <stdlib.h>",
         "#include <string.h>",
+        "#if !defined(_WIN32)",
+        "#include <sys/types.h>",
+        "#endif",
         "",
         r'''#if defined(_WIN32)
 /* GCC 16's MinGW static libgfortran uses the POSIX strndup entry point, while
@@ -1509,6 +1878,8 @@ static int turing_read_file(
     return 1;
 }
 ''' if file_ports else "",),
+        _C_FILE_BROKER_SOURCE if _requires_file_broker(module) else "",
+        *shell_boundary_globals,
         display_source,
         f"extern void {entry.symbol}({', '.join(prototype_arguments)});",
         "",
@@ -1530,6 +1901,7 @@ static int turing_read_file(
             f"    TuringTraceRecord trace_storage[{trace_capacity}];",
             "    TuringTraceSite trace_site = {0};",
         ) if trace else ()),
+        *shell_boundary_declarations,
         "    int frame;",
         "    { int argument_index;",
         "      for (argument_index = 2; argument_index < argc; ++argument_index)",
@@ -1557,6 +1929,7 @@ static int turing_read_file(
             if trace else
             "                &profile, &stats, NULL, NULL, 3) != 1) return 5;"
         ),
+        *shell_boundary_actions,
         *display_present_lines,
         *feedback_lines,
         "        if (stream_frames) {",
@@ -1595,6 +1968,7 @@ static int turing_read_file(
         "      if (!outputs_file) { perror(\"final outputs\"); return 6; }",
         *output_write_lines,
         "      fclose(outputs_file); }",
+        *(('    turing_shell_file_close_all();',) if _requires_file_broker(module) else ()),
         f"    for (frame = 0; frame < {len(values)}; ++frame) free(slots[frame]);",
         "    return 0;",
         "}",
@@ -1802,7 +2176,12 @@ def compile_fortran_module_c_shell(
     environment["PATH"] = (
         str(Path(compiler).parent) + os.pathsep + environment.get("PATH", "")
     )
-    fortran_flags = aggressive_fortran_flags(compiler)
+    fortran_flags = aggressive_fortran_flags(
+        compiler,
+        # Set by emit_module when the SSA carried precision sections; the
+        # C shell itself only marshals, so its flags stay unconditional.
+        precision_sections=bool(getattr(module, "precision_sections", False)),
+    )
     c_flags = aggressive_c_flags(compiler)
     try:
         link_flags = (
@@ -17158,8 +17537,7 @@ def _class_surface_ssa_program(
                     for occurrence in occurrences.get(int(actual.id), ()):
                         occurrence.dtype = dtype
 
-    return (
-        IRModule(
+    lowered_module = IRModule(
             all_functions,
             **(
                 {"function_table": source_function_table}
@@ -17181,7 +17559,18 @@ def _class_surface_ssa_program(
                 SSAMachineIndirectTable(tuple(machine_indirect_links))
             ),
             metadata=module_metadata,
-        ),
+        )
+    # Precision is one vertical compiler feature: the frontend names widened
+    # arithmetic, the repository SSA proves exact reductions and materialises
+    # limbs, and destinations consume the resulting contract.  Running this
+    # transaction at the completed-module seam keeps every backend on the same
+    # lowered program and lets it repair the canonical call ABI after formals
+    # grow.  Modules without precision operations are left byte-for-byte alone.
+    from .ir_identities import apply_precision_pipeline
+    apply_precision_pipeline(lowered_module)
+
+    return (
+        lowered_module,
         {
             name: emit_outputs(name, function)
             for name, function in all_functions.items()
@@ -18203,13 +18592,38 @@ def lower_ast_source_to_ssa(
                         )
         remaining = dict(materialized_identities)
         unmaterialized_boundaries = []
+        boundary_transformations = []
+        shell_contexts = [
+            dict(item)
+            for item in graph.G.graph.get("shell_file_contexts", ())
+        ]
+        used_shell_contexts: set[int] = set()
         for boundary in extraction_boundaries:
             contract = dict(boundary.get("extraction_contract") or {})
             identity = str(contract.get("identity") or "")
             if identity and remaining.get(identity, 0) > 0:
                 remaining[identity] -= 1
-            else:
+                continue
+            replacement = next((
+                (index, context)
+                for index, context in enumerate(shell_contexts)
+                if index not in used_shell_contexts
+                and str(context.get("identity") or "") == identity
+            ), None)
+            if replacement is None:
                 unmaterialized_boundaries.append(boundary)
+                continue
+            context_index, context = replacement
+            used_shell_contexts.add(context_index)
+            boundary_transformations.append({
+                "source_identity": identity,
+                "source_rule": contract.get("rule_id"),
+                "transformation": "python-file-context-to-shell-file-region",
+                "scope": context.get("scope"),
+                "shell_operation_identities": tuple(
+                    map(str, context.get("operation_identities", ()))
+                ),
+            })
         unresolved_call_records = tuple(
             {
                 "caller": str(record.caller),
@@ -18223,6 +18637,7 @@ def lower_ast_source_to_ssa(
         module.metadata["extraction_boundary_accounting"] = {
             "occurrences": extraction_boundaries,
             "materialized_identity_counts": materialized_identities,
+            "boundary_transformations": tuple(boundary_transformations),
             "unmaterialized": tuple(unmaterialized_boundaries),
             "unresolved_call_records": unresolved_call_records,
             "repository_ssa_complete": not (
@@ -18234,6 +18649,44 @@ def lower_ast_source_to_ssa(
             "path": str(getattr(extraction_policy, "path", "")),
             "decisions": list(extraction_policy.receipts()),
         }
+        shell_requests = {}
+        for boundary in extraction_boundaries:
+            contract = dict(boundary.get("extraction_contract") or {})
+            parameters = dict(contract.get("parameters") or {})
+            capability = parameters.get("shell_capability")
+            if capability is None:
+                continue
+            attributes = {
+                key: parameters[key]
+                for key in ("execution", "shell_abi")
+                if parameters.get(key) is not None
+            }
+            previous = shell_requests.setdefault(str(capability), attributes)
+            if previous != attributes:
+                raise ValueError(
+                    f"conflicting {capability!r} shell boundary declarations"
+                )
+        if shell_requests:
+            from .shell_io import (
+                ShellIOManifest,
+                ShellIORequest,
+                attach_shell_io_metadata,
+            )
+
+            module.metadata = attach_shell_io_metadata(
+                module.metadata,
+                ShellIOManifest(requests=tuple(
+                    ShellIORequest.create(capability, attributes=attributes)
+                    for capability, attributes in sorted(shell_requests.items())
+                )),
+            )
+            if shell_contexts:
+                shell_io_metadata = dict(module.metadata.get("shell_io") or {})
+                shell_io_metadata["boundary_plan_schema"] = (
+                    "turing.shell-boundary-plan.v1"
+                )
+                shell_io_metadata["boundary_plans"] = tuple(shell_contexts)
+                module.metadata["shell_io"] = shell_io_metadata
     for decision in decision_records:
         function = module.functions.get(
             f"{artifact_name}__{_identifier(decision['function'])}"

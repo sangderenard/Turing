@@ -140,6 +140,17 @@ def emit_ssa_function_to_wasm(
     constants: dict[int, float] = {}
     outputs: tuple[int, ...] = ()
     shortfalls: list[WasmEmissionShortfall] = []
+    from .ir_identities import precision_backend_shortfalls
+    shortfalls.extend(
+        WasmEmissionShortfall(
+            "precision_section",
+            "backend cannot honour precision obligations "
+            + repr(item["missing"]),
+        )
+        for item in precision_backend_shortfalls(
+            module, "wasm", (function_name,)
+        )
+    )
 
     def get(value_id: int) -> None:
         builder.local_get(locals_by_id[int(value_id)])
@@ -366,4 +377,567 @@ def emit_ssa_function_to_wasm(
     )
 
 
-__all__ = ["SSAWasmArtifact", "WasmEmissionShortfall", "emit_ssa_function_to_wasm"]
+# ---------------------------------------------------------------------------
+# Repository-call module emission: the batched lane.
+#
+# The scalar artifact above is one straight-line block behind slot-in-memory
+# scalars. The precision benchmark's kernels are a counted loop calling a
+# planned region once per element, addressing arrays through
+# GetElementPtr/Load/Store. This emitter takes that whole module and produces
+# ONE exported function: the wrapper's CFG is translated with the classic
+# label-dispatcher (a loop over nested blocks selected by a label local --
+# WebAssembly's structured control flow spelling of an arbitrary branch), and
+# the region is INLINED at its call site, because a single-block callee
+# invoked at a single site is cheaper to splice than to give its own function
+# and marshalling.
+#
+# The ABI mirrors the classification the C module lane uses: each root formal
+# becomes one parameter -- an i32 byte offset into exported linear memory for
+# a formal something addresses through, the value itself (i32/f64) for a
+# scalar. The host lays the arrays out in memory, passes their offsets, and
+# reads results back from memory.
+# ---------------------------------------------------------------------------
+
+import base64 as _base64
+import json as _json
+import struct as _struct
+import subprocess as _subprocess
+
+# Opcodes the module lane needs beyond the scalar lane's imports; numeric
+# values are the WebAssembly spec's, mirrored from wasm_binary's tables.
+_OP_UNREACHABLE = 0x00
+_OP_RETURN = 0x0F
+_OP_I32_EQ = 0x46
+_OP_I32_LT_S = 0x48
+_OP_I32_SUB = 0x6B
+_OP_I32_MUL = 0x6C
+_OP_I32_DIV_S = 0x6D
+_OP_I32_SHL = 0x74
+_F64_OPS = {"Add": 0xA0, "Sub": 0xA1, "Mul": 0xA2, "Div": 0xA3}
+_I32_OPS = {"Add": 0x6A, "Sub": 0x6B, "Mul": 0x6C, "Div": 0x6D}
+_I32_COMPARISONS = {
+    "Lt": 0x48, "Le": 0x4C, "Gt": 0x4A, "Ge": 0x4E, "Eq": 0x46, "Ne": 0x47,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class WasmCoreArtifact:
+    """A whole repository-call module as one exported wasm function.
+
+    ``parameters`` is the call ABI in formal order: ``("buffer", id)`` for an
+    i32 byte-offset parameter, ``("i32", id)`` / ``("f64", id)`` for scalars
+    passed by value. ``buffer_order`` lists the buffer-parameter value ids,
+    which is what a feed dictionary keys.
+    """
+
+    name: str
+    binary: bytes
+    parameters: tuple[tuple[str, int], ...]
+    shortfalls: tuple[WasmEmissionShortfall, ...]
+    precision_sections: bool = False
+
+    @property
+    def complete(self) -> bool:
+        return not self.shortfalls
+
+    @property
+    def buffer_order(self) -> tuple[int, ...]:
+        return tuple(
+            value_id for kind, value_id in self.parameters
+            if kind == "buffer"
+        )
+
+
+def emit_ssa_module_to_wasm_core(
+    module: IRModule, function_name: str, *, entry_name: str | None = None,
+) -> WasmCoreArtifact:
+    """Emit ``function_name`` plus its inlined callees as one wasm function."""
+
+    from .ir_identities import precision_backend_shortfalls
+
+    name = str(entry_name or function_name)
+    root: Function = module.functions[function_name]
+    shortfalls: list[WasmEmissionShortfall] = []
+    reachable = [function_name]
+    for block in root.blocks.values():
+        for instruction in block.instrs:
+            if instruction.op in ("Call", "call"):
+                reachable.append(
+                    str(instruction.attributes.get("callee") or "")
+                )
+    shortfalls.extend(
+        WasmEmissionShortfall(
+            "precision_section",
+            "backend cannot honour precision obligations "
+            + repr(item["missing"]) + f" in {item['function']}",
+        )
+        for item in precision_backend_shortfalls(module, "wasm", reachable)
+    )
+
+    # Which root formals are addressed through (see the C module lane for
+    # the fixed-point version; here one call level suffices because the
+    # region is the only callee and it is inlined).
+    pointer_ids: set[int] = set()
+    for callee_name in reachable:
+        function = module.functions.get(callee_name)
+        if function is None:
+            continue
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if str(instruction.op) == "GetElementPtr" and instruction.args:
+                    pointer_ids.add(int(instruction.args[0].id))
+                elif str(instruction.op) == "Store" and len(instruction.args) >= 2:
+                    pointer_ids.add(int(instruction.args[1].id))
+    for block in root.blocks.values():
+        for instruction in block.instrs:
+            if instruction.op not in ("Call", "call"):
+                continue
+            callee = module.functions.get(
+                str(instruction.attributes.get("callee") or "")
+            )
+            if callee is None:
+                continue
+            for actual, formal in zip(instruction.args, callee.args):
+                if int(formal.id) in pointer_ids:
+                    pointer_ids.add(int(actual.id))
+
+    def is_integer_value(value) -> bool:
+        return str(value.dtype or "").casefold() in {
+            "int", "int32", "i32", "int64", "i64", "long", "bool", "i1",
+        }
+
+    parameters: list[tuple[str, int]] = []
+    parameter_types: list[str] = []
+    for formal in root.args:
+        value_id = int(formal.id)
+        if value_id in pointer_ids:
+            parameters.append(("buffer", value_id))
+            parameter_types.append("i32")
+        elif is_integer_value(formal):
+            parameters.append(("i32", value_id))
+            parameter_types.append("i32")
+        else:
+            parameters.append(("f64", value_id))
+            parameter_types.append("f64")
+
+    builder = CodeBuilder("f64", parameter_count=len(parameters))
+    precision_present = False
+
+    class _Env:
+        """Value id -> local index, with parameters pre-bound."""
+
+        def __init__(self, bindings):
+            self.slots = dict(bindings)
+            self.integers = set()
+
+    root_env = _Env({
+        int(formal.id): index for index, formal in enumerate(root.args)
+    })
+    for formal in root.args:
+        if is_integer_value(formal) or int(formal.id) in pointer_ids:
+            root_env.integers.add(int(formal.id))
+
+    def slot_for(env, value, integer: bool):
+        value_id = int(value.id)
+        held = env.slots.get(value_id)
+        if held is None:
+            held = builder.declare_local("i32" if integer else "f64")
+            env.slots[value_id] = held
+            if integer:
+                env.integers.add(value_id)
+        return held
+
+    def push(env, value) -> bool:
+        held = env.slots.get(int(value.id))
+        if held is None:
+            shortfalls.append(WasmEmissionShortfall(
+                "operand", f"%t{value.id} is unavailable"
+            ))
+            return False
+        builder.local_get(held)
+        return True
+
+    def emit_straight_instruction(env, instruction) -> None:
+        """One non-control instruction into the current position."""
+
+        nonlocal precision_present
+        operation = str(instruction.op)
+        if instruction.attributes.get("precision_section"):
+            precision_present = True
+        if operation == "Const":
+            held = instruction.attributes.get(
+                "constant", instruction.attributes.get("value")
+            )
+            integer = (
+                isinstance(held, int)
+                or (instruction.res is not None
+                    and is_integer_value(instruction.res))
+            )
+            if integer:
+                builder.i32_const(int(held))
+            else:
+                builder.value_const(float(held))
+            builder.local_set(slot_for(env, instruction.res, integer))
+            return
+        if operation == "GetElementPtr" and len(instruction.args) >= 2:
+            # address = base_offset + (index << 3); limbs are f64.
+            if not (push(env, instruction.args[0])
+                    and push(env, instruction.args[1])):
+                return
+            builder.i32_const(3).raw(_OP_I32_SHL).raw(OP_I32_ADD)
+            builder.local_set(slot_for(env, instruction.res, True))
+            return
+        if operation == "Load" and instruction.args:
+            if not push(env, instruction.args[0]):
+                return
+            builder.load()
+            builder.local_set(slot_for(env, instruction.res, False))
+            return
+        if operation == "Store" and len(instruction.args) >= 2:
+            if not (push(env, instruction.args[1])
+                    and push(env, instruction.args[0])):
+                return
+            builder.store()
+            return
+        if operation == "Neg" and instruction.args:
+            source = instruction.args[0]
+            if int(source.id) in env.integers:
+                builder.i32_const(0)
+                if not push(env, source):
+                    return
+                builder.raw(_OP_I32_SUB)
+                builder.local_set(slot_for(env, instruction.res, True))
+            else:
+                if not push(env, source):
+                    return
+                builder.raw(0x9A)  # f64.neg
+                builder.local_set(slot_for(env, instruction.res, False))
+            return
+        if operation in _F64_OPS and len(instruction.args) == 2:
+            integer = all(
+                int(argument.id) in env.integers
+                for argument in instruction.args
+            )
+            if not (push(env, instruction.args[0])
+                    and push(env, instruction.args[1])):
+                return
+            builder.raw(
+                _I32_OPS[operation] if integer else _F64_OPS[operation]
+            )
+            builder.local_set(slot_for(env, instruction.res, integer))
+            return
+        if operation in _I32_COMPARISONS and len(instruction.args) == 2:
+            if not (push(env, instruction.args[0])
+                    and push(env, instruction.args[1])):
+                return
+            builder.raw(_I32_COMPARISONS[operation])
+            builder.local_set(slot_for(env, instruction.res, True))
+            return
+        shortfalls.append(WasmEmissionShortfall(
+            operation, "no module-lane WASM spelling"
+        ))
+
+    def inline_call(env, instruction) -> None:
+        callee_name = str(instruction.attributes.get("callee") or "")
+        callee = module.functions.get(callee_name)
+        if callee is None or set(callee.blocks) != {"entry"}:
+            shortfalls.append(WasmEmissionShortfall(
+                "Call",
+                f"callee {callee_name!r} is absent or not a single block",
+            ))
+            return
+        # The callee's formals alias the caller's actual slots; everything
+        # else the callee computes gets fresh locals in its own namespace.
+        callee_env = _Env({})
+        for actual, formal in zip(instruction.args, callee.args):
+            held = env.slots.get(int(actual.id))
+            if held is None:
+                shortfalls.append(WasmEmissionShortfall(
+                    "Call", f"actual %t{actual.id} is unavailable",
+                ))
+                return
+            callee_env.slots[int(formal.id)] = held
+            if int(actual.id) in env.integers:
+                callee_env.integers.add(int(formal.id))
+        for callee_instruction in callee.blocks["entry"].instrs:
+            operation = str(callee_instruction.op)
+            if operation in ("Ret", "Return"):
+                continue
+            if operation in ("Call", "call"):
+                inline_call(callee_env, callee_instruction)
+                continue
+            emit_straight_instruction(callee_env, callee_instruction)
+
+    # -- the wrapper CFG through the label dispatcher -----------------------
+    order = list(root.blocks)
+    label_local = builder.declare_local("i32")  # zero-initialised: entry
+
+    def edge_assignments(source_block: str, target_block: str) -> None:
+        target = root.blocks.get(target_block)
+        if target is None:
+            return
+        for instruction in target.instrs:
+            if str(instruction.op) != "Phi" or instruction.res is None:
+                continue
+            incoming = tuple(
+                instruction.attributes.get("incoming_blocks") or ()
+            )
+            for position, origin in enumerate(incoming):
+                if str(origin) == source_block and position < len(
+                    instruction.args
+                ):
+                    integer = is_integer_value(instruction.res) or all(
+                        int(a.id) in root_env.integers
+                        for a in instruction.args
+                        if a is not None
+                    )
+                    destination = slot_for(
+                        root_env, instruction.res, integer
+                    )
+                    if push(root_env, instruction.args[position]):
+                        builder.local_set(destination)
+
+    # Phi results need their locals to exist before any predecessor writes
+    # them, so walk them first.
+    for block_name in order:
+        for instruction in root.blocks[block_name].instrs:
+            if str(instruction.op) == "Phi" and instruction.res is not None:
+                slot_for(
+                    root_env, instruction.res,
+                    is_integer_value(instruction.res),
+                )
+
+    count = len(order)
+    builder.loop()
+    for _ in range(count):
+        builder.block()
+    for index in range(count):
+        builder.local_get(label_local).i32_const(index)
+        builder.raw(_OP_I32_EQ).br_if(index)
+    builder.raw(_OP_UNREACHABLE)
+    for index, block_name in enumerate(order):
+        builder.end()  # opens block ``index``'s straight-line code region
+        depth_to_loop = count - 1 - index
+        for instruction in root.blocks[block_name].instrs:
+            operation = str(instruction.op)
+            if operation == "Phi":
+                continue  # defined by edge assignments
+            if operation in ("Call", "call"):
+                inline_call(root_env, instruction)
+                continue
+            if operation == "Br":
+                target = str(instruction.attributes.get("target"))
+                edge_assignments(block_name, target)
+                builder.i32_const(order.index(target))
+                builder.local_set(label_local)
+                builder.br(depth_to_loop)
+                continue
+            if operation == "CondBr":
+                on_true = str(instruction.attributes.get("true_target"))
+                on_false = str(instruction.attributes.get("false_target"))
+                if not push(root_env, instruction.args[0]):
+                    continue
+                builder.if_()
+                edge_assignments(block_name, on_true)
+                builder.i32_const(order.index(on_true))
+                builder.local_set(label_local)
+                builder.br(depth_to_loop + 1)
+                builder.else_()
+                edge_assignments(block_name, on_false)
+                builder.i32_const(order.index(on_false))
+                builder.local_set(label_local)
+                builder.br(depth_to_loop + 1)
+                builder.end()
+                continue
+            if operation in ("Ret", "Return"):
+                builder.raw(_OP_RETURN)
+                continue
+            emit_straight_instruction(root_env, instruction)
+    builder.end()  # the dispatcher loop
+
+    binary = b""
+    if not shortfalls:
+        binary = build_module(
+            function_name=name,
+            parameter_types=parameter_types,
+            body=builder,
+            memory_pages=1,
+        )
+    return WasmCoreArtifact(
+        name=name,
+        binary=binary,
+        parameters=tuple(parameters),
+        shortfalls=tuple(shortfalls),
+        precision_sections=precision_present,
+    )
+
+
+_NODE_CORE_WORKER = r"""
+import readline from 'node:readline';
+let exports = null;
+let held_args = [];
+let entry = '';
+const rl = readline.createInterface({ input: process.stdin });
+const reply = (payload) => process.stdout.write(JSON.stringify(payload) + '\n');
+rl.on('line', async (line) => {
+  let msg;
+  try { msg = JSON.parse(line); } catch (e) { reply({ok: false, error: 'bad json'}); return; }
+  try {
+    if (msg.cmd === 'init') {
+      const bytes = Buffer.from(msg.module, 'base64');
+      const { instance } = await WebAssembly.instantiate(bytes, {});
+      exports = instance.exports;
+      entry = msg.entry;
+      const need = Math.ceil(msg.bytes / 65536);
+      const have = exports.memory.buffer.byteLength / 65536;
+      if (need > have) exports.memory.grow(need - have);
+      for (const buffer of msg.buffers) {
+        const data = Buffer.from(buffer.data, 'base64');
+        new Uint8Array(exports.memory.buffer, buffer.off, data.length).set(data);
+      }
+      held_args = msg.args;
+      reply({ok: true});
+    } else if (msg.cmd === 'run') {
+      exports[entry](...held_args);
+      reply({ok: true});
+    } else if (msg.cmd === 'read') {
+      const view = Buffer.from(exports.memory.buffer, msg.off, msg.len);
+      reply({ok: true, data: view.toString('base64')});
+    } else if (msg.cmd === 'exit') {
+      process.exit(0);
+    } else {
+      reply({ok: false, error: 'unknown cmd'});
+    }
+  } catch (error) {
+    reply({ok: false, error: String(error && error.stack || error)});
+  }
+});
+"""
+
+
+class _WasmCoreBuffers:
+    """Read-through view of the worker's linear memory, keyed by value id.
+
+    The arrays live inside the Node process; a lookup fetches the bytes at
+    that moment, so a read AFTER ``run()`` sees what the kernel wrote --
+    the same observable behaviour as the in-process lanes' shared arrays.
+    """
+
+    def __init__(self, execution, layout):
+        self._execution = execution
+        self._layout = layout  # value_id -> (offset, byte_length, dtype)
+
+    def __contains__(self, value_id) -> bool:
+        return int(value_id) in self._layout
+
+    def __getitem__(self, value_id):
+        import numpy as np
+
+        offset, length, dtype = self._layout[int(value_id)]
+        raw = self._execution.request({
+            "cmd": "read", "off": offset, "len": length,
+        })["data"]
+        return np.frombuffer(
+            _base64.b64decode(raw), dtype=dtype,
+        ).copy()
+
+
+class WasmCoreExecution:
+    """One instantiated core inside a persistent Node worker."""
+
+    def __init__(self, artifact: WasmCoreArtifact, feeds: Mapping[int, Any]):
+        import numpy as np
+        import shutil
+
+        node = shutil.which("node")
+        if node is None:
+            raise RuntimeError(
+                "node is required to execute WebAssembly cores"
+            )
+        layout: dict[int, tuple[int, int, str]] = {}
+        buffers = []
+        offset = 8  # keep 0 unused so a zero offset is never a real buffer
+        arguments: list[float | int] = []
+        for kind, value_id in artifact.parameters:
+            fed = feeds.get(int(value_id))
+            if kind == "buffer":
+                held = np.ascontiguousarray(
+                    np.atleast_1d(np.asarray(
+                        0.0 if fed is None else fed
+                    )), dtype="float64",
+                )
+                layout[int(value_id)] = (offset, held.nbytes, "float64")
+                buffers.append({
+                    "off": offset,
+                    "data": _base64.b64encode(held.tobytes()).decode(),
+                })
+                arguments.append(offset)
+                offset += (held.nbytes + 7) // 8 * 8
+            elif kind == "i32":
+                arguments.append(int(0 if fed is None else fed))
+            else:
+                arguments.append(float(0.0 if fed is None else fed))
+        self._process = _subprocess.Popen(
+            [node, "--input-type=module", "--eval", _NODE_CORE_WORKER],
+            stdin=_subprocess.PIPE, stdout=_subprocess.PIPE,
+            stderr=_subprocess.PIPE, text=True, encoding="utf-8",
+        )
+        self.buffers = _WasmCoreBuffers(self, layout)
+        self.request({
+            "cmd": "init",
+            "module": _base64.b64encode(artifact.binary).decode(),
+            "entry": artifact.name,
+            "bytes": offset,
+            "buffers": buffers,
+            "args": arguments,
+        })
+
+    def request(self, payload: dict) -> dict:
+        self._process.stdin.write(_json.dumps(payload) + "\n")
+        self._process.stdin.flush()
+        line = self._process.stdout.readline()
+        if not line:
+            error = self._process.stderr.read()
+            raise RuntimeError(f"wasm worker died: {error[-1500:]}")
+        answer = _json.loads(line)
+        if not answer.get("ok"):
+            raise RuntimeError(
+                f"wasm worker error: {answer.get('error')!r}"
+            )
+        return answer
+
+    def run(self) -> "WasmCoreExecution":
+        self.request({"cmd": "run"})
+        return self
+
+    def close(self) -> None:
+        try:
+            self.request({"cmd": "exit"})
+        except Exception:
+            pass
+        self._process.terminate()
+
+    def __del__(self):  # best-effort; the worker also dies with the parent
+        try:
+            self._process.terminate()
+        except Exception:
+            pass
+
+
+def prepare_wasm_core_execution(
+    artifact: WasmCoreArtifact, feeds: Mapping[int, Any],
+) -> WasmCoreExecution:
+    if not artifact.complete:
+        raise ValueError("wasm core artifact has emission shortfalls")
+    return WasmCoreExecution(artifact, feeds)
+
+
+__all__ = [
+    "SSAWasmArtifact",
+    "WasmCoreArtifact",
+    "WasmCoreExecution",
+    "WasmEmissionShortfall",
+    "emit_ssa_function_to_wasm",
+    "emit_ssa_module_to_wasm_core",
+    "prepare_wasm_core_execution",
+]

@@ -166,6 +166,21 @@ _BINARY_EXTINST: dict[str, str] = {
     "minimum": "FMin",
 }
 
+# GLSL.std.450 ``Fma`` (extended instruction 50) is the ternary
+# single-rounding a*b+c. It reaches this backend as a plain ``Fma``
+# instruction -- the precision pipeline's error-free transformations lower
+# to it, and FMA_MANDATORY in ``ir_identities`` is the obligation that it be
+# spelled as one operation, never as a mul+add that rounds twice. Unlike the
+# trigonometric subset, ``Fma`` belongs to GLSL.std.450's width-unrestricted
+# instructions, so float64 limbs are fine (it is deliberately absent from
+# _EXTINST_FLOAT16_32_ONLY below). Note the extended instruction alone is
+# not the whole obligation: per GLSL.std.450, single rounding is only
+# guaranteed when the OpExtInst RESULT is decorated NoContraction, which the
+# precision-section path in ``_apply`` takes care of.
+_TERNARY_EXTINST: dict[str, str] = {
+    "Fma": "Fma", "fma": "Fma",
+}
+
 # GLSL.std.450's "trigonometric instructions" subset (Sin/Cos/.../Pow) is
 # specified for 16- or 32-bit float components only -- Result Type and every
 # operand must share one of those widths. ``spirv-val`` rejects a 64-bit
@@ -183,6 +198,19 @@ _EXTINST_FLOAT16_32_ONLY: frozenset[str] = frozenset(
         "Sinh", "Cosh", "Tanh", "Asinh", "Acosh", "Atanh",
         "Exp", "Log", "Pow",
     }
+)
+
+# The float arithmetic spellings whose results carry NoContraction inside a
+# precision section. These are exactly the shapes a driver is otherwise
+# licensed to contract or reassociate: the native float add/sub/mul/div/
+# negate, and the GLSL.std.450 Fma itself (whose single rounding is only
+# guaranteed under the decoration -- see _TERNARY_EXTINST). Everything else
+# an instruction inside a section can emit (loads, stores, access chains,
+# comparisons) has no contraction to withdraw, and SPIR-V permits
+# NoContraction on arithmetic results only, so decorating more would trade a
+# silent numerical failure for a validation failure.
+_NOCONTRACTION_SPELLINGS: frozenset[str] = frozenset(
+    {"OpFAdd", "OpFSub", "OpFMul", "OpFDiv", "OpFNegate", "Fma"}
 )
 
 # Whole-array-to-scalar reductions -- not in any op table above (they need
@@ -262,6 +290,14 @@ class _ModuleBuilder:
         self.const_ids: dict[tuple[str, Any], str] = {}
         self.type_lines: list[str] = []
         self.exported: list[str] = []
+        # OpDecorate lines collected while emitting function bodies. SPIR-V's
+        # module layout puts every annotation in one section BEFORE all types
+        # and functions, so a decoration discovered mid-body (a NoContraction
+        # on a precision-section result, say) cannot be written where it was
+        # discovered -- it is parked here and _assemble threads it in next to
+        # the linkage decorations. No capability is required for
+        # NoContraction itself.
+        self.decorations: list[str] = []
 
     def fresh(self, hint: str) -> str:
         self._next_id += 1
@@ -386,12 +422,16 @@ class _FunctionEmitter:
         *,
         dtype: str = DEFAULT_DTYPE,
         outputs: Sequence[SSAValue] = (),
+        carried_shortfalls: Sequence[SPIRVShortfall] = (),
     ):
         self.function = function
         self.builder = builder
         self.dtype = dtype
         self.outputs = tuple(outputs)
-        self.shortfalls: list[SPIRVShortfall] = []
+        # Shortfalls discovered before emission started (precision-section
+        # obligations the backend cannot honour) travel on the same channel
+        # as the ones discovered per-instruction below.
+        self.shortfalls: list[SPIRVShortfall] = list(carried_shortfalls)
         # Array-shaped SSA value id -> the Function-storage pointer holding
         # it (an OpFunctionParameter for arguments, an OpVariable for
         # computed temporaries). Scalars never appear here -- they pass by
@@ -519,6 +559,8 @@ class _FunctionEmitter:
             return ("unary", _UNARY_NATIVE[op])
         if arity == 1 and op in _UNARY_EXTINST:
             return ("extinst_unary", _UNARY_EXTINST[op])
+        if arity == 3 and op in _TERNARY_EXTINST:
+            return ("extinst_ternary", _TERNARY_EXTINST[op])
         if arity == 3 and op in ("Select", "where"):
             return ("select", "")
         return None
@@ -559,10 +601,30 @@ class _FunctionEmitter:
                 f"    {result_id} = OpExtInst {result_type} {ext} "
                 f"{payload} {operand_ids[0]}"
             )
+        elif kind == "extinst_ternary":
+            ext = self.builder.glsl_ext()
+            body.append(
+                f"    {result_id} = OpExtInst {result_type} {ext} "
+                f"{payload} {operand_ids[0]} {operand_ids[1]} {operand_ids[2]}"
+            )
         elif kind == "select":
             body.append(
                 f"    {result_id} = OpSelect {result_type} "
                 f"{operand_ids[0]} {operand_ids[1]} {operand_ids[2]}"
+            )
+        # Inside a precision section, contraction must be withdrawn from
+        # every arithmetic result INCLUDING the declared Fma -- GLSL.std.450
+        # only guarantees Fma's single rounding when its OpExtInst result is
+        # decorated NoContraction, so without this line the FMA_MANDATORY
+        # claim in BACKEND_PRECISION_CAPABILITIES would be a lie. Ordinary
+        # instructions are deliberately left undecorated: contraction stays
+        # available to them, exactly as SECTION_ISOLATION scopes it.
+        if (
+            instr.attributes.get("precision_section")
+            and payload in _NOCONTRACTION_SPELLINGS
+        ):
+            self.builder.decorations.append(
+                f"OpDecorate {result_id} NoContraction"
             )
 
     def _augment_scalar_attrs(
@@ -815,8 +877,45 @@ def _emit_function(
     *,
     dtype: str,
     outputs: Sequence[SSAValue],
+    carried_shortfalls: Sequence[SPIRVShortfall] = (),
 ) -> SPIRVFunction:
-    return _FunctionEmitter(function, builder, dtype=dtype, outputs=outputs).emit()
+    return _FunctionEmitter(
+        function,
+        builder,
+        dtype=dtype,
+        outputs=outputs,
+        carried_shortfalls=carried_shortfalls,
+    ).emit()
+
+
+def _precision_shortfalls(
+    module: Any, function_names: Sequence[str],
+) -> dict[str, tuple[SPIRVShortfall, ...]]:
+    """Precision-section obligations this backend cannot honour, per function.
+
+    ``BACKEND_PRECISION_CAPABILITIES`` declares "spirv" delivers both
+    FMA_MANDATORY (GLSL.std.450 Fma) and SECTION_ISOLATION (NoContraction on
+    every section result), so with today's obligations this returns nothing
+    -- the call exists to keep that table honest: if a section ever carries
+    an obligation the table does not claim, it is refused here, on the same
+    shortfall channel as an unregistered opcode, rather than emitted wrong.
+    The receipt lives on the IRModule's metadata; a bare Function or plain
+    mapping simply has none, and the check passes vacuously.
+    """
+
+    from .ir_identities import precision_backend_shortfalls
+
+    grouped: dict[str, tuple[SPIRVShortfall, ...]] = {}
+    for item in precision_backend_shortfalls(module, "spirv", function_names):
+        function_name = str(item["function"])
+        grouped[function_name] = grouped.get(function_name, ()) + (
+            SPIRVShortfall(
+                "precision_section", "*",
+                "backend cannot honour precision obligations "
+                + repr(item["missing"]),
+            ),
+        )
+    return grouped
 
 
 def _assemble(name: str, builder: _ModuleBuilder, functions: tuple[SPIRVFunction, ...]) -> SPIRVModule:
@@ -828,6 +927,11 @@ def _assemble(name: str, builder: _ModuleBuilder, functions: tuple[SPIRVFunction
     lines.append("OpMemoryModel Logical GLSL450")
     for exported_name in builder.exported:
         lines.append(f'OpDecorate %{exported_name} LinkageAttributes "{exported_name}" Export')
+    # Decorations parked by the function emitters (NoContraction on
+    # precision-section results) belong in the same annotations section as
+    # the linkage decorations above -- SPIR-V's module layout requires every
+    # OpDecorate before the types and functions that follow.
+    lines.extend(builder.decorations)
     lines.extend(builder.type_lines)
     for fn in functions:
         if not fn.body:
@@ -843,12 +947,17 @@ def emit_function(
     *,
     dtype: str = DEFAULT_DTYPE,
     outputs: Sequence[SSAValue] = (),
+    module: IRModule | None = None,
 ) -> SPIRVModule:
     """Translate one SSA function into a standalone SPIR-V module.
 
     ``outputs`` names the SSA value that leaves the function. SSA itself
     records only arguments, so a result would otherwise never become the
-    function's return value.
+    function's return value. ``module`` is optional and only consulted for
+    the precision-pipeline receipt in its metadata -- a caller holding the
+    IRModule the function came from should pass it so precision-section
+    obligations are checked; without it the function's own metadata is the
+    only carrier available.
     """
 
     from .machine_dialect_ssa import (
@@ -864,8 +973,17 @@ def emit_function(
             "machine-state SSA remains: "
             + format_machine_dialect_occurrences(machine_residuals)
         )
+    precision = _precision_shortfalls(
+        module if module is not None else function, (function.name,)
+    )
     builder = _ModuleBuilder()
-    fn = _emit_function(function, builder, dtype=dtype, outputs=outputs)
+    fn = _emit_function(
+        function,
+        builder,
+        dtype=dtype,
+        outputs=outputs,
+        carried_shortfalls=precision.get(function.name, ()),
+    )
     return _assemble(function.name, builder, (fn,))
 
 
@@ -896,6 +1014,12 @@ def emit_module(
             + format_machine_dialect_occurrences(machine_residuals)
         )
     named_outputs = dict(outputs or {})
+    # Precision-section obligations are checked against the module BEFORE
+    # anything is emitted, mirroring the wasm/llvm lanes -- the receipt
+    # travels on the IRModule's metadata (a plain mapping has none and
+    # passes vacuously). See _precision_shortfalls for why this is expected
+    # to find nothing today.
+    precision = _precision_shortfalls(module, tuple(functions))
     builder = _ModuleBuilder()
     fns = tuple(
         _emit_function(
@@ -903,6 +1027,7 @@ def emit_module(
             builder,
             dtype=dtype,
             outputs=named_outputs.get(function_name, ()),
+            carried_shortfalls=precision.get(str(function_name), ()),
         )
         for function_name, function in functions.items()
     )

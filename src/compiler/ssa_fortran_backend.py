@@ -3837,6 +3837,12 @@ class FortranModule:
     # by-value/by-reference from a record rather than by reading the source
     # and guessing. See compiler/compiled_program_api.py.
     api: Any = None
+    # True when the SSA carried precision sections. The toolchain reads this
+    # at COMPILE time to withdraw contraction (-ffp-contract=off): the
+    # emitted expressions are parenthesised, but contraction is the one
+    # rewrite Fortran leaves to the processor, and building a section
+    # without withdrawing it would zero every residual silently.
+    precision_sections: bool = False
 
     @property
     def shortfalls(self) -> tuple[FortranShortfall, ...]:
@@ -3892,7 +3898,28 @@ def emit_module(
         else:
             print(report, file=sys.stderr, flush=True)
 
+    module_precision_sections = False
     if isinstance(module, IRModule):
+        from .ir_identities import (
+            PRECISION_PIPELINE_METADATA,
+            precision_backend_shortfalls,
+        )
+        module_precision_sections = bool(
+            (getattr(module, "metadata", {}) or {})
+            .get(PRECISION_PIPELINE_METADATA, {})
+            .get("section_contracts")
+        )
+        precision_shortfalls = precision_backend_shortfalls(module, "fortran")
+        if precision_shortfalls:
+            details = "; ".join(
+                f"{item['function']} values={item['value_ids']!r} "
+                f"missing={item['missing']!r}"
+                for item in precision_shortfalls
+            )
+            raise FortranEmissionError(
+                "Fortran cannot honour repository precision sections: "
+                + details
+            )
         unresolved_calls = tuple(
             record
             for records in getattr(module, "call_table", {}).values()
@@ -3942,6 +3969,12 @@ def emit_module(
     functions = (
         module.functions if isinstance(module, IRModule) else dict(module)
     )
+    host_linear_region_inlining = ()
+    if isinstance(module, IRModule):
+        from .ir_identities import inline_host_linear_source_regions
+        functions, host_linear_region_inlining = (
+            inline_host_linear_source_regions(functions)
+        )
     # The decompiler reuses IRModule/Function as structural containers while
     # retaining exact machine-state transitions.  Container compatibility is
     # not repository-SSA legalization: reject every residual occurrence before
@@ -5429,10 +5462,15 @@ def emit_module(
         language="fortran",
         entry=control_entries[0] if control_entries else None,
         entry_points=tuple(entry_points),
-        metadata={
-            "dtype": dtype,
-            "fortran_internal_symbols": dict(native_symbols),
-            **({
+            metadata={
+                "dtype": dtype,
+                "fortran_internal_symbols": dict(native_symbols),
+                **({
+                    "host_linear_region_inlining": list(
+                        host_linear_region_inlining
+                    ),
+                } if host_linear_region_inlining else {}),
+                **({
                 "shell_io": dict(module.metadata["shell_io"]),
             } if module.metadata.get("shell_io") else {}),
             **publication_metadata(functions),
@@ -5557,7 +5595,10 @@ def emit_module(
         },
     )
     _phase("Fortran source generation done")
-    return FortranModule(name, "\n".join(lines) + "\n", subroutines, api=api)
+    return FortranModule(
+        name, "\n".join(lines) + "\n", subroutines, api=api,
+        precision_sections=module_precision_sections,
+    )
 
 
 # Toolchains that are commonly installed but left off PATH on Windows.  A
@@ -5628,7 +5669,10 @@ def compile_module(
     source = module.write(workdir)
     suffix = ".dll" if sys.platform == "win32" else ".so"
     library = workdir / f"{module.name}{suffix}"
-    compile_flags = tuple(extra_flags or aggressive_fortran_flags(compiler))
+    compile_flags = tuple(extra_flags or aggressive_fortran_flags(
+        compiler,
+        precision_sections=bool(getattr(module, "precision_sections", False)),
+    ))
     try:
         link_flags = (
             standalone_fortran_link_flags(compiler) if standalone else ()

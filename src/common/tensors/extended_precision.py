@@ -1,18 +1,19 @@
-"""N-double arithmetic as a shim in the operator dispatch.
+"""N-double arithmetic owned by a precision-aware tensor wrapper.
 
-An extended value is an ORDINARY TENSOR whose last dimension carries its
+An extended value stores an ordinary tensor whose last dimension carries its
 limbs, interleaved at stride ``limbs``: the value it denotes is the exact sum
-of them, and every limb is a plain slice of the base dtype. Nothing here
-introduces a new dtype, a new wrapper, or a new opcode -- every step is built
-from ``+``, ``-`` and ``*`` on the base dtype, which is why this can sit in
-the operator dispatch and serve every backend at once.
+of them, and every limb is a plain slice of the base dtype. ``Precision`` owns
+that representation so an unaware tensor operation cannot accidentally treat
+limbs as ordinary channels. Every numerical step is still built from the base
+tensor's ``+``, ``-`` and ``*`` operations, so operator dispatch and recording
+remain backend-neutral.
 
-Limbs as CHANNELS is what makes it fit. The return type never changes -- an
-operator hands back a tensor, as it always did, merely wider -- so no caller
-learns a new type and no dispatch grows a case for one. A four-channel pixel
-at two limbs is eight in the last dimension read with stride two, so RGBA
-keeps striding and the precision rides alongside it. Widening is a shape
-change and collapsing is a strided sum, both ordinary tensor work.
+Limbs as CHANNELS is what makes the storage fit existing tensor backends. The
+wrapper remains visible until an explicit collapse, while its payload is an
+ordinary wider tensor. A four-channel pixel at two limbs is eight in the last
+dimension read with stride two, so RGBA keeps striding and the precision rides
+alongside it. Widening is a shape change and collapsing is a strided sum, both
+ordinary tensor work.
 
 ``n`` is a parameter, not a fixed choice of two. One limb is ordinary
 arithmetic and the shim declines; two is double-double; four is quad-double;
@@ -52,19 +53,84 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-# Dekker's splitting constant for binary64: 2**27 + 1.
-_SPLIT = 134217729.0
+#: Everything about a limb that depends on which float carries it, stated
+#: once. Two elements exist because two worlds do: the CPU lanes hold limbs
+#: in binary64, while WGSL and GLSL have no float64 at all, so their limbs
+#: are binary32 and there are roughly twice as many of them for the same
+#: precision.
+#:
+#: * ``split`` is Veltkamp's constant ``2**ceil(t/2) + 1`` for a t-bit
+#:   significand -- splitting with the wrong one does not degrade Dekker's
+#:   product, it invalidates the theorem.
+#: * ``digits_per_limb`` is ``t * log10(2)``, used to size orders and the
+#:   exact-rational working precision.
+#: * ``max_limbs`` is what the repository lowering accepts; ``ladder`` is
+#:   the widths a lane actually offers. binary64 walks 2/3/4; binary32
+#:   walks 2/4/6/8 -- even steps, because each rung is priced against the
+#:   binary64 rung it replaces (two f32 limbs per f64 limb) and odd rungs
+#:   would be tiers nothing on the other side corresponds to.
+#: * ``sensible_limit`` is where the expansion stops being the right
+#:   representation at all (see the module note); it scales with limb
+#:   count, not with carried bits, because the O(n**2) cost does.
+LIMB_ELEMENTS: dict[str, dict] = {
+    "float64": {
+        "split": 134217729.0,  # 2**27 + 1
+        "digits_per_limb": 15.95,
+        "max_limbs": 4,
+        "ladder": (2, 3, 4),
+        "sensible_limit": 8,
+    },
+    "float32": {
+        "split": 4097.0,  # 2**12 + 1
+        "digits_per_limb": 7.22,
+        "max_limbs": 8,
+        "ladder": (2, 4, 6, 8),
+        "sensible_limit": 16,
+    },
+}
+
+_ELEMENT_SPELLINGS = {
+    "float64": "float64", "f64": "float64", "double": "float64",
+    "float32": "float32", "f32": "float32", "single": "float32",
+}
+
+
+def limb_element_facts(element: Any = None) -> dict:
+    """The facts row for a limb element.
+
+    ``None`` means the value never had a dtype stamped, which today is
+    always the binary64 default the scalar path assumes. A PRESENT but
+    unrecognised element is refused: guessing a splitting constant produces
+    plausible numbers whose residuals are quietly wrong.
+    """
+
+    if element is None:
+        return LIMB_ELEMENTS["float64"]
+    name = _ELEMENT_SPELLINGS.get(str(element).casefold())
+    if name is None:
+        raise ValueError(
+            f"no limb arithmetic facts for element {element!r}; "
+            "supported elements are float64 and float32"
+        )
+    return LIMB_ELEMENTS[name]
+
+
+# Dekker's splitting constant for binary64: 2**27 + 1. The binary64 alias
+# survives because the eager path below IS binary64; element-aware callers
+# read ``limb_element_facts`` instead.
+_SPLIT = LIMB_ELEMENTS["float64"]["split"]
 
 # Beyond this the expansion is the wrong representation; see the module note.
-SENSIBLE_LIMIT = 8
+SENSIBLE_LIMIT = LIMB_ELEMENTS["float64"]["sensible_limit"]
 
-def limbs_for_digits(digits: int) -> int:
+def limbs_for_digits(digits: int, element: Any = None) -> int:
     """Limbs needed to carry ``digits`` decimal digits."""
 
     import math
 
-    needed = int(math.ceil(float(digits) / 15.95))
-    return int(min(max(needed, 1), SENSIBLE_LIMIT))
+    facts = limb_element_facts(element)
+    needed = int(math.ceil(float(digits) / facts["digits_per_limb"]))
+    return int(min(max(needed, 1), facts["sensible_limit"]))
 
 
 # --------------------------------------------------------------------------
@@ -130,17 +196,16 @@ def narrow(value: Any, limbs: int) -> Any:
 def plain(left: Any, op: str, right: Any) -> Any:
     """One operator at a SINGLE limb -- the calculator's primitive layer.
 
-    The transformations below are the implementation of extended precision, so
-    they cannot themselves be extended: asking the calculator for its default
-    width here would call this code to implement it, without end. Spelling the
-    width explicitly says that outright, and needs no ambient flag to say it
-    -- which matters because an ambient flag is exactly what does not survive
-    into a compiled program.
+    The transformations below are the IMPLEMENTATION of extended precision, so
+    they cannot themselves be extended. They operate on limb slices, which are
+    ordinary tensors, and dispatch only diverts for a ``Precision`` -- so this
+    is a plain operator call and cannot re-enter. Spelling it out says the
+    arithmetic here is deliberately primitive rather than incidentally so.
     """
 
     from .abstraction import AbstractTensor
 
-    return AbstractTensor._apply_operator(left, op, left, right, limbs=1)
+    return AbstractTensor._apply_operator(left, op, left, right)
 
 
 def two_sum(a, b):
@@ -407,6 +472,196 @@ def constant(like: Any, parts: Sequence, limbs: int) -> Any:
 
     from .abstraction import AbstractTensor
 
-    seed = plain(limb(like, 0, limbs), "mul", 0.0)
-    return interleave([plain(seed, "add", float(part))
-                       for part in parts[:limbs]])
+    # ``like`` is ONE channel wide already -- a caller hands a limb slice, not
+    # an interleaved value -- so slicing here would halve it again.
+    seed = plain(like, "mul", 0.0)
+    return interleave([plain(seed, "add", part) for part in parts[:limbs]])
+
+
+# --------------------------------------------------------------------------
+# The type that owns the width
+
+
+class Precision:
+    """An AbstractTensor plus the limb channels that give it its width.
+
+    WHY THIS IS A TYPE and not a flag on every tensor. The limbs live in extra
+    channels, and a general tensor operation cannot be taught to see past
+    channels it does not know about. Measured on a two-limb value: ``mean``
+    returned half of it, because it divided by the widened element count.
+    ``sum``, ``max``, ``abs`` and ``reshape`` happened to be right, which is
+    worse -- it means the failures are scattered and silent rather than
+    systematic and loud.
+
+    So the width is owned by a type that also owns the operators that
+    understand it. A `Precision` supports the basic unary and binary
+    arithmetic and nothing else; anything outside that either collapses at the
+    boundary or raises. Being unsupported is a fine answer, being quietly
+    halved is not.
+
+    Anything that wants enduring precision therefore does two things: make the
+    operands `Precision`, and stay within the basic operators. That is the
+    whole contract.
+    """
+
+    #: How two widths combine. KEEP-WIDEST: an operation touching a 3-limb
+    #: operand yields 3 limbs, so precision is never silently discarded by
+    #: meeting a narrower value. The alternative rules -- take the narrower,
+    #: or track significant digits -- are policies this deliberately does not
+    #: choose for the caller, because dropping precision is the kind of thing
+    #: that should be asked for rather than inherited.
+    COMBINE = "widest"
+
+    __slots__ = ("_value", "limbs")
+
+    @classmethod
+    def __class_getitem__(cls, width):
+        """Make authored ``Precision[n]`` annotations valid Python objects."""
+
+        import types
+
+        return types.GenericAlias(cls, width)
+
+    def __init__(self, value: Any, limbs: int):
+        self._value = value
+        self.limbs = int(limbs)
+
+    # -- crossing the boundary --------------------------------------------
+
+    @classmethod
+    def constant(cls, like: "Precision", parts: Sequence) -> "Precision":
+        """A constant the caller derived to more digits than a double holds.
+
+        The whole point of a wide chain is defeated if the values entering it
+        are single doubles. An exact coefficient is not representable -- the
+        sine core's second term is -1/6, whose remainder is -9.25e-18 -- so
+        adding ``float(-1/6)`` at every Horner step reintroduces exactly the
+        error the width was bought to avoid.
+        """
+
+        seed = like.term(0)
+        return cls(constant(seed, parts, like.limbs), like.limbs)
+
+    @classmethod
+    def of(cls, value: Any, limbs: int = 2) -> "Precision":
+        """Promote an ordinary tensor. This is where width is decided."""
+
+        return cls(widen(value, int(limbs)), int(limbs))
+
+    def collapse(self) -> Any:
+        """Back to an ordinary tensor, paying the rounding once."""
+
+        return narrow(self._value, self.limbs)
+
+    @property
+    def value(self) -> Any:
+        """The ordinary tensor this denotes -- COLLAPSED, never the wide one.
+
+        Reaching for ``.value`` is what a caller naturally does, so it gives
+        back something that is safe to hand anywhere: a plain tensor of the
+        expected shape, rounded once. The interleaved form stays internal,
+        because passing THAT to a general operation is the failure being
+        contained -- it sees channels it cannot know are limbs, and divides by
+        the wrong count.
+
+        Losing the extra digits here is the point. It happens at a named
+        boundary, in one place, rather than silently in whichever operation
+        happened not to understand the layout.
+        """
+
+        return self.collapse()
+
+    def to_float_lists(self) -> list:
+        return to_float_list(self._value, self.limbs)
+
+    # -- the representation ------------------------------------------------
+
+    def term(self, index: int) -> Any:
+        return limb(self._value, index, self.limbs)
+
+    def terms(self, width: int | None = None) -> list:
+        width = self.limbs if width is None else int(width)
+        if width == self.limbs:
+            return [self.term(index) for index in range(self.limbs)]
+        return limbs_of(widen(self.collapse(), width), width, self._value)
+
+    def __repr__(self) -> str:
+        return f"Precision(limbs={self.limbs})"
+
+    def __getattr__(self, name):
+        """Refuse every tensor method this type has not endorsed.
+
+        The interleaved value is deliberately not reachable. Handing it to a
+        general tensor operation is the whole failure being contained -- that
+        operation sees channels it does not know are limbs, and ``mean``
+        divides by the wrong count while ``sum`` happens to survive. A caller
+        that wants ordinary tensor work should ``collapse()`` first and mean
+        it.
+        """
+
+        raise AttributeError(
+            f"Precision does not endorse {name!r}. Use the basic arithmetic "
+            f"operators, or collapse() for an ordinary tensor -- reaching "
+            f"past this hands limb channels to something that cannot see them."
+        )
+
+    # -- arithmetic --------------------------------------------------------
+
+    @staticmethod
+    def width_of(operand: Any) -> int:
+        return operand.limbs if isinstance(operand, Precision) else 1
+
+    @classmethod
+    def dispatch(cls, op: str, left: Any, right: Any, *, limbs: int = 1,
+                 accumulator: Any = None, accumulate_output: bool = False):
+        """One operator at a stated width, on operands of any width."""
+
+        if op not in _HANDLED:
+            raise TypeError(
+                f"Precision supports the basic arithmetic operators; {op!r} "
+                f"is not one of them. Collapse first if that is what you mean "
+                f"-- a wide value put through an operation that cannot see "
+                f"its limbs comes back wrong rather than refused."
+            )
+        width = max(int(limbs or 1), cls.width_of(left), cls.width_of(right))
+        like = (left.term(0) if isinstance(left, Precision)
+                else right.term(0) if isinstance(right, Precision)
+                else (left if hasattr(left, "shape") else right))
+
+        def operand(value):
+            if isinstance(value, Precision):
+                return value.terms(width)
+            return limbs_of(value, width, like)
+
+        if op == "neg":
+            pieces = negate(operand(left))
+        else:
+            first, second = operand(left), operand(right)
+            if op in _REVERSED:
+                first, second = second, first
+            base = op[1:] if op in _REVERSED else op.lstrip("i")
+            if base == "add":
+                pieces = add_expansions(first, second, width)
+            elif base == "sub":
+                pieces = add_expansions(first, negate(second), width)
+            elif base == "mul":
+                pieces = multiply_expansions(first, second, width)
+            else:
+                pieces = divide_expansions(first, second, width)
+        if accumulator is not None:
+            for piece in pieces:
+                accumulator.absorb(piece)
+            if accumulate_output:
+                return accumulator
+            pieces = accumulator.to_expansion(width)
+        return cls(interleave(pieces), width)
+
+    def __add__(self, other): return Precision.dispatch("add", self, other)
+    def __radd__(self, other): return Precision.dispatch("add", other, self)
+    def __sub__(self, other): return Precision.dispatch("sub", self, other)
+    def __rsub__(self, other): return Precision.dispatch("rsub", self, other)
+    def __mul__(self, other): return Precision.dispatch("mul", self, other)
+    def __rmul__(self, other): return Precision.dispatch("mul", other, self)
+    def __truediv__(self, other): return Precision.dispatch("truediv", self, other)
+    def __rtruediv__(self, other): return Precision.dispatch("rtruediv", self, other)
+    def __neg__(self): return Precision.dispatch("neg", self, None)

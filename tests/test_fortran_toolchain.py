@@ -23,6 +23,13 @@ def test_gnu_policy_is_lto_native_and_standalone_without_fast_math():
     assert {"-O3", "-march=native", "-flto", "-funroll-loops"} <= set(c)
     assert {"-flto", "-static-libgfortran", "-static-libgcc"} <= set(link)
     assert "-ffast-math" not in fortran
+    # Ordinary modules keep contraction; a module carrying a precision
+    # section withdraws it, which is what lets the fortran lane declare
+    # SECTION_ISOLATION. Both halves of the policy are pinned here.
+    assert "-ffp-contract=off" not in fortran
+    precision = aggressive_fortran_flags(compiler, precision_sections=True)
+    assert "-ffp-contract=off" in precision
+    assert "-ffast-math" not in precision
     if os.name == "nt":
         assert "-static" in link
 

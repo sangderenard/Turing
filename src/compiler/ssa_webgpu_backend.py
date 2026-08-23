@@ -560,6 +560,25 @@ def emit_module(
     preferred_local_size: int = 256,
 ) -> WGSLModule:
     ir_module = module if isinstance(module, IRModule) else IRModule(dict(module))
+    # Precision sections are refused BEFORE anything is spelled, mirroring
+    # the wasm/llvm lanes: WGSL's fma() is explicitly permitted to round
+    # twice and the language has no `precise` and no contraction control, so
+    # "webgpu" claims neither obligation in BACKEND_PRECISION_CAPABILITIES.
+    # A section emitted anyway would produce plausible-looking arithmetic
+    # whose error terms are algebraically zero -- the residual comes back
+    # zero and nothing announces the failure -- which is exactly what this
+    # loud shortfall exists to prevent. Checked against the module as handed
+    # in (the pipeline receipt travels on the repository module's metadata),
+    # before the identity pass rebuilds anything.
+    from .ir_identities import precision_backend_shortfalls
+    precision_shortfalls = tuple(
+        WGSLShortfall(
+            str(item["function"]), "precision_section",
+            "backend cannot honour precision obligations "
+            + repr(item["missing"]),
+        )
+        for item in precision_backend_shortfalls(ir_module, "webgpu")
+    )
     named_outputs = dict(outputs or {})
     from .backend_identities import apply_backend_identities
     identity_result = apply_backend_identities(
@@ -578,6 +597,15 @@ def emit_module(
         ) == "webgpu"
     ]
     if webgpu_intrinsics:
+        if precision_shortfalls:
+            # The intrinsic path replaces the module wholesale with a
+            # hand-written kernel and returns early, so an accumulated
+            # shortfall would never reach the caller -- refuse through the
+            # module-level channel instead of silently dropping the section.
+            raise WGSLEmissionError(
+                "backend cannot honour precision obligations: "
+                + "; ".join(item.format() for item in precision_shortfalls)
+            )
         if len(webgpu_intrinsics) != 1:
             raise WGSLEmissionError(
                 "one WebGPU module cannot consume multiple backend intrinsics yet"
@@ -618,7 +646,7 @@ def emit_module(
         )
     functions = ir_module.functions
     launch_plan = plan_wgsl_launch(count, preferred_local_size=preferred_local_size)
-    shortfalls: list[WGSLShortfall] = []
+    shortfalls: list[WGSLShortfall] = list(precision_shortfalls)
     requested_entries = [key for key in named_outputs if key in functions]
     if requested_entries:
         function_name = requested_entries[0]

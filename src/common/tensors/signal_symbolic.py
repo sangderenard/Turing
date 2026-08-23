@@ -183,19 +183,35 @@ def structured_coefficients(name: str, order: int) -> tuple:
                  polynomial.coeff_monomial(1) for power in powers)
 
 
-def limb_decomposition(rational: Any, limbs: int) -> tuple[float, ...]:
-    """An exact rational as ``limbs`` float64 pieces that sum to it.
+def limb_decomposition(
+    rational: Any, limbs: int, element: Any = None,
+) -> tuple[float, ...]:
+    """An exact rational as ``limbs`` element-format pieces that sum to it.
 
     ``Fraction`` is exact and ``float(Fraction)`` is correctly rounded, so
     each step takes the nearest double and carries the remainder forward
     without loss. This is the whole reason no arbitrary-precision library is
     needed at build time: the coefficients were rational all along.
+
+    A binary32 element narrows each head through ``np.float32``. That is a
+    double rounding (rational to binary64 to binary32) and can pick the
+    other side of a binary32 tie in rare cases -- but the remainder is
+    computed from the head actually KEPT, so the decomposition's exact-sum
+    property is untouched; at most one low limb shifts by an ulp it then
+    recovers in the next.
     """
 
+    from .extended_precision import limb_element_facts
+
+    narrow_to_f32 = limb_element_facts(element) is limb_element_facts("f32")
     rest = Fraction(int(sympy.numer(rational)), int(sympy.denom(rational)))
     parts = []
     for _ in range(max(int(limbs), 1)):
         head = float(rest)
+        if narrow_to_f32:
+            import numpy as np
+
+            head = float(np.float32(head))
         parts.append(head)
         rest = rest - Fraction(head)
     return tuple(parts)
@@ -363,9 +379,9 @@ def constant_rational(name: str, digits: int = 64) -> Fraction:
     raise KeyError(f"no derivation for constant {name!r}")
 
 
-def constant_limbs(name: str, limbs: int = 2, scale: Fraction | None = None
-                   ) -> tuple[float, ...]:
-    """A constant as ``limbs`` float64 pieces that sum to it.
+def constant_limbs(name: str, limbs: int = 2, scale: Fraction | None = None,
+                   element: Any = None) -> tuple[float, ...]:
+    """A constant as ``limbs`` element-format pieces that sum to it.
 
     ``scale`` multiplies exactly before decomposition, so ``pi/2`` and
     ``2/pi`` are as exact as ``pi`` -- which matters because argument
@@ -373,13 +389,21 @@ def constant_limbs(name: str, limbs: int = 2, scale: Fraction | None = None
     would throw away the digits this went to the trouble of deriving.
     """
 
-    digits = int(limbs * 15.95) + 12
+    from .extended_precision import limb_element_facts
+
+    facts = limb_element_facts(element)
+    narrow_to_f32 = facts is limb_element_facts("f32")
+    digits = int(limbs * facts["digits_per_limb"]) + 12
     value = constant_rational(name, digits)
     if scale is not None:
         value = value * Fraction(scale)
     rest, parts = value, []
     for _ in range(max(int(limbs), 1)):
         head = float(rest)
+        if narrow_to_f32:
+            import numpy as np
+
+            head = float(np.float32(head))
         parts.append(head)
         rest = rest - Fraction(head)
     return tuple(parts)
@@ -523,7 +547,12 @@ CORE_RADII: dict[str, float] = {
 
 
 #: Digits a limb is worth when sizing an order to an arithmetic width.
-DIGITS_PER_LIMB_ESTIMATE = 15.95
+#: The binary64 row of ``extended_precision.LIMB_ELEMENTS`` -- kept as a
+#: named module constant because every current caller sizes against
+#: binary64 limbs; element-aware sizing reads the facts table directly.
+from .extended_precision import LIMB_ELEMENTS as _LIMB_ELEMENTS
+
+DIGITS_PER_LIMB_ESTIMATE = _LIMB_ELEMENTS["float64"]["digits_per_limb"]
 
 
 def _zero_low_bits(value: float, drop: int) -> float:
@@ -657,19 +686,144 @@ def reduce_argument(values: Any, magnitude: float, limbs: int = 2,
     precisely the part a single-double reduction throws away.
     """
 
-    from . import extended_precision as xp
+    from .extended_precision import Precision
     from .abstraction import AbstractTensor
 
     pieces = cody_waite_for(magnitude, name, scale)
     whole = float(sum(Fraction(piece) for piece in pieces))
     values = (values if isinstance(values, AbstractTensor)
               else AbstractTensor.get_tensor(values))
+    # The quotient is an exact integer and stays an ordinary tensor: rounding
+    # to the integer grid is what the shifter already did, so widening it
+    # would carry zeros around for nothing.
     quotient = ((values * (1.0 / whole)) + INTEGER_SHIFTER) - INTEGER_SHIFTER
-    # Promoted once, at the boundary. After that the width travels with the
-    # operands -- an n-limb value times a plain one is n-limb work -- so no
-    # ambient switch has to be open for the arithmetic to be wide.
-    reduced = xp.widen(values, limbs)
-    multiplier = xp.widen(quotient, limbs)
+    # Promoted once, at the boundary, and never unwrapped again. Every
+    # ``k * piece`` is exact by construction of the split, so the subtraction
+    # chain loses nothing and the residual accumulates in the low limbs.
+    reduced = Precision.of(values, limbs)
+    multiplier = Precision.of(quotient, limbs)
     for piece in pieces:
         reduced = reduced - multiplier * piece
     return reduced, quotient
+
+
+# --------------------------------------------------------------------------
+# From the proof to a runnable program, with no text in between
+
+
+@lru_cache(maxsize=128)
+def materialise(name: str, order: int):
+    """The identity, compiled into AbstractTensor Python and made callable.
+
+    No source is templated anywhere along this route. The identity goes to
+    SymPy, the reduced series goes to ``compile_sympy_equations``, the SSA
+    goes to ``materialize_function_body``, and what comes back is real
+    AbstractTensor Python. Building the same thing by pasting coefficients
+    into f-strings -- which is what the kernel sources do today -- is a second
+    implementation of the mathematics, and the one place it always breaks is
+    precision: a templated coefficient is ``repr(float(c))``, one double, so
+    the limbs die at emission no matter how many were derived.
+
+    COEFFICIENTS STAY SYMBOLIC, and that is the whole trick. They arrive as
+    parameters, so the emitted body holds no numeric literal at all -- it is
+    pure shape. What the caller passes decides the precision: plain tensors
+    give ordinary arithmetic, ``Precision`` operands give limbed arithmetic
+    through the same operators, and the program does not know the difference.
+    One materialisation therefore serves every width.
+
+    Returns ``(callable, parameter_names, exact_coefficients)``.
+    """
+
+    from ...compiler.symbolic_equation_compiler import (
+        compile_sympy_equations,
+    )
+    from ...compiler.ssa_python_materializer import (
+        materialize_function_body,
+    )
+
+    coefficients = structured_coefficients(name, order)
+    structure = TRANSCENDENTALS[name]["structure"]
+
+    # SymPy derives the MATHEMATICS and stops there. Precision is not part of
+    # the mathematics -- it is a property of the arithmetic that runs it, and
+    # writing limbs into the proof was a category error: it made one program
+    # per width out of something that should be one program for every width.
+    square = sympy.Symbol("s")
+    symbols = [sympy.Symbol(f"c{index}") for index in range(len(coefficients))]
+    body = symbols[-1]
+    for symbol in reversed(symbols[:-1]):
+        body = symbol + square * body
+    if structure in ("odd", "factored"):
+        body = sympy.Symbol("z") * body
+
+    compiled = compile_sympy_equations(
+        [sympy.Eq(sympy.Symbol("y"), body)], name=f"{name}_core",
+    )
+    statements, needs_math = materialize_function_body(
+        compiled.function, tensor_vocabulary=True,
+    )
+    if needs_math:
+        raise RuntimeError(
+            f"{name}: the materialised body wants the math module, which means "
+            f"a scalar opcode reached a tensor program"
+        )
+
+    assigned, loaded = set(), set()
+    for node in ast.walk(ast.Module(body=statements, type_ignores=[])):
+        if isinstance(node, ast.Name):
+            (assigned if isinstance(node.ctx, ast.Store) else loaded).add(node.id)
+    parameters = tuple(sorted(loaded - assigned))
+
+    function = ast.FunctionDef(
+        name=f"{name}_core",
+        args=ast.arguments(
+            posonlyargs=[], args=[ast.arg(arg=each) for each in parameters],
+            kwonlyargs=[], kw_defaults=[], defaults=[],
+        ),
+        body=statements, decorator_list=[], returns=None, type_params=[],
+    )
+    module = ast.fix_missing_locations(
+        ast.Module(body=[function], type_ignores=[])
+    )
+    namespace: dict = {}
+    exec(compile(module, f"<{name}_core>", "exec"), namespace)
+    return (namespace[f"{name}_core"], parameters, coefficients,
+            ast.unparse(module))
+
+
+def materialised_source(name: str, order: int) -> str:
+    """The materialised proof as SOURCE, for anything that compiles text.
+
+    The same program the callable runs, unparsed. A kernel that needs source
+    takes it from here rather than assembling one, so the compiled kernel and
+    the eagerly-run proof are the same program and cannot disagree.
+    """
+
+    return materialise(name, int(order))[3]
+
+
+def evaluate_proof(name: str, argument: Any, limbs: int = 2,
+                   digits: int | None = None) -> Any:
+    """Run the materialised proof at ``limbs``, returning what it produces.
+
+    The width is decided here, once, by promoting the argument and the
+    coefficients. Everything after that is the compiled structure running on
+    whatever it was handed.
+    """
+
+    from .extended_precision import Precision
+
+    digits = int(16 * limbs) if digits is None else int(digits)
+    count = order_for(name, CORE_RADII[name], digits=digits)
+    callable_, parameters, coefficients, _source = materialise(
+        name, order_to_degree(name, count))
+
+    structure = TRANSCENDENTALS[name]["structure"]
+    wide = Precision.of(argument, limbs) if limbs > 1 else argument
+    base = wide * wide if structure in ("odd", "even") else wide
+    supply = {"z": wide, "s": base}
+    for index, value in enumerate(coefficients):
+        parts = limb_decomposition(value, limbs)
+        supply[f"c{index}"] = (Precision.constant(wide, parts) if limbs > 1
+                               else parts[0])
+    return callable_(**{name_: supply[name_] for name_ in parameters})

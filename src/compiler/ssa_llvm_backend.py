@@ -326,7 +326,8 @@ import re as _noalias_re
 _FORMAL_ACTUAL = _noalias_re.compile(r"^%(arg|out)\.(\d+)$")
 _WRAPPER_STORAGE = _noalias_re.compile(r"^%(public|root\.frame)\.\d+$")
 _DEFINE_LINE = _noalias_re.compile(
-    r"^define void @(?P<symbol>[\w$.]+)\((?P<params>[^)]*)\)"
+    r"^define (?P<linkage>internal )?void "
+    r"@(?P<symbol>[\w$.]+)\((?P<params>[^)]*)\)"
 )
 
 
@@ -455,7 +456,8 @@ def _annotate_noalias(
                 parameter = parameter.replace("ptr %", "ptr noalias %", 1)
             rewritten.append(parameter)
         lines[0] = (
-            f"define void @{symbol}({', '.join(rewritten)})"
+            f"define {match.group('linkage') or ''}void "
+            f"@{symbol}({', '.join(rewritten)})"
             + lines[0][match.end():]
         )
         annotated.append("\n".join(lines))
@@ -875,6 +877,15 @@ def _emit_repository_call_module(
 
     reachable, kernels_used = _internal_call_closure(module, function_name)
     shortfalls: list[LLVMEmissionShortfall] = []
+    from .ir_identities import precision_backend_shortfalls
+    shortfalls.extend(
+        LLVMEmissionShortfall(
+            item["function"], "precision_section",
+            "backend cannot honour precision obligations "
+            + repr(item["missing"]),
+        )
+        for item in precision_backend_shortfalls(module, "llvm", reachable)
+    )
 
     values_by_function: dict[str, dict[int, _Any]] = {}
     for name in reachable:
@@ -2915,7 +2926,14 @@ def _emit_repository_call_module(
         )
         body[entry_label_index + 1:entry_label_index + 1] = entry_allocas
         emitted_functions.append("\n".join((
-            f"define void @{internal_symbols[name]}({', '.join(parameters)}) {{",
+            # ``internal``: these helpers exist only for the exported entry
+            # wrapper below, and saying so is what LETS the optimizer inline
+            # a single-caller region into its loop. Left external, a region
+            # invoked once per element pays a full ABI call each time --
+            # seventeen stack-argument stores per element on Win64 -- which
+            # measured 3.6x the whole kernel's arithmetic at two limbs.
+            f"define internal void @{internal_symbols[name]}"
+            f"({', '.join(parameters)}) {{",
             *body,
             "}",
         )))
@@ -3445,6 +3463,17 @@ def emit_ssa_function_to_llvm(
     function = module.functions[function_name]
     name = entry_name or function_name
     shortfalls: list[LLVMEmissionShortfall] = []
+    from .ir_identities import precision_backend_shortfalls
+    shortfalls.extend(
+        LLVMEmissionShortfall(
+            item["function"], "precision_section",
+            "backend cannot honour precision obligations "
+            + repr(item["missing"]),
+        )
+        for item in precision_backend_shortfalls(
+            module, "llvm", (function_name,)
+        )
+    )
     lines: list[str] = []
     globals_out: list[str] = []
     buffer_ids: list[int] = []
@@ -4370,13 +4399,23 @@ def compile_artifact(
             / "common" / "tensors" / "accelerator_backends" / "c_backend"
             / "turing_stream_buffer.c"
         ))
-    completed = _subprocess.run(
-        command, capture_output=True, text=True, check=False,
-    )
-    if completed.returncode != 0 or not library.is_file():
-        raise RuntimeError(
-            f"LLVM compile failed ({completed.returncode}):\n"
-            + completed.stderr[-2000:]
+    # zig's bundled runtimes (compiler_rt, mingw CRT) build on demand into a
+    # shared cache, and back-to-back invocations occasionally lose that race
+    # ("sub-compilation of ... failed"). The failure is in the toolchain's
+    # own bookkeeping, not in the module being compiled, so one retry is
+    # honest; a second failure is reported as real. The C lane carries the
+    # same policy.
+    completed = None
+    for _attempt in range(2):
+        completed = _subprocess.run(
+            command, capture_output=True, text=True, check=False,
         )
-    artifact.library_path = library
-    return artifact
+        if completed.returncode == 0 and library.is_file():
+            artifact.library_path = library
+            return artifact
+        if "sub-compilation" not in (completed.stderr or ""):
+            break
+    raise RuntimeError(
+        f"LLVM compile failed ({completed.returncode}):\n"
+        + completed.stderr[-2000:]
+    )
