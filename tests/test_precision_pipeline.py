@@ -708,3 +708,26 @@ def test_float32_limb_sections_widen_to_eight_and_split_with_4097():
     })})
     with pytest.raises(ValueError, match="ceiling"):
         apply_precision_pipeline(wide)
+
+
+def test_precision_scalar_operands_keep_element_shape():
+    """A wide value against a plain scalar must keep the element shape.
+
+    The dispatch's scalar expansion sliced an already-sliced template, so a
+    three-element value against a scalar broadcast (3,) into (2,) and
+    crashed; two-element values broadcast by coincidence, which is why the
+    original wrapper test missed it. Three elements is the honest shape.
+    """
+
+    import numpy as np
+
+    from src.common.tensors.abstraction import AbstractTensor
+    from src.common.tensors.extended_precision import Precision
+
+    wide = Precision.of(
+        AbstractTensor.get_tensor(np.asarray([0.1, 0.2, 0.3])), 2
+    )
+    assert (wide * 0.5).collapse().tolist() == [0.05, 0.1, 0.15]
+    assert (wide + 1.0).collapse().tolist() == [1.1, 1.2, 1.3]
+    quotients = (1.0 / wide).collapse().tolist()
+    assert quotients[0] == 10.0 and abs(quotients[2] - 10.0 / 3.0) < 1e-15

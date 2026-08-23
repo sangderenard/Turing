@@ -185,6 +185,23 @@ class CompiledVariant:
             parameter: value for parameter, value in arguments.items()
             if parameter not in self.specialized
         }
+        # Every declared parameter, or none: an unfed buffer is not an
+        # error at run time -- the kernel reads whatever the allocation
+        # held and returns a plausible number. A sine launched without its
+        # coefficient buffer produced clean-looking garbage that only an
+        # oracle could catch, which is precisely the silent failure this
+        # bank exists to end, so the refusal happens here by name.
+        missing = [
+            parameter for parameter in self.spec.parameter_order
+            if parameter not in arguments
+            and parameter not in self.specialized
+        ]
+        if missing:
+            raise TypeError(
+                f"{self.spec.name}: call is missing declared parameter(s) "
+                f"{missing}; parameter_order is "
+                f"{self.spec.parameter_order} and none may be omitted"
+            )
         signature = tuple(
             (parameter, tuple(np.shape(live[parameter])))
             for parameter in sorted(live)

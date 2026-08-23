@@ -624,14 +624,27 @@ class Precision:
                 f"its limbs comes back wrong rather than refused."
             )
         width = max(int(limbs or 1), cls.width_of(left), cls.width_of(right))
-        like = (left.term(0) if isinstance(left, Precision)
-                else right.term(0) if isinstance(right, Precision)
-                else (left if hasattr(left, "shape") else right))
+        # ``term(0)`` is ONE channel -- element-shaped, not interleaved --
+        # so it must never be handed to ``limbs_of``, whose scalar branch
+        # slices its template again and halves it (measured: a three-element
+        # value against a scalar broadcast (3,) into (2,); a two-element one
+        # broadcast by coincidence, which is why the defect survived its own
+        # test). The scalar expansion is built here from the element-shaped
+        # template directly: the leading limb carries the value, the rest
+        # are exact zeros. ``limbs_of`` keeps its interleaved contract for
+        # the callers that honour it.
+        template = (left.term(0) if isinstance(left, Precision)
+                    else right.term(0) if isinstance(right, Precision)
+                    else (left if hasattr(left, "shape") else right))
+        template_zero = plain(template, "mul", 0.0)
 
         def operand(value):
             if isinstance(value, Precision):
                 return value.terms(width)
-            return limbs_of(value, width, like)
+            if hasattr(value, "shape"):
+                return limbs_of(value, width, value)
+            return ([plain(template_zero, "add", value)]
+                    + [template_zero for _index in range(width - 1)])
 
         if op == "neg":
             pieces = negate(operand(left))

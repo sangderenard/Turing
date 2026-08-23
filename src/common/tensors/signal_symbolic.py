@@ -819,7 +819,21 @@ def evaluate_proof(name: str, argument: Any, limbs: int = 2,
         name, order_to_degree(name, count))
 
     structure = TRANSCENDENTALS[name]["structure"]
-    wide = Precision.of(argument, limbs) if limbs > 1 else argument
+    # An argument that is ALREADY wide keeps its limbs: an identity route
+    # hands in a reduced argument whose low limbs carry exactly the digits
+    # the reduction preserved, and re-promoting it would wrap the wrapper
+    # (the backend then receives a Precision as an element and refuses).
+    # A width disagreement is a caller error, said by name.
+    if isinstance(argument, Precision):
+        if int(argument.limbs) != int(limbs) and limbs > 1:
+            raise ValueError(
+                f"evaluate_proof({name!r}): argument carries "
+                f"{argument.limbs} limbs but {limbs} were requested; "
+                "widen or narrow it deliberately before evaluating"
+            )
+        wide = argument
+    else:
+        wide = Precision.of(argument, limbs) if limbs > 1 else argument
     base = wide * wide if structure in ("odd", "even") else wide
     supply = {"z": wide, "s": base}
     for index, value in enumerate(coefficients):

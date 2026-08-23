@@ -515,6 +515,17 @@ class AbstractTensor:
 
     # --- Unary math ---
     def sqrt(self) -> "AbstractTensor":
+        # The transcendental switchboard covers the WHOLE surface: when the
+        # caller selected the signal-math cores or the compiled kernel bank,
+        # sqrt, exp and log route there exactly as the trigonometric surface
+        # does, so no method quietly keeps reaching the backend's borrowed
+        # libm while the rest of the mathematics is our own. The surface
+        # composes taped primitive operations, so it is not wrapped in a
+        # second autograd node here.
+        from .abstraction_methods import trigonometry as _switchboard
+
+        if _switchboard.active_implementation()[0] != "operator":
+            return _switchboard._dispatch("sqrt", self)
         finalize = AbstractTensor._pre_autograd("sqrt", [self])
         if isinstance(self, AbstractTensor):
             result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
@@ -527,6 +538,10 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement sqrt_()")
 
     def exp(self) -> "AbstractTensor":
+        from .abstraction_methods import trigonometry as _switchboard
+
+        if _switchboard.active_implementation()[0] != "operator":
+            return _switchboard._dispatch("exp", self)
         finalize = AbstractTensor._pre_autograd("exp", [self])
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.exp_()
@@ -536,6 +551,10 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement exp_()")
 
     def log(self) -> "AbstractTensor":
+        from .abstraction_methods import trigonometry as _switchboard
+
+        if _switchboard.active_implementation()[0] != "operator":
+            return _switchboard._dispatch("log", self)
         finalize = AbstractTensor._pre_autograd("log", [self])
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.log_()

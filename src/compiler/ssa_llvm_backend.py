@@ -1428,6 +1428,10 @@ def _emit_repository_call_module(
             int(value.id): f"%arg.{index}"
             for index, value in enumerate(function.args)
         }
+        formal_positions: dict[int, int] = {
+            int(value.id): index
+            for index, value in enumerate(function.args)
+        }
         aggregate_members: dict[int, dict[int, str]] = {}
         address_members: dict[int, str] = {}
         address_slots: dict[int, str] = {}
@@ -2041,6 +2045,19 @@ def _emit_repository_call_module(
                     and instruction.args
                     and len(instruction.args) <= 2
                     and int(instruction.args[0].id) in pointers
+                    # A literal constant index alone is NOT evidence of a
+                    # pointer table: a flat coefficient buffer read at
+                    # c[13] emits the identical GEP+Const shape and loads a
+                    # NUMBER. Only a formal the classifier PROVED is
+                    # treated as a table -- its loaded slots dereferenced
+                    # as addresses -- may take the slot/load-ptr protocol.
+                    # Without this gate the signal kernels' coefficient
+                    # buffer was unpacked as fourteen pointers and each
+                    # double dereferenced as an address: an access
+                    # violation whose program was oracle-exact, which is
+                    # branch three of the diagnostic decision tree.
+                    and formal_positions.get(int(instruction.args[0].id))
+                    in callee_aggregate_parameter_positions.get(name, set())
                 ):
                     slot = f"%aggregate.slot.{tag}"
                     body.append(

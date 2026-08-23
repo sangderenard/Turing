@@ -158,6 +158,23 @@ def _routed(name: str, value):
     if name is None:
         return None
 
+    # A banked kernel is the CORE on its proven interval and nothing more --
+    # it carries no range reduction, so an argument beyond the core radius
+    # would be pushed through a polynomial that approximates nothing there
+    # and come back a plausible wrong number. The eager surface owns the
+    # reduction, so anything off the interval falls back to it, exactly as
+    # a name the bank does not carry does.
+    import numpy as _np
+
+    from ..signal_symbolic import CORE_RADII as _radii
+
+    core = name.rsplit("_d", 1)[0]
+    radius = _radii.get(core)
+    if radius is not None:
+        probe = _np.asarray(value, dtype=_np.float64)
+        if probe.size and float(_np.max(_np.abs(probe))) > float(radius):
+            return None
+
     import numpy as np
 
     from ..abstraction import AbstractTensor
@@ -168,8 +185,24 @@ def _routed(name: str, value):
     # the kernel's 2.5, on a route whose whole purpose is to be the fast one.
     source = np.asarray(value, dtype=np.float64)
     flat = np.ascontiguousarray(source.reshape(-1))
+    # The caller brings the DATA (x, y, n); the spec brings its own
+    # CONSTANTS -- the coefficient buffer a signal kernel reads its
+    # polynomial from. Launching without it once ran the kernel over an
+    # unfed buffer and returned clean-looking garbage, so the constants
+    # are read from the spec's own example generator, which produces them
+    # deterministically, and only for parameters the call does not supply.
+    spec = _LAUNCHER.bank.specs[name]
+    constants = {
+        parameter: fed
+        for parameter, fed in spec.example_inputs(
+            {size: 1 for size in spec.size_parameters},
+            np.random.default_rng(0),
+        ).items()
+        if parameter in spec.parameter_order
+        and parameter not in ("x", "y", "n")
+    }
     produced = _LAUNCHER.launch(
-        name, x=flat, y=np.zeros_like(flat), n=int(flat.size),
+        name, x=flat, y=np.zeros_like(flat), n=int(flat.size), **constants,
     )
     settled = np.asarray(produced, dtype=np.float64).reshape(source.shape)
     return AbstractTensor.get_tensor(settled, like=value)

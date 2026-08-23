@@ -1197,8 +1197,40 @@ class CoreSet:
 _PREBAKED: dict[tuple[str, str, str, float], CoreSet] = {}
 
 
+def _bake_fingerprint() -> str:
+    """What the baked numbers depend on, hashed.
+
+    A bake is a pure function of this module and the symbolic derivations it
+    measures against, so those two files' bytes are the whole cache key.
+    Editing either re-bakes honestly; editing anything else does not -- the
+    compiler fingerprint the kernel bank uses is deliberately NOT included,
+    because a bake is measured mathematics, not a compiled artifact.
+    """
+
+    import hashlib
+    import pathlib
+
+    digest = hashlib.sha256()
+    here = pathlib.Path(__file__).resolve()
+    for source in (here, here.with_name("signal_symbolic.py")):
+        digest.update(source.read_bytes())
+    return digest.hexdigest()[:16]
+
+
 def prebake(name: str = "reference") -> CoreSet:
-    """Bake (once per process) every core one named setting needs."""
+    """Bake every core one named setting needs -- once per MACHINE.
+
+    The measurement is the expensive half: scoring each candidate against
+    the exact-``Fraction`` reference at hundreds of points costs the better
+    part of a minute per setting, and it is a pure function of two source
+    files. So the finished numbers persist to disk keyed by setting and
+    source fingerprint, and every later process loads them instead of
+    re-measuring. The in-process memo above the disk layer is unchanged.
+    """
+
+    import dataclasses
+    import json
+    import pathlib
 
     try:
         settings = PREBAKE_SETS[str(name)]
@@ -1211,6 +1243,31 @@ def prebake(name: str = "reference") -> CoreSet:
     existing = _PREBAKED.get(key)
     if existing is not None:
         return existing
+
+    store = pathlib.Path(__file__).resolve().parents[3] / "build" / (
+        "prebaked_cores"
+    )
+    cache_path = store / (
+        f"{settings.name}-{settings.mode}-{settings.family}-"
+        f"{settings.epsilon!r}-{_bake_fingerprint()}.json"
+    )
+    if cache_path.is_file():
+        try:
+            rows = json.loads(cache_path.read_text(encoding="utf-8"))
+            baked = CoreSet(settings, {
+                core: BakedCore(**{
+                    field: tuple(value) if isinstance(value, list) else value
+                    for field, value in row.items()
+                })
+                for core, row in rows.items()
+            })
+            _PREBAKED[key] = baked
+            return baked
+        except Exception:
+            # An unreadable cache is re-measured, never trusted: the bake
+            # is cheap enough to redo and wrong numbers are not.
+            cache_path.unlink(missing_ok=True)
+
     baked = CoreSet(settings, {
         core: (
             fit_best(core, settings.epsilon) if settings.family == "best"
@@ -1219,6 +1276,14 @@ def prebake(name: str = "reference") -> CoreSet:
         for core in settings.cores()
     })
     _PREBAKED[key] = baked
+    try:
+        store.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({
+            core: dataclasses.asdict(row)
+            for core, row in baked.cores.items()
+        }), encoding="utf-8")
+    except Exception:
+        pass  # a failed write costs the next process a re-bake, nothing more
     return baked
 
 
@@ -1304,7 +1369,14 @@ def _binade(value: Any) -> Any:
     step needs to be right, not accurate.
     """
 
-    return (value.log() * (1.0 / LN2) + 0.5).floor()
+    # The BACKEND operator by name, never the surface method: ``value.log()``
+    # is switchable now, and routing the exponent probe back through the
+    # surface would ask ``log`` to compute itself. The deliberate deferral
+    # this docstring describes is to the platform operator, so it is spelled
+    # as exactly that.
+    return (
+        value._apply_operator("log", value, None) * (1.0 / LN2) + 0.5
+    ).floor()
 
 
 def _even_binade(value: Any) -> Any:
@@ -1312,7 +1384,9 @@ def _even_binade(value: Any) -> Any:
 
     # ceil via floor: this backend exposes only ``ceil_``, and -floor(-x)
     # is the portable spelling that lowers the same way everywhere.
-    return -((value.log() * (-0.5 / LN2)).floor())
+    return -((
+        value._apply_operator("log", value, None) * (-0.5 / LN2)
+    ).floor())
 
 
 # --------------------------------------------------------------------------
