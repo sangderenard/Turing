@@ -455,7 +455,11 @@ PRECISION_TYPE_ALIASES = {"double": "float64", "float": "float32",
 #: is no wider form of a reduction or a reshape that would be right, so those
 #: keep their ordinary name and a destination refuses the operand rather than
 #: reading its limbs as channels.
-PRECISION_CLOSED_OPERATIONS = ("add", "sub", "mul", "truediv", "neg")
+#: Spelled exactly as ``ast_ssa_name_map`` resolves them, which is not
+#: uniform -- four are capitalised and ``neg`` is not, and there is no
+#: ``truediv`` at this layer, only ``Div``. Keying on a tidied-up spelling
+#: silently misses and falls through to the ordinary operation.
+PRECISION_CLOSED_OPERATIONS = ("Add", "Sub", "Mul", "Div", "neg")
 
 #: The greatest width a generated name is provided for.
 PRECISION_LIMB_LIMIT = 8
@@ -475,7 +479,7 @@ def _build_precision_operator_names() -> dict:
         for element, tag in PRECISION_ELEMENT_TYPES:
             for limbs in range(2, PRECISION_LIMB_LIMIT + 1):
                 names[(operation, element, limbs)] = (
-                    f"{operation}_{tag}_p{limbs}_r{limbs}"
+                    f"{operation.lower()}_{tag}_p{limbs}_r{limbs}"
                 )
     return names
 
@@ -493,7 +497,7 @@ PRECISION_OPERATOR_NAMES = _build_precision_operator_names()
 #: nothing downstream recognises it either -- enough to keep the node out of
 #: the fusion planner's induced subgraph, which is what carries it intact.
 PRECISION_SINGULAR_NAMES = {
-    operation: f"precision_{operation}"
+    operation: f"precision_{operation.lower()}"
     for operation in PRECISION_CLOSED_OPERATIONS
 }
 
