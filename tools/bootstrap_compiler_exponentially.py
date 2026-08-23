@@ -100,6 +100,61 @@ def _compiler_usage_records(root: Path) -> list[dict[str, Any]]:
     } for key, values in sorted(merged.items())]
 
 
+def _deepest_first_failure(
+    result_path: Path,
+    result: dict[str, Any],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Select the deepest dependency failure, then its first unit order."""
+
+    candidates = []
+    product = Path(str(result.get("product") or ""))
+    if not product.is_absolute():
+        product = (result_path.parent / product).resolve()
+    if product.is_dir():
+        for path in sorted(product.rglob("failure.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError):
+                continue
+            if payload.get("status") != "failed":
+                continue
+            names = tuple(map(str,
+                payload.get("qualified_names")
+                or ([payload["qualified_name"]] if payload.get("qualified_name") else [])
+            ))
+            candidates.append({
+                "qualified_names": list(names),
+                "error_type": str(payload.get("error_type") or "Failure"),
+                "error": str(payload.get("error") or "compiler unit failed"),
+                "unit_index": int(payload.get("unit_index") or 0),
+                "artifact": path.resolve().as_posix(),
+                "artifact_depth": len(path.relative_to(product).parts),
+            })
+    candidates.sort(key=lambda record: (
+        -int(record["artifact_depth"]),
+        int(record["unit_index"]),
+        str(record["artifact"]),
+    ))
+    surface = [dict(record) for record in result.get("failures") or ()]
+    if candidates:
+        return candidates[0], [*candidates, *surface]
+    if surface:
+        first = dict(surface[0])
+        names = (
+            list(map(str, first.get("qualified_names") or ()))
+            or ([str(first["qualified_name"])] if first.get("qualified_name") else [])
+        )
+        chief = {
+            "qualified_names": names,
+            "error_type": str(first.get("error_type") or "Failure"),
+            "error": str(first.get("reason") or first.get("error") or "compiler unit failed"),
+            "artifact": result_path.resolve().as_posix(),
+            "artifact_depth": 0,
+        }
+        return chief, surface
+    return None, []
+
+
 def prioritize_compiler_work_batches(
     records: Sequence[dict[str, Any]],
     usage_records: Sequence[dict[str, Any]],
@@ -523,10 +578,24 @@ def _wave_worker(arguments: argparse.Namespace) -> int:
                 "failures": [dict(failure) for failure in error.failures],
             } if isinstance(error, NativeInstallationRequiredError) else {}),
         }
+        chief_failure, failure_chain = _deepest_first_failure(
+            wave_root / "wave-result.json", result,
+        )
+        if chief_failure is not None:
+            result["chief_failure"] = chief_failure
+            result["failure_chain"] = failure_chain
     usage_records = _compiler_usage_records(wave_root)
     if usage_records:
         result["compiler_usage"] = usage_records
     _atomic_json(wave_root / "wave-result.json", result)
+    if result.get("chief_failure"):
+        print(json.dumps({
+            "stage": "chief_failure",
+            **dict(result["chief_failure"]),
+            "enclosing_failure_count": max(
+                0, len(result.get("failure_chain") or ()) - 1,
+            ),
+        }, sort_keys=True), flush=True)
     print(json.dumps({
         "stage": "generation_exit",
         **{key: result.get(key) for key in (
@@ -705,6 +774,11 @@ def _archived_failed_wave(
                     result.get("error") or "archived compiler item failed"
                 ),
             } for name in entries]
+        chief_failure, failure_chain = _deepest_first_failure(
+            result_path, {**result, "failures": failures},
+        )
+        if chief_failure is not None and chief_failure.get("qualified_names"):
+            entries = tuple(map(str, chief_failure["qualified_names"]))
         archives.append({
             "source": source.as_posix(),
             "entries": list(entries),
@@ -716,6 +790,8 @@ def _archived_failed_wave(
                 "oldest current-source archived compiler item explicitly failed"
             ),
             "failures": failures,
+            "chief_failure": chief_failure,
+            "failure_chain": failure_chain,
             "archive_generation": int(wave.get("generation") or 0),
             "result": result_path.as_posix(),
         })
@@ -772,6 +848,18 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 state["status"] = "hard-failed"
                 state["hard_failure"] = archived_failure
                 _atomic_json(state_path, state)
+                if archived_failure.get("chief_failure"):
+                    print(json.dumps({
+                        "stage": "chief_failure",
+                        **dict(archived_failure["chief_failure"]),
+                        "archive_generation": archived_failure[
+                            "archive_generation"
+                        ],
+                        "enclosing_failure_count": max(
+                            0,
+                            len(archived_failure.get("failure_chain") or ()) - 1,
+                        ),
+                    }, sort_keys=True), flush=True)
                 print(json.dumps({
                     "stage": "archived_failure_detected",
                     **archived_failure,
@@ -951,6 +1039,8 @@ def _supervise(arguments: argparse.Namespace) -> int:
                     "error_type": result.get("error_type"),
                     "error": result.get("error"),
                     "failures": list(result.get("failures") or ()),
+                    "chief_failure": result.get("chief_failure"),
+                    "failure_chain": list(result.get("failure_chain") or ()),
                     "result": result_path.as_posix(),
                 }
                 _atomic_json(state_path, state)

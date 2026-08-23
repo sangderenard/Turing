@@ -451,6 +451,39 @@ def test_partial_archive_is_state_not_failure(tmp_path):
     assert exponential._archived_failed_wave(state) is None
 
 
+def test_deepest_failure_is_chief_and_first_unit_breaks_depth_ties(tmp_path):
+    product = tmp_path / "product"
+    shallow = product / "round_000" / "units" / "unit_000" / "failure.json"
+    deep_first = (
+        product / "round_000" / "process-graph-creeps" / "root"
+        / "round_000_resolved" / "units" / "unit_003" / "failure.json"
+    )
+    deep_later = deep_first.parents[1] / "unit_009" / "failure.json"
+    for path, index, name in (
+        (shallow, 0, "outer"),
+        (deep_later, 9, "deep_later"),
+        (deep_first, 3, "deep_first"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "status": "failed",
+            "unit_index": index,
+            "qualified_names": [name],
+            "error_type": "ValueError",
+            "error": f"{name} broke",
+        }), encoding="utf-8")
+    result_path = tmp_path / "wave-result.json"
+
+    chief, chain = exponential._deepest_first_failure(
+        result_path, {"product": product.as_posix()},
+    )
+
+    assert chief["qualified_names"] == ["deep_first"]
+    assert [item["qualified_names"][0] for item in chain] == [
+        "deep_first", "deep_later", "outer",
+    ]
+
+
 def test_revised_source_resumes_a_persisted_hard_failure(
     tmp_path, monkeypatch,
 ):

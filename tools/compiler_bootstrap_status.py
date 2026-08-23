@@ -182,6 +182,7 @@ def build_status(
             "sweep": int(state.get("sweep") or 0),
             "cursor": int(state.get("cursor") or 0),
             "wave_counts": dict(sorted(wave_counts.items())),
+            "hard_failure": state.get("hard_failure"),
         },
         "graph": {
             "total_batches": len(batches),
@@ -284,6 +285,15 @@ def _print_human(report: dict[str, Any]) -> None:
         f"bootstrap: {state['status']} generation={state['generation']} "
         f"sweep={state['sweep']} active_wave={running}"
     )
+    hard_failure = state.get("hard_failure") or {}
+    chief = hard_failure.get("chief_failure") or {}
+    if chief:
+        print(
+            "chief failure: "
+            f"{', '.join(chief.get('qualified_names') or ['<unknown>'])}: "
+            f"{chief.get('error_type')}: {chief.get('error')}"
+        )
+        print(f"  evidence: {chief.get('artifact')}")
     print(
         f"graph: {graph['total_authored_calls']} calls in "
         f"{graph['total_batches']} batches; "
