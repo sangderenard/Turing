@@ -435,12 +435,150 @@ _BITOPS_TO_EXECUTABLE = {
 }
 
 
-def _qualified_handler(prefix: str, operator: ast.AST) -> str:
+#: Element types a precision operation can be emitted at, widest first. The
+#: ORDER is the dispatch rule: where two operands disagree, the wider type
+#: wins, because narrowing is a loss and a loss should be asked for rather
+#: than inherited from whichever operand happened to be on the left.
+PRECISION_ELEMENT_TYPES: tuple[tuple[str, str], ...] = (
+    ("float64", "f64"),
+    ("float32", "f32"),
+    ("float16", "f16"),
+)
+
+#: Spellings that mean the same element type.
+PRECISION_TYPE_ALIASES = {"double": "float64", "float": "float32",
+                          "f64": "float64", "f32": "float32", "f16": "float16"}
+
+#: Operations closed over the limb representation. A sum, difference,
+#: product, quotient or negation of limbed values IS a limbed value, so each
+#: has a wider counterpart meaning the same thing. Nothing else belongs: there
+#: is no wider form of a reduction or a reshape that would be right, so those
+#: keep their ordinary name and a destination refuses the operand rather than
+#: reading its limbs as channels.
+PRECISION_CLOSED_OPERATIONS = ("add", "sub", "mul", "truediv", "neg")
+
+#: The greatest width a generated name is provided for.
+PRECISION_LIMB_LIMIT = 8
+
+
+def _build_precision_operator_names() -> dict:
+    """Every precision operator name, generated once at import.
+
+    Built here rather than formatted at each call so the set of names a
+    destination may receive is a fixed, inspectable table -- a backend can be
+    checked against it, and a name that is not in it is a name nothing agreed
+    to emit.
+    """
+
+    names = {}
+    for operation in PRECISION_CLOSED_OPERATIONS:
+        for element, tag in PRECISION_ELEMENT_TYPES:
+            for limbs in range(2, PRECISION_LIMB_LIMIT + 1):
+                names[(operation, element, limbs)] = (
+                    f"{operation}_{tag}_p{limbs}_r{limbs}"
+                )
+    return names
+
+
+#: (operation, element type, limbs) -> the name a destination implements.
+PRECISION_OPERATOR_NAMES = _build_precision_operator_names()
+
+
+def _widest_element(*declared: Optional[str]) -> Optional[str]:
+    """The widest element type among the operands, or ``None`` if none say.
+
+    Highest precision decides: an operation between a wide operand and a
+    narrow one is emitted at the wide type, so meeting a narrower value never
+    silently costs digits the caller already paid for.
+    """
+
+    order = {element: rank for rank, (element, _tag)
+             in enumerate(PRECISION_ELEMENT_TYPES)}
+    best, best_rank = None, len(order)
+    for value in declared:
+        if not value:
+            continue
+        element = PRECISION_TYPE_ALIASES.get(str(value), str(value))
+        rank = order.get(element)
+        if rank is not None and rank < best_rank:
+            best, best_rank = element, rank
+    return best
+
+
+def _operand_precision(graph: Any, node: ast.AST) -> tuple[int, Optional[str]]:
+    """An operand's declared width, read off the AST.
+
+    The declaration is what the source says the value IS -- captured by
+    ``annotate_types`` at ingestion and kept as ``type_annotations`` -- so a
+    limbed operand is recognised from the program rather than from a flag
+    something else was supposed to have set. Returns ``(1, None)`` for an
+    ordinary value.
+
+    ``Precision`` and ``Precision[n]`` are the spellings; the element type
+    comes from a second subscript when the declaration gives one, because a
+    precision operation is named for the width it is emitted at and that is
+    not derivable from the limb count.
+    """
+
+    if not isinstance(node, ast.Name):
+        return 1, None
+    try:
+        annotations = graph.G.graph.get("type_annotations") or {}
+    except AttributeError:
+        return 1, None
+    declared = annotations.get(node.id)
+    if not declared:
+        return 1, None
+    try:
+        parsed = ast.parse(str(declared), mode="eval").body
+    except SyntaxError:
+        return 1, None
+
+    target = parsed.value if isinstance(parsed, ast.Subscript) else parsed
+    name = (target.id if isinstance(target, ast.Name)
+            else target.attr if isinstance(target, ast.Attribute) else None)
+    if name != "Precision":
+        return 1, None
+
+    limbs, dtype = 1, None
+    if isinstance(parsed, ast.Subscript):
+        index = parsed.slice
+        parts = index.elts if isinstance(index, ast.Tuple) else [index]
+        for part in parts:
+            if isinstance(part, ast.Constant) and isinstance(part.value, int):
+                limbs = max(int(part.value), 1)
+            elif isinstance(part, ast.Name):
+                dtype = part.id
+            elif isinstance(part, ast.Constant) and isinstance(part.value, str):
+                dtype = part.value
+    return limbs, dtype
+
+
+def _qualified_handler(prefix: str, operator: ast.AST, *, limbs: int = 1,
+                       dtype: Optional[str] = None) -> str:
+    """The operator's identity, taken from the precision table when it is one.
+
+    Most limbs and highest precision decide: the caller passes what the
+    operands declared, and the widest of each is what the name is looked up
+    with. An operand carrying limbs makes this a different operation, not the
+    same one in a mode, so it gets a name of its own -- and a name outside the
+    ordinary vocabulary is one nothing downstream has a rewrite for, which is
+    what carries it to a destination untouched.
+    """
+
     spelling = f"{prefix}:{type(operator).__name__.lower()}"
     handler = ast_ssa_name_map.get(spelling)
     if handler is None:
         raise KeyError(f"no existing operator alias for {spelling!r}")
-    return _BITOPS_TO_EXECUTABLE.get(handler.value, handler.value)
+    canonical = _BITOPS_TO_EXECUTABLE.get(handler.value, handler.value)
+    width = max(int(limbs or 1), 1)
+    if width <= 1:
+        return canonical
+    element = _widest_element(dtype)
+    generated = PRECISION_OPERATOR_NAMES.get(
+        (str(canonical), element, width)
+    )
+    return generated if generated is not None else canonical
 
 
 def _c_qualified_handler(prefix: str, operator: str) -> str:
@@ -5464,7 +5602,14 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 attributes["source_type"] = "BinOp"
                 attributes["constant_folded"] = "sequence-replication"
                 continue
-            operation = _qualified_handler("binop", expression.op)
+            left_limbs, left_type = _operand_precision(graph, expression.left)
+            right_limbs, right_type = _operand_precision(
+                graph, expression.right)
+            operation = _qualified_handler(
+                "binop", expression.op,
+                limbs=max(left_limbs, right_limbs),
+                dtype=_widest_element(left_type, right_type),
+            )
             data["type"] = operation
             data["op"] = operation
             attributes = data.setdefault("attributes", {})
@@ -5519,7 +5664,12 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     id(expression.operand),
                 )
                 continue
-            operation = _qualified_handler("unaryop", expression.op)
+            operand_limbs, operand_type = _operand_precision(
+                graph, expression.operand)
+            operation = _qualified_handler(
+                "unaryop", expression.op, limbs=operand_limbs,
+                dtype=operand_type,
+            )
             data["type"] = operation
             data["op"] = operation
             data.setdefault("attributes", {})["source_type"] = "UnaryOp"
