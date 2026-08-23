@@ -15,6 +15,7 @@ from src.compiler.project_compilation_product import (
     compile_resolved_process_graph_unit,
     compiler_toolchain_fingerprint,
     authored_control_contract,
+    authored_closure_contract,
     authored_definition_sha256,
     authored_parameter_contract,
     authored_return_contract,
@@ -68,6 +69,22 @@ def test_authored_call_discovery_excludes_declarations_without_python_jobs():
         "concrete_no_op",
         "module_function",
     ]
+
+
+def test_authored_closure_contract_distinguishes_captures_from_globals():
+    source = (
+        "GLOBAL = 3\n\n"
+        "def outer(value):\n"
+        "    offset = value + 1\n"
+        "    def inner(scale):\n"
+        "        return offset * scale + GLOBAL\n"
+        "    return inner\n"
+    )
+
+    assert authored_closure_contract(
+        source, "outer.<locals>.inner",
+    ) == {"captures": ["offset"]}
+    assert authored_closure_contract(source, "outer") == {"captures": []}
 
 
 def test_resolved_unit_refuses_a_stale_compiler_toolchain_plan(tmp_path):

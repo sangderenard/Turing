@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import pickle
 import subprocess
+import symtable
 import sys
 import threading
 import time
@@ -2765,6 +2766,47 @@ def authored_parameter_contract(
     }
 
 
+def authored_closure_contract(
+    source: str, qualified_name: str,
+) -> dict[str, Any]:
+    """Describe exact lexical values a nested callable must receive.
+
+    Python's symbol table already distinguishes a true closure cell from a
+    module global. Reusing it prevents a nested body that reads outer locals
+    from being mistaken for a closed zero-argument program.
+    """
+
+    definition = _authored_definitions(source).get(str(qualified_name))
+    if definition is None:
+        raise ValueError(f"unknown authored project call {qualified_name!r}")
+    if definition.kind != "nested-function":
+        return {"captures": []}
+    root = symtable.symtable(source, "<authored-project>", "exec")
+    pending = list(root.get_children())
+    selected = None
+    while pending:
+        table = pending.pop()
+        if (
+            table.get_type() == "function"
+            and table.get_name() == definition.node.name
+            and int(table.get_lineno()) == int(definition.node.lineno)
+        ):
+            selected = table
+            break
+        pending.extend(table.get_children())
+    if selected is None:
+        raise RuntimeError(
+            f"Python symbol table lost nested callable {qualified_name!r}"
+        )
+    return {
+        "captures": sorted(
+            symbol.get_name()
+            for symbol in selected.get_symbols()
+            if symbol.is_free()
+        ),
+    }
+
+
 def authored_control_contract(source: str, qualified_name: str) -> dict[str, int]:
     """Count control owned by one callable without borrowing child bodies."""
 
@@ -3070,6 +3112,8 @@ def compilation_creep_frontier(
             action = (
                 "lower-compiler-graph-table-abi"
                 if record.get("unresolved_program_abi_references")
+                else "closure-convert-lexical-captures"
+                if record.get("missing_lexical_captures")
                 else "materialize-required-source-values"
                 if record.get("unresolved_required_source_values")
                 else str(record.get("control_frontier_action"))
@@ -4462,6 +4506,7 @@ def compile_project_call(
     return_contract = authored_return_contract(source, qualified_name)
     control_contract = authored_control_contract(source, qualified_name)
     parameter_contract = authored_parameter_contract(source, qualified_name)
+    closure_contract = authored_closure_contract(source, qualified_name)
     export_names = tuple(map(str, exports))
     root_symbol = export_names[0] if export_names else None
     root_function = (
@@ -4525,7 +4570,13 @@ def compile_project_call(
         name for name in parameter_contract["used_parameters"]
         if name not in represented_parameters
     )
-    parameter_publication_complete = not missing_used_parameters
+    missing_lexical_captures = tuple(
+        name for name in closure_contract["captures"]
+        if name not in represented_parameters
+    )
+    parameter_publication_complete = not (
+        missing_used_parameters or missing_lexical_captures
+    )
     unresolved_program_abi_references = tuple(sorted({
         (
             str(accounting.get("program_abi_parameter") or ""),
@@ -4717,9 +4768,11 @@ def compile_project_call(
         "authored_return_contract": return_contract,
         "authored_control_contract": control_contract,
         "authored_parameter_contract": parameter_contract,
+        "authored_closure_contract": closure_contract,
         "root_parameter_accounting": {
             "represented_parameters": sorted(represented_parameters),
             "missing_used_parameters": list(missing_used_parameters),
+            "missing_lexical_captures": list(missing_lexical_captures),
             "unresolved_reference_fields": [
                 {"parameter": parameter, "field": field}
                 for parameter, field in unresolved_program_abi_references
@@ -6927,6 +6980,12 @@ def compile_project_product(
                             or {}
                         ).get("missing_used_parameters", ())
                     ),
+                    "missing_lexical_captures": list(
+                        (
+                            unit_receipt.get("root_parameter_accounting")
+                            or {}
+                        ).get("missing_lexical_captures", ())
+                    ),
                     "unresolved_required_source_values": list(
                         (
                             unit_receipt.get("root_semantic_accounting")
@@ -7735,6 +7794,7 @@ __all__ = [
     "compilation_creep_frontier",
     "authored_call_dependencies",
     "authored_control_contract",
+    "authored_closure_contract",
     "authored_definition_sha256",
     "authored_return_contract",
     "dependency_ordered_records",
