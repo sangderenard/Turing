@@ -164,6 +164,36 @@ a declared `Precision[n]` parameter to become n formals, which is the same
 decision the lowering already made internally and has not been extended to
 the boundary.
 
+## The signal cores, compiled
+
+MEASURED through LLVM against exact rational evaluation of the same
+polynomial, 25 points per core inside its own reduced interval. Worst
+relative error, expressed in ulp (half an ulp = correctly rounded):
+
+| core | parity | ordinary | Precision[2] |
+|---|---|---|---|
+| sin | odd | 0.57 | 0.49 |
+| cos | even | 0.46 | 0.32 |
+| exp | none | 0.53 | 0.44 |
+| atan | odd | 0.50 | 0.46 |
+| tanh | odd | 0.44 | 0.41 |
+| sinh | odd | **0.76** | 0.42 |
+| asin | odd | **0.73** | 0.34 |
+| sec | even | 0.47 | 0.47 |
+
+`sinh` and `asin` are NOT correctly rounded as ordinary arithmetic -- they
+exceed half an ulp and therefore return the wrong double for some arguments
+-- and both are correctly rounded at two limbs. That is the case the whole
+pipeline exists for: precision is not shaving an already-good number, it is
+the difference between right and wrong.
+
+All 19 materialised cores use only `+` and `*`; none divides. The untested
+`Div` expansion is therefore not on the signal pack's path at all.
+
+`expm1` and `log1p` have structure `factored` and are not measured above:
+the comparison harness only models plain Horner with a parity multiply, so
+those figures would be its error rather than theirs.
+
 ## What remains
 
 - **Neither pass is wired into a compilation path.** They are called
