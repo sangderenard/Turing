@@ -194,6 +194,39 @@ All 19 materialised cores use only `+` and `*`; none divides. The untested
 the comparison harness only models plain Horner with a parity multiply, so
 those figures would be its error rather than theirs.
 
+## Where the time goes — and it is not the same per backend
+
+MEASURED on the same sin pack, same SSA, 1e5 elements:
+
+| backend | width 1 | width 2 | ratio |
+|---|---|---|---|
+| LLVM | 2.3 ns | 56 ns | 24x |
+| Fortran | 429 ns | 447 ns | **1.04x** |
+
+Fortran pays about 430 ns per element in region-call overhead, so going
+from 18 flops to 115 costs 4%. The arithmetic is invisible underneath the
+dispatch. LLVM inlines the same call away entirely. Verified computing
+correct values on both, so this is work being timed and not a broken call.
+
+The cause is region granularity: the planner carves the LOOP BODY into its
+own function, so it is called once per element through a bind(C) boundary
+Fortran cannot inline across. One backend papering over it is what kept it
+invisible.
+
+On LLVM, where dispatch is free, the 24x decomposes as 6.4x more flops
+(115 against 18) times 3.7x worse throughput per flop -- 1.46 cycles per
+flop against 0.39. The second factor is the serial dependency chain a
+double-double operation is: two_sum feeds the renormalise feeds the next
+operation. Elements are independent even though limbs are not, so it is
+recoverable by getting several elements in flight.
+
+Two hypotheses died here and are recorded so they are not re-run: the
+memory-slot allocas are NOT the bottleneck (the LLVM compile is hardcoded
+-O2, so mem2reg was always promoting them, and -O3 on top changes nothing),
+and deferring renormalisation helped by SHORTENING THE CHAIN rather than by
+relieving stack pressure, which is why time moved 62% while instruction
+count moved 24%.
+
 ## What remains
 
 - **Neither pass is wired into a compilation path.** They are called
