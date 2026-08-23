@@ -272,24 +272,51 @@ def measure(name, width, root, sizes, repeats, accuracy_samples):
             best = min(best, time.perf_counter() - start)
         timings[count] = best / count
 
+    # ONE call for every accuracy point. Calling per point limited this to a
+    # couple of dozen samples, which cannot distinguish a core that is
+    # correctly rounded from one that is correctly rounded on the twenty
+    # arguments that were looked at. The kernel is an array kernel; using it
+    # as one costs nothing and buys four thousand points.
     rng = random.Random(7)
-    errors = []
-    for _ in range(accuracy_samples):
-        z = rng.uniform(-radius * 0.98, radius * 0.98)
+    points = [rng.uniform(-radius * 0.98, radius * 0.98)
+              for _ in range(accuracy_samples)]
+    packed = np.zeros(accuracy_samples * width, dtype=np.float64)
+    packed[::width] = points
+    produced = call(packed, accuracy_samples)
+
+    errors: list[float] = []
+    exact_hits = 0
+    counted = 0
+    for index, z in enumerate(points):
         structural = z * z if structure in ("odd", "even") else z
-        x = np.zeros(width, dtype=np.float64)
-        x[0] = z
-        got = float(call(x, 1)[0])
         accumulated = Fraction(0)
         for coefficient in reversed(exact):
             accumulated = accumulated * Fraction(structural) + coefficient
         truth = accumulated * Fraction(z) if structure == "odd" else accumulated
         if not truth:
             continue
-        errors.append(
-            float(abs(Fraction(got) - truth) / abs(truth)) / ULP
-        )
-    return timings, errors, identities
+        # A limbed result is the SUM of its limbs; comparing only the high
+        # limb would score the representation on half of itself.
+        got = Fraction(0)
+        for limb in range(width):
+            value = float(produced[index * width + limb])
+            if value == value:  # NaN poisons the Fraction, and says enough
+                got += Fraction(value)
+            else:
+                got = None
+                break
+        if got is None:
+            errors.append(float("inf"))
+            counted += 1
+            continue
+        counted += 1
+        # Bit-exact means: no other double is closer to the true value. That
+        # is the only accuracy claim worth making, and it is not the same as
+        # a small average.
+        if float(truth) == float(got):
+            exact_hits += 1
+        errors.append(float(abs(got - truth) / abs(truth)) / ULP)
+    return timings, errors, (exact_hits, counted)
 
 
 def main() -> int:

@@ -1747,11 +1747,21 @@ def lower_precision_operations(functions) -> dict:
                     width = arrays.get(int(where[0].id)) if where else None
                     if width and width > 1:
                         base, index = where
-                        limbs[int(instruction.res.id)] = [
+                        loaded_limbs = [
                             put("Load", (channel(base, index, width, position),),
                                 instruction.res)
                             for position in range(width)
                         ]
+                        limbs[int(instruction.res.id)] = loaded_limbs
+                        # The original value must still be DEFINED. Not every
+                        # consumer of a load from a precision array is a
+                        # precision operation -- a shell computing `s = z * z`
+                        # from an undeclared local reads it as ordinary
+                        # arithmetic -- and such a consumer still names the id
+                        # this expansion just removed the definition of.
+                        # Leaving it dangling produced NaN, because the
+                        # instruction read whatever the slot happened to hold.
+                        collapse(loaded_limbs, instruction.res)
                         continue
                     emitted.append(instruction)
                     continue
