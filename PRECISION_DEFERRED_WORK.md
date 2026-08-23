@@ -15,14 +15,23 @@ reduction phase, and the specific-name pass must run after planning.
 
 ## Recognition gaps
 
-**Parameter annotations are invisible.**
-`def f(a: Precision[2])` is not captured. `_TypeAnnotator`
-(`src/transmogrifier/graph/node_special_cases.py:455`) has `visit_AnnAssign`
-and `visit_ClassDef` and nothing for `ast.arg`, so only annotated
-*assignments* in a body are recorded. Its own docstring claims it is "where
-an `int` parameter's integer-ness comes from", which is not true today. Any
-program declaring precision on a parameter silently compiles as ordinary
-arithmetic. This is the most likely thing to bite a real caller.
+**Parameter annotations: fixed, but the annotator is still misleading.**
+`def f(a: Precision[2])` used to compile silently as ordinary arithmetic.
+The cause was real but the obvious remedy was wrong: `_TypeAnnotator`
+(`node_special_cases.py:455`) genuinely has no visitor for `ast.arg`, so
+parameter declarations never reach `type_annotations` -- but `build_from_ast`
+already unparses every one of them into `function_parameter_annotations`.
+`_operand_precision` now reads that instead, rather than teaching the
+annotator a second route to a fact already collected.
+
+Two things remain. `_TypeAnnotator`'s docstring still claims it is "where an
+`int` parameter's integer-ness comes from", which is not true and will
+mislead the next reader exactly as it misled me. And because the reduction
+walk does not carry which function it is inside, a parameter name is only
+honoured when every function declaring it agrees; where two disagree the
+operand reads as ordinary. That is a miss rather than a wrong width, which
+is the right way round, but it is a real limit worth removing by carrying
+the enclosing function identity.
 
 **`precision_element` is `None` at ingestion.**
 `Precision[2]` gives limbs but no element type, so the specific-name lookup

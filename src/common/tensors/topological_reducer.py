@@ -527,6 +527,36 @@ def _widest_element(*declared: Optional[str]) -> Optional[str]:
     return best
 
 
+def _parameter_declaration(graph: Any, name: str) -> Optional[str]:
+    """A parameter's declared type, when every function declaring it agrees.
+
+    ``annotate_types`` captures annotated ASSIGNMENTS only -- its
+    ``_TypeAnnotator`` has no visitor for ``ast.arg`` -- so a declaration
+    written on a parameter never reaches ``type_annotations``. It is not
+    lost, though: ``build_from_ast`` already unparses every parameter
+    annotation into ``function_parameter_annotations``, keyed by function
+    identity. This reads that rather than teaching the annotator a second
+    way to learn the same fact.
+
+    The walk does not carry which function it is inside, so a name is only
+    honoured when every function that declares it declares it identically.
+    Where two disagree the answer is None and the operand reads as ordinary
+    -- a miss, never a wrong width, which is the right way round for
+    something whose failure is silent.
+    """
+
+    try:
+        by_function = graph.G.graph.get("function_parameter_annotations") or {}
+    except AttributeError:
+        return None
+    declared = {
+        str((parameters or {}).get(name))
+        for parameters in by_function.values()
+        if (parameters or {}).get(name)
+    }
+    return declared.pop() if len(declared) == 1 else None
+
+
 def _operand_precision(graph: Any, node: ast.AST) -> tuple[int, Optional[str]]:
     """An operand's declared width, read off the AST.
 
@@ -548,7 +578,9 @@ def _operand_precision(graph: Any, node: ast.AST) -> tuple[int, Optional[str]]:
         annotations = graph.G.graph.get("type_annotations") or {}
     except AttributeError:
         return 1, None
-    declared = annotations.get(node.id)
+    declared = annotations.get(node.id) or _parameter_declaration(
+        graph, node.id
+    )
     if not declared:
         return 1, None
     try:
