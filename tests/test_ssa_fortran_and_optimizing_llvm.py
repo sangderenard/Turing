@@ -230,6 +230,34 @@ def test_fortran_nested_bitwise_operands_use_one_integer_kind():
     assert "iand(int(" in source
 
 
+def test_fortran_lowers_source_ast_bitwise_spellings():
+    left = SSAValue(0, "int64")
+    right = SSAValue(1, "int64")
+    masked = SSAValue(2, "int64")
+    result = SSAValue(3, "int64")
+    function = Function(
+        "source_bits",
+        [left, right],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("BitAnd", [left, right], masked),
+                    Instr("BitOr", [masked, right], result),
+                    Instr("Ret", [result], SSAValue(4)),
+                ],
+            )
+        },
+    )
+
+    emitted = emit_function(function, outputs=[result])
+
+    assert emitted.complete, [item.format() for item in emitted.shortfalls]
+    assert "iand(" in emitted.source
+    assert "ior(" in emitted.source
+    assert "UNSUPPORTED" not in emitted.source
+
+
 def test_fortran_repository_right_shift_preserves_signed_source_semantics():
     value = SSAValue(0, "int")
     amount = SSAValue(1, "int")

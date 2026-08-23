@@ -1431,6 +1431,8 @@ def test_automatic_scalar_verification_is_abi_selected(
         def verify_native_scalar_callable(
             self, qualified_name, authored, probes, *, activation_adapter=None,
             ignored_source_parameters=(), probe_factory=None,
+            native_result_codec=None,
+            expected_probe_results=None,
         ):
             observed.update({
                 "qualified_name": qualified_name,
@@ -1439,6 +1441,8 @@ def test_automatic_scalar_verification_is_abi_selected(
                 "activation_adapter": activation_adapter,
                 "ignored_source_parameters": tuple(ignored_source_parameters),
                 "probe_factory": probe_factory,
+                "native_result_codec": native_result_codec,
+                "expected_probe_results": tuple(expected_probe_results or ()),
             })
 
             def deployed(value):
@@ -1488,6 +1492,8 @@ def test_automatic_scalar_verification_is_abi_selected(
     assert observed["activation_adapter"] == "descriptor-call-v1"
     assert observed["ignored_source_parameters"] == ()
     assert observed["probe_factory"] == "authored-contract-scalar-v1"
+    assert observed["native_result_codec"] is None
+    assert observed["expected_probe_results"] == (-2, 2, 6)
 
 
 def test_automatic_scalar_verification_proves_unused_method_receiver(
@@ -1624,6 +1630,64 @@ def test_scalar_verifier_executes_with_ast_proven_ignored_receiver(
     assert deployed.__turing_native_verification__["ignored_source_parameters"] == [
         "self"
     ]
+
+
+def test_scalar_verifier_decodes_an_unsigned_word_from_signed_native_abi(
+    tmp_path, monkeypatch,
+):
+    import ctypes
+    from src.compiler.project_compilation_product import ProjectCompilationProduct
+
+    source = "def word():\n    return 0xFFFFFFFFFFFFFFFF\n"
+    source_path = tmp_path / "source.py"
+    source_path.write_text(source, encoding="utf-8")
+    native_root = tmp_path / "units" / "word" / "native"
+    native_root.mkdir(parents=True)
+    api_path = native_root / "word.api.yaml"
+    library_path = native_root / "word.dll"
+    api_path.write_text("api", encoding="utf-8")
+    library_path.write_bytes(b"native")
+    product = ProjectCompilationProduct(
+        root=tmp_path,
+        manifest={
+            "source": source_path.as_posix(),
+            "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+        },
+        links={"word": {
+            "native_api": api_path.relative_to(tmp_path).as_posix(),
+            "native_library": library_path.relative_to(tmp_path).as_posix(),
+            "native_entrypoint": "word",
+        }},
+    )
+
+    def authored():
+        return 0xFFFFFFFFFFFFFFFF
+
+    def native(output):
+        output._obj.value = -1
+
+    monkeypatch.setattr(
+        ctypes, "CDLL", lambda _path: SimpleNamespace(word=native),
+    )
+    monkeypatch.setattr(
+        "src.compiler.compiled_program_api.load_api",
+        lambda _path: {"entry_points": [{
+            "name": "word", "symbol": "word",
+            "parameters": [{
+                "name": "result", "role": "output", "ctypes": "c_int64",
+            }],
+        }]},
+    )
+
+    deployed = product.verify_native_scalar_callable(
+        "word", authored, ((),),
+        native_result_codec="unsigned-c_int64-v1",
+    )
+
+    assert deployed() == 0xFFFFFFFFFFFFFFFF
+    assert deployed.__turing_native_verification__["native_result_codec"] == (
+        "unsigned-c_int64-v1"
+    )
 
 
 def _verified_install_fixture(tmp_path):

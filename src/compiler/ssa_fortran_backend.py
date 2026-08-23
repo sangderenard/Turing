@@ -2946,13 +2946,20 @@ class _FunctionEmitter:
                 return expression
             return f"real({expression}, c_double)"
 
-        if op in {"bitand", "bitor", "bitxor", "shl", "shr"} and len(args) == 2:
+        bitwise_op = {
+            "BitAnd": "bitand",
+            "BitOr": "bitor",
+            "BitXor": "bitxor",
+        }.get(op, op)
+        if bitwise_op in {
+            "bitand", "bitor", "bitxor", "shl", "shr",
+        } and len(args) == 2:
             if all(self._is_logical(value) for value in instr.args):
                 logical = {
                     "bitand": ".and.",
                     "bitor": ".or.",
                     "bitxor": ".neqv.",
-                }.get(op)
+                }.get(bitwise_op)
                 if logical is None:
                     return None
                 return f"({args[0]} {logical} {args[1]})"
@@ -2963,7 +2970,7 @@ class _FunctionEmitter:
             integer_args = [
                 f"int({argument}, c_int64_t)" for argument in args
             ]
-            expression = _BINARY[op].format(*integer_args)
+            expression = _BINARY[bitwise_op].format(*integer_args)
             if str(instr.res.dtype or self.dtype) in _INTEGER_DTYPES:
                 return expression
             return f"real({expression}, c_double)"

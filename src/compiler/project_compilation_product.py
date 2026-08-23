@@ -359,6 +359,8 @@ class ProjectCompilationProduct:
         activation_adapter: str | None = None,
         ignored_source_parameters: Iterable[str] = (),
         probe_factory: str | None = None,
+        native_result_codec: str | None = None,
+        expected_probe_results: Sequence[Any] | None = None,
     ) -> Callable[..., Any]:
         """Load a scalar native unit only after ABI and behavior agree.
 
@@ -375,6 +377,13 @@ class ProjectCompilationProduct:
 
         if not probes:
             raise ValueError("native verification requires at least one probe")
+        if (
+            expected_probe_results is not None
+            and len(expected_probe_results) != len(probes)
+        ):
+            raise ValueError(
+                "expected native probe results must align one-to-one with probes"
+            )
 
         name = str(qualified_name)
         try:
@@ -482,6 +491,17 @@ class ProjectCompilationProduct:
         native.restype = None
 
         route_counts = {"native": 0, "fallback": 0}
+        result_codecs = {
+            None: lambda value: value,
+            "unsigned-c_int32-v1": lambda value: int(value) & 0xFFFFFFFF,
+            "unsigned-c_int64-v1": lambda value: int(value) & 0xFFFFFFFFFFFFFFFF,
+        }
+        try:
+            decode_native_result = result_codecs[native_result_codec]
+        except KeyError as error:
+            raise ValueError(
+                f"unknown native scalar result codec {native_result_codec!r}"
+            ) from error
 
         def deployed(*args: Any, **kwargs: Any) -> Any:
             bound = signature.bind(*args, **kwargs)
@@ -500,15 +520,19 @@ class ProjectCompilationProduct:
             result = output_type()
             native(*native_inputs, ctypes.byref(result))
             route_counts["native"] += 1
-            return result.value
+            return decode_native_result(result.value)
 
         probe_records = []
-        for probe in probes:
+        for probe_index, probe in enumerate(probes):
             if isinstance(probe, Mapping):
                 arguments, keywords = (), dict(probe)
             else:
                 arguments, keywords = tuple(probe), {}
-            expected = authored(*arguments, **keywords)
+            expected = (
+                authored(*arguments, **keywords)
+                if expected_probe_results is None else
+                expected_probe_results[probe_index]
+            )
             actual = deployed(*arguments, **keywords)
             if type(actual) is not type(expected) or actual != expected:
                 raise ValueError(
@@ -531,6 +555,7 @@ class ProjectCompilationProduct:
             "authored_parameters": list(source_parameters),
             "native_source_parameters": list(native_source_parameters),
             "ignored_source_parameters": list(omitted_source_parameters),
+            "native_result_codec": native_result_codec,
             "probe_count": len(probe_records),
             "native_probe_count": int(route_counts["native"]),
             "fallback_probe_count": int(route_counts["fallback"]),
@@ -2220,6 +2245,25 @@ def verify_project_unit_automatically(
             tuple(values[parameter] for parameter in source_parameters)
             if positional_only else values
         )
+    output_ctype = str(outputs[0].get("ctypes") or "")
+    signed_widths = {"c_int32": 32, "c_int64": 64}
+    width = signed_widths.get(output_ctype)
+    authored_probe_results = [
+        authored(*probe) if isinstance(probe, tuple) else authored(**probe)
+        for probe in probes
+    ]
+    result_codec = None
+    if (
+        width is not None
+        and authored_probe_results
+        and all(
+            isinstance(value, int) and not isinstance(value, bool)
+            and 0 <= value < (1 << width)
+            for value in authored_probe_results
+        )
+        and any(value >= (1 << (width - 1)) for value in authored_probe_results)
+    ):
+        result_codec = f"unsigned-{output_ctype}-v1"
     return product.verify_native_scalar_callable(
         name,
         authored,
@@ -2227,6 +2271,8 @@ def verify_project_unit_automatically(
         activation_adapter="descriptor-call-v1",
         ignored_source_parameters=ignored,
         probe_factory="authored-contract-scalar-v1",
+        native_result_codec=result_codec,
+        expected_probe_results=authored_probe_results,
     )
 
 
@@ -7195,6 +7241,14 @@ def compile_project_product(
                         message=message,
                     ),
                 )
+                if not emitted.complete:
+                    raise RuntimeError(
+                        "native Fortran emission has semantic shortfalls: "
+                        + "; ".join(
+                            shortfall.format()
+                            for shortfall in emitted.shortfalls
+                        )
+                    )
                 executable = compile_fortran_module_c_shell(
                     emitted,
                     {},
