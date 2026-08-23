@@ -641,6 +641,7 @@ def _archived_unsuccessful_wave(
 ) -> dict[str, Any] | None:
     """Return the oldest current-source archive that was not installed."""
 
+    archives = []
     for wave in sorted(
         state.get("waves") or (),
         key=lambda item: int(item.get("generation") or 0),
@@ -685,8 +686,6 @@ def _archived_unsuccessful_wave(
             and not int(unit_counts.get("partial") or 0)
             and set(entries) <= installed
         )
-        if succeeded:
-            continue
         failures = []
         for record in archived_frontier:
             failures.append(dict(record))
@@ -696,9 +695,11 @@ def _archived_unsuccessful_wave(
                 "status": str(outcome.get("status") or result.get("status") or "missing"),
                 "reason": "archived compiler item was not sealed and installed",
             } for name in entries]
-        return {
+        archives.append({
             "source": source.as_posix(),
             "entries": list(entries),
+            "installed": sorted(installed),
+            "succeeded": succeeded,
             "error_type": "ArchivedBootstrapItemUnsuccessful",
             "error": (
                 "oldest current-source archived compiler item did not finish "
@@ -707,6 +708,22 @@ def _archived_unsuccessful_wave(
             "failures": failures,
             "archive_generation": int(wave.get("generation") or 0),
             "result": result_path.as_posix(),
+        })
+    for position, archive in enumerate(archives):
+        if archive["succeeded"]:
+            continue
+        required = set(archive["entries"])
+        superseded = any(
+            later["succeeded"]
+            and later["source"] == archive["source"]
+            and required <= set(later["installed"])
+            for later in archives[position + 1:]
+        )
+        if superseded:
+            continue
+        return {
+            key: value for key, value in archive.items()
+            if key not in {"installed", "succeeded"}
         }
     return None
 
@@ -770,7 +787,7 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 state.pop("hard_failure", None)
                 state["sources"] = _prioritize_failed_work(
                     discover_compiler_work_batches(
-                    arguments.source_root, batch_size=arguments.jobs,
+                        arguments.source_root, batch_size=arguments.jobs,
                     ), prior_failure,
                 )
                 state["status"] = "running"

@@ -382,6 +382,46 @@ def test_startup_hard_fails_oldest_current_unsuccessful_archive_and_prioritizes_
     assert state["cursor"] == 0
 
 
+def test_later_installed_archive_supersedes_an_older_frontier(tmp_path):
+    source = tmp_path / "stage.py"
+    source.write_text("def stage():\n    return 1\n", encoding="utf-8")
+    digest = exponential._sha256(source)
+    waves = []
+    for generation, outcome in enumerate((
+        {
+            "status": "frontier",
+            "installed_qualified_names": [],
+            "creep_frontier": [{
+                "qualified_name": "stage", "status": "partial",
+            }],
+            "native_verification_frontier": [],
+            "unit_counts": {"partial": 1},
+        },
+        {
+            "status": "sealed",
+            "installed_qualified_names": ["stage"],
+            "creep_frontier": [],
+            "native_verification_frontier": [],
+            "unit_counts": {"complete": 1},
+        },
+    )):
+        result = tmp_path / f"wave-{generation}.json"
+        result.write_text(json.dumps({
+            "status": "complete",
+            "source": source.resolve().as_posix(),
+            "source_sha256": digest,
+            "entries": ["stage"],
+            "outcome": outcome,
+        }), encoding="utf-8")
+        waves.append({
+            "generation": generation,
+            "source": source.resolve().as_posix(),
+            "result": result.resolve().as_posix(),
+        })
+
+    assert exponential._archived_unsuccessful_wave({"waves": waves}) is None
+
+
 def test_revised_source_resumes_a_persisted_hard_failure(
     tmp_path, monkeypatch,
 ):
