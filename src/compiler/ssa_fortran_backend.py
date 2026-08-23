@@ -4027,6 +4027,51 @@ def emit_module(
                         f"record {descriptor.identity!r} field {field.name!r} "
                         f"names absent record {field.record_id} in {function_name!r}"
                     )
+    # A scheduled region publishes through the aggregate convention and
+    # records nothing about it: no ``return_value``, no ``named_outputs``, no
+    # ``Ret``. Its declared outputs were therefore empty while the CALL SITE
+    # derived its actual arguments from the aggregate projections -- two
+    # sources for one interface, one of them silent, so the callee declared
+    # eleven dummies against a call passing twenty-eight and gfortran refused
+    # the module.
+    #
+    # The projections are the authority available here: a planner region
+    # shares its caller's value space, so the value a caller loads out of slot
+    # k IS the value the region defined. Reading them back gives the callee
+    # exactly the interface the call site is already going to use.
+    aggregate_outputs: dict[str, dict[int, SSAValue]] = {}
+    for function in functions.values():
+        for block in function.blocks.values():
+            for index, instruction in enumerate(block.instrs):
+                if instruction.op not in ("Call", "call"):
+                    continue
+                if instruction.attributes.get(
+                    "result_convention"
+                ) != "ssa.aggregate" or instruction.res is None:
+                    continue
+                callee = str(instruction.attributes.get("callee") or "")
+                if not callee:
+                    continue
+                slots = aggregate_outputs.setdefault(callee, {})
+                addresses: dict[int, int] = {}
+                for follower in block.instrs[index + 1:]:
+                    if follower.res is None:
+                        continue
+                    if (
+                        follower.op == "GetElementPtr" and follower.args
+                        and int(follower.args[0].id) == int(instruction.res.id)
+                    ):
+                        position = follower.attributes.get("aggregate_index")
+                        if position is not None:
+                            addresses[int(follower.res.id)] = int(position)
+                    elif (
+                        follower.op == "Load" and follower.args
+                        and int(follower.args[0].id) in addresses
+                    ):
+                        slots[addresses[int(follower.args[0].id)]] = (
+                            follower.res
+                        )
+
     named_outputs = dict(outputs or {})
     for function_name, function in functions.items():
         if function_name in named_outputs:
@@ -4037,6 +4082,11 @@ def emit_module(
             continue
         declared = tuple(function.metadata.get("named_outputs") or ())
         if not declared:
+            projected = aggregate_outputs.get(str(function_name))
+            if projected:
+                named_outputs[function_name] = tuple(
+                    projected[position] for position in sorted(projected)
+                )
             continue
         values = {
             int(value.id): value
@@ -5382,6 +5432,9 @@ def emit_module(
         metadata={
             "dtype": dtype,
             "fortran_internal_symbols": dict(native_symbols),
+            **({
+                "shell_io": dict(module.metadata["shell_io"]),
+            } if module.metadata.get("shell_io") else {}),
             **publication_metadata(functions),
             "tensor_table_schema": "turing.repository-ssa-tensor-table.v1",
             "tensor_tables": {
