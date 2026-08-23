@@ -1383,3 +1383,157 @@ def mark_precision_sections(functions) -> int:
                     instruction.attributes[PRECISION_SECTION_ATTRIBUTE] = True
                     marked += 1
     return marked
+
+
+def lower_precision_operations(functions) -> dict:
+    """Expand every `precision_*` into arithmetic a destination already has.
+
+    A precision value becomes ONE SSA VALUE PER LIMB, not one value with a
+    limb axis. That is the representation the working kernels use --
+    `two_product(a, b, p, e, n)` writes its two limbs to two arrays -- and it
+    is the one that survives, because each limb is then an ordinary scalar
+    that every backend can already hold, load and store. The channel-shaped
+    alternative needs a destination to understand an aggregate before it can
+    do arithmetic on one.
+
+    After this runs no `precision_*` remains, which is the point: the
+    operators exist to be recognised and reduced against, and their identity
+    is not meant to reach a backend. The section attribute is stamped on
+    every instruction produced here so the boundary survives where the
+    operator does not.
+
+    Expansions are the standard double-double ones, written out in SSA:
+    two_product via `Fma`, two_sum by Knuth, and a renormalising
+    quick_two_sum at the end of each. Returns a count per operation.
+    """
+
+    from ..common.tensors.topological_reducer import PRECISION_SINGULAR_NAMES
+
+    add_name = PRECISION_SINGULAR_NAMES["Add"]
+    sub_name = PRECISION_SINGULAR_NAMES["Sub"]
+    mul_name = PRECISION_SINGULAR_NAMES["Mul"]
+    neg_name = PRECISION_SINGULAR_NAMES["neg"]
+    expandable = {add_name, sub_name, mul_name, neg_name}
+
+    counts = {name: 0 for name in expandable}
+    next_id = _module_watermark(functions)
+
+    for function in functions.values():
+        # value id -> its limbs, high first. Absent means an ordinary value,
+        # which is simply a one-limb expansion whose low limb is zero.
+        limbs: dict[int, list] = {}
+
+        for block in function.blocks.values():
+            if not any(
+                str(each.op) in expandable for each in block.instrs
+            ):
+                continue
+            emitted: list = []
+
+            def fresh(like):
+                nonlocal next_id
+                value = SSAValue(
+                    next_id, dtype=like.dtype, shape=(), device=like.device,
+                )
+                next_id += 1
+                return value
+
+            def put(op, args, like):
+                result = fresh(like)
+                emitted.append(Instr(op, list(args), result, attributes={
+                    PRECISION_SECTION_ATTRIBUTE: True,
+                    "lowered_from": "precision",
+                }))
+                return result
+
+            def parts(value):
+                return limbs.get(int(value.id), [value])
+
+            def two_sum(a, b):
+                s = put("Add", (a, b), a)
+                bb = put("Sub", (s, a), a)
+                left = put("Sub", (a, put("Sub", (s, bb), a)), a)
+                right = put("Sub", (b, bb), a)
+                return s, put("Add", (left, right), a)
+
+            def quick_two_sum(a, b):
+                s = put("Add", (a, b), a)
+                return s, put("Sub", (b, put("Sub", (s, a), a)), a)
+
+            def two_product(a, b):
+                product = put("Mul", (a, b), a)
+                negated = put("Neg", (product,), a)
+                return product, put(FMA, (a, b, negated), a)
+
+            for instruction in block.instrs:
+                operation = str(instruction.op)
+                if operation not in expandable or instruction.res is None:
+                    emitted.append(instruction)
+                    continue
+
+                if operation == neg_name:
+                    # Exact per limb: a sign flip cannot round.
+                    source = parts(instruction.args[0])
+                    limbs[int(instruction.res.id)] = [
+                        put("Neg", (each,), each) for each in source
+                    ]
+                    counts[operation] += 1
+                    continue
+
+                left = parts(instruction.args[0])
+                right = parts(instruction.args[1])
+                if operation == sub_name:
+                    right = [put("Neg", (each,), each) for each in right]
+
+                if operation == mul_name:
+                    high, error = two_product(left[0], right[0])
+                    # The cross terms, when either operand has a low limb.
+                    for a_index, b_index in ((0, 1), (1, 0)):
+                        if len(left) > a_index and len(right) > b_index:
+                            error = put("Add", (
+                                error,
+                                put("Mul", (left[a_index], right[b_index]),
+                                    error),
+                            ), error)
+                else:
+                    high, error = two_sum(left[0], right[0])
+                    for tail in (left[1:2], right[1:2]):
+                        if tail:
+                            error = put("Add", (error, tail[0]), error)
+
+                high, error = quick_two_sum(high, error)
+                limbs[int(instruction.res.id)] = [high, error]
+                counts[operation] += 1
+
+            block.instrs = emitted
+
+        # A limbed value read by something that was not expanded wants a
+        # single number: sum the limbs, high first, which is the value the
+        # expansion represents.
+        if limbs:
+            for block in function.blocks.values():
+                rebuilt: list = []
+                for instruction in block.instrs:
+                    for position, argument in enumerate(instruction.args):
+                        parts_of = limbs.get(int(argument.id))
+                        if not parts_of:
+                            continue
+                        total = parts_of[0]
+                        for each in parts_of[1:]:
+                            collapsed = SSAValue(
+                                next_id, dtype=total.dtype, shape=(),
+                                device=total.device,
+                            )
+                            next_id += 1
+                            rebuilt.append(Instr(
+                                "Add", [total, each], collapsed,
+                                attributes={
+                                    PRECISION_SECTION_ATTRIBUTE: True,
+                                    "lowered_from": "precision.collapse",
+                                },
+                            ))
+                            total = collapsed
+                        instruction.args[position] = total
+                    rebuilt.append(instruction)
+                block.instrs = rebuilt
+    return counts
