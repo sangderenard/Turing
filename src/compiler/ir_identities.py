@@ -1124,13 +1124,18 @@ def contract_multiply_add_to_fma(functions, licensed: bool | None = None) -> dic
 # destination is measured against.
 # ---------------------------------------------------------------------------
 
-#: A destination must spell `Fma(x, y, z)` with exactly one rounding, or say
-#: it cannot. Substituting a multiply and an add is the one response that is
-#: WORSE THAN REFUSING: it compiles, it runs, it returns a plausible number,
-#: and the residual it computes is identically zero. A backend without an
-#: fma instruction is not thereby disqualified from every program -- it is
-#: disqualified from this section, and saying so is the whole obligation.
-FMA_SINGLE_ROUNDING = "fma.single_rounding"
+#: The section's `Fma` instructions are MANDATORY, not licensed.
+#:
+#: Deliberately not "Fma rounds once" -- that is what `Fma` means, it is true
+#: in ordinary code as well, and a destination that cannot spell the op
+#: shortfalls through the ordinary mechanism without any help from here.
+#: What is section-specific is the opposite of the usual policy: an `Fma`
+#: elsewhere APPEARS ONLY WHEN `contract_multiply_add` licenses it and must
+#: not appear under `prove` at all, whereas here it is the residual itself,
+#: so it has to be emitted whatever the contract says. A destination that
+#: drops it because the contract forbids contraction has not been
+#: conservative; it has computed zero.
+FMA_MANDATORY = "fma.mandatory_regardless_of_contract"
 
 #: A destination must not reassociate or contract within the section, except
 #: at instructions the section itself declares as `Fma`. Both halves matter
@@ -1149,7 +1154,7 @@ LANE_STAGING = "lanes.optional_concurrency"
 
 #: Every obligation a precision section can place on a destination.
 PRECISION_SECTION_OBLIGATIONS = (
-    FMA_SINGLE_ROUNDING, SECTION_ISOLATION, LANE_STAGING,
+    FMA_MANDATORY, SECTION_ISOLATION, LANE_STAGING,
 )
 
 
@@ -1189,14 +1194,17 @@ class PrecisionSectionContract:
 
         Empty means the section may be lowered there. Anything else is a
         shortfall to report BEFORE emitting, not a degradation to discover
-        in the numbers afterwards. ``LANE_STAGING`` never appears: it is
-        permission, so no destination can fail it.
+        in the numbers afterwards -- the failures here do not announce
+        themselves, they return plausible numbers whose residual is zero.
+        ``LANE_STAGING`` never appears: it is permission, so no destination
+        can fail it. ``FMA_MANDATORY`` appears only for a section that
+        actually contains one.
         """
 
         declared = frozenset(str(each) for each in capabilities)
         required = set(self.obligations) - {LANE_STAGING}
         if not self.fma_value_ids:
-            required.discard(FMA_SINGLE_ROUNDING)
+            required.discard(FMA_MANDATORY)
         return tuple(sorted(required - declared))
 
 
