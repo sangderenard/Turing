@@ -99,6 +99,18 @@ class CFunctionArtifact:
 _BINARY = {
     "Add": "+", "Sub": "-", "Mul": "*", "Div": "/",
 }
+
+#: C is the one destination where both halves of the precision-section API
+#: have a STANDARD answer rather than a compiler-specific one.
+#:
+#: `fma` is C99 <math.h> and the standard specifies it as a single rounding
+#: of ``x * y + z``, so the obligation is met by the language rather than by
+#: a flag that a different toolchain might spell differently or ignore.
+#: There is deliberately no fallback: a target whose libm lacks `fma` must
+#: shortfall, because substituting ``x * y + z`` computes a residual that is
+#: identically zero -- a plausible number, silently wrong, which is worse
+#: than refusing to emit.
+_TERNARY = {"fma": "fma"}
 _UNARY = {"Abs": "fabs", "Sqrt": "sqrt", "Neg": None}
 _UNARY_FOLDED = {
     key.casefold(): value for key, value in _UNARY.items()
@@ -242,6 +254,11 @@ def emit_ssa_function_to_c(
                 rendered = f"((double)((long long)({args[0]})))"
             else:
                 rendered = args[0]
+        elif op.casefold() in _TERNARY and len(args) == 3:
+            rendered = (
+                f"{_TERNARY[op.casefold()]}"
+                f"({args[0]}, {args[1]}, {args[2]})"
+            )
         elif op in _BINARY and len(args) == 2:
             rendered = f"({args[0]} {_BINARY[op]} {args[1]})"
         elif op in {"Max", "Min"} and len(args) == 2:
@@ -312,6 +329,18 @@ def emit_ssa_function_to_c(
     source = "\n".join((
         "#include <math.h>",
         "#include <stddef.h>",
+        # SECTION_ISOLATION, in the language's own words rather than a
+        # toolchain's. C already evaluates an expression as written -- it
+        # grants no licence to reassociate -- so contraction is the only
+        # rewrite the standard permits behind the author's back, and this
+        # withdraws it. Every fused multiply-add still present is then one
+        # this compiler emitted on purpose.
+        #
+        # Two caveats worth keeping visible. GCC does not implement this
+        # pragma and wants -ffp-contract=off instead; clang, which is what
+        # `zig cc` is, honours it. And -ffast-math overrides everything
+        # here, so a precision section must never be built under it.
+        "#pragma STDC FP_CONTRACT OFF",
         "#if defined(_WIN32)",
         "#define TURING_EXPORT __declspec(dllexport)",
         "#else",
