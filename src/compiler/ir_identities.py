@@ -750,3 +750,186 @@ PRECISION_REFUSALS: tuple[PrecisionIdentity, ...] = (
         ),
     ),
 )
+
+
+def reduce_precision_operations(functions) -> dict:
+    """Fire the identities whose evidence is already in the SSA.
+
+    Every rewrite here is exact, so none consults the work contract. Most
+    do not restructure anything: they record HOW an operation is to be
+    realised -- per-limb, scaled, renormalised or not -- as a fact on the
+    instruction. That is the honest shape while destinations are still
+    unwritten, because the decision is the identity's to make and the
+    spelling is theirs, and it keeps the reduction phase from having to
+    know either.
+
+    Absent on purpose: ``exact_identity_element``. Dropping ``add(x, 0)``
+    means pointing every consumer at ``x``, and this module deliberately
+    avoids use-rewriting -- it is why ``x**1`` is missing from the ``Pow``
+    reduction. It needs the same machinery that entry needs, and should
+    arrive with it rather than growing a private copy here.
+
+    ``sterbenz_cancellation`` waits on a proven range (catalogue section
+    5); the two kernel entries wait on the bank.
+
+    Returns a count per identity name.
+    """
+
+    from math import frexp
+
+    from ..common.tensors.topological_reducer import PRECISION_SINGULAR_NAMES
+
+    add_name = PRECISION_SINGULAR_NAMES["Add"]
+    sub_name = PRECISION_SINGULAR_NAMES["Sub"]
+    mul_name = PRECISION_SINGULAR_NAMES["Mul"]
+    neg_name = PRECISION_SINGULAR_NAMES["neg"]
+
+    counts = {
+        "negation_is_per_limb": 0,
+        "subtraction_is_addition_of_negation": 0,
+        "scaling_by_power_of_two": 0,
+        "single_renormalisation_per_chain": 0,
+    }
+    next_id = _module_watermark(functions)
+
+    def fresh(like) -> SSAValue:
+        nonlocal next_id
+        value = SSAValue(
+            next_id, dtype=like.dtype, shape=tuple(like.shape or ()),
+            device=like.device, accounting=dict(like.accounting or {}),
+        )
+        next_id += 1
+        return value
+
+    def is_power_of_two(value: float) -> bool:
+        # Exactly a power of two, and finite: frexp puts every such value
+        # at a mantissa of exactly 0.5. Zero and the specials are excluded
+        # because scaling by them is not an exponent shift.
+        if not value or value != value or value in (float("inf"), -float("inf")):
+            return False
+        return frexp(abs(value))[0] == 0.5
+
+    for function in functions.values():
+        # -- negation is a sign flip, never an expansion -------------------
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if str(instruction.op) == neg_name:
+                    instruction.attributes["precision_form"] = "per_limb"
+                    counts["negation_is_per_limb"] += 1
+
+        # -- subtraction is addition of a negation -------------------------
+        # The result value is reused, so no consumer needs rewriting: only
+        # a negation is inserted ahead of the operation that keeps the id.
+        for block in function.blocks.values():
+            if not any(
+                str(instruction.op) == sub_name
+                for instruction in block.instrs
+            ):
+                continue
+            rewritten = []
+            for instruction in block.instrs:
+                if str(instruction.op) != sub_name or len(instruction.args) != 2:
+                    rewritten.append(instruction)
+                    continue
+                left, right = instruction.args
+                negated = fresh(right)
+                rewritten.append(Instr(
+                    neg_name, [right], negated,
+                    attributes={
+                        "precision_form": "per_limb",
+                        "precision_limbs": instruction.attributes.get(
+                            "precision_limbs"
+                        ),
+                        "precision_element": instruction.attributes.get(
+                            "precision_element"
+                        ),
+                        "lowered_from": sub_name,
+                    },
+                ))
+                instruction.op = add_name
+                instruction.args = [left, negated]
+                instruction.attributes["lowered_from"] = sub_name
+                rewritten.append(instruction)
+                counts["negation_is_per_limb"] += 1
+                counts["subtraction_is_addition_of_negation"] += 1
+            block.instrs = rewritten
+
+        # -- scaling by a power of two is exact per limb -------------------
+        constants: dict[int, float] = {}
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.op == "Const" and instruction.res is not None:
+                    value = _constant_value(instruction)
+                    if value is not None:
+                        constants[int(instruction.res.id)] = value
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if str(instruction.op) != mul_name:
+                    continue
+                for operand in instruction.args:
+                    scale = constants.get(int(operand.id))
+                    if scale is None or not is_power_of_two(scale):
+                        continue
+                    instruction.attributes["precision_form"] = "scale_per_limb"
+                    instruction.attributes["precision_scale"] = scale
+                    counts["scaling_by_power_of_two"] += 1
+                    break
+
+        # -- one renormalisation per chain ---------------------------------
+        # An intermediate expansion needs renormalising only if something
+        # READS it. Anything reached through metadata counts as a reader:
+        # a loop-carried port or a declared output is consumed through a
+        # channel no scan of operands can see.
+        protected: set[int] = set()
+        for key in (
+            "source_output_value_ids", "required_source_value_ids",
+        ):
+            protected.update(
+                int(value_id)
+                for value_id in (function.metadata.get(key) or ())
+            )
+        for name_value in (function.metadata.get("named_outputs") or ()):
+            try:
+                protected.add(int(name_value[1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+        for port_id, port_value in dict(
+            function.metadata.get("carried_port_values") or {}
+        ).items():
+            protected.add(int(port_id))
+            try:
+                protected.add(int(port_value.id))
+            except (AttributeError, TypeError, ValueError):
+                continue
+
+        readers: dict[int, list] = {}
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                for argument in instruction.args:
+                    readers.setdefault(int(argument.id), []).append(instruction)
+                if instruction.op in ("Phi", "phi"):
+                    for _predecessor, value in (
+                        instruction.attributes.get("incoming") or ()
+                    ):
+                        try:
+                            readers.setdefault(int(value.id), []).append(
+                                instruction
+                            )
+                        except (AttributeError, TypeError, ValueError):
+                            continue
+
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if str(instruction.op) != add_name or instruction.res is None:
+                    continue
+                result = int(instruction.res.id)
+                consumers = readers.get(result, ())
+                internal = (
+                    result not in protected
+                    and len(consumers) == 1
+                    and str(consumers[0].op) == add_name
+                )
+                instruction.attributes["precision_renormalise"] = not internal
+                if internal:
+                    counts["single_renormalisation_per_chain"] += 1
+    return counts
