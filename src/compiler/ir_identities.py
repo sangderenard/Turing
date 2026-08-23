@@ -713,10 +713,23 @@ PRECISION_REFUSALS: tuple[PrecisionIdentity, ...] = (
         effect="REFUSED: the error term must keep its written association",
         justification=(
             "A dual expression is algebraically zero -- that is what makes "
-            "it the error term -- so ANY reassociating simplifier folds it "
-            "away entirely. Knuth's and Dekker's proofs hold for one "
-            "specific order of operations and for no other. The primal may "
-            "be reassociated freely; the dual may not be touched at all."
+            "it the error term -- so a reassociating simplifier that sees "
+            "it whole can fold it away entirely. Knuth's and Dekker's "
+            "proofs hold for one specific order of operations and for no "
+            "other; the primal may be reassociated freely, the dual may not "
+            "be touched at all.
+
+"
+            "MEASURED, because the stronger claim is easy to assume and was "
+            "asserted here before it was checked: gfortran at -ffast-math "
+            "did NOT fold a raw two_sum residual, on inputs that genuinely "
+            "lose bits. Lowering one SSA value per statement, through named "
+            "temporaries loaded from and stored to arrays, appears to be "
+            "why -- no simplifier ever sees the residual as one expression. "
+            "So this refusal is a standing hazard rather than an observed "
+            "failure, and the structure is carrying more of the protection "
+            "than the isolation flags are. Treat a destination that inlines "
+            "more aggressively as untested, not as safe."
         ),
     ),
     PrecisionIdentity(
