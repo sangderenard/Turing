@@ -75,6 +75,43 @@ def test_default_contract_draws_python_native_and_decompile_lines():
     )
 
 
+@pytest.mark.parametrize("target", [open, io.open, Path.open, Path.read_bytes])
+def test_python_filesystem_uses_the_existing_shell_file_broker(target):
+    decision = ExtractionContract(CONTRACT).decide(target)
+
+    assert decision.action is ExtractionAction.PYTHON_HOST_CALL
+    assert decision.rule_id == "python-filesystem-is-a-shell-boundary"
+    assert decision.parameters["execution"] == "shell_io.file_broker"
+    assert decision.parameters["shell_capability"] == "files"
+    assert decision.parameters["shell_abi"] == "turing-shell-io-abi.files"
+
+
+def test_process_graph_retains_filesystem_call_as_a_shell_boundary():
+    contract = ExtractionContract(CONTRACT)
+    graph = ProcessGraph(materialize_memory=False)
+    graph.build_from_ast(
+        """
+from pathlib import Path
+def kernel(name):
+    path = Path(name)
+    return path.read_bytes()
+""",
+        resolve_unresolved_parents=True,
+        pursuit_roots=("kernel",),
+        parent_include=contract,
+    )
+
+    boundaries = graph.G.graph["extraction_boundary_calls"]
+    file_boundary = next(
+        item for item in boundaries
+        if (item.get("extraction_contract") or {}).get("identity")
+        == "pathlib.Path.read_bytes"
+    )
+    receipt = file_boundary["extraction_contract"]
+    assert receipt["action"] == "python_host_call"
+    assert receipt["parameters"]["execution"] == "shell_io.file_broker"
+
+
 def test_program_abi_correlates_unannotated_method_receiver_by_class_identity():
     contract = ExtractionContract(CONTRACT)
 

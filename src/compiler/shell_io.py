@@ -517,24 +517,101 @@ class ShellIOABI:
         }
 
 
+def attach_shell_io_metadata(
+    metadata: Mapping[str, Any] | None,
+    manifest: ShellIOManifest,
+    abi: ShellIOABI = ShellIOABI(),
+) -> dict[str, Any]:
+    """Return metadata carrying an additively merged shell IO contract.
+
+    Repository SSA exists before a target-specific ``CompiledProgramAPI``.
+    Keeping this merge independent of that descriptor lets ingestion attach
+    shell needs to the IR module and lets emission copy the exact same record
+    into the eventual native/web API.
+    """
+
+    metadata = dict(metadata or {})
+    incoming = manifest.to_mapping()
+    existing_shell = dict(metadata.get("shell_io") or {})
+    existing = dict(existing_shell.get("requirements") or {})
+    if existing:
+        request_rows = {}
+        for row in (*existing.get("requests", ()), *incoming.get("requests", ())):
+            capability = str(row.get("capability"))
+            current = request_rows.get(capability)
+            if current is None:
+                request_rows[capability] = dict(row)
+                continue
+            old_attributes = dict(current.get("attributes") or {})
+            new_attributes = dict(row.get("attributes") or {})
+            conflicts = {
+                key for key in old_attributes.keys() & new_attributes.keys()
+                if old_attributes[key] != new_attributes[key]
+            }
+            if conflicts:
+                raise ValueError(
+                    f"conflicting shell IO request attributes for "
+                    f"{capability!r}: {sorted(conflicts)!r}"
+                )
+            current["attributes"] = {**old_attributes, **new_attributes}
+            current["optional"] = bool(
+                current.get("optional", False) and row.get("optional", False)
+            )
+
+        def merged_rows(key: str, identity):
+            rows = [*existing.get(key, ()), *incoming.get(key, ())]
+            merged = {}
+            for row in rows:
+                token = identity(row)
+                if token in merged and dict(merged[token]) != dict(row):
+                    raise ValueError(
+                        f"conflicting shell IO {key} declaration for {token!r}"
+                    )
+                merged[token] = dict(row)
+            return list(merged.values())
+
+        incoming = {
+            **existing,
+            **incoming,
+            "requests": list(request_rows.values()),
+            "bindings": merged_rows(
+                "bindings",
+                lambda row: (
+                    str(row.get("entry_point")), str(row.get("parameter")),
+                ),
+            ),
+            "options": merged_rows(
+                "options", lambda row: str(row.get("name")),
+            ),
+            "system_ports": merged_rows(
+                "system_ports", lambda row: str(row.get("name")),
+            ),
+        }
+        old_filesystem = existing.get("virtual_filesystem")
+        new_filesystem = manifest.to_mapping().get("virtual_filesystem")
+        if old_filesystem and new_filesystem and old_filesystem != new_filesystem:
+            raise ValueError("conflicting shell IO virtual filesystem declarations")
+        if old_filesystem and not new_filesystem:
+            incoming["virtual_filesystem"] = old_filesystem
+    metadata["shell_io"] = {
+        **existing_shell,
+        "requirements": incoming,
+        "abi": existing_shell.get("abi") or abi.to_mapping(),
+    }
+    return metadata
+
+
 def attach_shell_io(
     api: Any,
     manifest: ShellIOManifest,
     abi: ShellIOABI = ShellIOABI(),
 ) -> Any:
-    """Return a compiled API descriptor carrying its shell IO contract.
-
-    ``CompiledProgramAPI.metadata`` is already the repository's extension
-    surface consumed by generated pages.  Keeping shell IO there avoids a
-    second descriptor and leaves artifacts with no IO demand unchanged.
-    """
+    """Return a compiled API descriptor carrying its shell IO contract."""
 
     manifest = resolve_shell_io_bindings(api, manifest)
-    metadata = dict(getattr(api, "metadata", {}) or {})
-    metadata["shell_io"] = {
-        "requirements": manifest.to_mapping(),
-        "abi": abi.to_mapping(),
-    }
+    metadata = attach_shell_io_metadata(
+        getattr(api, "metadata", None), manifest, abi,
+    )
     try:
         return replace(api, metadata=metadata)
     except TypeError as error:
@@ -755,6 +832,7 @@ __all__ = [
     "VirtualMountKind",
     "WEB_JAVASCRIPT_SHELL",
     "attach_shell_io",
+    "attach_shell_io_metadata",
     "plan_shell_stack",
     "resolve_shell_io_bindings",
 ]

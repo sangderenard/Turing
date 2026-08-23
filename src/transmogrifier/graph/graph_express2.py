@@ -32,6 +32,7 @@ from .node_special_cases import (
 from .python_special_cases import (
     extraction_receipt,
     interpret_python_special_case,
+    lower_python_shell_file_contexts,
 )
 from .python_identity_programs import resolve_python_identity
 import colorsys
@@ -3008,6 +3009,8 @@ class ProcessGraph:
                 None if boundary_resolution is None
                 else boundary_resolution.role_schema
             )
+            if special is not None and special.role_schema is not None:
+                schema = special.role_schema
             if schema is None:
                 schema = self.role_schemas.get(node_type)
             args = getattr(current, "args", [])
@@ -3300,6 +3303,17 @@ class ProcessGraph:
             # MachinePathHeadStatus``) was real and resolved, just
             # discarded before reduction could ever see it.
             self.python_bindings = root_bindings
+            # Source pursuit is what resolves ``open``/``Path.open`` to the
+            # extraction contract's shell-file boundary. Lower the lexical
+            # resource scope only now, from that exact receipt; doing it before
+            # pursuit would have to guess from spelling and doing it after graph
+            # construction would leave a false control-divergence ``With``.
+            tree = lower_python_shell_file_contexts(tree)
+            shell_file_contexts = tuple(
+                getattr(tree, "_turing_shell_file_contexts", ()) or ()
+            )
+            if shell_file_contexts:
+                self.G.graph["shell_file_contexts"] = shell_file_contexts
             if parent_include is not None and hasattr(parent_include, "receipts"):
                 self.G.graph["extraction_contract_receipts"] = (
                     parent_include.receipts()

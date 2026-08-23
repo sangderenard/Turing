@@ -56,6 +56,10 @@ class SpecialCase:
     attributes: dict
     constant: Any
     terminal: bool = True
+    # An adapter may retain dataflow while replacing the source node's role
+    # schema. Shell boundaries use this to keep authored arguments but omit
+    # the Python callable object: deployment owns the operation itself.
+    role_schema: dict | None = None
 
 
 def _as_numeric_constant(element: ast.AST) -> tuple[bool, Any]:
@@ -341,27 +345,53 @@ class _ContextInliner(ast.NodeTransformer):
 
     @staticmethod
     def _halves(definition: ast.FunctionDef):
-        """Set-up and clean-up: the statements either side of the ``yield``."""
+        """Set-up, yielded value and clean-up from a manager template."""
 
         def holds_yield(node) -> bool:
             return any(isinstance(inner, (ast.Yield, ast.YieldFrom))
                        for inner in ast.walk(node))
 
         setup: list[ast.stmt] = []
-        for statement in definition.body:
+        for statement_index, statement in enumerate(definition.body):
             if isinstance(statement, ast.Try) and holds_yield(statement):
-                for inner in statement.body:
+                # A handler can suppress or replace an exception thrown by
+                # the protected body. That is not a non-suppressing closure
+                # template, so retain the original With for full handling.
+                if statement.handlers or statement.orelse:
+                    return None
+                for inner_index, inner in enumerate(statement.body):
                     if holds_yield(inner):
-                        break
+                        yielded = next(
+                            node for node in ast.walk(inner)
+                            if isinstance(node, (ast.Yield, ast.YieldFrom))
+                        )
+                        return (
+                            setup,
+                            getattr(yielded, "value", None),
+                            list(statement.body[inner_index + 1:]),
+                            list(statement.finalbody),
+                            list(definition.body[statement_index + 1:]),
+                        )
                     setup.append(inner)
-                return setup, list(statement.finalbody)
             if holds_yield(statement):
-                return setup, []
+                yielded = next(
+                    node for node in ast.walk(statement)
+                    if isinstance(node, (ast.Yield, ast.YieldFrom))
+                )
+                return (
+                    setup,
+                    getattr(yielded, "value", None),
+                    [],
+                    [],
+                    list(definition.body[statement_index + 1:]),
+                )
             setup.append(statement)
         return None
 
     def _bind(self, definition: ast.FunctionDef, call: ast.Call,
-              setup: list[ast.stmt], cleanup: list[ast.stmt]):
+              setup: list[ast.stmt], yielded: ast.expr | None,
+              success: list[ast.stmt], cleanup: list[ast.stmt],
+              epilogue: list[ast.stmt]):
         """Both halves, in ONE renaming scope, parameters bound by assignment.
 
         The halves must share a scope: the set-up's temporary is what the
@@ -380,7 +410,8 @@ class _ContextInliner(ast.NodeTransformer):
         parameters = [argument.arg for argument in definition.args.args]
         owned = set(parameters) | {
             node.id
-            for statement in (*setup, *cleanup)
+            for statement in (*setup, *success, *cleanup, *epilogue, yielded)
+            if statement is not None
             for node in ast.walk(statement)
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
         }
@@ -409,12 +440,21 @@ class _ContextInliner(ast.NodeTransformer):
                        value=copy.deepcopy(value))
             for name, value in zip(parameters, call.args)
         ]
-        return binding + rebind(setup), rebind(cleanup)
+        rebound_yield = (
+            ast.Constant(value=None)
+            if yielded is None else Rebind().visit(copy.deepcopy(yielded))
+        )
+        return (
+            binding + rebind(setup),
+            rebound_yield,
+            rebind(success),
+            rebind(cleanup),
+            rebind(epilogue),
+        )
 
     def visit_With(self, node):  # noqa: N802
         node = self.generic_visit(node)
-        prologue: list[ast.stmt] = []
-        epilogue: list[ast.stmt] = []
+        templates = []
         for item in node.items:
             call = item.context_expr
             if not isinstance(call, ast.Call):
@@ -425,17 +465,24 @@ class _ContextInliner(ast.NodeTransformer):
             halves = self._halves(definition)
             if halves is None:
                 return node
+            template = self._bind(definition, call, *halves)
+            setup, yielded, success, cleanup, epilogue = template
             if item.optional_vars is not None:
-                # ``as`` names the yielded value, which is the one thing the
-                # halves do not carry between them. Left alone rather than
-                # guessed at.
-                return node
-            setup, cleanup = self._bind(definition, call, *halves)
-            prologue.extend(setup)
-            # Clean-ups undo in reverse, innermost first.
-            epilogue[:0] = cleanup
+                setup.append(ast.Assign(
+                    targets=[copy.deepcopy(item.optional_vars)],
+                    value=yielded,
+                ))
+            templates.append((setup, success, cleanup, epilogue))
             self.inlined.append(ast.unparse(call))
-        return prologue + list(node.body) + epilogue
+        body = list(node.body)
+        for setup, success, cleanup, epilogue in reversed(templates):
+            protected = body + success
+            if cleanup:
+                protected = [ast.Try(
+                    body=protected, handlers=[], orelse=[], finalbody=cleanup,
+                )]
+            body = setup + protected + epilogue
+        return body
 
 
 def inline_context_managers(tree: ast.AST, resolver) -> ast.AST:

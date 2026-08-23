@@ -283,6 +283,20 @@ rules:
       port: stdout
       callbacks: reject
 
+  # Files are resources supplied by the enclosing native/web shell.  Keep
+  # Python's convenient Path and stream APIs as the authored spelling, but do
+  # not ingest their implementation or pretend a numerical backend owns the
+  # host filesystem.  FileBrokerABI is the shared open/read/write/close ABI.
+  - id: python-filesystem-is-a-shell-boundary
+    match:
+      identity: [builtins.open, io.*, _io.*, pathlib.*]
+    action: python_host_call
+    parameters:
+      execution: shell_io.file_broker
+      callbacks: reject
+      shell_capability: files
+      shell_abi: turing-shell-io-abi.files
+
   - id: never-extract-cpython-bootstrap
     match:
       module: [importlib*, _frozen_importlib*, inspect, ast, dis, types]

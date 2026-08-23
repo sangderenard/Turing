@@ -88,6 +88,24 @@ def test_shell_io_travels_in_the_existing_compiled_api_descriptor():
     assert shell_io["abi"]["schema"] == "turing-shell-io-abi"
 
 
+def test_shell_io_attachment_adds_capabilities_without_erasing_existing_ones():
+    api = CompiledProgramAPI("demo", "fortran", "run")
+    with_files = attach_shell_io(
+        api, ShellIOManifest((ShellIORequest.create("files"),)),
+    )
+
+    combined = attach_shell_io(
+        with_files,
+        ShellIOManifest((ShellIORequest.create("display_double_buffer"),)),
+    ).to_mapping()["metadata"]["shell_io"]
+
+    assert [
+        request["capability"]
+        for request in combined["requirements"]["requests"]
+    ] == ["files", "display_double_buffer"]
+    assert combined["abi"]["schema"] == "turing-shell-io-abi"
+
+
 def test_manifest_serializes_parameter_bindings_and_generated_options():
     manifest = ShellIOManifest(
         (ShellIORequest.create("display_double_buffer"),),

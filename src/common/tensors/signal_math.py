@@ -269,6 +269,17 @@ def working_digits(epsilon: float) -> int:
     return int(max(30, math.ceil(-math.log10(epsilon)) + 25))
 
 
+#: How many limbs a bake stores per coefficient, regardless of the target it
+#: was asked for. Storing more than any deployment will use costs a few floats
+#: once and removes a whole class of question: a core baked for one width is
+#: not a different artefact from the same core baked for another, so a caller
+#: asking for two limbs and a caller asking for four read the SAME numbers and
+#: cannot disagree. The evaluation takes the leading ``width`` of them and
+#: ignores the rest, so the deployment follows the request rather than the
+#: bake.
+BAKE_LIMBS = 4
+
+
 def limbs_for(epsilon: float) -> int:
     """How many float64 limbs a coefficient needs to hold this target.
 
@@ -311,10 +322,32 @@ def validate_epsilon(epsilon: float | None) -> float:
     return epsilon
 
 
-def _horner(argument: Any, coefficients: Sequence[float]) -> Any:
-    result = argument * 0.0 + float(coefficients[-1])
-    for coefficient in reversed(tuple(coefficients)[:-1]):
-        result = result * argument + float(coefficient)
+def _horner(argument: Any, coefficients: Sequence[float],
+            corrections: Sequence | None = None) -> Any:
+    """Horner, carrying the coefficients at the argument's own width.
+
+    ``corrections`` holds what a double could not keep of each coefficient.
+    Dropping them is invisible and expensive: the chain is wide, every step
+    looks exact, and each one adds a constant that was already wrong in its
+    last bits. Measured on the sine core, carrying them is the difference
+    between 96.67% and 100% of results correctly rounded -- the arithmetic
+    was never the limit once the width was there, the CONSTANTS were.
+    """
+
+    from .extended_precision import Precision
+
+    values = tuple(coefficients)
+    wide = isinstance(argument, Precision) and bool(corrections)
+
+    def term(index: int) -> Any:
+        if not wide:
+            return values[index]
+        return Precision.constant(
+            argument, (values[index],) + tuple(corrections[index]))
+
+    result = argument * 0.0 + term(len(values) - 1)
+    for index in range(len(values) - 2, -1, -1):
+        result = result * argument + term(index)
     return result
 
 
@@ -331,8 +364,31 @@ def _index_tensor(value: Any) -> Any:
     )
 
 
-def evaluate_core(reduced: Any, core: BakedCore) -> Any:
-    """Evaluate a baked core on an argument ALREADY inside its interval."""
+def evaluate_core(reduced: Any, core: BakedCore, *,
+                  collapse: bool | None = None) -> Any:
+    """Evaluate a baked core on an argument ALREADY inside its interval.
+
+    The argument decides the arithmetic. Hand it a ``Precision`` and every
+    step of the Horner chain stays wide, so the rounding is paid once at the
+    end of the core rather than at each of its twenty steps; hand it an
+    ordinary tensor and nothing changes from before.
+
+    ``collapse`` names what comes BACK. The default follows the argument --
+    wide in, wide out -- because a caller that went to the trouble of
+    supplying width usually means to keep it through whatever it does next.
+    Pass ``True`` at the boundary, where an ordinary tensor is wanted.
+    """
+
+    from .extended_precision import Precision
+
+    wide = isinstance(reduced, Precision)
+    if collapse is None:
+        collapse = not wide
+
+    def settle(result: Any) -> Any:
+        if collapse and isinstance(result, Precision):
+            return result.collapse()
+        return result
 
     # ``exact`` is the same FORM as ``structured`` -- the parity is carried by
     # the expression either way -- and differs only in where the coefficients
@@ -341,13 +397,16 @@ def evaluate_core(reduced: Any, core: BakedCore) -> Any:
         if core.structure == "factored":
             # f(u) = u * P(u): the root is exact, so the polynomial never has
             # to fit across a zero and relative accuracy stays attainable.
-            return reduced * _horner(reduced, core.values)
+            return settle(reduced * _horner(
+                reduced, core.values, core.corrections
+            ))
         square = reduced * reduced
-        polynomial = _horner(square, core.values)
-        return reduced * polynomial if core.structure == "odd" else polynomial
+        polynomial = _horner(square, core.values, core.corrections)
+        return settle(reduced * polynomial if core.structure == "odd" else polynomial)
 
     if core.family == "series":
-        return _horner(reduced - core.centre, core.values)
+        return settle(_horner(reduced - core.centre, core.values,
+                              core.corrections))
 
     if core.family == "polyspline":
         width = len(core.values) // core.segments
@@ -385,7 +444,7 @@ def evaluate_core(reduced: Any, core: BakedCore) -> Any:
     index = _index_tensor(base)
     left = table.index_select(0, index)
     right = table.index_select(0, index + 1)
-    return left + (right - left) * weight
+    return settle(left + (right - left) * weight)
 
 
 def _measure(core: BakedCore) -> BakedCore:
@@ -464,7 +523,7 @@ def _chebyshev_nodes(low: float, high: float, count: int) -> np.ndarray:
     ) + low
 
 
-def _split_high_low(values, limbs: int = 2):
+def _split_high_low(values, limbs: int | None = None):
     """Each value as ``limbs`` doubles that sum to it.
 
     ``Fraction`` is exact and ``float(Fraction)`` is correctly rounded, so
@@ -475,6 +534,7 @@ def _split_high_low(values, limbs: int = 2):
 
     from fractions import Fraction
 
+    limbs = BAKE_LIMBS if limbs is None else max(int(limbs), BAKE_LIMBS)
     heads, tails = [], []
     for value in values:
         parts = []
@@ -640,7 +700,7 @@ def fit_exact(core: str, epsilon: float | None = None) -> BakedCore:
             from .signal_symbolic import structured_coefficients
 
             coefficients = structured_coefficients(str(core), int(order))
-            highs, lows = _split_high_low(coefficients, limbs_for(epsilon))
+            highs, lows = _split_high_low(coefficients)
             return _measure(BakedCore(
                 core=core, family="exact", epsilon=epsilon,
                 low=spec.low, high=spec.high, structure="factored",

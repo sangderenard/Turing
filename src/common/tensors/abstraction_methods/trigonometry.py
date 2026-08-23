@@ -89,6 +89,7 @@ def use_signal_kernels(quality: str = "draft") -> str:
 
     global _IMPLEMENTATION, _QUALITY, _LAUNCHER
     _LAUNCHER = LaunchCoordinator(open_signal_bank(str(quality)))
+    _KERNEL_KEYS.clear()
     _IMPLEMENTATION, _QUALITY = "signal_kernels", str(quality)
     return _IMPLEMENTATION
 
@@ -111,6 +112,38 @@ def _surface():
     return signal_math(_QUALITY)
 
 
+#: Method name -> the bank's spec key, resolved once per installed launcher.
+_KERNEL_KEYS: dict = {}
+
+
+def _kernel_key(name: str):
+    """The bank's key for a surface method, or ``None``.
+
+    The bank keys a kernel by what it IS -- ``sin_d32``, the sine core at
+    thirty-two digits -- while the surface asks by what the caller SAID,
+    ``sin``. Looking the bare name up directly matched nothing, so the
+    ``signal_kernels`` route silently served every call from the eager
+    surface while claiming to be the compiled one. When several digit
+    variants exist the highest wins: the caller chose this route for
+    fidelity, and the profiler, not this table, is where a cheaper variant
+    would earn its place.
+    """
+
+    if name in _KERNEL_KEYS:
+        return _KERNEL_KEYS[name]
+    specs = _LAUNCHER.bank.specs
+    if name in specs:
+        _KERNEL_KEYS[name] = name
+        return name
+    prefix = name + "_d"
+    digits = [
+        int(key[len(prefix):]) for key in specs
+        if key.startswith(prefix) and key[len(prefix):].isdigit()
+    ]
+    _KERNEL_KEYS[name] = f"{prefix}{max(digits)}" if digits else None
+    return _KERNEL_KEYS[name]
+
+
 def _routed(name: str, value):
     """One routed launch, or ``None`` when the bank has no kernel by that name.
 
@@ -119,7 +152,10 @@ def _routed(name: str, value):
     the rest must keep working through the eager cores.
     """
 
-    if _LAUNCHER is None or name not in _LAUNCHER.bank.specs:
+    if _LAUNCHER is None:
+        return None
+    name = _kernel_key(name)
+    if name is None:
         return None
 
     import numpy as np

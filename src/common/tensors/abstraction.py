@@ -2457,33 +2457,9 @@ class AbstractTensor:
 
         return matmul(self, other)
 
-    #: How many limb channels this tensor's last dimension carries. One is a
-    #: plain tensor -- the overwhelming case -- and nothing about it differs
-    #: from before. Higher means the last dimension is ``channels * limbs``
-    #: interleaved at stride ``limbs``.
-    #:
-    #: It has to be carried rather than inferred: a last dimension of six is
-    #: six channels, or three at two limbs, and no shape distinguishes them.
-    #: The COUNT is metadata, the DATA is the shape -- which is what keeps the
-    #: return type an ordinary tensor.
-    limbs: int = 1
-
-    #: How wide the calculator works when nobody says otherwise. Two limbs is
-    #: double the dtype: the intermediate is exact to about twice the working
-    #: precision and the result is collapsed back, so a caller sees the same
-    #: shape and the same type it always did -- only correctly rounded. This
-    #: is the FMA bargain applied to every operator: compute wide, round once.
-    #:
-    #: ``simple`` (one limb) is the old behaviour, for paths that would rather
-    #: have the speed; ``extreme`` keeps the limbs instead of collapsing, for
-    #: a caller that means to keep chaining exactly and pay the rounding once
-    #: at the end.
-    CALCULATOR_LIMBS = 2
-
     def _apply_operator(self, op: str, left: Any, right: Any, *,
-                        limbs: int | None = None, accumulator: Any = None,
-                        accumulate_output: bool = False,
-                        collapse: bool = True):
+                        limbs: int = 1, accumulator: Any = None,
+                        accumulate_output: bool = False):
         """
         Arithmetic with bool tensors:
         - if mixing with floats/complex -> cast bool to float
@@ -2500,38 +2476,42 @@ class AbstractTensor:
         elif isinstance(right, AbstractTensor) and isinstance(left, (list, tuple)):
             left = right.ensure_tensor(left)       # instead of get_tensor(... Faculty.NUMPY)
 
-        # N-double work, driven by ARGUMENTS. ``limbs`` is what this call will
-        # accept: the operands say what precision is available, this says what
-        # is kept, and the renormalisation to it IS the precision choice --
-        # two 2-limb values have a 4-limb exact product, so without a stated
-        # ceiling a chain grows without bound.
+        # Extended precision is a SPECIAL CASE, caught here and handled by the
+        # operand that owns it -- not mixed into this path. A limbed value
+        # keeps its limbs in extra channels, and a general tensor operation
+        # cannot be taught to see past them: measured, ``mean`` on a two-limb
+        # value returned half of it, because it divided by the widened element
+        # count. ``sum``, ``max`` and the rest were right only by accident.
         #
-        # It is a parameter rather than ambient state for a reason that only
-        # shows up once compiled. A thread-local is invisible to the compiler:
-        # whatever sets it is a store nothing in the program reads, so the
-        # store is deleted as dead and every operator lowers single-limb while
-        # appearing to have honoured the request. An argument is in the tree.
-        #
-        # It sits HERE, above the backend unwrap, because every step is built
-        # from + - * on the base dtype, so one implementation covers every
-        # backend; and because the expansion is ordinary tensor arithmetic it
-        # records on the tape as the chain that actually produced the value.
-        # The recursion is bounded by the default: the expansion's own
-        # arithmetic asks for one limb and so cannot re-enter.
-        width = int(self.CALCULATOR_LIMBS if limbs is None else limbs)
-        if width > 1 or accumulator is not None:
-            from .extended_precision import apply as _extended_apply
+        # So the width lives on its own type, which owns the operators that
+        # understand it, and everything else either collapses at the boundary
+        # or refuses. Being loudly unsupported beats being quietly halved.
+        from .extended_precision import Precision
 
-            extended_result = _extended_apply(
+        # Width is a PARAMETER of the operation, so the existing operator
+        # deployment carries it: a caller that wants an exact step asks for it
+        # here and every backend, every dtype and the tape all keep working,
+        # because nothing else in this path changes.
+        #
+        # It reaches the operation two ways, and both are the same request. An
+        # operand may already be a ``Precision``, which is how width travels
+        # down a chain without being restated at every step; or the call names
+        # ``limbs`` directly, which is how the first step of a chain gets its
+        # width in the first place. A promotion at the boundary and a
+        # parameter at the call are the same thing said at different times.
+        #
+        # ``limbs=1`` is the default and costs one comparison, so ordinary
+        # arithmetic is untouched -- which matters, because a wider default
+        # buys nothing measurable for a single + - * /: IEEE already returns
+        # the correctly rounded result, and computing one wide and rounding
+        # back was bit-identical on every pair tested.
+        width = max(int(limbs or 1),
+                    Precision.width_of(left), Precision.width_of(right))
+        if width > 1 or accumulator is not None:
+            return Precision.dispatch(
                 op, left, right, limbs=width, accumulator=accumulator,
                 accumulate_output=accumulate_output,
             )
-            if extended_result is not None:
-                if collapse and not accumulate_output:
-                    from .extended_precision import narrow
-
-                    return narrow(extended_result, width)
-                return extended_result
 
         # Record first using the original operand wrappers so parameter identity
         # is preserved on the tape (ids match actual model params).
