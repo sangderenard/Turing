@@ -68,6 +68,19 @@ def test_work_batches_are_smallest_ready_and_dependency_first(tmp_path):
     assert all(record["authored_call_count"] == 1 for record in batches)
 
 
+def test_catalogue_revision_check_finds_noncurrent_changed_source(tmp_path):
+    first = tmp_path / "first.py"
+    second = tmp_path / "second.py"
+    first.write_text("def first():\n    return 1\n", encoding="utf-8")
+    second.write_text("def second():\n    return 2\n", encoding="utf-8")
+    state = {"sources": exponential.discover_compiler_work_batches(
+        tmp_path, batch_size=1,
+    )}
+    second.write_text("def second():\n    return 3\n", encoding="utf-8")
+
+    assert exponential._changed_catalogue_source(state) == second.resolve()
+
+
 def test_supervisor_joins_then_restarts_until_a_stable_sweep(
     tmp_path, monkeypatch,
 ):

@@ -446,6 +446,22 @@ def _migrate_legacy_state(
         str(record.get("source") or ""): dict(record)
         for record in state.get("sources") or ()
     }
+
+
+def _changed_catalogue_source(state: dict[str, Any]) -> Path | None:
+    """Return the first deterministically ordered source changed on disk."""
+
+    expected = {}
+    for record in state.get("sources") or ():
+        expected.setdefault(
+            str(record.get("source") or ""),
+            str(record.get("source_sha256") or ""),
+        )
+    for raw_path, expected_digest in sorted(expected.items()):
+        path = Path(raw_path).resolve()
+        if not path.is_file() or _sha256(path) != expected_digest:
+            return path
+    return None
     sources = discover_compiler_work_batches(
         arguments.source_root, batch_size=arguments.jobs,
     )
@@ -498,12 +514,8 @@ def _supervise(arguments: argparse.Namespace) -> int:
             and int(state["generation"]) < int(arguments.max_generations)
             and int(state["sweep"]) < int(arguments.max_sweeps)
         ):
-            sources = state["sources"]
-            cursor = int(state["cursor"])
-            source_record = sources[cursor]
-            source = Path(str(source_record["source"])).resolve()
-            current_source_hash = _sha256(source)
-            if current_source_hash != str(source_record["source_sha256"]):
+            changed_source = _changed_catalogue_source(state)
+            if changed_source is not None:
                 state["sources"] = discover_compiler_work_batches(
                     arguments.source_root, batch_size=arguments.jobs,
                 )
@@ -512,7 +524,7 @@ def _supervise(arguments: argparse.Namespace) -> int:
                 state["sweep_progress"] = True
                 state["catalogue_refresh"] = {
                     "generation": int(state["generation"]),
-                    "changed_source": source.as_posix(),
+                    "changed_source": changed_source.as_posix(),
                     "reason": "authored-source-sha256-changed",
                 }
                 _atomic_json(state_path, state)
@@ -522,6 +534,16 @@ def _supervise(arguments: argparse.Namespace) -> int:
                     "batch_count": len(state["sources"]),
                 }, sort_keys=True), flush=True)
                 continue
+            sources = state["sources"]
+            cursor = int(state["cursor"])
+            source_record = sources[cursor]
+            source = Path(str(source_record["source"])).resolve()
+            current_source_hash = _sha256(source)
+            if current_source_hash != str(source_record["source_sha256"]):
+                raise RuntimeError(
+                    "compiler catalogue changed after its generation-boundary "
+                    f"revision check: {source}"
+                )
             generation = int(state["generation"])
             wave_root = _unused_wave_root(root, generation)
             command = [
