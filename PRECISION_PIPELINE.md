@@ -1,125 +1,203 @@
-# Precision pipeline — state and deferred work
+# The precision pipeline
 
-Rewritten 2026-08-23 after a sweep. Each item says what is true, where, and
-how it was established. Items marked MEASURED were run, not reasoned about —
-several of today's confident diagnoses were wrong and were caught only by
-running them, so the distinction is load-bearing.
+State as of 2026-08-23. Claims marked MEASURED were run; the rest are
+structural facts about the code. The distinction matters here because
+several confident diagnoses during this work were wrong and only running
+them caught it — each of those is recorded below rather than quietly fixed.
 
-## What remains — smaller than it looked
+## What it does
 
-An earlier draft of this file called the limb channel an open design problem
-and the lowering "not yet made". That was wrong, and the evidence against it
-was already on disk.
+Declare a width in ordinary Python and the arithmetic under it becomes
+double-double, compiled, on a real backend:
 
-**The error-free transformations already compile, end to end.** MEASURED:
-`TWO_PRODUCT_SOURCE` — ordinary authored Python — through the canonical
-source compiler to SSA, lowered to Fortran, built by gfortran, returns the
-exact primal AND the exact residual, 0 of 2000 mismatches each, residual
-nonzero on every sample. It used Dekker splitting and no `Fma` at all, and
-`t11 - (t11 - t7)` — the algebraically-foldable half — survived into the
-emitted Fortran untouched.
+```python
+def cancel(a: Precision[2], b: Precision[2], out, n):
+    for i in range(n):
+        out[i] = (a[i] + b[i]) - a[i]
+    return out
+```
 
-So no destination needs to know what a precision operation is, and the limb
-channel needs no invention: the kernel takes one array per limb (`p` and
-`e`), which IS the channel layout materialised. That question was answered
-by writing the function.
+MEASURED, compiled to Fortran and run natively — the same source, one
+annotation apart:
 
-**What is actually left** is to connect `precision_mul` to that already-
-working body — inline it, or emit a call to it. Until then a program that
-declares precision still stops at the backend: Fortran says
-`! UNSUPPORTED precision_mul`, LLVM reports
-`operation has no repository LLVM emission`. Both refuse rather than emit
-something wrong, which is the API behaving correctly; they are simply not
-yet pointed at the body that works.
+| | result |
+|---|---|
+| ordinary | `[0.0, 4.0, 0.0, 0.0]` |
+| `Precision[2]` | `[1.0, 3.7, 1e-16, 5.0]` |
+| exact `b` | `[1.0, 3.7, 1e-16, 5.0]` |
 
-The remaining judgement is inline versus call, which is a cost question
-(call overhead per element against code growth), not a correctness one.
+Ordinary arithmetic loses `b` completely in three of four. That single
+annotation is the whole difference.
 
-## Working, and measured
+## The path a program takes
 
-* **Declarations reach SSA.** `Precision[2]` on a parameter or an annotated
-  assignment produces `precision_mul` / `precision_add` / `precision_sub`.
-* **Indexed operands work.** `a[i] * b[i]` on a declared `a` is recognised.
-  Broken until today, and silently: every array-walking kernel lost its
-  precision and lowered as ordinary arithmetic.
-* **Precision propagates.** `carry_precision_through_ssa` puts the limb
-  count on the value as a last-dimension channel plus an `accounting` fact,
-  then renames consumers. A four-operation chain that kept two keeps four.
-* **Identities fire.** Four of eight: per-limb negation, sub-as-add-of-neg,
-  power-of-two scaling, one renormalisation per chain. MEASURED: a
-  three-addition chain carries one renormalisation instead of three.
-* **`Fma` on four lanes.** MEASURED against an exact rational oracle —
-  C 0/2000, LLVM 0/500, Fortran 0/2000 mismatches. WASM expands to multiply
-  and add, declares no capability, and is refused a section containing an
-  `Fma` before emission.
-* **Ordinary code is unaffected.** MEASURED: no precision operation appears
-  in a program that declares none; LLVM and Fortran emit it cleanly. The C
-  lane refuses loops (`direct scalar C requires one entry block`), a
-  pre-existing structural limit of that backend, not a regression.
+1. **Recognition** — `topological_reducer._operand_precision` reads the
+   declaration off the AST and `_qualified_handler` renames the operation to
+   `precision_mul` and siblings. Declarations come from annotated
+   assignments (`type_annotations`) and from parameters
+   (`function_parameter_annotations`). Indexed operands are read through to
+   the name they index, so `a[i] * b[i]` counts.
 
-## Held back on purpose
+2. **Carrying** — `ir_identities.carry_precision_through_ssa` puts the limb
+   count on the SSA value and renames consumers, to a fixed point. Without
+   this, precision stops at the first undeclared temporary.
 
-**Neither SSA pass is wired into a compilation path.** They go in as one
-transparent swap. Ordering when they do: carry before reduce; the
-specific-name pass after planning.
+3. **Identities** — `reduce_precision_operations` fires four of the eight in
+   `PRECISION_IDENTITIES`: per-limb negation, sub-as-add-of-neg,
+   power-of-two scaling, and one renormalisation per chain. MEASURED: a
+   three-addition chain carries one renormalisation instead of three.
 
-## Corrected today — do not re-derive these
+4. **Section marking** — `mark_precision_sections` stamps every instruction
+   in a section, because the operator is about to be expanded away and the
+   *boundary* has to outlive it.
 
-**The dual is not reliably folded away by optimizers.** Asserted here and in
-several commit messages as established. MEASURED and it is not: gfortran
-returned the exact `two_sum` residual at default, `-O2` and `-ffast-math`
-alike, on inputs that genuinely lose bits. Lowering one SSA value per
-statement through named temporaries appears to be why — no simplifier sees
-the residual as a single expression. The hazard is real in principle (it is
-why `NoContraction`, `precise` and `FP_CONTRACT` exist), but treat a
-destination that inlines harder as untested, not as safe.
+5. **Lowering** — `lower_precision_operations` expands every `precision_*`
+   into ordinary `Mul`/`Add`/`Sub`/`Neg`/`Fma`. Afterwards none remains.
 
-**`Fma` needed no new primitive and no compiler tag.** Two earlier claims,
-both wrong. It is a named intrinsic with IEEE semantics, so nothing folds
-it; Fortran passes while declaring no isolation at all.
+6. **Emission** — an ordinary backend compile.
+
+## The two decisions that mattered
+
+**A precision value is one SSA value per limb, not one value with a limb
+axis.** This was the thing that blocked progress longest, and the answer was
+already on disk: the working `two_product` kernel writes its two limbs to
+two arrays. Per-limb values survive because each limb is then an ordinary
+scalar every backend can already hold, load and store; the channel-shaped
+alternative requires a destination to understand an aggregate before doing
+arithmetic on one, and none do.
+
+**The operator is scaffolding; the section is load-bearing.** `precision_mul`
+exists to be recognised, propagated and reduced against, and is expanded
+before any backend sees it — which is why no backend implements one. But the
+expansion is plain arithmetic indistinguishable from anyone else's, so the
+section attribute carries the boundary in the operator's place. Stamping
+instructions rather than recording a range is what makes it durable: an
+expansion inheriting its source's attributes stays marked, and a pass that
+moves an instruction cannot move it out of its section.
+
+## `Fma` across the backends
+
+`Fma(x, y, z)` is `x * y + z` under exactly one rounding — the operation, not
+a licence to fuse. MEASURED against an exact rational oracle (`Fraction`
+arithmetic, not another float computation that could agree by sharing a
+mistake):
+
+| lane | spelling | result |
+|---|---|---|
+| C | `fma()` (C99) | 0 / 2000 mismatches |
+| LLVM | `@llvm.fma.f64` | 0 / 500 |
+| Fortran | `ieee_fma()` (F2018) | 0 / 2000 |
+| WASM | `mul` + `add` | refused before emission |
+
+`BACKEND_PRECISION_CAPABILITIES` is what keeps that unified front honest:
+**emitting is not meeting.** WebAssembly has no fma instruction, so it
+expands and declares nothing, and a section containing an `Fma` is refused
+there before emission rather than discovered afterwards in a residual that
+came back zero. Ordinary code wanting the accuracy still compiles on all
+four; only code whose correctness depends on the single rounding is turned
+away.
+
+The obligations are deliberately not uniform in kind. `FMA_MANDATORY` and
+`SECTION_ISOLATION` are requirements a destination meets or must refuse;
+`LANE_STAGING` is permission, so a backend ignoring it conforms rather than
+fails.
+
+## Findings that corrected earlier claims
+
+**`Fma` needed no new primitive and no compiler tag.** Recorded twice as
+blocked on a missing primitive. Wrong twice: LLVM's `contract` flag was
+already per-instruction, and adding the intrinsic was a table entry. It
+works because a named intrinsic with IEEE semantics has no algebraic pattern
+to fold — we replaced the fragile thing rather than protecting it.
+
+**Optimizers did not delete the dual.** Asserted repeatedly as established.
+MEASURED and false for this toolchain: gfortran returned the exact `two_sum`
+residual at default, `-O2` and `-ffast-math` alike, on inputs that genuinely
+lose bits, and `t11 - (t11 - t7)` survived into the emitted Fortran intact.
+The likely reason is structural — one SSA value per statement through named
+temporaries means no simplifier sees the residual whole. The hazard is real
+in principle (it is why `NoContraction`, `precise` and `FP_CONTRACT` exist),
+so treat a destination that inlines harder as untested, not safe.
 
 **Parameter annotations were already collected.** `_TypeAnnotator` has no
 `ast.arg` visitor, but `build_from_ast` publishes
 `function_parameter_annotations`. Patching the annotator would have built a
-second path to data that already existed.
+second path to existing data. Measuring before editing caught it.
 
-## Blocked on machinery that does not exist
+**Indexed operands were silently unrecognised.** `a[i] * b[i]` lowered as
+ordinary arithmetic because the check accepted only a bare `ast.Name`. The
+declaration survived on scalars and was lost by every kernel that walks an
+array — which is all of them.
 
-* **`exact_identity_element`** needs use-rewriting — the same machinery
-  `x**1` needs in the `Pow` reduction. Should arrive with it.
-* **`sterbenz_cancellation`** needs a proven range (catalogue section 5's
-  fact slot). Highest-value blocked identity; must never fire on a guess.
-* **`exact_accumulation_over_long_chain`** needs a banked superaccumulator.
-* **The specific-name pass** — `PRECISION_OPERATOR_NAMES` (105 names) has no
-  consumer. Needs operating width from the fused batch and return width from
-  the actual consumer.
+**A "wrong answer" was my own test harness, twice.** Fortran appeared to
+compute zero; I had called the loop-body region with `n` where it expected
+`i`. A plain-multiply control caught it — a multiply cannot be blamed on
+rounding. Later the two_product outputs looked wrong because I passed `p`
+and `e` swapped.
 
-## Known-shallow, by choice
+## Coefficient capture — a standing constraint
 
-* **The width rule is fixed-width, not exact.** "Most limbs decides" gives
-  `p2` for `p2 × p2`; Shewchuk's exact bound is `p8` (`2mn`), and `p4` for a
-  sum (`m + n`). The current rule is the double-double preset; the bit-exact
-  preset needs the other, and only one is implemented.
-* **`r` always equals `p`.** No collapsing variant, since the return width
-  is the consumer's property and no consumer has asked for one.
-* **Fortran claims `FMA_MANDATORY`, not `SECTION_ISOLATION`.** It forbids
-  reassociating a parenthesised expression but cannot withdraw contraction
-  specifically. It passed the measurement anyway — which shows the hazard
-  was not triggered, not that it cannot be.
-* **`Div` untested.** The one closed operation whose expansion is iterative
-  rather than a fixed transformation.
+Coefficients are captured AND used at four limbs; the operating width is
+then the least that meets the target, chosen per core rather than fixed.
 
-## Loose ends
+MEASURED on the `sin` core's nine structured coefficients:
 
-* **`_TypeAnnotator`'s docstring is false.** It claims to be where an `int`
-  parameter's integer-ness comes from; it has no `ast.arg` visitor. It
-  misled me today and will mislead the next reader.
-* **`graph_has_tensor_operation` is dead code** that reads as authoritative
-  (`node_special_cases.py:718`). Nothing calls it. I reasoned from it before
-  checking.
-* **Lane closures exist and nothing produces one for precision.** `Deploy`
-  and `Join` are registered operators and `deployment_ssa_binding` PROVES
-  lane independence before binding. Only `loop_composer` builds a region.
-  Limbs are not independent in general — `two_sum` propagates error between
-  them — but the operations stamped `precision_form` (per-limb negation,
-  power-of-two scaling) are exactly those where they are.
+| capture | worst relative error |
+|---|---|
+| 1 limb (what the kernels marshal today) | 7.837e-17 |
+| 4 limbs | 1.236e-65 |
+
+Against a half-ulp budget of 1.11e-16, single-double capture spends about a
+third of the budget before any arithmetic runs. The compiled core measures
+correctly rounded despite that, not because of it.
+
+Capture width and operating width are separate decisions. Capture is free —
+it happens once at build time from exact rationals, via
+`limb_decomposition(value, 4)` — while operating width is paid per
+operation, so it should be searched upward from the smallest rather than
+chosen comfortably.
+
+**Blocked on an ABI gap.** A `Precision[n]` parameter still arrives as ONE
+scalar, while the lowering represents a precision value as n separate
+scalars. Four-limb coefficients therefore cannot be passed in yet: it needs
+a declared `Precision[n]` parameter to become n formals, which is the same
+decision the lowering already made internally and has not been extended to
+the boundary.
+
+## What remains
+
+- **Neither pass is wired into a compilation path.** They are called
+  explicitly. They go in as one transparent swap; ordering is carry → reduce
+  → mark → lower.
+- **Four identities are unfired.** `exact_identity_element` needs
+  use-rewriting (the machinery `x**1` also wants);
+  `sterbenz_cancellation` needs a proven range (catalogue section 5);
+  `exact_accumulation_over_long_chain` and `two_product_kernel` need the
+  bank.
+- **The width rule is fixed-width, not exact.** "Most limbs decides" gives
+  `p2` for `p2 × p2`; Shewchuk's exact bound is `2mn` for a product and
+  `m + n` for a sum. The current rule is the double-double preset; the
+  bit-exact preset needs the other.
+- **`Div` is untested** — the one closed operation whose expansion is
+  iterative rather than a fixed transformation.
+- **Isolation is blunt away from LLVM.** LLVM withholds `contract` per
+  instruction. C emits `FP_CONTRACT OFF` for the whole translation unit;
+  Fortran has no mechanism and honestly declares none.
+- **A cleaner isolation exists and is unbuilt.** Each region is already
+  minted as its own function on every backend
+  (`..._planned_region_0` is a Fortran `subroutine` and an LLVM `define`),
+  so a function-level attribute would replace per-instruction stamping with
+  one portable marker — provided the region is not per-element, which is
+  unmeasured.
+- **Lane closures exist and nothing produces one for precision.** `Deploy`
+  and `Join` are registered operators and `deployment_ssa_binding` proves
+  lane independence before binding. Limbs are not independent in general —
+  `two_sum` propagates error between them — but per-limb negation and
+  power-of-two scaling are exactly the cases where they are.
+
+## Loose ends worth closing
+
+- `_TypeAnnotator`'s docstring claims to be where an `int` parameter's
+  declared type comes from. It has no `ast.arg` visitor. It misled me.
+- `graph_has_tensor_operation` (`node_special_cases.py:718`) reads as
+  authoritative and is called by nothing. I reasoned from it before checking.
