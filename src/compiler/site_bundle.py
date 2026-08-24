@@ -2309,12 +2309,43 @@ def build_program_bundle(
             program = None
             module = None
             if contract.final_fused_reduction:
-                program = project_public_numerical_program(aot)
-                channel.log("emitting wasm module", path="wasm", entrypoint=contract.entrypoint)
-                module = emit_wasm_module(
-                    program, name=contract.entrypoint, dtype="float64"
-                )
-                channel.log("wasm module emitted", path="wasm", operations=len(required_steps(program)))
+                projected = project_public_numerical_program(aot)
+                # A FUSED PROGRAM IS A SPECIALISATION, not a universal form:
+                # it is sound for contiguous tensor operations and pure
+                # maths, and the projection declines anything else -- a
+                # program whose public outputs span several regions is
+                # handed back as a fallback carrying no feeds and no
+                # outputs at all. Emitting from that produced a module with
+                # an empty ABI, and every page declaring state_feedback was
+                # then refused for naming inputs the empty ABI did not have.
+                # Measured: the columnar multifluid demo resolves all six of
+                # its outputs, across five regions, and published fine once
+                # -- so this was a silent narrowing of what could be
+                # published, not a property of the program.
+                #
+                # So flatten only when flattening produced something, and
+                # otherwise keep the control path, which is what the
+                # projection's own docstring says owns the ABI in that case.
+                if getattr(projected, "outputs", None):
+                    program = projected
+                    channel.log("emitting wasm module", path="wasm", entrypoint=contract.entrypoint)
+                    module = emit_wasm_module(
+                        program, name=contract.entrypoint, dtype="float64"
+                    )
+                    channel.log("wasm module emitted", path="wasm", operations=len(required_steps(program)))
+                elif real_control is not None:
+                    channel.log(
+                        "public outputs span several regions; keeping the "
+                        "control path rather than flattening",
+                        path="wasm",
+                        regions=len(aot.region_programs or {}),
+                    )
+                else:
+                    raise RuntimeError(
+                        "no single region carries this program's public "
+                        "outputs and no control regions were retained, so "
+                        "there is nothing to publish a public ABI from"
+                    )
             elif real_control is None:
                 raise RuntimeError(
                     "final fused reduction is disabled, but compilation "
@@ -2324,6 +2355,31 @@ def build_program_bundle(
                 channel.log(
                     "final fused reduction disabled; retaining control-region Wasm",
                     path="wasm",
+                )
+            if contract.state_feedback and module is None:
+                # No flattened module to interrogate, so the declared ABI is
+                # what the feedback must bind against: every fed name has to
+                # be a parameter the entrypoint takes, and every source has
+                # to be an output it returns. Checking nothing here was the
+                # older behaviour and it let a contract name state the
+                # program does not have, which surfaces much later as a
+                # runtime binding failure with no explanation.
+                missing_inputs = (
+                    set(contract.state_feedback) - set(aot.function_parameters)
+                )
+                missing_outputs = (
+                    set(contract.state_feedback.values())
+                    - set(aot.function_outputs)
+                )
+                if missing_inputs or missing_outputs:
+                    raise ValueError(
+                        "state feedback does not match the Python ABI; "
+                        f"missing inputs={sorted(missing_inputs)!r}; "
+                        f"missing outputs={sorted(missing_outputs)!r}"
+                    )
+                channel.log(
+                    "state feedback checked against the declared ABI",
+                    path="wasm", pairs=len(contract.state_feedback),
                 )
             if contract.state_feedback and module is not None:
                 entry = module.api.entry_points[0]
