@@ -354,6 +354,17 @@ def divide_expansions(left: Sequence, right: Sequence, limbs: int) -> list:
 # carrying limbs on a tensor
 
 
+
+def _flatten(nested):
+    """Every leaf of a nested list, in order."""
+
+    if isinstance(nested, list):
+        for item in nested:
+            yield from _flatten(item)
+    else:
+        yield nested
+
+
 def limbs_of(value: Any, width: int, like: Any) -> list:
     """An operand as ``width`` ordinary tensors, one per limb.
 
@@ -603,6 +614,65 @@ class Precision:
 
         return self.collapse()
 
+    # -- layout: a boundary fact, declared per destination ---------------
+    #
+    # There is no universally best arrangement of limbs in a buffer, and
+    # the measurements say so plainly. A compiled per-element kernel wants
+    # ELEMENT-MAJOR ("interleaved"): element i's limbs land on one cache
+    # line, and on the CPU lanes that measured 1.2x to 1.7x faster than
+    # the alternative. A GPU wants LIMB-MAJOR ("blocked"): adjacent
+    # invocations then read adjacent addresses instead of addresses a
+    # stride apart, which is what coalescing rewards. The eager surface
+    # wants neither, because it holds its limbs planar and never packs
+    # them at all.
+    #
+    # So the layout is not a property of the value. It is a property of
+    # the DESTINATION, chosen where the value crosses into one, and the
+    # only thing this type owes is an exact conversion in both directions.
+
+    def interleaved(self):
+        """Element-major: element i, limb k at flat index ``i * limbs + k``.
+
+        What every compiled kernel in this tree addresses today, and what
+        the artifacts and feeds already on disk contain.
+        """
+
+        return interleave(list(self._terms))
+
+    def blocked(self):
+        """Limb-major: element i, limb k at flat index ``k * count + i``.
+
+        Each limb contiguous. Offered because a dispatch-parallel
+        destination reads it better, not because anything here prefers it.
+        """
+
+        from .abstraction import AbstractTensor
+
+        return AbstractTensor.concat(
+            [term.reshape(-1) for term in self._terms], dim=0,
+        )
+
+    @classmethod
+    def from_interleaved(cls, value, limbs: int) -> "Precision":
+        """Adopt an element-major buffer without copying its meaning."""
+
+        return cls(value, int(limbs))
+
+    @classmethod
+    def from_blocked(cls, value, limbs: int) -> "Precision":
+        """Adopt a limb-major buffer, splitting it back into terms."""
+
+        from .abstraction import AbstractTensor
+
+        flat = AbstractTensor.get_tensor(value).reshape(-1)
+        width = max(int(limbs), 1)
+        count = int(flat.shape[0]) // width
+        return cls(
+            [flat[position * count:(position + 1) * count]
+             for position in range(width)],
+            width,
+        )
+
     @property
     def _value(self):
         """The interleaved payload, built on demand.
@@ -851,6 +921,79 @@ class Precision:
             if remaining:
                 base = base * base
         return result
+
+    # -- transcendentals: the cores, at this width -----------------------
+    #
+    # These are not arithmetic and cannot be built from it, so they are
+    # not implemented here: they are ROUTED to the materialised proof
+    # cores, which are the same programs the compiler lowers and which
+    # measure their own error against an exact oracle. The width travels
+    # with the argument, so a wide value gets a wide Horner chain rather
+    # than a double's worth of answer widened afterwards.
+    #
+    # A core is valid on ITS OWN INTERVAL and carries no range reduction,
+    # so an argument outside that interval is refused by name rather than
+    # pushed through a polynomial that approximates nothing there. That is
+    # the same rule the compiled kernels follow -- their router falls back
+    # to the eager surface beyond the radius -- and it is deliberate: a
+    # silently extrapolated core returns a plausible number, which is the
+    # one outcome this type exists to prevent. Reduction belongs to the
+    # caller, or to the signal surface that owns turns and binades.
+
+    def _core(self, name: str) -> "Precision":
+        from .signal_symbolic import CORE_RADII, evaluate_proof
+
+        radius = CORE_RADII.get(name)
+        if radius is None:
+            raise AttributeError(
+                f"no proof core is registered for {name!r}"
+            )
+        magnitude = abs(self).collapse()
+        try:
+            worst = max(
+                abs(float(each))
+                for each in _flatten(magnitude.tolist())
+            )
+        except (TypeError, ValueError):
+            worst = float("inf")
+        if worst > float(radius):
+            raise ValueError(
+                f"{name}: argument reaches {worst!r}, outside the core's "
+                f"proven interval +-{radius}. Reduce the range first -- a "
+                "core evaluated beyond its interval approximates nothing "
+                "and would return a plausible wrong answer at every limb"
+            )
+        return evaluate_proof(name, self, self.limbs)
+
+    def sin(self) -> "Precision":
+        return self._core("sin")
+
+    def cos(self) -> "Precision":
+        return self._core("cos")
+
+    def tan(self) -> "Precision":
+        return self._core("tan")
+
+    def exp(self) -> "Precision":
+        return self._core("exp")
+
+    def expm1(self) -> "Precision":
+        return self._core("expm1")
+
+    def log1p(self) -> "Precision":
+        return self._core("log1p")
+
+    def sinh(self) -> "Precision":
+        return self._core("sinh")
+
+    def cosh(self) -> "Precision":
+        return self._core("cosh")
+
+    def tanh(self) -> "Precision":
+        return self._core("tanh")
+
+    def atan(self) -> "Precision":
+        return self._core("atan")
 
     def sum(self) -> "Precision":
         """Add every element WITHOUT collapsing on the way.

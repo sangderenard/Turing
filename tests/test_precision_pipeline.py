@@ -97,10 +97,15 @@ def test_live_precision_wrapper_keeps_width_until_explicit_collapse():
     # divides by the element count -- so the contract this pins is the
     # ANSWER rather than the refusal.
     assert wide.mean().collapse().tolist() == [9.0]
-    # What must still refuse is anything that would have to answer from
-    # the leading limb alone.
-    with pytest.raises((AttributeError, TypeError, NotImplementedError)):
+    # ``exp`` is routed to its proof core now, so what it refuses here is
+    # the INTERVAL: eight and ten are far outside the band the core was
+    # fitted on, and extrapolating it would return a plausible number at
+    # every limb. Anything with no wide meaning at all still refuses on
+    # the attribute.
+    with pytest.raises(ValueError, match="outside the core"):
         wide.exp()
+    with pytest.raises((AttributeError, TypeError, NotImplementedError)):
+        wide.erf()
 
 
 def test_shader_capability_selection_does_not_claim_abstract_precision_ops():

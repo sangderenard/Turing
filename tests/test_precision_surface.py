@@ -105,10 +105,39 @@ def test_sqrt_converges_to_the_exact_root():
     assert abs(root[0] * root[0] - 2) < Fraction(1, 10 ** 40)
 
 
-def test_transcendentals_refuse_rather_than_collapse():
-    """A wide value must never be answered from its leading limb alone."""
+def test_transcendentals_are_evaluated_at_the_value_s_own_width():
+    """Routed to the cores, which hold the width rather than collapsing it."""
 
-    for name in ("exp", "sin", "log", "tanh"):
+    from src.common.tensors import signal_symbolic as proof
+
+    arguments = [0.1, -0.3, 0.5]
+    errors = {}
+    for width in (2, 3):
+        produced = Precision.of(
+            AbstractTensor.get_tensor(np.asarray(arguments)), width
+        ).sin()
+        assert isinstance(produced, Precision)
+        assert produced.limbs == width
+        truth = proof.exact_evaluator("sin", proof.CORE_RADII["sin"], 70)
+        errors[width] = max(
+            abs(got - truth(value))
+            for got, value in zip(exact(produced), arguments)
+        )
+    # Each limb has to buy precision, or the routing collapsed somewhere.
+    assert errors[3] < errors[2]
+    assert errors[2] < Fraction(1, 10 ** 30)
+
+
+def test_a_core_refuses_outside_the_interval_it_was_proven_on():
+    """Extrapolating a core returns a plausible number, so it must not."""
+
+    beyond = Precision.of(AbstractTensor.get_tensor(np.asarray([2.0])), 2)
+    with pytest.raises(ValueError, match="outside the core"):
+        beyond.sin()
+
+
+def test_operations_with_no_wide_meaning_still_refuse():
+    for name in ("erf", "gamma", "arcsinh"):
         with pytest.raises((AttributeError, TypeError, NotImplementedError)):
             getattr(wide(), name)()
 
