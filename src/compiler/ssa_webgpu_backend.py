@@ -943,6 +943,19 @@ def emit_module(
             "stage": COMPUTE.name,
             "io_layout": io_layout.to_mapping(),
             "feed_bindings": [item.to_mapping() for item in feed_bindings],
+            # When the feeds are packed, the binding can no longer name the
+            # value it carries -- there is one binding for all of them -- so
+            # the ORDER is stated here instead. Without it a host has to
+            # guess the layout from a pre-emission module, and this lane
+            # rebuilds the module through apply_backend_identities before
+            # emitting, so the guess can be wrong: every constant lands in
+            # the wrong slot, the arithmetic overflows, and the field comes
+            # back entirely NaN with no error anywhere. The layout is part
+            # of the ABI and belongs in it.
+            "feed_span": (
+                [int(value.id) for value in function.args]
+                if packed_feeds else None
+            ),
             "outputs": [item.to_mapping() for item in output_bindings],
             "component_abi": component_abi.to_mapping(),
         },

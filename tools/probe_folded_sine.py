@@ -45,7 +45,8 @@ class _IndexX(ast.NodeTransformer):
         return node
 
 
-def build(width: int, digits: int, backend: str = "c"):
+def build(width: int, digits: int, backend: str = "c",
+          element: str | None = None):
     sine = list(core_terms("sin", digits))
     cosine = list(core_terms("cos", digits))
     terms = max(len(sine), len(cosine))
@@ -61,6 +62,13 @@ def build(width: int, digits: int, backend: str = "c"):
         sympy.symbols(f"c0:{terms}"), sympy.symbols(f"d0:{terms}"),
     )
     expression, constants = symbolise_numbers(expression)
+
+    from src.compiler.ir_identities import (
+        narrow_float64_to_float32, two_product_flavor_scope,
+    )
+    # A float32 ladder has no fma to spell, so it lowers under the split
+    # flavour -- the same pairing the GPU lanes use.
+    flavour = two_product_flavor_scope("split" if element else "fma")
 
     compiled = compile_sympy_equations(
         [sympy.Eq(sympy.Symbol("y"), expression)], name="probe",
@@ -93,10 +101,17 @@ def build(width: int, digits: int, backend: str = "c"):
         body=body, orelse=[],
     )
     ordered = (*parameters, "n", "y")
+    def _slice():
+        if element is None:
+            return ast.Constant(value=width)
+        return ast.Tuple(
+            elts=[ast.Constant(value=width),
+                  ast.Name(id=element, ctx=ast.Load())], ctx=ast.Load())
+
     annotate = (
         (lambda: ast.Subscript(
             value=ast.Name(id="Precision", ctx=ast.Load()),
-            slice=ast.Constant(value=width), ctx=ast.Load(),
+            slice=_slice(), ctx=ast.Load(),
         ))
         if width > 1 else (lambda: None)
     )
@@ -117,10 +132,13 @@ def build(width: int, digits: int, backend: str = "c"):
         ast.Module(body=[function], type_ignores=[])
     ))
 
-    module, _outputs, _exports = lower_ast_source_to_ssa(
-        source, "probe", name=f"p{width}",
-    )
-    entry = f"p{width}__probe"
+    with flavour:
+        module, _outputs, _exports = lower_ast_source_to_ssa(
+            source, "probe", name=f"p{width}{element or ''}",
+        )
+    if element:
+        narrow_float64_to_float32(module)
+    entry = f"p{width}{element or ''}__probe"
     native = deploy(
         backend, module, entry, Path(f"build/probe_folded/{backend}_w{width}"),
     )
@@ -128,8 +146,10 @@ def build(width: int, digits: int, backend: str = "c"):
     return native, ids, sine, cosine, constants, terms
 
 
-def score(width: int, digits: int, backend: str = "c", quiet: bool = True):
-    native, ids, sine, cosine, constants, terms = build(width, digits, backend)
+def score(width: int, digits: int, backend: str = "c", quiet: bool = True,
+          element: str | None = None):
+    native, ids, sine, cosine, constants, terms = build(
+        width, digits, backend, element)
 
     quarter_exact = constant_rational("tau", digits) / 4
     turn = float(quarter_exact)
@@ -142,7 +162,8 @@ def score(width: int, digits: int, backend: str = "c", quiet: bool = True):
 
     def wide(value):
         return tuple(
-            float(part) for part in limb_decomposition(value, width)
+            float(part) for part in
+            limb_decomposition(value, width, element=element)
         )
 
     scalars = {

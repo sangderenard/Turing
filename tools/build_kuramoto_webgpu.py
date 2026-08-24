@@ -170,7 +170,14 @@ def feed_plan(function, entry: str, width: int, sine, cosine, constants,
                 ids.setdefault(f"{name}__limb{position}", int(limb))
 
     def limbs_of(value):
-        return [float(part) for part in limb_decomposition(value, width)]
+        # The element MUST be stated. Splitting for float64 limbs and then
+        # consuming the parts as float32 makes the head unrepresentable and
+        # the tail meaningless: the correction belongs to bits the f32 head
+        # does not have.
+        return [
+            float(part)
+            for part in limb_decomposition(value, width, element="float32")
+        ]
 
     scalars = {
         "coupling": limbs_of(Fraction(coupling).limit_denominator(10**9)),
@@ -219,15 +226,17 @@ def feed_plan(function, entry: str, width: int, sine, cosine, constants,
 # values that the compiled kernel produced.
 
 GATHER_WGSL = """
-// Offsets into the one feed span, so this writes exactly where the
-// compiled kernel will read. `limb` strides a field's limbs, which sit
-// in consecutive slots.
-struct Shape {
-  wide: u32, high: u32, count: u32, limbs: u32,
-  theta: u32, up: u32, down: u32, left: u32, right: u32, pad: u32,
-};
+// Offsets into the one feed span, supplied explicitly. A field's limbs
+// are NOT consecutive -- the emitter lays out limb 0 of every formal
+// before limb 1 of any of them -- so striding by the limb index walks
+// into a NEIGHBOUR's slot and then into the coefficients. Measured, that
+// overwrote the series with phase data every frame and the field came
+// back entirely NaN.
+struct Shape { wide: u32, high: u32, count: u32, limbs: u32 };
 @group(0) @binding(0) var<uniform> shape: Shape;
 @group(0) @binding(1) var<storage, read_write> feeds: array<f32>;
+// [theta..., up..., down..., left..., right...], `limbs` entries each.
+@group(0) @binding(2) var<storage, read> offsets: array<u32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -235,33 +244,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (i >= shape.count) { return; }
   let row = i / shape.wide;
   let col = i % shape.wide;
-  let up_row = (row + shape.high - 1u) % shape.high;
-  let down_row = (row + 1u) % shape.high;
-  let left_col = (col + shape.wide - 1u) % shape.wide;
-  let right_col = (col + 1u) % shape.wide;
-  let up_i = up_row * shape.wide + col;
-  let down_i = down_row * shape.wide + col;
-  let left_i = row * shape.wide + left_col;
-  let right_i = row * shape.wide + right_col;
+  let up_i = ((row + shape.high - 1u) % shape.high) * shape.wide + col;
+  let down_i = ((row + 1u) % shape.high) * shape.wide + col;
+  let left_i = row * shape.wide + (col + shape.wide - 1u) % shape.wide;
+  let right_i = row * shape.wide + (col + 1u) % shape.wide;
   // Every limb moves together: a gather is data movement and cannot
   // round, so the expansion crosses it intact.
   for (var k: u32 = 0u; k < shape.limbs; k = k + 1u) {
-    let src = shape.theta + k * shape.count;
-    feeds[shape.up + k * shape.count + i] = feeds[src + up_i];
-    feeds[shape.down + k * shape.count + i] = feeds[src + down_i];
-    feeds[shape.left + k * shape.count + i] = feeds[src + left_i];
-    feeds[shape.right + k * shape.count + i] = feeds[src + right_i];
+    let src = offsets[k];
+    feeds[offsets[shape.limbs + k] + i] = feeds[src + up_i];
+    feeds[offsets[2u * shape.limbs + k] + i] = feeds[src + down_i];
+    feeds[offsets[3u * shape.limbs + k] + i] = feeds[src + left_i];
+    feeds[offsets[4u * shape.limbs + k] + i] = feeds[src + right_i];
   }
 }
 """
 
 PRESENT_WGSL = """
-struct Shape {
-  wide: u32, high: u32, count: u32, limbs: u32,
-  theta: u32, up: u32, down: u32, left: u32, right: u32, pad: u32,
-};
+struct Shape { wide: u32, high: u32, count: u32, limbs: u32 };
 @group(0) @binding(0) var<uniform> shape: Shape;
 @group(0) @binding(1) var<storage, read> feeds: array<f32>;
+@group(0) @binding(2) var<storage, read> offsets: array<u32>;
 
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
@@ -291,7 +294,7 @@ fn fs(in: VertexOut) -> @location(0) vec4<f32> {
   // is the one place rounding the expansion costs nothing.
   var phase = 0.0;
   for (var k: u32 = 0u; k < shape.limbs; k = k + 1u) {
-    phase = phase + feeds[shape.theta + k * shape.count + y * shape.wide + x];
+    phase = phase + feeds[offsets[k] + y * shape.wide + x];
   }
   let tau = 6.283185307179586;
   let turn = phase / tau - floor(phase / tau);
@@ -305,11 +308,11 @@ fn fs(in: VertexOut) -> @location(0) vec4<f32> {
 
 def page(kernel_wgsl: str, plan: dict, width: int, height: int,
          limbs: int, digits: int, terms: int, seed: int,
-         spread: float) -> str:
+         spread: float, published: int) -> str:
     manifest = {
         "wide": width, "high": height, "limbs": limbs, "digits": digits,
         "terms": terms, "seed": seed, "spread": spread,
-        "slots": plan["slots"],
+        "slots": plan["slots"], "published": published,
     }
     return _PAGE.replace("__MANIFEST__", json.dumps(manifest)) \
                 .replace("__KERNEL_WGSL__", json.dumps(kernel_wgsl)) \
@@ -456,16 +459,29 @@ async function main() {
   // The kernel publishes its two limbs to two output buffers; they are
   // copied back into theta's slots between steps, which is also the
   // ping-pong that stops a cell reading a neighbour it just overwrote.
+  // ONE buffer per value the shader actually publishes. Binding more
+  // than the layout declares is rejected outright, and the compute pass
+  // is then dropped every frame while the step counter still advances --
+  // which reads exactly like a field that refuses to organise.
   const outputs = [];
-  for (let limb = 0; limb < limbs; limb++) outputs.push(storage(count * 4));
+  for (let i = 0; i < MANIFEST.published; i++) outputs.push(storage(count * 4));
 
   const shape = device.createBuffer({
-    size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  device.queue.writeBuffer(shape, 0, new Uint32Array([
-    wide, high, count, limbs,
-    thetaSlots[0], neighbourSlots.up[0], neighbourSlots.down[0],
-    neighbourSlots.left[0], neighbourSlots.right[0], 0,
-  ]));
+    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(shape, 0,
+    new Uint32Array([wide, high, count, limbs]));
+
+  // The real slot of every limb of every field, in the order the shaders
+  // index it. Nothing here assumes a field's limbs are adjacent.
+  const order = [];
+  for (const name of ["theta", "up", "down", "left", "right"]) {
+    const row = name === "theta" ? thetaSlots : neighbourSlots[name];
+    for (let limb = 0; limb < limbs; limb++) order.push(row[limb]);
+  }
+  const offsets = device.createBuffer({
+    size: Math.max(order.length * 4, 16),
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(offsets, 0, new Uint32Array(order));
 
   status.textContent = "compiling shaders…";
   const kernelModule = device.createShaderModule({ code: KERNEL_WGSL });
@@ -495,6 +511,37 @@ async function main() {
   outputs.forEach((buffer, index) =>
     kernelEntries.push({ binding: 1 + index, resource: { buffer } }));
 
+  // A readback hook, so the field can be SCORED rather than watched:
+  // it collapses theta's limbs on the host and reports the same local
+  // coherence the CPU demos print, which is what makes "the GPU agrees"
+  // a measurement instead of an impression.
+  const readback = device.createBuffer({
+    size: count * 4,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  window.__field = async () => {
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(
+      feeds, thetaSlots[0] * 4, readback, 0, count * 4);
+    device.queue.submit([encoder.finish()]);
+    await readback.mapAsync(GPUMapMode.READ);
+    const values = new Float32Array(readback.getMappedRange()).slice();
+    readback.unmap();
+    const at = (r, c) => values[((r + high) % high) * wide + ((c + wide) % wide)];
+    let total = 0;
+    for (let r = 0; r < high; r++) for (let c = 0; c < wide; c++) {
+      const p = at(r, c);
+      total += Math.cos(at(r - 1, c) - p) + Math.cos(at(r + 1, c) - p)
+             + Math.cos(at(r, c - 1) - p) + Math.cos(at(r, c + 1) - p);
+    }
+    let finite = 0, nan = 0, lo = Infinity, hi = -Infinity;
+    for (const v of values) {
+      if (Number.isFinite(v)) { finite++; if (v < lo) lo = v; if (v > hi) hi = v; }
+      else nan++;
+    }
+    return { step, coherence: total / (4 * count),
+             finite, nan, lo, hi, first: Array.from(values.slice(0, 6)) };
+  };
+
   let step = 0;
   let last = performance.now();
   let frames = 0;
@@ -510,6 +557,7 @@ async function main() {
       entries: [
         { binding: 0, resource: { buffer: shape } },
         { binding: 1, resource: { buffer: feeds } },
+        { binding: 2, resource: { buffer: offsets } },
       ],
     }));
     gather.dispatchWorkgroups(Math.ceil(count / 64));
@@ -526,7 +574,7 @@ async function main() {
     advance.end();
 
     // 3. the advanced phase becomes the field, limb by limb
-    for (let limb = 0; limb < limbs; limb++) {
+    for (let limb = 0; limb < outputs.length; limb++) {
       encoder.copyBufferToBuffer(
         outputs[limb], 0, feeds, thetaSlots[limb] * 4, count * 4);
     }
@@ -545,6 +593,7 @@ async function main() {
       entries: [
         { binding: 0, resource: { buffer: shape } },
         { binding: 1, resource: { buffer: feeds } },
+        { binding: 2, resource: { buffer: offsets } },
       ],
     }));
     paint.draw(6);
@@ -565,9 +614,19 @@ async function main() {
         `${MANIFEST.limbs} f32 limbs, ${MANIFEST.terms} terms`;
       last = now; frames = 0;
     }
-    requestAnimationFrame(frame);
+    schedule();
   }
-  requestAnimationFrame(frame);
+  // rAF is SUSPENDED in a hidden tab, so a page driven only by it never
+  // starts when nothing is looking at it -- the field would sit forever
+  // showing whatever the last status write said. setTimeout keeps running
+  // either way, so visibility decides the pacing and never the progress.
+  window.__paused = false;
+  function schedule() {
+    if (window.__paused) { setTimeout(schedule, 50); return; }
+    if (document.hidden) setTimeout(frame, 16);
+    else requestAnimationFrame(frame);
+  }
+  schedule();
 }
 
 main().catch((error) => fail(String(error && error.message || error)));
@@ -623,7 +682,7 @@ def main(argv=None) -> int:
         emitted.source, encoding="utf-8", newline="\n")
     html = page(emitted.source, plan, width, height, limbs,
                 int(arguments.digits), terms, int(arguments.seed),
-                float(arguments.spread))
+                float(arguments.spread), len(_returned_values(flat[entry])))
     path = destination / "index.html"
     path.write_text(html, encoding="utf-8", newline="\n")
 
