@@ -100,11 +100,24 @@ MODES = ("direct", "implied")
 DEFAULT_FAMILY = "exact"
 DEFAULT_MODE = "direct"
 
-TAU = 2.0 * math.pi
+#: The turn, the natural logarithm of two, and of ten -- DERIVED, never
+#: borrowed. ``math.log`` is the platform's libm, which is the one thing
+#: this stack exists to replace; taking a core constant from it means the
+#: replacement rests on the thing replaced. Each of these is now the
+#: correctly rounded double of an exactly derived rational, and the same
+#: derivation serves a wide caller at any width through
+#: ``signal_symbolic.constant_limbs``.
+def _derived(name: str) -> float:
+    from .signal_symbolic import constant_rational
+
+    return float(constant_rational(name, 40))
+
+
+TAU = _derived("tau")
 HALF_PI = 0.5 * math.pi
 QUARTER_PI = 0.25 * math.pi
-LN2 = math.log(2.0)
-LN10 = math.log(10.0)
+LN2 = _derived("ln2")
+LN10 = _derived("ln10")
 
 #: The smallest set that implies the whole surface, used by ``implied`` mode.
 PRIMITIVES = ("sin", "cos", "atan", "exp", "log", "sqrt")

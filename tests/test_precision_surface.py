@@ -160,3 +160,34 @@ def test_eager_core_evaluates_wide_and_beats_the_double_path():
     narrow_error = abs(Fraction(narrow) - truth)
     assert wide_error < narrow_error
     assert wide_error < Fraction(1, 10 ** 30)
+
+
+@pytest.mark.parametrize("name", ("tau", "pi", "e", "ln2", "ln10"))
+@pytest.mark.parametrize("width", (1, 2, 4, 8))
+def test_constants_are_derived_correctly_at_any_width(name, width):
+    """Every constant, derived not borrowed, to whatever width is asked.
+
+    A constant taken from libm is the one thing this stack exists to
+    replace, and a constant that stops converging is worse than one that
+    refuses -- it silently caps the precision of everything downstream.
+    ``ln10`` did exactly that: its derivation added a term belonging to a
+    different identity and returned ln(10) + 2*ln(2), which nothing
+    noticed while nothing consumed it.
+    """
+
+    import mpmath
+
+    from src.common.tensors.signal_symbolic import constant_limbs
+
+    parts = constant_limbs(name, width)
+    assert len(parts) == width
+    total = sum((Fraction(part) for part in parts), Fraction())
+    with mpmath.workdps(40 + 20 * width):
+        truth = {
+            "tau": 2 * mpmath.pi, "pi": mpmath.pi, "e": mpmath.e,
+            "ln2": mpmath.log(2), "ln10": mpmath.log(10),
+        }[name]
+        error = abs(mpmath.mpf(total.numerator) / total.denominator - truth)
+        # Each limb has to buy roughly fifteen digits, or the derivation
+        # has stopped converging and the width is decorative.
+        assert error < mpmath.mpf(10) ** (-14 * width)
