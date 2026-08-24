@@ -480,22 +480,13 @@ async function main() {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) fail("no WebGPU adapter");
 
-  // The emitted ABI binds one storage buffer per formal, and a wide
-  // kernel has many, so the device is asked for what the adapter can
-  // actually give rather than the conservative default.
-  const wanted = {};
-  for (const key of ["maxStorageBuffersPerShaderStage",
-                     "maxBindGroupsPlusVertexBuffers",
-                     "maxBufferSize", "maxStorageBufferBindingSize"]) {
-    if (adapter.limits[key] !== undefined) wanted[key] = adapter.limits[key];
-  }
-  const device = await adapter.requestDevice({ requiredLimits: wanted });
-  // HOLD THE ADAPTER. The render loop never mentions it, so once main's
-  // closure is done with it the adapter becomes collectable -- and when
-  // it goes, Dawn releases the instance behind it and every buffer on
-  // this device starts answering "a valid external Instance reference no
-  // longer exists". The symptom is a page that runs for a while and then
-  // quietly stops computing while its step counter keeps climbing.
+  // Ask for NOTHING beyond the defaults. Requesting every limit the
+  // adapter reports was needed when the ABI bound one storage buffer per
+  // formal and this kernel wanted sixty-nine of them. The feeds are one
+  // packed span now, so five bindings is the whole requirement -- well
+  // inside what WebGPU guarantees -- and a maximal request is just
+  // pressure on a device several pages may be sharing.
+  const device = await adapter.requestDevice();
   window.__gpu = { adapter, device };
   device.addEventListener?.("uncapturederror", (e) =>
     fail("WebGPU error: " + e.error.message));
@@ -633,45 +624,53 @@ async function main() {
   // it collapses theta's limbs on the host and reports the same local
   // coherence the CPU demos print, which is what makes "the GPU agrees"
   // a measurement instead of an impression.
-  const readback = device.createBuffer({
-    size: count * 4,
-    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-  window.__field = async () => {
+  // A fresh staging buffer per call, mapped once and destroyed. Sharing
+  // one buffer across overlapping calls is what broke this: the status
+  // line asks every half second, a call takes longer than that, and the
+  // second map lands on a buffer the first still holds. The probe was
+  // reporting a fault in itself as a fault in the field.
+  let probing = false;
+  async function readField(slot) {
+    const staging = device.createBuffer({
+      size: count * 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const encoder = device.createCommandEncoder();
-    encoder.copyBufferToBuffer(
-      feeds, stateSlots[MANIFEST.gatherFrom][0] * 4, readback, 0, count * 4);
+    encoder.copyBufferToBuffer(feeds, slot * 4, staging, 0, count * 4);
     device.queue.submit([encoder.finish()]);
-    await readback.mapAsync(GPUMapMode.READ);
-    const values = new Float32Array(readback.getMappedRange()).slice();
-    readback.unmap();
-    const at = (r, c) => values[((r + high) % high) * wide + ((c + wide) % wide)];
-    let total = 0;
-    for (let r = 0; r < high; r++) for (let c = 0; c < wide; c++) {
-      const p = at(r, c);
-      total += Math.cos(at(r - 1, c) - p) + Math.cos(at(r + 1, c) - p)
-             + Math.cos(at(r, c - 1) - p) + Math.cos(at(r, c + 1) - p);
+    await staging.mapAsync(GPUMapMode.READ);
+    const values = new Float32Array(staging.getMappedRange()).slice();
+    staging.unmap();
+    staging.destroy();
+    return values;
+  }
+
+  window.__field = async () => {
+    if (probing) return null;
+    probing = true;
+    try {
+      const slots = stateSlots[MANIFEST.gatherFrom];
+      const values = await readField(slots[0]);
+      const low = limbs > 1 ? await readField(slots[1]) : new Float32Array(count);
+
+      const at = (r, c) =>
+        values[((r + high) % high) * wide + ((c + wide) % wide)];
+      let total = 0, finite = 0, nan = 0, lo = Infinity, hi = -Infinity;
+      for (let r = 0; r < high; r++) for (let c = 0; c < wide; c++) {
+        const v = at(r, c);
+        total += Math.cos(at(r - 1, c) - v) + Math.cos(at(r + 1, c) - v)
+               + Math.cos(at(r, c - 1) - v) + Math.cos(at(r, c + 1) - v);
+      }
+      for (const v of values) {
+        if (Number.isFinite(v)) { finite++; if (v < lo) lo = v; if (v > hi) hi = v; }
+        else nan++;
+      }
+      let lowNonzero = 0;
+      for (const v of low) if (v !== 0) lowNonzero++;
+      return { step, coherence: total / (4 * count), finite, nan, lo, hi,
+               lowNonzero };
+    } finally {
+      probing = false;
     }
-    let finite = 0, nan = 0, lo = Infinity, hi = -Infinity;
-    for (const v of values) {
-      if (Number.isFinite(v)) { finite++; if (v < lo) lo = v; if (v > hi) hi = v; }
-      else nan++;
-    }
-    // Read the LOW limb too: if it is identically zero the ladder is
-    // decorative, and the whole point is that it is not.
-    const lowEnc = device.createCommandEncoder();
-    lowEnc.copyBufferToBuffer(
-      feeds, stateSlots[MANIFEST.gatherFrom][1] * 4, readback, 0, count * 4);
-    device.queue.submit([lowEnc.finish()]);
-    await readback.mapAsync(GPUMapMode.READ);
-    const low = new Float32Array(readback.getMappedRange()).slice();
-    readback.unmap();
-    let lowNonzero = 0, lowMax = 0;
-    for (const v of low) {
-      if (v !== 0) lowNonzero++;
-      if (Math.abs(v) > lowMax) lowMax = Math.abs(v);
-    }
-    return { step, coherence: total / (4 * count), lowNonzero, lowMax,
-             finite, nan, lo, hi, first: Array.from(values.slice(0, 6)) };
   };
 
   let step = 0;
@@ -753,6 +752,7 @@ async function main() {
       // page that reports progress while its numbers are NaN is how two
       // separate failures here looked exactly like success.
       window.__field().then((f) => {
+        if (!f) return;
         health.textContent = f.nan
           ? `field: ${f.nan} of ${count} cells are NaN`
           : `field: [${f.lo.toFixed(2)}, ${f.hi.toFixed(2)}] · ` +
