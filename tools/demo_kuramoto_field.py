@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from dataclasses import dataclass
 from fractions import Fraction
 import math
 from pathlib import Path
@@ -204,27 +205,90 @@ def symbolise_numbers(expression, prefix: str = "k"):
     return convert(expression), values
 
 
-def kuramoto_equation(terms: int):
-    """The whole advance, as one SymPy equation, and its free symbols."""
+#: Which cell each neighbour symbol reads, as (row, column) steps on the
+#: torus. The gather is generated from this, so a program that wants a
+#: wider neighbourhood states it here rather than editing a shader.
+KURAMOTO_STENCIL = {
+    "up": (-1, 0), "down": (1, 0), "left": (0, -1), "right": (0, 1),
+}
+
+
+@dataclass(frozen=True)
+class FieldProgram:
+    """One lattice program: its mathematics, and what it needs from memory.
+
+    Everything downstream -- materialisation, lowering, narrowing, WGSL
+    emission, feed packing, the host -- consumes only this. Swapping the
+    physics means writing another builder that returns one of these; it
+    does not mean touching the compiler or the page.
+    """
+
+    name: str
+    equation: object
+    constants: dict
+    #: Per-cell values held in memory between steps.
+    state: tuple
+    #: The state field the equation advances.
+    advances: str
+    #: Neighbour symbol -> (row, column) offset.
+    stencil: dict
+    #: Runtime scalars beyond the series and the derived constants.
+    scalars: tuple
+
+
+def kuramoto_program(terms: int, lag: bool = False) -> FieldProgram:
+    """Kuramoto on a torus, optionally with a Sakaguchi phase lag.
+
+    The lag is ONE TERM -- ``sin(difference - alpha)`` instead of
+    ``sin(difference)`` -- and it changes the character of the field
+    rather than its scale: at zero lag the neighbours pull straight
+    toward agreement and the lattice locks into domains, while a nonzero
+    lag makes the pull asymmetric, so a defect no longer sits still and
+    the field carries spiral waves and can hold locked and drifting
+    regions at once.
+
+    That it is one term here, and nothing anywhere else, is the point of
+    the FieldProgram seam.
+    """
 
     theta, omega = sympy.symbols("theta omega")
     coupling, dt = sympy.symbols("coupling dt")
     quarter, neg_quarter, inv_quarter = sympy.symbols(
         "quarter neg_quarter inv_quarter"
     )
+    alpha = sympy.Symbol("alpha")
     sine = sympy.symbols(f"c0:{terms}")
     cosine = sympy.symbols(f"d0:{terms}")
 
+    def difference(name: str):
+        gap = sympy.Symbol(name) - theta
+        return gap - alpha if lag else gap
+
     pull = sum(
         folded_sine(
-            sympy.Symbol(name) - theta, quarter, neg_quarter, inv_quarter,
+            difference(name), quarter, neg_quarter, inv_quarter,
             sine, cosine,
         )
-        for name in NEIGHBOURS
+        for name in KURAMOTO_STENCIL
     )
     advanced = theta + dt * (omega + coupling * pull)
     advanced, constants = symbolise_numbers(advanced)
-    return sympy.Eq(sympy.Symbol("advanced"), advanced), constants
+    return FieldProgram(
+        name="sakaguchi" if lag else "kuramoto",
+        equation=sympy.Eq(sympy.Symbol("advanced"), advanced),
+        constants=constants,
+        state=("theta", "omega"),
+        advances="theta",
+        stencil=dict(KURAMOTO_STENCIL),
+        scalars=("coupling", "dt") + (("alpha",) if lag else ()),
+    )
+
+
+def kuramoto_equation(terms: int):
+    """The advance alone, for callers that only want the mathematics."""
+
+    program = kuramoto_program(terms)
+    return program.equation, program.constants
 
 
 def materialise(equation, name: str):

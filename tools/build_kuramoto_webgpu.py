@@ -44,7 +44,7 @@ import sympy
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools.demo_kuramoto_field import (  # noqa: E402
-    NEIGHBOURS, core_terms, kuramoto_equation,
+    core_terms, kuramoto_program,
 )
 from src.common.tensors.signal_symbolic import (  # noqa: E402
     constant_rational, limb_decomposition,
@@ -62,9 +62,51 @@ from src.compiler.symbolic_equation_compiler import (  # noqa: E402
 )
 from src.compiler import ssa_webgpu_backend as webgpu  # noqa: E402
 
-#: Per-cell fields the host supplies as real arrays. Everything else the
-#: equation names is one value shared by every cell.
-FIELDS = ("theta", "omega", *NEIGHBOURS)
+#: The gather shader, generated from a program's stencil. Nothing about
+#: the neighbourhood is written into the shader by hand: a program that
+#: wants diagonals, or a wider ring, or a second species, states it in its
+#: stencil and this follows.
+def gather_wgsl(stencil) -> str:
+    reads = []
+    for position, (name, (drow, dcol)) in enumerate(stencil.items(), start=1):
+        row = ("row" if drow == 0 else
+               f"(row + shape.high - {abs(drow)}u) % shape.high" if drow < 0
+               else f"(row + {drow}u) % shape.high")
+        col = ("col" if dcol == 0 else
+               f"(col + shape.wide - {abs(dcol)}u) % shape.wide" if dcol < 0
+               else f"(col + {dcol}u) % shape.wide")
+        reads.append(
+            f"    // {name} at ({drow:+d}, {dcol:+d})\n"
+            f"    feeds[offsets[{position}u * shape.limbs + k] + i] = "
+            f"feeds[src + ({row}) * shape.wide + ({col})];"
+        )
+    return """
+// Offsets into the one feed span, supplied explicitly. A field's limbs
+// are NOT consecutive -- the emitter lays out limb 0 of every formal
+// before limb 1 of any of them -- so striding by the limb index walks
+// into a NEIGHBOUR's slot and then into the coefficients. Measured, that
+// overwrote the series with phase data every frame and the field came
+// back entirely NaN.
+struct Shape { wide: u32, high: u32, count: u32, limbs: u32 };
+@group(0) @binding(0) var<uniform> shape: Shape;
+@group(0) @binding(1) var<storage, read_write> feeds: array<f32>;
+// [source..., then one block per stencil entry], `limbs` entries each.
+@group(0) @binding(2) var<storage, read> offsets: array<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= shape.count) { return; }
+  let row = i / shape.wide;
+  let col = i % shape.wide;
+  // Every limb moves together: a gather is data movement and cannot
+  // round, so the expansion crosses it intact.
+  for (var k: u32 = 0u; k < shape.limbs; k = k + 1u) {
+    let src = offsets[k];
+""" + "\n".join(reads) + """
+  }
+}
+"""
 
 
 def cell_source(equation, width: int, element: str) -> tuple[str, tuple]:
@@ -116,8 +158,8 @@ def cell_source(equation, width: int, element: str) -> tuple[str, tuple]:
     return source, parameters
 
 
-def build(width: int, digits: int, cells: int):
-    """Lower, narrow, flatten, and emit WGSL. Returns the module and plan."""
+def build(width: int, digits: int, cells: int, lag: bool = False):
+    """Lower, narrow, flatten, and emit WGSL for one FieldProgram."""
 
     sine = list(core_terms("sin", digits))
     cosine = list(core_terms("cos", digits))
@@ -125,7 +167,8 @@ def build(width: int, digits: int, cells: int):
     sine += [Fraction(0)] * (terms - len(sine))
     cosine += [Fraction(0)] * (terms - len(cosine))
 
-    equation, constants = kuramoto_equation(terms)
+    program = kuramoto_program(terms, lag=lag)
+    equation, constants = program.equation, program.constants
 
     with two_product_flavor_scope("split"):
         source, parameters = cell_source(equation, width, "float32")
@@ -142,7 +185,8 @@ def build(width: int, digits: int, cells: int):
         flat, name="kuramoto", count=cells,
         outputs={entry: returned},
     )
-    return emitted, flat, entry, sine, cosine, constants, terms, narrowed
+    return (emitted, flat, entry, sine, cosine, constants, terms, narrowed,
+            program)
 
 
 def _returned_values(function):
@@ -154,7 +198,7 @@ def _returned_values(function):
 
 
 def feed_plan(function, entry: str, width: int, sine, cosine, constants,
-              quarter_exact, coupling: float, dt: float):
+              quarter_exact, runtime: dict, program):
     """Which SSA id each feed buffer answers to, and what goes in it.
 
     A ``Precision[n]`` formal became n formals, one per limb, so the plan
@@ -180,12 +224,14 @@ def feed_plan(function, entry: str, width: int, sine, cosine, constants,
         ]
 
     scalars = {
-        "coupling": limbs_of(Fraction(coupling).limit_denominator(10**9)),
-        "dt": limbs_of(Fraction(dt).limit_denominator(10**9)),
+        name: limbs_of(Fraction(value).limit_denominator(10 ** 9))
+        for name, value in runtime.items()
+    }
+    scalars.update({
         "quarter": limbs_of(quarter_exact),
         "neg_quarter": limbs_of(-quarter_exact),
         "inv_quarter": limbs_of(1 / quarter_exact),
-    }
+    })
     for prefix, values in (("c", sine), ("d", cosine)):
         for index, value in enumerate(values):
             scalars[f"{prefix}{index}"] = limbs_of(value)
@@ -195,6 +241,7 @@ def feed_plan(function, entry: str, width: int, sine, cosine, constants,
     # The feeds are ONE SPAN: formal at position k occupies
     # [k * count, (k + 1) * count). So the plan is written by POSITION in
     # the emitted signature, not by SSA id, and the host fills one buffer.
+    fields = set(program.state) | set(program.stencil)
     by_id = {int(identifier): name for name, identifier in ids.items()}
     plan = {"slots": [], "unbound": []}
     for position, formal in enumerate(function.args):
@@ -204,7 +251,7 @@ def feed_plan(function, entry: str, width: int, sine, cosine, constants,
             continue
         base, _, suffix = name.partition("__limb")
         limb = int(suffix) if suffix else 0
-        if base in FIELDS:
+        if base in fields:
             plan["slots"].append(
                 {"at": position, "field": base, "limb": limb}
             )
@@ -224,41 +271,6 @@ def feed_plan(function, entry: str, width: int, sine, cosine, constants,
 # The gather shader reads each cell's four neighbours off the torus and
 # the present shader paints phase as hue. Both only move or display
 # values that the compiled kernel produced.
-
-GATHER_WGSL = """
-// Offsets into the one feed span, supplied explicitly. A field's limbs
-// are NOT consecutive -- the emitter lays out limb 0 of every formal
-// before limb 1 of any of them -- so striding by the limb index walks
-// into a NEIGHBOUR's slot and then into the coefficients. Measured, that
-// overwrote the series with phase data every frame and the field came
-// back entirely NaN.
-struct Shape { wide: u32, high: u32, count: u32, limbs: u32 };
-@group(0) @binding(0) var<uniform> shape: Shape;
-@group(0) @binding(1) var<storage, read_write> feeds: array<f32>;
-// [theta..., up..., down..., left..., right...], `limbs` entries each.
-@group(0) @binding(2) var<storage, read> offsets: array<u32>;
-
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
-  if (i >= shape.count) { return; }
-  let row = i / shape.wide;
-  let col = i % shape.wide;
-  let up_i = ((row + shape.high - 1u) % shape.high) * shape.wide + col;
-  let down_i = ((row + 1u) % shape.high) * shape.wide + col;
-  let left_i = row * shape.wide + (col + shape.wide - 1u) % shape.wide;
-  let right_i = row * shape.wide + (col + 1u) % shape.wide;
-  // Every limb moves together: a gather is data movement and cannot
-  // round, so the expansion crosses it intact.
-  for (var k: u32 = 0u; k < shape.limbs; k = k + 1u) {
-    let src = offsets[k];
-    feeds[offsets[shape.limbs + k] + i] = feeds[src + up_i];
-    feeds[offsets[2u * shape.limbs + k] + i] = feeds[src + down_i];
-    feeds[offsets[3u * shape.limbs + k] + i] = feeds[src + left_i];
-    feeds[offsets[4u * shape.limbs + k] + i] = feeds[src + right_i];
-  }
-}
-"""
 
 PRESENT_WGSL = """
 struct Shape { wide: u32, high: u32, count: u32, limbs: u32 };
@@ -308,15 +320,19 @@ fn fs(in: VertexOut) -> @location(0) vec4<f32> {
 
 def page(kernel_wgsl: str, plan: dict, width: int, height: int,
          limbs: int, digits: int, terms: int, seed: int,
-         spread: float, published: int) -> str:
+         spread: float, published: int, program) -> str:
     manifest = {
         "wide": width, "high": height, "limbs": limbs, "digits": digits,
         "terms": terms, "seed": seed, "spread": spread,
         "slots": plan["slots"], "published": published,
+        "advances": program.advances,
+        "stencil": list(program.stencil),
+        "programName": program.name,
     }
     return _PAGE.replace("__MANIFEST__", json.dumps(manifest)) \
                 .replace("__KERNEL_WGSL__", json.dumps(kernel_wgsl)) \
-                .replace("__GATHER_WGSL__", json.dumps(GATHER_WGSL)) \
+                .replace("__GATHER_WGSL__",
+                         json.dumps(gather_wgsl(program.stencil))) \
                 .replace("__PRESENT_WGSL__", json.dumps(PRESENT_WGSL))
 
 
@@ -437,7 +453,7 @@ async function main() {
     const base = slot.at * count;
     if (slot.field === undefined) {
       staging.fill(slot.value, base, base + count);
-    } else if (slot.field === "theta") {
+    } else if (slot.field === MANIFEST.advances) {
       if (slot.limb === 0) staging.set(phases, base);
       thetaSlots[slot.limb] = base;
     } else if (slot.field === "omega") {
@@ -450,7 +466,7 @@ async function main() {
   // Where the gather pass writes, and where it reads the phase from.
   const neighbourSlots = {};
   for (const slot of slots) {
-    if (slot.field && slot.field !== "theta" && slot.field !== "omega") {
+    if (slot.field && MANIFEST.stencil.includes(slot.field)) {
       neighbourSlots[slot.field] = neighbourSlots[slot.field] || [];
       neighbourSlots[slot.field][slot.limb] = slot.at * count;
     }
@@ -474,8 +490,10 @@ async function main() {
   // The real slot of every limb of every field, in the order the shaders
   // index it. Nothing here assumes a field's limbs are adjacent.
   const order = [];
-  for (const name of ["theta", "up", "down", "left", "right"]) {
-    const row = name === "theta" ? thetaSlots : neighbourSlots[name];
+  // Source field first, then one block per stencil entry, in the order
+  // the generated gather indexes them.
+  for (const name of [MANIFEST.advances, ...MANIFEST.stencil]) {
+    const row = name === MANIFEST.advances ? thetaSlots : neighbourSlots[name];
     for (let limb = 0; limb < limbs; limb++) order.push(row[limb]);
   }
   const offsets = device.createBuffer({
@@ -650,6 +668,9 @@ def main(argv=None) -> int:
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--spread", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=11)
+    parser.add_argument("--lag", type=float, default=0.0,
+                        help="Sakaguchi phase lag in radians; any nonzero "
+                             "value selects the lagged program")
     parser.add_argument("--output", type=Path,
                         default=Path("build/kuramoto-webgpu"))
     arguments = parser.parse_args(argv)
@@ -661,8 +682,9 @@ def main(argv=None) -> int:
     print(f"emitting {width}x{height} = {cells:,d} cells at "
           f"{limbs} float32 limbs", flush=True)
 
-    (emitted, flat, entry, sine, cosine, constants, terms,
-     narrowed) = build(limbs, int(arguments.digits), cells)
+    (emitted, flat, entry, sine, cosine, constants, terms, narrowed,
+     program) = build(limbs, int(arguments.digits), cells,
+                      lag=bool(arguments.lag))
 
     print(f"narrowed {narrowed} values to float32; "
           f"{terms} terms per series", flush=True)
@@ -673,9 +695,13 @@ def main(argv=None) -> int:
         raise SystemExit("WGSL emission incomplete")
 
     quarter_exact = constant_rational("tau", int(arguments.digits)) / 4
+    runtime = {"coupling": float(arguments.coupling),
+               "dt": float(arguments.dt)}
+    if "alpha" in program.scalars:
+        runtime["alpha"] = float(arguments.lag)
     plan, ids = feed_plan(
         flat[entry], entry, limbs, sine, cosine, constants, quarter_exact,
-        float(arguments.coupling), float(arguments.dt),
+        runtime, program,
     )
     if plan["unbound"]:
         raise SystemExit(f"unbound formals: {sorted(plan['unbound'])[:8]}")
@@ -686,7 +712,8 @@ def main(argv=None) -> int:
         emitted.source, encoding="utf-8", newline="\n")
     html = page(emitted.source, plan, width, height, limbs,
                 int(arguments.digits), terms, int(arguments.seed),
-                float(arguments.spread), len(_returned_values(flat[entry])))
+                float(arguments.spread), len(_returned_values(flat[entry])),
+                program)
     path = destination / "index.html"
     path.write_text(html, encoding="utf-8", newline="\n")
 
