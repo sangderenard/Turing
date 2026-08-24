@@ -278,7 +278,7 @@ def kuramoto_program(terms: int, lag: bool = False) -> FieldProgram:
         equation=sympy.Eq(sympy.Symbol("advanced"), advanced),
         constants=constants,
         state=("theta", "omega"),
-        advances="theta",
+        advances=("theta",),
         stencil=dict(KURAMOTO_STENCIL),
         scalars=("coupling", "dt") + (("alpha",) if lag else ()),
     )

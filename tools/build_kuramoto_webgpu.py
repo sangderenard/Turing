@@ -44,7 +44,7 @@ import sympy
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools.demo_kuramoto_field import (  # noqa: E402
-    core_terms, kuramoto_program,
+    core_terms, hamiltonian_program, kicked_rotor_energy, kuramoto_program,
 )
 from src.common.tensors.signal_symbolic import (  # noqa: E402
     constant_rational, limb_decomposition,
@@ -116,7 +116,9 @@ def cell_source(equation, width: int, element: str) -> tuple[str, tuple]:
     already derives ``linear_index`` from the invocation id.
     """
 
-    compiled = compile_sympy_equations([equation], name="kuramoto_step")
+    equations = (list(equation) if isinstance(equation, (list, tuple))
+                 else [equation])
+    compiled = compile_sympy_equations(equations, name="kuramoto_step")
     statements, needs_math = materialize_function_body(
         compiled.function, tensor_vocabulary=True,
     )
@@ -158,7 +160,20 @@ def cell_source(equation, width: int, element: str) -> tuple[str, tuple]:
     return source, parameters
 
 
-def build(width: int, digits: int, cells: int, lag: bool = False):
+#: The programs this page can carry. Each is one FieldProgram, and
+#: nothing below here knows which was chosen.
+def _program_for(choice: str, terms: int, lag: bool):
+    if choice == "rotor":
+        # A Hamiltonian, not an update: SymPy derives the whole step.
+        return hamiltonian_program(
+            kicked_rotor_energy(), terms, scalars=("K", "epsilon"),
+            name="kicked-rotor",
+        )
+    return kuramoto_program(terms, lag=lag)
+
+
+def build(width: int, digits: int, cells: int, lag: bool = False,
+          choice: str = "kuramoto"):
     """Lower, narrow, flatten, and emit WGSL for one FieldProgram."""
 
     sine = list(core_terms("sin", digits))
@@ -167,7 +182,7 @@ def build(width: int, digits: int, cells: int, lag: bool = False):
     sine += [Fraction(0)] * (terms - len(sine))
     cosine += [Fraction(0)] * (terms - len(cosine))
 
-    program = kuramoto_program(terms, lag=lag)
+    program = _program_for(choice, terms, lag)
     equation, constants = program.equation, program.constants
 
     with two_product_flavor_scope("split"):
@@ -187,6 +202,28 @@ def build(width: int, digits: int, cells: int, lag: bool = False):
     )
     return (emitted, flat, entry, sine, cosine, constants, terms, narrowed,
             program)
+
+
+def writeback_plan(function, program, limbs: int):
+    """Which field and limb each published value belongs to.
+
+    The Ret names one value per equation, in equation order, and each
+    expands to its limb row -- so the published order is field-major and
+    the host can be told it rather than having to infer it.
+    """
+
+    rows = dict(function.metadata.get("precision_lowered_values") or ())
+    plan = []
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            if str(instruction.op) not in ("Ret", "Return"):
+                continue
+            for field, value in zip(program.advances, instruction.args):
+                row = rows.get(int(value.id)) or (int(value.id),)
+                for limb, _identifier in enumerate(row):
+                    plan.append({"field": field, "limb": limb})
+            return plan
+    return plan
 
 
 def _returned_values(function):
@@ -351,12 +388,19 @@ fn fs(in: VertexOut) -> @location(0) vec4<f32> {
 
 def page(kernel_wgsl: str, plan: dict, width: int, height: int,
          limbs: int, digits: int, terms: int, seed: int,
-         spread: float, published: int, program) -> str:
+         spread: float, published: int, program, writeback) -> str:
     manifest = {
         "wide": width, "high": height, "limbs": limbs, "digits": digits,
         "terms": terms, "seed": seed, "spread": spread,
         "slots": plan["slots"], "published": published,
-        "advances": program.advances,
+        "advances": list(program.advances),
+        "gatherFrom": program.advances[0],
+        "stateSeed": {
+            field: ("turn" if field == program.advances[0]
+                    else "spread" if field == "omega" else "quiet")
+            for field in program.state
+        },
+        "writeback": writeback,
         "stencil": list(program.stencil),
         "programName": program.name,
     }
@@ -466,11 +510,17 @@ async function main() {
     const u = Math.max(random(), 1e-12), v = random();
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
   };
-  const phases = new Float32Array(count);
-  const spins = new Float32Array(count);
-  for (let i = 0; i < count; i++) {
-    phases[i] = (random() * 2 - 1) * Math.PI;
-    spins[i] = gaussian() * MANIFEST.spread;
+  // One seed array per state field, named by how the program wants it
+  // started: a phase is uniform on a turn, anything else is drawn narrow.
+  const seeds = {};
+  for (const [field, kind] of Object.entries(MANIFEST.stateSeed)) {
+    const values = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      values[i] = kind === "turn" ? (random() * 2 - 1) * Math.PI
+                : kind === "spread" ? gaussian() * MANIFEST.spread
+                : 0;
+    }
+    seeds[field] = values;
   }
 
   // The feeds are ONE SPAN: formal at position k occupies
@@ -479,16 +529,15 @@ async function main() {
   const slots = MANIFEST.slots;
   const feeds = storage(slots.length * count * 4);
   const staging = new Float32Array(slots.length * count);
-  const thetaSlots = [];
+  const stateSlots = {};
   for (const slot of slots) {
     const base = slot.at * count;
     if (slot.field === undefined) {
       staging.fill(slot.value, base, base + count);
-    } else if (slot.field === MANIFEST.advances) {
-      if (slot.limb === 0) staging.set(phases, base);
-      thetaSlots[slot.limb] = base;
-    } else if (slot.field === "omega") {
-      if (slot.limb === 0) staging.set(spins, base);
+    } else if (MANIFEST.stateSeed[slot.field] !== undefined) {
+      if (slot.limb === 0) staging.set(seeds[slot.field], base);
+      stateSlots[slot.field] = stateSlots[slot.field] || [];
+      stateSlots[slot.field][slot.limb] = base;
     }
     // Neighbour fields are filled by the gather pass each step.
   }
@@ -523,8 +572,8 @@ async function main() {
   const order = [];
   // Source field first, then one block per stencil entry, in the order
   // the generated gather indexes them.
-  for (const name of [MANIFEST.advances, ...MANIFEST.stencil]) {
-    const row = name === MANIFEST.advances ? thetaSlots : neighbourSlots[name];
+  for (const name of [MANIFEST.gatherFrom, ...MANIFEST.stencil]) {
+    const row = stateSlots[name] || neighbourSlots[name];
     for (let limb = 0; limb < limbs; limb++) order.push(row[limb]);
   }
   const offsets = device.createBuffer({
@@ -574,7 +623,7 @@ async function main() {
   window.__field = async () => {
     const encoder = device.createCommandEncoder();
     encoder.copyBufferToBuffer(
-      feeds, thetaSlots[0] * 4, readback, 0, count * 4);
+      feeds, stateSlots[MANIFEST.gatherFrom][0] * 4, readback, 0, count * 4);
     device.queue.submit([encoder.finish()]);
     await readback.mapAsync(GPUMapMode.READ);
     const values = new Float32Array(readback.getMappedRange()).slice();
@@ -594,7 +643,8 @@ async function main() {
     // Read the LOW limb too: if it is identically zero the ladder is
     // decorative, and the whole point is that it is not.
     const lowEnc = device.createCommandEncoder();
-    lowEnc.copyBufferToBuffer(feeds, thetaSlots[1] * 4, readback, 0, count * 4);
+    lowEnc.copyBufferToBuffer(
+      feeds, stateSlots[MANIFEST.gatherFrom][1] * 4, readback, 0, count * 4);
     device.queue.submit([lowEnc.finish()]);
     await readback.mapAsync(GPUMapMode.READ);
     const low = new Float32Array(readback.getMappedRange()).slice();
@@ -640,10 +690,14 @@ async function main() {
     advance.end();
 
     // 3. the advanced phase becomes the field, limb by limb
-    for (let limb = 0; limb < outputs.length; limb++) {
+    // Each published value goes to the field and limb the manifest
+    // names. Two-equation programs advance two fields, and every limb of
+    // each is published, so nothing collapses on the way back in.
+    MANIFEST.writeback.forEach((where, index) => {
       encoder.copyBufferToBuffer(
-        outputs[limb], 0, feeds, thetaSlots[limb] * 4, count * 4);
-    }
+        outputs[index], 0, feeds,
+        stateSlots[where.field][where.limb] * 4, count * 4);
+    });
 
     // 4. paint it
     const paint = encoder.beginRenderPass({
@@ -712,6 +766,13 @@ def main(argv=None) -> int:
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--spread", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=11)
+    parser.add_argument("--program", default="kuramoto",
+                        choices=("kuramoto", "rotor"),
+                        help="kuramoto: a phase field. rotor: a lattice of "
+                             "kicked rotors whose update SymPy derives from "
+                             "a Hamiltonian")
+    parser.add_argument("--kick", type=float, default=1.2,
+                        help="rotor only: the standard-map kick strength")
     parser.add_argument("--lag", type=float, default=0.0,
                         help="Sakaguchi phase lag in radians; any nonzero "
                              "value selects the lagged program")
@@ -728,7 +789,8 @@ def main(argv=None) -> int:
 
     (emitted, flat, entry, sine, cosine, constants, terms, narrowed,
      program) = build(limbs, int(arguments.digits), cells,
-                      lag=bool(arguments.lag))
+                      lag=bool(arguments.lag),
+                      choice=str(arguments.program))
 
     print(f"narrowed {narrowed} values to float32; "
           f"{terms} terms per series", flush=True)
@@ -739,10 +801,15 @@ def main(argv=None) -> int:
         raise SystemExit("WGSL emission incomplete")
 
     quarter_exact = constant_rational("tau", int(arguments.digits)) / 4
-    runtime = {"coupling": float(arguments.coupling),
-               "dt": float(arguments.dt)}
+    runtime = {"dt": float(arguments.dt)}
+    if "coupling" in program.scalars:
+        runtime["coupling"] = float(arguments.coupling)
     if "alpha" in program.scalars:
         runtime["alpha"] = float(arguments.lag)
+    if "K" in program.scalars:
+        runtime["K"] = float(arguments.kick)
+    if "epsilon" in program.scalars:
+        runtime["epsilon"] = float(arguments.coupling)
     plan, ids = feed_plan(
         flat[entry], entry, limbs, sine, cosine, constants, quarter_exact,
         runtime, program,
@@ -757,7 +824,7 @@ def main(argv=None) -> int:
     html = page(emitted.source, plan, width, height, limbs,
                 int(arguments.digits), terms, int(arguments.seed),
                 float(arguments.spread), len(_returned_values(flat[entry])),
-                program)
+                program, writeback_plan(flat[entry], program, limbs))
     path = destination / "index.html"
     path.write_text(html, encoding="utf-8", newline="\n")
 
