@@ -2541,7 +2541,14 @@ def build_program_bundle(
                         instruction.args
                         for block in passthrough_function.blocks.values()
                         for instruction in block.instrs
-                        if instruction.op in {"Ret", "ret", "Return", "return"}
+                        # str() because an opcode is not a plain string, and
+                        # comparing the raw value against a set of names
+                        # silently matched nothing: the return was never
+                        # found, so the passthrough was emitted with no
+                        # outputs and refused for "compute module has no
+                        # named output" -- which read as the WGSL lane being
+                        # unable to express an identity shader.
+                        if str(instruction.op) in {"Ret", "ret", "Return", "return"}
                     ),
                     (),
                 )
