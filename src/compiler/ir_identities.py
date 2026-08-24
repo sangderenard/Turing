@@ -428,6 +428,97 @@ def drop_dead_pure_region_calls(functions) -> int:
 
 
 
+#: Limb elements narrower than the binary64 default. Carrying one of these
+#: retypes the value, because on a lane with no f64 the two statements
+#: cannot be allowed to disagree.
+_NARROW_LIMB_ELEMENTS = frozenset({"float32", "f32", "single"})
+
+_FLOAT64_SPELLINGS = frozenset({"float64", "double", "f64"})
+_INT64_SPELLINGS = frozenset({"int64", "i64", "long"})
+
+
+def narrow_float64_to_float32(module) -> int:
+    """Retype every remaining binary64 value as binary32, once it is safe.
+
+    The GPU lanes have no f64 AT ALL -- WGSL does not define the type --
+    so a float64 value reaching them is not a precision choice, it is an
+    impossibility. The choice that IS available is the one the ladder was
+    built for: two float32 limbs in place of one float64, which carries
+    more significand than the f64 it replaces rather than less.
+
+    The precision expansion already types its own limbs from the declared
+    element, so after it runs what is left at float64 is the surrounding
+    scaffolding -- formals, the loads through them, and the exact integer
+    floors of range reduction, none of which hold a limbed quantity. This
+    narrows that scaffolding so the module speaks one element throughout.
+
+    REFUSED when any precision section declares an element other than
+    float32, because then the float64 values are load-bearing and
+    narrowing them would be exactly the silent precision loss the whole
+    pipeline exists to prevent. A module with no sections at all is also
+    refused: nothing there is carrying precision in limbs, so narrowing it
+    would simply be throwing digits away where the caller asked for none
+    of this.
+
+    Returns how many values were retyped.
+    """
+
+    receipt = (getattr(module, "metadata", {}) or {}).get(
+        PRECISION_PIPELINE_METADATA
+    ) or {}
+    contracts = tuple(receipt.get("section_contracts", ()))
+    if not contracts:
+        raise ValueError(
+            "narrow_float64_to_float32 refuses a module with no precision "
+            "sections: there are no limbs carrying the precision that "
+            "narrowing would rely on, so this would only lose digits"
+        )
+    declared = {
+        str(contract.get("element") or "float64") for contract in contracts
+    }
+    unsupported = {
+        element for element in declared
+        if element not in _NARROW_LIMB_ELEMENTS
+    }
+    if unsupported:
+        raise ValueError(
+            "narrow_float64_to_float32 refuses a module whose sections "
+            f"declare {sorted(unsupported)}: those limbs ARE float64 and "
+            "narrowing them would silently halve the precision the caller "
+            "declared"
+        )
+
+    seen: set[int] = set()
+    narrowed = 0
+
+    def retype(value) -> None:
+        nonlocal narrowed
+        if value is None or id(value) in seen:
+            return
+        seen.add(id(value))
+        dtype = str(getattr(value, "dtype", None) or "")
+        if dtype in _FLOAT64_SPELLINGS:
+            value.dtype = "float32"
+            narrowed += 1
+        elif dtype in _INT64_SPELLINGS:
+            # WGSL has no 64-bit integer either. These are the index and
+            # quarter-turn counts around the arithmetic, not quantities --
+            # a field addressed by an i32 index is bounded by the same
+            # limit its buffers already are.
+            value.dtype = "int32"
+            narrowed += 1
+
+    for function in (getattr(module, "functions", module) or {}).values():
+        for formal in getattr(function, "args", ()):
+            retype(formal)
+        for block in getattr(function, "blocks", {}).values():
+            for instruction in getattr(block, "instrs", ()):
+                retype(getattr(instruction, "res", None))
+                for argument in getattr(instruction, "args", ()):
+                    retype(argument)
+    return narrowed
+
+
 #: Operations whose result is a truth value rather than a quantity.
 _PREDICATE_NAMES = frozenset({
     "Lt", "Le", "Gt", "Ge", "Eq", "Ne",
@@ -510,9 +601,18 @@ def carry_precision_through_ssa(functions) -> int:
         if value is None or limbs <= 1 or limbs_of(value) == limbs:
             return False
         value.accounting["precision_limbs"] = int(limbs)
-        value.accounting["precision_element"] = str(
-            element or value.dtype or ""
-        ) or None
+        resolved = str(element or value.dtype or "") or None
+        value.accounting["precision_element"] = resolved
+        # The element is what the limbs ARE, so it is the value's dtype and
+        # not merely a note beside it. Leaving the two to disagree is
+        # invisible on a lane that has both widths and fatal on one that
+        # does not: a float32 expansion kept saying float64, and the
+        # WebGPU emitter -- where there IS no f64 -- refused sixty-seven
+        # values whose limbs were already 24-bit. Only a NARROWING is
+        # written here; the default element is the dtype the value already
+        # carries, so a binary64 program is untouched.
+        if resolved in _NARROW_LIMB_ELEMENTS and value.dtype != resolved:
+            value.dtype = resolved
         existing = tuple(value.shape or ())
         # Idempotent: a re-run must not append a second channel.
         if not existing or existing[-1] != int(limbs):
@@ -1409,11 +1509,28 @@ BACKEND_PRECISION_CAPABILITIES: dict[str, tuple[str, ...]] = {
     # emitted on demand, and the f32-only restriction covers only the
     # extended-instruction transcendentals a limb section never uses.
     "spirv": (FMA_MANDATORY, SECTION_ISOLATION),
-    # WGSL's fma() is explicitly permitted to round twice, and the language
-    # offers no `precise` and no contraction control -- neither obligation
-    # can be claimed. Sections reach this lane only through the "split"
-    # flavour once an isolation story exists; until then they are refused.
-    "webgpu": (),
+    # WGSL's fma() is explicitly permitted to round twice, so FMA_MANDATORY
+    # is not claimed and never will be -- a section containing an Fma is
+    # still refused here, which is what the fma_value_ids gate in
+    # precision_backend_shortfalls already decides on its own.
+    #
+    # SECTION_ISOLATION is claimed for the "split" flavour, which is the
+    # route this comment always named. Split two_product spells no fma at
+    # all: Veltkamp halves at 4097 (2**12 + 1), and for a 24-bit f32
+    # significand the 12-bit half products are exact, so the residual is
+    # recovered by subtraction rather than by a fused rounding. That
+    # removes the failure this lane was guarding against -- an fma-shaped
+    # residual coming back algebraically zero -- because there is no fused
+    # operation left to double-round.
+    #
+    # What is NOT settled by the language is reassociation: two_sum's
+    # `(a - (s - b')) + (b - b')` is only an error-free transformation if
+    # it is evaluated as written. So this claim is carried by MEASUREMENT
+    # rather than by a spec argument -- tools/probe_webgpu_precision.py
+    # scores the emitted shader against exact rational truth in a real
+    # browser, and a lane that reassociated would show it immediately as a
+    # width that stops buying precision.
+    "webgpu": (SECTION_ISOLATION,),
     # Desktop GLSL compute (GL 4.3 + GL_ARB_gpu_shader5): the `precise`
     # qualifier is exactly contraction-and-reassociation control -- values
     # so qualified must be computed as written, and an fma() call on
@@ -1865,10 +1982,28 @@ def lower_precision_operations(
         for block in function.blocks.values():
             emitted: list = []
 
+            # The element the section being expanded declared, when it is
+            # narrower than the value it is expanding. An expansion mints
+            # many values and every one of them is a LIMB, so the element
+            # is what they are -- inheriting the pre-expansion dtype makes
+            # a float32 expansion claim to be float64, which is wrong in
+            # two ways at once. It refuses to emit on a lane that has no
+            # f64 at all, and, worse, ``splitter_for`` reads the same
+            # dtype to choose Veltkamp's constant: a float32 limb split at
+            # 2**27 + 1 instead of 4097 does not halve a 24-bit
+            # significand, so the half products stop being exact and the
+            # residual is quietly wrong rather than loudly absent.
+            section_element: list = [None]
+
             def fresh(like):
                 nonlocal next_id
+                declared = section_element[0]
+                dtype = (
+                    declared if declared in _NARROW_LIMB_ELEMENTS
+                    else like.dtype
+                )
                 value = SSAValue(
-                    next_id, dtype=like.dtype, shape=(), device=like.device,
+                    next_id, dtype=dtype, shape=(), device=like.device,
                 )
                 next_id += 1
                 return value
@@ -2096,6 +2231,9 @@ def lower_precision_operations(
 
             for instruction in block.instrs:
                 operation = str(instruction.op)
+                section_element[0] = instruction.attributes.get(
+                    "precision_element"
+                )
 
                 if operation in ("Call", "call"):
                     callee = str(instruction.attributes.get("callee") or "")
@@ -2542,7 +2680,19 @@ def inline_host_linear_source_regions(functions) -> tuple[dict, tuple[dict, ...]
         if callee is None or len(occurrences) != 1:
             continue
         integral = dict(callee.metadata.get("source_region_integral") or {})
-        if not integral or tuple(integral.get("output_value_ids") or ()):
+        # PUBLISHED OUTPUTS ARE FINE. The splice clones each instruction
+        # with its own result value, ids and all, so a value the region
+        # published is produced in the caller at the same id the caller
+        # already refers to -- there is nothing left to publish through.
+        # The one hazard that would make this unsafe, an id in the region
+        # colliding with one the caller already produces, is checked
+        # separately below and still rejects the splice.
+        #
+        # Refusing them was costing a real destination: a two-limb result
+        # publishes two values, and WGSL has no multi-value helper, so the
+        # GPU lane could not take a wide kernel at all while the region
+        # stayed a call.
+        if not integral:
             continue
         if set(callee.blocks) != {"entry"}:
             continue

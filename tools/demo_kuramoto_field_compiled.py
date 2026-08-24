@@ -75,12 +75,19 @@ class _IndexFields(ast.NodeTransformer):
         return node
 
 
-def loop_source(equation, width: int) -> tuple[str, tuple[str, ...]]:
+def loop_source(equation, width: int,
+                element: str | None = None) -> tuple[str, tuple[str, ...]]:
     """The whole-field kernel, as source, for one equation and one width.
 
     Same materialisation ``demo_kuramoto_field.materialise`` uses, stopped
     one step earlier -- before it is wrapped in a scalar ``FunctionDef``
     and exec'd -- so the statements can be placed inside a loop instead.
+
+    ``element`` names the limb element when it is not the binary64 default.
+    ``Precision[8, float32]`` is eight 24-bit limbs rather than eight
+    53-bit ones, which is the ladder the GPU lanes carry because WGSL has
+    no f64 at all -- there the choice is not "narrow or wide" but "one f32
+    or several", and several is the one that keeps the mathematics.
     """
 
     from src.compiler.ssa_python_materializer import materialize_function_body
@@ -126,10 +133,19 @@ def loop_source(equation, width: int) -> tuple[str, tuple[str, ...]]:
         body=body, orelse=[],
     )
 
+    def _subscript():
+        if element is None:
+            return ast.Constant(value=width)
+        return ast.Tuple(
+            elts=[ast.Constant(value=width), ast.Name(id=element,
+                                                      ctx=ast.Load())],
+            ctx=ast.Load(),
+        )
+
     annotate = (
         (lambda: ast.Subscript(
             value=ast.Name(id="Precision", ctx=ast.Load()),
-            slice=ast.Constant(value=width), ctx=ast.Load(),
+            slice=_subscript(), ctx=ast.Load(),
         ))
         if width > 1 else (lambda: None)
     )
