@@ -105,6 +105,9 @@ def test_native_boundary_is_forwarded_through_shell_external_reference_abi():
     assert plan["loader"] == "existing_module"
     assert plan["symbol_resolution"] == "in_place"
     assert plan["external_domain"] == "host_system"
+    assert plan["native_abi"] == "cpython-c-api"
+    assert plan["runtime_owner"] == "shell"
+    assert plan["shell_profiles"] == ("python", "cpython-c")
     assert plan["shell_abi"] == (
         "turing-shell-io-abi.external_references"
     )

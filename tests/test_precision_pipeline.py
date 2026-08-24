@@ -90,8 +90,17 @@ def test_live_precision_wrapper_keeps_width_until_explicit_collapse():
     assert wide.limbs == 2
     assert wide.to_float_lists() == [[8.0, 10.0], [0.0, 0.0]]
     assert wide.collapse().tolist() == [8.0, 10.0]
-    with pytest.raises(AttributeError, match="collapse"):
-        wide.mean()
+    # ``mean`` used to be refused here, and being refused was the right
+    # answer while it was WRONG: it divided by the widened element count
+    # and returned half the value. It is endorsed now because it is
+    # correct now -- it sums the expansions without collapsing and
+    # divides by the element count -- so the contract this pins is the
+    # ANSWER rather than the refusal.
+    assert wide.mean().collapse().tolist() == [9.0]
+    # What must still refuse is anything that would have to answer from
+    # the leading limb alone.
+    with pytest.raises((AttributeError, TypeError, NotImplementedError)):
+        wide.exp()
 
 
 def test_shader_capability_selection_does_not_claim_abstract_precision_ops():
