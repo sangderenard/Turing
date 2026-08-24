@@ -523,7 +523,7 @@ class Precision:
     #: that should be asked for rather than inherited.
     COMBINE = "widest"
 
-    __slots__ = ("_terms", "limbs")
+    __slots__ = ("_stack", "limbs")
 
     @classmethod
     def __class_getitem__(cls, width):
@@ -556,13 +556,30 @@ class Precision:
         # A sequence is taken as the terms themselves; a tensor is taken
         # as an interleaved payload and split once, so every existing
         # caller and every stored artifact keeps working unchanged.
+        from .abstraction import AbstractTensor
+
         self.limbs = int(limbs)
         if isinstance(value, (list, tuple)):
-            self._terms = tuple(value)
+            parts = list(value)
         else:
-            self._terms = tuple(
+            parts = [
                 limb(value, index, self.limbs) for index in range(self.limbs)
-            )
+            ]
+        # The limbs are a LEADING AXIS, not a tuple and not channels.
+        #
+        # A tuple is planar but it is not a tensor, so the value has no
+        # shape of its own and nothing can reason about it without
+        # unpacking first. Channels were worse: they made shape[-1] a lie,
+        # so every operation that did not know about limbs computed
+        # confidently on limbs*n elements. A leading axis is the only
+        # arrangement where the width is an ordinary dimension -- shape[0]
+        # is the limb count, shape[1:] is exactly what the caller declared
+        # -- so widening a program does not disturb a single shape
+        # assumption below it, and the trailing axes keep meaning what
+        # they always meant.
+        self._stack = AbstractTensor.stack(
+            [AbstractTensor.get_tensor(part) for part in parts], dim=0,
+        )
 
     # -- crossing the boundary --------------------------------------------
 
@@ -591,9 +608,9 @@ class Precision:
     def collapse(self) -> Any:
         """Back to an ordinary tensor, paying the rounding once."""
 
-        total = self._terms[0]
-        for term in self._terms[1:]:
-            total = plain(total, "add", term)
+        total = self._stack[0]
+        for index in range(1, self.limbs):
+            total = plain(total, "add", self._stack[index])
         return total
 
     @property
@@ -637,7 +654,15 @@ class Precision:
         the artifacts and feeds already on disk contain.
         """
 
-        return interleave(list(self._terms))
+        # The limb axis moved to the END, then flattened. Both layouts
+        # are the SAME STACK in two axis orders, which is the whole
+        # argument for holding the limbs as a dimension rather than as a
+        # tuple of arrays: a destination is handed the memory it wants by
+        # permuting an axis and flattening, never by packing element by
+        # element.
+        stack = self._stack
+        order = tuple(range(1, len(tuple(stack.shape)))) + (0,)
+        return stack.transpose(*order).reshape(-1)
 
     def blocked(self):
         """Limb-major: element i, limb k at flat index ``k * count + i``.
@@ -646,11 +671,9 @@ class Precision:
         destination reads it better, not because anything here prefers it.
         """
 
-        from .abstraction import AbstractTensor
-
-        return AbstractTensor.concat(
-            [term.reshape(-1) for term in self._terms], dim=0,
-        )
+        # Already the stack's own axis order: limb zero's elements, then
+        # limb one's, and so on. Flattening is the whole conversion.
+        return self._stack.reshape(-1)
 
     @classmethod
     def from_interleaved(cls, value, limbs: int) -> "Precision":
@@ -674,6 +697,24 @@ class Precision:
         )
 
     @property
+    def shape(self):
+        """The shape the CALLER declared: the stack without its limb axis.
+
+        This is the whole point of holding the limbs as a leading axis. A
+        two-limb field of a hundred elements reports a hundred, not two
+        hundred and not a tuple of two arrays, so every shape assumption
+        written against the narrow program still holds when it is widened.
+        """
+
+        return tuple(self._stack.shape)[1:]
+
+    @property
+    def stacked(self):
+        """The payload: limbs on axis zero, the declared shape after it."""
+
+        return self._stack
+
+    @property
     def _value(self):
         """The interleaved payload, built on demand.
 
@@ -683,24 +724,25 @@ class Precision:
         format now, not the storage: nothing inside this type reads it.
         """
 
-        return interleave(list(self._terms))
+        return interleave(self.terms())
 
     def to_float_lists(self) -> list:
-        return [term.tolist() for term in self._terms]
+        return [self._stack[index].tolist() for index in range(self.limbs)]
 
     # -- the representation ------------------------------------------------
 
     def term(self, index: int) -> Any:
-        return self._terms[int(index)]
+        return self._stack[int(index)]
 
     def terms(self, width: int | None = None) -> list:
         width = self.limbs if width is None else int(width)
         if width == self.limbs:
-            return list(self._terms)
+            return [self._stack[index] for index in range(self.limbs)]
         if width < self.limbs:
-            return list(self._terms[:width])
-        zero = plain(self._terms[0], "mul", 0.0)
-        return list(self._terms) + [zero] * (width - self.limbs)
+            return [self._stack[index] for index in range(width)]
+        held = [self._stack[index] for index in range(self.limbs)]
+        zero = plain(held[0], "mul", 0.0)
+        return held + [zero] * (width - self.limbs)
 
     def __repr__(self) -> str:
         return f"Precision(limbs={self.limbs})"
@@ -824,16 +866,14 @@ class Precision:
         """
 
         return Precision(
-            interleave([function(term) for term in self.terms()]), self.limbs
+            [function(term) for term in self.terms()], self.limbs
         )
 
     def _slice_limbs(self, start: int, stop: int) -> "Precision":
         """Elements ``[start:stop]``, with each one's limbs kept together."""
 
         return Precision(
-            interleave([
-                term.reshape(-1)[start:stop] for term in self.terms()
-            ]),
+            [term.reshape(-1)[start:stop] for term in self.terms()],
             self.limbs,
         )
 
