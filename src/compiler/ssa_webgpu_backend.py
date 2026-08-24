@@ -14,6 +14,7 @@ from ..transmogrifier.ssa import BasicBlock, Function, Instr, IRModule, SSAValue
 _BINARY: dict[str, str] = {
     "Add": "({0} + {1})", "Sub": "({0} - {1})",
     "Mul": "({0} * {1})", "Div": "({0} / {1})",
+    "Max": "max({0}, {1})", "Min": "min({0}, {1})",
     "Mod": "({0} % {1})", "Pow": "pow({0}, {1})",
     "FloorDiv": "floor({0} / {1})",
     "Eq": "f32({0} == {1})", "Ne": "f32({0} != {1})",
@@ -42,7 +43,8 @@ _BINARY: dict[str, str] = {
 }
 
 _UNARY: dict[str, str] = {
-    "Neg": "(-{0})", "Abs": "abs({0})", "LNot": "f32(!bool({0}))",
+    "Neg": "(-{0})", "Abs": "abs({0})", "Sqrt": "sqrt({0})",
+    "LNot": "f32(!bool({0}))",
     "Not": "bitcast<f32>(~bitcast<u32>({0}))",
     "neg": "(-{0})", "abs": "abs({0})", "sqrt": "sqrt({0})",
     "exp": "exp({0})", "log": "log({0})", "sin": "sin({0})",

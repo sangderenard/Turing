@@ -195,6 +195,33 @@ def test_fast_contract_legalizes_float64_through_a_backend_identity():
     ]
 
 
+def test_repository_spellings_for_sqrt_and_extrema_emit_to_wgsl():
+    value = SSAValue(710, "float32")
+    other = SSAValue(711, "float32")
+    root = SSAValue(712, "float32")
+    maximum = SSAValue(713, "float32")
+    minimum = SSAValue(714, "float32")
+    function = Function("surface", [value, other], {
+        "entry": BasicBlock("entry", [
+            Instr("Sqrt", [value], root),
+            Instr("Max", [root, other], maximum),
+            Instr("Min", [maximum, value], minimum),
+            Instr("Ret", [minimum], None),
+        ]),
+    })
+
+    artifact = emit_module(
+        IRModule({"surface": function}),
+        name="surface",
+        outputs={"surface": (minimum,)},
+    )
+
+    assert artifact.complete
+    assert "sqrt(v_710)" in artifact.source
+    assert "max(v_712, v_711)" in artifact.source
+    assert "min(v_713, v_710)" in artifact.source
+
+
 def test_canonical_ssa_diamond_emits_structured_if_else():
     condition = SSAValue(0, "bool")
     left = SSAValue(1, "float32")
