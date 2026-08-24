@@ -96,6 +96,7 @@ def use_signal_kernels(quality: str = "double2") -> str:
     global _IMPLEMENTATION, _QUALITY, _LAUNCHER
     _LAUNCHER = LaunchCoordinator(open_signal_bank(str(quality)))
     _KERNEL_KEYS.clear()
+    _KERNEL_CONSTANTS.clear()
     _IMPLEMENTATION, _QUALITY = "signal_kernels", str(quality)
     return _IMPLEMENTATION
 
@@ -120,6 +121,9 @@ def _surface():
 
 #: Method name -> the bank's spec key, resolved once per installed launcher.
 _KERNEL_KEYS: dict = {}
+
+#: Spec name -> its constant feeds, derived once per installed launcher.
+_KERNEL_CONSTANTS: dict = {}
 
 
 def _kernel_key(name: str):
@@ -198,15 +202,21 @@ def _routed(name: str, value):
     # are read from the spec's own example generator, which produces them
     # deterministically, and only for parameters the call does not supply.
     spec = _LAUNCHER.bank.specs[name]
-    constants = {
-        parameter: fed
-        for parameter, fed in spec.example_inputs(
-            {size: 1 for size in spec.size_parameters},
-            np.random.default_rng(0),
-        ).items()
-        if parameter in spec.parameter_order
-        and parameter not in ("x", "y", "n")
-    }
+    constants = _KERNEL_CONSTANTS.get(name)
+    if constants is None:
+        # Deterministic per spec, so derived once per installed launcher --
+        # rebuilding them from the example generator on every call was
+        # measured as a visible share of the routed call's overhead.
+        constants = {
+            parameter: fed
+            for parameter, fed in spec.example_inputs(
+                {size: 1 for size in spec.size_parameters},
+                np.random.default_rng(0),
+            ).items()
+            if parameter in spec.parameter_order
+            and parameter not in ("x", "y", "n")
+        }
+        _KERNEL_CONSTANTS[name] = constants
     # A wide kernel strides limbs through every buffer: the plain argument
     # occupies each element's leading limb with exact zeros below, and the
     # answer comes back as limbs whose sum is the collapsed double.
