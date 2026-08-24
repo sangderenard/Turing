@@ -115,6 +115,38 @@ _BINARY = {
     "Add": "+", "Sub": "-", "Mul": "*", "Div": "/",
 }
 
+#: Python's ``%`` and ``//`` are FLOORED -- the remainder carries the
+#: divisor's sign -- while C's ``%`` and ``/`` truncate toward zero. The
+#: difference is invisible until an operand goes negative, and then it is
+#: an out-of-bounds read rather than a wrong number: a periodic wrap like
+#: ``(row - 1) % height`` returns -1 instead of height-1 and addresses a
+#: whole row BEFORE the buffer. The LLVM lane already spells the floored
+#: form; these are the same correction in C, kept as named helpers because
+#: the fix needs each operand twice and a macro would evaluate side
+#: effects twice with it.
+_FLOORED_HELPERS = (
+    "static long long turing_imod(long long a, long long b) {",
+    "    long long r = a % b;",
+    "    return (r != 0 && ((r ^ b) < 0)) ? r + b : r;",
+    "}",
+    "static long long turing_ifloordiv(long long a, long long b) {",
+    "    long long q = a / b, r = a % b;",
+    "    return (r != 0 && ((r ^ b) < 0)) ? q - 1 : q;",
+    "}",
+    "static double turing_fmod(double a, double b) {",
+    "    double r = fmod(a, b);",
+    "    return (r != 0.0 && ((r < 0.0) != (b < 0.0))) ? r + b : r;",
+    "}",
+    "static double turing_ffloordiv(double a, double b) {",
+    "    return floor(a / b);",
+    "}",
+)
+#: (integer helper, double helper) per opcode.
+_FLOORED = {
+    "Mod": ("turing_imod", "turing_fmod"),
+    "FloorDiv": ("turing_ifloordiv", "turing_ffloordiv"),
+}
+
 #: C is the one destination where both halves of the precision-section API
 #: have a STANDARD answer rather than a compiler-specific one.
 #:
@@ -301,6 +333,10 @@ def emit_ssa_function_to_c(
             )
         elif op in _BINARY and len(args) == 2:
             rendered = f"({args[0]} {_BINARY[op]} {args[1]})"
+        elif op in _FLOORED and len(args) == 2:
+            # This lane is all-double, so only the floating spelling can
+            # apply; the floored correction is the same one either way.
+            rendered = f"{_FLOORED[op][1]}({args[0]}, {args[1]})"
         elif op in {"Max", "Min"} and len(args) == 2:
             rendered = f"f{op.lower()}({args[0]}, {args[1]})"
         elif op == "Neg" and len(args) == 1:
@@ -386,6 +422,7 @@ def emit_ssa_function_to_c(
         "#else",
         "#define TURING_EXPORT __attribute__((visibility(\"default\")))",
         "#endif",
+        *_FLOORED_HELPERS,
         f"TURING_EXPORT void {name}(const double *in, double *out) {{",
         *emitted_tables.values(),
         *lines,
@@ -889,6 +926,16 @@ def emit_ssa_module_to_c(
                         f"const {kind} t{result_id} = "
                         f"({args[0]} {_BINARY[op]} {args[1]});"
                     )
+                elif op in _FLOORED and len(args) == 2:
+                    integral = all(map(is_integer, instruction.args))
+                    helper = _FLOORED[op][0 if integral else 1]
+                    kind = "long long" if integral else "double"
+                    if integral:
+                        integer_ids.add(result_id)
+                    declared = (
+                        f"const {kind} t{result_id} = "
+                        f"{helper}({args[0]}, {args[1]});"
+                    )
                 elif op in _C_COMPARISONS and len(args) == 2:
                     integer_ids.add(result_id)
                     declared = (
@@ -973,6 +1020,8 @@ def emit_ssa_module_to_c(
         "#else",
         "#define TURING_EXPORT __attribute__((visibility(\"default\")))",
         "#endif",
+        "",
+        *_FLOORED_HELPERS,
         "",
         *prototypes,
         "",

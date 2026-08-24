@@ -253,6 +253,25 @@ def tensor_identity(value: Any) -> int:
     return id(value)
 
 
+def _defers_to_reflected(other: Any) -> bool:
+    """Whether a forward dunder should step aside for ``other``'s own.
+
+    ``Precision`` is not an ``AbstractTensor`` -- it composes several of
+    them -- and carries its own ``__radd__``/``__rsub__``/etc. Python only
+    tries those when the forward call answers ``NotImplemented``; left
+    unchecked, ``AbstractTensor``'s forward operator instead falls through
+    to the numpy-facing backend, which does not recognise a ``Precision``
+    operand and raises trying to use it as an array dtype. That failure
+    reads as "numpy doesn't understand precision", but numpy is never
+    supposed to see it -- the reflected method is, and this is what lets
+    it.
+    """
+
+    from .extended_precision import Precision
+
+    return isinstance(other, Precision)
+
+
 class AbstractTensor:
     # Declared so ``tensor_identity`` reads a slot that always exists rather
     # than a lookup that misses on first use. Instances overwrite it with
@@ -2658,15 +2677,23 @@ class AbstractTensor:
 
 
     def __add__(self, other):
+        if _defers_to_reflected(other):
+            return NotImplemented
         return self._apply_operator("add", self, other)
 
     def __sub__(self, other):
+        if _defers_to_reflected(other):
+            return NotImplemented
         return self._apply_operator("sub", self, other)
 
     def __mul__(self, other):
+        if _defers_to_reflected(other):
+            return NotImplemented
         return self._apply_operator("mul", self, other)
 
     def __truediv__(self, other):
+        if _defers_to_reflected(other):
+            return NotImplemented
         return self._apply_operator("truediv", self, other)
 
     def __floordiv__(self, other):

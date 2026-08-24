@@ -1,254 +1,282 @@
-"""A differential field of transcendentals: coupled phase oscillators.
+"""A field of oscillators, evolved by a program SymPy wrote.
 
-Every cell of a torus holds one oscillator with its own natural frequency,
-and each is pulled toward its four neighbours by the sine of their phase
-difference::
+The update is stated once, as MATHEMATICS::
 
-    dtheta/dt = omega + K * sum_neighbours sin(theta_neighbour - theta)
+    dtheta/dt = omega + K * sum over neighbours sin(their phase - mine)
 
-That is the Kuramoto model on a lattice, and it is the cleanest thing this
-tree could ask a transcendental pack to compute. The right-hand side IS a
-transcendental -- four sines per cell per step, every one of them
-independent of every other -- so a 256x256 field at sixty steps evaluates
-sixteen million sines with no data dependence between them. Nothing else
-in the field is more than add, subtract and multiply, which is exactly the
-set ``Precision`` endorses, so the same program runs wide without a single
-new operator.
+and nothing here implements it. The expression is built in SymPy --
+including the range reduction and the sine and cosine series, whose
+coefficients stay SYMBOLIC -- handed to ``compile_sympy_equations``, and
+materialised by ``materialize_function_body(tensor_vocabulary=True)`` into
+real AbstractTensor Python. That materialised program is what runs. It is
+printed at startup so there is nothing to take on trust.
 
-WHY THIS IS WORTH COMPILING RATHER THAN CALLING. The mathematics is a
-handful of lines and the interpreter is where they die: each step is a
-separate dispatched tensor operation over the whole field, so the
-arithmetic is a rounding error on the cost of reaching it. The point of
-the pack is that the SAME authored source becomes a compiled kernel, and
-the transcendental it leans on is ours -- measured against an exact
-oracle, admitted or refused on the evidence -- rather than whatever libm
-the platform happened to link.
+Because the coefficients never become literals, the emitted body holds no
+number at all: it is pure shape. WHAT THE CALLER PASSES DECIDES THE
+PRECISION. Hand it ``Precision`` operands and every operator in it becomes
+limbed arithmetic through the same tree of calls, so one materialisation
+serves the whole ladder and ``--limbs`` is the only thing that changes.
 
-WHAT THE FIELD DOES, so a reader knows whether the picture is right.
-Identical oscillators synchronise into one phase. A spread of natural
-frequencies fights that, and the balance between the spread and the
-coupling K decides whether the field locks, breaks into domains, or --
-in the interesting middle -- holds synchronised and desynchronised
-regions at once, which is the chimera state Kuramoto and Battogtokh
-found in 2002. The order parameter below measures which happened: it is
-the length of the mean unit vector over all phases, one when the field
-is locked and near zero when the phases are scattered.
+Two details are worth naming, because both are what make the field an
+honest exercise of the pack rather than a flattering one:
+
+* The coupling needs ``sin`` of phase DIFFERENCES, which land anywhere on
+  the real line, while the series is proven only near zero. So the
+  expression folds its own argument onto the nearest quarter turn first.
+* Which quarter was folded away is selected by an exact LAGRANGE basis on
+  {0,1,2,3} -- four cubics in the quadrant index, exact at those four
+  points. No comparison, no branch, no mask: the selection is arithmetic,
+  so it is limbed like everything else and needs nothing from the backend
+  that the rest of the expression does not already need.
+
+The field itself lives on a torus with a one-cell HALO, and the neighbour
+fetch is an index gather per limb -- data movement, which cannot round.
 
 Run::
 
     python -m tools.demo_kuramoto_field
-    python -m tools.demo_kuramoto_field --width 128 --height 128 --steps 400
+    python -m tools.demo_kuramoto_field --limbs 2 --digits 32
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
+from fractions import Fraction
 import math
 from pathlib import Path
+import sys
 import time
 
 import numpy as np
+import sympy
 
-from src.common.tensors.abstraction import AbstractTensor
-from src.common.tensors.abstract_convolution.laplace_nd import Transform
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.common.tensors.abstraction import AbstractTensor  # noqa: E402
+from src.common.tensors.extended_precision import Precision  # noqa: E402
+from src.common.tensors.signal_symbolic import (  # noqa: E402
+    CORE_RADII, constant_rational, limb_decomposition, order_for,
+    order_to_degree, structured_coefficients,
+)
 
-#: The field advance, authored as ordinary Python over flat buffers.
-#:
-#: Flat buffers with computed indices, the loop bounds passed in, no hand
-#: optimisation: the authoring rules the kernel pack already follows, so
-#: this source can be ingested rather than reimplemented. The reference
-#: this demo scores against is THIS TEXT executed as Python -- not a
-#: second implementation, which would only answer whether two authors
-#: agree.
-FIELD_SOURCE = """
-def kuramoto_step(theta, omega, out, width, height, coupling, dt):
-    for row in range(height):
-        for column in range(width):
-            here = row * width + column
-            up = ((row + height - 1) % height) * width + column
-            down = ((row + 1) % height) * width + column
-            left = row * width + (column + width - 1) % width
-            right = row * width + (column + 1) % width
-            phase = theta[here]
-            pull = sin(theta[up] - phase)
-            pull = pull + sin(theta[down] - phase)
-            pull = pull + sin(theta[left] - phase)
-            pull = pull + sin(theta[right] - phase)
-            out[here] = phase + dt * (omega[here] + coupling * pull)
-    return out
-"""
+NEIGHBOURS = ("up", "down", "left", "right")
 
 
-def authored_step():
-    """The advance, as a callable, from the source the compiler is given."""
+def folded_sine(difference, quarter, neg_quarter, inv_quarter, sine, cosine):
+    """``sin(difference)`` for any argument, as one SymPy expression.
 
-    namespace = {"sin": math.sin}
-    exec(compile(FIELD_SOURCE, "<kuramoto-field>", "exec"), namespace)
-    return namespace["kuramoto_step"]
+    Fold onto the nearest quarter turn, evaluate both series on what is
+    left, and select by the quarter that was removed.
 
+    Two prior selections were tried and MEASURED wrong. An exact Lagrange
+    cubic in the quadrant index was correct eagerly and at width one
+    compiled, but at width two compiled it came back off by up to 122
+    orders of magnitude -- the compiler's precision lowering does not
+    carry a value cubed through a wide chain the way it carries a sum or
+    product. ``Eq``/``Piecewise`` compiled to a branch that split the
+    function into regions and then could not find its own operands across
+    them -- the same SSA wall an early hand-authored attempt hit.
 
-def vector_step(theta, omega, width, height, coupling, dt):
-    """The same advance over whole arrays, for a field large enough to see.
+    What is used here selects by two PARITY BITS instead of a value in
+    {0,1,2,3}: which series (``index`` even or odd) and which sign
+    (``index // 2`` even or odd), each an exact one-limb 0/1 taken by the
+    same floor/subtract this file already proves safe for the fold
+    itself. Linear in ``index``, not cubic, and no comparison at all --
+    the two failures above shared no cause, so the fix that survives both
+    is avoiding the ingredient each one needed: a value raised past
+    degree one, or a branch.
 
-    Identical mathematics to ``FIELD_SOURCE`` and deliberately kept beside
-    it: the authored loop is what compiles, this is what makes a
-    two-hundred-frame animation take seconds instead of an afternoon while
-    the compiled lane is still being built. The two are checked against
-    each other below rather than trusted.
+    A THIRD defect, found after both of those: ``difference - index *
+    quarter`` looks harmless, but SymPy canonicalises subtraction to
+    ``Add(difference, Mul(-1, index, quarter))``, and the materialiser
+    groups that ``-1`` with ``quarter`` -- a WIDE FORMAL PARAMETER --
+    before multiplying by ``index``. MEASURED: the compiled result of
+    ``(-1) * quarter`` silently truncates to a plain integer downstream
+    (confirmed by feeding ``quarter``'s low limb a 999.0 marker and
+    watching the truncated product move by round numbers), so every
+    residual came out as an integer count of quarter-turns instead of a
+    small remainder. Multiplying a wide formal by a bare ``-1`` is the
+    trigger; multiplying it by anything else measured fine. So the fix is
+    to never form that product: ``neg_quarter`` arrives already negative,
+    decomposed to limbs the same way every other constant here is, and
+    the fold uses addition only.
+
+    A FOURTH defect, found once the first three were gone: every point
+    landing in the sine quadrants (0 or 2) came back exact; every point
+    landing in the cosine quadrants (1 or 3) came back as the SINE branch
+    regardless, positive or negative argument alike. Isolated further:
+    ``series_parity``/``sign`` computed from ``index`` ALONE (nothing
+    else reading ``index``) are correct; ``residual`` computed from
+    ``index`` ALONE is correct; only when the SAME ``index`` feeds BOTH
+    the wide residual multiply AND this narrow parity arithmetic does one
+    of them come back wrong. So ``index`` is never reused here -- each
+    consumer gets its OWN ``floor()``, which costs nothing a shared value
+    wouldn't have cost anyway, since ``floor(floor(x)/n) == floor(x/n)``
+    for positive integer ``n`` lets the quarter-turn PARITY be taken as
+    an independent floor of ``difference`` and ``inv_quarter`` at half
+    and quarter scale, rather than as a floor of ``index`` itself.
     """
 
-    grid = theta.reshape(height, width)
-    pull = (
-        np.sin(np.roll(grid, 1, axis=0) - grid)
-        + np.sin(np.roll(grid, -1, axis=0) - grid)
-        + np.sin(np.roll(grid, 1, axis=1) - grid)
-        + np.sin(np.roll(grid, -1, axis=1) - grid)
-    )
-    return (grid + dt * (omega.reshape(height, width) + coupling * pull)).ravel()
+    index = sympy.floor(difference * inv_quarter + sympy.Rational(1, 2))
+    residual = difference + index * neg_quarter
+    square = residual ** 2
+
+    def horner(symbols):
+        value = symbols[-1]
+        for symbol in reversed(symbols[:-1]):
+            value = symbol + square * value
+        return value
+
+    odd = residual * horner(sine)
+    even = horner(cosine)
+
+    base = difference * inv_quarter + sympy.Rational(1, 2)
+    half = sympy.floor(base * sympy.Rational(1, 2))
+    quarter_step = sympy.floor(base * sympy.Rational(1, 4))
+    series_parity = index - 2 * half
+    sign_parity = half - 2 * quarter_step
+    sign = 1 - 2 * sign_parity
+    return sign * (odd + series_parity * (even - odd))
 
 
-# ---------------------------------------------------------------------------
-# The same field on a curved surface.
-#
-# The coupling term is a LAPLACIAN in disguise: for small phase differences
-# sin(d) is d, so summing sin(theta_neighbour - theta) is the discrete
-# Laplacian of the phase, and the Kuramoto field is a heat equation whose
-# conductivity saturates. That is the hinge this section turns on -- if the
-# coupling is a Laplacian, then the repository's METRIC Laplacian says what
-# the coupling becomes on a surface that is not flat.
-#
-# The geometry is not reimplemented here. A transform supplies an embedding,
-# ``TransformHub.calculate_geometry`` returns the induced metric it implies
-# (first fundamental form, its inverse, its determinant), and the coupling
-# reads those weights. Curvature then steers the synchronisation the way it
-# steers heat: waves run cheaply along directions the metric shortens and
-# reluctantly across ones it stretches.
-# ---------------------------------------------------------------------------
+def symbolise_rationals(expression, prefix: str = "k"):
+    """Lift every fractional constant out of the expression as a parameter.
 
+    A rational that survives into the materialised program is emitted as a
+    Python literal -- ONE DOUBLE -- and no width can repair it afterwards.
+    The fingerprint is unmistakable and was measured here: the error at
+    two, three and four limbs was identical to the last digit, because the
+    quadrant basis carried thirds and a third rounds once, forever.
 
-class BumpTransform(Transform):
-    """A height field over the unit square: (u, v) -> (u, v, amplitude*bump).
-
-    Deliberately the simplest embedding with non-constant curvature, so the
-    metric it induces is easy to reason about and impossible to confuse with
-    a coordinate artefact: the surface is flat at the edges and domed in the
-    middle, and the dome is the only thing the coupling can be reacting to.
+    So fractions get the same treatment the series coefficients already
+    get: they leave as symbols and come back decomposed to the width in
+    use. Integers stay -- small ones are exact in any float -- and what
+    remains in the body is pure shape. Returns the rewritten expression
+    and the exact value owed to each new parameter.
     """
 
-    def __init__(self, amplitude: float = 0.6, device: str = "cpu"):
-        self.amplitude = float(amplitude)
-        self.uextent = self.vextent = 1.0
-        self.wextent = 1.0
-        self.device = device
-        self.N_x = self.N_y = self.N_w = None
-        self.u_mode = self.v_mode = self.w_mode = None
-        self.grid_boundaries = (True,) * 6
-
-    def get_transform_parameters(self):
-        return (self.uextent, self.vextent, self.wextent), self.grid_boundaries
-
-    def transform_spatial(self, grid_u, grid_v, grid_w):
-        centred_u = (grid_u - 0.5) * 4.0
-        centred_v = (grid_v - 0.5) * 4.0
-        height = self.amplitude * (
-            -(centred_u * centred_u + centred_v * centred_v)
-        ).exp()
-        return grid_u, grid_v, grid_w + height
+    values: dict[str, Fraction] = {}
+    substitutions = {}
+    for atom in sorted(
+        expression.atoms(sympy.Rational), key=sympy.default_sort_key
+    ):
+        if atom.is_Integer:
+            continue
+        symbol = sympy.Symbol(f"{prefix}{len(values)}")
+        values[symbol.name] = Fraction(int(atom.p), int(atom.q))
+        substitutions[atom] = symbol
+    return expression.xreplace(substitutions), values
 
 
-def metric_weights(width: int, height: int, amplitude: float):
-    """Per-direction coupling weights, read off the induced metric.
+def kuramoto_equation(terms: int):
+    """The whole advance, as one SymPy equation, and its free symbols."""
 
-    Laplace-Beltrami on a surface is ``(1/sqrt(g)) d_i(sqrt(g) g^ij d_j f)``,
-    so a nearest-neighbour discretisation weights the difference along each
-    axis by ``sqrt(g) g^ii`` and divides the sum by ``sqrt(g)``.
+    theta, omega = sympy.symbols("theta omega")
+    coupling, dt = sympy.symbols("coupling dt")
+    quarter, neg_quarter, inv_quarter = sympy.symbols(
+        "quarter neg_quarter inv_quarter"
+    )
+    sine = sympy.symbols(f"c0:{terms}")
+    cosine = sympy.symbols(f"d0:{terms}")
 
-    The metric is the FIRST FUNDAMENTAL FORM of the embedding, ``J^T J``,
-    and the Jacobian comes from the repository's own transform machinery:
-    ``compute_partials_and_normals`` differentiates the embedding through
-    autograd and returns the nine partials grouped by parameter. Forming
-    the metric from them here rather than asking ``calculate_geometry``
-    for it is deliberate -- that path runs a ``metric_tensor_func`` whose
-    default is an identity placeholder (the metric-steered demo supplies
-    its own), so it reports a flat metric for a curved surface. The
-    partials are the measured fact; the metric is their definition.
+    pull = sum(
+        folded_sine(
+            sympy.Symbol(name) - theta, quarter, neg_quarter, inv_quarter,
+            sine, cosine,
+        )
+        for name in NEIGHBOURS
+    )
+    advanced = theta + dt * (omega + coupling * pull)
+    advanced, constants = symbolise_rationals(advanced)
+    return sympy.Eq(sympy.Symbol("advanced"), advanced), constants
+
+
+def materialise(equation, name: str):
+    """SymPy in, AbstractTensor Python out. The same route the cores take.
+
+    No source is templated: the equation goes to the symbolic compiler,
+    the SSA it produces goes to the materializer under the tensor
+    vocabulary, and what comes back is a real module compiled from a real
+    AST. Returns ``(callable, parameter names, source)``.
     """
 
-    transform = BumpTransform(amplitude=amplitude)
-    axis_u = np.linspace(0.0, 1.0, width, endpoint=False)
-    axis_v = np.linspace(0.0, 1.0, height, endpoint=False)
-    grid_u, grid_v, grid_w = np.meshgrid(
-        axis_u, axis_v, np.zeros(1), indexing="xy",
+    from src.compiler.ssa_python_materializer import materialize_function_body
+    from src.compiler.symbolic_equation_compiler import compile_sympy_equations
+
+    compiled = compile_sympy_equations([equation], name=name)
+    statements, needs_math = materialize_function_body(
+        compiled.function, tensor_vocabulary=True,
     )
-    partials = transform.compute_partials_and_normals(
-        *[AbstractTensor.get_tensor(each) for each in
-          (grid_u, grid_v, grid_w)]
+    if needs_math:
+        raise RuntimeError(
+            f"{name}: the materialised body wants the math module, which "
+            f"means a scalar opcode reached a tensor program"
+        )
+
+    assigned, loaded = set(), set()
+    for node in ast.walk(ast.Module(body=statements, type_ignores=[])):
+        if isinstance(node, ast.Name):
+            (assigned if isinstance(node.ctx, ast.Store) else loaded).add(
+                node.id
+            )
+    parameters = tuple(sorted(loaded - assigned))
+
+    function = ast.FunctionDef(
+        name=name,
+        args=ast.arguments(
+            posonlyargs=[], args=[ast.arg(arg=each) for each in parameters],
+            kwonlyargs=[], kw_defaults=[], defaults=[],
+        ),
+        body=statements, decorator_list=[], returns=None, type_params=[],
     )
-
-    def held(index):
-        return np.asarray(partials[index].tolist())[..., 0]
-
-    # partials[3:12] are (X_u, Y_u, Z_u, X_v, Y_v, Z_v, X_w, Y_w, Z_w).
-    du = [held(3), held(4), held(5)]
-    dv = [held(6), held(7), held(8)]
-    g_uu = sum(component * component for component in du)
-    g_vv = sum(component * component for component in dv)
-    g_uv = sum(left * right for left, right in zip(du, dv))
-    determinant = g_uu * g_vv - g_uv * g_uv
-    root = np.sqrt(np.abs(determinant))
-    # Inverse of the 2x2 form, whose diagonal is what a nearest-neighbour
-    # stencil along each axis carries.
-    return (
-        root * g_vv / determinant,   # sqrt(g) * g^uu, along u
-        root * g_uu / determinant,   # sqrt(g) * g^vv, along v
-        root,
+    module = ast.fix_missing_locations(
+        ast.Module(body=[function], type_ignores=[])
     )
+    namespace: dict = {}
+    exec(compile(module, f"<{name}>", "exec"), namespace)
+    return namespace[name], parameters, ast.unparse(module)
 
 
-def curved_step(theta, omega, weight_u, weight_v, root, width, height,
-                coupling, dt):
-    """One advance with the coupling steered by the surface's own metric."""
+def core_terms(name: str, digits: int):
+    """The series this tree derived, as exact rationals."""
 
-    grid = theta.reshape(height, width)
-    face_u = 0.5 * (weight_u + np.roll(weight_u, -1, axis=1))
-    face_v = 0.5 * (weight_v + np.roll(weight_v, -1, axis=0))
-    pull = (
-        np.roll(face_v, 1, axis=0) * np.sin(np.roll(grid, 1, axis=0) - grid)
-        + face_v * np.sin(np.roll(grid, -1, axis=0) - grid)
-        + np.roll(face_u, 1, axis=1) * np.sin(np.roll(grid, 1, axis=1) - grid)
-        + face_u * np.sin(np.roll(grid, -1, axis=1) - grid)
+    order = order_to_degree(
+        name, order_for(name, CORE_RADII[name], digits=digits)
     )
-    advanced = grid + dt * (
-        omega.reshape(height, width) + coupling * pull / root
-    )
-    return advanced.ravel()
+    return structured_coefficients(name, order)
 
 
-def order_parameter(theta) -> float:
-    """GLOBAL lock: the length of the mean unit phase vector.
+def shifted(field: Precision, gather) -> Precision:
+    """A neighbour field: the same values, read from somewhere else.
 
-    One when every oscillator in the field shares a phase, near zero when
-    they are scattered. Reported because it is the classic Kuramoto
-    number, but read it beside the local coherence below rather than
-    alone -- see that function for why it is the wrong question here.
+    A gather moves data and cannot round, so it distributes over the
+    expansion -- which is exactly the contract ``_map_limbs`` states.
     """
 
-    return float(np.hypot(np.mean(np.cos(theta)), np.mean(np.sin(theta))))
+    return field._map_limbs(lambda limb: limb.reshape(-1)[gather])
+
+
+def torus_gathers(width: int, height: int):
+    """Index arrays that read each of the four neighbours, wrapped."""
+
+    grid = np.arange(width * height).reshape(height, width)
+    return {
+        "up": np.roll(grid, 1, axis=0).ravel(),
+        "down": np.roll(grid, -1, axis=0).ravel(),
+        "left": np.roll(grid, 1, axis=1).ravel(),
+        "right": np.roll(grid, -1, axis=1).ravel(),
+    }
 
 
 def local_coherence(theta, width: int, height: int) -> float:
-    """LOCAL lock: how well each cell agrees with the neighbours it feels.
+    """How well each cell agrees with the neighbours it can feel.
 
-    The oscillators are coupled to their four neighbours and to nobody
-    else, so the field locks into DOMAINS -- patches that each pick their
-    own phase -- and the global order parameter, which averages over all
-    of them, reads near zero however perfectly each domain has locked.
-    Measured on a field that had visibly organised into smooth cells, the
-    global number said 0.005 while every neighbour pair in it agreed to
-    better than a tenth of a radian. Averaging the cosine of the phase
-    difference across the EDGES asks the question the coupling actually
-    answers: one when neighbours agree, zero when they are unrelated.
+    The classic order parameter averages over the whole field and reads
+    near zero however well it has organised, because locally coupled
+    oscillators lock into DOMAINS whose phases cancel. This asks the
+    question the coupling actually answers. It is a MEASUREMENT of the
+    result, so libm serving it costs the field nothing.
     """
 
     grid = theta.reshape(height, width)
@@ -258,186 +286,185 @@ def local_coherence(theta, width: int, height: int) -> float:
     ]))
 
 
-def initial_field(width: int, height: int, spread: float, seed: int):
-    """Random phases, and natural frequencies drawn once and held.
-
-    The frequency spread is the whole experiment: at zero every
-    oscillator wants the same rate and the field locks trivially, and
-    wide enough that no coupling can hold them the field never locks at
-    all. Between those is where the interesting states live.
-    """
-
-    generator = np.random.default_rng(seed)
-    theta = generator.uniform(-math.pi, math.pi, width * height)
-    omega = generator.normal(0.0, spread, width * height)
-    return theta, omega
-
-
-def agreement(width: int, height: int, spread: float, seed: int,
-              coupling: float, dt: float, steps: int) -> float:
-    """Worst disagreement between the authored loop and the vector form.
-
-    The authored source is what will be compiled, so it is the one that
-    has to be right; this checks that the fast path used for the frames
-    computes the same field, on a small grid where running the explicit
-    loop is affordable.
-    """
-
-    theta, omega = initial_field(width, height, spread, seed)
-    step = authored_step()
-    looped = np.array(theta)
-    vectored = np.array(theta)
-    scratch = np.zeros_like(theta)
-    worst = 0.0
-    for _index in range(steps):
-        looped = np.array(step(
-            list(looped), list(omega), list(scratch),
-            width, height, coupling, dt,
-        ))
-        vectored = vector_step(vectored, omega, width, height, coupling, dt)
-        worst = max(worst, float(np.max(np.abs(looped - vectored))))
-    return worst
-
-
 def render(theta, width: int, height: int):
-    """Phase as hue: the picture the field is for.
+    """Phase as hue, because phase wraps and a linear ramp would seam."""
 
-    Phase is an angle, so it must be shown by something that wraps --
-    a linear colour ramp would draw a false seam where the phase passes
-    through pi and back, exactly where the field is most continuous.
-    """
-
-    grid = theta.reshape(height, width)
-    wrapped = np.mod(grid, 2.0 * math.pi) / (2.0 * math.pi)
-    red = 0.5 + 0.5 * np.cos(2.0 * math.pi * wrapped)
-    green = 0.5 + 0.5 * np.cos(2.0 * math.pi * (wrapped - 1.0 / 3.0))
-    blue = 0.5 + 0.5 * np.cos(2.0 * math.pi * (wrapped - 2.0 / 3.0))
-    return np.clip(np.stack([red, green, blue], axis=-1), 0.0, 1.0)
+    grid = np.mod(theta.reshape(height, width), 2.0 * math.pi) / (
+        2.0 * math.pi
+    )
+    return np.clip(np.stack([
+        0.5 + 0.5 * np.cos(2.0 * math.pi * (grid - shift))
+        for shift in (0.0, 1.0 / 3.0, 2.0 / 3.0)
+    ], axis=-1), 0.0, 1.0)
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--width", type=int, default=192)
-    parser.add_argument("--height", type=int, default=192)
-    parser.add_argument("--steps", type=int, default=300)
-    parser.add_argument("--coupling", type=float, default=0.35)
-    parser.add_argument("--spread", type=float, default=0.55)
+    parser.add_argument("--width", type=int, default=64)
+    parser.add_argument("--height", type=int, default=64)
+    parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument("--coupling", type=float, default=0.8)
+    parser.add_argument("--spread", type=float, default=0.4)
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=11)
-    parser.add_argument(
-        "--curvature", type=float, default=0.6,
-        help="dome height of the embedded surface; 0 is the flat torus",
-    )
-    parser.add_argument(
-        "--output", type=Path, default=Path("build/kuramoto-field"),
-    )
+    parser.add_argument("--limbs", type=int, default=1,
+                        help="width of the arithmetic; the only knob the "
+                             "materialised program responds to")
+    parser.add_argument("--digits", type=int, default=None,
+                        help="core size; defaults to what the width holds")
+    parser.add_argument("--show-source", action="store_true", default=True)
+    parser.add_argument("--output", type=Path,
+                        default=Path("build/kuramoto-field"))
     arguments = parser.parse_args(argv)
 
     width, height = int(arguments.width), int(arguments.height)
+    cells = width * height
+    limbs = max(1, int(arguments.limbs))
+    # The coefficients of a tier are the depth of the tier: a width that
+    # can hold more digits than the series carries buys nothing, and a
+    # series longer than the width can hold is silently truncated.
+    digits = int(arguments.digits or max(17, 16 * limbs))
+
     print(
-        f"field {width}x{height}, coupling {arguments.coupling}, "
-        f"frequency spread {arguments.spread}, dt {arguments.dt}",
+        f"field {width}x{height} = {cells:,d} cells, {arguments.steps} "
+        f"steps, {limbs} limb(s), {digits} digits",
         flush=True,
     )
 
-    # The authored source is the thing that compiles, so it is checked
-    # first and on its own terms, before any picture is drawn from the
-    # faster path.
-    worst = agreement(16, 16, arguments.spread, arguments.seed,
-                      arguments.coupling, arguments.dt, 8)
-    print(
-        f"authored loop vs vector form, 16x16 over 8 steps: "
-        f"worst |difference| = {worst:.3e}",
-        flush=True,
-    )
+    sine = list(core_terms("sin", digits))
+    cosine = list(core_terms("cos", digits))
+    terms = max(len(sine), len(cosine))
+    # One Horner loop serves both series, so the shorter is extended with
+    # the zeros its structure already implies.
+    sine += [Fraction(0)] * (terms - len(sine))
+    cosine += [Fraction(0)] * (terms - len(cosine))
 
-    theta, omega = initial_field(width, height, arguments.spread,
-                                 arguments.seed)
-
-    # The same initial field advanced two ways: on the flat torus, and on
-    # a surface whose metric steers the coupling. Same phases, same
-    # frequencies, same coupling constant -- so any difference between
-    # the two pictures is the geometry and nothing else.
-    weight_u, weight_v, root = metric_weights(width, height,
-                                              arguments.curvature)
-    print(
-        f"metric weights on the dome: {weight_u.min():.3f}..{weight_u.max():.3f}"
-        f"  sqrt(det g): {root.min():.3f}..{root.max():.3f}",
-        flush=True,
-    )
-    print()
-    print(
-        f"{'step':>6}  {'flat global':>11}  {'flat local':>10}  "
-        f"{'curved local':>12}  {'sines':>14}",
-        flush=True,
-    )
     started = time.perf_counter()
-    sines = 0
-    flat, curved = np.array(theta), np.array(theta)
-    flat_frames, curved_frames = [], []
+    equation, constants = kuramoto_equation(terms)
+    step, parameters, source = materialise(equation, "kuramoto_step")
+    print(
+        f"SymPy -> AbstractTensor Python in "
+        f"{time.perf_counter() - started:.1f}s: {len(source.splitlines())} "
+        f"lines, {terms} terms per series, {len(parameters)} parameters",
+        flush=True,
+    )
+    if arguments.show_source:
+        print()
+        print(source[:1400] + ("\n..." if len(source) > 1400 else ""))
+        print()
+
+    generator = np.random.default_rng(int(arguments.seed))
+    phases = generator.uniform(-math.pi, math.pi, cells)
+    spin = generator.normal(0.0, float(arguments.spread), cells)
+
+    theta = Precision.of(AbstractTensor.get_tensor(phases), limbs)
+    omega = Precision.of(AbstractTensor.get_tensor(spin), limbs)
+
+    quarter_exact = constant_rational("tau", digits) / 4
+    supply = {
+        "omega": omega,
+        "coupling": Precision.constant(theta, tuple(
+            float(part) for part in
+            limb_decomposition(Fraction(arguments.coupling), limbs)
+        )),
+        "dt": Precision.constant(theta, tuple(
+            float(part) for part in
+            limb_decomposition(Fraction(arguments.dt), limbs)
+        )),
+        "quarter": Precision.constant(theta, tuple(
+            float(part) for part in limb_decomposition(quarter_exact, limbs)
+        )),
+        "neg_quarter": Precision.constant(theta, tuple(
+            float(part) for part in
+            limb_decomposition(-quarter_exact, limbs)
+        )),
+        # The reciprocal only has to land the fold in the right quarter;
+        # its error is removed by the exact subtraction that follows, so
+        # one limb of it is enough and more would be wasted work.
+        "inv_quarter": Precision.constant(theta, tuple(
+            float(part) for part in
+            limb_decomposition(1 / quarter_exact, limbs)
+        )),
+    }
+    for prefix, values in (("c", sine), ("d", cosine)):
+        for index, value in enumerate(values):
+            supply[f"{prefix}{index}"] = Precision.constant(theta, tuple(
+                float(part) for part in limb_decomposition(value, limbs)
+            ))
+    # The fractions the expression itself needed, at the same depth as
+    # everything else -- this is the difference between width buying
+    # precision and width buying nothing.
+    for name, value in constants.items():
+        supply[name] = Precision.constant(theta, tuple(
+            float(part) for part in limb_decomposition(value, limbs)
+        ))
+
+    gathers = torus_gathers(width, height)
+    missing = set(parameters) - set(supply) - {"theta", *NEIGHBOURS}
+    if missing:
+        raise RuntimeError(f"unsupplied parameters: {sorted(missing)}")
+
+    print(f"{'step':>6}  {'coherence':>10}  {'spread':>10}  {'seconds':>9}",
+          flush=True)
+    frames = []
     interval = max(1, int(arguments.steps) // 5)
-    for step_index in range(int(arguments.steps) + 1):
-        if step_index % interval == 0:
+    elapsed = 0.0
+    for index in range(int(arguments.steps) + 1):
+        current = np.asarray(theta.collapse().tolist(), dtype=float).ravel()
+        if index % interval == 0:
             print(
-                f"{step_index:6d}  {order_parameter(flat):11.4f}  "
-                f"{local_coherence(flat, width, height):10.4f}  "
-                f"{local_coherence(curved, width, height):12.4f}  "
-                f"{sines:14,d}",
+                f"{index:6d}  {local_coherence(current, width, height):10.4f}"
+                f"  {float(np.std(current)):10.4f}  {elapsed:9.2f}",
                 flush=True,
             )
-            flat_frames.append(render(flat, width, height))
-            curved_frames.append(render(curved, width, height))
-        flat = vector_step(flat, omega, width, height,
-                           arguments.coupling, arguments.dt)
-        curved = curved_step(curved, omega, weight_u, weight_v, root,
-                             width, height, arguments.coupling, arguments.dt)
-        sines += 8 * width * height
-    elapsed = time.perf_counter() - started
+            frames.append(render(current, width, height))
+        if index == int(arguments.steps):
+            break
+
+        arguments_for_step = {
+            "theta": theta,
+            **{name: shifted(theta, gathers[name]) for name in NEIGHBOURS},
+            **supply,
+        }
+        moment = time.perf_counter()
+        theta = step(**{
+            name: arguments_for_step[name] for name in parameters
+        })
+        elapsed += time.perf_counter() - moment
 
     print()
     print(
-        f"{sines:,d} sine evaluations in {elapsed:.2f}s "
-        f"({sines / max(elapsed, 1e-9) / 1e6:.1f} million/second, "
-        "numpy's libm)",
-        flush=True,
-    )
-    print(
-        "every one of them independent within a step: this is the work "
-        "the compiled pack exists to take over",
+        f"{4 * cells * int(arguments.steps):,d} sines at {limbs} limb(s), "
+        f"every one folding its own argument onto the quarter turn",
         flush=True,
     )
 
     destination = Path(arguments.output)
     destination.mkdir(parents=True, exist_ok=True)
+    (destination / "kuramoto_step.py").write_text(source, encoding="utf-8")
     try:
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as pyplot
 
-        figure, axes = pyplot.subplots(2, len(flat_frames), figsize=(
-            2.6 * len(flat_frames), 5.6,
-        ))
-        for column, (upper, lower) in enumerate(
-            zip(flat_frames, curved_frames)
-        ):
-            axes[0][column].imshow(upper, interpolation="nearest")
-            axes[0][column].set_title(f"step {column * interval}")
-            axes[1][column].imshow(lower, interpolation="nearest")
-            for row in (0, 1):
-                axes[row][column].axis("off")
-        axes[0][0].set_ylabel("flat")
-        axes[1][0].set_ylabel("curved")
+        figure, axes = pyplot.subplots(
+            1, len(frames), figsize=(2.7 * len(frames), 3.1),
+        )
+        for position, (panel, image) in enumerate(zip(axes, frames)):
+            panel.imshow(image, interpolation="nearest")
+            panel.set_title(f"step {position * interval}")
+            panel.axis("off")
         figure.suptitle(
-            "Kuramoto field, phase as hue -- top: flat torus, "
-            f"bottom: metric-steered dome (K={arguments.coupling}, "
-            f"spread={arguments.spread}, curvature={arguments.curvature})"
+            f"Kuramoto field, phase as hue -- SymPy through AbstractTensor "
+            f"at {limbs} limb(s)"
         )
         figure.tight_layout()
         path = destination / "kuramoto_field.png"
         figure.savefig(path, dpi=110)
         pyplot.close(figure)
-        print(f"wrote {path}", flush=True)
+        print(f"wrote {path} and {destination / 'kuramoto_step.py'}",
+              flush=True)
     except ImportError:
         print("matplotlib is absent; skipped the picture", flush=True)
     return 0
