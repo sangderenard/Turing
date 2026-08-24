@@ -102,20 +102,23 @@ def folded_sine(difference, quarter, neg_quarter, inv_quarter, sine, cosine):
     decomposed to limbs the same way every other constant here is, and
     the fold uses addition only.
 
-    A FOURTH defect, found once the first three were gone: every point
-    landing in the sine quadrants (0 or 2) came back exact; every point
-    landing in the cosine quadrants (1 or 3) came back as the SINE branch
-    regardless, positive or negative argument alike. Isolated further:
-    ``series_parity``/``sign`` computed from ``index`` ALONE (nothing
-    else reading ``index``) are correct; ``residual`` computed from
-    ``index`` ALONE is correct; only when the SAME ``index`` feeds BOTH
-    the wide residual multiply AND this narrow parity arithmetic does one
-    of them come back wrong. So ``index`` is never reused here -- each
-    consumer gets its OWN ``floor()``, which costs nothing a shared value
-    wouldn't have cost anyway, since ``floor(floor(x)/n) == floor(x/n)``
-    for positive integer ``n`` lets the quarter-turn PARITY be taken as
-    an independent floor of ``difference`` and ``inv_quarter`` at half
-    and quarter scale, rather than as a floor of ``index`` itself.
+    A FOURTH defect turned out to be the THIRD one again, wearing a
+    different coat. At width two every point landing in the sine
+    quadrants was exact while every point in the cosine quadrants came
+    back as the sine branch -- the blend was selecting wrongly, and the
+    residual it blended was measurably correct. The blend was written
+    ``odd + parity * (even - odd)``, and ``even - odd`` is
+    ``Add(even, Mul(-1, odd))``: a WIDE value negated, and then that
+    negation multiplied. Exactly the shape that already had to be fixed
+    for ``quarter``, only here the wide operand is a runtime value rather
+    than a formal, so the earlier fix could not cover it.
+
+    Written as a convex blend instead -- ``odd * other + even * parity``
+    with ``other = 1 - parity`` -- both selectors are narrow, both
+    products are narrow times wide, and no wide value is negated inside a
+    product anywhere. The two selectors are exact complementary bits, so
+    this is the same selection, spelled so the defect has nothing to bite
+    on.
     """
 
     index = sympy.floor(difference * inv_quarter + sympy.Rational(1, 2))
@@ -135,38 +138,70 @@ def folded_sine(difference, quarter, neg_quarter, inv_quarter, sine, cosine):
     half = sympy.floor(base * sympy.Rational(1, 2))
     quarter_step = sympy.floor(base * sympy.Rational(1, 4))
     series_parity = index - 2 * half
+    other_parity = 1 - series_parity
     sign_parity = half - 2 * quarter_step
     sign = 1 - 2 * sign_parity
-    return sign * (odd + series_parity * (even - odd))
+    return sign * (odd * other_parity + even * series_parity)
 
 
-def symbolise_rationals(expression, prefix: str = "k"):
-    """Lift every fractional constant out of the expression as a parameter.
+def symbolise_numbers(expression, prefix: str = "k"):
+    """Lift EVERY numeric constant out of the expression as a parameter.
 
-    A rational that survives into the materialised program is emitted as a
-    Python literal -- ONE DOUBLE -- and no width can repair it afterwards.
-    The fingerprint is unmistakable and was measured here: the error at
-    two, three and four limbs was identical to the last digit, because the
-    quadrant basis carried thirds and a third rounds once, forever.
+    A number that survives into the materialised program is emitted as a
+    Python literal -- one double if it is fractional, and an INTEGER if it
+    is whole -- and no width downstream can repair either. Both failure
+    modes were measured here, and the second one three separate times
+    before its shape was recognised.
 
-    So fractions get the same treatment the series coefficients already
-    get: they leave as symbols and come back decomposed to the width in
-    use. Integers stay -- small ones are exact in any float -- and what
-    remains in the body is pure shape. Returns the rewritten expression
-    and the exact value owed to each new parameter.
+    The fractional case is the obvious one: a third rounds once, forever,
+    so the error at two, three and four limbs came back identical to the
+    last digit.
+
+    The integer case is worse because it does not look like a number
+    problem at all. SymPy canonicalises ``a - b`` to ``Add(a, Mul(-1, b))``
+    and types that ``-1`` as an integer, which then TYPES THE PRODUCT --
+    so a wide value multiplied by it inferred an integer result, and each
+    backend went wrong in its own dialect. The C lane truncated a
+    precision residual to a whole count of quarter turns; the same shape
+    later selected the sine series where the cosine one was owed, in every
+    quadrant that needed it; the Fortran lane emitted ``int(x, c_int)``
+    and additionally overflowed 2**31, wrong by 5.1e+11 at an argument of
+    1e12 while every smaller argument stayed exact. Three symptoms, one
+    integer literal.
+
+    So nothing numeric is left in the body. Every constant leaves as a
+    symbol and comes back decomposed to the width in use, which is
+    deliberate overkill for something like ``2`` and exactly the point:
+    the program cannot be typed down by a constant it does not contain.
+    The one number that must STAY is a ``Pow`` exponent, which is
+    structure rather than a quantity -- ``r ** 2`` says how many factors,
+    and a symbol there is not a different precision, it is a different
+    program.
+
+    Returns the rewritten expression and the exact value owed to each new
+    parameter.
     """
 
     values: dict[str, Fraction] = {}
-    substitutions = {}
-    for atom in sorted(
-        expression.atoms(sympy.Rational), key=sympy.default_sort_key
-    ):
-        if atom.is_Integer:
-            continue
-        symbol = sympy.Symbol(f"{prefix}{len(values)}")
-        values[symbol.name] = Fraction(int(atom.p), int(atom.q))
-        substitutions[atom] = symbol
-    return expression.xreplace(substitutions), values
+    cache: dict = {}
+
+    def convert(node):
+        if node.is_Number:
+            held = cache.get(node)
+            if held is not None:
+                return held
+            symbol = sympy.Symbol(f"{prefix}{len(values)}")
+            values[symbol.name] = Fraction(int(node.p), int(node.q))
+            cache[node] = symbol
+            return symbol
+        if node.is_Atom:
+            return node
+        if isinstance(node, sympy.Pow):
+            base, exponent = node.args
+            return sympy.Pow(convert(base), exponent)
+        return node.func(*(convert(each) for each in node.args))
+
+    return convert(expression), values
 
 
 def kuramoto_equation(terms: int):
@@ -188,7 +223,7 @@ def kuramoto_equation(terms: int):
         for name in NEIGHBOURS
     )
     advanced = theta + dt * (omega + coupling * pull)
-    advanced, constants = symbolise_rationals(advanced)
+    advanced, constants = symbolise_numbers(advanced)
     return sympy.Eq(sympy.Symbol("advanced"), advanced), constants
 
 

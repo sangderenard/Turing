@@ -327,8 +327,18 @@ _SHAPE_ONLY = frozenset(
     }
 )
 
+#: ``Fma``/``fma`` belong here for the same reason the others do, and the
+#: omission was measured: a precision section whose result dtype inference
+#: had settled on an integer emitted
+#: ``ieee_fma(t43, int(t55, c_int), -t915)``, and gfortran refused it --
+#: "there is no specific function for the generic 'ieee_fma'" -- because
+#: the generic has no integer form to resolve to. An FMA is a floating
+#: primitive by definition; the C lane took the same SSA and computed it
+#: correctly only because C promotes silently, so this was a Fortran-only
+#: failure over an SSA sloppiness both lanes shared.
 _REAL_OPERAND = frozenset(
-    {"sign", "floor", "ceil", "round", "trunc", "sqrt", "exp", "log"}
+    {"sign", "floor", "ceil", "round", "trunc", "sqrt", "exp", "log",
+     "Fma", "fma"}
 )
 
 _INTEGER_DTYPES = frozenset(
@@ -1874,6 +1884,23 @@ class _FunctionEmitter:
         else:
             result_dtype = str(getattr(instr.res, "dtype", None) or self.dtype)
             target_real = result_dtype not in _INTEGER_DTYPES
+            # Mixed integer/real arithmetic PROMOTES. Trusting the result
+            # dtype alone demotes instead, and dtype here is inferred
+            # rather than declared, so one integer-typed operand is enough
+            # to mistype the result and drag a real operand down with it.
+            # MEASURED: SymPy canonicalises subtraction to ``Mul(-1, x)``
+            # and types that -1 as an integer, so ``-1 * index`` inferred
+            # an integer result and emitted ``int(index, c_int)`` -- which
+            # both discards the fraction and overflows 2**31, wrong by
+            # 5.1e+11 at an argument of 1e12 while every smaller argument
+            # stayed exact. Promotion is what C and numpy already do here,
+            # which is why this was a Fortran-only failure.
+            if not target_real and any(
+                str(getattr(value, "dtype", None) or self.dtype)
+                not in _INTEGER_DTYPES
+                for value in instr.args
+            ):
+                target_real = True
         converted = list(args)
         for position, value in enumerate(instr.args):
             if position >= len(converted):
@@ -3944,6 +3971,63 @@ class FortranModule:
         return path
 
 
+#: Arithmetic whose result must be REAL as soon as any operand is.
+_PROMOTING_ARITHMETIC = frozenset({
+    "Add", "Sub", "Mul", "Div", "Fma", "Neg",
+    "add", "sub", "mul", "div", "fma", "neg",
+})
+
+
+def _promote_mixed_arithmetic_results(module, dtype: str) -> int:
+    """Retype a mixed integer/real result that was inferred integer.
+
+    dtype on this path is INFERRED, not declared, and one integer-typed
+    operand is enough to mistype an arithmetic result. Fortran then
+    believes it, declares an integer temporary, and demotes the real
+    operand to fill it -- so the value is truncated on the way in and
+    again on the way out.
+
+    MEASURED: SymPy canonicalises ``a - b`` to ``Add(a, Mul(-1, b))`` and
+    types that ``-1`` as an integer, so ``-1 * index`` inferred an integer
+    result. The emitted ``int(index, c_int)`` discarded the fraction and
+    overflowed 2**31 -- wrong by 5.1e+11 at an argument of 1e12, while
+    every argument small enough to survive the cast stayed exact, which is
+    exactly the shape of failure that hides in a sample.
+
+    Promotion is what C and numpy do with the same SSA, which is why both
+    of those lanes were already correct here. Returns how many results
+    were retyped.
+    """
+
+    functions = getattr(module, "functions", module) or {}
+    repaired = 0
+    for function in functions.values():
+        for block in getattr(function, "blocks", {}).values():
+            for instruction in getattr(block, "instrs", ()):
+                if str(instruction.op) not in _PROMOTING_ARITHMETIC:
+                    continue
+                result = getattr(instruction, "res", None)
+                if result is None:
+                    continue
+                current = str(getattr(result, "dtype", None) or dtype)
+                if current not in _INTEGER_DTYPES:
+                    continue
+                promoted = next(
+                    (
+                        str(getattr(value, "dtype", None) or dtype)
+                        for value in instruction.args
+                        if str(getattr(value, "dtype", None) or dtype)
+                        not in _INTEGER_DTYPES
+                    ),
+                    None,
+                )
+                if promoted is None:
+                    continue
+                result.dtype = promoted
+                repaired += 1
+    return repaired
+
+
 def emit_module(
     module: IRModule | Mapping[str, Function],
     *,
@@ -3971,6 +4055,7 @@ def emit_module(
     """
 
     _emit_module_started = time.time()
+    _promote_mixed_arithmetic_results(module, dtype)
 
     def _phase(message: str) -> None:
         elapsed = time.time() - _emit_module_started
