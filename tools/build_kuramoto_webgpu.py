@@ -190,10 +190,41 @@ def build(width: int, digits: int, cells: int, lag: bool = False):
 
 
 def _returned_values(function):
+    """Everything the step publishes -- EVERY LIMB, not the collapsed head.
+
+    Precision lowering ends each wide operation by collapsing its limbs
+    into one value so it can be used as an ordinary scalar, and the
+    ``Ret`` names that collapsed value. Publishing it alone throws the
+    expansion away at the boundary: the arithmetic inside a step is as
+    wide as it was asked to be, and the field between steps is a single
+    float. A ladder that cannot carry its own state forward buys nothing
+    but a slower first step.
+
+    The limb row is recorded per value by the lowering, so the row is
+    what gets published when there is one.
+    """
+
+    rows = dict(function.metadata.get("precision_lowered_values") or ())
+    produced = {
+        int(instruction.res.id): instruction.res
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None
+    }
     for block in function.blocks.values():
         for instruction in block.instrs:
-            if str(instruction.op) in ("Ret", "Return"):
-                return list(instruction.args)
+            if str(instruction.op) not in ("Ret", "Return"):
+                continue
+            published = []
+            for value in instruction.args:
+                row = rows.get(int(value.id))
+                if not row:
+                    published.append(value)
+                    continue
+                published.extend(
+                    produced.get(int(limb), value) for limb in row
+                )
+            return published
     return []
 
 
@@ -560,7 +591,20 @@ async function main() {
       if (Number.isFinite(v)) { finite++; if (v < lo) lo = v; if (v > hi) hi = v; }
       else nan++;
     }
-    return { step, coherence: total / (4 * count),
+    // Read the LOW limb too: if it is identically zero the ladder is
+    // decorative, and the whole point is that it is not.
+    const lowEnc = device.createCommandEncoder();
+    lowEnc.copyBufferToBuffer(feeds, thetaSlots[1] * 4, readback, 0, count * 4);
+    device.queue.submit([lowEnc.finish()]);
+    await readback.mapAsync(GPUMapMode.READ);
+    const low = new Float32Array(readback.getMappedRange()).slice();
+    readback.unmap();
+    let lowNonzero = 0, lowMax = 0;
+    for (const v of low) {
+      if (v !== 0) lowNonzero++;
+      if (Math.abs(v) > lowMax) lowMax = Math.abs(v);
+    }
+    return { step, coherence: total / (4 * count), lowNonzero, lowMax,
              finite, nan, lo, hi, first: Array.from(values.slice(0, 6)) };
   };
 

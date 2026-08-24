@@ -2700,7 +2700,24 @@ def inline_host_linear_source_regions(functions) -> tuple[dict, tuple[dict, ...]
         if any(str(instruction.op) in forbidden for instruction in body.instrs):
             continue
         caller_name, block_name, index, call = occurrences[0]
-        if call.res is not None or len(call.args) != len(callee.args):
+        if len(call.args) != len(callee.args):
+            continue
+        # An AGGREGATE result is not a reason to refuse. The call hands
+        # back a span the caller immediately takes apart, and every read
+        # of it carries `source_output_id` naming the value that slot
+        # stands for -- so once the producing instructions live in the
+        # caller, the span and the reads of it are both redundant and are
+        # dropped below. Refusing this kept the region alive as a
+        # separate function, and a value produced inside it could only
+        # leave through the published set: the limbs of a wide result are
+        # not in that set, so a two-limb kernel published its collapsed
+        # head and the field it fed was single precision between steps.
+        aggregate = (
+            int(call.res.id) if call.res is not None
+            and str(call.attributes.get("result_convention") or "")
+            == "ssa.aggregate" else None
+        )
+        if call.res is not None and aggregate is None:
             continue
         produced = {
             int(instruction.res.id)
@@ -2718,6 +2735,62 @@ def inline_host_linear_source_regions(functions) -> tuple[dict, tuple[dict, ...]
         if not valid:
             continue
         caller = functions[caller_name]
+        # Instructions that only take the aggregate apart. They are keyed
+        # by position so they can be deleted, and they are excluded from
+        # the occupancy test below: a Load whose result IS the id the
+        # spliced body produces is not a collision, it is the same value
+        # arriving by a route that is about to disappear.
+        aggregate_reads: dict[tuple, tuple] = {}
+        if aggregate is not None:
+            pointers = {aggregate}
+            for caller_block_name, caller_block in caller.blocks.items():
+                for position, instruction in enumerate(caller_block.instrs):
+                    operation = str(instruction.op)
+                    reads_aggregate = any(
+                        int(argument.id) in pointers
+                        for argument in instruction.args
+                    )
+                    if not reads_aggregate:
+                        continue
+                    if operation not in (
+                        "GetElementPtr", "getelementptr", "Load", "load",
+                    ):
+                        aggregate_reads.clear()
+                        break
+                    # Only a GetElementPtr yields another POINTER into the
+                    # span. A Load yields the value itself, and whatever
+                    # consumes that -- the Ret, most importantly -- is an
+                    # ordinary use and not an illegal reader of the
+                    # aggregate. Treating a Load result as a pointer made
+                    # the function's own return look like a violation and
+                    # aborted every splice.
+                    if instruction.res is not None and operation in (
+                        "GetElementPtr", "getelementptr",
+                    ):
+                        pointers.add(int(instruction.res.id))
+                    aggregate_reads[
+                        (caller_name, str(caller_block_name), position)
+                    ] = ()
+                else:
+                    continue
+                break
+            # Every read must be accounted for, and each published slot
+            # must actually be produced by the body, or the caller would
+            # be left referring to something no longer defined.
+            named = {
+                int(instruction.attributes.get("source_output_id"))
+                for caller_block in caller.blocks.values()
+                for instruction in caller_block.instrs
+                if instruction.attributes.get("source_output_id") is not None
+                and str(instruction.op) in ("Load", "load")
+            }
+            if not aggregate_reads or not named <= produced:
+                continue
+        read_results = {
+            int(caller.blocks[key[1]].instrs[key[2]].res.id)
+            for key in aggregate_reads
+            if caller.blocks[key[1]].instrs[key[2]].res is not None
+        }
         occupied = {
             int(value.id) for value in caller.args
         } | {
@@ -2725,6 +2798,7 @@ def inline_host_linear_source_regions(functions) -> tuple[dict, tuple[dict, ...]
             for caller_block in caller.blocks.values()
             for instruction in caller_block.instrs
             if instruction.res is not None and instruction is not call
+            and int(instruction.res.id) not in read_results
         }
         if produced & occupied:
             continue
@@ -2750,6 +2824,7 @@ def inline_host_linear_source_regions(functions) -> tuple[dict, tuple[dict, ...]
                 ),
             ))
         replacements[(caller_name, block_name, index)] = cloned
+        replacements.update(aggregate_reads)
         removable.add(callee_name)
         receipts.append({
             "caller": caller_name,
@@ -2779,6 +2854,31 @@ def inline_host_linear_source_regions(functions) -> tuple[dict, tuple[dict, ...]
             if receipt["caller"] == caller_name
         )
         metadata["host_linear_region_inlining"] = own_receipts
+        # The limb rows move WITH the instructions. A value's row says
+        # which SSA values are its limbs, and splicing relocates the
+        # instructions that produce them into this caller -- so leaving
+        # the rows behind in a function that no longer exists loses the
+        # only record that a result is wide. Measured, the returned value
+        # of a two-limb kernel had a row of (22418, 22437) inside the
+        # region and none at all after inlining, so the low limb was
+        # simply never published and the field it fed was single
+        # precision between steps however many limbs the arithmetic used.
+        rows = dict(metadata.get("precision_lowered_values") or ())
+        for receipt in own_receipts:
+            spliced = functions.get(str(receipt["callee"]))
+            if spliced is None:
+                continue
+            # The caller's own rows WIN. A region shares its caller's
+            # formals by identity, so it records rows for them too --
+            # naming its own low-limb values, which are not the caller's.
+            # Overwriting cost the caller the names of eight formals and
+            # left them unbound at the boundary.
+            for value_id, limb_ids in (
+                spliced.metadata.get("precision_lowered_values") or ()
+            ):
+                rows.setdefault(value_id, limb_ids)
+        if rows:
+            metadata["precision_lowered_values"] = tuple(sorted(rows.items()))
         view[caller_name] = dataclasses.replace(
             caller, blocks=blocks, metadata=metadata
         )

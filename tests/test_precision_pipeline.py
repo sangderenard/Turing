@@ -470,10 +470,12 @@ def test_split_two_product_flavour_matches_fma_bit_for_bit_and_frees_wasm():
         if flavour == "split":
             assert "Fma" not in operations
             # No fma was incurred, so the only obligation left is
-            # isolation -- which wasm delivers and WGSL cannot.
+            # isolation -- which wasm delivers by construction and WGSL
+            # now claims for exactly this flavour. Split is what puts a
+            # limbed section on a lane whose fma() is allowed to round
+            # twice: there is no fused operation left to double-round.
             assert precision_backend_shortfalls(module, "wasm", ("f",)) == ()
-            webgpu = precision_backend_shortfalls(module, "webgpu", ("f",))
-            assert webgpu[0]["missing"] == (SECTION_ISOLATION,)
+            assert precision_backend_shortfalls(module, "webgpu", ("f",)) == ()
             with pytest.raises(ValueError, match="already lowered"):
                 apply_precision_pipeline(module, two_product_flavor="fma")
         else:
@@ -629,10 +631,42 @@ def test_webgpu_backend_refuses_precision_sections_loudly():
         if shortfall.operation == "precision_section"
     ]
     assert refusals, [s.format() for s in emitted.shortfalls]
-    # WGSL's fma() may round twice and the language has no contraction
-    # control, so BOTH obligations are named in the refusal.
+    # WGSL's fma() may round twice, so FMA_MANDATORY is refused and always
+    # will be. SECTION_ISOLATION is no longer part of the refusal: the lane
+    # claims it for the split flavour, which spells no fused operation at
+    # all. This section is fma-flavoured, so it is still refused -- on the
+    # one obligation that genuinely cannot be met, and not on both.
     assert FMA_MANDATORY in refusals[0].reason
-    assert SECTION_ISOLATION in refusals[0].reason
+    assert SECTION_ISOLATION not in refusals[0].reason
+
+
+def test_webgpu_accepts_a_split_flavoured_section():
+    """The split flavour is the route onto a lane with no honest fma.
+
+    Veltkamp halves at 4097 are exact for a 24-bit significand, so the
+    residual is recovered by subtraction rather than by a fused rounding
+    -- which removes the failure this lane guards against, a residual that
+    comes back algebraically zero. Nothing is claimed about ``fma``; there
+    simply is not one.
+    """
+
+    from src.compiler.ir_identities import (
+        BACKEND_PRECISION_CAPABILITIES, precision_backend_shortfalls,
+    )
+
+    assert SECTION_ISOLATION in BACKEND_PRECISION_CAPABILITIES["webgpu"]
+    assert FMA_MANDATORY not in BACKEND_PRECISION_CAPABILITIES["webgpu"]
+
+    module, _function = _lowered_precision_mul_module()
+    receipt = (module.metadata or {}).get("precision_pipeline") or {}
+    contracts = list(receipt.get("section_contracts") or ())
+    assert contracts, receipt
+    # The same contract with no Fma in it -- which is what the split
+    # flavour emits -- must pass, because fma_value_ids is what decides
+    # whether FMA_MANDATORY is owed.
+    for contract in contracts:
+        contract["fma_value_ids"] = []
+    assert precision_backend_shortfalls(module, "webgpu") == ()
 
 
 def test_webgl_backend_refuses_precision_sections_loudly():
