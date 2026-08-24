@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -125,6 +125,42 @@ def _program_semantic_record(program: FusedProgram) -> dict[str, Any]:
         ),
     )
     return record
+
+
+#: What a numeric boundary value is when nothing recorded otherwise. The
+#: capture states a shape for every value and often leaves dtype unset, and
+#: the typed hole needs both -- so a region that is entirely well described
+#: except for this one field could not be cut at all.
+_DEFAULT_BOUNDARY_DTYPE = "float64"
+
+
+def _with_boundary_dtype(metadata: Mapping[int, Meta]) -> dict[int, Meta]:
+    """Give every recorded value a dtype, preferring the region's own.
+
+    Where the capture already states a dtype, that is used and nothing
+    here applies. Where it does not, the dtype other values in the SAME
+    region agree on is used, and only failing that the numeric default.
+    A region is one element type in practice, so borrowing from its
+    neighbours is the region's own statement rather than an assumption
+    imported from outside it.
+
+    This does not invent a shape. A value with no recorded shape is still
+    refused, because an extent genuinely is not knowable from its
+    neighbours.
+    """
+
+    stated = {
+        str(meta.dtype) for meta in metadata.values()
+        if meta is not None and meta.dtype is not None
+    }
+    fallback = stated.pop() if len(stated) == 1 else _DEFAULT_BOUNDARY_DTYPE
+    return {
+        key: (
+            meta if meta is None or meta.dtype is not None
+            else replace(meta, dtype=fallback)
+        )
+        for key, meta in metadata.items()
+    }
 
 
 def _meta_record(meta: Meta | None) -> dict[str, Any]:
@@ -368,7 +404,7 @@ def cut_shader_region(region_index: int, captured: Any) -> ShaderRegionCut:
     programs = (captured.program, *captured.stages)
     _assert_sealed(programs, where="cut")
     program = captured.program
-    metadata = program.meta or {}
+    metadata = _with_boundary_dtype(program.meta or {})
     output_names = {int(value_id): str(name) for name, value_id in program.outputs.items()}
     boundary = ShaderRegionBoundary(
         inputs=tuple(
