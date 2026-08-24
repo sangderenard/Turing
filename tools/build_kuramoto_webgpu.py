@@ -483,7 +483,11 @@ async function main() {
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   device.queue.writeBuffer(offsets, 0, new Uint32Array(order));
 
-  status.textContent = "compiling shaders…";
+  // "loading", not "compiling": the page does not compile anything.
+  // It hands finished WGSL to the browser, and this string is only a
+  // default that stands until the first frame overwrites it -- so it
+  // must not claim to know what is happening.
+  status.textContent = "loading…";
   const kernelModule = device.createShaderModule({ code: KERNEL_WGSL });
   const info = await kernelModule.getCompilationInfo();
   const errors = info.messages.filter((m) => m.type === "error");
