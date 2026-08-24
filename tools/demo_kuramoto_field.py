@@ -303,7 +303,9 @@ def materialise(equation, name: str):
     from src.compiler.ssa_python_materializer import materialize_function_body
     from src.compiler.symbolic_equation_compiler import compile_sympy_equations
 
-    compiled = compile_sympy_equations([equation], name=name)
+    equations = (list(equation) if isinstance(equation, (list, tuple))
+                 else [equation])
+    compiled = compile_sympy_equations(equations, name=name)
     statements, needs_math = materialize_function_body(
         compiled.function, tensor_vocabulary=True,
     )
@@ -571,3 +573,136 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
+
+
+def folded_cosine(argument, quarter, neg_quarter, inv_quarter, sine, cosine):
+    """``cos(argument)`` through the same fold, as ``sin(argument + pi/2)``.
+
+    One core, not two: the quarter turn is already a parameter here and
+    shifting by it is exact, so the cosine costs a single addition and
+    inherits every property the sine's reduction was proved to have.
+    """
+
+    return folded_sine(
+        argument + quarter, quarter, neg_quarter, inv_quarter, sine, cosine,
+    )
+
+
+def _opposite(stencil, name: str) -> str:
+    """The stencil entry pointing the other way, which must exist."""
+
+    drow, dcol = stencil[name]
+    for other, offset in stencil.items():
+        if offset == (-drow, -dcol):
+            return other
+    raise ValueError(
+        f"stencil entry {name!r} at {(drow, dcol)} has no opposite; a "
+        f"Hamiltonian needs a symmetric neighbourhood, because the force "
+        f"on a cell includes what its neighbours feel from IT"
+    )
+
+
+def hamiltonian_program(energy, terms: int, stencil=None,
+                        scalars=(), name: str = "hamiltonian"):
+    """Derive a symplectic lattice update from a per-site energy.
+
+    ``energy`` is one SymPy expression in ``theta``, ``p`` and the stencil
+    names -- the energy THIS cell contributes, with each bond counted from
+    both ends. Nothing else is written: SymPy differentiates it and the
+    integrator is assembled from the derivatives.
+
+    The subtlety is that a cell's force is not just its own energy's
+    derivative. Cell j's energy also depends on theta_i wherever j's
+    neighbourhood reaches back to i, which happens at the OPPOSITE offset.
+    So the force collects
+
+        dh/dtheta  +  sum over n of  (dh/d[opposite n])[theta -> n, opposite n -> theta]
+
+    and that second sum is the whole reason a Hamiltonian gives a
+    different -- and conservative -- update rather than an arbitrary one.
+
+    The integrator is symplectic Euler: momentum first, then position at
+    the NEW momentum. It preserves phase-space volume and has bounded
+    energy drift, which is what makes it usable as a chaos experiment:
+    whatever the trajectory does, the integrator is not the thing
+    corrupting it.
+    """
+
+    stencil = dict(stencil or KURAMOTO_STENCIL)
+    theta, momentum = sympy.symbols("theta p")
+    dt = sympy.Symbol("dt")
+    quarter, neg_quarter, inv_quarter = sympy.symbols(
+        "quarter neg_quarter inv_quarter"
+    )
+
+    force = sympy.diff(energy, theta)
+    for neighbour in stencil:
+        back = _opposite(stencil, neighbour)
+        force = force + sympy.diff(energy, sympy.Symbol(back)).subs(
+            {theta: sympy.Symbol(neighbour), sympy.Symbol(back): theta},
+            simultaneous=True,
+        )
+
+    advanced_p = momentum - dt * force
+    advanced_theta = theta + dt * sympy.diff(energy, momentum).subs(
+        momentum, advanced_p,
+    )
+
+    # Only now are the transcendentals replaced by cores that hold on the
+    # whole line. Differentiating first keeps SymPy working on the
+    # mathematics rather than on a range reduction.
+    series = sympy.symbols(f"c0:{terms}"), sympy.symbols(f"d0:{terms}")
+
+    def resolve(expression):
+        expression = expression.replace(
+            sympy.cos,
+            lambda argument: folded_cosine(
+                argument, quarter, neg_quarter, inv_quarter, *series,
+            ),
+        )
+        return expression.replace(
+            sympy.sin,
+            lambda argument: folded_sine(
+                argument, quarter, neg_quarter, inv_quarter, *series,
+            ),
+        )
+
+    equations = [
+        sympy.Eq(sympy.Symbol("theta_next"), resolve(advanced_theta)),
+        sympy.Eq(sympy.Symbol("p_next"), resolve(advanced_p)),
+    ]
+    lifted, constants = [], {}
+    for equation in equations:
+        rhs, found = symbolise_numbers(
+            equation.rhs, prefix=f"k{len(constants)}_",
+        )
+        constants.update(found)
+        lifted.append(sympy.Eq(equation.lhs, rhs))
+
+    return FieldProgram(
+        name=name,
+        equation=lifted,
+        constants=constants,
+        state=("theta", "p"),
+        advances=("theta", "p"),
+        stencil=stencil,
+        scalars=tuple(scalars) + ("dt",),
+    )
+
+
+def kicked_rotor_energy(kick="K", coupling="epsilon"):
+    """A lattice of kicked rotors: the standard map, coupled.
+
+    Each site is a pendulum driven by its own potential and pulled by its
+    neighbours. Chaotic for a kick of any size, which is the point -- a
+    chaotic field is where floating-point width stops being decorative,
+    because roundoff grows at the Lyapunov rate and precision becomes a
+    statement about how long the trajectory is still the true one.
+    """
+
+    theta, momentum = sympy.symbols("theta p")
+    K, epsilon = sympy.Symbol(kick), sympy.Symbol(coupling)
+    bonds = sum(
+        sympy.cos(theta - sympy.Symbol(name)) for name in KURAMOTO_STENCIL
+    )
+    return momentum ** 2 / 2 + K * sympy.cos(theta) + epsilon * bonds / 2
