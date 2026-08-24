@@ -83,6 +83,12 @@ from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 
+#: Element counts every admitted cell is timed at. Three steps across
+#: the decades from one to a thousand: the small end is where dispatch
+#: dominates and the large end is where arithmetic does, and a cell's
+#: honest cost is the line through both rather than either alone.
+PROFILE_SIZES: tuple[int, ...] = (1, 32, 1024)
+
 MANIFEST_SCHEMA = "turing.kernel-bank.v2"  # v2: + profile, data_layout
 
 
@@ -124,6 +130,18 @@ class KernelSpec:
     #: coefficients included -- carries interleaved limbs: the coefficients
     #: of a tier are at the depth of the tier, never collapsed to singles.
     limb_width: int = 1
+    #: WHAT THIS CELL DELIVERS, measured -- ``(run) -> max |error|`` against
+    #: an oracle that is exact, not another implementation.
+    #:
+    #: Verification and capability answer different questions and neither
+    #: substitutes for the other. ``_verify`` asks "did the compiler compile
+    #: this program faithfully" by comparing against the kernel's own Python
+    #: twin; both sides can be faithful to a program that approximates
+    #: badly. This asks "how close to the TRUE function does the answer
+    #: land", which is the only fact a caller choosing between a cheap cell
+    #: and an accurate one can act on. A matrix with speeds and no measured
+    #: accuracies is a menu with no prices.
+    capability_probe: Callable[[Callable[..., Any]], float] | None = None
 
     def item_data(
         self, axis: str, sizes: Mapping[str, int],
@@ -184,8 +202,17 @@ class CompiledVariant:
     ret_ids: tuple[int, ...]
     _executions: dict = field(default_factory=dict)
 
-    def _execute(self, arguments: Mapping[str, Any]):
+    def _prepare(self, feeds):
+        """The shared execution face, whichever lane built this native."""
+
+        preparer = getattr(self.native, "prepare_execution", None)
+        if preparer is not None:
+            return preparer(feeds)
         from src.compiler.ssa_llvm_backend import prepare_artifact_execution
+
+        return prepare_artifact_execution(self.native, feeds)
+
+    def _execute(self, arguments: Mapping[str, Any]):
 
         live = {
             parameter: value for parameter, value in arguments.items()
@@ -225,7 +252,7 @@ class CompiledVariant:
             for p in live
         }
         if execution is None:
-            execution = prepare_artifact_execution(self.native, feeds)
+            execution = self._prepare(feeds)
             self._executions[signature] = execution
         else:
             for parameter, value in live.items():
@@ -434,7 +461,8 @@ class KernelBank:
         return f"{newest:.0f}"
 
     def variant_key(self, name: str, *, contract: str | None,
-                    specialized: Mapping[str, int] | None) -> str:
+                    specialized: Mapping[str, int] | None,
+                    backend: str = "llvm") -> str:
         spec = self.specs[name]
         payload = json.dumps({
             "kernel": name,
@@ -444,6 +472,11 @@ class KernelBank:
             "contract": contract or "develop",
             "specialized": dict(sorted((specialized or {}).items())),
             "compiler": self._fingerprint,
+            # The destination is part of a variant's identity: the same
+            # program emitted to C and to LLVM are two artifacts with two
+            # measured costs, and a bank that keyed them together would
+            # keep whichever compiled first and hide the other.
+            "backend": str(backend),
         }, sort_keys=True)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
@@ -453,7 +486,8 @@ class KernelBank:
     # -- admission --------------------------------------------------------
     def get(self, name: str, *, contract: str | None = None,
             specialized: Mapping[str, int] | None = None,
-            compile_missing: bool = True) -> CompiledVariant:
+            compile_missing: bool = True,
+            backend: str = "llvm") -> CompiledVariant:
         """Return an admitted variant, materializing or compiling as needed.
 
         Raises :class:`BankRefusal` if the variant was previously refused
@@ -483,6 +517,7 @@ class KernelBank:
                 )
         key = self.variant_key(
             name, contract=contract, specialized=specialized,
+            backend=backend,
         )
         if key in self._live:
             return self._live[key]
@@ -497,25 +532,120 @@ class KernelBank:
                 )
             variant = self._materialize(
                 spec, key, directory, contract, specialized, manifest,
+                backend=backend,
             )
             self._live[key] = variant
             return variant
         if not compile_missing:
             raise BankRefusal(f"{name}[{key}] is not in the bank")
         variant = self._compile_and_admit(
-            spec, key, directory, contract, specialized,
+            spec, key, directory, contract, specialized, backend=backend,
         )
         self._live[key] = variant
         return variant
 
+    #: How each destination turns a lowered module into a runnable native.
+    #:
+    #: One entry per lane the bank can realize a kernel on. Every emitter
+    #: here returns something answering the SHARED EXECUTION FACE -- either
+    #: an LLVM artifact (served by ``prepare_artifact_execution``) or an
+    #: artifact carrying its own ``prepare_execution`` -- so
+    #: ``CompiledVariant`` runs any of them without knowing which lane it
+    #: came from. Adding a lane is adding a row, not a branch.
+    BACKENDS: dict[str, str] = {
+        "llvm": "the reference lane: one function per SSA function, "
+                "internal linkage, the host's own ABI",
+        "c": "the C module lane: labels and gotos, the same buffer ABI, "
+             "compiled by zig cc",
+        "fortran": "gfortran through the packed pointer-array shell; "
+                   "ieee_fma and withdrawn contraction",
+        "glsl": "desktop GL 4.3 compute, precise-qualified fp64, one "
+                "invocation per element",
+    }
+
+    def _emit_native(self, backend: str, module, entrypoint: str,
+                     directory: Path):
+        """One lowered module, realized on ``backend``."""
+
+        name = str(backend).casefold()
+        if name == "llvm":
+            from src.compiler.ssa_llvm_backend import (
+                compile_artifact, emit_ssa_function_to_llvm,
+            )
+
+            artifact = emit_ssa_function_to_llvm(module, entrypoint)
+            if not artifact.complete:
+                raise BankRefusal(
+                    f"{entrypoint}: {len(artifact.shortfalls)} LLVM "
+                    "shortfall(s): " + "; ".join(
+                        item.reason[:120] for item in artifact.shortfalls[:3]
+                    )
+                )
+            return compile_artifact(artifact, directory=directory)
+        if name == "c":
+            from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+
+            artifact = emit_ssa_module_to_c(module, entrypoint)
+            if not artifact.complete:
+                raise BankRefusal(
+                    f"{entrypoint}: {len(artifact.shortfalls)} C "
+                    "shortfall(s): " + "; ".join(
+                        f"{item.operation}: {item.reason}"[:120]
+                        for item in artifact.shortfalls[:3]
+                    )
+                )
+            return artifact.compile(directory)
+        if name == "fortran":
+            from src.compiler.fortran_c_shell import (
+                compile_fortran_module_c_shell,
+            )
+            from src.compiler.ssa_fortran_backend import (
+                FortranCoreNative, emit_module,
+            )
+
+            fortran_module = emit_module(module, progress=lambda _line: None)
+            if not fortran_module.complete:
+                raise BankRefusal(
+                    f"{entrypoint}: {len(fortran_module.shortfalls)} Fortran "
+                    "shortfall(s): " + "; ".join(
+                        f"{item.operation}: {item.reason}"[:120]
+                        for item in fortran_module.shortfalls[:3]
+                    )
+                )
+            built = compile_fortran_module_c_shell(
+                fortran_module, {}, directory, library=True,
+                entrypoint=entrypoint, name=entrypoint[:48],
+            )
+            record = next(
+                entry for entry in fortran_module.api.entry_points
+                if str(entry.name) == entrypoint
+            )
+            return FortranCoreNative(built.executable_path, record)
+        if name == "glsl":
+            from src.compiler.ssa_glsl_compute_backend import (
+                emit_ssa_module_to_glsl_compute,
+            )
+
+            artifact = emit_ssa_module_to_glsl_compute(module, entrypoint)
+            if artifact.shortfalls:
+                raise BankRefusal(
+                    f"{entrypoint}: {len(artifact.shortfalls)} GLSL "
+                    "shortfall(s): " + "; ".join(
+                        f"{item.operation}: {item.reason}"[:120]
+                        for item in artifact.shortfalls[:3]
+                    )
+                )
+            return artifact
+        raise BankRefusal(
+            f"unknown backend {backend!r}; the bank realizes "
+            f"{sorted(self.BACKENDS)}"
+        )
+
     def _lower_and_emit(self, spec: KernelSpec, key: str,
                         contract: str | None,
                         specialized: Mapping[str, int],
-                        directory: Path):
+                        directory: Path, backend: str = "llvm"):
         from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
-        from src.compiler.ssa_llvm_backend import (
-            compile_artifact, emit_ssa_function_to_llvm,
-        )
         from src.compiler.work_contract import set_active_contract
 
         source = (
@@ -545,15 +675,9 @@ class KernelBank:
                 except Exception:
                     module_pickle.unlink(missing_ok=True)
             entrypoint = f"{tag}__{spec.function_name}"
-            artifact = emit_ssa_function_to_llvm(module, entrypoint)
-            if not artifact.complete:
-                raise BankRefusal(
-                    f"{spec.name}: {len(artifact.shortfalls)} emission "
-                    "shortfall(s): " + "; ".join(
-                        s.reason[:120] for s in artifact.shortfalls[:3]
-                    )
-                )
-            native = compile_artifact(artifact, directory=directory)
+            native = self._emit_native(
+                backend, module, entrypoint, directory,
+            )
         finally:
             set_active_contract(None)
         function = module.functions[entrypoint]
@@ -587,10 +711,10 @@ class KernelBank:
         return module, outputs, native, id_by_name, output_names, ret_ids
 
     def _materialize(self, spec, key, directory, contract, specialized,
-                     manifest) -> CompiledVariant:
+                     manifest, backend: str = "llvm") -> CompiledVariant:
         (module, outputs, native, id_by_name, output_names,
          ret_ids) = self._lower_and_emit(
-            spec, key, contract, specialized, directory,
+            spec, key, contract, specialized, directory, backend=backend,
         )
         recorded_ids = (manifest.get("binding") or {}).get(
             "parameter_ids_at_build"
@@ -611,7 +735,8 @@ class KernelBank:
         )
 
     def _compile_and_admit(self, spec, key, directory, contract,
-                           specialized) -> CompiledVariant:
+                           specialized,
+                           backend: str = "llvm") -> CompiledVariant:
         directory.mkdir(parents=True, exist_ok=True)
         manifest = {
             "schema": MANIFEST_SCHEMA,
@@ -624,11 +749,13 @@ class KernelBank:
                 spec.source.encode("utf-8")
             ).hexdigest(),
             "access_signature": list(spec.access_signature),
+            "backend": str(backend),
             "built_unix": time.time(),
         }
         try:
             variant = self._materialize(
                 spec, key, directory, contract, specialized, manifest,
+                backend=backend,
             )
             verification = self._verify(variant)
         except BankRefusal as refusal:
@@ -670,6 +797,7 @@ class KernelBank:
                 )
         if verification["admitted"]:
             manifest["profile"] = self._profile(variant, verification)
+            manifest["capability"] = self._capability(variant)
         (directory / "manifest.json").write_text(
             json.dumps(manifest, indent=2), encoding="utf-8",
         )
@@ -679,6 +807,48 @@ class KernelBank:
                 f"{verification['reason']}"
             )
         return variant
+
+    def _capability(self, variant: CompiledVariant) -> dict:
+        """What the admitted cell DELIVERS, measured against exact truth.
+
+        Recorded beside the profile so a selector has both halves of every
+        matrix cell: what it costs and what it is worth. A spec with no
+        probe records ``None`` rather than a guess -- an unmeasured cell
+        must be unselectable-on-accuracy, never optimistically ranked.
+        """
+
+        probe = getattr(variant.spec, "capability_probe", None)
+        if probe is None:
+            return {
+                "measured_error": None,
+                "note": "spec declares no capability probe; this cell can "
+                        "be chosen for speed but never claimed for accuracy",
+            }
+        # A SPECIALIZED cell has its trip count in the code: probing it at
+        # any other element count runs the baked loop off the end of the
+        # buffers the probe allocated. Its measurement is taken at the size
+        # it was built for -- the only size it can be asked about.
+        samples = next(
+            (int(value) for parameter, value in variant.specialized.items()
+             if parameter in variant.spec.size_parameters),
+            None,
+        )
+        try:
+            measured = float(
+                probe(variant.run) if samples is None
+                else probe(variant.run, samples)
+            )
+        except Exception as error:  # a probe failure is not a kernel failure
+            return {
+                "measured_error": None,
+                "note": f"probe failed: {str(error)[:200]}",
+            }
+        return {
+            "measured_error": measured,
+            "limb_width": int(getattr(variant.spec, "limb_width", 1) or 1),
+            "note": "max |kernel - exact truth| over the probe's sample; "
+                    "the accuracy this cell may be claimed to deliver",
+        }
 
     def _profile(self, variant: CompiledVariant, verification: dict) -> dict:
         """Auto-collected performance profile, taken at build time.
@@ -722,24 +892,87 @@ class KernelBank:
             cold.append(time.perf_counter() - started)
         compute_avg = float(np.median(warm))
         cold_avg = float(np.median(cold))
-        # Two DIFFERENT launch costs, measured separately -- conflating
-        # them under-reports launch for every variant profiled after its
-        # admission probe (observed: a specialized core charting
-        # launch=0.0 because its one true first launch had already been
-        # paid before profiling began):
-        #
-        # * FIRST launch -- library load, first dispatch, page faults --
-        #   is paid exactly once per variant per process. The admission
-        #   probe's own timing IS that first call ever, so it is read
-        #   from there, never re-measurable afterwards.
-        # * RELAUNCH -- preparing a fresh execution (buffer allocation
-        #   and binding) for a new call signature -- recurs, and is what
-        #   the cache-cleared cold repeats isolate.
+        # PER-ELEMENT COST NEEDS TWO POINTS. The admission probe runs a
+        # handful of elements, and dividing one such timing by its element
+        # count reports dispatch amortization, not arithmetic: a sine core
+        # charted eight thousand nanoseconds an element at six elements
+        # and forty at scale, which would make every cheap cell look
+        # expensive and rank the matrix by nothing but call overhead. A
+        # second timing at a size where arithmetic dominates gives the
+        # SLOPE (nanoseconds per element) and the INTERCEPT (what one call
+        # costs before any element is touched), which are the two numbers
+        # a caller actually chooses between. A spec whose size parameters
+        # cannot be scaled keeps the single-point reading and says so.
+        # PER-ELEMENT COST IS A SLOPE, FITTED, NOT A SUBTRACTION. One
+        # timing divided by its element count reports dispatch
+        # amortization (a sine charted eight thousand nanoseconds an
+        # element at six elements and forty at scale); two timings
+        # differenced report the slope but multiply both readings' noise
+        # into it (the same cell measured 23.9 and 7.4 on consecutive
+        # runs). Several sizes across the decades, each timed repeatedly
+        # and reduced by MEDIAN, then a least-squares line through them:
+        # the slope is nanoseconds per element, the intercept is what one
+        # call costs before any element is touched, and both are stable
+        # because every point constrains them.
+        ladder: list[tuple[int, float]] = []
+        if len(sizes) == 1:
+            (axis, _base), = sizes.items()
+            # A SPECIALIZED variant has its trip count baked into the
+            # emitted code: it loops that many times whatever buffers it is
+            # handed, so timing it at any other size walks off the end of
+            # them. (Measured the hard way: profiling a size-1024 sine at
+            # one element wrote a thousand doubles into a one-double
+            # allocation and took the process down.) Its curve is therefore
+            # the single point it was built for -- which is the whole
+            # bargain of specialization, and why the per-element cost of a
+            # baked cell is read directly rather than fitted.
+            baked = variant.specialized.get(axis)
+            candidates = (
+                (int(baked),) if baked is not None else PROFILE_SIZES
+            )
+            for count in candidates:
+                try:
+                    payload = spec.example_inputs({axis: int(count)}, rng)
+                    variant.run(payload)  # warm this signature
+                    repeats = []
+                    for _ in range(5):
+                        started = time.perf_counter()
+                        variant.run(payload)
+                        repeats.append(time.perf_counter() - started)
+                    ladder.append((int(count), float(np.median(repeats))))
+                except Exception:
+                    continue
+        if len(ladder) == 1 and variant.specialized:
+            # One point and a known intercept is still two facts: the call
+            # overhead measured on this lane's parametric sibling is the
+            # same dispatch path, so the baked cell reports its own total
+            # and lets a reader subtract rather than inventing a slope.
+            count, seconds = ladder[0]
+            per_element = seconds / max(1.0, float(count))
+            call_overhead = 0.0
+        elif len(ladder) >= 2:
+            counts = np.asarray([point[0] for point in ladder], dtype=float)
+            seconds = np.asarray([point[1] for point in ladder], dtype=float)
+            slope, intercept = np.polyfit(counts, seconds, 1)
+            per_element = max(0.0, float(slope))
+            call_overhead = max(0.0, float(intercept))
+        else:
+            per_element = compute_avg / max(
+                1.0, float(max(sizes.values(), default=1))
+            )
+            call_overhead = 0.0
+        size_curve = [
+            {"elements": count, "seconds": seconds}
+            for count, seconds in ladder
+        ]
         first_call = float(
             verification.get("probe_call_seconds") or cold_avg
         )
         return {
             "sizes": sizes,
+            "compute_seconds_per_element": per_element,
+            "call_overhead_seconds": call_overhead,
+            "size_curve": size_curve,
             "compute_avg_seconds": compute_avg,
             "cold_avg_seconds": cold_avg,
             "first_call_seconds": first_call,
@@ -894,6 +1127,165 @@ class KernelBank:
             name, contract=contract, specialized=None,
             compile_missing=compile_missing,
         ), "parametric"
+
+    def matrix(self, family: str) -> list[dict]:
+        """Every registered cell of one core, with what is known about it.
+
+        A row per spec whose name is ``family`` or ``family_d<digits>``:
+        its declared digits and width, and -- where the cell has been built
+        -- its measured delivered accuracy and its measured per-element
+        cost. Cells that were never built report ``None`` for both, which
+        is the honest state of an option nobody has priced yet.
+        """
+
+        built = {}
+        for manifest in self.inventory():
+            if manifest.get("specialized"):
+                continue
+            capability = manifest.get("capability") or {}
+            profile = manifest.get("profile") or {}
+            # Per-element cost from the profile's own compute average and
+            # the sizes it was taken at -- the launch half is kept
+            # separately, never folded in: dispatch is paid once per call
+            # and arithmetic once per element, and a single blended number
+            # misprices every batch size but the one it was taken at.
+            per_element = profile.get("compute_seconds_per_element")
+            if per_element is None and profile.get(
+                "compute_avg_seconds"
+            ) is not None:
+                # A record written before the two-point profile existed:
+                # fall back to its single-point division and let it be
+                # visibly worse rather than silently absent.
+                elements = max(
+                    (int(value) for value in
+                     (profile.get("sizes") or {}).values()),
+                    default=1,
+                )
+                per_element = (
+                    float(profile["compute_avg_seconds"]) / max(elements, 1)
+                )
+            built[(
+                str(manifest.get("kernel")),
+                str(manifest.get("backend") or "llvm"),
+            )] = {
+                "measured_error": capability.get("measured_error"),
+                "compute_ns_per_element": (
+                    None if per_element is None else float(per_element) * 1e9
+                ),
+                "call_overhead_ns": (
+                    None if profile.get("call_overhead_seconds") is None
+                    else float(profile["call_overhead_seconds"]) * 1e9
+                ),
+                "first_launch_ns": (
+                    None if profile.get("first_launch_seconds") is None
+                    else float(profile["first_launch_seconds"]) * 1e9
+                ),
+                "admitted": bool(
+                    (manifest.get("verification") or {}).get("admitted")
+                ),
+            }
+        rows = []
+        for name, spec in self.specs.items():
+            core, _, suffix = str(name).partition("_d")
+            if core != str(family):
+                continue
+            for backend in self.BACKENDS:
+                row = {
+                    "kernel": str(name),
+                    "backend": str(backend),
+                    "digits": int(suffix) if suffix.isdigit() else None,
+                    "limb_width": int(getattr(spec, "limb_width", 1) or 1),
+                    "measured_error": None,
+                    "compute_ns_per_element": None,
+                    "call_overhead_ns": None,
+                    "first_launch_ns": None,
+                    "admitted": None,
+                }
+                row.update(built.get((str(name), str(backend)), {}))
+                rows.append(row)
+        return sorted(rows, key=lambda row: (
+            row["limb_width"], row["digits"] or 0, row["backend"],
+        ))
+
+    def cheapest_meeting(self, family: str, required_error: float, *,
+                         sizes: Mapping[str, int] | None = None,
+                         contract: str | None = None,
+                         build_missing: bool = True):
+        """The fastest cell of ``family`` MEASURED to reach ``required_error``.
+
+        This is what the matrix is for. Callers do not want ``sin_d32``;
+        they want sine to a stated accuracy as cheaply as that accuracy can
+        be had, and which cell that is depends on facts only measurement
+        knows -- a thirty-two digit series evaluated in one double delivers
+        about sixteen digits and charges for thirty-two, so an assumption
+        from the declared digits would rank it top and be wrong.
+
+        Cells are considered cheapest-first among those whose MEASURED
+        error meets the requirement. Unbuilt cells are built on demand when
+        allowed, cheapest declared first, so the answer is discovered
+        rather than assumed. Returns ``(variant, row)``; raises
+        ``BankRefusal`` when no cell of this family can reach the target.
+        """
+
+        rows = self.matrix(family)
+        if not rows:
+            raise BankRefusal(f"no kernels registered for core {family!r}")
+        target = float(required_error)
+
+        def cost(row):
+            measured = row.get("compute_ns_per_element")
+            if measured is not None:
+                return float(measured)
+            # Unpriced: rank by the work its declaration implies, so the
+            # cheapest plausible cell is the first one actually measured.
+            return float((row["digits"] or 32) * row["limb_width"] ** 2)
+
+        priced = [
+            row for row in rows
+            if row["measured_error"] is not None and row["admitted"]
+        ]
+        for row in sorted(priced, key=cost):
+            if float(row["measured_error"]) <= target:
+                return self.get(
+                    row["kernel"], contract=contract,
+                    specialized=dict(sizes) if sizes else None,
+                    compile_missing=True, backend=row["backend"],
+                ), row
+        if not build_missing:
+            raise BankRefusal(
+                f"no measured cell of {family!r} reaches {target:.3e}"
+            )
+        for row in sorted(
+            (row for row in rows if row["measured_error"] is None), key=cost,
+        ):
+            try:
+                variant = self.get(
+                    row["kernel"], contract=contract, compile_missing=True,
+                    backend=row["backend"],
+                )
+            except BankRefusal:
+                continue
+            refreshed = next((
+                candidate for candidate in self.matrix(family)
+                if candidate["kernel"] == row["kernel"]
+                and candidate["backend"] == row["backend"]
+            ), row)
+            measured = refreshed.get("measured_error")
+            if measured is not None and float(measured) <= target:
+                if sizes:
+                    variant = self.get(
+                        row["kernel"], contract=contract,
+                        specialized=dict(sizes), compile_missing=True,
+                        backend=row["backend"],
+                    )
+                return variant, refreshed
+        raise BankRefusal(
+            f"no cell of {family!r} reaches {target:.3e}; measured cells: "
+            + repr([
+                (row["kernel"], row["measured_error"])
+                for row in self.matrix(family)
+            ][:6])
+        )
 
     # -- inventory --------------------------------------------------------
     def inventory(self) -> list[dict]:

@@ -196,6 +196,13 @@ class GLSLComputeArtifact:
     #: Array formals whose SSBOs the shader stores into; these are what
     #: ``run()`` reads back into the host mirrors after the dispatch.
     written_buffers: tuple[int, ...] = ()
+    #: The element count as a COMPILE-TIME literal, when the kernel was
+    #: built with its trip count baked in. A tiling deployment wants
+    #: exactly this: the workgroup count is then known at emission, the
+    #: guard folds away, and no feed carries a size the code already
+    #: knows. ``None`` means the count arrives at run time, in the
+    #: scalars block, as the first entry of ``scalar_order``.
+    baked_count: int | None = None
     local_size: int = 64
     _program: Any = field(default=None, repr=False)
 
@@ -291,24 +298,52 @@ class GLSLComputeArtifact:
             )
             buffer_names[int(value_id)] = name
 
+        # Scalars are ALSO published in ``buffers``, keyed by their value
+        # id, even though they live in the packed block rather than an
+        # SSBO of their own. The shared execution face promises that a
+        # value fed by id can be read back by that id, and a reader
+        # checking every declared parameter -- which is what the kernel
+        # bank's verification does -- must not fault on a coefficient
+        # merely because this lane packs it differently.
+        for value_id in self.scalar_order:
+            fed = feeds.get(int(value_id))
+            if fed is None:
+                continue
+            buffers.setdefault(int(value_id), np.ascontiguousarray(
+                np.atleast_1d(np.asarray(fed)), dtype=np.float64,
+            ))
+
         # The scalars block: pack exactly the layout the artifact documents.
         # The count is uint32 at offset 0, four bytes of padding align the
         # doubles to their std430 base alignment of 8, then one double per
         # remaining scalar_order entry in order. Missing coefficient feeds
         # become 0.0, which is the exact-zero appended-limb convention the
         # feed builders already use.
-        count_id = int(self.scalar_order[0])
-        count = int(np.asarray(feeds[count_id]).reshape(-1)[0])
-        header = np.zeros(2, dtype=np.uint32)
-        header[0] = count
+        if self.baked_count is not None:
+            count = int(self.baked_count)
+        else:
+            count_id = int(self.scalar_order[0])
+            count = int(np.asarray(feeds[count_id]).reshape(-1)[0])
+        # When the count is baked the shader declares no count field, so
+        # the block must not carry one either -- the doubles start at
+        # offset zero and every std430 offset downstream shifts with them.
+        scalar_values = (
+            self.scalar_order if self.baked_count is not None
+            else self.scalar_order[1:]
+        )
         coefficients = np.asarray(
             [
                 float(np.asarray(feeds.get(int(value_id), 0.0)).reshape(-1)[0])
-                for value_id in self.scalar_order[1:]
+                for value_id in scalar_values
             ],
             dtype=np.float64,
         )
-        block = header.tobytes() + coefficients.tobytes()
+        if self.baked_count is None:
+            header = np.zeros(2, dtype=np.uint32)
+            header[0] = count
+            block = header.tobytes() + coefficients.tobytes()
+        else:
+            block = coefficients.tobytes()
         scalar_name = int(GL.glGenBuffers(1))
         GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, scalar_name)
         GL.glBufferData(
@@ -438,6 +473,33 @@ def emit_ssa_module_to_glsl_compute(
             "cannot identify the element count for the dispatch guard",
         )
 
+    # A bound that is a CONSTANT is a specialized kernel's baked trip
+    # count. Taking it as a literal is the point of specializing for a
+    # tiling deployment: the guard folds, the workgroup count is known
+    # before the shader is compiled, and nothing has to feed a size the
+    # emitted code already contains. A bound that is a formal keeps the
+    # run-time path, where the count rides in the scalars block.
+    baked_count = None
+    wrapper_formals = {int(value.id) for value in wrapper.args}
+    if count_id not in wrapper_formals:
+        for block in wrapper.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    str(instruction.op) == "Const"
+                    and instruction.res is not None
+                    and int(instruction.res.id) == int(count_id)
+                ):
+                    held = instruction.attributes.get(
+                        "constant", instruction.attributes.get("value")
+                    )
+                    if held is not None:
+                        baked_count = int(held)
+        if baked_count is None:
+            return refuse(
+                "Lt", f"loop bound %t{count_id} is neither a wrapper formal "
+                "nor a constant; the dispatch guard needs one or the other",
+            )
+
     # -- region formal classification: buffers vs scalars -------------------
     #
     # An array base is told apart by what is done THROUGH it: it appears as
@@ -486,9 +548,12 @@ def emit_ssa_module_to_glsl_compute(
             ))
 
     buffer_order = tuple(actual_of[held] for held in array_formals)
-    scalar_order = (int(count_id),) + tuple(
-        actual_of[held] for held in scalar_formals
-    )
+    # A baked count is in the code, not in the block: leaving its id at
+    # the head of scalar_order would make every reader look for a feed
+    # that does not exist (and fault on it).
+    scalar_order = (
+        () if baked_count is not None else (int(count_id),)
+    ) + tuple(actual_of[held] for held in scalar_formals)
     written_buffers = tuple(
         actual_of[held] for held in array_formals if held in written_bases
     )
@@ -652,7 +717,10 @@ def emit_ssa_module_to_glsl_compute(
         f"layout(std430, binding = {len(array_formals)}) readonly buffer "
         "ScalarFeed {"
     )
-    interface.append("    uint element_count;  // the wrapper's loop bound")
+    if baked_count is None:
+        interface.append(
+            "    uint element_count;  // the wrapper's loop bound"
+        )
     interface.append("    uint _pad0;          // aligns the doubles to 8")
     interface.append("    double scalars[];    // coefficients, layout order")
     interface.append("} feed;")
@@ -668,7 +736,12 @@ def emit_ssa_module_to_glsl_compute(
         *interface,
         "void main() {",
         "    uint invocation = gl_GlobalInvocationID.x;",
-        "    if (invocation >= feed.element_count) { return; }",
+        (
+            "    if (invocation >= feed.element_count) { return; }"
+            if baked_count is None else
+            f"    if (invocation >= {int(baked_count)}u) {{ return; }}"
+            "  // trip count baked at specialization"
+        ),
         "    // The region's element-index formal, standing in for the loop",
         "    // Phi. Signed int on purpose: the SSA index arithmetic is",
         "    // signed and the strides are tiny, so int is both faithful",
@@ -684,6 +757,7 @@ def emit_ssa_module_to_glsl_compute(
         source=source,
         buffer_order=buffer_order,
         scalar_order=scalar_order,
+        baked_count=baked_count,
         shortfalls=tuple(shortfalls),
         precision_sections=precision_present,
         written_buffers=written_buffers,

@@ -741,6 +741,14 @@ def fit_exact(core: str, epsilon: float | None = None) -> BakedCore:
             from .signal_symbolic import order_for, order_to_degree
 
             digits = int(math.ceil(-math.log10(epsilon)))
+            if digits <= 16:
+                # Tiers within one double bake exactly as they always
+                # have: the full march from three. The predicted start
+                # exists for the wide tiers, where each rung costs an
+                # exact-oracle measurement in wide arithmetic; changing
+                # which rung a LEGACY tier admits at would move a working
+                # system for a saving it does not need.
+                return range(3, int(limit) + 1, 2)
             half = 0.5 * (float(spec.high) - float(spec.low))
             predicted = int(order_to_degree(
                 str(core), order_for(str(core), half, digits=digits)

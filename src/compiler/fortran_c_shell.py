@@ -4777,6 +4777,201 @@ def _control_expression_value_ids(expression: Any) -> frozenset[int]:
     ))
 
 
+def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgraphs):
+    """Retain each ``use_native`` occurrence as one lexical control call.
+
+    This is intentionally the last control transformation. Earlier region and
+    hierarchy passes therefore cannot mistake an external capability for a
+    Python function to pursue or for a numerical region to fuse.
+    """
+
+    from .control_source import (
+        CallBlock, ConditionalBlock, ExternalReferenceCallBlock, LoopBlock,
+        SequenceBlock, StatementBlock, WhileBlock,
+    )
+    from .glsl_deployment_strategy import _branch_compartments
+
+    graph_obj = graph.G
+    memberships = _branch_compartments(graph)
+
+    def node_position(node_id):
+        data = graph_obj.nodes.get(int(node_id), {})
+        expression = data.get("expr_obj")
+        span = data.get("source_span") or {}
+        return (
+            int(getattr(expression, "lineno", span.get("line", 1 << 30)) or (1 << 30)),
+            int(getattr(expression, "col_offset", span.get("column", 0)) or 0),
+            int(node_id),
+        )
+
+    region_positions = {
+        int(index): min(
+            (node_position(node_id) for node_id in subgraph.G.graph.get(
+                "deployment_nodes", ()
+            )),
+            default=(1 << 30, 0, int(index)),
+        )
+        for index, subgraph in enumerate(dispatch_subgraphs)
+    }
+
+    def block_position(block):
+        if isinstance(block, ExternalReferenceCallBlock):
+            return node_position(block.callsite_id)
+        if isinstance(block, StatementBlock) and len(block.lines) == 1:
+            line = block.lines[0]
+            if line.startswith("__scheduled_region_") and line.endswith("__"):
+                return region_positions.get(
+                    int(line[len("__scheduled_region_"):-2]),
+                    (1 << 30, 0, 0),
+                )
+        if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
+            return node_position(block.source_node_id)
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            source_id = block.source_loop_node_id
+            if source_id is not None:
+                return node_position(source_id)
+        if isinstance(block, CallBlock):
+            return node_position(block.callsite_id)
+        if isinstance(block, SequenceBlock) and block.blocks:
+            return min(map(block_position, block.blocks))
+        return (1 << 30, 0, 0)
+
+    def insert_ordered(block, external):
+        sequence = block if isinstance(block, SequenceBlock) else SequenceBlock((block,))
+        decorated = [
+            (block_position(child), index, child)
+            for index, child in enumerate(sequence.blocks)
+        ]
+        decorated.append((block_position(external), len(decorated), external))
+        return SequenceBlock(tuple(
+            child for _position, _index, child in sorted(
+                decorated, key=lambda item: (item[0], item[1])
+            )
+        ))
+
+    def insert_in_conditional(block, owner_id, arm, external):
+        if isinstance(block, ConditionalBlock):
+            if int(block.source_node_id or -1) == int(owner_id):
+                if arm == "body":
+                    return replace(block, body=insert_ordered(block.body, external)), True
+                return replace(
+                    block,
+                    orelse=insert_ordered(block.orelse or SequenceBlock(()), external),
+                ), True
+            body, inserted = insert_in_conditional(block.body, owner_id, arm, external)
+            if inserted:
+                return replace(block, body=body), True
+            if block.orelse is not None:
+                orelse, inserted = insert_in_conditional(
+                    block.orelse, owner_id, arm, external
+                )
+                if inserted:
+                    return replace(block, orelse=orelse), True
+        elif isinstance(block, SequenceBlock):
+            children = []
+            for child in block.blocks:
+                projected, inserted = insert_in_conditional(
+                    child, owner_id, arm, external
+                )
+                children.append(projected)
+                if inserted:
+                    children.extend(block.blocks[len(children):])
+                    return SequenceBlock(tuple(children)), True
+        elif isinstance(block, (LoopBlock, WhileBlock)):
+            body, inserted = insert_in_conditional(
+                block.body, owner_id, arm, external
+            )
+            if inserted:
+                return replace(block, body=body), True
+        elif isinstance(block, CallBlock):
+            callee, inserted = insert_in_conditional(
+                block.callee, owner_id, arm, external
+            )
+            if inserted:
+                return replace(block, callee=callee), True
+        return block, False
+
+    root = control.root
+    unplaced = []
+    installed = []
+    for node_id, data in sorted(graph_obj.nodes(data=True), key=lambda item: node_position(item[0])):
+        expression = data.get("expr_obj")
+        contract = dict(
+            data.get("extraction_contract")
+            or (data.get("attributes") or {}).get("extraction_contract")
+            or getattr(expression, "_extraction_contract", None)
+            or {}
+        )
+        if not isinstance(expression, ast.Call) or contract.get("action") != "use_native":
+            continue
+        if os.environ.get("TURING_DEBUG_EXTERNAL_REFERENCE"):
+            print(
+                "DEBUG-EXTERNAL-REFERENCE "
+                f"function={graph_obj.graph.get('function_name')} "
+                f"callsite={int(node_id)} identity={contract.get('identity')} "
+                f"parents={data.get('parents')} "
+                f"parameters={contract.get('parameters')}",
+                file=sys.stderr,
+            )
+        parameters = dict(contract.get("parameters") or {})
+        result_dtype = parameters.get("result_dtype")
+        if result_dtype is None:
+            unplaced.append((int(node_id), "native boundary has no recorded result_dtype"))
+            continue
+
+        parents = tuple(data.get("parents") or ())
+
+        def parent_value_id(parent_id):
+            if parent_id not in graph_obj:
+                return None
+            return int(graph_obj.nodes[parent_id].get("value_id", parent_id))
+
+        arguments = tuple(
+            result for parent_id in ordered_arguments(parents)
+            for result in (parent_value_id(parent_id),) if result is not None
+        )
+        keywords = tuple(
+            (name, result)
+            for parent_id, role in parents
+            for name in (keyword_argument_name(role),)
+            if name is not None
+            for result in (parent_value_id(parent_id),)
+            if result is not None
+        )
+        if len(arguments) != len(expression.args) or len(keywords) != len(expression.keywords):
+            unplaced.append((int(node_id), "native boundary arguments lack SSA identities"))
+            continue
+        external = ExternalReferenceCallBlock(
+            callsite_id=int(node_id),
+            identity=str(contract["identity"]),
+            argument_value_ids=arguments,
+            keyword_argument_value_ids=keywords,
+            result_value_id=int(data.get("value_id", node_id)),
+            result_dtype=str(result_dtype),
+            shell_abi=str(parameters["shell_abi"]),
+            external_domain=str(parameters["external_domain"]),
+        )
+        guarded = tuple(
+            (int(owner), str(arm))
+            for owner, arm in memberships.get(int(node_id), ())
+            if str(arm) in {"body", "orelse"}
+        )
+        inserted = False
+        for owner_id, arm in sorted(
+            guarded, key=lambda item: node_position(item[0]), reverse=True
+        ):
+            root, inserted = insert_in_conditional(root, owner_id, arm, external)
+            if inserted:
+                break
+        if guarded and not inserted:
+            unplaced.append((int(node_id), "native boundary conditional scope is not retained"))
+            continue
+        if not inserted:
+            root = insert_ordered(root, external)
+        installed.append(int(node_id))
+    return replace(control, root=root), tuple(installed), tuple(unplaced)
+
+
 def _control_block_consumes_values(block: Any, value_ids: Iterable[int]) -> bool:
     """Whether a control subtree observes any exact SSA identity."""
 
@@ -8298,6 +8493,15 @@ def _class_surface_ssa_program(
             control,
             root=_schedule_sequence_query_dependencies(control.root),
         )
+        (
+            control,
+            external_reference_callsites,
+            external_reference_call_shortfalls,
+        ) = _install_external_reference_calls(
+            control,
+            graph,
+            getattr(shell, "dispatch_subgraphs", ()),
+        )
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
@@ -8409,6 +8613,18 @@ def _class_surface_ssa_program(
                 resolved_sequence_schemas=resolved_sequence_schemas,
             )
         )
+        if external_reference_callsites:
+            module_ir.metadata["external_reference_callsites"] = tuple(
+                external_reference_callsites
+            )
+        if external_reference_call_shortfalls:
+            module_ir.metadata["external_reference_call_shortfalls"] = tuple(
+                {
+                    "source_call_node_id": int(callsite_id),
+                    "reason": str(reason),
+                }
+                for callsite_id, reason in external_reference_call_shortfalls
+            )
         if shortfalls:
             lowering_failures.extend((symbol, item) for item in shortfalls)
         lowering_failures.extend(
@@ -18651,6 +18867,31 @@ def lower_ast_source_to_ssa(
         }
         shell_requests = {}
         native_reference_plans = {}
+        native_reference_occurrences = []
+        native_nodes_by_location = {}
+        for native_node_id, native_node_data in graph.G.nodes(data=True):
+            native_expression = native_node_data.get("expr_obj")
+            if not isinstance(native_expression, ast.Call):
+                continue
+            native_contract = dict(
+                native_node_data.get("extraction_contract")
+                or (native_node_data.get("attributes") or {}).get(
+                    "extraction_contract"
+                )
+                or getattr(native_expression, "_extraction_contract", None)
+                or {}
+            )
+            if str(native_contract.get("action") or "") != "use_native":
+                continue
+            span = native_node_data.get("source_span") or {}
+            location = (
+                str(native_contract.get("identity") or ""),
+                int(getattr(native_expression, "lineno", span.get("line", -1))),
+                int(getattr(native_expression, "col_offset", span.get("column", -1))),
+            )
+            native_nodes_by_location.setdefault(location, []).append((
+                int(native_node_id), native_node_data, native_expression,
+            ))
         for boundary in extraction_boundaries:
             contract = dict(boundary.get("extraction_contract") or {})
             parameters = dict(contract.get("parameters") or {})
@@ -18698,6 +18939,65 @@ def lower_ast_source_to_ssa(
                         "conflicting native boundary ABI declarations for "
                         f"{identity!r}"
                     )
+                location = (
+                    identity,
+                    int(boundary.get("line", -1)),
+                    int(boundary.get("column", -1)),
+                )
+                candidates = native_nodes_by_location.get(location, ())
+                occurrence_node = next((
+                    candidate
+                    for candidate in candidates
+                    if not boundary.get("owner_name")
+                    or str((candidate[1].get("source_scope") or ("",))[-1])
+                    == str(boundary.get("owner_name"))
+                ), candidates[0] if candidates else None)
+                argument_value_ids = ()
+                keyword_argument_value_ids = ()
+                result_value_id = None
+                source_call_node_id = None
+                if occurrence_node is not None:
+                    source_call_node_id, node_data, expression = occurrence_node
+
+                    def occurrence_value_id(source_expression):
+                        source_id = id(source_expression)
+                        if source_id not in graph.G:
+                            return None
+                        return int(graph.G.nodes[source_id].get(
+                            "value_id", source_id
+                        ))
+
+                    argument_value_ids = tuple(
+                        value_id
+                        for argument in expression.args
+                        for value_id in (occurrence_value_id(argument),)
+                        if value_id is not None
+                    )
+                    keyword_argument_value_ids = tuple(
+                        (str(keyword.arg), value_id)
+                        for keyword in expression.keywords
+                        if keyword.arg is not None
+                        for value_id in (occurrence_value_id(keyword.value),)
+                        if value_id is not None
+                    )
+                    result_value_id = int(node_data.get(
+                        "value_id", source_call_node_id
+                    ))
+                native_reference_occurrences.append({
+                    "identity": identity,
+                    "owner": boundary.get("owner_name"),
+                    "line": int(boundary.get("line", -1)),
+                    "column": int(boundary.get("column", -1)),
+                    "source_call_node_id": source_call_node_id,
+                    "argument_value_ids": argument_value_ids,
+                    "keyword_argument_value_ids": keyword_argument_value_ids,
+                    "result_value_id": result_value_id,
+                    "operations": ("resolve", "call", "release"),
+                    "argument_frame": "turing.external-reference-arguments.v1",
+                    "result_frame": "turing.external-reference-value.v1",
+                    "object_policy": "shell-owned-opaque-handles",
+                    "shell_abi": parameters.get("shell_abi"),
+                })
         if shell_requests:
             from .shell_io import (
                 ShellIOManifest,
@@ -18727,6 +19027,12 @@ def lower_ast_source_to_ssa(
                 shell_io_metadata["external_reference_plans"] = tuple(
                     native_reference_plans[identity]
                     for identity in sorted(native_reference_plans)
+                )
+                shell_io_metadata["external_reference_occurrence_schema"] = (
+                    "turing.shell-external-reference-occurrence.v1"
+                )
+                shell_io_metadata["external_reference_occurrences"] = tuple(
+                    native_reference_occurrences
                 )
                 module.metadata["shell_io"] = shell_io_metadata
     for decision in decision_records:

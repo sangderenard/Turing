@@ -318,6 +318,7 @@ def test_native_boundary_receipt_survives_function_graph_reduction():
         "shell_capability": "host_references",
         "shell_abi": "turing-shell-io-abi.external_references",
         "external_domain": "host_system",
+        "result_dtype": "opaque_ref",
     }
 
 

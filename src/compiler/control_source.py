@@ -285,6 +285,20 @@ class CallBlock:
 
 
 @dataclass(frozen=True)
+class ExternalReferenceCallBlock:
+    """One authored call through the shell external-reference capability."""
+
+    callsite_id: int
+    identity: str
+    argument_value_ids: tuple[int, ...]
+    keyword_argument_value_ids: tuple[tuple[str, int], ...]
+    result_value_id: int
+    result_dtype: str
+    shell_abi: str = "turing-shell-io-abi.external_references"
+    external_domain: str = "host_system"
+
+
+@dataclass(frozen=True)
 class ValidationBlock:
     """Device-side predicate whose failure is reported through shell errors."""
 
@@ -353,6 +367,7 @@ ControlBlock = (
     | StateMachineTick
     | ParallelDeployment
     | CallBlock
+    | ExternalReferenceCallBlock
     | ValidationBlock
     | SequenceMutationBlock
     | SequenceQueryBlock
@@ -477,6 +492,12 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
                 values.add(int(block.count_value_id))
             if block.predicate_value_id is not None:
                 values.add(int(block.predicate_value_id))
+        elif isinstance(block, ExternalReferenceCallBlock):
+            values.update(int(value_id) for value_id in block.argument_value_ids)
+            values.update(
+                int(value_id)
+                for _name, value_id in block.keyword_argument_value_ids
+            )
         elif isinstance(block, SequenceBlock):
             for child in block.blocks:
                 visit(child)
@@ -2130,6 +2151,7 @@ __all__ = [
     "ControlExpression",
     "ControlSequenceMutation",
     "CallBlock",
+    "ExternalReferenceCallBlock",
     "ValidationBlock",
     "ControlProgram",
     "ControlTarget",

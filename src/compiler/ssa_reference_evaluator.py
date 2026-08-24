@@ -367,6 +367,7 @@ class SSAReferenceEvaluator:
         *,
         step_limit: int = 5_000_000,
         history: Iterable[int] = (),
+        external_reference_host: Any = None,
     ) -> None:
         self.module = module
         self.functions = dict(getattr(module, "functions", {}) or {})
@@ -381,6 +382,9 @@ class SSAReferenceEvaluator:
         self.history_ids = frozenset(int(value) for value in history)
         self.history: dict[int, list[Any]] = {}
         self._root_frame: dict[int, Any] | None = None
+        self.external_reference_host = external_reference_host
+        self._external_reference_ids: dict[str, int] = {}
+        self._external_request_id = 0
 
     # -- public -----------------------------------------------------------
 
@@ -610,6 +614,9 @@ class SSAReferenceEvaluator:
         )
 
     def _call(self, instruction: Any, values: dict[int, Any]) -> None:
+        if instruction.attributes.get("external_reference"):
+            self._external_call(instruction, values)
+            return
         callee_name = str(instruction.attributes.get("callee") or "")
         callee = self.functions.get(callee_name)
         if callee is None:
@@ -672,6 +679,77 @@ class SSAReferenceEvaluator:
             values[int(instruction.res.id)] = (
                 returned[0] if len(returned) == 1 else list(returned)
             )
+
+    def _external_call(self, instruction: Any, values: dict[int, Any]) -> None:
+        """Execute one SSA capability call through the physical shell records."""
+
+        from .shell_external_references import (
+            EXTERNAL_CALL, EXTERNAL_OK, EXTERNAL_RESOLVE,
+            ExistingModuleExternalReferenceHost,
+            ExternalReferenceRequestRecord,
+        )
+
+        host = self.external_reference_host
+        if host is None:
+            host = ExistingModuleExternalReferenceHost()
+            self.external_reference_host = host
+        identity = str(instruction.attributes.get("external_identity") or "")
+        reference_id = self._external_reference_ids.get(identity)
+
+        def service(operation: int, payload: bytes, reference: int = 0) -> Any:
+            self._external_request_id += 1
+            argument_offset = 64
+            result_offset = argument_offset + len(payload) + 64
+            memory = bytearray(result_offset + max(4096, len(payload) * 4 + 64))
+            memory[argument_offset:argument_offset + len(payload)] = payload
+            request = ExternalReferenceRequestRecord(
+                operation=operation,
+                request_id=self._external_request_id,
+                reference_id=int(reference),
+                arguments_offset=argument_offset,
+                arguments_length=len(payload),
+                result_offset=result_offset,
+                result_capacity=len(memory) - result_offset,
+            )
+            completion = host.service(request, memory)
+            if completion.status != EXTERNAL_OK:
+                raise SSAEvaluationError(
+                    f"external reference {identity!r} completed with status "
+                    f"{completion.status}"
+                )
+            result = bytes(memory[
+                result_offset:result_offset + completion.result_length
+            ])
+            return None if not result else host.values.decode(result)
+
+        if reference_id is None:
+            reference_id = int(service(EXTERNAL_RESOLVE, host.values.encode(identity)))
+            self._external_reference_ids[identity] = reference_id
+        positional_count = len(instruction.args) - len(tuple(
+            instruction.attributes.get("keyword_names") or ()
+        ))
+        positional = tuple(
+            self._operand(values, argument)
+            for argument in instruction.args[:positional_count]
+        )
+        keyword_names = tuple(
+            map(str, instruction.attributes.get("keyword_names") or ())
+        )
+        keywords = {
+            name: self._operand(values, argument)
+            for name, argument in zip(
+                keyword_names,
+                instruction.args[positional_count:],
+                strict=True,
+            )
+        }
+        result = service(
+            EXTERNAL_CALL,
+            host.values.encode_arguments(positional, keywords),
+            reference_id,
+        )
+        if instruction.res is not None:
+            values[int(instruction.res.id)] = result
 
     def _value(self, values: dict[int, Any], value: Any) -> Any:
         """The stored object, address included -- no dereference."""

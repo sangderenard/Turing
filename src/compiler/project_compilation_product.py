@@ -7095,6 +7095,12 @@ def compile_project_product(
                     "error": failure.get("error"),
                     "failure_stage": failure.get("stage"),
                     "failure": failure_path.relative_to(root).as_posix(),
+                    **({
+                        "frontier_kind": failure.get("frontier_kind"),
+                        "subdivision_boundaries": list(
+                            failure.get("subdivision_boundaries") or ()
+                        ),
+                    } if failure.get("frontier_kind") else {}),
                 } if failure else {}),
                 **({
                     "process_graph_unit_plan": (
@@ -7615,6 +7621,24 @@ def compile_project_bootstrap_creep(
                 continue
             error_type = str(unit.get("error_type") or "")
             error = str(unit.get("error") or "")
+            # These are durable continuation frontiers, not terminal compiler
+            # failures.  Let the subdivision/deep-retry pass below consume
+            # their published ProcessGraph products before enforcing native
+            # installation.  Treating them as installation failures here
+            # made the creep loop raise before it could reach the code that
+            # exists specifically to compile their child integrals.
+            if (
+                (
+                    error_type == "CompilationSubdivisionRequired"
+                    and str(unit.get("frontier_kind") or "")
+                    == "compilation-subdivision-required"
+                )
+                or (
+                    error_type == "ResourceLimitExceeded"
+                    and "elapsed time" in error
+                )
+            ):
+                continue
             reason = ": ".join(part for part in (error_type, error) if part)
             native_completion_failures.append({
                 "qualified_name": str(

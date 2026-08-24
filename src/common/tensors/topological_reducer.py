@@ -3710,7 +3710,13 @@ def _normalize_lexical_values(
                     )
                     sequence_mutation = (
                         sequence_policy is not None
-                        and call.func.attr in {"add", "append", "extend"}
+                        and call.func.attr in {
+                            "add", "append", "extend", "pop"
+                        }
+                        and not (
+                            aggregate_kind == "dict"
+                            and call.func.attr == "pop"
+                        )
                         and not (
                             aggregate_kind in {"tuple", "bytes"}
                             or not state_attributes.get(

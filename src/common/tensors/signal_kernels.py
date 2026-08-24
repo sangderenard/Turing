@@ -218,6 +218,54 @@ def _radius(name: str) -> float:
     return float(_proof.CORE_RADII[name])
 
 
+def _capability_probe(name: str, width: int, constants: Mapping[str, Any],
+                      parameter_order: tuple[str, ...]):
+    """Measure what a built cell DELIVERS against exact truth.
+
+    The oracle is ``exact_evaluator`` -- rational arithmetic, no library --
+    sampled across the core's own interval, and the comparison is made
+    against the EXACT SUM of the returned limbs so a wide cell is not
+    scored through a collapse that throws away what it bought. This is the
+    number a selector ranks accuracy by; it is deliberately not the
+    verification error, which asks the different question of whether the
+    compiler was faithful to the program.
+    """
+
+    from . import signal_symbolic as _proof
+
+    radius = float(_proof.CORE_RADII[name])
+
+    def probe(run, samples: int = 64) -> float:
+        from fractions import Fraction
+
+        samples = max(1, int(samples))
+        points = np.linspace(-radius * 0.98, radius * 0.98, samples)
+        x = np.zeros(samples * width)
+        x[::width] = points
+        arguments = {
+            "x": x, "y": np.zeros(samples * width), "n": samples,
+            **{key: value for key, value in constants.items()},
+        }
+        produced = np.asarray(
+            run({key: arguments[key] for key in parameter_order}),
+            dtype=np.float64,
+        ).ravel()
+        truth = _proof.exact_evaluator(
+            name, radius, max(20, 17 * width),
+        )
+        worst = 0.0
+        for index, point in enumerate(points):
+            got = sum(
+                (Fraction(float(produced[index * width + limb]))
+                 for limb in range(width)),
+                Fraction(0),
+            )
+            worst = max(worst, abs(float(got - truth(float(point)))))
+        return worst
+
+    return probe
+
+
 def _wide_reference(name: str, order: int, width: int,
                     coefficient_names: tuple[str, ...]):
     """The same materialised program, run eagerly at its declared width.
@@ -338,14 +386,36 @@ def kernel_spec(cores: _signal.CoreSet, name: str, digits: int = 32,
             "",
         ))
     else:
+        # ONE SHAPE FOR EVERY LANE. The core is inlined into the loop here
+        # exactly as it is at width two and above, because that is the
+        # shape all four destinations are proven on: a kernel that CALLS a
+        # core and stores its return needs each lane to carry a
+        # value-returning call across its own function boundary, and the C
+        # and GLSL lanes -- which take the whole module and flatten it --
+        # had no reason to grow that until now. Inlining costs nothing (the
+        # callee has one call site) and removes the divergence.
         reads = {each: f"c[{int(each[1:])}]" for each in coefficients}
-        shell = KERNEL_SHELL.format(
-            name=name,
-            annotate=annotate,
-            structural="z * z" if structure in ("odd", "even") else "z",
-            arguments=", ".join(reads.get(each, each) for each in parameters),
-        )
-        source = body + shell
+        statements = [
+            line for line in body.splitlines()[1:] if line.strip()
+        ]
+        returned = statements[-1].split("return")[-1].strip()
+        inlined = [("    " + line) for line in statements[:-1]]
+        source = "\n".join((
+            "",
+            f"def {name}(x, y, n, c):",
+            "    for i in range(n):",
+            "        z = x[i]",
+            "        s = "
+            + ("z * z" if structure in ("odd", "even") else "z"),
+            *[
+                f"        {each} = {reads[each]}"
+                for each in coefficients
+            ],
+            *inlined,
+            f"        y[i] = {returned}",
+            "    return y",
+            "",
+        ))
     order = _proof.order_to_degree(
         name, _proof.order_for(name, _radius(name), digits=digits))
     exact = _proof.structured_coefficients(name, order)
@@ -376,19 +446,23 @@ def kernel_spec(cores: _signal.CoreSet, name: str, digits: int = 32,
                 **{key: value for key, value in _constants.items()},
             }
 
+        wide_order = (
+            "x", "y", "n", *coefficients,
+            *(
+                f"{coefficient}__limb{position}"
+                for coefficient in coefficients
+                for position in range(1, width)
+            ),
+        )
         return KernelSpec(
             name=f"{name}_d{digits}", source=source, function_name=name,
             reference=_wide_reference(name, order, width, coefficients),
-            parameter_order=(
-                "x", "y", "n", *coefficients,
-                *(
-                    f"{coefficient}__limb{position}"
-                    for coefficient in coefficients
-                    for position in range(1, width)
-                ),
-            ),
+            parameter_order=wide_order,
             size_parameters=("n",),
             example_inputs=example_inputs,
+            capability_probe=_capability_probe(
+                name, width, constants, wide_order,
+            ),
             # Wide buffers hold width limbs per element, which the extent
             # vocabulary cannot yet say; None makes partitioning machinery
             # refuse rather than tear limb pairs across a chunk boundary.
@@ -419,6 +493,9 @@ def kernel_spec(cores: _signal.CoreSet, name: str, digits: int = 32,
         example_inputs=example_inputs,
         extents={"x": ("n",), "y": ("n",), "c": ()},
         limb_width=1,
+        capability_probe=_capability_probe(
+            name, 1, {"c": values}, ("x", "y", "n", "c"),
+        ),
     )
 
 
@@ -445,10 +522,25 @@ def signal_kernel_specs(quality: str = DEFAULT_KERNEL_QUALITY, *,
 
     epsilon = float(_sets[str(quality)].epsilon)
     width = _limbs_for_digits(int(_math.ceil(-_math.log10(epsilon))))
+    # THE MATRIX, registered rather than assumed. A core is not one
+    # program: sized for eight digits it is a handful of terms, for
+    # thirty-two several times that, and at one limb the wide sizings
+    # cannot deliver what they charge for. Which cell a caller should use
+    # is a measured fact, so every cell is REGISTERED here and the bank
+    # prices them lazily -- registration compiles nothing; only a cell
+    # someone selects is ever built.
     specs = {}
     for name in FORWARD_KERNELS:
-        spec = kernel_spec(cores, name, limb_width=int(width))
-        specs[spec.name] = spec
+        for digits in ACCURACY_AXIS:
+            try:
+                spec = kernel_spec(
+                    cores, name, digits=digits, limb_width=int(width),
+                )
+            except Exception:
+                # A cell that cannot be authored is left out, not faked;
+                # the caller sees which combinations exist.
+                continue
+            specs[spec.name] = spec
     if include_vjp and False:
         for name in FORWARD_KERNELS:
             # Only the plans this module can author. `identity` is bypassed by

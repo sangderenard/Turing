@@ -374,6 +374,64 @@ def test_project_bootstrap_hard_fails_an_explicitly_failed_compiler_unit(
         raise AssertionError("failed compiler unit did not hard fail")
 
 
+def test_project_bootstrap_crawls_a_structured_failed_subdivision(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "compiler_part.py"
+    source.write_text("def root(value):\n    return value\n", encoding="utf-8")
+    observed = []
+
+    def compile_round(_source, output, **_kwargs):
+        unit_root = output / "units" / "root"
+        unit_root.mkdir(parents=True)
+        (unit_root / "resolved-process-graph.pkl").write_bytes(b"graph")
+        (unit_root / "process-graph-units.json").write_text(
+            json.dumps({"units": [{"qualified_names": ["root"]}]}),
+            encoding="utf-8",
+        )
+        return {
+            "units": [{
+                "qualified_name": "root",
+                "status": "failed",
+                "error_type": "CompilationSubdivisionRequired",
+                "error": "source loop owner must remain around its regions",
+                "frontier_kind": "compilation-subdivision-required",
+                "path": "units/root",
+                "process_graph_unit_plan": (
+                    "units/root/process-graph-units.json"
+                ),
+            }],
+            "automatic_native_verification": [],
+            "creep_frontier": [{"qualified_name": "root"}],
+        }
+
+    def crawl(graph, plan, output, **_kwargs):
+        observed.append((graph, plan, output))
+        return {
+            "status": "sealed",
+            "verified_products": [],
+            "fixed_points": [{"kind": "typed-child-frontier"}],
+        }
+
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.compile_project_product",
+        compile_round,
+    )
+    monkeypatch.setattr(
+        "src.compiler.project_compilation_product.compile_process_graph_creep",
+        crawl,
+    )
+
+    manifest = compile_project_bootstrap_creep(
+        source, tmp_path / "creep", max_rounds=1,
+    )
+
+    assert len(observed) == 1
+    assert manifest["rounds"][0]["process_graph_creeps"][0]["status"] == (
+        "sealed"
+    )
+
+
 def test_project_bootstrap_creep_automatically_crawls_partial_unit_plan(
     tmp_path, monkeypatch,
 ):

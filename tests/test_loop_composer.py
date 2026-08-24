@@ -1148,6 +1148,32 @@ def test_mapping_pop_none_preserves_optional_result_identity():
     assert len(mutation.argument_value_ids) == 2
 
 
+def test_zero_argument_list_pop_is_a_resident_loop_state_transition():
+    graph = _function_graph(
+        "def kernel(values):\n"
+        "    pending = list(values)\n"
+        "    total = 0\n"
+        "    while pending:\n"
+        "        total = total + pending.pop()\n"
+        "    return total\n",
+        "kernel",
+    )
+    plan, = _glsl_composer().compose(graph)
+    effect, = plan.loop.state_effects
+
+    assert effect.operator == "pop"
+    assert effect.mode is LoopStateEffectMode.SEQUENCE_MUTATION
+    assert effect.argument_value_ids == ()
+
+    plan, = materialize_retained_loop_ports(graph, (plan,))
+    reduction, = analyze_shader_loop_reductions(
+        graph, (plan,), (plan.loop.body_nodes,),
+    )
+    mutation, = reduction.control_program.root.sequence_mutations
+    assert mutation.operator == "pop"
+    assert mutation.policy == "duplicates"
+
+
 def test_sequence_mutation_expression_resolves_deterministic_value_identity():
     graph = _function_graph(
         "def kernel(values):\n"

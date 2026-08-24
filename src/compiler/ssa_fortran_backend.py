@@ -5735,3 +5735,106 @@ __all__ = [
     "fortran_compiler",
     "supported_tensor_operations",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Running a compiled Fortran core: the shared execution face.
+#
+# The packed pointer-array entry takes every published parameter in one
+# call, and the API records name each formal by the SSA value id it came
+# from -- so the same value-id-keyed feed dictionary every other lane
+# consumes marshals this one too. Nothing here knows what the kernel
+# computes; it reads the records.
+# ---------------------------------------------------------------------------
+
+import numpy as np
+
+
+class FortranCoreExecution:
+    """Allocated buffers and a bound packed entry, mirroring the LLVM face."""
+
+    def __init__(self, buffers, entry, pointers, count):
+        self.buffers = buffers
+        self._entry = entry
+        self._pointers = pointers
+        self._count = count
+
+    def run(self) -> "FortranCoreExecution":
+        if not self._entry(self._pointers, self._count):
+            raise RuntimeError("packed Fortran entry rejected its arguments")
+        return self
+
+
+class FortranCoreNative:
+    """A compiled Fortran core behind the packed pointer-array ABI.
+
+    The published API records name every parameter ``t<value_id>`` and name
+    each dynamic extent with the value id of the array it measures, so the
+    same value-id-keyed feed dictionary every other lane consumes marshals
+    this one too -- nothing here knows the operator, only the records.
+    """
+
+    #: Loaded Fortran libraries, kept for the life of the process.
+    #:
+    #: A standalone-linked gfortran artifact carries its own runtime, and
+    #: unloading that runtime at DLL_PROCESS_DETACH takes the process down
+    #: -- observed as an access violation inside garbage collection the
+    #: moment the last reference to a compiled core was dropped, long
+    #: after the kernel itself had run correctly. Holding the handle here
+    #: means a library is loaded once, never unloaded, and re-used by
+    #: every later variant that resolves to the same path: the crash
+    #: cannot happen, and repeated loads of the same artifact stop
+    #: happening too.
+    _LIBRARIES: dict = {}
+
+    def __init__(self, library_path: Path, entry_record):
+        import ctypes
+
+        self._entry_record = entry_record
+        symbol = f"{entry_record.symbol}__packed"
+        resolved = str(Path(library_path).resolve())
+        library = FortranCoreNative._LIBRARIES.get(resolved)
+        if library is None:
+            library = ctypes.CDLL(resolved)
+            FortranCoreNative._LIBRARIES[resolved] = library
+        self._library = library
+        function = getattr(library, symbol)
+        function.restype = ctypes.c_int
+        function.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t,
+        ]
+        self._packed = function
+
+    def prepare_execution(self, feeds) -> FortranCoreExecution:
+        import ctypes
+        import re
+
+        parameters = tuple(self._entry_record.parameters)
+        slots = []
+        buffers: dict[int, Any] = {}
+        for parameter in parameters:
+            dtype = "int32" if str(parameter.c_type) == "int32_t" else "float64"
+            if str(getattr(parameter, "role", "")) == "extent":
+                # extent_dynamic_<hash>_<value_id>_<axis>: the runtime
+                # length of the array that value id was fed with.
+                matched = re.search(r"_(\d+)_(\d+)$", str(parameter.name))
+                measured = np.asarray(feeds[int(matched.group(1))])
+                held = np.asarray([measured.size], dtype=dtype)
+            else:
+                value_id = int(str(parameter.name).lstrip("t"))
+                fed = feeds.get(value_id)
+                held = np.ascontiguousarray(
+                    np.atleast_1d(np.asarray(
+                        0 if fed is None else fed
+                    )), dtype=dtype,
+                )
+                buffers[value_id] = held
+            slots.append(held)
+        pointers = (ctypes.c_void_p * len(slots))(*(
+            ctypes.c_void_p(int(held.ctypes.data)) for held in slots
+        ))
+        return FortranCoreExecution(
+            buffers, self._packed, pointers, len(slots),
+        )
+
+

@@ -1151,6 +1151,52 @@ def test_mapping_pop_none_lowers_to_typed_optional_lookup_then_delete():
     )
 
 
+def test_zero_argument_sequence_pop_loads_last_value_and_commits_length():
+    control = ControlProgram(LoopBlock(
+        "item", "0", "1", "1", SequenceBlock(()),
+        sequence_mutations=(ControlSequenceMutation(
+            20,
+            "pop",
+            (),
+            23,
+            policy="duplicates",
+        ),),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="sequence_pop",
+        first_value_id=1000,
+        sequence_declarations=((20, "duplicates", 1, True),),
+        sequence_column_dtypes={20: ("int64",)},
+    )
+    instructions = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+    pop_instructions = [
+        instruction for instruction in instructions
+        if instruction.attributes.get("binding") == "ssa_sequence_pop"
+    ]
+
+    assert shortfalls == ()
+    assert any(
+        str(instruction.op).casefold() == "sub"
+        for instruction in pop_instructions
+    )
+    assert any(
+        str(instruction.op).casefold() == "load"
+        and instruction.res is not None
+        and int(instruction.res.id) == 23
+        for instruction in pop_instructions
+    )
+    assert any(
+        str(instruction.op).casefold() == "store"
+        for instruction in pop_instructions
+    )
+
+
 def test_structural_dependency_chain_delays_early_sequence_mutation():
     from src.compiler.control_source import (
         ControlProgram, ControlSequenceMutation, LoopBlock, SequenceBlock,

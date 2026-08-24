@@ -1,6 +1,7 @@
 import ast
 import contextlib
 import io
+import _pickle
 from pathlib import Path
 
 import sympy
@@ -10,6 +11,7 @@ from src.common.dt_system.dt_scaler import Metrics
 from src.compiler.process_graph_function_linking import link_process_graph_functions
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.symbolic_equation_compiler import compile_sympy_equations
+from src.compiler.ssa_reference_evaluator import SSAReferenceEvaluator
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
 
@@ -106,6 +108,70 @@ def test_native_boundary_is_forwarded_through_shell_external_reference_abi():
     assert plan["shell_abi"] == (
         "turing-shell-io-abi.external_references"
     )
+    assert shell_io["external_reference_occurrence_schema"] == (
+        "turing.shell-external-reference-occurrence.v1"
+    )
+    occurrence, = shell_io["external_reference_occurrences"]
+    assert occurrence["identity"] == "_pickle.loads"
+    assert occurrence["owner"] == "root"
+    assert len(occurrence["argument_value_ids"]) == 1
+    assert occurrence["result_value_id"] is not None
+    assert occurrence["operations"] == ("resolve", "call", "release")
+    assert occurrence["object_policy"] == "shell-owned-opaque-handles"
+    external_calls = [
+        instruction
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("external_reference")
+    ]
+    call, = external_calls
+    assert call.attributes["external_identity"] == "_pickle.loads"
+    assert call.attributes["shell_abi"] == (
+        "turing-shell-io-abi.external_references"
+    )
+    assert len(call.args) == 1
+    assert call.res.dtype == "opaque_ref"
+
+
+def test_repository_ssa_executes_pickle_through_the_recorded_shell_abi():
+    module, outputs, _exports = lower_ast_source_to_ssa(
+        "import _pickle\n"
+        "def root(payload):\n"
+        "    return _pickle.loads(payload)\n",
+        "root",
+        name="native_pickle_execution",
+        extraction_contract=CONTRACT,
+    )
+    function_name = "native_pickle_execution__root"
+    function = module.functions[function_name]
+    payload_id = int(function.args[0].id)
+    expected = {"native-link": [3, 5, 8]}
+    result = SSAReferenceEvaluator(module).run(
+        function_name, {payload_id: _pickle.dumps(expected)}
+    )
+    assert result.returned == (expected,)
+    assert result.values[int(outputs[function_name][0].id)] == expected
+
+
+def test_repository_ssa_passes_file_object_handle_to_native_pickle_load():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "import _pickle\n"
+        "def root(stream):\n"
+        "    return _pickle.load(stream)\n",
+        "root",
+        name="native_pickle_file_execution",
+        extraction_contract=CONTRACT,
+    )
+    function_name = "native_pickle_file_execution__root"
+    function = module.functions[function_name]
+    stream_id = int(function.args[0].id)
+    expected = ("file-object-handle", {"generation": 144})
+    result = SSAReferenceEvaluator(module).run(
+        function_name,
+        {stream_id: io.BytesIO(_pickle.dumps(expected))},
+    )
+    assert result.returned == (expected,)
 
 
 def test_direct_source_to_ssa_preserves_all_linked_tuple_results():

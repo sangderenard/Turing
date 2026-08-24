@@ -18,6 +18,7 @@ from .control_source import (
     ControlExpression,
     ControlProgram,
     ControlSequenceMutation,
+    ExternalReferenceCallBlock,
     LoopControlBlock,
     LoopBlock,
     ParallelDeployment,
@@ -3320,6 +3321,41 @@ class _ControlSSABuilder:
             # control, not an additional runtime invocation.
             self.lower(block.callee, path=f"{path}.callee")
             return
+        if isinstance(block, ExternalReferenceCallBlock):
+            arguments = [
+                self.external_value(value_id)
+                for value_id in block.argument_value_ids
+            ]
+            arguments.extend(
+                self.external_value(value_id)
+                for _name, value_id in block.keyword_argument_value_ids
+            )
+            result = SSAValue(
+                int(block.result_value_id), dtype=str(block.result_dtype)
+            )
+            self.emit(
+                Handler.Call,
+                arguments,
+                result,
+                attributes={
+                    "callee": "turing_external_reference_call",
+                    "external_reference": True,
+                    "external_identity": str(block.identity),
+                    "external_callsite_id": int(block.callsite_id),
+                    "external_domain": str(block.external_domain),
+                    "shell_abi": str(block.shell_abi),
+                    "keyword_names": tuple(
+                        name for name, _value_id
+                        in block.keyword_argument_value_ids
+                    ),
+                    "argument_frame": "turing.external-reference-arguments.v1",
+                    "result_frame": "turing.external-reference-value.v1",
+                    "object_policy": "shell-owned-opaque-handles",
+                    "extraction_identity": str(block.identity),
+                },
+            )
+            self.external_values[int(block.result_value_id)] = result
+            return
         if isinstance(block, ValidationBlock):
             self.validation_contracts.append({
                 "predicate_value_id": int(block.predicate_value_id),
@@ -3781,7 +3817,7 @@ class _ControlSSABuilder:
                 "destination uniqueness policy is unresolved",
             ))
             return
-        if not mutation.argument_value_ids:
+        if not mutation.argument_value_ids and operation != "pop":
             self.shortfalls.append(SSALoweringShortfall(
                 "ssa-sequence",
                 operation,
@@ -3796,6 +3832,97 @@ class _ControlSSABuilder:
             location=location,
         )
         if destination is None:
+            return
+
+        if operation == "pop" and not mutation.argument_kind.startswith(
+            "mapping_"
+        ):
+            if mutation.argument_value_ids:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", operation, location,
+                    "resident sequence pop currently supports only the "
+                    "zero-argument last-row operation",
+                ))
+                return
+            if len(destination.column_value_ids) != 1:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", operation, location,
+                    "resident sequence pop requires one resolved value "
+                    "column before aggregate-row results are admitted",
+                ))
+                return
+            storage = self.sequence_storage_values[
+                int(destination.sequence_id)
+            ]
+            length_address = storage[len(destination.column_value_ids)]
+            attributes = {
+                "binding": "ssa_sequence_pop",
+                "sequence_id": int(destination.sequence_id),
+                "source_effect_node_id": int(mutation.effect_node_id),
+                **({
+                    "extraction_identity": str(
+                        mutation.extraction_identity
+                    ),
+                } if mutation.extraction_identity is not None else {}),
+            }
+            length = self.fresh_value(dtype="int64")
+            self.emit(
+                Handler.Load, [length_address], length,
+                attributes=attributes,
+            )
+            nonempty = self.fresh_value(dtype="bool")
+            self.emit(
+                Handler.Gt,
+                [length, self.constant_value(0)],
+                nonempty,
+                attributes=attributes,
+            )
+            selected = self.new_block("sequence_pop_selected")
+            empty = self.new_block("sequence_pop_empty")
+            self.conditional_branch(nonempty, selected, empty)
+
+            self.current = empty
+            self.emit(
+                Handler.Call,
+                [],
+                attributes={
+                    "callee": "turing_validation_error",
+                    "error_code": 71,
+                    **attributes,
+                },
+            )
+            self.branch(selected)
+
+            self.current = selected
+            new_length = self.fresh_value(dtype="int64")
+            self.emit(
+                Handler.Sub,
+                [length, self.constant_value(1)],
+                new_length,
+                attributes=attributes,
+            )
+            address = self.fresh_value(dtype="ptr")
+            self.emit(
+                Handler.GetElementPtr,
+                [storage[0], new_length],
+                address,
+                attributes=attributes,
+            )
+            result = self.produced_value(
+                int(mutation.effect_node_id),
+                dtype=str(storage[0].dtype or "unknown"),
+                claim_provisional_definition=True,
+            )
+            self.emit(
+                Handler.Load, [address], result,
+                attributes=attributes,
+            )
+            self.emit(
+                Handler.Store,
+                [new_length, length_address],
+                attributes=attributes,
+            )
+            self.external_values[int(mutation.effect_node_id)] = result
             return
 
         if mutation.argument_kind.startswith("mapping_"):
