@@ -16,6 +16,9 @@ from src.compiler.extraction_contract import (
 from src.common.tensors.abstract_nn import Adam
 from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.autograd import autograd
+from src.common.tensors.topological_reducer import (
+    reduce_abstract_tensor_topology,
+)
 from src.compiler.evolution_metagraph import record_evolution
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 from src.transmogrifier.graph.python_special_cases import (
@@ -283,6 +286,39 @@ def test_python_boundary_keeps_call_arguments_but_never_ingests_callee(
     assert "resolved_ast_parent" not in call["attributes"]
     if action == "reject":
         assert graph.G.graph["rejected_extraction_calls"]
+
+
+def test_native_boundary_receipt_survives_function_graph_reduction():
+    contract = ExtractionContract(CONTRACT)
+    graph = ProcessGraph(materialize_memory=False)
+    graph.build_from_ast(
+        "import pickle\ndef kernel(stream):\n    return pickle.load(stream)\n",
+        resolve_unresolved_parents=True,
+        pursuit_roots=("kernel",),
+        parent_include=contract,
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        reduce_abstract_tensor_topology(graph)
+
+    function_graph = graph.function_table.entry("kernel").graph
+    call = next(
+        data for _node_id, data in function_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and ast.unparse(data["expr_obj"]) == "pickle.load(stream)"
+    )
+    attributes = call["attributes"]
+    assert attributes["extraction_action"] == "use_native"
+    assert attributes["extraction_identity"] == "_pickle.load"
+    assert attributes["extraction_contract"]["parameters"] == {
+        "loader": "existing_module",
+        "symbol_resolution": "in_place",
+        "callbacks": "reject",
+        "execution": "shell_io.external_references",
+        "shell_capability": "host_references",
+        "shell_abi": "turing-shell-io-abi.external_references",
+        "external_domain": "host_system",
+    }
 
 
 def test_first_live_call_event_is_already_contract_classified():

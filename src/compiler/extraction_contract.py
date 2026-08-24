@@ -808,7 +808,10 @@ class ExtractionContract:
             ExtractionAction.INGEST_PYTHON: {"follow_reachable_calls"},
             ExtractionAction.INTRINSIC: {"lowering_namespace"},
             ExtractionAction.PYTHON_HOST_CALL: {"execution", "callbacks"},
-            ExtractionAction.USE_NATIVE: {"loader", "symbol_resolution", "callbacks"},
+            ExtractionAction.USE_NATIVE: {
+                "loader", "symbol_resolution", "callbacks", "execution",
+                "shell_capability", "shell_abi", "external_domain",
+            },
             ExtractionAction.DECOMPILE_MACHINE: {
                 "explicit_opt_in", "max_functions", "max_total_bytes",
                 "max_dependency_depth",

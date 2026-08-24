@@ -168,7 +168,7 @@ FORWARD_KERNELS: tuple[str, ...] = ("sin", "cos", "tan", "exp")
 #: ``repr(float(c))``, which is where a derived coefficient loses every limb
 #: past the first. A buffer is unambiguously data the caller supplies.
 KERNEL_SHELL = """
-def {name}(x, y, n, c):
+def {name}(x{annotate}, y{annotate}, n, c{annotate}):
     for i in range(n):
         z = x[i]
         s = {structural}
@@ -218,8 +218,81 @@ def _radius(name: str) -> float:
     return float(_proof.CORE_RADII[name])
 
 
-def kernel_spec(cores: _signal.CoreSet, name: str, digits: int = 32):
-    """One :class:`KernelSpec` for the forward of ``name`` at ``digits``."""
+def _wide_reference(name: str, order: int, width: int,
+                    coefficient_names: tuple[str, ...]):
+    """The same materialised program, run eagerly at its declared width.
+
+    A width-annotated kernel's semantics ARE the limb expansion, so its
+    oracle cannot be the source exec'd over plain buffers -- indexing
+    ``x[i]`` there reads one limb slot, not one element. The honest twin is
+    the eager Precision path over the SAME materialised callable: interleaved
+    buffers wrap directly (interleaving is Precision's own layout), the
+    coefficients rebuild from their limb slots, and the produced limbs write
+    back interleaved. Still one authorship: identity, SymPy, compiler.
+    """
+
+    from .abstraction import AbstractTensor
+    from .extended_precision import Precision
+    from . import signal_symbolic as _proof
+
+    callable_, parameters, _coefficients, _source = _proof.materialise(
+        name, order)
+    structure = _proof.TRANSCENDENTALS[name]["structure"]
+
+    parameter_order = (
+        "x", "y", "n", *coefficient_names,
+        *(
+            f"{coefficient}__limb{position}"
+            for coefficient in coefficient_names
+            for position in range(1, width)
+        ),
+    )
+
+    def reference(*arguments, **named):
+        # The bank calls references POSITIONALLY in parameter_order; eager
+        # callers may name them. Both spell the same binding.
+        import numpy as np
+
+        named = {**dict(zip(parameter_order, arguments)), **named}
+        x, y, n = named.pop("x"), named.pop("y"), named.pop("n")
+        count = int(n)
+        wide = Precision(
+            AbstractTensor.get_tensor(
+                np.asarray(x, dtype=np.float64)[: count * width]
+            ),
+            width,
+        )
+        base = wide * wide if structure in ("odd", "even") else wide
+        supply = {"z": wide, "s": base}
+        for coefficient in coefficient_names:
+            parts = (float(named[coefficient]), *(
+                float(named[f"{coefficient}__limb{position}"])
+                for position in range(1, width)
+            ))
+            supply[coefficient] = Precision.constant(wide, parts)
+        produced = callable_(
+            **{parameter: supply[parameter] for parameter in parameters}
+        )
+        flat = np.asarray(
+            produced._value.tolist(), dtype=np.float64
+        ).ravel()
+        y = np.asarray(y, dtype=np.float64)
+        y[: count * width] = flat[: count * width]
+        return y
+
+    return reference
+
+
+def kernel_spec(cores: _signal.CoreSet, name: str, digits: int = 32,
+                limb_width: int = 1):
+    """One :class:`KernelSpec` for the forward of ``name`` at ``digits``.
+
+    ``limb_width`` is the tier's depth, and EVERYTHING in the kernel is at
+    that depth: the source carries ``Precision[width]`` annotations so the
+    compiler's precision pipeline expands the arithmetic, and the
+    coefficient buffer holds each exact rational decomposed to exactly that
+    many limbs -- the coefficients of a tier are the depth of the tier.
+    """
 
     from ...compiler.kernel_bank import KernelSpec
 
@@ -235,20 +308,106 @@ def kernel_spec(cores: _signal.CoreSet, name: str, digits: int = 32):
     # anything else in the argument itself. Squaring the wrong one computes a
     # different function, so it comes from the identity table rather than a
     # guess.
-    reads = {each: f"c[{int(each[1:])}]" for each in coefficients}
-    shell = KERNEL_SHELL.format(
-        name=name,
-        structural="z * z" if structure in ("odd", "even") else "z",
-        arguments=", ".join(reads.get(each, each) for each in parameters),
-    )
-    source = body + shell
+    width = max(int(limb_width), 1)
+    annotate = f": Precision[{width}]" if width > 1 else ""
+    if width > 1:
+        # The WIDE kernel takes the exact authored shape the precision
+        # benchmark proves daily: the core's statements INLINED into the
+        # loop and the coefficients as annotated scalar parameters, whose
+        # low limbs the pipeline appends as extra formals. The buffer-and-
+        # call spelling lowers along a different seam that does not yet
+        # stride a constant-indexed coefficient array, and a kernel is not
+        # the place to prove a new seam -- it is the place to use the
+        # proven one.
+        statements = [
+            line for line in body.splitlines()[1:] if line.strip()
+        ]
+        returned = statements[-1].split("return")[-1].strip()
+        inlined = [("    " + line) for line in statements[:-1]]
+        source = "\n".join((
+            "",
+            f"def {name}(x{annotate}, y{annotate}, n, "
+            + ", ".join(f"{c}{annotate}" for c in coefficients) + "):",
+            "    for i in range(n):",
+            "        z = x[i]",
+            "        s = "
+            + ("z * z" if structure in ("odd", "even") else "z"),
+            *inlined,
+            f"        y[i] = {returned}",
+            "    return y",
+            "",
+        ))
+    else:
+        reads = {each: f"c[{int(each[1:])}]" for each in coefficients}
+        shell = KERNEL_SHELL.format(
+            name=name,
+            annotate=annotate,
+            structural="z * z" if structure in ("odd", "even") else "z",
+            arguments=", ".join(reads.get(each, each) for each in parameters),
+        )
+        source = body + shell
     order = _proof.order_to_degree(
         name, _proof.order_for(name, _radius(name), digits=digits))
     exact = _proof.structured_coefficients(name, order)
+
+    if width > 1:
+        # The coefficients of a tier are the DEPTH of the tier: each exact
+        # rational decomposed to exactly ``width`` limbs. The head keeps
+        # the authored name and the tails take ``{name}__limb{j}`` -- the
+        # spelling the bank derives for the pipeline's appended formals --
+        # so every limb is a named, fed parameter and none is baked or
+        # silently zeroed.
+        constants: dict[str, float] = {}
+        for coefficient, value in zip(coefficients, exact):
+            parts = _proof.limb_decomposition(value, width)
+            constants[coefficient] = float(parts[0])
+            for position in range(1, width):
+                constants[f"{coefficient}__limb{position}"] = float(
+                    parts[position]
+                )
+
+        def example_inputs(sizes, rng, _r=_radius(name), _w=width,
+                           _constants=constants):
+            count = int(sizes["n"])
+            x = np.zeros(count * _w)
+            x[::_w] = rng.uniform(-_r * 0.98, _r * 0.98, count)
+            return {
+                "x": x, "y": np.zeros(count * _w), "n": count,
+                **{key: value for key, value in _constants.items()},
+            }
+
+        return KernelSpec(
+            name=f"{name}_d{digits}", source=source, function_name=name,
+            reference=_wide_reference(name, order, width, coefficients),
+            parameter_order=(
+                "x", "y", "n", *coefficients,
+                *(
+                    f"{coefficient}__limb{position}"
+                    for coefficient in coefficients
+                    for position in range(1, width)
+                ),
+            ),
+            size_parameters=("n",),
+            example_inputs=example_inputs,
+            # Wide buffers hold width limbs per element, which the extent
+            # vocabulary cannot yet say; None makes partitioning machinery
+            # refuse rather than tear limb pairs across a chunk boundary.
+            extents=None,
+            limb_width=width,
+        )
+
     values = np.asarray(
         [float(_proof.limb_decomposition(value, 1)[0]) for value in exact],
         dtype=np.float64,
     )
+
+    def example_inputs(sizes, rng, _r=_radius(name), _v=values):
+        return {
+            "x": rng.uniform(-_r * 0.98, _r * 0.98, sizes["n"]),
+            "y": np.zeros(sizes["n"]), "n": int(sizes["n"]),
+            "c": _v.copy(),
+        }
+
     return KernelSpec(
         name=f"{name}_d{digits}", source=source, function_name=name,
         reference=kernel_reference(source, name),
@@ -257,12 +416,9 @@ def kernel_spec(cores: _signal.CoreSet, name: str, digits: int = 32):
         # kernel against its Python reference, and outside the interval both
         # compute the same nonsense and agree -- admission would then mean
         # nothing. A core is only claimed where it is valid.
-        example_inputs=lambda sizes, rng, _r=_radius(name), _v=values: {
-            "x": rng.uniform(-_r * 0.98, _r * 0.98, sizes["n"]),
-            "y": np.zeros(sizes["n"]), "n": int(sizes["n"]),
-            "c": _v.copy(),
-        },
+        example_inputs=example_inputs,
         extents={"x": ("n",), "y": ("n",), "c": ()},
+        limb_width=1,
     )
 
 
@@ -278,9 +434,20 @@ def signal_kernel_specs(quality: str = DEFAULT_KERNEL_QUALITY, *,
     """
 
     cores = _signal.signal_math(quality).cores
+    # The tier's depth decides every kernel's width: a quality whose epsilon
+    # lies past one double's resolution builds width-annotated kernels with
+    # limb-decomposed coefficients, so the compiled artifact IS the tier
+    # rather than a single-double impression of it.
+    import math as _math
+
+    from .extended_precision import limbs_for_digits as _limbs_for_digits
+    from .signal_math import PREBAKE_SETS as _sets
+
+    epsilon = float(_sets[str(quality)].epsilon)
+    width = _limbs_for_digits(int(_math.ceil(-_math.log10(epsilon))))
     specs = {}
     for name in FORWARD_KERNELS:
-        spec = kernel_spec(cores, name)
+        spec = kernel_spec(cores, name, limb_width=int(width))
         specs[spec.name] = spec
     if include_vjp and False:
         for name in FORWARD_KERNELS:

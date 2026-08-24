@@ -37,6 +37,7 @@ from ...transmogrifier.function_table import (
 from ...transmogrifier.ssa_registry import ast_ssa_name_map, c_ssa_name_map
 from ...transmogrifier.graph.python_special_cases import (
     canonicalize_python_static_bindings,
+    interpret_python_special_case,
     interpret_python_static_value,
 )
 
@@ -6348,6 +6349,54 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         }
         function_graph = copy.copy(graph)
         function_graph.G = graph.G.subgraph(included).copy()
+        # Extraction decisions are occurrence contracts, not merely a root-
+        # graph audit log.  Several reducer rewrites rebuild a Call node's
+        # attributes while preserving its source AST identity; the global
+        # boundary ledger survives that rewrite, but the per-function graph
+        # previously lost the receipt needed by shell/native-call planning.
+        # Restore it by exact source occurrence before detaching the function
+        # graph.  This does not re-resolve or pursue the callable.
+        statement_name = str(getattr(statement, "name", ""))
+        statement_identity = getattr(statement, "_python_source_identity", None)
+        boundary_by_location = {
+            (int(boundary["line"]), int(boundary["column"])): dict(
+                boundary["extraction_contract"]
+            )
+            for boundary in graph.G.graph.get(
+                "extraction_boundary_calls", ()
+            )
+            if boundary.get("line") is not None
+            and boundary.get("column") is not None
+            and isinstance(boundary.get("extraction_contract"), Mapping)
+            and (
+                (
+                    statement_identity is None
+                    and str(boundary.get("owner_name") or "")
+                    == statement_name
+                )
+                or (
+                    statement_identity is not None
+                    and tuple(boundary.get("owner_source_identity") or ())
+                    == tuple(statement_identity)
+                )
+            )
+        }
+        for _member_id, member_data in function_graph.G.nodes(data=True):
+            expression = member_data.get("expr_obj")
+            if not isinstance(expression, ast.Call):
+                continue
+            receipt = boundary_by_location.get((
+                int(getattr(expression, "lineno", -1)),
+                int(getattr(expression, "col_offset", -1)),
+            ))
+            if receipt is None:
+                continue
+            expression._extraction_contract = receipt
+            special_case = interpret_python_special_case(expression)
+            if special_case is not None:
+                member_data.setdefault("attributes", {}).update(
+                    special_case.attributes
+                )
         # The definition may carry literal module constants and source-local
         # imports beyond the root graph's generic binding set.  Preserve that
         # exact static environment on the function graph consumed by compiled

@@ -74,6 +74,40 @@ def test_direct_source_to_ssa_preserves_linked_sympy_function_without_fusion():
     assert exports == ("root_direct__root", "root_direct__linked_math")
 
 
+def test_native_boundary_is_forwarded_through_shell_external_reference_abi():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "import _pickle\n"
+        "def root(payload):\n"
+        "    _pickle.loads(payload)\n"
+        "    return 1\n",
+        "root",
+        name="native_boundary_forwarding",
+        extraction_contract=CONTRACT,
+    )
+
+    shell_io = module.metadata["shell_io"]
+    request, = shell_io["requirements"]["requests"]
+    assert request == {
+        "capability": "host_references",
+        "optional": False,
+        "attributes": {
+            "execution": "shell_io.external_references",
+            "shell_abi": "turing-shell-io-abi.external_references",
+        },
+    }
+    assert shell_io["external_reference_plan_schema"] == (
+        "turing.shell-external-reference-plan.v1"
+    )
+    plan, = shell_io["external_reference_plans"]
+    assert plan["identity"] == "_pickle.loads"
+    assert plan["loader"] == "existing_module"
+    assert plan["symbol_resolution"] == "in_place"
+    assert plan["external_domain"] == "host_system"
+    assert plan["shell_abi"] == (
+        "turing-shell-io-abi.external_references"
+    )
+
+
 def test_direct_source_to_ssa_preserves_all_linked_tuple_results():
     x = sympy.Symbol("x")
     symbolic = compile_sympy_equations((

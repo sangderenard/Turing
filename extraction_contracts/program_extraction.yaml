@@ -196,19 +196,19 @@ defaults:
     parameters: {follow_reachable_calls: true}
   third_party_python:
     action: use_native
-    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject}
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system}
   stdlib_python:
     action: use_native
-    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject}
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system}
   builtin:
     action: intrinsic
     parameters: {lowering_namespace: cpython_semantics}
   native_extension:
     action: use_native
-    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject}
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system}
   dynamic_library:
     action: use_native
-    parameters: {loader: operating_system, symbol_resolution: in_place, callbacks: reject}
+    parameters: {loader: operating_system, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system}
   unknown:
     action: reject
     parameters: {reason: provenance_not_declared}
@@ -276,10 +276,9 @@ rules:
 
   - id: print-is-an-output-port
     match: {module: builtins, qualname: print}
-    action: use_native
+    action: python_host_call
     parameters:
-      loader: existing_module
-      symbol_resolution: in_place
+      execution: shell_io.stdout
       port: stdout
       callbacks: reject
 

@@ -447,6 +447,10 @@ def evaluate_core(reduced: Any, core: BakedCore, *,
     return settle(left + (right - left) * weight)
 
 
+#: Exact oracle columns keyed by (core, digits, low, high, points).
+_TRUTH_COLUMNS: dict = {}
+
+
 def _measure(core: BakedCore) -> BakedCore:
     """Score a baked core against the same program run wider.
 
@@ -466,16 +470,51 @@ def _measure(core: BakedCore) -> BakedCore:
     truth = _reference(core.core, digits=digits)
 
     positions = np.linspace(core.low, core.high, 801)
+    # The oracle column is a pure function of core, digits and interval --
+    # every rung of a growth ladder re-measures the SAME 801 positions, and
+    # at wide epsilons each exact evaluation costs real time. Deriving the
+    # column once per core and reading it thereafter changes no measured
+    # number; it only stops the ladder paying the oracle again for values
+    # it already holds.
+    truth_key = (str(core.core), int(digits),
+                 float(core.low), float(core.high), positions.size)
+    truth_column = _TRUTH_COLUMNS.get(truth_key)
+    if truth_column is None:
+        truth_column = [truth(float(item)) for item in positions]
+        _TRUTH_COLUMNS[truth_key] = truth_column
     tensor = AbstractTensor.get_tensor(positions)
-    columns = [np.asarray(
-        evaluate_core(tensor, core).tolist(), dtype=np.float64).ravel()]
+    # Past the double floor the argument is promoted to the width the
+    # epsilon implies -- the TIER'S OWN width, no wider: the instrument's
+    # exactness comes from the Fraction difference below, so evaluating
+    # wider than production would measure an evaluation nobody runs and
+    # admit on its behalf. Every limb becomes a column and the difference
+    # is formed from the exact sum. This measures ANY family wide --
+    # corrections decide whether the CORE's coefficients carry tails, not
+    # whether the instrument may look; a tail-less core measured wide
+    # honestly shows its coefficient-representation floor. Polyspline is
+    # the one mechanical exclusion: its segment selection is
+    # comparison-driven, which the wide arithmetic does not speak.
+    width = max(1, xp.limbs_for_digits(
+        int(math.ceil(-math.log10(core.epsilon)))
+    ))
+    if width > 1 and core.family != "polyspline":
+        produced_wide = evaluate_core(
+            xp.Precision.of(tensor, width), core, collapse=False,
+        )
+        columns = [
+            np.asarray(row, dtype=np.float64).ravel()
+            for row in produced_wide.to_float_lists()
+        ]
+    else:
+        columns = [np.asarray(
+            evaluate_core(tensor, core).tolist(), dtype=np.float64).ravel()]
 
     magnitude = np.empty(positions.size)
     absolute = np.empty(positions.size)
     for index, item in enumerate(positions):
         produced = sum((Fraction(float(column[index])) for column in columns),
                        Fraction(0))
-        expected = truth(float(item))
+        expected = truth_column[index]
         magnitude[index] = abs(float(expected))
         absolute[index] = abs(float(produced - expected))
     # A genuine zero of the function contributes its absolute error; dividing
@@ -690,6 +729,34 @@ def fit_exact(core: str, epsilon: float | None = None) -> BakedCore:
     spec = CORE_RANGES[core]
     if spec.structure is None:
         raise ValueError(f"{core!r} declares no parity; fit it as a plain core")
+
+    # The exact tail bound already names the order this epsilon needs, so
+    # the ladder STARTS just below that prediction instead of marching from
+    # three -- admission stays measured (the bound proposes, the instrument
+    # disposes), but a wide-epsilon fit stops paying twenty exact-oracle
+    # measurements to rediscover what the bound knew. A prediction failure
+    # falls back to the full ladder, never to a guess.
+    def _ladder(limit: int):
+        try:
+            from .signal_symbolic import order_for, order_to_degree
+
+            digits = int(math.ceil(-math.log10(epsilon)))
+            half = 0.5 * (float(spec.high) - float(spec.low))
+            predicted = int(order_to_degree(
+                str(core), order_for(str(core), half, digits=digits)
+            ))
+            # A prediction past the cap clamps to the cap's last rungs:
+            # the ladder still runs, measures, and returns its best with
+            # ``admitted=False`` -- the truthful verdict for a series that
+            # cannot reach this epsilon within the growth limit, and the
+            # verdict an EMPTY range would have turned into a crash.
+            start = max(3, min(predicted - 4, int(limit) - 4))
+        except Exception:
+            start = 3
+        if start % 2 == 0:
+            start += 1
+        return range(start, int(limit) + 1, 2)
+
     if spec.structure == "factored":
         # A root-factored core has an exact form of its own: f(u) = u * P(u)
         # with P's coefficients taken straight from the Taylor series, the
@@ -708,8 +775,7 @@ def fit_exact(core: str, epsilon: float | None = None) -> BakedCore:
                 note=f"{spec.note}; exact factored series, order {order}",
             ))
 
-        return _grow(build_factored,
-                     range(3, GROWTH_LIMITS["exact"] + 1, 2))
+        return _grow(build_factored, _ladder(GROWTH_LIMITS["exact"]))
 
     def build(order: int) -> BakedCore:
         _exact_coefficients = _exact_structured_coefficients(
@@ -721,7 +787,7 @@ def fit_exact(core: str, epsilon: float | None = None) -> BakedCore:
             note=f"{spec.note}; exact {spec.structure} series, order {order}",
         ))
 
-    return _grow(build, range(3, GROWTH_LIMITS["series"] + 1, 2))
+    return _grow(build, _ladder(GROWTH_LIMITS["series"]))
 
 
 def _chebyshev_segment(function: Callable[[float], float], low: float,
@@ -1134,7 +1200,18 @@ PREBAKE_SETS: Mapping[str, PrebakeSettings] = {
     ),
     "double": PrebakeSettings(
         "double", "direct", "best", 1.0e-15,
-        "everything the working type can hold; the dispatch default",
+        "everything one working double can hold",
+    ),
+    # Family pinned to "exact", never "best": the selector sweeps every
+    # family including the LUT, whose growth cap is four million entries --
+    # at this epsilon that ladder would happily bake tables at double-double
+    # density, which is not a core, it is a warehouse. The exact family is
+    # the one built for this target: true series coefficients whose stored
+    # tails the wide Horner consumes.
+    "double2": PrebakeSettings(
+        "double2", "direct", "exact_first", 1.0e-31,
+        "two limbs of double, exact-series coefficients with stored tails; "
+        "sqrt's Newton seed stays a fit",
     ),
     "reference": PrebakeSettings(
         "reference", "direct", "best", 1.0e-15,
@@ -1268,13 +1345,23 @@ def prebake(name: str = "reference") -> CoreSet:
             # is cheap enough to redo and wrong numbers are not.
             cache_path.unlink(missing_ok=True)
 
-    baked = CoreSet(settings, {
-        core: (
-            fit_best(core, settings.epsilon) if settings.family == "best"
-            else fit_core(core, settings.family, settings.epsilon)
-        )
-        for core in settings.cores()
-    })
+    def _fit(core: str) -> BakedCore:
+        if settings.family == "best":
+            return fit_best(core, settings.epsilon)
+        if settings.family == "exact_first":
+            # Exact-series coefficients wherever a series identity exists;
+            # the one core without one is sqrt, whose identity is Newton's
+            # fixed point and whose baked polynomial is only the SEED --
+            # the iteration squares its own correct digits, so the seed is
+            # fit, not derived. Never the selector sweep: its LUT ladder
+            # would grow warehouse tables toward a wide epsilon.
+            try:
+                return fit_core(core, "exact", settings.epsilon)
+            except KeyError:
+                return fit_core(core, "structured", settings.epsilon)
+        return fit_core(core, settings.family, settings.epsilon)
+
+    baked = CoreSet(settings, {core: _fit(core) for core in settings.cores()})
     _PREBAKED[key] = baked
     try:
         store.mkdir(parents=True, exist_ok=True)

@@ -18650,6 +18650,7 @@ def lower_ast_source_to_ssa(
             "decisions": list(extraction_policy.receipts()),
         }
         shell_requests = {}
+        native_reference_plans = {}
         for boundary in extraction_boundaries:
             contract = dict(boundary.get("extraction_contract") or {})
             parameters = dict(contract.get("parameters") or {})
@@ -18666,6 +18667,37 @@ def lower_ast_source_to_ssa(
                 raise ValueError(
                     f"conflicting {capability!r} shell boundary declarations"
                 )
+            if str(contract.get("action") or "") == "use_native":
+                identity = str(contract.get("identity") or "")
+                if not identity:
+                    raise ValueError(
+                        "native extraction boundary lacks an exact identity"
+                    )
+                plan = {
+                    "identity": identity,
+                    "module": contract.get("module"),
+                    "qualname": contract.get("qualname"),
+                    "classification": contract.get("classification"),
+                    "loader": parameters.get("loader"),
+                    "symbol_resolution": parameters.get(
+                        "symbol_resolution"
+                    ),
+                    "callbacks": parameters.get("callbacks"),
+                    "execution": parameters.get("execution"),
+                    "shell_capability": parameters.get(
+                        "shell_capability"
+                    ),
+                    "shell_abi": parameters.get("shell_abi"),
+                    "external_domain": parameters.get("external_domain"),
+                }
+                previous_plan = native_reference_plans.setdefault(
+                    identity, plan
+                )
+                if previous_plan != plan:
+                    raise ValueError(
+                        "conflicting native boundary ABI declarations for "
+                        f"{identity!r}"
+                    )
         if shell_requests:
             from .shell_io import (
                 ShellIOManifest,
@@ -18686,6 +18718,16 @@ def lower_ast_source_to_ssa(
                     "turing.shell-boundary-plan.v1"
                 )
                 shell_io_metadata["boundary_plans"] = tuple(shell_contexts)
+                module.metadata["shell_io"] = shell_io_metadata
+            if native_reference_plans:
+                shell_io_metadata = dict(module.metadata.get("shell_io") or {})
+                shell_io_metadata["external_reference_plan_schema"] = (
+                    "turing.shell-external-reference-plan.v1"
+                )
+                shell_io_metadata["external_reference_plans"] = tuple(
+                    native_reference_plans[identity]
+                    for identity in sorted(native_reference_plans)
+                )
                 module.metadata["shell_io"] = shell_io_metadata
     for decision in decision_records:
         function = module.functions.get(

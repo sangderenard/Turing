@@ -6,6 +6,11 @@ import json
 import pickle
 from types import SimpleNamespace
 
+import tools.compile_project_catalogue as compile_project_catalogue
+from src.compiler.glsl_deployment_strategy import (
+    CompilationSubdivisionRequired,
+)
+
 from src.compiler.project_compilation_product import (
     NativeInstallationRequiredError,
     compilation_creep_frontier,
@@ -605,6 +610,56 @@ def test_structured_refusals_publish_name_based_deterministic_integrals(tmp_path
     assert json.loads(
         (tmp_path / "first" / "subdivision-integrals.json").read_text()
     ) == first
+
+
+def test_project_worker_publishes_structured_loop_subdivision(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "source.py"
+    source.write_text("def kernel():\n    return 1\n", encoding="utf-8")
+    output = tmp_path / "worker"
+
+    def refuse(_source, _entry, directory, **_kwargs):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "resolved-process-graph.pkl").write_bytes(b"graph")
+        (directory / "process-graph-units.json").write_text(json.dumps({
+            "schema": "turing.compilation-unit-plan.v1",
+            "units": [{
+                "qualified_names": ["kernel"],
+                "function_references": [7],
+                "dependency_units": [],
+            }],
+        }), encoding="utf-8")
+        raise CompilationSubdivisionRequired(
+            "retain source loop owner",
+            boundaries=({
+                "kind": "loop-control-owner",
+                "loop_node_id": 11,
+                "region_indices": [3],
+                "blockers": ["With"],
+                "function_reference": 7,
+                "qualified_name": "kernel",
+            },),
+        )
+
+    monkeypatch.setattr(
+        compile_project_catalogue, "compile_project_call", refuse,
+    )
+    result = compile_project_catalogue.main([
+        "--worker", "--source", str(source), "--entry", "kernel",
+        "--output", str(output),
+    ])
+
+    assert result == 1
+    failure = json.loads((output / "failure.json").read_text())
+    assert failure["frontier_kind"] == "compilation-subdivision-required"
+    plan = json.loads(
+        (output / "subdivision-integrals.json").read_text()
+    )
+    integral, = plan["integrals"]
+    assert integral["function_references"] == [7]
+    assert integral["region_indices"] == [3]
+    assert integral["blockers"] == ["With"]
 
 
 def test_subdivision_plan_uses_actual_fallback_owner_not_selected_parent(

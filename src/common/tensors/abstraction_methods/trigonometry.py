@@ -35,15 +35,21 @@ from __future__ import annotations
 #: ``"operator"`` or ``"signal_math"``. See the module docstring.
 _IMPLEMENTATION = "operator"
 
-#: Which prebaked quality the signal-math route resolves to.
-_QUALITY = "audio"
+#: Which prebaked quality the signal-math route resolves to. "double2"
+#: -- two limbs of double, exact-series coefficients with stored tails --
+#: is the dispatch default; looser tiers are chosen deliberately or not
+#: at all. The width only materialises where a caller brings a wide
+#: argument: a plain tensor through the eager surface still evaluates in
+#: double, and the compiled kernels receive single-double coefficients,
+#: so at this tier they differ from "double" only by the pinned family.
+_QUALITY = "double2"
 
 
 #: The coordinator serving compiled kernels, once one has been installed.
 _LAUNCHER = None
 
 
-def use_signal_math(quality: str = "audio") -> str:
+def use_signal_math(quality: str = "double2") -> str:
     """Route the whole surface through the baked signal-math cores.
 
     Bakes the cores HERE rather than letting the first call trigger it.
@@ -63,7 +69,7 @@ def use_signal_math(quality: str = "audio") -> str:
     return _IMPLEMENTATION
 
 
-def use_signal_kernels(quality: str = "draft") -> str:
+def use_signal_kernels(quality: str = "double2") -> str:
     """Route the surface through COMPILED kernels the bank has admitted.
 
     ``use_signal_math`` selects the eager cores: the authoring surface, which
@@ -201,10 +207,26 @@ def _routed(name: str, value):
         if parameter in spec.parameter_order
         and parameter not in ("x", "y", "n")
     }
-    produced = _LAUNCHER.launch(
-        name, x=flat, y=np.zeros_like(flat), n=int(flat.size), **constants,
-    )
-    settled = np.asarray(produced, dtype=np.float64).reshape(source.shape)
+    # A wide kernel strides limbs through every buffer: the plain argument
+    # occupies each element's leading limb with exact zeros below, and the
+    # answer comes back as limbs whose sum is the collapsed double.
+    width = max(int(getattr(spec, "limb_width", 1) or 1), 1)
+    if width > 1:
+        strided = np.zeros(flat.size * width)
+        strided[::width] = flat
+        produced = _LAUNCHER.launch(
+            name, x=strided, y=np.zeros_like(strided), n=int(flat.size),
+            **constants,
+        )
+        settled = np.asarray(produced, dtype=np.float64).reshape(
+            -1, width
+        ).sum(axis=1).reshape(source.shape)
+    else:
+        produced = _LAUNCHER.launch(
+            name, x=flat, y=np.zeros_like(flat), n=int(flat.size),
+            **constants,
+        )
+        settled = np.asarray(produced, dtype=np.float64).reshape(source.shape)
     return AbstractTensor.get_tensor(settled, like=value)
 
 

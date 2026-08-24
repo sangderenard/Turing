@@ -705,6 +705,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "traceback": traceback.format_exc(),
                 **({"stage": failure_stage} if failure_stage else {}),
             }
+            diagnostic = getattr(error, "to_failure_mapping", None)
+            if callable(diagnostic):
+                failure.update(dict(diagnostic()))
             process_graph_plan = arguments.output / "process-graph-units.json"
             if process_graph_plan.is_file():
                 failure["process_graph_unit_plan"] = process_graph_plan.name
@@ -721,6 +724,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 encoding="utf-8", newline="\n",
             )
             os.replace(temporary, destination)
+            if (
+                process_graph_plan.is_file()
+                and resolved_process_graph.is_file()
+            ):
+                publish_process_graph_subdivision_plan(
+                    arguments.output,
+                    (failure,),
+                    resolved_process_graph,
+                    process_graph_plan,
+                )
             print(failure["traceback"], flush=True)
             return 1
         print(json.dumps({

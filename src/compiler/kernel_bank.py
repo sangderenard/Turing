@@ -118,6 +118,12 @@ class KernelSpec:
     #: Source-derived flat-index strides for every array access. This is the
     #: structural half of tile evidence; profile timings are the measured half.
     access_signature: tuple[dict[str, Any], ...] = ()
+    #: Limbs per element in every float buffer. One means ordinary double
+    #: kernels. Wider means the source is Precision-annotated at this width,
+    #: the compiled arithmetic is the limb expansion, and every buffer --
+    #: coefficients included -- carries interleaved limbs: the coefficients
+    #: of a tier are at the depth of the tier, never collapsed to singles.
+    limb_width: int = 1
 
     def item_data(
         self, axis: str, sizes: Mapping[str, int],
@@ -556,6 +562,22 @@ class KernelBank:
             or function.metadata.get("value_names") or ()
         )
         id_by_name = {str(k): int(v) for k, v in table.items()}
+        # A width-annotated parameter grew low-limb formals during precision
+        # lowering; the pipeline records each widened value's limb ids, and
+        # here every appended limb becomes a NAMED parameter --
+        # ``{name}__limb{j}`` -- so a spec can feed a coefficient at the
+        # tier's full depth instead of its high double alone.
+        lowered_rows = dict(
+            function.metadata.get("precision_lowered_values") or ()
+        )
+        for parameter_name, parameter_id in tuple(id_by_name.items()):
+            row = lowered_rows.get(int(parameter_id))
+            if not row:
+                continue
+            for position, limb_id in enumerate(tuple(row)[1:], start=1):
+                id_by_name.setdefault(
+                    f"{parameter_name}__limb{position}", int(limb_id)
+                )
         output_names = {
             str(p) for p, _v in (function.metadata.get("named_outputs") or ())
         }
