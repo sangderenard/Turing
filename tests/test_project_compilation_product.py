@@ -819,6 +819,81 @@ def test_resource_bound_scc_divides_into_name_correlated_function_shells(
     )
 
 
+def test_repository_ssa_timeout_divides_at_exact_function_reference(tmp_path):
+    graph = tmp_path / "resolved.pkl"
+    unit_plan = tmp_path / "units.json"
+    graph.write_bytes(b"resolved graph")
+    unit_plan.write_text(json.dumps({
+        "schema": "turing.compilation-unit-plan.v1",
+        "units": [{
+            "qualified_names": ["re._compiler._compile"],
+            "function_references": [26],
+            "dependency_units": [],
+        }],
+    }), encoding="utf-8")
+    record = {
+        "status": "failed",
+        "error_type": "ResourceLimitExceeded",
+        "resource": "elapsed-time",
+        "stage": {"phase": "repository-ssa-lowering"},
+        "unit_index": 0,
+        "unit": {
+            "qualified_names": ["re._compiler._compile"],
+            "function_references": [26],
+        },
+    }
+
+    plan = publish_process_graph_subdivision_plan(
+        tmp_path / "product", (record,), graph, unit_plan,
+    )
+
+    integral, = plan["integrals"]
+    assert integral["kind"] == "function-shell"
+    assert integral["function_references"] == [26]
+    assert integral["blockers"] == [
+        "resource:elapsed-time", "phase:repository-ssa-lowering",
+    ]
+
+
+def test_subdivision_timeout_reuses_integral_function_reference(tmp_path):
+    graph = tmp_path / "resolved.pkl"
+    unit_plan = tmp_path / "units.json"
+    graph.write_bytes(b"resolved graph")
+    unit_plan.write_text(json.dumps({
+        "schema": "turing.compilation-unit-plan.v1",
+        "units": [{
+            "qualified_names": ["re._compiler._optimize_charset"],
+            "function_references": [38],
+            "dependency_units": [],
+        }],
+    }), encoding="utf-8")
+    record = {
+        "status": "failed",
+        "error_type": "ResourceLimitExceeded",
+        "resource": "elapsed-time",
+        "stage": {"phase": "repository-ssa-lowering"},
+        "integral_index": 5,
+        "qualified_names": ["re._compiler._optimize_charset"],
+        "integral": {
+            "schema": "turing.process-graph-subdivision-integral.v1",
+            "parent_unit_index": 6,
+            "qualified_names": ["re._compiler._optimize_charset"],
+            "function_references": [38],
+            "kind": "function-shell",
+        },
+    }
+
+    plan = publish_process_graph_subdivision_plan(
+        tmp_path / "product", (record,), graph, unit_plan,
+    )
+
+    integral, = plan["integrals"]
+    assert integral["qualified_names"] == [
+        "re._compiler._optimize_charset",
+    ]
+    assert integral["function_references"] == [38]
+
+
 def test_authored_parameter_contract_distinguishes_used_and_unused_formals():
     contract = authored_parameter_contract("""
 def outer(used, unused, *, keyword=1):

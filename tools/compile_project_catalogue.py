@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 import traceback
 from typing import Sequence
@@ -28,6 +29,32 @@ from src.compiler.project_compilation_product import (
 
 
 COMPILER_USAGE_TRACE_ROOT_ENV = "TURING_COMPILER_USAGE_TRACE_ROOT"
+
+
+def _atomic_json(path: Path, value) -> None:
+    """Publish worker telemetry without making observation a failure mode.
+
+    Progress files are read concurrently by the parent process.  On Windows,
+    virus scanners and readers can briefly retain a sharing handle, so use a
+    writer-unique temporary and retry the replace just as the compiler product
+    publisher does.
+    """
+
+    temporary = path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True),
+        encoding="utf-8", newline="\n",
+    )
+    for attempt in range(50):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt == 49:
+                raise
+            time.sleep(0.01)
 
 
 class _CompilerUsageProfiler:
@@ -86,12 +113,7 @@ class _CompilerUsageProfiler:
             )],
         }
         self.destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.destination.with_name(self.destination.name + ".tmp")
-        temporary.write_text(
-            json.dumps(payload, indent=2, sort_keys=True),
-            encoding="utf-8", newline="\n",
-        )
-        os.replace(temporary, self.destination)
+        _atomic_json(self.destination, payload)
 
 
 def _publish_bootstrap_runtime_state(
@@ -104,12 +126,7 @@ def _publish_bootstrap_runtime_state(
         "schema": "turing.compiler-bootstrap-activation.v1",
         "products": list(state_provider()),
     }
-    temporary = destination.with_name(destination.name + ".tmp")
-    temporary.write_text(
-        json.dumps(activation_receipt, indent=2, sort_keys=True),
-        encoding="utf-8", newline="\n",
-    )
-    os.replace(temporary, destination)
+    _atomic_json(destination, activation_receipt)
 
 
 def _planned_unit_progress_writer(
@@ -153,12 +170,7 @@ def _planned_unit_progress_writer(
             "current": current,
         }
         destination = root / "compile-progress.json"
-        temporary = destination.with_name(destination.name + ".tmp")
-        temporary.write_text(
-            json.dumps(payload, indent=2, sort_keys=True),
-            encoding="utf-8", newline="\n",
-        )
-        os.replace(temporary, destination)
+        _atomic_json(destination, payload)
         print(text, flush=True)
 
     return report
@@ -566,14 +578,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     pass
             arguments.output.mkdir(parents=True, exist_ok=True)
             failure_destination = arguments.output / "failure.json"
-            temporary = failure_destination.with_name(
-                failure_destination.name + ".tmp"
-            )
-            temporary.write_text(
-                json.dumps(failure, indent=2, sort_keys=True),
-                encoding="utf-8", newline="\n",
-            )
-            os.replace(temporary, failure_destination)
+            _atomic_json(failure_destination, failure)
             print(failure["traceback"], flush=True)
             return 1
         print(json.dumps(receipt, indent=2, sort_keys=True), flush=True)
@@ -637,12 +642,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 failure.update(dict(diagnostic()))
             arguments.output.mkdir(parents=True, exist_ok=True)
             destination = arguments.output / "failure.json"
-            temporary = destination.with_name(destination.name + ".tmp")
-            temporary.write_text(
-                json.dumps(failure, indent=2, sort_keys=True),
-                encoding="utf-8", newline="\n",
-            )
-            os.replace(temporary, destination)
+            _atomic_json(destination, failure)
             publish_process_graph_subdivision_plan(
                 arguments.output,
                 (failure,),
@@ -718,12 +718,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 failure["resolved_process_graph"] = resolved_process_graph.name
             arguments.output.mkdir(parents=True, exist_ok=True)
             destination = arguments.output / "failure.json"
-            temporary = destination.with_name(destination.name + ".tmp")
-            temporary.write_text(
-                json.dumps(failure, indent=2, sort_keys=True),
-                encoding="utf-8", newline="\n",
-            )
-            os.replace(temporary, destination)
+            _atomic_json(destination, failure)
             if (
                 process_graph_plan.is_file()
                 and resolved_process_graph.is_file()

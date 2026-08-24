@@ -18334,10 +18334,37 @@ def _lower_resolved_process_graph_deployment(
 
         requested_loop = int(subdivision_request["loop_node_id"])
         matches = []
-        for target in _walk_planned_shells(
-            deployment, include_function_registry=True,
-        ):
+        requested_reference_set = set(requested_references)
+        if requested_reference_set:
+            if len(requested_reference_set) != 1:
+                raise ValueError(
+                    "loop subdivision requires exactly one owner function "
+                    f"reference; received={tuple(sorted(requested_reference_set))!r}"
+                )
+            requested_reference = next(iter(requested_reference_set))
+            canonical_target = deployment.function_shells.get(
+                requested_reference
+            )
+            if canonical_target is None and (
+                deployment.process_graph.G.graph.get("function_ref")
+                == requested_reference
+            ):
+                canonical_target = deployment
+            candidates = (() if canonical_target is None else (canonical_target,))
+        else:
+            # Compatibility for historical subdivision receipts. New receipts
+            # always carry the exact owner function reference.
+            candidates = _walk_planned_shells(
+                deployment, include_function_registry=True,
+            )
+        for target in candidates:
             target_graph = target.process_graph.G
+            target_reference = target_graph.graph.get("function_ref")
+            if requested_reference_set and (
+                target_reference is None
+                or int(target_reference) not in requested_reference_set
+            ):
+                continue
             target_name = str(
                 target_graph.graph.get("qualified_name")
                 or target_graph.graph.get("function_name")

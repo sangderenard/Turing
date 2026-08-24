@@ -5671,18 +5671,33 @@ def publish_process_graph_subdivision_plan(
     integrals_by_identity: dict[tuple[str, ...], dict[str, Any]] = {}
     for source_record in records:
         record = dict(source_record)
-        unit_index = int(record.get("unit_index", -1))
+        integral_record = dict(record.get("integral") or {})
+        unit_index = int(record.get(
+            "unit_index", integral_record.get("parent_unit_index", -1)
+        ))
         unit = dict(record.get("unit") or {})
         qualified_names = tuple(map(
-            str, unit.get("qualified_names") or record.get("qualified_names") or (),
+            str,
+            unit.get("qualified_names")
+            or integral_record.get("qualified_names")
+            or record.get("qualified_names")
+            or (),
         ))
         function_references = tuple(map(
-            int, unit.get("function_references") or (),
+            int,
+            unit.get("function_references")
+            or integral_record.get("function_references")
+            or record.get("function_references")
+            or (),
         ))
         resource_phase = str((record.get("stage") or {}).get("phase") or "")
         if (
             str(record.get("error_type") or "") == "ResourceLimitExceeded"
-            and resource_phase == "deployment-instantiation"
+            and resource_phase in {
+                "deployment-instantiation",
+                "control-graph-planning",
+                "repository-ssa-lowering",
+            }
         ):
             if len(function_references) != len(qualified_names):
                 raise ValueError(
@@ -6301,7 +6316,18 @@ def compile_process_graph_subdivision_plan(
         _atomic_json(destination / "failure.json", failure)
         records[index] = failure
         del running[index]
-        report("subdivision_integral_resource_failure", **failure)
+        report(
+            "subdivision_integral_resource_failure",
+            integral_index=index,
+            status="failed",
+            qualified_names=failure["qualified_names"],
+            resource=kind,
+            error=detail,
+            resource_stage=durable_stage,
+            elapsed_seconds=failure["elapsed_seconds"],
+            peak_resident_bytes=failure["peak_resident_bytes"],
+            peak_private_bytes=failure["peak_private_bytes"],
+        )
 
     write_progress()
     while pending or running:

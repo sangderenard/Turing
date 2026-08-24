@@ -2,6 +2,7 @@ import json
 import os
 import hashlib
 
+import tools.compile_project_catalogue as compile_project_catalogue
 from tools.diagnose_translation import (
     load_compilation_product,
     load_compilation_unit,
@@ -149,6 +150,31 @@ def test_resolved_worker_persists_meta_compilation_phase_and_memory(tmp_path):
     assert progress["qualified_names"] == ["Compiler.lower"]
     assert progress["current"]["phase"] == "deployment-instantiation"
     assert progress["current"]["private_bytes"] > 0
+
+
+def test_resolved_worker_retries_transient_windows_progress_replace(
+    tmp_path, monkeypatch,
+):
+    real_replace = os.replace
+    attempts = []
+
+    def briefly_denied(source, destination):
+        attempts.append((source, destination))
+        if len(attempts) < 4:
+            raise PermissionError("observer retains sharing handle")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(compile_project_catalogue.os, "replace", briefly_denied)
+    report = _planned_unit_progress_writer(
+        tmp_path, 2, {"qualified_names": ["Compiler.lower"]},
+    )
+
+    report("ssa-source: lowering full planned source to repository SSA")
+
+    assert len(attempts) == 4
+    assert json.loads((tmp_path / "compile-progress.json").read_text())[
+        "current"
+    ]["phase"] == "repository-ssa-lowering"
 
 
 def test_compilation_unit_routes_published_repository_into_ssa_tree(tmp_path):
