@@ -126,7 +126,13 @@ _BINARY = {
 #: identically zero -- a plausible number, silently wrong, which is worse
 #: than refusing to emit.
 _TERNARY = {"fma": "fma"}
-_UNARY = {"Abs": "fabs", "Sqrt": "sqrt", "Neg": None}
+_UNARY = {
+    "Abs": "fabs", "Sqrt": "sqrt", "Neg": None,
+    # Range reduction is floor and nothing else, so a lane without it
+    # cannot compile a transcendental outside its core's own interval.
+    # C99 has all three in <math.h>.
+    "Floor": "floor", "Ceil": "ceil", "Round": "nearbyint",
+}
 _UNARY_FOLDED = {
     key.casefold(): value for key, value in _UNARY.items()
     if value is not None

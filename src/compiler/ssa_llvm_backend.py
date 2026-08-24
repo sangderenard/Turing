@@ -464,6 +464,16 @@ def _annotate_noalias(
     return annotated
 
 
+#: The same tables keyed by casefolded name, for operations whose emitted
+#: spelling differs in case from the canonical one.
+_BINARY_FOLDED: dict[str, str] = {
+    key.casefold(): value for key, value in _BINARY.items()
+}
+_UNARY_FOLDED: dict[str, str] = {
+    key.casefold(): value for key, value in _UNARY.items()
+}
+
+
 def scalar_likeness(
     operation: str, *, precision_section: bool = False,
 ) -> str | None:
@@ -484,7 +494,18 @@ def scalar_likeness(
     honouring the section costs one condition.
     """
 
+    # Looked up by the SPELLING THE SSA EMITS, which is not the spelling
+    # these tables are keyed by: the reducer plants ``floor`` where the
+    # table says ``Floor``, and an exact match therefore reports a
+    # capability that is present as missing. That is the same failure the
+    # C lane's casefolded tables were built to end -- "a capability that
+    # exists but is spelled differently is indistinguishable from a
+    # missing one" -- and it kept range reduction, and with it every
+    # full-domain transcendental, from compiling at all.
     template = _BINARY.get(operation) or _UNARY.get(operation)
+    if template is None:
+        folded = str(operation).casefold()
+        template = _BINARY_FOLDED.get(folded) or _UNARY_FOLDED.get(folded)
     if (
         template is not None
         and operation in _CONTRACT_ELIGIBLE
