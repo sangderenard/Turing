@@ -425,14 +425,17 @@ _PAGE = r"""<!doctype html>
   canvas { width: min(80vmin, 640px); height: min(80vmin, 640px);
            image-rendering: pixelated; border-radius: 6px;
            box-shadow: 0 0 0 1px #232838; }
-  #status { font-variant-numeric: tabular-nums; min-height: 1.5em; }
+  #status, #health { font-variant-numeric: tabular-nums;
+                     min-height: 1.5em; }
+  #health { color: #8d95a8; }
   .note { max-width: 640px; color: #8d95a8; font-size: 13px; }
   b { color: #e7ebf4; font-weight: 600; }
 </style>
 </head>
 <body>
 <canvas id="view" width="512" height="512"></canvas>
-<div id="status">starting…</div>
+<div id="status">loading…</div>
+<div id="health"></div>
 <div class="note">
   Every cell is pulled toward its four neighbours by
   <b>sin(their phase − mine)</b>. The sine is derived in SymPy, lowered to
@@ -450,6 +453,7 @@ const GATHER_WGSL = __GATHER_WGSL__;
 const PRESENT_WGSL = __PRESENT_WGSL__;
 
 const status = document.getElementById("status");
+const health = document.getElementById("health");
 const canvas = document.getElementById("view");
 
 function fail(message) {
@@ -486,8 +490,20 @@ async function main() {
     if (adapter.limits[key] !== undefined) wanted[key] = adapter.limits[key];
   }
   const device = await adapter.requestDevice({ requiredLimits: wanted });
+  // HOLD THE ADAPTER. The render loop never mentions it, so once main's
+  // closure is done with it the adapter becomes collectable -- and when
+  // it goes, Dawn releases the instance behind it and every buffer on
+  // this device starts answering "a valid external Instance reference no
+  // longer exists". The symptom is a page that runs for a while and then
+  // quietly stops computing while its step counter keeps climbing.
+  window.__gpu = { adapter, device };
   device.addEventListener?.("uncapturederror", (e) =>
     fail("WebGPU error: " + e.error.message));
+  // Nothing here may fail quietly. A rejection with no handler used to
+  // stop the loop and leave a cleared canvas looking like a finished
+  // render.
+  window.addEventListener("unhandledrejection", (e) =>
+    fail("unhandled: " + String(e.reason && e.reason.message || e.reason)));
 
   const { wide, high, limbs } = MANIFEST;
   const count = wide * high;
@@ -662,6 +678,12 @@ async function main() {
   let last = performance.now();
   let frames = 0;
 
+  // Deliberately NOT async. Awaiting completion here was added on a bad
+  // measurement -- a hidden pane reporting 0 fps and a lost device, which
+  // was the pane being throttled and reclaimed, not the shader. Worse, an
+  // async frame turns any throw into an unhandled rejection: the loop
+  // stops, nothing is reported, and the last cleared frame stays on
+  // screen. A silent stop is the one failure this page must not have.
   function frame() {
     const encoder = device.createCommandEncoder();
 
@@ -727,6 +749,16 @@ async function main() {
     if (now - last > 500) {
       const fps = frames * 1000 / (now - last);
       const sines = 4 * count * fps;
+      // Say what the FIELD contains, not just that frames happened. A
+      // page that reports progress while its numbers are NaN is how two
+      // separate failures here looked exactly like success.
+      window.__field().then((f) => {
+        health.textContent = f.nan
+          ? `field: ${f.nan} of ${count} cells are NaN`
+          : `field: [${f.lo.toFixed(2)}, ${f.hi.toFixed(2)}] · ` +
+            `low limb live in ${f.lowNonzero}/${count} · ` +
+            `coherence ${f.coherence.toFixed(4)}`;
+      }).catch((e) => { health.textContent = "field: " + String(e).slice(0, 80); });
       status.textContent =
         `${wide}x${high} = ${count.toLocaleString()} cells · step ` +
         `${step.toLocaleString()} · ${fps.toFixed(0)} fps · ` +
