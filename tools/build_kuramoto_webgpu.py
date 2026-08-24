@@ -185,17 +185,28 @@ def feed_plan(function, entry: str, width: int, sine, cosine, constants,
     for name, value in constants.items():
         scalars[name] = limbs_of(value)
 
-    plan = {"fields": {}, "scalars": {}, "unbound": []}
-    for name, identifier in sorted(ids.items()):
+    # The feeds are ONE SPAN: formal at position k occupies
+    # [k * count, (k + 1) * count). So the plan is written by POSITION in
+    # the emitted signature, not by SSA id, and the host fills one buffer.
+    by_id = {int(identifier): name for name, identifier in ids.items()}
+    plan = {"slots": [], "unbound": []}
+    for position, formal in enumerate(function.args):
+        name = by_id.get(int(formal.id))
+        if name is None:
+            plan["unbound"].append(f"%{formal.id}")
+            continue
         base, _, suffix = name.partition("__limb")
         limb = int(suffix) if suffix else 0
         if base in FIELDS:
-            plan["fields"].setdefault(base, {})[limb] = int(identifier)
+            plan["slots"].append(
+                {"at": position, "field": base, "limb": limb}
+            )
         elif base in scalars:
             parts = scalars[base]
-            plan["scalars"][int(identifier)] = (
-                parts[limb] if limb < len(parts) else 0.0
-            )
+            plan["slots"].append({
+                "at": position,
+                "value": parts[limb] if limb < len(parts) else 0.0,
+            })
         else:
             plan["unbound"].append(name)
     return plan, ids
@@ -208,36 +219,49 @@ def feed_plan(function, entry: str, width: int, sine, cosine, constants,
 # values that the compiled kernel produced.
 
 GATHER_WGSL = """
-struct Shape { wide: u32, high: u32 };
+// Offsets into the one feed span, so this writes exactly where the
+// compiled kernel will read. `limb` strides a field's limbs, which sit
+// in consecutive slots.
+struct Shape {
+  wide: u32, high: u32, count: u32, limbs: u32,
+  theta: u32, up: u32, down: u32, left: u32, right: u32, pad: u32,
+};
 @group(0) @binding(0) var<uniform> shape: Shape;
-@group(0) @binding(1) var<storage, read> theta: array<f32>;
-@group(0) @binding(2) var<storage, read_write> up: array<f32>;
-@group(0) @binding(3) var<storage, read_write> down: array<f32>;
-@group(0) @binding(4) var<storage, read_write> left: array<f32>;
-@group(0) @binding(5) var<storage, read_write> right: array<f32>;
+@group(0) @binding(1) var<storage, read_write> feeds: array<f32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let count = shape.wide * shape.high;
   let i = gid.x;
-  if (i >= count) { return; }
+  if (i >= shape.count) { return; }
   let row = i / shape.wide;
   let col = i % shape.wide;
   let up_row = (row + shape.high - 1u) % shape.high;
   let down_row = (row + 1u) % shape.high;
   let left_col = (col + shape.wide - 1u) % shape.wide;
   let right_col = (col + 1u) % shape.wide;
-  up[i] = theta[up_row * shape.wide + col];
-  down[i] = theta[down_row * shape.wide + col];
-  left[i] = theta[row * shape.wide + left_col];
-  right[i] = theta[row * shape.wide + right_col];
+  let up_i = up_row * shape.wide + col;
+  let down_i = down_row * shape.wide + col;
+  let left_i = row * shape.wide + left_col;
+  let right_i = row * shape.wide + right_col;
+  // Every limb moves together: a gather is data movement and cannot
+  // round, so the expansion crosses it intact.
+  for (var k: u32 = 0u; k < shape.limbs; k = k + 1u) {
+    let src = shape.theta + k * shape.count;
+    feeds[shape.up + k * shape.count + i] = feeds[src + up_i];
+    feeds[shape.down + k * shape.count + i] = feeds[src + down_i];
+    feeds[shape.left + k * shape.count + i] = feeds[src + left_i];
+    feeds[shape.right + k * shape.count + i] = feeds[src + right_i];
+  }
 }
 """
 
 PRESENT_WGSL = """
-struct Shape { wide: u32, high: u32 };
+struct Shape {
+  wide: u32, high: u32, count: u32, limbs: u32,
+  theta: u32, up: u32, down: u32, left: u32, right: u32, pad: u32,
+};
 @group(0) @binding(0) var<uniform> shape: Shape;
-@group(0) @binding(1) var<storage, read> theta: array<f32>;
+@group(0) @binding(1) var<storage, read> feeds: array<f32>;
 
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
@@ -263,7 +287,12 @@ fn vs(@builtin(vertex_index) index: u32) -> VertexOut {
 fn fs(in: VertexOut) -> @location(0) vec4<f32> {
   let x = min(u32(in.uv.x * f32(shape.wide)), shape.wide - 1u);
   let y = min(u32(in.uv.y * f32(shape.high)), shape.high - 1u);
-  let phase = theta[y * shape.wide + x];
+  // Collapse the limbs for display: the eye needs one number, and this
+  // is the one place rounding the expansion costs nothing.
+  var phase = 0.0;
+  for (var k: u32 = 0u; k < shape.limbs; k = k + 1u) {
+    phase = phase + feeds[shape.theta + k * shape.count + y * shape.wide + x];
+  }
   let tau = 6.283185307179586;
   let turn = phase / tau - floor(phase / tau);
   let r = 0.5 + 0.5 * cos(tau * turn);
@@ -280,7 +309,7 @@ def page(kernel_wgsl: str, plan: dict, width: int, height: int,
     manifest = {
         "wide": width, "high": height, "limbs": limbs, "digits": digits,
         "terms": terms, "seed": seed, "spread": spread,
-        "fields": plan["fields"], "scalars": plan["scalars"],
+        "slots": plan["slots"],
     }
     return _PAGE.replace("__MANIFEST__", json.dumps(manifest)) \
                 .replace("__KERNEL_WGSL__", json.dumps(kernel_wgsl)) \
@@ -394,39 +423,49 @@ async function main() {
     spins[i] = gaussian() * MANIFEST.spread;
   }
 
-  // One buffer per limb per field. Limb 0 carries the value and the
-  // rest start exactly zero, which is the expansion [x, +0, ...].
-  const fieldBuffers = {};
-  for (const [name, slots] of Object.entries(MANIFEST.fields)) {
-    fieldBuffers[name] = [];
-    for (let limb = 0; limb < limbs; limb++) {
-      const buffer = storage(count * 4);
-      const initial = new Float32Array(count);
-      if (limb === 0) {
-        if (name === "theta") initial.set(phases);
-        else if (name === "omega") initial.set(spins);
-      }
-      device.queue.writeBuffer(buffer, 0, initial);
-      fieldBuffers[name].push(buffer);
+  // The feeds are ONE SPAN: formal at position k occupies
+  // [k * count, (k + 1) * count). Constants are written once here and
+  // never touched again; only theta's limbs are rewritten per step.
+  const slots = MANIFEST.slots;
+  const feeds = storage(slots.length * count * 4);
+  const staging = new Float32Array(slots.length * count);
+  const thetaSlots = [];
+  for (const slot of slots) {
+    const base = slot.at * count;
+    if (slot.field === undefined) {
+      staging.fill(slot.value, base, base + count);
+    } else if (slot.field === "theta") {
+      if (slot.limb === 0) staging.set(phases, base);
+      thetaSlots[slot.limb] = base;
+    } else if (slot.field === "omega") {
+      if (slot.limb === 0) staging.set(spins, base);
+    }
+    // Neighbour fields are filled by the gather pass each step.
+  }
+  device.queue.writeBuffer(feeds, 0, staging);
+
+  // Where the gather pass writes, and where it reads the phase from.
+  const neighbourSlots = {};
+  for (const slot of slots) {
+    if (slot.field && slot.field !== "theta" && slot.field !== "omega") {
+      neighbourSlots[slot.field] = neighbourSlots[slot.field] || [];
+      neighbourSlots[slot.field][slot.limb] = slot.at * count;
     }
   }
-  // The kernel writes the advanced phase; ping-pong so a step never
-  // reads a cell its own neighbours already overwrote.
-  const nextTheta = [];
-  for (let limb = 0; limb < limbs; limb++) nextTheta.push(storage(count * 4));
 
-  // The compute ABI reads every formal as feed[linear_index], so a value
-  // shared by every cell is replicated to full length. Free at runtime.
-  const scalarBuffers = {};
-  for (const [id, value] of Object.entries(MANIFEST.scalars)) {
-    const buffer = storage(count * 4);
-    device.queue.writeBuffer(buffer, 0, new Float32Array(count).fill(value));
-    scalarBuffers[id] = buffer;
-  }
+  // The kernel publishes its two limbs to two output buffers; they are
+  // copied back into theta's slots between steps, which is also the
+  // ping-pong that stops a cell reading a neighbour it just overwrote.
+  const outputs = [];
+  for (let limb = 0; limb < limbs; limb++) outputs.push(storage(count * 4));
 
   const shape = device.createBuffer({
-    size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  device.queue.writeBuffer(shape, 0, new Uint32Array([wide, high]));
+    size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(shape, 0, new Uint32Array([
+    wide, high, count, limbs,
+    thetaSlots[0], neighbourSlots.up[0], neighbourSlots.down[0],
+    neighbourSlots.left[0], neighbourSlots.right[0], 0,
+  ]));
 
   status.textContent = "compiling shaders…";
   const kernelModule = device.createShaderModule({ code: KERNEL_WGSL });
@@ -451,25 +490,11 @@ async function main() {
     primitive: { topology: "triangle-list" },
   });
 
-  // The kernel's own bindings, in the order the emitter declared them.
-  // Limb 0 of `theta` is the field being advanced; the rest are fixed.
-  function kernelEntries(thetaSet) {
-    const entries = [];
-    for (const [name, slots] of Object.entries(MANIFEST.fields)) {
-      for (const [limb, id] of Object.entries(slots)) {
-        const source = name === "theta" ? thetaSet : fieldBuffers[name];
-        entries.push({ binding: Number(id),
-                       resource: { buffer: source[Number(limb)] } });
-      }
-    }
-    for (const [id, buffer] of Object.entries(scalarBuffers)) {
-      entries.push({ binding: Number(id), resource: { buffer } });
-    }
-    return entries;
-  }
+  // One feed span in, one buffer per published limb out.
+  const kernelEntries = [{ binding: 0, resource: { buffer: feeds } }];
+  outputs.forEach((buffer, index) =>
+    kernelEntries.push({ binding: 1 + index, resource: { buffer } }));
 
-  let theta = fieldBuffers.theta;
-  let spare = nextTheta;
   let step = 0;
   let last = performance.now();
   let frames = 0;
@@ -484,11 +509,7 @@ async function main() {
       layout: gatherPipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: shape } },
-        { binding: 1, resource: { buffer: theta[0] } },
-        { binding: 2, resource: { buffer: fieldBuffers.up[0] } },
-        { binding: 3, resource: { buffer: fieldBuffers.down[0] } },
-        { binding: 4, resource: { buffer: fieldBuffers.left[0] } },
-        { binding: 5, resource: { buffer: fieldBuffers.right[0] } },
+        { binding: 1, resource: { buffer: feeds } },
       ],
     }));
     gather.dispatchWorkgroups(Math.ceil(count / 64));
@@ -499,12 +520,18 @@ async function main() {
     advance.setPipeline(kernelPipeline);
     advance.setBindGroup(0, device.createBindGroup({
       layout: kernelPipeline.getBindGroupLayout(0),
-      entries: kernelEntries(theta),
+      entries: kernelEntries,
     }));
     advance.dispatchWorkgroups(Math.ceil(count / 256));
     advance.end();
 
-    // 3. paint it
+    // 3. the advanced phase becomes the field, limb by limb
+    for (let limb = 0; limb < limbs; limb++) {
+      encoder.copyBufferToBuffer(
+        outputs[limb], 0, feeds, thetaSlots[limb] * 4, count * 4);
+    }
+
+    // 4. paint it
     const paint = encoder.beginRenderPass({
       colorAttachments: [{
         view: context.getCurrentTexture().createView(),
@@ -517,7 +544,7 @@ async function main() {
       layout: presentPipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: shape } },
-        { binding: 1, resource: { buffer: theta[0] } },
+        { binding: 1, resource: { buffer: feeds } },
       ],
     }));
     paint.draw(6);
@@ -600,8 +627,10 @@ def main(argv=None) -> int:
     path = destination / "index.html"
     path.write_text(html, encoding="utf-8", newline="\n")
 
+    fields = sum(1 for slot in plan["slots"] if "field" in slot)
     print(f"shader {len(emitted.source):,d} bytes, "
-          f"{len(plan['fields'])} fields, {len(plan['scalars'])} scalars",
+          f"{len(plan['slots'])} feed slots ({fields} field, "
+          f"{len(plan['slots']) - fields} constant) in one span",
           flush=True)
     print(f"wrote {path}", flush=True)
     return 0

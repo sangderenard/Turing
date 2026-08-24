@@ -63,6 +63,11 @@ _DTYPE: dict[str, str] = {
     "uint32": "u32", "u32": "u32", "bool": "bool",
 }
 _FLOAT64 = frozenset({"float64", "double", "f64"})
+
+#: Storage buffers per shader stage a WebGPU implementation must provide.
+#: Devices commonly offer more, but a shader that needs more than this is
+#: not portable, so it is the point at which feeds are packed into one span.
+_MAX_GUARANTEED_STORAGE_BINDINGS = 8
 _COMPARISON = {
     "Eq": "{0} == {1}", "Ne": "{0} != {1}",
     "Lt": "{0} < {1}", "Le": "{0} <= {1}",
@@ -243,6 +248,29 @@ class _FunctionEmitter:
         if item not in self.shortfalls:
             self.shortfalls.append(item)
 
+    def aggregate_dtype(self, callee: str, returns) -> str | None:
+        """The WGSL type of a span of published values.
+
+        One element type for the whole span, because that is what an
+        array is. A region publishing a mixture is refused rather than
+        widened: the caller reads each slot at a declared type, and
+        silently promoting one of them would change a value on the way
+        out of the call.
+        """
+
+        spelled = {self.dtype(value) for value in returns}
+        if None in spelled:
+            return None
+        if len(spelled) != 1:
+            self.fail(
+                "Call",
+                f"region {callee!r} publishes a mixed-type span "
+                f"{sorted(item for item in spelled if item)}; WGSL returns "
+                f"one array element type",
+            )
+            return None
+        return f"array<{spelled.pop()}, {len(returns)}>"
+
     def dtype(self, value: SSAValue) -> str | None:
         dtype = str(value.dtype or "float32").lower()
         if dtype in _FLOAT64:
@@ -298,13 +326,28 @@ class _FunctionEmitter:
             if returns is None:
                 self.fail(operation, f"unknown WGSL callee {callee!r}")
                 return
-            if len(returns) != 1:
-                self.fail(operation, "multi-output numerical regions are not yet supported")
+            if len(returns) == 1:
+                dtype = self.dtype(returns[0])
+            else:
+                # A region publishing many values returns ONE SPAN, which
+                # is what the caller already reads it as: the call result
+                # is an aggregate and every use is a GetElementPtr at a
+                # constant index. WGSL returns a fixed-size array by
+                # value, so the span crosses the call intact and each
+                # index resolves below without a temporary.
+                dtype = self.aggregate_dtype(callee, returns)
+            if dtype is None:
                 return
-            dtype = self.dtype(returns[0])
             expression = f"{callee}({', '.join(args)})"
         elif operation in {"GetElementPtr", "getelementptr"} and args:
-            self.aliases[result.id] = args[0]
+            # Indexing an aggregate the callee returned. The index is on
+            # the instruction rather than in the operand, and taking it
+            # from there keeps this exact when the constant that spells it
+            # has been folded away.
+            index = instr.attributes.get("aggregate_index")
+            self.aliases[result.id] = (
+                args[0] if index is None else f"{args[0]}[{int(index)}]"
+            )
             return
         elif operation in {"Load", "load"} and args:
             expression = args[0]
@@ -436,6 +479,16 @@ class _FunctionEmitter:
                 )
         elif len(self.outputs) == 1:
             self.lines.append(f"  return {self.operand(self.outputs[0])};")
+        elif self.outputs:
+            # The span, constructed in publication order so slot k is the
+            # value the caller reads at aggregate index k.
+            element = self.dtype(self.outputs[0])
+            values = ", ".join(
+                self.operand(value) for value in self.outputs
+            )
+            self.lines.append(
+                f"  return array<{element}, {len(self.outputs)}>({values});"
+            )
         return "\n".join(self.lines), tuple(self.shortfalls)
 
 
@@ -686,8 +739,42 @@ def emit_module(
         if str(instruction.op) in {"Call", "call"}
         and "tensor_operation" not in instruction.attributes
     }
+    def _published_span(callee: str) -> tuple:
+        """What a planned region hands back, when it has no ``Ret``.
+
+        A region does not return -- it PUBLISHES, and the list of what it
+        published lives on the callsite as ``output_ids`` while the values
+        themselves are produced inside the region. Reading only ``Ret``
+        therefore saw an empty signature and every such region looked like
+        it returned nothing at all.
+        """
+
+        produced = {
+            int(instruction.res.id): instruction.res
+            for block in functions[callee].blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        }
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if str(instruction.op) not in {"Call", "call"}:
+                    continue
+                if str(instruction.attributes.get("callee", "")) != callee:
+                    continue
+                published = instruction.attributes.get("output_ids") or ()
+                resolved = tuple(
+                    produced[int(identifier)] for identifier in published
+                    if int(identifier) in produced
+                )
+                if len(resolved) == len(tuple(published)):
+                    return resolved
+        return ()
+
     callees = {
-        callee: function_returns.get(callee, ())
+        callee: (
+            function_returns.get(callee)
+            or _published_span(callee)
+        )
         for callee in called_names
         if callee in functions
     }
@@ -695,17 +782,48 @@ def emit_module(
 
     bindings = []
     feed_bindings = []
-    for binding, value in enumerate(function.args):
-        dtype = _DTYPE.get(str(value.dtype or "float32").lower(), "f32")
+    feed_dtypes = {
+        _DTYPE.get(str(value.dtype or "float32").lower(), "f32")
+        for value in function.args
+    }
+    # ONE BINDING PER FORMAL runs out of bindings: WebGPU guarantees only
+    # eight storage buffers per stage, and a wide kernel has dozens of
+    # coefficients. Measured, this kernel asked for 69 against a device
+    # limit of 16 -- the shader itself compiled, and the pipeline was
+    # refused for counting alone.
+    #
+    # The feeds are a SPAN, so they are bound as one: formal k occupies
+    # `[k * count, (k + 1) * count)` and reads its own element at
+    # `linear_index`. Packing only when the count would exceed the
+    # guaranteed minimum keeps small kernels spelled the readable way,
+    # and it needs one element type for the whole span -- a mixed one
+    # stays unpacked and says so by simply not fitting.
+    packed_feeds = (
+        len(function.args) + len(output_values)
+        > _MAX_GUARANTEED_STORAGE_BINDINGS
+        and len(feed_dtypes) == 1
+    )
+    if packed_feeds:
+        element = next(iter(feed_dtypes))
         bindings.append(
-            f"@group(0) @binding({binding}) var<storage, read> feed_{value.id}: array<{dtype}>;"
+            "@group(0) @binding(0) var<storage, read> feeds: "
+            f"array<{element}>;"
         )
         feed_bindings.append(BufferBinding(
-            f"feed_{value.id}", "feed", dtype, binding, value_id=value.id,
+            "feeds", "feed", element, 0, value_id=None,
         ))
+    else:
+        for binding, value in enumerate(function.args):
+            dtype = _DTYPE.get(str(value.dtype or "float32").lower(), "f32")
+            bindings.append(
+                f"@group(0) @binding({binding}) var<storage, read> feed_{value.id}: array<{dtype}>;"
+            )
+            feed_bindings.append(BufferBinding(
+                f"feed_{value.id}", "feed", dtype, binding, value_id=value.id,
+            ))
     output_bindings = []
     for index, value in enumerate(output_values):
-        binding = len(function.args) + index
+        binding = (1 if packed_feeds else len(function.args)) + index
         dtype = _DTYPE.get(str(value.dtype or "float32").lower(), "f32")
         bindings.append(
             f"@group(0) @binding({binding}) var<storage, read_write> output_{index}: array<{dtype}>;"
@@ -730,12 +848,26 @@ def emit_module(
     helpers: list[str] = []
     for callee, returns in callees.items():
         helper = functions[callee]
-        if len(returns) != 1:
+        element_types = {
+            _DTYPE.get(str(value.dtype or "float32").lower())
+            for value in returns
+        }
+        if len(returns) == 1:
+            return_dtype = _DTYPE.get(str(returns[0].dtype or "float32").lower())
+        elif None in element_types or len(element_types) != 1:
+            # Mixed or unrepresentable slots: refused rather than widened,
+            # because the caller reads each slot at a declared type.
             shortfalls.append(WGSLShortfall(
-                callee, "return", "multi-output numerical regions are not yet supported",
+                callee, "return",
+                "region publishes a span WGSL cannot spell as one array "
+                f"element type: {sorted(str(item) for item in element_types)}",
             ))
             continue
-        return_dtype = _DTYPE.get(str(returns[0].dtype or "float32").lower())
+        else:
+            # The published values ARE a span, so the region returns one:
+            # WGSL returns a fixed-size array by value, and the caller
+            # indexes it at the aggregate positions it already uses.
+            return_dtype = f"array<{element_types.pop()}, {len(returns)}>"
         parameter_types = [
             _DTYPE.get(str(value.dtype or "float32").lower())
             for value in helper.args
@@ -766,9 +898,12 @@ def emit_module(
         loop_records=_loop_records(ir_module, function_name),
         callees=callees,
     )
-    for value in function.args:
+    for position, value in enumerate(function.args):
         dtype = _DTYPE.get(str(value.dtype or "float32").lower(), "f32")
         emitter.lines.append(
+            f"  let {_name(value)}: {dtype} = "
+            f"feeds[{position * int(count)}u + linear_index];"
+            if packed_feeds else
             f"  let {_name(value)}: {dtype} = feed_{value.id}[linear_index];"
         )
     body, function_shortfalls = emitter.emit()
