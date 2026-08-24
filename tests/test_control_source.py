@@ -537,3 +537,34 @@ def test_python_shell_finalizes_to_callable_only_after_selection():
 
     assert state == [0, 1, 2, 3]
     assert function.__compiled_shell_source__.startswith("def collect")
+
+
+def test_python_shell_owns_existing_module_external_reference_calls():
+    from src.compiler.control_source import ExternalReferenceCallBlock
+
+    logical = ControlProgram(
+        ExternalReferenceCallBlock(
+            callsite_id=7,
+            identity="_pickle.loads",
+            argument_value_ids=(1,),
+            keyword_argument_value_ids=(),
+            result_value_id=2,
+            result_dtype="opaque_ref",
+        ),
+    )
+    function = compile_python_shell(
+        logical,
+        (),
+        function_name="load_pickled_value",
+        parameters=("value_1",),
+    )
+
+    import pickle
+
+    assert function(pickle.dumps({"native": [1, 2, 3]})) is None
+    resolver = function.__external_reference_resolver__
+    assert resolver is not None
+    assert resolver.host.values.object(1) == {"native": [1, 2, 3]}
+    assert "__turing_external_call__('_pickle.loads'" in (
+        function.__compiled_shell_source__
+    )

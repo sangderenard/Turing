@@ -45,6 +45,7 @@ _C_TYPES: dict[str, tuple[str, str]] = {
     "i32": ("int32_t", "c_int32"),
     "int64": ("int64_t", "c_int64"),
     "i64": ("int64_t", "c_int64"),
+    "opaque_ref": ("int64_t", "c_int64"),
     "bool": ("bool", "c_bool"),
     "logical": ("bool", "c_bool"),
 }

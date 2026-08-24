@@ -219,19 +219,19 @@ rules:
   - id: native-pickle-object-result
     match: {module: _pickle, qualname: "*", occurrence: definition}
     action: use_native
-    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, result_dtype: opaque_ref}
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: cpython-c-api, runtime_owner: shell, shell_profiles: [python, cpython-c], result_dtype: opaque_ref}
   - id: native-json-object-result
     match: {module: json, qualname: loads, occurrence: definition}
     action: use_native
-    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, result_dtype: opaque_ref}
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: cpython-c-api, runtime_owner: shell, shell_profiles: [python, cpython-c], result_dtype: opaque_ref}
   - id: native-performance-counter-scalar-result
     match: {module: time, qualname: perf_counter, occurrence: definition}
     action: use_native
-    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, result_dtype: float64}
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: cpython-c-api, runtime_owner: shell, shell_profiles: [python, cpython-c], result_dtype: float64}
   - id: native-os-replace-none-result
     match: {module: nt, qualname: replace, occurrence: definition}
     action: use_native
-    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, result_dtype: opaque_ref}
+    parameters: {loader: existing_module, symbol_resolution: in_place, callbacks: reject, execution: shell_io.external_references, shell_capability: host_references, shell_abi: turing-shell-io-abi.external_references, external_domain: host_system, native_abi: cpython-c-api, runtime_owner: shell, shell_profiles: [python, cpython-c], result_dtype: opaque_ref}
 
   # These are ordinary live Python objects, not runtime graph parameters.
   # When an instance or one of its definitions occurs on a reachable source

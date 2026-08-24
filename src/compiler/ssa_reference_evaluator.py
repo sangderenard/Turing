@@ -685,13 +685,13 @@ class SSAReferenceEvaluator:
 
         from .shell_external_references import (
             EXTERNAL_CALL, EXTERNAL_OK, EXTERNAL_RESOLVE,
-            ExistingModuleExternalReferenceHost,
+            PythonModuleExternalReferenceHost,
             ExternalReferenceRequestRecord,
         )
 
         host = self.external_reference_host
         if host is None:
-            host = ExistingModuleExternalReferenceHost()
+            host = PythonModuleExternalReferenceHost()
             self.external_reference_host = host
         identity = str(instruction.attributes.get("external_identity") or "")
         reference_id = self._external_reference_ids.get(identity)

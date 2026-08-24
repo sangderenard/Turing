@@ -3323,11 +3323,11 @@ class _ControlSSABuilder:
             return
         if isinstance(block, ExternalReferenceCallBlock):
             arguments = [
-                self.external_value(value_id)
+                self.external_value(value_id, dtype="opaque_ref")
                 for value_id in block.argument_value_ids
             ]
             arguments.extend(
-                self.external_value(value_id)
+                self.external_value(value_id, dtype="opaque_ref")
                 for _name, value_id in block.keyword_argument_value_ids
             )
             result = SSAValue(
@@ -3344,6 +3344,9 @@ class _ControlSSABuilder:
                     "external_callsite_id": int(block.callsite_id),
                     "external_domain": str(block.external_domain),
                     "shell_abi": str(block.shell_abi),
+                    "native_abi": str(block.native_abi),
+                    "runtime_owner": str(block.runtime_owner),
+                    "shell_profiles": tuple(block.shell_profiles),
                     "keyword_names": tuple(
                         name for name, _value_id
                         in block.keyword_argument_value_ids

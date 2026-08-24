@@ -296,6 +296,9 @@ class ExternalReferenceCallBlock:
     result_dtype: str
     shell_abi: str = "turing-shell-io-abi.external_references"
     external_domain: str = "host_system"
+    native_abi: str = ""
+    runtime_owner: str = ""
+    shell_profiles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -827,6 +830,29 @@ def render_control_block(
         # A target renderer therefore sees the callee as ordinary nested
         # control, not as a host-language function call.
         return render_control_block(block.callee, target)
+    if isinstance(block, ExternalReferenceCallBlock):
+        if target is not ControlTarget.PYTHON:
+            raise ValueError(
+                "external-reference control requires a target-owned ABI adapter; "
+                f"none is installed for {target.value} control rendering"
+            )
+        positional = ", ".join(
+            f"value_{int(value_id)}" for value_id in block.argument_value_ids
+        )
+        positional_tuple = (
+            "()" if not positional else
+            f"({positional},)" if len(block.argument_value_ids) == 1 else
+            f"({positional})"
+        )
+        keywords = ", ".join(
+            f"{name!r}: value_{int(value_id)}"
+            for name, value_id in block.keyword_argument_value_ids
+        )
+        return (
+            f"value_{int(block.result_value_id)} = "
+            f"__turing_external_call__({block.identity!r}, "
+            f"{positional_tuple}, {{{keywords}}}, {block.result_dtype!r})",
+        )
     if isinstance(block, ValidationBlock):
         predicate = f"value_{int(block.predicate_value_id)}"
         expected = "true" if block.expect_true else "false"
@@ -1102,6 +1128,8 @@ def compose_region_code(
                 block.argument_bindings,
                 block.result_bindings,
             )
+        if isinstance(block, ExternalReferenceCallBlock):
+            return block
         if isinstance(block, ValidationBlock):
             if (
                 retained_values is not None
@@ -2086,11 +2114,19 @@ def compile_python_shell(
             "",
         ))
     scope = dict(namespace or {})
+    if "__turing_external_call__" not in scope:
+        from .shell_external_references import PythonShellExternalReferenceResolver
+
+        external_resolver = PythonShellExternalReferenceResolver()
+        scope["__turing_external_call__"] = external_resolver.call
+    else:
+        external_resolver = None
     if abstract_tensor_backend is not None:
         scope["AbstractTensor"] = AbstractTensor
     exec(compile(source, f"<compiled-shell:{function_name}>", "exec"), scope)
     result = scope[function_name]
     result.__compiled_shell_source__ = source
+    result.__external_reference_resolver__ = external_resolver
     return result
 
 

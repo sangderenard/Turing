@@ -2494,6 +2494,69 @@ class _FunctionEmitter:
         native_callee = self.callee_native_symbols.get(str(callee), str(callee))
         return [f"    call {native_callee}({', '.join(arguments)})"]
 
+    def _external_reference_call(self, instr: Instr) -> list[str] | None:
+        """Emit one typed call to the C shell's external-reference thunk."""
+
+        if not (
+            instr.op in {"Call", "call"}
+            and instr.attributes.get("external_reference")
+            and instr.res is not None
+        ):
+            return None
+        if any(_is_array(self._typed(argument)) for argument in instr.args):
+            return None
+        from .shell_external_references import external_reference_thunk_symbol
+
+        symbol = external_reference_thunk_symbol(
+            self.function.name,
+            int(instr.attributes["external_callsite_id"]),
+            str(instr.attributes["external_identity"]),
+        )
+        self._locals[int(instr.res.id)] = self._typed(instr.res)
+        operands = [self._operand(argument) for argument in instr.args]
+        return [
+            f"    call {symbol}({', '.join((*operands, _name(instr.res)))})"
+        ]
+
+    def _external_reference_interfaces(self) -> list[str]:
+        from .shell_external_references import external_reference_thunk_symbol
+
+        interfaces = []
+        seen = set()
+        for block in self.function.blocks.values():
+            for instr in block.instrs:
+                if not (
+                    instr.op in {"Call", "call"}
+                    and instr.attributes.get("external_reference")
+                    and instr.res is not None
+                ):
+                    continue
+                symbol = external_reference_thunk_symbol(
+                    self.function.name,
+                    int(instr.attributes["external_callsite_id"]),
+                    str(instr.attributes["external_identity"]),
+                )
+                if symbol in seen:
+                    continue
+                seen.add(symbol)
+                values = (*instr.args, instr.res)
+                if any(_is_array(self._typed(value)) for value in values):
+                    continue
+                names = tuple(f"a{index}" for index in range(len(values)))
+                interfaces.extend((
+                    "    interface",
+                    f"      subroutine {symbol}({', '.join(names)}) "
+                    f"bind(C, name=\"{symbol}\")",
+                    "        use, intrinsic :: iso_c_binding",
+                    *(
+                        f"        {_DTYPE_KIND.get(str(self._typed(value).dtype or self.dtype), 'real(c_double)')} :: {name}"
+                        for name, value in zip(names, values)
+                    ),
+                    f"      end subroutine {symbol}",
+                    "    end interface",
+                ))
+        return interfaces
+
     #: Value-precision cast kernels arrive as ``Call`` instructions whose
     #: callee is the C kernel symbol (attached by the shared tensor SSA
     #: lowering) with operands ``(source, out, count)``.  They are not SSA
@@ -3329,6 +3392,11 @@ class _FunctionEmitter:
                 body.extend(call)
                 continue
 
+            external_call = self._external_reference_call(instr)
+            if external_call is not None:
+                body.extend(external_call)
+                continue
+
             store = self._indexed_store(instr)
             if store is not None:
                 body.extend(store)
@@ -3556,6 +3624,7 @@ class _FunctionEmitter:
             f"    integer(c_int), intent(in), value :: {extent}"
             for extent in extent_names
         ]
+        declarations.extend(self._external_reference_interfaces())
         # A referenced table must also be declared. Rendering the body sets
         # this flag, and the body is rendered before this point.
         if self.uses_sin_table:
@@ -5457,6 +5526,63 @@ def emit_module(
             })
         if bindings:
             sequence_runtime_bindings[function_name] = bindings
+    from .shell_external_references import external_reference_thunk_symbol
+
+    external_reference_thunks = []
+    for function_name, function in functions.items():
+        resolved_dtypes = function_value_dtypes.get(function_name, {})
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if not (
+                    instruction.op in {"Call", "call"}
+                    and instruction.attributes.get("external_reference")
+                    and instruction.res is not None
+                ):
+                    continue
+                external_reference_thunks.append({
+                    "symbol": external_reference_thunk_symbol(
+                        function_name,
+                        int(instruction.attributes["external_callsite_id"]),
+                        str(instruction.attributes["external_identity"]),
+                    ),
+                    "function": str(function_name),
+                    "callsite_id": int(
+                        instruction.attributes["external_callsite_id"]
+                    ),
+                    "identity": str(
+                        instruction.attributes["external_identity"]
+                    ),
+                    "argument_dtypes": [
+                        str(
+                            resolved_dtypes.get(int(argument.id))
+                            or argument.dtype
+                            or dtype
+                        )
+                        for argument in instruction.args
+                    ],
+                    "keyword_names": list(map(
+                        str,
+                        instruction.attributes.get("keyword_names") or (),
+                    )),
+                    "result_dtype": str(
+                        resolved_dtypes.get(int(instruction.res.id))
+                        or instruction.res.dtype
+                        or dtype
+                    ),
+                    "shell_abi": str(instruction.attributes["shell_abi"]),
+                    "native_abi": str(
+                        instruction.attributes.get("native_abi") or ""
+                    ),
+                    "runtime_owner": str(
+                        instruction.attributes.get("runtime_owner") or ""
+                    ),
+                    "shell_profiles": list(map(
+                        str, instruction.attributes.get("shell_profiles") or (),
+                    )),
+                    "external_domain": str(
+                        instruction.attributes["external_domain"]
+                    ),
+                })
     api = CompiledProgramAPI(
         module=name,
         language="fortran",
@@ -5465,6 +5591,10 @@ def emit_module(
             metadata={
                 "dtype": dtype,
                 "fortran_internal_symbols": dict(native_symbols),
+                "external_reference_thunk_schema": (
+                    "turing.external-reference-c-thunk.v1"
+                ),
+                "external_reference_thunks": external_reference_thunks,
                 **({
                     "host_linear_region_inlining": list(
                         host_linear_region_inlining

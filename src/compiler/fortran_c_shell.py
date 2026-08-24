@@ -91,6 +91,7 @@ _NUMPY_DTYPES = {
     "i32": np.dtype("int32"),
     "int64": np.dtype("int64"),
     "i64": np.dtype("int64"),
+    "opaque_ref": np.dtype("int64"),
 }
 
 
@@ -1365,6 +1366,8 @@ def emit_fortran_c_shell_source(
     final_outputs_filename: str = "final-outputs.bin",
     trace: bool = False,
     trace_capacity: int = 4096,
+    private_cpython_runtime_dll: str | None = None,
+    private_cpython_opaque_inputs: Mapping[str, str] | None = None,
 ) -> str:
     """Emit a standalone C main around one described Fortran entry point.
 
@@ -1407,6 +1410,36 @@ def emit_fortran_c_shell_source(
     ) = _native_shell_boundary_lines(
         module, entry, values, slot_by_parameter, extents,
     )
+    external_reference_thunks = tuple(
+        (getattr(module, "api", None).metadata or {}).get(
+            "external_reference_thunks", ()
+        )
+        if getattr(module, "api", None) is not None else ()
+    )
+    unsupported_external_abis = sorted({
+        str(thunk.get("native_abi") or "")
+        for thunk in external_reference_thunks
+        if str(thunk.get("native_abi") or "") != "cpython-c-api"
+    })
+    if unsupported_external_abis:
+        raise FortranEmissionError(
+            "C/Fortran shell has no adapter for external native ABIs: "
+            + ", ".join(map(repr, unsupported_external_abis))
+        )
+    private_cpython_adapter = ""
+    if external_reference_thunks:
+        if private_cpython_runtime_dll is None:
+            raise ValueError(
+                "C shell external references require an artifact-owned "
+                "private CPython runtime"
+            )
+        from .cpython_runtime import emit_private_cpython_adapter
+
+        private_cpython_adapter = emit_private_cpython_adapter(
+            external_reference_thunks,
+            runtime_dll=private_cpython_runtime_dll,
+        )
+    opaque_input_files = dict(private_cpython_opaque_inputs or {})
     display = _display_configuration(module, entry)
     file_ports = _system_file_configurations(module, entry)
     system_parameters = {
@@ -1511,6 +1544,29 @@ def emit_fortran_c_shell_source(
             "        size_t loaded_bytes = 0;",
             f"        if (!turing_read_file({variable}, (uint8_t *)slots[{data_slot}], {port['capacity']}, &loaded_bytes)) return 9;",
             f"        *(({port['length'].c_type} *)slots[{length_slot}]) = ({port['length'].c_type})loaded_bytes;",
+            "    }",
+        ))
+
+    opaque_input_lines = []
+    for parameter_name, filename in opaque_input_files.items():
+        if parameter_name not in slot_by_parameter:
+            raise ValueError(
+                f"opaque CPython input {parameter_name!r} is not in the entry ABI"
+            )
+        slot = slot_by_parameter[parameter_name]
+        variable = _identifier("opaque_input_" + parameter_name)
+        opaque_input_lines.extend((
+            "    {",
+            f"      FILE *{variable} = turing_open_artifact(argv[0], {_c_string(filename)}, \"rb\");",
+            "      long opaque_size; uint8_t *opaque_data; int64_t opaque_handle;",
+            f"      if ({variable} == NULL || fseek({variable}, 0, SEEK_END) != 0 ||",
+            f"          (opaque_size = ftell({variable})) < 0 || fseek({variable}, 0, SEEK_SET) != 0) return 10;",
+            "      opaque_data = (uint8_t *)malloc((size_t)opaque_size);",
+            f"      if (opaque_data == NULL || fread(opaque_data, 1, (size_t)opaque_size, {variable}) != (size_t)opaque_size) return 10;",
+            f"      fclose({variable});",
+            "      opaque_handle = turing_cpython_retain_bytes(opaque_data, (size_t)opaque_size);",
+            "      free(opaque_data); if (opaque_handle == 0) return 10;",
+            f"      *((int64_t *)slots[{slot}]) = opaque_handle;",
             "    }",
         ))
 
@@ -1879,6 +1935,7 @@ static int turing_read_file(
 }
 ''' if file_ports else "",),
         _C_FILE_BROKER_SOURCE if _requires_file_broker(module) else "",
+        private_cpython_adapter,
         *shell_boundary_globals,
         display_source,
         f"extern void {entry.symbol}({', '.join(prototype_arguments)});",
@@ -1913,6 +1970,7 @@ static int turing_read_file(
         *file_load_lines,
         *input_read_lines,
         "    fclose(state);",
+        *opaque_input_lines,
         *display_open_lines,
         "    turing_launch_stats_reset(&stats);",
         *((
@@ -2034,6 +2092,8 @@ def compile_fortran_module_c_shell(
     standalone: bool = True,
     library: bool = False,
     trace: bool = False,
+    cpython_runtime: str | Path | None = None,
+    repository_root: str | Path | None = None,
 ) -> FortranCShellExecutable:
     """Compile generated Fortran plus the generic profiled C main.
 
@@ -2053,6 +2113,30 @@ def compile_fortran_module_c_shell(
         raise FortranEmissionError(f"C compiler beside gfortran is missing: {gcc}")
     output = Path(directory).resolve()
     output.mkdir(parents=True, exist_ok=True)
+    external_reference_thunks = tuple(
+        (getattr(module, "api", None).metadata or {}).get(
+            "external_reference_thunks", ()
+        )
+        if getattr(module, "api", None) is not None else ()
+    )
+    unsupported_external_abis = sorted({
+        str(thunk.get("native_abi") or "")
+        for thunk in external_reference_thunks
+        if str(thunk.get("native_abi") or "") != "cpython-c-api"
+    })
+    if unsupported_external_abis:
+        raise FortranEmissionError(
+            "C/Fortran shell has no adapter for external native ABIs: "
+            + ", ".join(map(repr, unsupported_external_abis))
+        )
+    selected_cpython = None
+    if external_reference_thunks:
+        from .cpython_runtime import discover_cpython_runtime
+
+        selected_cpython = discover_cpython_runtime(
+            cpython_runtime,
+            repository=(repository_root or Path(__file__).resolve().parents[2]),
+        )
     entry = _entrypoint(module, entrypoint)
     # A shared library exports the emitted ABI directly: dynamic extents are
     # ordinary runtime arguments supplied by its eventual caller. Requiring
@@ -2072,6 +2156,7 @@ def compile_fortran_module_c_shell(
         for parameter in (port["data"], port["length"])
     }
     state_bytes = bytearray()
+    opaque_input_payloads: dict[str, bytes] = {}
     if not library:
         missing = {
             _source_name(parameter)
@@ -2088,6 +2173,15 @@ def compile_fortran_module_c_shell(
             if parameter.name in system_parameters:
                 continue
             source_name = _source_name(parameter)
+            if str(parameter.dtype).casefold() == "opaque_ref":
+                supplied_value = inputs[source_name]
+                if not isinstance(supplied_value, (bytes, bytearray, memoryview)):
+                    raise ValueError(
+                        f"opaque CPython input {source_name!r} must be a byte payload"
+                    )
+                opaque_input_payloads[parameter.name] = bytes(supplied_value)
+                state_bytes.extend(np.asarray(0, dtype=np.int64).tobytes())
+                continue
             dtype = _NUMPY_DTYPES.get(str(parameter.dtype).casefold())
             if dtype is None:
                 raise ValueError(f"unsupported C-shell dtype {parameter.dtype!r}")
@@ -2105,10 +2199,23 @@ def compile_fortran_module_c_shell(
     api_path = output / f"{name}.api.yaml"
     state_path = output / "initial-state.bin"
     final_outputs_path = output / "final-outputs.bin"
+    opaque_input_files = {
+        parameter_name: f"opaque-input-{index}.bin"
+        for index, parameter_name in enumerate(opaque_input_payloads)
+    }
+    for parameter_name, payload in opaque_input_payloads.items():
+        (output / opaque_input_files[parameter_name]).write_bytes(payload)
     fortran_path.write_text(module.source, encoding="utf-8")
     packed_symbol = None
     if library:
         c_source, packed_symbol = emit_fortran_packed_library_source(entry)
+        if selected_cpython is not None:
+            from .cpython_runtime import emit_private_cpython_adapter
+
+            c_source += "\n" + emit_private_cpython_adapter(
+                external_reference_thunks,
+                runtime_dll=selected_cpython.dll.name,
+            )
     else:
         c_source = emit_fortran_c_shell_source(
             module,
@@ -2118,6 +2225,10 @@ def compile_fortran_module_c_shell(
             extent_overrides=extents,
             initial_state_filename=state_path.name,
             final_outputs_filename=final_outputs_path.name,
+            private_cpython_runtime_dll=(
+                selected_cpython.dll.name if selected_cpython is not None else None
+            ),
+            private_cpython_opaque_inputs=opaque_input_files,
         )
     c_path.write_text(c_source, encoding="utf-8")
     # Pack runtime dependencies into the contract at compile time. The
@@ -2151,6 +2262,31 @@ def compile_fortran_module_c_shell(
     if runtime_dependencies:
         metadata = dict(api.metadata)
         metadata["runtime_dependencies"] = runtime_dependencies
+        api = replace(api, metadata=metadata)
+    if selected_cpython is not None:
+        from .cpython_runtime import stage_cpython_runtime
+
+        staged_cpython = stage_cpython_runtime(
+            selected_cpython,
+            output,
+            module_identities=(
+                str(thunk["identity"]) for thunk in external_reference_thunks
+            ),
+        )
+        metadata = dict(api.metadata)
+        dependencies = list(metadata.get("runtime_dependencies") or ())
+        dependencies.extend({
+            "name": path.name,
+            "path": path.as_posix(),
+            "owner": "private-cpython",
+        } for path in staged_cpython.files if path.parent == output)
+        metadata["runtime_dependencies"] = dependencies
+        metadata["private_cpython_runtime"] = {
+            "schema": "turing.private-cpython-runtime.v1",
+            "abi_tag": selected_cpython.abi_tag,
+            "provenance": selected_cpython.provenance,
+            "manifest": staged_cpython.manifest_path.name,
+        }
         api = replace(api, metadata=metadata)
     if packed_symbol is not None:
         metadata = dict(api.metadata)
@@ -4950,6 +5086,9 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
             result_dtype=str(result_dtype),
             shell_abi=str(parameters["shell_abi"]),
             external_domain=str(parameters["external_domain"]),
+            native_abi=str(parameters.get("native_abi") or ""),
+            runtime_owner=str(parameters.get("runtime_owner") or ""),
+            shell_profiles=tuple(map(str, parameters.get("shell_profiles") or ())),
         )
         guarded = tuple(
             (int(owner), str(arm))
@@ -18976,6 +19115,9 @@ def lower_ast_source_to_ssa(
                     ),
                     "shell_abi": parameters.get("shell_abi"),
                     "external_domain": parameters.get("external_domain"),
+                    "native_abi": parameters.get("native_abi"),
+                    "runtime_owner": parameters.get("runtime_owner"),
+                    "shell_profiles": tuple(parameters.get("shell_profiles") or ()),
                 }
                 previous_plan = native_reference_plans.setdefault(
                     identity, plan
@@ -19043,6 +19185,9 @@ def lower_ast_source_to_ssa(
                     "result_frame": "turing.external-reference-value.v1",
                     "object_policy": "shell-owned-opaque-handles",
                     "shell_abi": parameters.get("shell_abi"),
+                    "native_abi": parameters.get("native_abi"),
+                    "runtime_owner": parameters.get("runtime_owner"),
+                    "shell_profiles": tuple(parameters.get("shell_profiles") or ()),
                 })
         if shell_requests:
             from .shell_io import (
@@ -19122,6 +19267,7 @@ def compile_ast_fortran_c_shell(
     tensor_ssa_reference: Any = None,
     runtime_closure_only: bool = False,
     trace: bool = False,
+    cpython_runtime: str | Path | None = None,
 ) -> FortranCShellExecutable:
     """Compile Python AST through the registered Fortran target and C shell.
 
@@ -19308,6 +19454,7 @@ def compile_ast_fortran_c_shell(
                 name=artifact_name,
                 standalone=standalone,
                 library=True,
+                cpython_runtime=cpython_runtime,
             )
         raise FortranEmissionError(
             "whole-object library compilation produced no planned method "
@@ -19714,6 +19861,7 @@ def compile_ast_fortran_c_shell(
         standalone=standalone,
         library=library,
         trace=trace,
+        cpython_runtime=cpython_runtime,
     )
 
 

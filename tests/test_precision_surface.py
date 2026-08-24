@@ -1,0 +1,133 @@
+"""What the precision surface computes, pinned against exact arithmetic.
+
+These tests exist to make a STORAGE change safe. The limbs are moving from
+interleaved channels to a planar stack, and the whole risk of that move is
+that a layout error is silent: a value read with the wrong stride is still
+a perfectly ordinary tensor of plausible numbers. So every assertion here
+is against an exact ``Fraction`` reference computed from the limbs
+themselves, never against a remembered float, and the seams that cross the
+boundary -- the eager cores and the compiled kernels' feeds -- are checked
+by value rather than by shape.
+"""
+
+from fractions import Fraction
+
+import numpy as np
+import pytest
+
+from src.common.tensors.abstraction import AbstractTensor
+from src.common.tensors.extended_precision import Precision
+
+
+VALUES = [0.1, 0.25, 1.5, -0.75]
+
+
+def wide(values=VALUES, width=2):
+    return Precision.of(
+        AbstractTensor.get_tensor(np.asarray(values, dtype=np.float64)), width
+    )
+
+
+def exact(value: Precision):
+    """The number a Precision denotes: the exact sum of its limbs."""
+
+    rows = value.to_float_lists()
+    count = len(rows[0])
+    return [
+        sum((Fraction(row[index]) for row in rows), Fraction())
+        for index in range(count)
+    ]
+
+
+@pytest.mark.parametrize("width", (2, 3, 4))
+def test_arithmetic_is_exact_at_every_width(width):
+    left, right = wide(width=width), wide([2.0, 3.0, 0.5, -4.0], width)
+    reference = [Fraction(v) for v in VALUES]
+    other = [Fraction(v) for v in [2.0, 3.0, 0.5, -4.0]]
+
+    for produced, expected in (
+        (left + right, [a + b for a, b in zip(reference, other)]),
+        (left - right, [a - b for a, b in zip(reference, other)]),
+        (left * right, [a * b for a, b in zip(reference, other)]),
+        (-left, [-a for a in reference]),
+    ):
+        for got, want in zip(exact(produced), expected):
+            assert abs(got - want) < Fraction(1, 10 ** (14 * width))
+
+
+def test_width_buys_precision_that_a_double_cannot_hold():
+    """A third of one, at two widths: the wider answer is nearer.
+
+    The point of the type in one assertion. If a storage change quietly
+    collapsed the limbs, both widths would agree exactly -- and that
+    agreement is the failure, not the pass.
+    """
+
+    third_2 = exact(wide([1.0], 2) / 3.0)[0]
+    third_4 = exact(wide([1.0], 4) / 3.0)[0]
+    truth = Fraction(1, 3)
+    assert abs(third_4 - truth) < abs(third_2 - truth)
+    assert abs(third_2 - truth) < Fraction(1, 10 ** 28)
+    assert abs(third_4 - truth) < Fraction(1, 10 ** 60)
+
+
+def test_reductions_keep_the_limbs_they_were_given():
+    """Summing must not round each element to a double on the way."""
+
+    total = exact(wide().sum())[0]
+    assert abs(total - sum(Fraction(v) for v in VALUES)) < Fraction(1, 10 ** 28)
+
+    average = exact(wide().mean())[0]
+    expected = sum(Fraction(v) for v in VALUES) / len(VALUES)
+    assert abs(average - expected) < Fraction(1, 10 ** 28)
+
+
+def test_elementwise_surface_matches_exact_arithmetic():
+    # abs is exact: it only changes signs, which no limb has to round.
+    assert exact(abs(wide())) == [abs(Fraction(v)) for v in VALUES]
+    # A cube needs three times the input's bits, which is more than two
+    # limbs hold, so this is checked to the width's own resolution rather
+    # than to equality -- demanding exactness would be demanding precision
+    # the representation never claimed.
+    for got, want in zip(exact(wide() ** 3), [Fraction(v) ** 3 for v in VALUES]):
+        assert abs(got - want) < Fraction(1, 10 ** 28)
+    assert [float(v) for v in wide().floor().tolist()] == [
+        float(np.floor(v)) for v in VALUES
+    ]
+    assert [float(v) for v in wide().sign().tolist()] == [
+        float(np.sign(v)) for v in VALUES
+    ]
+
+
+def test_sqrt_converges_to_the_exact_root():
+    root = exact(wide([2.0, 9.0], 3).sqrt())
+    assert abs(root[1] - 3) < Fraction(1, 10 ** 40)
+    assert abs(root[0] * root[0] - 2) < Fraction(1, 10 ** 40)
+
+
+def test_transcendentals_refuse_rather_than_collapse():
+    """A wide value must never be answered from its leading limb alone."""
+
+    for name in ("exp", "sin", "log", "tanh"):
+        with pytest.raises((AttributeError, TypeError, NotImplementedError)):
+            getattr(wide(), name)()
+
+
+def test_eager_core_evaluates_wide_and_beats_the_double_path():
+    """The seam to signal_symbolic: a wide argument stays wide through it."""
+
+    from src.common.tensors import signal_symbolic as proof
+
+    argument = 0.3
+    narrow = float(proof.evaluate_proof("sin", argument, 1))
+    widened = proof.evaluate_proof(
+        "sin", AbstractTensor.get_tensor(np.asarray([argument])), 3,
+    )
+    assert isinstance(widened, Precision)
+    assert widened.limbs == 3
+
+    truth = proof.exact_evaluator("sin", proof.CORE_RADII["sin"], 60)(argument)
+    wide_error = abs(exact(widened)[0] - truth)
+    narrow_error = abs(Fraction(narrow) - truth)
+    assert wide_error < narrow_error
+    assert wide_error < Fraction(1, 10 ** 30)

@@ -6,8 +6,24 @@ from src.compiler.shell_external_references import (
     EXTERNAL_RELEASE,
     EXTERNAL_RESOLVE,
     ExistingModuleExternalReferenceHost,
+    PythonShellExternalReferenceResolver,
     ExternalReferenceRequestRecord,
 )
+
+
+def test_python_shell_resolver_uses_record_abi_for_pickle():
+    import pickle
+
+    resolver = PythonShellExternalReferenceResolver()
+
+    result = resolver.call(
+        "_pickle.loads",
+        (pickle.dumps(("compiled", 41)),),
+        result_dtype="opaque_ref",
+    )
+
+    assert result == ("compiled", 41)
+    assert resolver._reference_ids == {"_pickle.loads": 1}
 
 
 def _request(host, memory, operation, payload, *, reference_id=0, request_id=1):

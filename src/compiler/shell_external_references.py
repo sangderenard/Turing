@@ -9,6 +9,7 @@ handles.  No ``PyObject *`` and no guest pointer crosses this boundary.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import importlib
 import struct
 from typing import Any, Mapping, Sequence
@@ -41,6 +42,20 @@ _BYTES = 4
 _TEXT = 5
 _HANDLE = 6
 _TUPLE = 7
+
+EXTERNAL_RESULT_OPAQUE_HANDLE = 1
+EXTERNAL_RESULT_FLOAT64 = 2
+
+
+def external_reference_thunk_symbol(
+    function_name: str, callsite_id: int, identity: str,
+) -> str:
+    """Stable C symbol for one typed repository-SSA boundary occurrence."""
+
+    digest = hashlib.sha256(
+        f"{function_name}\0{int(callsite_id)}\0{identity}".encode("utf-8")
+    ).hexdigest()[:20]
+    return f"turing_external_reference_{digest}"
 
 
 @dataclass(frozen=True)
@@ -225,8 +240,8 @@ class ExternalReferenceValueCodec:
         return args, kwargs
 
 
-class ExistingModuleExternalReferenceHost:
-    """Resolve and invoke exact identities in already importable modules."""
+class PythonModuleExternalReferenceHost:
+    """Resolve exact module identities in this shell's CPython runtime."""
 
     def __init__(self) -> None:
         self.values = ExternalReferenceValueCodec()
@@ -278,7 +293,13 @@ class ExistingModuleExternalReferenceHost:
                 if any(callable(value) for value in (*args, *kwargs.values())):
                     status = EXTERNAL_CALLBACK_REJECTED
                 else:
-                    result = self.values.encode(function(*args, **kwargs))
+                    returned = function(*args, **kwargs)
+                    result = (
+                        bytes((_HANDLE,))
+                        + _I64.pack(self.values.retain(returned))
+                        if request.flags == EXTERNAL_RESULT_OPAQUE_HANDLE
+                        else self.values.encode(returned)
+                    )
             elif request.operation == EXTERNAL_RELEASE:
                 if reference_id not in self._references:
                     raise LookupError(reference_id)
@@ -315,8 +336,93 @@ class ExistingModuleExternalReferenceHost:
         )
 
 
+ExistingModuleExternalReferenceHost = PythonModuleExternalReferenceHost
+
+
+class PythonShellExternalReferenceResolver:
+    """Python-shell owner for the physical external-reference record ABI.
+
+    Generated Python control calls this small adapter; the adapter does not
+    bypass the shell contract.  It resolves and invokes through the same
+    request/completion records used by other shell profiles and keeps the
+    resulting reference IDs local to this shell instance.
+    """
+
+    def __init__(self, host: PythonModuleExternalReferenceHost | None = None) -> None:
+        self.host = host or PythonModuleExternalReferenceHost()
+        self._reference_ids: dict[str, int] = {}
+        self._request_id = 0
+
+    def _next_request_id(self) -> int:
+        self._request_id += 1
+        return self._request_id
+
+    def _service(
+        self,
+        *,
+        operation: int,
+        reference_id: int = 0,
+        arguments: bytes = b"",
+        flags: int = 0,
+    ) -> bytes:
+        result_offset = len(arguments)
+        result_capacity = max(4096, len(arguments) * 4)
+        memory = bytearray(result_offset + result_capacity)
+        memory[:len(arguments)] = arguments
+        completion = self.host.service(ExternalReferenceRequestRecord(
+            operation=operation,
+            request_id=self._next_request_id(),
+            reference_id=reference_id,
+            arguments_offset=0,
+            arguments_length=len(arguments),
+            result_offset=result_offset,
+            result_capacity=result_capacity,
+            flags=flags,
+        ), memory)
+        if completion.status != EXTERNAL_OK:
+            raise RuntimeError(
+                "Python shell external-reference request failed: "
+                f"operation={operation}, status={completion.status}"
+            )
+        return bytes(memory[result_offset:result_offset + completion.result_length])
+
+    def resolve(self, identity: str) -> int:
+        known = self._reference_ids.get(str(identity))
+        if known is not None:
+            return known
+        payload = self.host.values.encode(str(identity))
+        result = self._service(operation=EXTERNAL_RESOLVE, arguments=payload)
+        reference_id = int(self.host.values.decode(result))
+        self._reference_ids[str(identity)] = reference_id
+        return reference_id
+
+    def call(
+        self,
+        identity: str,
+        args: Sequence[Any] = (),
+        kwargs: Mapping[str, Any] | None = None,
+        result_dtype: str | None = None,
+    ) -> Any:
+        reference_id = self.resolve(identity)
+        arguments = self.host.values.encode_arguments(tuple(args), kwargs)
+        result = self._service(
+            operation=EXTERNAL_CALL,
+            reference_id=reference_id,
+            arguments=arguments,
+            flags=(
+                EXTERNAL_RESULT_OPAQUE_HANDLE
+                if str(result_dtype) == "opaque_ref" else 0
+            ),
+        )
+        return self.host.values.decode(result)
+
+
 __all__ = [
     "EXTERNAL_CALL", "EXTERNAL_OK", "EXTERNAL_RELEASE", "EXTERNAL_RESOLVE",
+    "EXTERNAL_RESULT_FLOAT64", "EXTERNAL_RESULT_OPAQUE_HANDLE",
     "ExistingModuleExternalReferenceHost", "ExternalReferenceCompletionRecord",
     "ExternalReferenceRequestRecord", "ExternalReferenceValueCodec",
+    "PythonShellExternalReferenceResolver",
+    "PythonModuleExternalReferenceHost",
+    "external_reference_thunk_symbol",
 ]
