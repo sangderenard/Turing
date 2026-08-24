@@ -224,7 +224,20 @@ _UNARY: dict[str, str] = {
     # downstream that then sees mixed INTEGER and REAL operands. Fortran
     # assignment converts on the way into an integer variable, so this is
     # safe even when the result is declared integer.
-    "floor": "real(floor({0}), c_double)",
+    # FLOOR() returns a default INTEGER, which is four bytes: an argument
+    # past about two billion overflows it and the result is nonsense
+    # rather than an error. Range reduction produces exactly such
+    # arguments -- a quarter-turn count near a trillion -- and measured,
+    # this returned 2.98e+189 for sin(1e12) while the same kernel was
+    # exact at 0.3. Naming a wider integer kind only moves the cliff to
+    # nine quintillion; AINT stays in the reals, where a double is
+    # already integral above 2**52 and the whole question dissolves. The
+    # MERGE supplies the difference between truncation and flooring,
+    # which is the one place they disagree: a negative with a fraction.
+    "floor": (
+        "(aint({0}) - merge(1.0_c_double, 0.0_c_double, "
+        "{0} < aint({0})))"
+    ),
     "ceil": "real(ceiling({0}), c_double)",
     "round": "real(nint({0}), c_double)",
     "sign": "sign(1.0_c_double, {0})",

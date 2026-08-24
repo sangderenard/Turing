@@ -427,6 +427,38 @@ def drop_dead_pure_region_calls(functions) -> int:
     return removed_total
 
 
+
+#: Operations whose result is a truth value rather than a quantity.
+_PREDICATE_NAMES = frozenset({
+    "Lt", "Le", "Gt", "Ge", "Eq", "Ne",
+    "lt", "le", "gt", "ge", "eq", "ne",
+})
+
+
+
+def _is_predicate_derived(instruction, definitions, predicates,
+                          depth: int = 4) -> bool:
+    """Whether this value descends from a comparison within a few steps.
+
+    Shallow on purpose: a mask is formed close to the comparison that
+    made it, and a deep search would start refusing genuine arithmetic
+    that merely happens to sit downstream of a branch condition.
+    """
+
+    if depth <= 0:
+        return False
+    for argument in getattr(instruction, "args", ()):
+        identifier = int(argument.id)
+        if identifier in predicates:
+            return True
+        producer = definitions.get(identifier)
+        if producer is not None and _is_predicate_derived(
+            producer, definitions, predicates, depth - 1
+        ):
+            return True
+    return False
+
+
 def carry_precision_through_ssa(functions) -> int:
     """Make a precision result self-describing, then rename what reads it.
 
@@ -544,6 +576,13 @@ def carry_precision_through_ssa(functions) -> int:
                 for instruction in block.instrs
                 if instruction.res is not None
             }
+            predicates = {
+                int(instruction.res.id)
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.res is not None
+                and str(instruction.op) in _PREDICATE_NAMES
+            }
             for block in function.blocks.values():
                 for instruction in block.instrs:
                     if str(instruction.op) not in planted:
@@ -562,6 +601,23 @@ def carry_precision_through_ssa(functions) -> int:
                             producer is None
                             or str(producer.op)
                             not in PRECISION_CLOSED_OPERATIONS
+                        ):
+                            continue
+                        # A value built from a COMPARISON is a mask: it is
+                        # zero or one, exactly representable in one limb,
+                        # and there is nothing for a second limb to hold.
+                        # Widening it anyway is not merely wasted work --
+                        # it puts an error-free transformation on a
+                        # boolean, and the LLVM lane then tracks the same
+                        # register as both i1 and double and emits a
+                        # two_product residual over a predicate. Measured,
+                        # a quadrant blend that the C lane computed
+                        # exactly came back off by half on LLVM. The
+                        # forward pass never reached these because a mask
+                        # has no limbed operand; only this backward half
+                        # can, so the guard belongs here.
+                        if _is_predicate_derived(
+                            producer, definitions, predicates
                         ):
                             continue
                         producer.attributes["precision_limbs"] = int(limbs)
