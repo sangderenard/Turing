@@ -173,7 +173,7 @@ def _program_for(choice: str, terms: int, lag: bool):
 
 
 def build(width: int, digits: int, cells: int, lag: bool = False,
-          choice: str = "kuramoto"):
+          choice: str = "kuramoto", local_size: int = 256):
     """Lower, narrow, flatten, and emit WGSL for one FieldProgram."""
 
     sine = list(core_terms("sin", digits))
@@ -198,7 +198,7 @@ def build(width: int, digits: int, cells: int, lag: bool = False,
     returned = _returned_values(function)
     emitted = webgpu.emit_module(
         flat, name="kuramoto", count=cells,
-        outputs={entry: returned},
+        outputs={entry: returned}, preferred_local_size=local_size,
     )
     return (emitted, flat, entry, sine, cosine, constants, terms, narrowed,
             program)
@@ -386,13 +386,118 @@ fn fs(in: VertexOut) -> @location(0) vec4<f32> {
 """
 
 
+TILE_WGSL = """
+struct View {
+  width: f32,
+  height: f32,
+  tile: f32,
+  _padding: f32,
+};
+@group(0) @binding(0) var field_sampler: sampler;
+@group(0) @binding(1) var field_texture: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> view: View;
+
+struct VertexOut {
+  @builtin(position) position: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) index: u32) -> VertexOut {
+  var points = array<vec2<f32>, 6>(
+    vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
+    vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0));
+  let p = points[index];
+  var out: VertexOut;
+  out.position = vec4<f32>(p, 0.0, 1.0);
+  out.uv = vec2<f32>((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5);
+  return out;
+}
+
+@fragment
+fn fs(in: VertexOut) -> @location(0) vec4<f32> {
+  let repeats = vec2<f32>(view.width, view.height) / view.tile;
+  return textureSample(field_texture, field_sampler, in.uv * repeats);
+}
+"""
+
+
+PERTURB_WGSL = """
+struct Shape { wide: u32, high: u32, count: u32, limbs: u32 };
+struct Interaction {
+  x: f32,
+  y: f32,
+  radius: f32,
+  strength: f32,
+  enabled: u32,
+  _padding_0: u32,
+  _padding_1: u32,
+  _padding_2: u32,
+};
+@group(0) @binding(0) var<uniform> shape: Shape;
+@group(0) @binding(1) var<storage, read_write> feeds: array<f32>;
+@group(0) @binding(2) var<storage, read> offsets: array<u32>;
+@group(0) @binding(3) var<uniform> interaction: Interaction;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= shape.count || interaction.enabled == 0u) { return; }
+
+  let row = f32(i / shape.wide);
+  let col = f32(i % shape.wide);
+  let raw_x = abs(col - interaction.x);
+  let raw_y = abs(row - interaction.y);
+  let dx = min(raw_x, f32(shape.wide) - raw_x);
+  let dy = min(raw_y, f32(shape.high) - raw_y);
+  let distance_2 = dx * dx + dy * dy;
+  let radius_2 = interaction.radius * interaction.radius;
+  if (distance_2 >= radius_2) { return; }
+
+  let falloff = 1.0 - distance_2 / radius_2;
+  let delta = interaction.strength * falloff * falloff;
+  let high_at = offsets[0] + i;
+  let high_value = feeds[high_at];
+
+  // Error-free two-sum keeps an external bump in the same two-limb phase
+  // representation as the compiled program. One-limb builds simply use it.
+  if (shape.limbs > 1u) {
+    let low_at = offsets[1] + i;
+    let first = high_value + delta;
+    let virtual_delta = first - high_value;
+    let error = (high_value - (first - virtual_delta)) +
+                (delta - virtual_delta);
+    let corrected_low = feeds[low_at] + error;
+    let result = first + corrected_low;
+    feeds[high_at] = result;
+    feeds[low_at] = corrected_low - (result - first);
+  } else {
+    feeds[high_at] = high_value + delta;
+  }
+}
+"""
+
+
 def page(kernel_wgsl: str, plan: dict, width: int, height: int,
          limbs: int, digits: int, terms: int, seed: int,
-         spread: float, published: int, program, writeback) -> str:
+         spread: float, published: int, program, writeback,
+         workgroup_size: int) -> str:
+    # A stamp over the shader AND the host, so a page can say which build
+    # it is. Every confusing round here has had a stale artifact as a live
+    # hypothesis, and a page that cannot identify itself keeps that
+    # hypothesis alive for free.
+    import hashlib
+
+    build_stamp = hashlib.sha256(
+        (kernel_wgsl + _PAGE + json.dumps(plan, sort_keys=True))
+        .encode("utf-8")
+    ).hexdigest()[:8]
     manifest = {
         "wide": width, "high": height, "limbs": limbs, "digits": digits,
+        "workgroupSize": workgroup_size,
         "terms": terms, "seed": seed, "spread": spread,
         "slots": plan["slots"], "published": published,
+        "build": build_stamp,
         "advances": list(program.advances),
         "gatherFrom": program.advances[0],
         "stateSeed": {
@@ -404,41 +509,73 @@ def page(kernel_wgsl: str, plan: dict, width: int, height: int,
         "stencil": list(program.stencil),
         "programName": program.name,
     }
-    return _PAGE.replace("__MANIFEST__", json.dumps(manifest)) \
+    page_title = {
+        "kuramoto": "Kuramoto phase field",
+        "sakaguchi": "Sakaguchi-Kuramoto phase field",
+        "kicked-rotor": "Hamiltonian kicked-rotor lattice",
+    }[program.name]
+    program_note = {
+        "kuramoto": (
+            "Every cell is pulled toward its four neighbours by "
+            "<b>sin(their phase - mine)</b>."
+        ),
+        "sakaguchi": (
+            "Every cell is pulled toward its four neighbours through a "
+            "<b>phase-lagged sine coupling</b>, breaking the ordinary "
+            "Kuramoto symmetry."
+        ),
+        "kicked-rotor": (
+            "Each cell is a <b>Hamiltonian kicked rotor</b>: the compiled "
+            "step advances both its angle and conjugate momentum while "
+            "coupling it to the surrounding lattice."
+        ),
+    }[program.name]
+    return _PAGE.replace("__PAGE_TITLE__", page_title) \
+                .replace("__PROGRAM_NOTE__", program_note) \
+                .replace("__MANIFEST__", json.dumps(manifest)) \
                 .replace("__KERNEL_WGSL__", json.dumps(kernel_wgsl)) \
                 .replace("__GATHER_WGSL__",
                          json.dumps(gather_wgsl(program.stencil))) \
-                .replace("__PRESENT_WGSL__", json.dumps(PRESENT_WGSL))
+                .replace("__PRESENT_WGSL__", json.dumps(PRESENT_WGSL)) \
+                .replace("__TILE_WGSL__", json.dumps(TILE_WGSL)) \
+                .replace("__PERTURB_WGSL__", json.dumps(PERTURB_WGSL))
 
 
 _PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Kuramoto field, compiled to WebGPU</title>
+<title>__PAGE_TITLE__, compiled to WebGPU</title>
 <style>
   :root { color-scheme: dark; }
-  body { margin: 0; background: #0b0d12; color: #d7dbe4;
-         font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
-         display: flex; flex-direction: column; align-items: center;
-         gap: 12px; padding: 20px; }
-  canvas { width: min(80vmin, 640px); height: min(80vmin, 640px);
-           image-rendering: pixelated; border-radius: 6px;
-           box-shadow: 0 0 0 1px #232838; }
+  html, body { width: 100%; min-height: 100%; }
+  body { margin: 0; overflow: hidden; background: #0b0d12; color: #d7dbe4;
+         font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh;
+           image-rendering: pixelated; touch-action: none; cursor: crosshair; }
+  main { position: relative; z-index: 1; width: min(620px, calc(100vw - 40px));
+         margin: 20px auto; padding: 14px 16px; border-radius: 8px;
+         background: rgb(11 13 18 / .78); border: 1px solid rgb(215 219 228 / .16);
+         box-shadow: 0 12px 48px rgb(0 0 0 / .28); backdrop-filter: blur(9px);
+         pointer-events: none; }
   #status, #health { font-variant-numeric: tabular-nums;
                      min-height: 1.5em; }
   #health { color: #8d95a8; }
-  .note { max-width: 640px; color: #8d95a8; font-size: 13px; }
+  #stamp { color: #5d6478; font-size: 12px; }
+  #pointer { color: #c9d2e7; font-variant-numeric: tabular-nums; }
+  .note { max-width: 640px; color: #a6aec0; font-size: 13px; }
   b { color: #e7ebf4; font-weight: 600; }
 </style>
 </head>
 <body>
 <canvas id="view" width="512" height="512"></canvas>
+<main>
 <div id="status">loading…</div>
 <div id="health"></div>
+<div id="pointer">move over any tile for a hill · press for a dimple</div>
+<div id="stamp">build …</div>
 <div class="note">
-  Every cell is pulled toward its four neighbours by
-  <b>sin(their phase − mine)</b>. The sine is derived in SymPy, lowered to
+  __PROGRAM_NOTE__ The update is derived in SymPy, lowered to
   AbstractTensor Python, and compiled to WGSL by the repository's own
   WebGPU backend — at <b>Precision[2, float32]</b>, two 24-bit limbs,
   because WGSL has no f64 and two limbs carry more significand than the
@@ -446,19 +583,32 @@ _PAGE = r"""<!doctype html>
   appears, so WGSL's permission to double-round <code>fma()</code> never
   applies.
 </div>
+</main>
 <script type="module">
 const MANIFEST = __MANIFEST__;
 const KERNEL_WGSL = __KERNEL_WGSL__;
 const GATHER_WGSL = __GATHER_WGSL__;
 const PRESENT_WGSL = __PRESENT_WGSL__;
+const TILE_WGSL = __TILE_WGSL__;
+const PERTURB_WGSL = __PERTURB_WGSL__;
 
 const status = document.getElementById("status");
 const health = document.getElementById("health");
+const pointerStatus = document.getElementById("pointer");
+const stamp = document.getElementById("stamp");
+stamp.textContent = "build " + MANIFEST.build;
 const canvas = document.getElementById("view");
+let failed = false;
 
-function fail(message) {
+function showFailure(message) {
+  failed = true;
   status.textContent = message;
   status.style.color = "#ff9d9d";
+  console.error(message);
+}
+
+function fail(message) {
+  showFailure(message);
   throw new Error(message);
 }
 
@@ -488,13 +638,15 @@ async function main() {
   // pressure on a device several pages may be sharing.
   const device = await adapter.requestDevice();
   window.__gpu = { adapter, device };
+  device.lost.then(info => showFailure(
+    "WebGPU device lost: " + (info.message || info.reason || "unknown")));
   device.addEventListener?.("uncapturederror", (e) =>
-    fail("WebGPU error: " + e.error.message));
+    showFailure("WebGPU error: " + e.error.message));
   // Nothing here may fail quietly. A rejection with no handler used to
   // stop the loop and leave a cleared canvas looking like a finished
   // render.
   window.addEventListener("unhandledrejection", (e) =>
-    fail("unhandled: " + String(e.reason && e.reason.message || e.reason)));
+    showFailure("unhandled: " + String(e.reason && e.reason.message || e.reason)));
 
   const { wide, high, limbs } = MANIFEST;
   const count = wide * high;
@@ -602,17 +754,102 @@ async function main() {
   }
   const gatherModule = device.createShaderModule({ code: GATHER_WGSL });
   const presentModule = device.createShaderModule({ code: PRESENT_WGSL });
+  const tileModule = device.createShaderModule({ code: TILE_WGSL });
+  const perturbModule = device.createShaderModule({ code: PERTURB_WGSL });
+
+  async function requireValidShader(label, module) {
+    const report = await module.getCompilationInfo();
+    const errors = report.messages.filter(message => message.type === "error");
+    if (!errors.length) return;
+    const first = errors[0];
+    fail(`${label} WGSL: ${first.message} (line ${first.lineNum})`);
+  }
+  await requireValidShader("gather", gatherModule);
+  await requireValidShader("present", presentModule);
+  await requireValidShader("tile", tileModule);
+  await requireValidShader("perturb", perturbModule);
 
   const kernelPipeline = device.createComputePipeline({
     layout: "auto", compute: { module: kernelModule, entryPoint: "main" } });
   const gatherPipeline = device.createComputePipeline({
     layout: "auto", compute: { module: gatherModule, entryPoint: "main" } });
+  const perturbPipeline = device.createComputePipeline({
+    layout: "auto", compute: { module: perturbModule, entryPoint: "main" } });
   const presentPipeline = device.createRenderPipeline({
     layout: "auto",
     vertex: { module: presentModule, entryPoint: "vs" },
     fragment: { module: presentModule, entryPoint: "fs",
                 targets: [{ format }] },
     primitive: { topology: "triangle-list" },
+  });
+  const tilePipeline = device.createRenderPipeline({
+    layout: "auto",
+    vertex: { module: tileModule, entryPoint: "vs" },
+    fragment: { module: tileModule, entryPoint: "fs",
+                targets: [{ format }] },
+    primitive: { topology: "triangle-list" },
+  });
+
+  // The simulation publishes one logical image at its own draw rate. That
+  // image stays on the GPU and is sampled repeatedly across the page in the
+  // same command buffer, so every tile is the exact same system step.
+  const fieldTexture = device.createTexture({
+    size: [wide, high], format,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+  });
+  const fieldView = fieldTexture.createView();
+  const fieldSampler = device.createSampler({
+    addressModeU: "repeat", addressModeV: "repeat",
+    magFilter: "nearest", minFilter: "nearest",
+  });
+  const viewUniform = device.createBuffer({
+    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const interactionUniform = device.createBuffer({
+    size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const tileCssPixels = 256;
+  const pointer = { inside: false, pressed: false, x: 0, y: 0 };
+
+  function reportPointer(event, forceInside = null) {
+    const rect = canvas.getBoundingClientRect();
+    const localX = event.clientX - rect.left;
+    const localY = event.clientY - rect.top;
+    const tileX = ((localX % tileCssPixels) + tileCssPixels) % tileCssPixels;
+    const tileY = ((localY % tileCssPixels) + tileCssPixels) % tileCssPixels;
+    pointer.x = tileX / tileCssPixels * wide;
+    pointer.y = tileY / tileCssPixels * high;
+    pointer.inside = forceInside ?? (localX >= 0 && localY >= 0 &&
+      localX < rect.width && localY < rect.height);
+    window.__pointer = {
+      page: { x: localX, y: localY },
+      field: { x: pointer.x, y: pointer.y },
+      pressed: pointer.pressed,
+    };
+    window.dispatchEvent(new CustomEvent("turing-pointer", {
+      detail: window.__pointer,
+    }));
+    pointerStatus.textContent =
+      `page ${localX.toFixed(0)}, ${localY.toFixed(0)} → field ` +
+      `${pointer.x.toFixed(1)}, ${pointer.y.toFixed(1)} · ` +
+      (pointer.pressed ? "dimple" : "hill");
+  }
+  canvas.addEventListener("pointermove", reportPointer);
+  canvas.addEventListener("pointerenter", reportPointer);
+  canvas.addEventListener("pointerdown", event => {
+    pointer.pressed = true;
+    canvas.setPointerCapture(event.pointerId);
+    reportPointer(event);
+  });
+  const releasePointer = event => {
+    pointer.pressed = false;
+    reportPointer(event);
+    if (canvas.hasPointerCapture(event.pointerId)) {
+      canvas.releasePointerCapture(event.pointerId);
+    }
+  };
+  canvas.addEventListener("pointerup", releasePointer);
+  canvas.addEventListener("pointercancel", releasePointer);
+  canvas.addEventListener("pointerleave", event => {
+    reportPointer(event, false);
   });
 
   // One feed span in, one buffer per published limb out.
@@ -684,9 +921,44 @@ async function main() {
   // stops, nothing is reported, and the last cleared frame stays on
   // screen. A silent stop is the one failure this page must not have.
   function frame() {
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    const displayWidth = Math.max(1, Math.round(canvas.clientWidth * ratio));
+    const displayHeight = Math.max(1, Math.round(canvas.clientHeight * ratio));
+    if (canvas.width !== displayWidth || canvas.height !== displayHeight) {
+      canvas.width = displayWidth;
+      canvas.height = displayHeight;
+    }
+    device.queue.writeBuffer(viewUniform, 0, new Float32Array([
+      canvas.clientWidth, canvas.clientHeight, tileCssPixels, 0,
+    ]));
+    const interaction = new ArrayBuffer(32);
+    const interactionFloats = new Float32Array(interaction);
+    const interactionWords = new Uint32Array(interaction);
+    interactionFloats.set([
+      pointer.x, pointer.y, 5.5, pointer.pressed ? -0.035 : 0.035,
+    ]);
+    interactionWords[4] = pointer.inside ? 1 : 0;
+    device.queue.writeBuffer(interactionUniform, 0, interaction);
+
     const encoder = device.createCommandEncoder();
 
-    // 1. neighbours off the torus (data movement)
+    // 1. A shell-owned intervention changes the real field. Page coordinates
+    // are already folded back through the repeated texture period.
+    const perturb = encoder.beginComputePass();
+    perturb.setPipeline(perturbPipeline);
+    perturb.setBindGroup(0, device.createBindGroup({
+      layout: perturbPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: shape } },
+        { binding: 1, resource: { buffer: feeds } },
+        { binding: 2, resource: { buffer: offsets } },
+        { binding: 3, resource: { buffer: interactionUniform } },
+      ],
+    }));
+    perturb.dispatchWorkgroups(Math.ceil(count / 64));
+    perturb.end();
+
+    // 2. neighbours off the torus (data movement)
     const gather = encoder.beginComputePass();
     gather.setPipeline(gatherPipeline);
     gather.setBindGroup(0, device.createBindGroup({
@@ -700,17 +972,17 @@ async function main() {
     gather.dispatchWorkgroups(Math.ceil(count / 64));
     gather.end();
 
-    // 2. the compiled advance (the mathematics)
+    // 3. the compiled advance (the mathematics)
     const advance = encoder.beginComputePass();
     advance.setPipeline(kernelPipeline);
     advance.setBindGroup(0, device.createBindGroup({
       layout: kernelPipeline.getBindGroupLayout(0),
       entries: kernelEntries,
     }));
-    advance.dispatchWorkgroups(Math.ceil(count / 256));
+    advance.dispatchWorkgroups(Math.ceil(count / MANIFEST.workgroupSize));
     advance.end();
 
-    // 3. the advanced phase becomes the field, limb by limb
+    // 4. the advanced phase becomes the field, limb by limb
     // Each published value goes to the field and limb the manifest
     // names. Two-equation programs advance two fields, and every limb of
     // each is published, so nothing collapses on the way back in.
@@ -720,7 +992,26 @@ async function main() {
         stateSlots[where.field][where.limb] * 4, count * 4);
     });
 
-    // 4. paint it
+    // 5. Pull one texture from current system state.
+    const publish = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: fieldView, loadOp: "clear", storeOp: "store",
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+    publish.setPipeline(presentPipeline);
+    publish.setBindGroup(0, device.createBindGroup({
+      layout: presentPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: shape } },
+        { binding: 1, resource: { buffer: feeds } },
+        { binding: 2, resource: { buffer: offsets } },
+      ],
+    }));
+    publish.draw(6);
+    publish.end();
+
+    // 6. Tile that exact texture across the page in the same submission.
     const paint = encoder.beginRenderPass({
       colorAttachments: [{
         view: context.getCurrentTexture().createView(),
@@ -728,13 +1019,13 @@ async function main() {
         clearValue: { r: 0, g: 0, b: 0, a: 1 },
       }],
     });
-    paint.setPipeline(presentPipeline);
+    paint.setPipeline(tilePipeline);
     paint.setBindGroup(0, device.createBindGroup({
-      layout: presentPipeline.getBindGroupLayout(0),
+      layout: tilePipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: shape } },
-        { binding: 1, resource: { buffer: feeds } },
-        { binding: 2, resource: { buffer: offsets } },
+        { binding: 0, resource: fieldSampler },
+        { binding: 1, resource: fieldView },
+        { binding: 2, resource: { buffer: viewUniform } },
       ],
     }));
     paint.draw(6);
@@ -751,14 +1042,26 @@ async function main() {
       // Say what the FIELD contains, not just that frames happened. A
       // page that reports progress while its numbers are NaN is how two
       // separate failures here looked exactly like success.
-      window.__field().then((f) => {
-        if (!f) return;
-        health.textContent = f.nan
-          ? `field: ${f.nan} of ${count} cells are NaN`
-          : `field: [${f.lo.toFixed(2)}, ${f.hi.toFixed(2)}] · ` +
-            `low limb live in ${f.lowNonzero}/${count} · ` +
-            `coherence ${f.coherence.toFixed(4)}`;
-      }).catch((e) => { health.textContent = "field: " + String(e).slice(0, 80); });
+      if (MANIFEST.programName === "kicked-rotor") {
+        // This kernel is large enough that a periodic CPU map can become the
+        // pacing bottleneck. Its angle and momentum remain GPU-resident; the
+        // texture is the observation path and explicit __field() remains
+        // available when a diagnostic readback is actually requested.
+        health.textContent =
+          "field: GPU-resident angle + momentum · interactive phase forcing";
+      } else {
+        window.__field().then((f) => {
+          if (!f) return;
+          stamp.textContent = "build " + MANIFEST.build;
+          health.textContent = f.nan
+            ? `field: ${f.nan} of ${count} cells are NaN`
+            : `field: [${f.lo.toFixed(2)}, ${f.hi.toFixed(2)}] · ` +
+              `low limb live in ${f.lowNonzero}/${count} · ` +
+              `coherence ${f.coherence.toFixed(4)}`;
+        }).catch((e) => {
+          health.textContent = "field: " + String(e).slice(0, 80);
+        });
+      }
       status.textContent =
         `${wide}x${high} = ${count.toLocaleString()} cells · step ` +
         `${step.toLocaleString()} · ${fps.toFixed(0)} fps · ` +
@@ -766,7 +1069,15 @@ async function main() {
         `${MANIFEST.limbs} f32 limbs, ${MANIFEST.terms} terms`;
       last = now; frames = 0;
     }
-    schedule();
+    // A program step is a transaction: do not enqueue the next one until
+    // every writeback and the corresponding observation frame has finished.
+    // Small kernels can hide an unbounded submission backlog for a long time;
+    // a larger compiled program makes the same harness bug lose the device.
+    // Keep the promise explicit (rather than making frame async) so failures
+    // are latched and reported instead of becoming a rejected animation task.
+    device.queue.onSubmittedWorkDone().then(schedule).catch((error) =>
+      showFailure("WebGPU submission failed: " +
+        String(error && error.message || error)));
   }
   // rAF is SUSPENDED in a hidden tab, so a page driven only by it never
   // starts when nothing is looking at it -- the field would sit forever
@@ -774,6 +1085,7 @@ async function main() {
   // either way, so visibility decides the pacing and never the progress.
   window.__paused = false;
   function schedule() {
+    if (failed) return;
     if (window.__paused) { setTimeout(schedule, 50); return; }
     if (document.hidden) setTimeout(frame, 16);
     else requestAnimationFrame(frame);
@@ -781,7 +1093,7 @@ async function main() {
   schedule();
 }
 
-main().catch((error) => fail(String(error && error.message || error)));
+main().catch((error) => showFailure(String(error && error.message || error)));
 </script>
 </body>
 </html>
@@ -792,6 +1104,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--width", type=int, default=96)
     parser.add_argument("--height", type=int, default=96)
+    parser.add_argument("--local-size", type=int, default=256,
+                        help="preferred WebGPU compute workgroup width")
     parser.add_argument("--limbs", type=int, default=2)
     parser.add_argument("--digits", type=int, default=14)
     parser.add_argument("--coupling", type=float, default=0.8)
@@ -822,7 +1136,8 @@ def main(argv=None) -> int:
     (emitted, flat, entry, sine, cosine, constants, terms, narrowed,
      program) = build(limbs, int(arguments.digits), cells,
                       lag=bool(arguments.lag),
-                      choice=str(arguments.program))
+                      choice=str(arguments.program),
+                      local_size=int(arguments.local_size))
 
     print(f"narrowed {narrowed} values to float32; "
           f"{terms} terms per series", flush=True)
@@ -856,7 +1171,8 @@ def main(argv=None) -> int:
     html = page(emitted.source, plan, width, height, limbs,
                 int(arguments.digits), terms, int(arguments.seed),
                 float(arguments.spread), len(_returned_values(flat[entry])),
-                program, writeback_plan(flat[entry], program, limbs))
+                program, writeback_plan(flat[entry], program, limbs),
+                int(emitted.launch_plan.workgroup_size[0]))
     path = destination / "index.html"
     path.write_text(html, encoding="utf-8", newline="\n")
 
