@@ -1870,6 +1870,11 @@ def emit_wasm_module(
                         {"module": memory_import.module, "field": memory_import.field}
                         if memory_import is not None else None
                     ),
+                    transcendental_error=max(
+                        (float(entry.get("bound") or 0.0)
+                         for entry in (static_data.get("entries") or {}).values()),
+                        default=0.0,
+                    ),
                     input_names=labels,
                     output_names=list(program.outputs.keys()),
                     parameter_dtypes=parameter_dtypes)
@@ -3492,6 +3497,7 @@ def _describe(
     reserved_bytes: int = 0,
     static_data_offset: int = 0,
     shared_memory_import: Mapping[str, str] | None = None,
+    transcendental_error: float = 0.0,
     input_names: Sequence[str] | None = None,
     output_names: Sequence[str] | None = None,
     parameter_dtypes: Mapping[int, str] | None = None,
@@ -3590,6 +3596,13 @@ def _describe(
             "reserved_bytes": int(reserved_bytes),
             "static_data_offset": int(static_data_offset),
             "shared_memory_import": dict(shared_memory_import or {}),
+            # WHAT THIS MODULE'S TRANSCENDENTALS DELIVER. Each baked table
+            # measures the error it actually achieves, and that number was
+            # computed and then discarded -- so a verifier had no way to
+            # know what the emitter promised and checked against a
+            # tolerance the table could never meet. A published module
+            # states its own accuracy.
+            "transcendental_error": float(transcendental_error),
         },
     )
 
