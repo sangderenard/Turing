@@ -132,6 +132,13 @@ def test_native_boundary_is_forwarded_through_shell_external_reference_abi():
     )
     assert len(call.args) == 1
     assert call.res.dtype == "opaque_ref"
+    assert [
+        instruction
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("extraction_identity") == "_pickle.loads"
+    ] == [call]
 
 
 def test_repository_ssa_executes_pickle_through_the_recorded_shell_abi():

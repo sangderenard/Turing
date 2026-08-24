@@ -7341,6 +7341,52 @@ def _class_surface_ssa_program(
             )
         if control is None:
             continue
+        external_call_node_ids = {
+            int(node_id)
+            for node_id, node_data in graph_obj.nodes(data=True)
+            if str((node_data.get("attributes") or {}).get(
+                "extraction_action"
+            ) or (node_data.get("extraction_contract") or {}).get(
+                "action"
+            )) == "use_native"
+        }
+        external_only_region_indices = {
+            int(region_index)
+            for region_index, subgraph in enumerate(
+                getattr(shell, "dispatch_subgraphs", ())
+            )
+            for deployment_nodes in (set(map(
+                int, subgraph.G.graph.get("deployment_nodes", ())
+            )),)
+            if deployment_nodes
+            and deployment_nodes.issubset(external_call_node_ids)
+        }
+        if os.environ.get("TURING_DEBUG_EXTERNAL_REFERENCE"):
+            print(
+                "DEBUG-EXTERNAL-REGIONS "
+                f"function={function_name} calls={sorted(external_call_node_ids)} "
+                f"regions={tuple(tuple(map(int, subgraph.G.graph.get('deployment_nodes', ()))) for subgraph in getattr(shell, 'dispatch_subgraphs', ()))} "
+                f"external_only={sorted(external_only_region_indices)}",
+                file=sys.stderr,
+            )
+        if external_only_region_indices:
+            # Capture historically presented a native-boundary Call as a
+            # numerical op as well (``_pickle.load`` became a tensor ``load``),
+            # so repository SSA contained both a guessed intrinsic and the
+            # real shell capability call. The boundary occurrence owns the
+            # operation. Remove only regions made entirely from those exact
+            # call nodes; a mixed numerical region remains a loud backend
+            # shortfall until it can be split without discarding operands.
+            from .control_source import project_control_regions
+
+            control = project_control_regions(
+                control,
+                tuple(
+                    int(region_index)
+                    for region_index in control.region_indices
+                    if int(region_index) not in external_only_region_indices
+                ),
+            )
         # Some precompile-only shells retain the flat region schedule even
         # though branch compartments were already proven during partitioning.
         # Reapply the backend-neutral ordinary-conditional overlay here before

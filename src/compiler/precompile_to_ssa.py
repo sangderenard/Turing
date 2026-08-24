@@ -7730,6 +7730,12 @@ def lower_control_sections_to_ssa(
             ):
                 continue
             region_index = int(region.name.split("_", 1)[1])
+            if region_index not in set(map(int, control.region_indices)):
+                # Projection removed this region's only lexical marker. This
+                # is how an external-reference occurrence replaces the old
+                # capture-time numerical imitation of the same call; keeping
+                # the detached region would execute both meanings.
+                continue
             if region_index in region_callees:
                 continue
             # Namespace regions by their owning method so two methods that each
