@@ -168,7 +168,7 @@ import types
 from pathlib import Path
 from dataclasses import dataclass, field, replace
 from collections.abc import Iterable
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from ....compiler.glsl_deployment_strategy import (
     ProcessGraphGLSLDeployment,
@@ -508,6 +508,58 @@ def _apply_parameter_constant_map(
     return module
 
 
+def _feed_origins_from_ssa_identity(
+    program: Any,
+    parameters: Sequence[str],
+    already: Mapping[int, Any],
+) -> dict[int, dict[str, str]]:
+    """Recover each feed's source parameter from the SSA identity map.
+
+    Matching source identity ids against a program's feeds only works while
+    the two share a numbering, and a REGION program does not: its feeds are
+    numbered independently, so ``identity_table[name][0]`` (a small source
+    id) is never found among them. Measured on a five-parameter kernel, the
+    parameters carried ids 0-4 while the selected region fed on 30 and 41 --
+    nothing matched, every feed came out as ``feed0``/``feed1``, and every
+    page declaring ``state_feedback`` was refused for having no input by
+    that name. Including pages that had previously published.
+
+    The general lowering already records what each value IS, though. Every
+    feed carries its AST identity in ``ssa_identity_tokens``, so feed 30
+    spells out a ``Subscript`` of ``Name(id='theta')`` -- the name is
+    present, it was simply never consulted. This reads it back.
+
+    The FIRST parameter named in a feed's tokens is the one it derives from,
+    because the tokens follow AST order and the base of an access precedes
+    its index: ``theta[index]`` names ``theta`` before ``index``, and the
+    feed belongs to ``theta``. Feeds already named by id keep those names --
+    an exact match is better evidence than a token scan.
+    """
+
+    tokens = (getattr(program, "extras", None) or {}).get(
+        "ssa_identity_tokens"
+    ) or {}
+    if not tokens:
+        return {}
+    wanted = tuple(parameters)
+    recovered: dict[int, dict[str, str]] = {}
+    for feed_id in map(int, getattr(program, "feeds", ()) or ()):
+        if feed_id in already:
+            continue
+        row = tokens.get(feed_id)
+        if not row:
+            continue
+        for token in row:
+            text = str(token)
+            if not text.startswith("value:"):
+                continue
+            candidate = text[len("value:"):]
+            if candidate in wanted:
+                recovered[feed_id] = {"binding_name": candidate}
+                break
+    return recovered
+
+
 def project_public_numerical_program(compilation: AOTCompilation) -> Any:
     """Project one numeric region through the retained source identity map.
 
@@ -568,6 +620,9 @@ def project_public_numerical_program(compilation: AOTCompilation) -> Any:
         history = tuple(compilation.identity_table.get(name, ()))
         if history and int(history[0]) in program.feeds:
             origins[int(history[0])] = {"binding_name": name}
+    origins.update(_feed_origins_from_ssa_identity(
+        program, compilation.function_parameters, origins,
+    ))
     extras["capture_feed_origins"] = origins
     return FusedProgram(
         version=program.version,
