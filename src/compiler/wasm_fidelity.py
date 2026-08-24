@@ -259,6 +259,28 @@ def verify_wasm_module(
         for position, (output_name, value_id) in enumerate(program.outputs.items()):
             expected = expected_by_id[value_id].ravel(order="C")
             actual = np.asarray(actual_outputs[position], dtype=np_dtype)
+            if actual.size != expected.size:
+                # A COUNT mismatch is a fidelity result, not an accident.
+                # Comparing elementwise anyway made numpy broadcast the
+                # finite mask to the larger operand and index the smaller
+                # one with it, so the checker raised IndexError on exactly
+                # the disagreement it exists to report -- and the caller
+                # saw a crash from deep inside numpy instead of "this
+                # module returned one value where four were expected".
+                case_passed = False
+                outputs.append({
+                    "name": output_name,
+                    "value_id": int(value_id),
+                    "length": int(actual.size),
+                    "expected_length": int(expected.size),
+                    "passed": False,
+                    "absolute_error": None,
+                    "detail": (
+                        f"produced {actual.size} value(s) where "
+                        f"{expected.size} were expected"
+                    ),
+                })
+                continue
             passed = bool(np.allclose(
                 actual, expected, rtol=rtol, atol=atol, equal_nan=True
             ))
