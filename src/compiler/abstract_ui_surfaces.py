@@ -158,10 +158,101 @@ def sampled_mud_oval_height_field(
     }
 
 
+def _smoothstep(value: float) -> float:
+    clamped = min(1.0, max(0.0, value))
+    return clamped * clamped * (3.0 - 2.0 * clamped)
+
+
+def sampled_hoop_height_field(
+    identity: str,
+    parent: str,
+    *,
+    center_x: float,
+    center_z: float,
+    half_x: float,
+    half_z: float,
+    door_x: float | None = None,
+    door_z: float | None = None,
+    door_clear_radius: float = 9.0,
+    inner_radius: float = 0.50,
+    outer_radius: float = 0.86,
+    band_softness: float = 0.10,
+    baseline_height: float = 0.12,
+    amplitude: float = 0.42,
+    columns: int = 97,
+    rows: int = 97,
+    palette_role: str = "artifact-scratch",
+) -> dict[str, Any]:
+    """Bake a ring of crawler terrain around the wall of a courtyard.
+
+    The plaza in the middle and the ground within reach of a doorway stay flat
+    -- open space for driving -- while a band near the wall carries real
+    bumps.  Unlike ``sampled_mud_oval_height_field``, whose landscape fills
+    the whole interior and cuts a single smooth lane through it, this leaves
+    the interior clear and puts the terrain only where a wall-hugging loop
+    would cross it.
+    """
+
+    if min(half_x, half_z) <= 0 or columns < 3 or rows < 3:
+        raise ValueError("a sampled hoop needs positive extents and at least a 3x3 grid")
+    if not 0 <= inner_radius < outer_radius <= 1:
+        raise ValueError("the hoop band must sit strictly between the plaza and the wall")
+    minimum_x, minimum_z = center_x - half_x, center_z - half_z
+    cell_x, cell_z = 2 * half_x / (columns - 1), 2 * half_z / (rows - 1)
+    ellipse_x, ellipse_z = half_x * .94, half_z * .94
+    door_soften = max(1.0, door_clear_radius * .35)
+    heights: list[float] = []
+    for row in range(rows):
+        z = minimum_z + row * cell_z
+        for column in range(columns):
+            x = minimum_x + column * cell_x
+            dx, dz = (x - center_x) / ellipse_x, (z - center_z) / ellipse_z
+            radius = math.hypot(dx, dz)
+            local_x, local_z = x - center_x, z - center_z
+            inner_edge = _smoothstep((radius - inner_radius) / band_softness)
+            outer_edge = 1.0 - _smoothstep((radius - outer_radius) / band_softness)
+            band = max(0.0, min(inner_edge, outer_edge))
+            if door_x is not None and door_z is not None:
+                door_distance = math.hypot(x - door_x, z - door_z)
+                band *= _smoothstep((door_distance - door_clear_radius) / door_soften)
+            broad_hills = (.31 * math.sin(local_x * .21)
+                           + .26 * math.cos(local_z * .19)
+                           + .17 * math.sin((local_x - local_z) * .27)
+                           + .11 * math.cos((local_x + 1.6 * local_z) * .37))
+            whoops = .12 * abs(math.sin(local_x * .58) * math.cos(local_z * .64))
+            height = baseline_height + amplitude * band * (0.55 + broad_hills + whoops)
+            heights.append(round(max(.02, height), 6))
+    minimum_height, maximum_height = min(heights), max(heights)
+    return {
+        "identity": identity, "kind": "static-sampled-terrain", "label": "Hoop crawler ring",
+        "parent_identity": parent, "center": [center_x, center_z],
+        "half_extent": [half_x, half_z], "height": maximum_height,
+        "floor_height": minimum_height, "wall_thickness": .04,
+        "palette_role": palette_role, "wall_palette_role": palette_role,
+        "geometry_mode": "sampled-height-field-prism", "openings": [],
+        "placement": {"custody": "placed", "elevation": 0.0, "yaw_degrees": 0.0},
+        "physics": {"body": "static", "collider": "solid-contact-surface", "enabled": True,
+                    "contact_mode": "normal-constraint-with-coulomb-friction"},
+        "surface": {
+            "schema": ABSTRACT_UI_SURFACE_VERSION, "kind": "sampled-height-field",
+            "resolution": [columns, rows], "heights": heights,
+            "middle_height": baseline_height,
+            "origin": [minimum_x, 0.0, minimum_z], "cell_size": [cell_x, cell_z],
+            "domain": {"minimum_x": minimum_x, "maximum_x": center_x + half_x,
+                       "minimum_z": minimum_z, "maximum_z": center_z + half_z},
+            "interpolation": "piecewise-planar-two-triangles-per-cell",
+            "gradient": "triangle-plane-gradient", "one_sided": True,
+            "features": {"landscape": "procedural-crawler-hoop",
+                         "course": "clear-plaza-ring-band", "authority": "outer-yard-depth-map"},
+        },
+    }
+
+
 # Compatibility name for callers that still describe the wedge-shaped mesh by
 # its appearance. It has no ramp-specific physics semantics.
 linear_ramp_box = linear_gradient_solid
 
 
 __all__ = ["ABSTRACT_UI_SURFACE_VERSION", "linear_gradient_solid", "linear_ramp_box",
-           "sampled_mud_oval_height_field", "support_surface_model"]
+           "sampled_mud_oval_height_field", "sampled_hoop_height_field",
+           "support_surface_model"]

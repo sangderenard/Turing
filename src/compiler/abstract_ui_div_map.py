@@ -56,7 +56,8 @@ from .abstract_ui_software_mesh import (
 )
 from .abstract_ui_scene_mesh import SCENE_MESH_SOURCE, compile_scene_mesh_wasm
 from .abstract_ui_tools import EntityInventory, Hotbar, InventoryItem, depth_map_tool, form_tool
-from .abstract_ui_surfaces import sampled_mud_oval_height_field, support_surface_model
+from .abstract_ui_surfaces import (sampled_hoop_height_field, sampled_mud_oval_height_field,
+                                    support_surface_model)
 from .abstract_ui_vehicles import (
     vehicle_slot_model,
 )
@@ -470,6 +471,50 @@ def world_div_map_model(
             palette_role=vehicle["configuration"]["presentation"]["terrain_palette_role"],
         ))
         vehicle["offroad_terrain"] = terrain_identity
+        # A second, open field beyond the original courtyard's south gate --
+        # real space to drive in, not another room full of introspected
+        # content.  Terrain lives only in a ring near the field's own walls;
+        # the plaza in the middle and the ground around both doorways stay
+        # clear.  Directly south, sharing the gate's X so the two doors line
+        # up, with a short threshold gap rather than two walls touching.
+        gate = courtyard["openings"][0]
+        gate_world_x = spawn_x + float(gate.get("offset", 0.0))
+        old_south_wall_z = spawn_z - float(courtyard["half_extent"][1])
+        yard_half = 45.0
+        yard_gap = 2.5
+        yard_center_x = gate_world_x
+        yard_center_z = old_south_wall_z - yard_gap - yard_half
+        yard_identity = f"{world.identity}/yard/outer-field"
+        yard_gate_x = yard_center_x
+        yard_gate_z = yard_center_z + yard_half
+        yard_courtyard = {
+            "identity": yard_identity, "kind": "courtyard", "label": "Outer field",
+            "parent_identity": f"{world.identity}/representation:global",
+            "hierarchy_depth": 1,
+            "center": [yard_center_x, yard_center_z],
+            "half_extent": [yard_half, yard_half],
+            "height": 3.2, "floor_height": 0.02,
+            "wall_thickness": 0.20, "radius": 12.0,
+            "palette_role": "courtyard-face", "wall_palette_role": "courtyard-wall",
+            "openings": [{
+                "identity": f"{yard_identity}/opening:gate",
+                "kind": "gate", "side": "north", "offset": 0.0,
+                "width": float(gate.get("width", 1.1)), "height": float(gate.get("height", 0.82)),
+            }],
+            "metaphor": "open driving field",
+        }
+        geometry["boxes"].append(yard_courtyard)
+        yard_terrain_identity = f"{world.identity}/physics/outer-field-hoop-height-field"
+        yard_terrain_half = yard_half * .96
+        yard_terrain_columns = min(129, max(49, int(round(yard_terrain_half * 4)) | 1))
+        geometry["boxes"].append(sampled_hoop_height_field(
+            yard_terrain_identity, yard_identity,
+            center_x=yard_center_x, center_z=yard_center_z,
+            half_x=yard_terrain_half, half_z=yard_terrain_half,
+            door_x=yard_gate_x, door_z=yard_gate_z,
+            columns=yard_terrain_columns, rows=yard_terrain_columns,
+            palette_role=vehicle["configuration"]["presentation"]["terrain_palette_role"],
+        ))
         gun_object = gun_tool(
             f"{world.identity}/tools/physics-ball-gun",
             projectile_system["archetype"]["identity"],

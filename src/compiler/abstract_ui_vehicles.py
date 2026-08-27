@@ -661,7 +661,8 @@ def symbolic_vehicle_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, 
     clutch_torque = transmitted_drive_torque + requested_overrun_torque
     transmission_output_torque = clutch_torque * signed_gear * s["clutch_efficiency"]
     transfer_case_input_torque = transmission_output_torque * s["transfer_case_ratio"]
-    transfer_case_direction = transfer_case_input_torque / _smooth_abs(transfer_case_input_torque)
+    transfer_case_direction = (transfer_case_input_torque
+        / _smooth_abs(transfer_case_input_torque, epsilon="15.0"))
     transfer_case_output_torque = transfer_case_direction * _c2_positive(
         _smooth_abs(transfer_case_input_torque) - s["transfer_case_drag_torque"],
         sympy.Float("0.5"))
@@ -790,7 +791,7 @@ def symbolic_vehicle_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, 
         # Differentiate the filtered state analytically.  A raw one-tick
         # difference aliases radial-probe handoff and terrain tessellation into
         # false ABS/TCS intervention.
-        slip_magnitude_growth = (filtered_slip / _smooth_abs(filtered_slip)
+        slip_magnitude_growth = (filtered_slip / _smooth_abs(filtered_slip, epsilon="0.02")
                                  * slip_sensor_velocity)
         slip_growth = _c2_positive(
             slip_magnitude_growth / s["slip_growth_reference_m_s2"],
@@ -808,7 +809,7 @@ def symbolic_vehicle_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, 
                                             sympy.Float("0.035"))
         brake_scales[wheel] = _c2_clamp(brake_target, s["minimum_torque_fraction"], 1,
                                         sympy.Float("0.035"))
-        smooth_direction = omega / _smooth_abs(omega)
+        smooth_direction = omega / _smooth_abs(omega, epsilon="0.6")
         axle_torque = drive_torque * s[f"drive_fraction_{wheel}"] * traction_scales[wheel]
         lock_torque = (s["differential_lock"] * s["differential_lock_maximum_torque"]
                        * sympy.tanh(s["differential_lock_stiffness"]
@@ -817,7 +818,26 @@ def symbolic_vehicle_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, 
         tire_reaction = s[f"longitudinal_force_{wheel}"] * s["wheel_radius"]
         resisting = smooth_direction * (s["brake_torque"] * s["brake"] * brake_scales[wheel]
                                          + s["rolling_resistance_torque"])
-        raw_omega = omega + dt * (axle_torque + lock_torque - tire_reaction - resisting) / s["wheel_inertia"]
+        # Drive torque crosses a clutch and a gear/transfer-case/final-drive
+        # reduction before it ever reaches this wheel; what resists it on the
+        # way is the engine's rotating inertia reflected through that ratio,
+        # not the wheel's own bare inertia -- exactly as the engine side of
+        # this same clutch already divides by engine_rotating_inertia alone.
+        # Omitting this term let axle_torque, multiplied by a first-gear/
+        # low-range ratio near 64:1, act against a 2.5 kg*m2 wheel: tens of
+        # thousands of Nm over a wheel that small snaps wheel_omega to its
+        # speed cap in a single tick, in whatever sign the torque happened to
+        # have -- which then feeds coupled_crank_speed on the engine side and
+        # is the actual mechanism behind the clutch torque sign flipping
+        # between a sane value and +-30,000 Nm at extreme total ratio.  The
+        # reflected share is split by this wheel's own drive fraction so the
+        # four wheels sum back to exactly one engine's inertia, and it
+        # correctly vanishes with the gear ratio when the clutch is neutral.
+        reflected_ratio = signed_gear * s["transfer_case_ratio"] * s["final_drive_ratio"]
+        reflected_inertia = (s["engine_rotating_inertia"] * reflected_ratio ** 2
+                             * s[f"drive_fraction_{wheel}"])
+        effective_wheel_inertia = s["wheel_inertia"] + reflected_inertia
+        raw_omega = omega + dt * (axle_torque + lock_torque - tire_reaction - resisting) / effective_wheel_inertia
         wheel_omegas[wheel] = (s["maximum_wheel_speed"] * raw_omega
                                / sympy.sqrt(s["maximum_wheel_speed"] ** 2 + raw_omega ** 2))
 
