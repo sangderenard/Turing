@@ -147,6 +147,24 @@ def test_webgpu_candidate_takes_priority_and_canvas2d_is_the_last_resort():
     ]
 
 
+def test_named_rgb_outputs_can_force_wasm_canvas_presentation():
+    descriptor = _shader_execution_descriptor(
+        [{
+            "language": "webgpu",
+            "role": "shader-surface",
+            "available": True,
+            "url": "source/roles/shader-surface/program.compute.wgsl",
+        }],
+        configuration={"channels": ["red", "green", "blue"]},
+        canvas_only=True,
+    )
+
+    assert descriptor["language"] == "canvas2d"
+    assert descriptor["url"] is None
+    assert [item["language"] for item in descriptor["candidates"]] == ["canvas2d"]
+    assert descriptor["configuration"]["channels"] == ["red", "green", "blue"]
+
+
 def test_gallery_refuses_to_publish_into_the_turing_source_repository():
     import pytest
 

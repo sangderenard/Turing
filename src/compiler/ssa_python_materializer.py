@@ -284,7 +284,25 @@ class _BodyMaterializer:
                     f"{self.function.name}: Const %t{int(result.id)} carries "
                     "no 'value' attribute, so there is no literal to emit"
                 )
+            if attributes["value"] is None:
+                raise MaterializationError(
+                    f"{self.function.name}: None must use the explicit "
+                    "NoneValue operation"
+                )
             self.assign(result, _constant(attributes["value"]))
+            return
+
+        if operation in {"NoneValue", "nonevalue"}:
+            if result is None:
+                raise MaterializationError(
+                    f"{self.function.name}: NoneValue has no SSA result"
+                )
+            if instruction.args or attributes:
+                raise MaterializationError(
+                    f"{self.function.name}: NoneValue must carry no operands "
+                    "or attributes"
+                )
+            self.assign(result, "None")
             return
 
         if operation in {"GetAttr", "getattr"}:

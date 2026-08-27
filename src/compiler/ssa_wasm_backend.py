@@ -57,6 +57,7 @@ class SSAWasmArtifact:
 def emit_ssa_function_to_wasm(
     module: IRModule, function_name: str, *, entry_name: str | None = None,
     trig_solver: str = "lut", trig_epsilon: float | None = None,
+    work_contract: str | None = None,
 ) -> SSAWasmArtifact:
     """Emit one scalar SSA function as a WebAssembly module.
 
@@ -67,11 +68,19 @@ def emit_ssa_function_to_wasm(
     Both are available deliberately -- a table costs memory and an interpolation,
     a series costs multiplies, and which is cheaper depends on the target.
     """
-    from .work_contract import active_contract
+    from .work_contract import PRESETS, active_contract
 
     function: Function = module.functions[function_name]
     name = str(entry_name or function_name)
-    contract = active_contract()
+    if work_contract is None:
+        contract = active_contract()
+    else:
+        contract = PRESETS.get(str(work_contract).strip().lower())
+        if contract is None:
+            raise ValueError(
+                f"unknown work contract {work_contract!r}; presets: "
+                f"{sorted(PRESETS)}"
+            )
     input_names = tuple(function.metadata.get("argument_names", ()))
     output_names = tuple(function.metadata.get("output_names", ()))
     if set(function.blocks) != {"entry"}:
@@ -314,6 +323,15 @@ def emit_ssa_function_to_wasm(
                 get(args[0])
                 builder.op("sqrt")
                 wat_operation = f"local.get $t{args[0]} f64.sqrt"
+            elif exponent == -0.5 and contract.inexact_identities:
+                builder.value_const(1.0)
+                get(args[0])
+                builder.op("sqrt")
+                builder.op("div")
+                wat_operation = (
+                    "f64.const 0x1.0000000000000p+0 "
+                    f"local.get $t{args[0]} f64.sqrt f64.div"
+                )
             elif exponent in (0.5, -0.5, -2.0):
                 # These spellings change bits (the sqrt family); scalar WASM
                 # has no pow instruction to fall back on, so exact-only
@@ -564,6 +582,13 @@ def emit_ssa_module_to_wasm_core(
         operation = str(instruction.op)
         if instruction.attributes.get("precision_section"):
             precision_present = True
+        if operation in {"NoneValue", "nonevalue"}:
+            shortfalls.append(WasmEmissionShortfall(
+                operation,
+                "core Wasm has no untyped absence value; lower an optional "
+                "to explicit presence and payload values before emission",
+            ))
+            return
         if operation == "Const":
             held = instruction.attributes.get(
                 "constant", instruction.attributes.get("value")

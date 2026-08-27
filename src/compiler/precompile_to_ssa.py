@@ -793,9 +793,11 @@ class _ControlSSABuilder:
         sequence_initializations: tuple[tuple[int, str, int], ...] = (),
         sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
         sequence_column_dtypes: Mapping[int, tuple[str, ...]] | None = None,
+        sequence_record_identities: Mapping[int, str] | None = None,
         source_sequence_ids: tuple[int, ...] = (),
         sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
         table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
+        lexical_table_lookup_result_ids: tuple[int, ...] = (),
         table_lookup_defaults: dict[int, int | float] | None = None,
         table_stores: tuple[
             tuple[int, int | tuple[int, ...], int, int], ...
@@ -884,7 +886,16 @@ class _ControlSSABuilder:
         self.declared_parameter_only_ids: set[int] = set()
         self.validation_contracts: list[dict[str, object]] = []
         self.table_lookup_defaults = dict(table_lookup_defaults or {})
+        self.lexical_table_lookup_result_ids = frozenset(map(
+            int, lexical_table_lookup_result_ids,
+        ))
         self.sequence_descriptors: dict[int, SSASequenceDescriptor] = {}
+        self.sequence_record_identities = {
+            int(sequence_id): str(identity)
+            for sequence_id, identity in (
+                sequence_record_identities or {}
+            ).items()
+        }
         self.resolved_sequence_schemas: dict[int, ResolvedSequenceSchema] = {
             int(sequence_id): schema
             for sequence_id, schema in (resolved_sequence_schemas or {}).items()
@@ -968,6 +979,11 @@ class _ControlSSABuilder:
         # host-side load.
         self.local_control_values: dict[str, SSAValue] = {}
         self.loop_targets: list[tuple[BasicBlock, BasicBlock]] = []
+        # Each active loop records the carried values visible on every direct
+        # break edge.  A post-loop value is not always the header Phi: a break
+        # can follow a carried update which has not traversed the latch yet.
+        # The exit therefore needs its own edge-aware Phi.
+        self.loop_exit_contexts: list[dict[str, Any]] = []
         self.deployment_records: list[dict[str, Any]] = [
             {
                 "region_id": int(region.region_id),
@@ -1437,6 +1453,8 @@ class _ControlSSABuilder:
             for kind, operation in operations
         }
         for result_id, query_id, sequence_id in table_lookups:
+            if int(result_id) in self.lexical_table_lookup_result_ids:
+                continue
             if ("lookup", (result_id, query_id, sequence_id)) in scheduled_table_operations:
                 continue
             # A whole-program shell graph shows every linked frame's nodes,
@@ -2618,6 +2636,14 @@ class _ControlSSABuilder:
                         "aggregate_index": output_index,
                         "source_output_id": output_id,
                     },
+                    # Control construction can encounter a consumer before
+                    # lexical scheduling emits the region which defines it.
+                    # ``external_value`` provisionally exposes that identity as
+                    # a formal.  This load is its exact planned definition, so
+                    # claim the same SSAValue object and retire the provisional
+                    # formal.  ``produced_value`` still refuses this transition
+                    # for declared in/out storage and versions those writes.
+                    claim_provisional_definition=True,
                 )
         for kind, table_arguments in self.table_region_post_operations.get(
             int(region_index), ()
@@ -2665,6 +2691,53 @@ class _ControlSSABuilder:
         block = BasicBlock(name)
         self.blocks[name] = block
         return block
+
+    def _value_dominates_current_edge(self, value: SSAValue) -> bool:
+        """Whether this exact SSA object is resident on the current edge."""
+
+        if any(argument is value for argument in self.arguments):
+            return True
+        producer_blocks = {
+            name
+            for name, block in self.blocks.items()
+            if any(instruction.res is value for instruction in block.instrs)
+        }
+        if not producer_blocks:
+            return False
+        current_name = self.current.name
+        if current_name in producer_blocks:
+            return True
+        block_names = tuple(self.blocks)
+        entry_name = block_names[0]
+        predecessors = {name: set() for name in block_names}
+        for name, block in self.blocks.items():
+            for successor in block.successors:
+                if successor in predecessors:
+                    predecessors[successor].add(name)
+        dominators = {
+            name: ({name} if name == entry_name else set(block_names))
+            for name in block_names
+        }
+        changed = True
+        while changed:
+            changed = False
+            for name in block_names:
+                if name == entry_name:
+                    continue
+                incoming = predecessors[name]
+                common = (
+                    set.intersection(*(
+                        dominators[parent] for parent in incoming
+                    ))
+                    if incoming else set()
+                )
+                updated = {name} | common
+                if updated != dominators[name]:
+                    dominators[name] = updated
+                    changed = True
+        return len(producer_blocks) == 1 and next(iter(
+            producer_blocks
+        )) in dominators[current_name]
 
     def emit(
         self,
@@ -3290,6 +3363,22 @@ class _ControlSSABuilder:
                 raise ValueError(f"{block.action} appears outside a loop")
             latch, exit_block = self.loop_targets[-1]
             target = exit_block if block.action == "break" else latch
+            if block.action == "break" and self.loop_exit_contexts:
+                context = self.loop_exit_contexts[-1]
+                carried_values = []
+                for updated_id, initial_id, current in context["carried"]:
+                    candidate = self.external_values.get(
+                        int(updated_id),
+                        self.external_values.get(int(initial_id), current),
+                    )
+                    carried_values.append(
+                        candidate
+                        if self._value_dominates_current_edge(candidate)
+                        else current
+                    )
+                context["break_edges"].append((
+                    self.current, tuple(carried_values)
+                ))
             if block.predicate_value_id is None:
                 self.branch(target)
                 self.current.instrs[-1].attributes["source_control"] = (
@@ -3707,6 +3796,17 @@ class _ControlSSABuilder:
         """Lower a lexical query against the sequence's length-cell ABI."""
 
         location = f"{path}.sequence_query[{query.source_call_node_id}]"
+        if query.operation == "lookup":
+            self._emit_table_lookup(
+                int(query.result_value_id),
+                (
+                    int(query.key_value_ids[0])
+                    if len(query.key_value_ids) == 1
+                    else tuple(map(int, query.key_value_ids))
+                ),
+                int(query.sequence_value_id),
+            )
+            return
         descriptor = self._sequence_descriptor(
             int(query.sequence_value_id),
             policy="duplicates",
@@ -4152,16 +4252,31 @@ class _ControlSSABuilder:
         )
 
         call_arguments: tuple[SSAValue, ...]
+        deferred_record_row: tuple[int, str, int] | None = None
         if operation in {"append", "add"}:
             expected_columns = len(destination.column_value_ids)
             if len(mutation.argument_value_ids) != expected_columns:
-                self.shortfalls.append(SSALoweringShortfall(
-                    "ssa-sequence", operation, location,
-                    "row insertion requires one explicit value per resident "
-                    f"column; expected {expected_columns}, received "
-                    f"{len(mutation.argument_value_ids)}",
-                ))
-                return
+                record_identity = self.sequence_record_identities.get(
+                    int(destination.sequence_id)
+                )
+                if (
+                    record_identity is not None
+                    and len(mutation.argument_value_ids) == 1
+                    and expected_columns > 1
+                ):
+                    deferred_record_row = (
+                        int(mutation.argument_value_ids[0]),
+                        str(record_identity),
+                        int(expected_columns),
+                    )
+                else:
+                    self.shortfalls.append(SSALoweringShortfall(
+                        "ssa-sequence", operation, location,
+                        "row insertion requires one explicit value per resident "
+                        f"column; expected {expected_columns}, received "
+                        f"{len(mutation.argument_value_ids)}",
+                    ))
+                    return
             joined_flat_id = self.joined_flat_sequence_ids.get(
                 int(destination.sequence_id)
             )
@@ -4337,11 +4452,12 @@ class _ControlSSABuilder:
                     ),
                 )
             )
-            for mutation_value, element_dtype in zip(
-                mutation_values, destination.column_dtypes
-            ):
-                if str(element_dtype) not in {"", "unknown", "None"}:
-                    mutation_value.dtype = str(element_dtype)
+            if deferred_record_row is None:
+                for mutation_value, element_dtype in zip(
+                    mutation_values, destination.column_dtypes
+                ):
+                    if str(element_dtype) not in {"", "unknown", "None"}:
+                        mutation_value.dtype = str(element_dtype)
             call_arguments = (
                 *self.sequence_storage_values[destination.sequence_id],
                 *mutation_values,
@@ -4448,6 +4564,9 @@ class _ControlSSABuilder:
                 "ssa_sequence_operation": operation,
                 "sequence_id": int(destination.sequence_id),
                 "source_effect_node_id": int(mutation.effect_node_id),
+                **({
+                    "ssa_deferred_record_row": deferred_record_row,
+                } if deferred_record_row is not None else {}),
                 **({
                     "extraction_identity": str(mutation.extraction_identity),
                 } if mutation.extraction_identity is not None else {}),
@@ -4724,6 +4843,84 @@ class _ControlSSABuilder:
             resident = self.external_value(int(initial_id))
             self.external_values[int(merged_id)] = resident
 
+    def _publish_loop_result_ports(
+        self,
+        loop: LoopBlock | WhileBlock,
+        *,
+        header: BasicBlock,
+        exit_block: BasicBlock,
+        carried: list[tuple[int, int, SSAValue, SSAValue, SSAValue]],
+        break_edges: tuple[tuple[BasicBlock, tuple[SSAValue, ...]], ...],
+    ) -> None:
+        """Define authored LoopResult ids with edge-correct exit Phis."""
+
+        carried_by_updated = {
+            int(updated_id): (index, current)
+            for index, (updated_id, _initial_id, _initial, _updated, current)
+            in enumerate(carried)
+        }
+        carried_ports = getattr(self, "_carried_port_groups", None)
+        if carried_ports is None:
+            carried_ports = {}
+            self._carried_port_groups = carried_ports
+        port_values = getattr(self, "_carried_port_values", None)
+        if port_values is None:
+            port_values = {}
+            self._carried_port_values = port_values
+
+        self.current = exit_block
+        for port_id, initial_id, updated_id in getattr(
+            loop, "result_ports", ()
+        ):
+            carried_entry = carried_by_updated.get(int(updated_id))
+            if carried_entry is None:
+                continue
+            carried_index, normal_value = carried_entry
+            incoming_blocks = [header.name]
+            incoming_values = [normal_value]
+            for predecessor, edge_values in break_edges:
+                incoming_blocks.append(predecessor.name)
+                incoming_values.append(edge_values[carried_index])
+
+            # A post-loop call may have exposed this authored identity as a
+            # provisional formal while structural blocks were assembled.  Use
+            # that exact SSAValue as the definition so already-built operands
+            # become resident, then retire its provisional ABI role.
+            port = self.produced_value(
+                int(port_id),
+                dtype=str(normal_value.dtype or "unknown"),
+                claim_provisional_definition=True,
+            )
+            self.emit(
+                Handler.Phi,
+                incoming_values,
+                port,
+                attributes={
+                    "incoming_blocks": tuple(incoming_blocks),
+                    "binding": "loop_result_port",
+                    "initial_value_id": int(initial_id),
+                    "updated_value_id": int(updated_id),
+                },
+            )
+            group = carried_ports.setdefault(
+                (int(initial_id), int(updated_id)), set()
+            )
+            group.add(int(port_id))
+            port.accounting["carried_port_ids"] = tuple(dict.fromkeys((
+                *(port.accounting.get("carried_port_ids") or ()),
+                *sorted(int(item) for item in group),
+            )))
+            # Nested loops can expose successive LoopResult spellings for
+            # the same carried binding.  Once the enclosing loop exits, every
+            # spelling in that equivalence class denotes the enclosing exit
+            # value.  Rebind the lookup table (without rewriting operands
+            # already emitted inside the loop) so post-loop expressions that
+            # retained an inner port id cannot bypass the outer zero-trip
+            # path and consume a non-dominating inner Phi.
+            for equivalent_port_id in group:
+                self.external_values[int(equivalent_port_id)] = port
+                port_values[int(equivalent_port_id)] = port
+
     def lower_loop(self, loop: LoopBlock, *, path: str) -> None:
         recursion_region_id = loop.recursion_region_id
         deployment_id = None
@@ -4880,6 +5077,15 @@ class _ControlSSABuilder:
 
         self.current = body
         self.loop_targets.append((latch, exit_block))
+        exit_context = {
+            "carried": tuple(
+                (updated_id, initial_id, current)
+                for updated_id, initial_id, _initial, _updated, current
+                in carried
+            ),
+            "break_edges": [],
+        }
+        self.loop_exit_contexts.append(exit_context)
         if deployment_id is not None:
             # Lane zero is the SSA template for every independent iteration;
             # the iteration space above tells a deployment pass how to fan it
@@ -5199,6 +5405,7 @@ class _ControlSSABuilder:
             for terminal in loop.terminal_controls:
                 self.lower(terminal, path=f"{path}.terminal")
         finally:
+            self.loop_exit_contexts.pop()
             self.loop_targets.pop()
         body_blocks = [
             candidate
@@ -5247,48 +5454,6 @@ class _ControlSSABuilder:
                         )),
                     )
                 )
-        # After the loop, each carried NAME means its LoopResult port, and
-        # every post-loop consumer was rewired to that port id.  Define the
-        # port as the carried Phi's exit value; left undefined it
-        # materialized as a producerless argument and every reduction after
-        # the loop read its own seed.
-        #
-        # Nesting: continuation consumers hold the INNERMOST loop's port ids
-        # (materialization rewires inner-first), but only the OUTERMOST phi
-        # dominates the outer exit.  Each loop therefore rebinds every port
-        # already seen for the same (initial, updated) carried identity, so
-        # after the outermost lowering all aliases of one reduction name the
-        # phi that is actually in scope where they are read.
-        carried_ports = getattr(self, "_carried_port_groups", None)
-        if carried_ports is None:
-            carried_ports = {}
-            self._carried_port_groups = carried_ports
-        for port_id, initial_id, updated_id in getattr(
-            loop, "result_ports", ()
-        ):
-            phi = carried_phis.get(int(updated_id))
-            if phi is None or phi.res is None:
-                continue
-            group = carried_ports.setdefault(
-                (int(initial_id), int(updated_id)), set()
-            )
-            group.add(int(port_id))
-            port_values = getattr(self, "_carried_port_values", None)
-            if port_values is None:
-                port_values = {}
-                self._carried_port_values = port_values
-            for grouped_port in group:
-                self.external_values[int(grouped_port)] = phi.res
-                port_values[int(grouped_port)] = phi.res
-            # The record-return expansion selects Ret components by RAW
-            # layout id.  A port-resolved phi carries its own result id, so
-            # the component silently dropped and the public return read the
-            # port's unwritten field cell.  Name every port this phi stands
-            # for on the value itself, so id-keyed selection can follow it.
-            phi.res.accounting["carried_port_ids"] = tuple(dict.fromkeys((
-                *(phi.res.accounting.get("carried_port_ids") or ()),
-                *sorted(int(item) for item in group),
-            )))
         for source_id, collection_id, induction_name, start in (
             self.program.collection_bindings
         ):
@@ -5367,11 +5532,15 @@ class _ControlSSABuilder:
         else:
             self.local_control_values[loop.induction] = previous_induction
         for updated_id, initial_id, _initial, _updated, current in carried:
-            # On the exit edge the header Phi is the final carried value and
-            # dominates every post-loop consumer, including a zero-trip loop.
             self.external_values[initial_id] = current
             self.external_values[updated_id] = current
-        self.current = exit_block
+        self._publish_loop_result_ports(
+            loop,
+            header=header,
+            exit_block=exit_block,
+            carried=carried,
+            break_edges=tuple(exit_context["break_edges"]),
+        )
         if deployment_id is not None:
             self.emit_deployment_boundary(Handler.Join, record)
 
@@ -5459,6 +5628,15 @@ class _ControlSSABuilder:
 
         self.current = body
         self.loop_targets.append((latch, exit_block))
+        exit_context = {
+            "carried": tuple(
+                (updated_id, initial_id, current)
+                for updated_id, initial_id, _initial, _updated, current
+                in carried
+            ),
+            "break_edges": [],
+        }
+        self.loop_exit_contexts.append(exit_context)
         try:
             self.lower(loop.body, path=f"{path}.body")
             for mutation in loop.sequence_mutations:
@@ -5466,6 +5644,7 @@ class _ControlSSABuilder:
             for terminal in loop.terminal_controls:
                 self.lower(terminal, path=f"{path}.terminal")
         finally:
+            self.loop_exit_contexts.pop()
             self.loop_targets.pop()
         if not self.current.successors:
             self.branch(latch)
@@ -5536,7 +5715,13 @@ class _ControlSSABuilder:
             self.external_values[initial_id] = current
             self.external_values[updated_id] = current
         self.external_values[int(loop.predicate_value_id)] = current_predicate
-        self.current = exit_block
+        self._publish_loop_result_ports(
+            loop,
+            header=header,
+            exit_block=exit_block,
+            carried=carried,
+            break_edges=tuple(exit_context["break_edges"]),
+        )
 
     def lower_state_machine(
         self,
@@ -5835,10 +6020,144 @@ class _ControlSSABuilder:
                     ),
                 },
         )
+        loop_result_rebindings = (
+            _canonicalize_non_dominating_loop_result_uses(function)
+        )
+        if loop_result_rebindings:
+            function.metadata["loop_result_use_rebindings"] = (
+                loop_result_rebindings
+            )
         if self.evolution is not None and self.ssa_evolution is not None:
             self.evolution.bind_artifact(function, self.ssa_evolution)
             self.evolution.close_graph(self.ssa_evolution)
         return function, tuple(self.shortfalls)
+
+
+def _canonicalize_non_dominating_loop_result_uses(
+    function: Function,
+) -> tuple[tuple[str, int, int, int, int], ...]:
+    """Resolve stale nested LoopResult operands only when CFG proves it.
+
+    Control construction can retain the inner spelling of a carried result in
+    an expression that is finally placed after an enclosing loop.  The inner
+    Phi does not dominate the enclosing loop's zero-trip exit; the enclosing
+    result Phi does.  ``carried_port_values`` records the exact lexical result
+    equivalence.  This pass changes an operand only when the old object fails
+    dominance and the recorded replacement object satisfies it, so it is not
+    a blanket value-id/SSA-version substitution.
+    """
+
+    port_values = dict(
+        function.metadata.get("carried_port_values") or {}
+    )
+    if not port_values or not function.blocks:
+        return ()
+
+    block_names = tuple(function.blocks)
+    entry = block_names[0]
+    predecessors = {name: set() for name in block_names}
+    for name, block in function.blocks.items():
+        for successor in block.successors:
+            if successor in predecessors:
+                predecessors[successor].add(name)
+
+    reachable = {entry}
+    pending = [entry]
+    while pending:
+        name = pending.pop()
+        for successor in function.blocks[name].successors:
+            if successor in function.blocks and successor not in reachable:
+                reachable.add(successor)
+                pending.append(successor)
+
+    dominators = {
+        name: ({name} if name == entry else set(reachable))
+        for name in reachable
+    }
+    changed = True
+    while changed:
+        changed = False
+        for name in block_names:
+            if name == entry or name not in reachable:
+                continue
+            incoming = predecessors[name] & reachable
+            parent_dominators = (
+                set.intersection(*(dominators[parent] for parent in incoming))
+                if incoming else set()
+            )
+            updated = {name} | parent_dominators
+            if updated != dominators[name]:
+                dominators[name] = updated
+                changed = True
+
+    argument_ids = {int(value.id) for value in function.args}
+    definition_sites: dict[int, list[tuple[str, int]]] = {}
+    for block_name, block in function.blocks.items():
+        for instruction_index, instruction in enumerate(block.instrs):
+            if instruction.res is not None:
+                definition_sites.setdefault(
+                    int(instruction.res.id), []
+                ).append((block_name, instruction_index))
+
+    def dominates(
+        value: SSAValue,
+        use_block: str,
+        use_index: int,
+        incoming_block: str | None,
+    ) -> bool:
+        value_id = int(value.id)
+        if value_id in argument_ids:
+            return True
+        sites = definition_sites.get(value_id, ())
+        # Multiple producers for one numeric identity are not valid SSA and
+        # cannot be made safe by guessing which Python SSAValue object a use
+        # meant.  Leave such a case untouched for structural validation.
+        if len(sites) != 1:
+            return False
+        definition_block, definition_index = sites[0]
+        target_block = incoming_block or use_block
+        if target_block not in reachable:
+            return False
+        if definition_block != target_block:
+            return definition_block in dominators[target_block]
+        target_index = (
+            len(function.blocks[target_block].instrs)
+            if incoming_block is not None else use_index
+        )
+        return definition_index < target_index
+
+    receipts = []
+    for block_name, block in function.blocks.items():
+        for instruction_index, instruction in enumerate(block.instrs):
+            incoming_blocks = (
+                tuple(instruction.attributes.get("incoming_blocks") or ())
+                if str(instruction.op).casefold() == "phi" else ()
+            )
+            resolved_args = list(instruction.args)
+            for argument_index, argument in enumerate(instruction.args):
+                replacement = port_values.get(int(argument.id))
+                if replacement is None or replacement is argument:
+                    continue
+                incoming_block = (
+                    str(incoming_blocks[argument_index])
+                    if argument_index < len(incoming_blocks) else None
+                )
+                if dominates(
+                    argument, block_name, instruction_index, incoming_block
+                ):
+                    continue
+                if not dominates(
+                    replacement, block_name, instruction_index, incoming_block
+                ):
+                    continue
+                resolved_args[argument_index] = replacement
+                receipts.append((
+                    str(block_name), int(instruction_index),
+                    int(argument_index), int(argument.id),
+                    int(replacement.id),
+                ))
+            instruction.args = resolved_args
+    return tuple(receipts)
 
 
 def lower_control_program_to_ssa(
@@ -5863,9 +6182,11 @@ def lower_control_program_to_ssa(
     sequence_initializations: tuple[tuple[int, str, int], ...] = (),
     sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
     sequence_column_dtypes: Mapping[int, tuple[str, ...]] | None = None,
+    sequence_record_identities: Mapping[int, str] | None = None,
     source_sequence_ids: tuple[int, ...] = (),
     sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
     table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
+    lexical_table_lookup_result_ids: tuple[int, ...] = (),
     table_lookup_defaults: dict[int, int | float] | None = None,
     table_stores: tuple[
         tuple[int, int | tuple[int, ...], int, int], ...
@@ -5905,9 +6226,11 @@ def lower_control_program_to_ssa(
         sequence_initializations=sequence_initializations,
         sequence_declarations=sequence_declarations,
         sequence_column_dtypes=sequence_column_dtypes,
+        sequence_record_identities=sequence_record_identities,
         source_sequence_ids=source_sequence_ids,
         sequence_memberships=sequence_memberships,
         table_lookups=table_lookups,
+        lexical_table_lookup_result_ids=lexical_table_lookup_result_ids,
         table_lookup_defaults=table_lookup_defaults,
         table_stores=table_stores,
         table_deletions=table_deletions,
@@ -6900,8 +7223,68 @@ def _schedule_loop_callsites(
                     *map(int, block.result_alias_ids),
                 ))),
             )
-        if isinstance(block, LoopBlock):
-            return ((), tuple(sorted(produced_sequences(block))))
+        if isinstance(block, (LoopBlock, WhileBlock)):
+            # A loop is one scheduling unit, but it is not dependency-free.
+            # Pure regions immediately outside it can define loop-invariant
+            # values consumed anywhere in its body (row-neighbour indices in
+            # the fluid stencil are the minimal example).  Hiding those feeds
+            # lets the stable outer schedule leave their producer after the
+            # loop, creating uses which no definition dominates.
+            consumed: set[int] = set()
+            produced: set[int] = set(produced_sequences(block))
+
+            def collect_surface(candidate: Any) -> None:
+                if isinstance(candidate, StatementBlock):
+                    region_index = scheduled_region(candidate)
+                    signature = (
+                        None if region_index is None
+                        else (region_dependency_signatures or {}).get(
+                            region_index,
+                            region_signatures.get(region_index, ((), ())),
+                        )
+                    )
+                    if signature is not None:
+                        consumed.update(map(int, signature[0]))
+                        produced.update(map(int, signature[1]))
+                    return
+                if isinstance(candidate, SequenceBlock):
+                    for child in candidate.blocks:
+                        collect_surface(child)
+                    return
+                if isinstance(candidate, ConditionalBlock):
+                    if candidate.predicate_value_id is not None:
+                        consumed.add(int(candidate.predicate_value_id))
+                    collect_surface(candidate.body)
+                    if candidate.orelse is not None:
+                        collect_surface(candidate.orelse)
+                    return
+                if isinstance(candidate, (LoopBlock, WhileBlock)):
+                    if isinstance(candidate, WhileBlock):
+                        consumed.add(int(candidate.predicate_value_id))
+                        collect_surface(candidate.condition)
+                    collect_surface(candidate.body)
+                    return
+                signature = dependency_signature(candidate)
+                if signature is not None:
+                    consumed.update(map(int, signature[0]))
+                    produced.update(map(int, signature[1]))
+
+            if isinstance(block, WhileBlock):
+                consumed.add(int(block.predicate_value_id))
+                collect_surface(block.condition)
+            collect_surface(block.body)
+            consumed.update(
+                int(initial_id)
+                for _updated_id, initial_id in block.carried_aliases
+            )
+            produced.update(
+                int(port_id) for port_id, _initial, _updated
+                in block.result_ports
+            )
+            return (
+                tuple(sorted(consumed - produced)),
+                tuple(sorted(produced)),
+            )
         return None
 
     def dependency_order(block: Any) -> Any:
@@ -7021,13 +7404,29 @@ def _materialize_control_constants(
             )
             if (
                 value_id in constant_values
-                and str(instruction.op).casefold() in {"const", "constant"}
+                and str(instruction.op).casefold() in {
+                    "const", "constant", "nonevalue",
+                }
             ):
-                if instruction.attributes.get("value") != constant_values[value_id]:
+                literal = constant_values[value_id]
+                matches = (
+                    str(instruction.op).casefold() == "nonevalue"
+                    and literal is None
+                    and not instruction.attributes
+                ) or (
+                    str(instruction.op).casefold() in {"const", "constant"}
+                    and instruction.attributes.get("value") == literal
+                )
+                if not matches:
                     raise ValueError(
                         "canonical constant identity has conflicting literals: "
                         f"value={value_id}"
                     )
+                if literal is None and str(instruction.op).casefold() != "nonevalue":
+                    instruction.op = "NoneValue"
+                    instruction.attributes = {}
+                    if instruction.res is not None:
+                        instruction.res.dtype = "none"
                 existing.setdefault(value_id, instruction)
                 continue
             retained.append(instruction)
@@ -7040,24 +7439,187 @@ def _materialize_control_constants(
     if not materialized_ids:
         return function
     entry = next(iter(function.blocks.values()))
-    entry.instrs[0:0] = [
-        existing.get(value_id) or Instr(
-            "Const", [],
+    materializations = []
+    for value_id in materialized_ids:
+        resident = existing.get(value_id)
+        if resident is not None:
+            materializations.append(resident)
+            continue
+        literal = constant_values[value_id]
+        is_none = literal is None
+        materializations.append(Instr(
+            "NoneValue" if is_none else "Const", [],
             SSAValue(
                 value_id,
-                dtype=str(value_dtypes.get(value_id) or "float64"),
+                dtype=(
+                    "none" if is_none
+                    else str(value_dtypes.get(value_id) or "float64")
+                ),
                 accounting={"authored_constant": True},
             ),
-            attributes={"value": copy.deepcopy(constant_values[value_id])},
-        )
-        for value_id in materialized_ids
-    ]
+            attributes={} if is_none else {
+                "value": copy.deepcopy(literal)
+            },
+        ))
+    entry.instrs[0:0] = materializations
     materialized = set(materialized_ids)
     function.args = [
         argument for argument in function.args
         if int(argument.id) not in materialized
     ]
     return function
+
+
+def _install_loop_owned_table_queries(
+    control: ControlProgram,
+    table_lookups: Iterable[tuple[int, int | tuple[int, ...], int]],
+    loop_owners: Mapping[int, int],
+    *,
+    excluded_result_ids: Iterable[int] = (),
+    globally_mutated_sequence_ids: Iterable[int] = (),
+) -> tuple[ControlProgram, tuple[int, ...], tuple[tuple[int, str], ...]]:
+    """Place keyed reads only under their exact retained source loop.
+
+    The graph identifies both the lookup's key value and the comprehension
+    node which defines that key.  A retained LoopBlock carries that same
+    source node id.  This is sufficient to place a pure read after the loop's
+    projected target load, provided the queried sequence is not mutated in the
+    loop.  Missing/ambiguous owners are left untouched and reported; numeric
+    proximity is never used as a scheduling surrogate.
+    """
+
+    excluded = set(map(int, excluded_result_ids))
+    globally_mutated = set(map(int, globally_mutated_sequence_ids))
+    by_loop: dict[int, list[tuple[int, tuple[int, ...], int]]] = {}
+    for result_id, query_ids, sequence_id in table_lookups:
+        result_id = int(result_id)
+        if result_id in excluded:
+            continue
+        keys = tuple(map(
+            int, query_ids if isinstance(query_ids, tuple) else (query_ids,),
+        ))
+        owners = {
+            int(loop_owners[key]) for key in keys if key in loop_owners
+        }
+        if len(owners) != 1 or any(key not in loop_owners for key in keys):
+            continue
+        owner, = owners
+        by_loop.setdefault(owner, []).append((
+            result_id, keys, int(sequence_id),
+        ))
+
+    installed: list[int] = []
+    refusals: list[tuple[int, str]] = []
+
+    def mutated_sequences(block: ControlBlock) -> set[int]:
+        found: set[int] = set()
+        if isinstance(block, SequenceMutationBlock):
+            found.add(int(block.mutation.sequence_value_id))
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                found.update(mutated_sequences(child))
+        elif isinstance(block, ConditionalBlock):
+            found.update(mutated_sequences(block.body))
+            if block.orelse is not None:
+                found.update(mutated_sequences(block.orelse))
+        elif isinstance(block, LoopBlock):
+            found.update(
+                int(item.sequence_value_id) for item in block.sequence_mutations
+            )
+            found.update(mutated_sequences(block.body))
+        elif isinstance(block, WhileBlock):
+            found.update(
+                int(item.sequence_value_id) for item in block.sequence_mutations
+            )
+            found.update(mutated_sequences(block.condition))
+            found.update(mutated_sequences(block.body))
+        elif isinstance(block, CallBlock):
+            found.update(mutated_sequences(block.callee))
+        elif isinstance(block, ParallelDeployment):
+            for lane in block.lanes:
+                found.update(mutated_sequences(lane))
+        elif isinstance(block, StateMachineTick):
+            for _case, body in block.cases:
+                found.update(mutated_sequences(body))
+            if block.default is not None:
+                found.update(mutated_sequences(block.default))
+        return found
+
+    def rewrite(block: ControlBlock) -> ControlBlock:
+        if isinstance(block, SequenceBlock):
+            return replace(block, blocks=tuple(map(rewrite, block.blocks)))
+        if isinstance(block, ConditionalBlock):
+            return replace(
+                block,
+                body=rewrite(block.body),
+                orelse=(
+                    None if block.orelse is None else rewrite(block.orelse)
+                ),
+            )
+        if isinstance(block, LoopBlock):
+            body = rewrite(block.body)
+            owned = tuple(by_loop.get(int(
+                block.source_loop_node_id
+                if block.source_loop_node_id is not None else -1
+            ), ()))
+            if not owned:
+                return replace(block, body=body)
+            mutated = mutated_sequences(body) | {
+                int(item.sequence_value_id) for item in block.sequence_mutations
+            } | globally_mutated
+            queries = []
+            for result_id, keys, sequence_id in owned:
+                if sequence_id in mutated:
+                    refusals.append((
+                        result_id,
+                        f"sequence {sequence_id} is mutable in its owner loop",
+                    ))
+                    continue
+                queries.append(SequenceQueryBlock(
+                    result_value_id=result_id,
+                    sequence_value_id=sequence_id,
+                    operation="lookup",
+                    source_call_node_id=result_id,
+                    producer_loop_node_id=block.source_loop_node_id,
+                    key_value_ids=keys,
+                ))
+                installed.append(result_id)
+            if not queries:
+                return replace(block, body=body)
+            body_blocks = (
+                body.blocks if isinstance(body, SequenceBlock) else (body,)
+            )
+            return replace(
+                block,
+                body=SequenceBlock((*queries, *body_blocks)),
+            )
+        if isinstance(block, WhileBlock):
+            return replace(
+                block,
+                condition=rewrite(block.condition),
+                body=rewrite(block.body),
+            )
+        if isinstance(block, CallBlock):
+            return replace(block, callee=rewrite(block.callee))
+        if isinstance(block, ParallelDeployment):
+            return replace(block, lanes=tuple(map(rewrite, block.lanes)))
+        if isinstance(block, StateMachineTick):
+            return replace(
+                block,
+                cases=tuple(
+                    (case, rewrite(body)) for case, body in block.cases
+                ),
+                default=(
+                    None if block.default is None else rewrite(block.default)
+                ),
+            )
+        return block
+
+    return (
+        replace(control, root=rewrite(control.root)),
+        tuple(dict.fromkeys(installed)),
+        tuple(refusals),
+    )
 
 
 def lower_control_sections_to_ssa(
@@ -7086,9 +7648,11 @@ def lower_control_sections_to_ssa(
     field_aliases: tuple[tuple[int, int], ...] = (),
     sequence_declarations: tuple[tuple[int, str, int, bool], ...] = (),
     sequence_column_dtypes: Mapping[int, tuple[str, ...]] | None = None,
+    sequence_record_identities: Mapping[int, str] | None = None,
     source_sequence_ids: tuple[int, ...] = (),
     sequence_memberships: tuple[tuple[int, int, int, bool], ...] = (),
     table_lookups: tuple[tuple[int, int | tuple[int, ...], int], ...] = (),
+    table_lookup_loop_owners: Mapping[int, int] | None = None,
     table_lookup_defaults: dict[int, int | float] | None = None,
     table_stores: tuple[
         tuple[int, int | tuple[int, ...], int, int], ...
@@ -8590,6 +9154,34 @@ def lower_control_sections_to_ssa(
         ))
         region_dependency_signatures[int(region_index)] = (consumed, produced)
 
+    region_scheduled_lookup_ids = {
+        int(operation[0])
+        for operations in (
+            *table_region_operations.values(),
+            *table_region_post_operations.values(),
+        )
+        for kind, operation in operations
+        if str(kind) in {"lookup", "lookup_capture"}
+    }
+    control, lexical_table_lookup_ids, lookup_refusals = (
+        _install_loop_owned_table_queries(
+            control,
+            table_lookups,
+            table_lookup_loop_owners or {},
+            excluded_result_ids=region_scheduled_lookup_ids,
+            globally_mutated_sequence_ids=(
+                int(sequence_id)
+                for _effect, _key, _value, sequence_id in table_stores
+            ),
+        )
+    )
+    shortfalls.extend(
+        SSALoweringShortfall(
+            "ssa-table", "lexical-lookup", control_name,
+            f"lookup {result_id} cannot be placed: {reason}",
+        )
+        for result_id, reason in lookup_refusals
+    )
     control, plan_callsite_bindings = _schedule_loop_callsites(
         control,
         hierarchy_plan,
@@ -8616,9 +9208,11 @@ def lower_control_sections_to_ssa(
         sequence_initializations=sequence_initializations,
         sequence_declarations=sequence_declarations,
         sequence_column_dtypes=sequence_column_dtypes,
+        sequence_record_identities=sequence_record_identities,
         source_sequence_ids=source_sequence_ids,
         sequence_memberships=sequence_memberships,
         table_lookups=table_lookups,
+        lexical_table_lookup_result_ids=lexical_table_lookup_ids,
         table_lookup_defaults=table_lookup_defaults,
         table_stores=table_stores,
         table_deletions=table_deletions,
@@ -8782,6 +9376,17 @@ def lower_control_sections_to_ssa(
     from .ir_string_interning import tokenize_ssa_string_constants
 
     tokenize_ssa_string_constants(functions, string_table)
+    # Section composition and field/index materialization can reconstruct
+    # SSAValue wrappers after the control builder's own finish boundary.  Run
+    # the same CFG-proven LoopResult reconciliation at the completed section
+    # boundary, where every final scalar expression and zero-trip edge exists.
+    for function in functions.values():
+        rebindings = _canonicalize_non_dominating_loop_result_uses(function)
+        if rebindings:
+            function.metadata["loop_result_use_rebindings"] = tuple((
+                *function.metadata.get("loop_result_use_rebindings", ()),
+                *rebindings,
+            ))
     record_tables = {}
     reference_slots = {
         int(slot)

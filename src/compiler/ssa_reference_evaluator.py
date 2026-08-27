@@ -513,12 +513,28 @@ class SSAReferenceEvaluator:
 
         if operation in {"Const", "const"}:
             attributes = instruction.attributes
+            if (
+                ("constant" in attributes and attributes["constant"] is None
+                 and "values" not in attributes)
+                or ("value" in attributes and attributes["value"] is None)
+            ):
+                raise SSAEvaluationError(
+                    "None must use the explicit NoneValue operation"
+                )
             payload = attributes.get("constant")
             if payload is None:
                 payload = attributes.get("value")
             if payload is None and "values" in attributes:
                 payload = attributes.get("values")
             values[int(result.id)] = payload
+            return
+
+        if operation in {"NoneValue", "nonevalue"}:
+            if result is None or instruction.args or instruction.attributes:
+                raise SSAEvaluationError(
+                    "NoneValue requires one result and no operands or attributes"
+                )
+            values[int(result.id)] = None
             return
 
         if operation in {"Phi", "phi"}:

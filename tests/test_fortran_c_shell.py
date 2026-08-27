@@ -29,6 +29,34 @@ from src.compiler.shell_io import (
 )
 
 
+def test_dead_pure_structural_value_is_removed_but_public_value_is_kept():
+    from src.compiler.ir_identities import (
+        drop_dead_pure_structural_instructions,
+    )
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    left = SSAValue(1, "float64")
+    right = SSAValue(2, "float64")
+    dead = SSAValue(3, "float64")
+    public = SSAValue(4, "float64")
+    function = Function("probe", [left, right], {
+        "entry": BasicBlock("entry", [
+            Instr("Sub", [left, right], dead, attributes={
+                "structural_operation": "sub"
+            }),
+            Instr("Add", [left, right], public, attributes={
+                "structural_operation": "add"
+            }),
+            Instr("Ret", [public], None),
+        ])
+    }, metadata={"source_output_value_ids": (4,)})
+
+    assert drop_dead_pure_structural_instructions({function.name: function}) == 1
+    assert [instruction.op for instruction in function.blocks["entry"].instrs] == [
+        "Add", "Ret"
+    ]
+
+
 def test_pure_region_dce_preserves_an_exact_required_source_feed():
     from src.compiler.ir_identities import drop_dead_pure_region_calls
     from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
@@ -1454,6 +1482,53 @@ def test_filtered_authored_record_sequence_keeps_row_provenance():
     assert set(projected_fields).issubset(definitions)
     assert not set(projected_fields).intersection(unexplained)
     assert unexplained == ()
+
+
+def test_local_record_sequence_expands_linked_record_return_into_typed_row():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "from dataclasses import dataclass\n"
+        "@dataclass\n"
+        "class Row:\n"
+        "    count: int\n"
+        "    weight: float\n"
+        "def make(value: int) -> Row:\n"
+        "    return Row(value, float(value))\n"
+        "def total(value: int) -> int:\n"
+        "    rows: list[Row] = []\n"
+        "    row = make(value)\n"
+        "    rows.append(row)\n"
+        "    first = rows[0]\n"
+        "    return first.count\n",
+        "total",
+        name="local_record_sequence",
+    )
+    function = module.functions["local_record_sequence__total"]
+    descriptor = next(iter(
+        module.sequence_tables[function.name].sequences.values()
+    ))
+    append = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("ssa_sequence_operation") == "append"
+    )
+    row_id = int(append.attributes["ssa_record_row_expanded_from"])
+    record = module.record_tables[function.name].records[row_id]
+    physical_ids = tuple(
+        int(value_id)
+        for field in record.fields
+        for value_id in field.value_ids
+    )
+
+    assert descriptor.column_dtypes == ("int64", "float64")
+    assert append.attributes["ssa_record_row_identity"] == "Row"
+    assert tuple(value.id for value in append.args[-2:]) == physical_ids
+    assert tuple(value.dtype for value in append.args[-2:]) == (
+        "int64", "float64",
+    )
+    assert function.metadata.get("unresolved_record_sequence_rows") is None
 
 
 def test_pursued_re_compile_uses_one_external_multikey_table_contract():

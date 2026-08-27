@@ -900,6 +900,41 @@ def lower_tensor_calls_to_repository_ssa(
                     instruction.op in {"Call", "call"}
                     and instruction.attributes.get("callee") is not None
                 ):
+                    # AOT numerical-region capture may already have selected
+                    # the universal repository fallback before this pass sees
+                    # the call.  Keep the AbstractTensor semantic identity on
+                    # that fallback so a destination can still replace it by
+                    # its qualified GEMM intrinsic.  Without this, authored
+                    # ``left @ right``/``left.matmul(right)`` reaches here as
+                    # an otherwise-correct ``matmul_double`` call, but the
+                    # WebGPU identity has nothing left to recognize.
+                    tensor_spelling = (
+                        instruction.attributes.get("tensor_operation")
+                        or instruction.attributes.get("tensor_candidate")
+                    )
+                    if (
+                        str(tensor_spelling) == "matmul"
+                        and instruction.attributes.get("callee")
+                        == "matmul_double"
+                    ):
+                        attributes = dict(instruction.attributes)
+                        attributes.setdefault(
+                            "backend_intrinsic_candidate",
+                            {
+                                "semantic_identity": (
+                                    "src.common.tensors.abstraction."
+                                    "AbstractTensor.matmul"
+                                ),
+                                "lowering_namespace": "abstract_tensor",
+                                "ingested_fallback": False,
+                            },
+                        )
+                        attributes.setdefault(
+                            "backend_intrinsic_family", "blas.gemm"
+                        )
+                        instruction = dataclasses.replace(
+                            instruction, attributes=attributes
+                        )
                     rewritten.append(instruction)
                     continue
                 candidate_only = bool(

@@ -64,6 +64,53 @@ def kernel(x, gain):
     assert artifact.api.to_mapping()["metadata"]["dispatch_workgroups"] == (1, 1, 1)
 
 
+def test_canonical_sympy_pi_and_tanh_spell_as_webgpu_intrinsics():
+    source = SSAValue(900, "float32")
+    pi = SSAValue(901, "float32")
+    result = SSAValue(902, "float32")
+    function = Function("canonical_intrinsics", [source], {
+        "entry": BasicBlock("entry", [
+            Instr("Pi", [], pi, {"constant_identity": "pi"}),
+            Instr("Tanh", [source], result),
+            Instr("Ret", [pi, result], None),
+        ]),
+    })
+    artifact = emit_module(
+        IRModule({function.name: function}), name=function.name,
+        outputs={function.name: (pi, result)}, count=1,
+    )
+
+    assert artifact.complete
+    assert "3.14159265358979323846f" in artifact.source
+    assert "tanh(v_900)" in artifact.source
+
+
+def test_same_typed_outputs_can_publish_one_component_major_gpu_span():
+    left = SSAValue(700, "float32")
+    first = SSAValue(701, "float32")
+    second = SSAValue(702, "float32")
+    function = Function("packed", [left], {
+        "entry": BasicBlock("entry", [
+            Instr("Add", [left, left], first),
+            Instr("Mul", [left, left], second),
+            Instr("Ret", [first, second], None),
+        ]),
+    })
+    artifact = emit_module(
+        IRModule({"packed": function}), name="packed",
+        outputs={"packed": (first, second)}, count=4,
+        preferred_local_size=4, packed_outputs=True,
+    )
+
+    assert artifact.complete
+    assert artifact.source.count("var<storage, read_write>") == 1
+    assert "outputs[0u + linear_index]" in artifact.source
+    assert "outputs[4u + linear_index]" in artifact.source
+    metadata = artifact.api.to_mapping()["metadata"]
+    assert metadata["packed_outputs"] is True
+    assert metadata["output_span"] == [701, 702]
+
+
 @pytest.mark.parametrize("iterations", [3, 17])
 def test_ast_generated_loop_uses_structured_wgsl(iterations):
     source = """

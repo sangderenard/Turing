@@ -45,6 +45,7 @@ from ..common.tensors.fused_ir import (
     ELEMENTWISE_UNARY,
     FusedProgram,
     OpStep,
+    canonicalize_elementwise_steps,
     flatten_tensor_constant,
     ordered_feed_ids,
     resolve_view_source,
@@ -1457,6 +1458,7 @@ def emit_wasm_module(
     # under the flat run(count, ...) ABI otherwise; unroll it into an
     # elementwise fold over K strided views of that same buffer first, so
     # the rest of this emitter never has to special-case it.
+    program = canonicalize_elementwise_steps(program)
     program = unroll_feed_axis_reductions(program)
     value_type, element_bytes, load, store = _value_type(program, dtype)
     shortfalls: list[WasmShortfall] = []

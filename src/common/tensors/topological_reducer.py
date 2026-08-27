@@ -3590,13 +3590,45 @@ def _normalize_lexical_values(
                             break
                         if loaded:
                             break
+                # Overwrite-before-read proves that a value is not a recurrent
+                # body input; it does *not* prove that the pre-loop value is
+                # dead. A later lexical load observes the initial value when
+                # the loop executes zero times and the final body value
+                # otherwise, so that name still requires a loop-result phi.
+                # Restrict the scan to this function scope: a nested definition
+                # captures a name under a separate invocation and is not a
+                # continuation of this loop.
+                def same_scope_walk(node: ast.AST):
+                    yield node
+                    for child in ast.iter_child_nodes(node):
+                        if isinstance(child, (
+                            ast.FunctionDef, ast.AsyncFunctionDef,
+                            ast.ClassDef, ast.Lambda,
+                        )):
+                            continue
+                        yield from same_scope_walk(child)
+
+                loop_end = int(getattr(
+                    body_statement, "end_lineno",
+                    getattr(body_statement, "lineno", -1),
+                ))
+                live_after_loop = {
+                    member.id
+                    for member in same_scope_walk(statement)
+                    if isinstance(member, ast.Name)
+                    and isinstance(member.ctx, ast.Load)
+                    and int(getattr(member, "lineno", -1)) > loop_end
+                }
                 loop_carried_bindings = {
                     name: (before_loop[name], environment[name])
                     for name in before_loop.keys() & environment.keys()
                     if (
                         before_loop[name] != environment[name]
                         and name not in loop_target_bindings
-                        and name not in overwritten_before_read
+                        and (
+                            name not in overwritten_before_read
+                            or name in live_after_loop
+                        )
                         # A descendant loop's induction binding remains in
                         # Python's lexical environment after that loop, but it
                         # is not recurrent state of this enclosing loop.  Its

@@ -59,6 +59,7 @@ from .deployment_fifo import DeploymentFIFO
 from .control_source import (
     CallBlock,
     ControlExpression,
+    ControlOverlayScopeError,
     ControlProgram,
     LoopBlock,
     ParallelDeployment,
@@ -1841,7 +1842,23 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                 # A Name argument has an exact source-time identity: choose
                 # the latest deterministic definition preceding this call.
                 # This is SSA correlation, not name-based backend recovery.
-                if isinstance(argument_expression, ast.Name):
+                # Retained-loop materialization has already rewired a use
+                # after the loop onto its LoopResult/LoopExit port.  That
+                # edge is the control-aware current definition.  Replacing it
+                # with the latest source-coordinate candidate can select an
+                # assignment inside the loop body instead, moving a call
+                # behind the consumer of its own result.  Name-history repair
+                # is only for stale ordinary producer edges; never override a
+                # planner-owned loop exit correlation.
+                parent_operation = str(
+                    graph.G.nodes.get(int(parent), {}).get("op")
+                    or graph.G.nodes.get(int(parent), {}).get("type")
+                    or ""
+                ).casefold()
+                if (
+                    isinstance(argument_expression, ast.Name)
+                    and parent_operation not in {"loopresult", "loopexit"}
+                ):
                     call_position = source_position(int(node_id))
                     candidates = [
                         int(definition)
@@ -7097,6 +7114,95 @@ def _source_control_nesting_hints(
         parent: frozenset(sorted(nested))
         for parent, nested in children.items() if nested
     }
+
+
+def _overlay_control_or_require_subdivision(
+    graph: Any,
+    runtime_regions: Iterable[int],
+    reductions: Sequence[Any],
+    loop_controls: Sequence[ControlProgram],
+    conditional_controls: Sequence[ControlProgram],
+    nesting: Mapping[int, Iterable[int]],
+) -> ControlProgram:
+    """Turn a named cross-scope overlay refusal into loop-owned frontier data."""
+
+    try:
+        return overlay_scheduled_control(
+            runtime_regions,
+            (*loop_controls, *conditional_controls),
+            known_nesting=nesting,
+        )
+    except ControlOverlayScopeError as error:
+        conflict_regions = frozenset(map(int, error.region_indices))
+        overlapping = tuple(
+            (reduction, control)
+            for reduction, control in zip(
+                reductions, loop_controls, strict=True,
+            )
+            if conflict_regions.intersection(map(int, control.region_indices))
+        )
+        named_scope_inductions = {
+            component[len("loop("):-1]
+            for scope in error.scopes
+            for component in scope
+            if component.startswith("loop(") and component.endswith(")")
+        }
+
+        def loop_inductions(block: Any) -> frozenset[str]:
+            if isinstance(block, LoopBlock):
+                return frozenset((str(block.induction),)) | loop_inductions(
+                    block.body
+                )
+            if isinstance(block, SequenceBlock):
+                return frozenset().union(*(
+                    loop_inductions(child) for child in block.blocks
+                )) if block.blocks else frozenset()
+            return frozenset()
+
+        named = tuple(
+            (reduction, control)
+            for reduction, control in overlapping
+            if named_scope_inductions.intersection(loop_inductions(control.root))
+        )
+        implicated = named or overlapping
+        # A conditional/conditional conflict has no loop owner at which the
+        # subdivision planner can make progress. Preserve the original named
+        # refusal in that case instead of fabricating a boundary.
+        if not implicated:
+            raise
+        owner_reference = graph.G.graph.get("function_ref")
+        owner_qualified_name = None
+        owner_table = getattr(graph, "function_table", None)
+        if owner_reference is not None and owner_table is not None:
+            try:
+                owner_qualified_name = str(
+                    owner_table.entry(int(owner_reference)).qualified_name
+                )
+            except (IndexError, KeyError, TypeError, ValueError):
+                owner_qualified_name = None
+        scope_blockers = tuple(
+            "scope:" + ">".join(scope) for scope in sorted(error.scopes)
+        )
+        boundaries = tuple({
+            "kind": "loop-control-owner",
+            "loop_node_id": int(reduction.loop_node_id),
+            "region_indices": list(map(
+                int, sorted(control.region_indices),
+            )),
+            "blockers": [
+                "control-overlay-sequence-scope",
+                *scope_blockers,
+            ],
+            **({
+                "function_reference": int(owner_reference),
+            } if owner_reference is not None else {}),
+            **({
+                "qualified_name": owner_qualified_name,
+            } if owner_qualified_name is not None else {}),
+        } for reduction, control in implicated)
+        raise CompilationSubdivisionRequired(
+            str(error), boundaries=boundaries,
+        ) from error
 
 
 def _control_partition_keys(
@@ -14486,6 +14592,18 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             right = known.get(parents.get("rhs", parents.get("right")), unresolved)
             if left is unresolved or right is unresolved:
                 return unresolved
+            comparison_node = expression.ops[0]
+            if isinstance(comparison_node, (ast.Is, ast.IsNot)) and (
+                (isinstance(left, _ProgramABIValueFact) and right is None)
+                or (left is None and isinstance(right, _ProgramABIValueFact))
+            ):
+                # A program-ABI fact does not reveal a runtime numerical value,
+                # but it does prove that physical, nonoptional storage exists.
+                # This compiler has no tagged optional scalar/span/record ABI;
+                # such a value therefore cannot be Python ``None``.  Restrict
+                # the fold to identity-with-None so no equality or truthiness is
+                # inferred from the schema fact itself.
+                return isinstance(comparison_node, ast.IsNot)
             if isinstance(left, _ProgramABIValueFact) or isinstance(
                 right, _ProgramABIValueFact
             ):
@@ -14495,7 +14613,7 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 ast.Lt: operator.lt, ast.LtE: operator.le,
                 ast.Gt: operator.gt, ast.GtE: operator.ge,
                 ast.Is: operator.is_, ast.IsNot: operator.is_not,
-            }.get(type(expression.ops[0]))
+            }.get(type(comparison_node))
             if comparison is None:
                 return unresolved
             try:
@@ -14923,6 +15041,7 @@ def _fold_callsite_structural_values(graph: Any) -> None:
     # unselected lexical compartment and replace its merge Phi with an alias
     # to the selected producer.  The proof is the graph constant above; no
     # runtime tensor value or Python callable participates.
+    branch_memberships = _branch_compartments(graph)
     pruned = True
     while pruned:
         pruned = False
@@ -14963,10 +15082,129 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 for statement in rejected_statements
                 for member in ast.walk(statement)
             }
+            rejected_signatures = {
+                _ast_source_signature(member)
+                for statement in rejected_statements
+                for member in ast.walk(statement)
+            }
+            # ``if predicate: return value`` guards the lexical tail even
+            # though Python spells no explicit ``else``.  Function ingestion
+            # retains the exact top-level statement list; when the selected
+            # arm is terminal, include every following statement in the
+            # rejected compartment.  This is source control, not a heuristic
+            # over node numbering, and it survives clean-graph AST copies via
+            # source signatures.
+            function_body = tuple(
+                graph.G.graph.get("function_body") or ()
+            )
+            source_index = next((
+                index
+                for index, statement in enumerate(function_body)
+                if isinstance(statement, ast.If)
+                and _ast_source_signature(statement)
+                == _ast_source_signature(expression)
+            ), None)
+            selected_statements = (
+                tuple(expression.body)
+                if selected_role == "body"
+                else tuple(expression.orelse)
+            )
+            if (
+                source_index is not None
+                and selected_statements
+                and isinstance(selected_statements[-1], (ast.Return, ast.Raise))
+            ):
+                rejected_signatures.update(
+                    _ast_source_signature(member)
+                    for statement in function_body[source_index + 1:]
+                    for member in ast.walk(statement)
+                )
+            selected_return_id = None
+            if (
+                selected_statements
+                and isinstance(selected_statements[-1], ast.Return)
+                and selected_statements[-1].value is not None
+            ):
+                returned_expression = selected_statements[-1].value
+                if isinstance(returned_expression, ast.Name):
+                    history = tuple(map(
+                        int,
+                        (graph.G.graph.get("identity_table") or {}).get(
+                            returned_expression.id, ()
+                        ),
+                    ))
+                    selected_return_id = next((
+                        value_id for value_id in reversed(history)
+                        if value_id in graph.G
+                    ), None)
+                if selected_return_id is None:
+                    returned_signature = _ast_source_signature(
+                        returned_expression
+                    )
+                    matches = tuple(
+                        int(node_id)
+                        for node_id, data in graph.G.nodes(data=True)
+                        if isinstance(data.get("expr_obj"), ast.AST)
+                        and _ast_source_signature(data["expr_obj"])
+                        == returned_signature
+                    )
+                    if len(matches) == 1:
+                        selected_return_id = matches[0]
+            control_signature = _ast_source_signature(expression)
+            retained_control_id = next((
+                int(source_id)
+                for source_id, record in _source_control_records(
+                    graph.G
+                ).items()
+                if isinstance(record.get("expression"), ast.If)
+                and _ast_source_signature(record["expression"])
+                == control_signature
+            ), int(control_id))
+            # The reducer represents a value assigned in only one arm and used
+            # later as an external Input placeholder, retaining the real arm
+            # producer immediately before it in that name's identity history.
+            # Once this exact conditional is structurally selected, that
+            # placeholder is no longer external: collapse it only when one
+            # surviving predecessor belongs to the selected compartment.  The
+            # branch-membership receipt prevents this from guessing across
+            # loops, unrelated assignments, or an undecided conditional.
+            identities = graph.G.graph.get("identity_table") or {}
+            for _name, history in tuple(identities.items()):
+                ordered = tuple(map(int, history or ()))
+                if len(ordered) < 2:
+                    continue
+                placeholder_id = ordered[-1]
+                placeholder = graph.G.nodes.get(placeholder_id, {})
+                if not (
+                    placeholder.get("type") == "Input"
+                    and (placeholder.get("attributes") or {}).get(
+                        "binding_kind"
+                    ) == "external"
+                ):
+                    continue
+                selected_candidates = tuple(dict.fromkeys(
+                    value_id
+                    for value_id in ordered[:-1]
+                    if value_id in graph.G
+                    and (int(retained_control_id), str(selected_role))
+                    in branch_memberships.get(
+                        int(value_id), frozenset()
+                    )
+                ))
+                if len(selected_candidates) == 1:
+                    replace_alias(
+                        int(placeholder_id), int(selected_candidates[0])
+                    )
             rejected_nodes = {
                 int(node_id)
                 for node_id, data in graph.G.nodes(data=True)
                 if id(data.get("expr_obj")) in rejected_ast_ids
+                or isinstance(data.get("expr_obj"), ast.AST)
+                and _ast_source_signature(data["expr_obj"])
+                in rejected_signatures
+                or (int(retained_control_id), str(rejected_role)) in (
+                    branch_memberships.get(int(node_id), frozenset())
+                )
             }
             specialized = list(
                 graph.G.graph.get(
@@ -14981,6 +15219,14 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 remove_node(node_id)
             remove_node(int(control_id))
             identities = graph.G.graph.get("identity_table") or {}
+            if selected_return_id is not None:
+                graph.roots = [int(selected_return_id)]
+                for output_name in tuple(
+                    graph.G.graph.get("function_outputs") or ()
+                ):
+                    identities[str(output_name)] = (
+                        int(selected_return_id),
+                    )
             graph.G.graph["identity_table"] = {
                 str(name): tuple(
                     int(value_id) for value_id in history
@@ -15196,6 +15442,7 @@ def _callsite_specialized_shell_type(
     _receiver, positional, _all = _method_parameter_layout(original.G)
     specializations = {}
     tensor_descriptors: dict[str, dict[str, Any]] = {}
+    record_descriptors: dict[str, str] = {}
     bound_parameters: set[str] = set()
     data = caller.G.nodes[int(node_id)]
     for parent, role_value in data.get("parents") or ():
@@ -15212,6 +15459,15 @@ def _callsite_specialized_shell_type(
             continue
         parameter = str(parameter)
         bound_parameters.add(parameter)
+        record_abi = dict(
+            original.G.graph.get("parameter_record_abi") or {}
+        ).get(parameter)
+        if record_abi is not None and record_abi.get("identity") is not None:
+            # A declared record identity is a structural type fact even when
+            # the callsite carries no scalar literal or tensor descriptor.
+            # Replanning the clean callee lets isinstance(record, Schema)
+            # fold from that contract before regions/branches are carved.
+            record_descriptors[parameter] = str(record_abi["identity"])
         descriptor = _tensor_descriptor(caller, int(parent))
         if descriptor is not None:
             tensor_descriptors[parameter] = descriptor
@@ -15240,7 +15496,7 @@ def _callsite_specialized_shell_type(
             )
         ):
             specializations[parameter] = copy.deepcopy(default)
-    if not specializations and not tensor_descriptors:
+    if not specializations and not tensor_descriptors and not record_descriptors:
         return fallback
 
     def stable(value: Any) -> object:
@@ -15268,6 +15524,7 @@ def _callsite_specialized_shell_type(
             (name, stable(value))
             for name, value in tensor_descriptors.items()
         )),
+        tuple(sorted(record_descriptors.items())),
         int(max_nodes_per_dispatch),
     )
     cached = _CALLSITE_SHELL_TYPE_CACHE.get(key)
@@ -16145,16 +16402,19 @@ class ProcessGraphGLSLDeployment:
                     f"source_conditional_ids={sorted({int((data.get('attributes') or {}).get('source_conditional_id')) for _node, data in target.process_graph.G.nodes(data=True) if (data.get('attributes') or {}).get('source_conditional_id') is not None})}",
                     file=sys.stderr,
                 )
-            controls = loop_controls + conditional_controls
-            shell_control = overlay_scheduled_control(
+            nesting = _source_control_nesting_hints(
+                considered_reductions,
+                conditional_controls,
+                target.loop_plans,
+                target.process_graph,
+            )
+            shell_control = _overlay_control_or_require_subdivision(
+                target.process_graph,
                 runtime_regions,
-                controls,
-                known_nesting=_source_control_nesting_hints(
-                    considered_reductions,
-                    conditional_controls,
-                    target.loop_plans,
-                    target.process_graph,
-                ),
+                considered_reductions,
+                loop_controls,
+                conditional_controls,
+                nesting,
             )
             shell_control = _place_validation_blocks(
                 shell_control,
@@ -17960,15 +18220,19 @@ class ProcessGraphGLSLDeployment:
                 )
                 for reduction in considered_reductions
             )
-            shell_control = overlay_scheduled_control(
+            nesting = _source_control_nesting_hints(
+                considered_reductions,
+                conditional_controls,
+                self.loop_plans,
+                self.process_graph,
+            )
+            shell_control = _overlay_control_or_require_subdivision(
+                self.process_graph,
                 runtime_regions,
-                loop_controls + conditional_controls,
-                known_nesting=_source_control_nesting_hints(
-                    considered_reductions,
-                    conditional_controls,
-                    self.loop_plans,
-                    self.process_graph,
-                ),
+                considered_reductions,
+                loop_controls,
+                conditional_controls,
+                nesting,
             )
             shell_control = replace(
                 shell_control,

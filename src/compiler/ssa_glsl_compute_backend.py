@@ -592,6 +592,13 @@ def emit_ssa_module_to_glsl_compute(
         if section:
             precision_present = True
         qualifier = "precise " if section else "const "
+        if op in {"NoneValue", "nonevalue"}:
+            shortfalls.append(GLSLComputeShortfall(
+                op,
+                "GLSL has no absence value; lower an optional to explicit "
+                "presence and payload values before shader emission",
+            ))
+            continue
         if op == "Const":
             held = instruction.attributes.get(
                 "constant", instruction.attributes.get("value")

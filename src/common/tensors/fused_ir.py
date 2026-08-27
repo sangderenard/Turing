@@ -17,7 +17,7 @@ one, or many of these numeric segments.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from numbers import Real
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
@@ -392,10 +392,44 @@ def canonical_elementwise_op(op: str) -> tuple[str, bool]:
     # symbolic_process_graph.py's _SYMPY_TO_CANONICAL) rather than this
     # module's lowercase tape-op vocabulary. Accept that spelling here, once,
     # instead of every caller lowercasing before calling in.
-    lowered = name.lower()
+    lowered_name = name.lower()
+    lowered = ELEMENTWISE_ALIASES.get(lowered_name, lowered_name)
     if lowered != name and lowered in known:
         return lowered, False
+    if lowered_name[:1] in ("i", "r"):
+        base = ELEMENTWISE_ALIASES.get(lowered_name[1:], lowered_name[1:])
+        if base in known:
+            return base, lowered_name[0] == "r"
     raise KeyError(op)
+
+
+def canonicalize_elementwise_steps(program: FusedProgram) -> FusedProgram:
+    """Normalize elementwise step spellings without altering structural ops.
+
+    Frontends retain their natural vocabulary (for example Python AST
+    ``Div`` or reflected ``rsub``).  Backends should consume the common
+    elementwise vocabulary, including the explicit ``reverse`` attribute,
+    rather than each carrying another frontend-specific translation table.
+    """
+
+    steps: list[OpStep] = []
+    changed = False
+    for step in program.steps:
+        try:
+            op_name, prefix_reverse = canonical_elementwise_op(step.op_name)
+        except KeyError:
+            steps.append(step)
+            continue
+        attrs = dict(step.attrs)
+        reverse = bool(attrs.get("reverse", False)) ^ prefix_reverse
+        if reverse:
+            attrs["reverse"] = True
+        else:
+            attrs.pop("reverse", None)
+        normalized = replace(step, op_name=op_name, attrs=attrs)
+        changed = changed or normalized != step
+        steps.append(normalized)
+    return replace(program, steps=steps) if changed else program
 
 
 def ordered_feed_ids(program: FusedProgram) -> tuple[int, ...]:

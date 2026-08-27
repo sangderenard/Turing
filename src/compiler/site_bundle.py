@@ -1514,6 +1514,8 @@ def _shader_execution_descriptor(
     published_sources: list[dict[str, Any]],
     shell_io: Mapping[str, Any] | None = None,
     configuration: Mapping[str, Any] | None = None,
+    *,
+    canvas_only: bool = False,
 ) -> dict[str, Any] | None:
     """Build the priority-ordered list of shader-surface candidates.
 
@@ -1525,22 +1527,35 @@ def _shader_execution_descriptor(
     fall back to.
     """
 
+    canvas_candidate = {
+        "url": None,
+        "language": "canvas2d",
+        "stage": "none",
+        "role": "shader-surface",
+    }
     candidates: list[dict[str, Any]] = []
+    if canvas_only:
+        # A numerical program with named RGB outputs already has a complete
+        # presentation contract.  When no compiler-emitted presentation
+        # shader can express that contract, paint those Wasm outputs directly
+        # instead of promoting a compute shader to an opaque fullscreen canvas.
+        candidates.append(dict(canvas_candidate))
     by_language = {
         str(source.get("language")): source for source in published_sources
         if source.get("role") == "shader-surface" and source.get("available")
         and source.get("url")
     }
-    for source_language, wire_language, stage in _SHADER_SURFACE_LANGUAGES:
-        source = by_language.get(source_language)
-        if source is None:
-            continue
-        candidates.append({
-            "url": str(source["url"]),
-            "language": wire_language,
-            "stage": stage,
-            "role": "shader-surface",
-        })
+    if not canvas_only:
+        for source_language, wire_language, stage in _SHADER_SURFACE_LANGUAGES:
+            source = by_language.get(source_language)
+            if source is None:
+                continue
+            candidates.append({
+                "url": str(source["url"]),
+                "language": wire_language,
+                "stage": stage,
+                "role": "shader-surface",
+            })
     if not candidates:
         # Desktop GLSL is deliberately never a candidate here. Its SSBO
         # binding/channel arena needs the dedicated memory handler
@@ -1556,13 +1571,8 @@ def _shader_execution_descriptor(
     # shader compilation of any kind. wasm_html_shell.py's runtime tries
     # this only if every GPU-backed candidate above it fails to acquire a
     # context.
-    if shell_io:
-        candidates.append({
-            "url": None,
-            "language": "canvas2d",
-            "stage": "none",
-            "role": "shader-surface",
-        })
+    if shell_io and not canvas_only:
+        candidates.append(dict(canvas_candidate))
     descriptor = dict(candidates[0])
     descriptor["autostart"] = True
     descriptor["execution"] = {"continuous": True, "prefer_contiguous": True}
@@ -2630,11 +2640,11 @@ def build_program_bundle(
         # nothing but a trivial per-pixel display ever has to be expressed
         # as WebGL-safe scalar code. A page author never authors a shader
         # function unless they want something other than plain display.
+        canvas_output_presentation = False
         if (
             module is not None
             and
             contract.presentation_entrypoint is None
-            and passthrough_module.complete
             and effective_presentation_shader is None
         ):
             output_names = {
@@ -2643,21 +2653,32 @@ def build_program_bundle(
                 if item.role in {"output", "inout"}
             }
             if {"red", "green", "blue"} <= output_names:
-                channel.log(
-                    "no presentation_entrypoint authored; using the default "
-                    "passthrough as this page's shader support",
-                    path="presentation",
-                )
-                effective_presentation_shader = passthrough_module.source
-                if passthrough_wgsl_module is not None and passthrough_wgsl_module.complete:
-                    effective_presentation_shader_wgsl = passthrough_wgsl_module.source
-                effective_shader_configuration["output_feed_bindings"] = {
-                    item["uniform"]: name
-                    for item, name in zip(
-                        passthrough_module.api.metadata["feed_bindings"],
-                        ("red", "green", "blue"),
+                if passthrough_module.complete:
+                    channel.log(
+                        "no presentation_entrypoint authored; using the default "
+                        "passthrough as this page's shader support",
+                        path="presentation",
                     )
-                }
+                    effective_presentation_shader = passthrough_module.source
+                    if passthrough_wgsl_module is not None and passthrough_wgsl_module.complete:
+                        effective_presentation_shader_wgsl = passthrough_wgsl_module.source
+                    effective_shader_configuration["output_feed_bindings"] = {
+                        item["uniform"]: name
+                        for item, name in zip(
+                            passthrough_module.api.metadata["feed_bindings"],
+                            ("red", "green", "blue"),
+                        )
+                    }
+                else:
+                    channel.log(
+                        "default passthrough is unavailable; presenting named "
+                        "RGB outputs directly from Wasm",
+                        path="presentation",
+                    )
+                    effective_shader_configuration.setdefault(
+                        "channels", ["red", "green", "blue"]
+                    )
+                    canvas_output_presentation = True
 
         card_directory = Path("wasm") / f"size-{DEFAULT_WASM_CARD_OPERATIONS}"
         channel.log("partitioning program into wasm regions", path="regions")
@@ -2721,6 +2742,39 @@ def build_program_bundle(
         from .deployment_stage import (
             browser_threading_veto, plan_region_deployments,
         )
+
+        staged_deployment_allowed = True
+        if real_control is not None and contract.state_feedback:
+            region_output_ids = {
+                int(value_id)
+                for region_program in effective_region_programs.values()
+                for value_id in getattr(
+                    region_program, "program", region_program
+                ).outputs.values()
+            }
+            missing_feedback_outputs = [
+                output_name
+                for output_name in contract.state_feedback.values()
+                if not any(
+                    int(value_id) in region_output_ids
+                    for value_id in aot.identity_table.get(output_name, ())
+                )
+            ]
+            if missing_feedback_outputs:
+                if program is None:
+                    raise RuntimeError(
+                        "retained control regions do not produce state feedback "
+                        f"outputs {sorted(missing_feedback_outputs)!r}, and no "
+                        "contiguous program is available"
+                    )
+                channel.log(
+                    "retained control regions omit state feedback outputs; "
+                    "using the contiguous program",
+                    path="regions",
+                    outputs=sorted(missing_feedback_outputs),
+                )
+                real_control = None
+                staged_deployment_allowed = False
 
         _stage_channels = (
             effective_shader_configuration or {}
@@ -2830,6 +2884,17 @@ def build_program_bundle(
                 "emitting control region modules", path="regions",
                 regions=len(real_control.region_indices),
             )
+            state_input_value_names: dict[int, str] = {}
+            for input_name, output_name in contract.state_feedback.items():
+                for value_id in aot.identity_table.get(output_name, ()):
+                    value_id = int(value_id)
+                    previous = state_input_value_names.get(value_id)
+                    if previous is not None and previous != input_name:
+                        raise ValueError(
+                            f"state feedback value {value_id} is named by both "
+                            f"{previous!r} and {input_name!r}"
+                        )
+                    state_input_value_names[value_id] = str(input_name)
             # Per-region logging surfaces the final-reduction progress. The
             # content-addressed reduction cache (an incremental backup of each
             # lowered region) stays OFF until the build is deterministic: a
@@ -2842,6 +2907,7 @@ def build_program_bundle(
                 owner_name=contract.entrypoint,
                 module_dir=card_directory.as_posix(),
                 dtype="float64",
+                logical_input_names=state_input_value_names,
                 reduction_cache=None,
                 progress=lambda region, cached: channel.log(
                     f"region {region} reduction lowered",
@@ -2893,6 +2959,25 @@ def build_program_bundle(
                             str(output_name), [entry["name"], output_name]
                         )
             card_manifest["logical_outputs"] = logical_outputs
+            storage_redirects = dict(
+                card_manifest.get("storage_redirects", {}) or {}
+            )
+            for input_name, output_name in contract.state_feedback.items():
+                if input_name not in card_manifest.get("logical_inputs", {}):
+                    raise ValueError(
+                        f"state feedback names unknown logical input "
+                        f"{input_name!r}"
+                    )
+                producer_binding = logical_outputs.get(output_name)
+                if producer_binding is None:
+                    raise ValueError(
+                        f"state feedback names unknown logical output "
+                        f"{output_name!r}"
+                    )
+                storage_redirects[f"in::{input_name}"] = (
+                    f"out::{producer_binding[0]}::{producer_binding[1]}"
+                )
+            card_manifest["storage_redirects"] = storage_redirects
             channel.log("building class inventory", path="regions")
             inventory = build_class_inventory(card_manifest)
             channel.log("class inventory built", path="regions", methods=len(inventory.methods))
@@ -2981,6 +3066,9 @@ def build_program_bundle(
                 entrypoint=contract.entrypoint,
                 embed_binaries=False,
                 module_dir=card_directory.as_posix(),
+                storage_redirects=contract.state_feedback,
+                input_names=parameter_names,
+                allow_external_outputs=not staged_deployment_allowed,
             )
             channel.log("building class inventory", path="regions")
             inventory = build_class_inventory(card_manifest)
@@ -3391,6 +3479,7 @@ def build_program_bundle(
             published_sources,
             (module.api.metadata or {}).get("shell_io"),
             effective_shader_configuration,
+            canvas_only=canvas_output_presentation,
         )
         channel.log("writing audio asset", path="audio")
         audio_runtime = _write_audio_asset(
@@ -3419,7 +3508,10 @@ def build_program_bundle(
             map_ir=aot.map_ir,
             class_graph={
                 **card_manifest,
-                "variants": {str(DEFAULT_WASM_CARD_OPERATIONS): card_manifest},
+                "variants": (
+                    {str(DEFAULT_WASM_CARD_OPERATIONS): card_manifest}
+                    if staged_deployment_allowed else {}
+                ),
                 "contiguous": contiguous,
                 "runtime_version": BUILDER_VERSION,
             },

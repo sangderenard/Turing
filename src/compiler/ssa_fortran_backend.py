@@ -5699,8 +5699,8 @@ def emit_module(
                     ),
                 } if host_linear_region_inlining else {}),
                 **({
-                "shell_io": dict(module.metadata["shell_io"]),
-            } if module.metadata.get("shell_io") else {}),
+                "shell_io": dict(getattr(module, "metadata", {})["shell_io"]),
+            } if getattr(module, "metadata", {}).get("shell_io") else {}),
             **publication_metadata(functions),
             "tensor_table_schema": "turing.repository-ssa-tensor-table.v1",
             "tensor_tables": {

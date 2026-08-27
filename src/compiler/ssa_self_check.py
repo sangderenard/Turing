@@ -76,6 +76,21 @@ def check_formal_parity(module: Any) -> list[Finding]:
         formals = [int(argument.id) for argument in getattr(function, "args", ())]
         metadata = getattr(function, "metadata", None) or {}
         named = {int(value) for _label, value in metadata.get("parameter_names") or ()}
+        accounted = set(named)
+        accounted.update(
+            int(entry["value_id"])
+            for entry in metadata.get("storage_formals") or ()
+        )
+        # A schema-expanded record parameter has no independent source-level
+        # name per physical field.  Its parameter/field receipt is the ABI
+        # name, just as ``storage_formals`` is the name of leased workspace.
+        accounted.update(
+            int(argument.id)
+            for argument in getattr(function, "args", ())
+            if (getattr(argument, "accounting", None) or {}).get(
+                "program_abi_parameter"
+            ) is not None
+        )
         # Carried ports legitimately rename a parameter (the name follows the
         # phi); follow the accounting back so those do not read as unnamed.
         for carried in (metadata.get("carried_port_values") or {}).values():
@@ -84,11 +99,18 @@ def check_formal_parity(module: Any) -> list[Finding]:
                 source = accounting.get("source_value_id")
                 if source is not None:
                     named.add(int(source))
-        unnamed = [value for value in formals if value not in named]
+                    accounted.add(int(source))
+        unnamed = [value for value in formals if value not in accounted]
+        # Planned regions and generated sequence helpers deliberately have no
+        # source parameter names: their complete signature is an internal call
+        # contract.  This check audits drift from an authored function
+        # signature, so only functions which publish at least one source name
+        # are in its domain.
         if named and unnamed:
             findings.append(Finding(
                 "formal_parity", str(name),
-                f"{len(formals)} formals but only {len(named)} named; "
+                f"{len(formals)} formals but only {len(accounted)} named or "
+                "ABI-accounted; "
                 f"unnamed value ids {unnamed} -- no caller can know what to "
                 "pass. If one is also in a region's output_ids, this is the "
                 "formal/region-output collision.",
@@ -208,6 +230,25 @@ def check_output_contract_agreement(module: Any) -> list[Finding]:
     return findings
 
 
+def check_record_sequence_rows(module: Any) -> list[Finding]:
+    """Every record-row insertion must have a proven physical expansion."""
+
+    findings: list[Finding] = []
+    for name, function in _functions(module):
+        for record in (
+            getattr(function, "metadata", None) or {}
+        ).get("unresolved_record_sequence_rows") or ():
+            findings.append(Finding(
+                "record_sequence_row", str(name),
+                f"sequence {record.get('sequence_id')} cannot store record "
+                f"value {record.get('record_value_id')} "
+                f"({record.get('record_identity')!r}): "
+                f"{record.get('reason')}. The semantic record handle is not "
+                "a runtime row and must not cross the helper ABI.",
+            ))
+    return findings
+
+
 def suspicious_loop_invariant_formals(module: Any) -> list[Finding]:
     """Formals consumed inside a loop body, alongside at least one carried phi.
 
@@ -268,6 +309,7 @@ def run_all(module: Any) -> list[Finding]:
         *check_dead_storage_formals(module),
         *check_id_scale(module),
         *check_output_contract_agreement(module),
+        *check_record_sequence_rows(module),
     ]
 
 
@@ -278,6 +320,7 @@ __all__ = [
     "check_formal_parity",
     "check_id_scale",
     "check_output_contract_agreement",
+    "check_record_sequence_rows",
     "run_all",
     "suspicious_loop_invariant_formals",
 ]

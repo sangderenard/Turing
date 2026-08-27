@@ -43,7 +43,7 @@ _BINARY: dict[str, str] = {
 }
 
 _UNARY: dict[str, str] = {
-    "Neg": "(-{0})", "Abs": "abs({0})", "Sqrt": "sqrt({0})",
+    "Neg": "(-{0})", "Abs": "abs({0})", "Sqrt": "sqrt({0})", "Tanh": "tanh({0})",
     "LNot": "f32(!bool({0}))",
     "Not": "bitcast<f32>(~bitcast<u32>({0}))",
     "neg": "(-{0})", "abs": "abs({0})", "sqrt": "sqrt({0})",
@@ -233,12 +233,16 @@ class _FunctionEmitter:
         loop_records: Sequence[Mapping[str, Any]],
         callees: Mapping[str, tuple[SSAValue, ...]] | None = None,
         store_outputs: bool = True,
+        packed_outputs: bool = False,
+        invocation_count: int = 1,
     ):
         self.function = function
         self.outputs = tuple(outputs)
         self.loops = tuple(loop_records)
         self.callees = dict(callees or {})
         self.store_outputs = store_outputs
+        self.packed_outputs = bool(packed_outputs)
+        self.invocation_count = int(invocation_count)
         self.shortfalls: list[WGSLShortfall] = []
         self.lines: list[str] = []
         self.declared: set[int] = set()
@@ -292,6 +296,13 @@ class _FunctionEmitter:
         if result is None:
             self.fail(operation, "instruction has no result")
             return
+        if operation in {"NoneValue", "nonevalue"}:
+            self.fail(
+                operation,
+                "WGSL has no absence value; lower an optional to explicit "
+                "presence and payload values before WebGPU emission",
+            )
+            return
         dtype = self.dtype(result)
         args = [self.operand(value) for value in instr.args]
         if "right_scalar" in instr.attributes:
@@ -312,6 +323,8 @@ class _FunctionEmitter:
             expression = _UNARY[operation].format(*args)
         elif operation in _SHAPE_ONLY and len(args) == 1:
             expression = args[0]
+        elif operation == "Pi" or instr.attributes.get("constant_identity") == "pi":
+            expression = "3.14159265358979323846f"
         elif operation in {"Const", "const"}:
             constant = instr.attributes.get("constant")
             if constant is None:
@@ -475,9 +488,12 @@ class _FunctionEmitter:
                     self.emit_block(block, "  ", omit_control=True)
         if self.store_outputs:
             for value_id, binding in self.output_bindings.items():
+                target = (
+                    f"outputs[{binding * self.invocation_count}u + linear_index]"
+                    if self.packed_outputs else f"output_{binding}[linear_index]"
+                )
                 self.lines.append(
-                    f"  output_{binding}[linear_index] = "
-                    f"{self.aliases.get(value_id, f'v_{value_id}')};"
+                    f"  {target} = {self.aliases.get(value_id, f'v_{value_id}')};"
                 )
         elif len(self.outputs) == 1:
             self.lines.append(f"  return {self.operand(self.outputs[0])};")
@@ -613,6 +629,7 @@ def emit_module(
     outputs: Mapping[str, Sequence[SSAValue]] | None = None,
     count: int = 1,
     preferred_local_size: int = 256,
+    packed_outputs: bool = False,
 ) -> WGSLModule:
     ir_module = module if isinstance(module, IRModule) else IRModule(dict(module))
     # Precision sections are refused BEFORE anything is spelled, mirroring
@@ -805,6 +822,14 @@ def emit_module(
         > _MAX_GUARANTEED_STORAGE_BINDINGS
         and len(feed_dtypes) == 1
     )
+    output_dtypes = {
+        _DTYPE.get(str(value.dtype or "float32").lower(), "f32")
+        for value in output_values
+    }
+    if packed_outputs and len(output_dtypes) != 1:
+        raise WGSLEmissionError(
+            "packed WGSL outputs require one shared element dtype"
+        )
     if packed_feeds:
         element = next(iter(feed_dtypes))
         bindings.append(
@@ -824,15 +849,25 @@ def emit_module(
                 f"feed_{value.id}", "feed", dtype, binding, value_id=value.id,
             ))
     output_bindings = []
-    for index, value in enumerate(output_values):
-        binding = (1 if packed_feeds else len(function.args)) + index
-        dtype = _DTYPE.get(str(value.dtype or "float32").lower(), "f32")
+    output_binding_base = 1 if packed_feeds else len(function.args)
+    if packed_outputs:
+        dtype = next(iter(output_dtypes), "f32")
         bindings.append(
-            f"@group(0) @binding({binding}) var<storage, read_write> output_{index}: array<{dtype}>;"
+            f"@group(0) @binding({output_binding_base}) var<storage, read_write> outputs: array<{dtype}>;"
         )
         output_bindings.append(BufferBinding(
-            f"output_{index}", "output", dtype, binding, value_id=value.id,
+            "outputs", "output", dtype, output_binding_base, value_id=None,
         ))
+    else:
+        for index, value in enumerate(output_values):
+            binding = output_binding_base + index
+            dtype = _DTYPE.get(str(value.dtype or "float32").lower(), "f32")
+            bindings.append(
+                f"@group(0) @binding({binding}) var<storage, read_write> output_{index}: array<{dtype}>;"
+            )
+            output_bindings.append(BufferBinding(
+                f"output_{index}", "output", dtype, binding, value_id=value.id,
+            ))
     io_layout = ShaderIOLayout(
         COMPUTE.name, feeds=tuple(feed_bindings), outputs=tuple(output_bindings),
     )
@@ -899,6 +934,8 @@ def emit_module(
         function, outputs=output_values,
         loop_records=_loop_records(ir_module, function_name),
         callees=callees,
+        packed_outputs=packed_outputs,
+        invocation_count=count,
     )
     for position, value in enumerate(function.args):
         dtype = _DTYPE.get(str(value.dtype or "float32").lower(), "f32")
@@ -959,6 +996,11 @@ def emit_module(
                 if packed_feeds else None
             ),
             "outputs": [item.to_mapping() for item in output_bindings],
+            "packed_outputs": bool(packed_outputs),
+            "output_span": (
+                [int(value.id) for value in output_values]
+                if packed_outputs else None
+            ),
             "component_abi": component_abi.to_mapping(),
         },
     )

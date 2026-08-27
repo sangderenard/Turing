@@ -4309,6 +4309,25 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _load_pickle_artifact(path: str | Path) -> Any:
+    """Compose the file-shell and CPython pickle boundaries through bytes.
+
+    A shell file handle is not a Python file object.  Keeping
+    ``pickle.load(stream)`` inside ``with path.open(...)`` therefore leaves an
+    opaque context-manager protocol in compiled loops.  Bytes are the common
+    ABI already owned by both boundaries: the shell reads them and the native
+    ``_pickle.loads`` call consumes them.
+    """
+
+    return pickle.loads(Path(path).read_bytes())
+
+
+def _dump_pickle_artifact(path: str | Path, value: Any) -> None:
+    """Write a pickle through the same bytes-valued shell/native seam."""
+
+    Path(path).write_bytes(pickle.dumps(value, protocol=5))
+
+
 def _dump_resolved_process_graph(graph: Any, stream: Any) -> None:
     """Serialize a reduced graph while preserving importable module bindings.
 
@@ -4947,8 +4966,7 @@ def compile_resolved_process_graph_unit(
             "resolved-unit: loading post-reduction ProcessGraph "
             f"for unit {selected_index}"
         )
-    with resolved_path.open("rb") as stream:
-        graph = pickle.load(stream)
+    graph = _load_pickle_artifact(resolved_path)
     linked_repository_ssa: dict[int, tuple[Any, str, Mapping[str, Any]]] = {}
     linked_unit_receipts = []
     for dependency_index, dependency_root_value in sorted(
@@ -4971,10 +4989,9 @@ def compile_resolved_process_graph_unit(
             str, dependency_receipt.get("exports") or (),
         ))
         artifact = dependency_root / str(dependency_receipt["artifact"])
-        with artifact.open("rb") as stream:
-            dependency_module, dependency_outputs, stored_exports = pickle.load(
-                stream
-            )
+        dependency_module, dependency_outputs, stored_exports = (
+            _load_pickle_artifact(artifact)
+        )
         if dependency_exports != tuple(map(str, stored_exports)):
             raise ValueError(
                 f"resolved unit {int(dependency_index)} export receipt drifted"
@@ -5214,8 +5231,7 @@ def compile_resolved_process_graph_unit(
     detach_repository_ssa_frontend(module)
     artifact_path = root / "repository-ssa.pkl"
     temporary = artifact_path.with_name(artifact_path.name + ".tmp")
-    with temporary.open("wb") as stream:
-        pickle.dump((module, outputs, exports), stream, protocol=5)
+    _dump_pickle_artifact(temporary, (module, outputs, exports))
     os.replace(temporary, artifact_path)
     receipt = {
         "schema": "turing.resolved-process-graph-unit.v1",
@@ -5372,8 +5388,7 @@ def compile_process_graph_subdivision_integral(
         return compile_function_shell(integral)
     if progress is not None:
         progress(f"subdivision: loading {tuple(integral['identity_token_chain'])}")
-    with resolved_path.open("rb") as stream:
-        graph = pickle.load(stream)
+    graph = _load_pickle_artifact(resolved_path)
     from .fortran_c_shell import (
         extract_resolved_process_graph_subdivision_programs,
     )
@@ -5491,8 +5506,7 @@ def compile_process_graph_subdivision_integral(
         )
         artifact_path = root / artifact_name
         temporary = artifact_path.with_name(artifact_path.name + ".tmp")
-        with temporary.open("wb") as stream:
-            pickle.dump((module, outputs, exports), stream, protocol=5)
+        _dump_pickle_artifact(temporary, (module, outputs, exports))
         os.replace(temporary, artifact_path)
         artifact_sha256 = _file_sha256(artifact_path)
         verification = None

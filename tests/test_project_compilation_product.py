@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 import json
 import pickle
 from types import SimpleNamespace
@@ -117,6 +118,29 @@ def test_resolved_unit_refuses_a_stale_compiler_toolchain_plan(tmp_path):
         assert "compiler toolchain changed" in str(error)
     else:
         raise AssertionError("stale compiler plan was accepted")
+
+
+def test_bootstrap_pickle_artifacts_compose_bytes_boundaries_without_with_in_loops(
+    tmp_path,
+):
+    from src.compiler import project_compilation_product as product
+
+    artifact = tmp_path / "artifact.pkl"
+    expected = {"native": [1, 2, 3]}
+    product._dump_pickle_artifact(artifact, expected)
+    assert product._load_pickle_artifact(artifact) == expected
+
+    for function in (
+        product.compile_resolved_process_graph_unit,
+        product.compile_process_graph_subdivision_integral,
+    ):
+        tree = ast.parse(inspect.getsource(function))
+        assert not any(
+            isinstance(descendant, (ast.With, ast.AsyncWith))
+            for loop in ast.walk(tree)
+            if isinstance(loop, (ast.For, ast.AsyncFor, ast.While))
+            for descendant in ast.walk(loop)
+        )
 
 
 def test_empty_subdivision_plan_seals_a_bounded_product(tmp_path):

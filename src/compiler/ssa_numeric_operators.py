@@ -194,6 +194,9 @@ def backend_operator_inventories() -> Mapping[str, frozenset[str]]:
         covered_operations,
     )
     from .fused_program_wasm_backend import supported_tensor_operations as wasm
+    from .javascript_numeric_operators import (
+        supported_javascript_numeric_operations as javascript,
+    )
     from .ssa_fortran_backend import supported_tensor_operations as fortran
     from .ssa_llvm_backend import supported_tensor_operations as llvm
 
@@ -202,11 +205,12 @@ def backend_operator_inventories() -> Mapping[str, frozenset[str]]:
         "llvm": frozenset(llvm()),
         "fortran": frozenset(fortran()),
         "wasm": frozenset(wasm()),
+        "javascript": frozenset(javascript()),
     })
 
 
 def shared_implemented_tensor_operations() -> frozenset[str]:
-    """Canonical operations implemented by all four backend lanes."""
+    """Canonical operations implemented by every registered backend lane."""
 
     inventories = backend_operator_inventories()
     return frozenset.intersection(*inventories.values())

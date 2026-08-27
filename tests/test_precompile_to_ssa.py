@@ -23,7 +23,9 @@ from src.compiler.control_source import (
     overlay_scheduled_control,
 )
 from src.compiler.precompile_to_ssa import (
+    _canonicalize_non_dominating_loop_result_uses,
     _inject_field_slot_access,
+    _install_loop_owned_table_queries,
     _materialize_control_constants,
     ResolvedSequenceSchema,
     find_ssa_cycles,
@@ -1255,6 +1257,83 @@ def test_structural_dependency_chain_delays_early_sequence_mutation():
     )
 
 
+def test_loop_dependency_surface_moves_invariant_producer_before_loop():
+    from src.compiler.hierarchical_plan import PlanClosure
+    from src.compiler.precompile_to_ssa import _schedule_loop_callsites
+
+    consumer = StatementBlock(("__scheduled_region_1__",))
+    loop = LoopBlock("column", "0", "width", "1", SequenceBlock((consumer,)))
+    producer = StatementBlock(("__scheduled_region_0__",))
+
+    scheduled, _bindings = _schedule_loop_callsites(
+        ControlProgram(SequenceBlock((loop, producer))),
+        PlanClosure("root", (), ()),
+        {
+            0: ((2, 9), (13, 16)),
+            1: ((13, 16, 34), (35,)),
+        },
+    )
+
+    assert scheduled.root.blocks == (producer, loop)
+
+
+def test_keyed_read_is_installed_only_under_its_exact_source_loop():
+    loop = LoopBlock(
+        "iteration_432",
+        "0",
+        "4",
+        "1",
+        StatementBlock(("__scheduled_region_0__",)),
+        source_loop_node_id=432,
+    )
+    control = ControlProgram(loop, region_indices=(0,))
+
+    rewritten, installed, refusals = _install_loop_owned_table_queries(
+        control,
+        ((348, 26, 322),),
+        {26: 432},
+    )
+
+    assert installed == (348,)
+    assert refusals == ()
+    assert isinstance(rewritten.root, LoopBlock)
+    assert isinstance(rewritten.root.body, SequenceBlock)
+    query, original = rewritten.root.body.blocks
+    assert query == SequenceQueryBlock(
+        result_value_id=348,
+        sequence_value_id=322,
+        operation="lookup",
+        source_call_node_id=348,
+        producer_loop_node_id=432,
+        key_value_ids=(26,),
+    )
+    assert original is loop.body
+
+
+def test_while_dependency_surface_moves_invariant_producer_before_loop():
+    from src.compiler.hierarchical_plan import PlanClosure
+    from src.compiler.precompile_to_ssa import _schedule_loop_callsites
+
+    consumer = StatementBlock(("__scheduled_region_1__",))
+    loop = WhileBlock(
+        predicate_value_id=10,
+        condition=SequenceBlock(()),
+        body=consumer,
+    )
+    producer = StatementBlock(("__scheduled_region_0__",))
+
+    scheduled, _bindings = _schedule_loop_callsites(
+        ControlProgram(SequenceBlock((loop, producer))),
+        PlanClosure("root", (), ()),
+        {
+            0: ((2,), (13,)),
+            1: ((13,), (14,)),
+        },
+    )
+
+    assert scheduled.root.blocks == (producer, loop)
+
+
 def test_joined_generator_singleton_appends_scalar_without_temporary_sequence():
     from src.compiler.control_source import (
         ControlProgram, ControlSequenceMutation, LoopBlock, SequenceBlock,
@@ -1681,6 +1760,97 @@ def test_nested_loop_final_value_drives_enclosing_carried_phi():
     )
 
 
+def test_nested_loop_inner_result_port_rebinds_to_enclosing_exit():
+    inner = LoopBlock(
+        "inner",
+        "0",
+        "4",
+        "1",
+        StatementBlock(("__scheduled_region_3__",)),
+        carried_aliases=((20, 10),),
+        result_ports=((30, 10, 20),),
+    )
+    outer = LoopBlock(
+        "outer",
+        "0",
+        "4",
+        "1",
+        inner,
+        carried_aliases=((20, 10),),
+        result_ports=((40, 10, 20),),
+    )
+    control = ControlProgram(
+        SequenceBlock((outer, StatementBlock(("__scheduled_region_4__",)))),
+        region_indices=(3, 4),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_signatures={
+            3: ((10,), (20,)),
+            4: ((30,), (50,)),
+        },
+    )
+
+    assert shortfalls == ()
+    outer_result = next(
+        instruction.res
+        for instruction in function.blocks["loop_exit"].instrs
+        if instruction.attributes.get("binding") == "loop_result_port"
+    )
+    post_loop_call = next(
+        instruction
+        for instruction in function.blocks["loop_exit"].instrs
+        if instruction.attributes.get("region_index") == 4
+    )
+    assert outer_result.id == 40
+    assert post_loop_call.args == [outer_result]
+    assert function.metadata["carried_port_values"][30] is outer_result
+
+
+def test_stale_inner_loop_result_is_rebound_only_when_outer_phi_dominates():
+    seed = SSAValue(10, dtype="float64")
+    predicate = SSAValue(11, dtype="bool")
+    inner_result = SSAValue(30, dtype="float64")
+    outer_result = SSAValue(40, dtype="float64")
+    comparison = SSAValue(50, dtype="bool")
+    function = Function(
+        "nested_result_dominance",
+        [seed, predicate],
+        {
+            "entry": BasicBlock("entry", [
+                Instr("Br", [], None, attributes={"target": "header"}),
+            ], successors=["header"]),
+            "header": BasicBlock("header", [
+                Instr("CondBr", [predicate], None, attributes={
+                    "true_target": "body", "false_target": "exit",
+                }),
+            ], successors=["body", "exit"]),
+            "body": BasicBlock("body", [
+                Instr("Cast", [seed], inner_result),
+                Instr("Br", [], None, attributes={"target": "header"}),
+            ], successors=["header"]),
+            "exit": BasicBlock("exit", [
+                Instr("Phi", [seed], outer_result, attributes={
+                    "incoming_blocks": ("header",),
+                }),
+                # Repository composition may reconstruct value wrappers while
+                # preserving their exact numeric SSA identity.
+                Instr("Eq", [SSAValue(30, dtype="float64"), seed], comparison),
+                Instr("Ret", [comparison], None),
+            ]),
+        },
+        metadata={"carried_port_values": {30: outer_result, 40: outer_result}},
+    )
+
+    receipts = _canonicalize_non_dominating_loop_result_uses(function)
+
+    assert receipts == (("exit", 1, 0, 30, 40),)
+    assert function.blocks["exit"].instrs[1].args[0] is outer_result
+    assert function.blocks["body"].instrs[0].args[0] is seed
+
+
 def test_dynamic_arithmetic_loop_bound_lowers_to_ssa_values():
     control = ControlProgram(
         LoopBlock(
@@ -1930,6 +2100,114 @@ def test_condition_loop_break_and_switch_default_lower_to_cfg_ssa():
     assert function.metadata["recursion_table"][4]["loops"][0][
         "domain"
     ] == "condition"
+
+
+def test_while_result_port_is_an_exact_exit_phi():
+    control = ControlProgram(
+        WhileBlock(
+            predicate_value_id=10,
+            condition=StatementBlock(("__scheduled_region_0__",)),
+            body=StatementBlock(("__scheduled_region_1__",)),
+            carried_aliases=((2, 1),),
+            result_ports=((3, 1, 2),),
+        ),
+        region_indices=(0, 1),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_signatures={
+            0: ((1,), (10,)),
+            1: ((1,), (2,)),
+        },
+    )
+
+    assert shortfalls == ()
+    result_phi = next(
+        instruction
+        for instruction in function.blocks["while_exit"].instrs
+        if instruction.attributes.get("binding") == "loop_result_port"
+    )
+    assert result_phi.res.id == 3
+    assert result_phi.attributes["incoming_blocks"] == ("while_header",)
+    assert function.metadata["carried_port_values"][3] is result_phi.res
+    assert function.metadata["carried_port_values"][3].accounting[
+        "carried_port_ids"
+    ] == (3,)
+    assert 3 not in {argument.id for argument in function.args}
+
+
+def test_while_result_port_selects_the_value_visible_on_a_break_edge():
+    control = ControlProgram(
+        WhileBlock(
+            predicate_value_id=10,
+            condition=StatementBlock(("__scheduled_region_0__",)),
+            body=SequenceBlock((
+                StatementBlock(("__scheduled_region_1__",)),
+                LoopControlBlock("break"),
+            )),
+            carried_aliases=((2, 1),),
+            result_ports=((3, 1, 2),),
+        ),
+        region_indices=(0, 1),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_signatures={
+            0: ((1,), (10,)),
+            1: ((1,), (2,)),
+        },
+    )
+
+    assert shortfalls == ()
+    result_phi = next(
+        instruction
+        for instruction in function.blocks["while_exit"].instrs
+        if instruction.attributes.get("binding") == "loop_result_port"
+    )
+    assert result_phi.res.id == 3
+    assert result_phi.args[1].id == 2
+    assert result_phi.attributes["incoming_blocks"] == (
+        "while_header", "while_body",
+    )
+
+
+def test_while_break_does_not_capture_a_later_carried_update():
+    control = ControlProgram(
+        WhileBlock(
+            predicate_value_id=10,
+            condition=StatementBlock(("__scheduled_region_0__",)),
+            body=SequenceBlock((
+                LoopControlBlock("break", predicate_value_id=11),
+                StatementBlock(("__scheduled_region_1__",)),
+            )),
+            carried_aliases=((2, 1),),
+            result_ports=((3, 1, 2),),
+        ),
+        region_indices=(0, 1),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_signatures={
+            0: ((1,), (10,)),
+            1: ((1,), (2,)),
+        },
+    )
+
+    assert shortfalls == ()
+    carried_phi = next(
+        instruction
+        for instruction in function.blocks["while_header"].instrs
+        if instruction.attributes.get("binding") == "loop_carried"
+    )
+    result_phi = next(
+        instruction
+        for instruction in function.blocks["while_exit"].instrs
+        if instruction.attributes.get("binding") == "loop_result_port"
+    )
+    assert result_phi.args[1] is carried_phi.res
 
 
 def test_terminal_loop_return_runs_after_predicated_sequence_effects():

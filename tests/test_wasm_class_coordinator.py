@@ -443,3 +443,30 @@ def test_wasm_control_coordinator_runs_resident_condition_loop(tmp_path):
         capture_output=True, text=True, check=True,
     )
     assert float(completed.stdout) == 8.0
+
+
+def test_control_region_state_value_uses_contract_input_name_before_inventory():
+    program = FusedProgram(
+        version=1,
+        feeds={4},
+        steps=[OpStep(0, "add", [4], {"right_scalar": 0.05}, 5)],
+        outputs={"next_phase": 5},
+    )
+    control = ControlProgram(
+        StatementBlock(("__scheduled_region_0__",)),
+        region_indices=(0,),
+    )
+
+    _modules, manifest = emit_control_region_modules(
+        control,
+        {0: program},
+        owner_name="step",
+        module_dir=".",
+        logical_input_names={4: "phase"},
+    )
+    output_key = f"out::{manifest['modules'][0]['name']}::next_phase"
+    manifest["storage_redirects"] = {"in::phase": output_key}
+
+    assert set(manifest["logical_inputs"]) == {"phase"}
+    inventory = build_class_inventory(manifest)
+    assert [field.key for field in inventory.fields] == [output_key]

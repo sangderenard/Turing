@@ -141,6 +141,15 @@ _NAMED_FUNCTIONS = frozenset(
 )
 
 
+def supported_elementwise_operations() -> frozenset[str]:
+    """Elementwise operations the Python fidelity oracle can really lower."""
+
+    return frozenset(
+        (set(_ELEMENTWISE_TEMPLATES) | set(_NAMED_FUNCTIONS))
+        & (ELEMENTWISE_UNARY | ELEMENTWISE_BINARY)
+    )
+
+
 def _dialect_namespace(dialect: Dialect) -> dict[str, Any]:
     """Bind whatever bare name a dialect's emitted calls reference.
 
@@ -397,4 +406,5 @@ __all__ = [
     "compile_single_region_python",
     "lower_fused_program_region",
     "region_source_lines",
+    "supported_elementwise_operations",
 ]

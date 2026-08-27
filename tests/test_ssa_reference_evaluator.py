@@ -65,6 +65,23 @@ def test_unknown_instruction_raises_rather_than_guessing():
         SSAReferenceEvaluator(_Module()).run("f", {0: 1.0})
 
 
+def test_none_value_evaluates_as_absence_not_a_numeric_sentinel():
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    absent = SSAValue(1, dtype="none")
+    block = BasicBlock("entry", [
+        Instr("NoneValue", [], absent),
+        Instr("Ret", [absent], None),
+    ])
+
+    class _Module:
+        functions = {"f": Function("f", [], {"entry": block})}
+
+    evaluated = SSAReferenceEvaluator(_Module()).run("f", {})
+
+    assert evaluated.returned == (None,)
+
+
 def test_scalar_bit_shift_uses_the_planners_canonical_spelling():
     from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
 

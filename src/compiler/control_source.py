@@ -14,6 +14,26 @@ from typing import Any, Iterable, Mapping
 from .deployment_frame import DeploymentFrame, DeploymentJoin
 
 
+class ControlOverlayScopeError(ValueError):
+    """One control body has region markers in several insertion scopes."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        control_index: int,
+        region_indices: Iterable[int],
+        scopes: Mapping[tuple[str, ...], Iterable[int]],
+    ) -> None:
+        super().__init__(message)
+        self.control_index = int(control_index)
+        self.region_indices = tuple(sorted(map(int, region_indices)))
+        self.scopes = {
+            tuple(map(str, scope)): tuple(sorted(map(int, regions)))
+            for scope, regions in scopes.items()
+        }
+
+
 class ControlTarget(str, Enum):
     PYTHON = "python"
     C = "c"
@@ -331,16 +351,24 @@ class SequenceQueryBlock:
     extraction_identity: str | None = None
     result_alias_ids: tuple[int, ...] = ()
     producer_loop_node_id: int | None = None
+    # Exact authored key identities for a resident keyed-table read.  These
+    # are defined at this lexical position (often by a loop projection), so a
+    # backend must not hoist the lookup to function entry.
+    key_value_ids: tuple[int, ...] = ()
     # A first-or-default query over a derived record sequence yields a tagged
     # integer row handle.  The default arm uses -1 and subsequent source
     # ``is [not] None`` tests consume that tag.
     row_handle: bool = False
 
     def __post_init__(self) -> None:
-        if self.operation not in {"length", "first_or_default"}:
+        if self.operation not in {
+            "length", "first_or_default", "lookup",
+        }:
             raise ValueError("unknown resident sequence query")
         if self.operation == "first_or_default" and self.default_value_id is None:
             raise ValueError("first_or_default requires an explicit default")
+        if self.operation == "lookup" and not self.key_value_ids:
+            raise ValueError("lookup requires at least one exact key identity")
 
 
 @dataclass(frozen=True)
@@ -487,6 +515,7 @@ def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[in
             values.add(int(block.result_value_id))
             values.update(int(value_id) for value_id in block.result_alias_ids)
             values.add(int(block.sequence_value_id))
+            values.update(int(value_id) for value_id in block.key_value_ids)
             if block.default_value_id is not None:
                 values.add(int(block.default_value_id))
         elif isinstance(block, StreamPublishBlock):
@@ -876,6 +905,15 @@ def render_control_block(
             return (
                 f"value_{int(block.result_value_id)} = "
                 f"turing_sequence_length(value_{int(block.sequence_value_id)});",
+            )
+        if block.operation == "lookup":
+            keys = ", ".join(
+                f"value_{int(value_id)}" for value_id in block.key_value_ids
+            )
+            return (
+                f"value_{int(block.result_value_id)} = "
+                f"turing_sequence_lookup(value_{int(block.sequence_value_id)}, "
+                f"{keys});",
             )
         return (
             f"value_{int(block.result_value_id)} = "
@@ -1536,9 +1574,6 @@ def overlay_scheduled_control(
     deployment_regions = []
     specialized_conditional_node_ids = []
     controls = tuple(controls)
-    controlled_sets = tuple(
-        frozenset(control.region_indices) for control in controls
-    )
     direct_children = {
         int(parent): frozenset(int(child) for child in children)
         for parent, children in (known_nesting or {}).items()
@@ -1547,6 +1582,78 @@ def overlay_scheduled_control(
         child
         for children in direct_children.values()
         for child in children
+    )
+
+    # A predicate-producing numerical region is a dataflow predecessor, not
+    # private syntax owned by one branch. Two sibling structural conditionals
+    # can consequently name the same predicate region plus distinct later
+    # regions. The shared marker must remain once in the flat dependency
+    # schedule; embedding either complete control would otherwise duplicate
+    # it, while treating the siblings as nested would invent source structure.
+    # Hoist only a marker proven to be a direct Sequence prelude in every
+    # claimant. Anything inside a loop/arm remains a real cross-scope overlap
+    # and is still refused below.
+    initial_sets = tuple(
+        frozenset(control.region_indices) for control in controls
+    )
+    claims = {
+        region: tuple(
+            index for index, regions in enumerate(initial_sets)
+            if region in regions
+        )
+        for region in set().union(*initial_sets) if initial_sets
+    }
+
+    def declared_nested(left: int, right: int) -> bool:
+        return (
+            left in direct_children.get(right, ())
+            or right in direct_children.get(left, ())
+            or initial_sets[left] < initial_sets[right]
+            or initial_sets[right] < initial_sets[left]
+        )
+
+    hoisted = set()
+    for region, owners in claims.items():
+        if len(owners) < 2 or all(
+            declared_nested(left, right)
+            for offset, left in enumerate(owners)
+            for right in owners[offset + 1:]
+        ):
+            continue
+        if all(
+            isinstance(controls[index].root, SequenceBlock)
+            and any(
+                isinstance(block, StatementBlock)
+                and _region_marker(block) == region
+                for block in controls[index].root.blocks
+            )
+            for index in owners
+        ):
+            hoisted.add(region)
+    if hoisted:
+        rewritten = []
+        for control in controls:
+            root = control.root
+            if isinstance(root, SequenceBlock):
+                root = SequenceBlock(tuple(
+                    block for block in root.blocks
+                    if not (
+                        isinstance(block, StatementBlock)
+                        and _region_marker(block) in hoisted
+                    )
+                ))
+            rewritten.append(replace(
+                control,
+                root=root,
+                region_indices=tuple(
+                    region for region in control.region_indices
+                    if region not in hoisted
+                ),
+            ))
+        controls = tuple(rewritten)
+
+    controlled_sets = tuple(
+        frozenset(control.region_indices) for control in controls
     )
 
     def _nested_in(child: int, parent: int) -> bool:
@@ -1760,7 +1867,7 @@ def overlay_scheduled_control(
                 by_scope: dict[tuple[str, ...], list[int]] = {}
                 for region, scope in scope_paths.items():
                     by_scope.setdefault(scope, []).append(region)
-                raise ValueError(
+                message = (
                     "nested control's regions span "
                     f"{len(distinct_scopes)} sequence scopes of the parent "
                     f"(control index {child}, regions "
@@ -1773,6 +1880,12 @@ def overlay_scheduled_control(
                     "disagree about where these regions live; embed "
                     "cannot insert one planner-owned control body into "
                     "more than one scope."
+                )
+                raise ControlOverlayScopeError(
+                    message,
+                    control_index=child,
+                    region_indices=child_regions,
+                    scopes=by_scope,
                 )
             root, consumed = embed(
                 root,
@@ -1833,9 +1946,21 @@ def overlay_scheduled_control(
             continue
         overlap = set(controlled) & covered
         if overlap:
+            previous = [
+                {
+                    "index": other,
+                    "regions": tuple(controls[other].region_indices),
+                    "root": type(controls[other].root).__name__,
+                }
+                for other in maximal
+                if other != index
+                and set(controls[other].region_indices) & set(controlled)
+            ]
             raise ValueError(
                 "maximal control blocks overlap without containment: "
-                f"overlap={sorted(overlap)!r}"
+                f"overlap={sorted(overlap)!r}; current={{'index': {index}, "
+                f"'regions': {controlled!r}, 'root': "
+                f"{type(control.root).__name__!r}}}; previous={previous!r}"
             )
         first = min(controlled, key=positions.__getitem__)
         replacements[first] = nested_root(index)

@@ -261,6 +261,31 @@ def test_overlay_uses_known_nesting_for_equal_region_sets():
     assert outer_root.body.induction == "iteration_2"
 
 
+def test_overlay_hoists_a_predicate_region_shared_by_sibling_controls():
+    left = ControlProgram(
+        SequenceBlock((
+            StatementBlock(("__scheduled_region_10__",)),
+            StatementBlock(("__scheduled_region_11__",)),
+        )),
+        region_indices=(10, 11),
+    )
+    right = ControlProgram(
+        SequenceBlock((
+            StatementBlock(("__scheduled_region_10__",)),
+            StatementBlock(("__scheduled_region_12__",)),
+        )),
+        region_indices=(10, 12),
+    )
+
+    overlaid = overlay_scheduled_control((10, 11, 12), (left, right))
+
+    assert isinstance(overlaid.root, SequenceBlock)
+    rendered = render_control_program(overlaid, ControlTarget.C)
+    assert rendered.count("__scheduled_region_10__") == 1
+    assert rendered.count("__scheduled_region_11__") == 1
+    assert rendered.count("__scheduled_region_12__") == 1
+
+
 def test_loop_nesting_hints_fall_back_to_unprojected_control_tree():
     inner_loop = LoopBlock(
         "iteration_2",

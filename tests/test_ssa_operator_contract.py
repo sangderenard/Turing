@@ -17,7 +17,7 @@ from src.transmogrifier.ssa_registry import Handler
 
 
 def test_contract_contains_every_repository_and_tensor_operator():
-    assert len(REPOSITORY_SSA_OPERATORS) == len(Handler) == 117
+    assert len(REPOSITORY_SSA_OPERATORS) == len(Handler) == 119
     assert {row.handler for row in REPOSITORY_SSA_OPERATORS} == set(Handler)
     # 225, not the 223 this line was born with: the assertion was written in
     # the same commit that added ``cast_like`` and never counted it, and
@@ -50,7 +50,7 @@ def test_numeric_view_is_derived_from_the_complete_elementwise_catalogue():
 
 def test_each_backend_keeps_its_own_operator_inventory():
     inventories = backend_operator_inventories()
-    assert set(inventories) == {"c", "llvm", "fortran", "wasm"}
+    assert set(inventories) == {"c", "llvm", "fortran", "wasm", "javascript"}
     assert all(inventories.values())
     assert len({len(operations) for operations in inventories.values()}) > 1
     # Backend-private primitives are legitimate vocabulary too; they are not

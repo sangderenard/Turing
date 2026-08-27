@@ -230,3 +230,32 @@ def test_exact_contracts_forbid_the_private_sqrt_spellings():
         assert wasm_deploy.complete, wasm_deploy.shortfalls
     finally:
         set_active_contract(None)
+
+
+def test_wasm_reciprocal_sqrt_is_an_explicit_deploy_identity():
+    base = SSAValue(20, "float64")
+    exponent = SSAValue(21, "float64")
+    result = SSAValue(22, "float64")
+    function = Function(
+        "reciprocal_sqrt_kernel",
+        [base],
+        {"entry": BasicBlock("entry", [
+            Instr("Const", [], exponent, attributes={"constant": -0.5}),
+            Instr("Pow", [base, exponent], result),
+            Instr("Ret", [result], None),
+        ])},
+        metadata={"argument_names": ("base",), "output_names": ("result",)},
+    )
+    module = IRModule({function.name: function})
+
+    set_active_contract("develop")
+    try:
+        exact = emit_ssa_function_to_wasm(module, function.name)
+        deployed = emit_ssa_function_to_wasm(
+            module, function.name, work_contract="deploy",
+        )
+        assert not exact.complete
+        assert deployed.complete, deployed.shortfalls
+        assert "f64.sqrt f64.div" in deployed.wat
+    finally:
+        set_active_contract(None)

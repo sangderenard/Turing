@@ -758,6 +758,14 @@ class _FunctionEmitter:
             )
             return
 
+        if op in ("NoneValue", "nonevalue"):
+            self._shortfall(
+                op, block.name,
+                "SPIR-V shader values have no untyped absence value; lower "
+                "an optional to explicit presence and payload values first",
+            )
+            return
+
         result_dtype = instr.res.dtype or self.dtype
         result_shape = tuple(int(size) for size in instr.res.shape)
         elem_type = self.builder.scalar_type(result_dtype)

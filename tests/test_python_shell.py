@@ -18,6 +18,7 @@ from src.compiler.ssa_self_check import (
     check_formal_parity,
     check_id_scale,
     check_output_contract_agreement,
+    check_record_sequence_rows,
     run_all,
     suspicious_loop_invariant_formals,
 )
@@ -162,6 +163,34 @@ def test_the_formal_collision_is_caught_statically():
     assert "no caller can know" in findings[0].detail
 
 
+def test_schema_fields_and_declared_workspace_are_accounted_formals():
+    from src.transmogrifier.ssa import BasicBlock, Function, SSAValue
+
+    source = SSAValue(0)
+    field = SSAValue(5, accounting={
+        "program_abi_parameter": "state",
+        "program_abi_field": "height",
+    })
+    workspace = SSAValue(6, accounting={
+        "linked_call_frame_storage": "child",
+    })
+
+    class _Module:
+        functions = {
+            "f": Function(
+                "f",
+                [source, field, workspace],
+                {"entry": BasicBlock("entry", [])},
+                metadata={
+                    "parameter_names": (("x", 0),),
+                    "storage_formals": ({"value_id": 6},),
+                },
+            )
+        }
+
+    assert check_formal_parity(_Module()) == []
+
+
 def test_the_previously_colliding_program_now_passes_the_check():
     """The scheduler fix, held from the static side as well."""
 
@@ -209,6 +238,28 @@ def test_disagreeing_output_contracts_are_a_finding():
 
     findings = check_output_contract_agreement(_Module())
     assert findings and "another call site projects" in findings[0].detail
+
+
+def test_unexpanded_record_sequence_row_is_a_hard_finding():
+    from src.transmogrifier.ssa import BasicBlock, Function
+
+    class _Module:
+        functions = {
+            "f": Function(
+                "f", [], {"entry": BasicBlock("entry", [])},
+                metadata={"unresolved_record_sequence_rows": ({
+                    "sequence_id": 7,
+                    "record_value_id": 11,
+                    "record_identity": "Metrics",
+                    "reason": "record layout has 13 columns, expected 14",
+                },)},
+            )
+        }
+
+    findings = check_record_sequence_rows(_Module())
+    assert len(findings) == 1
+    assert findings[0].check == "record_sequence_row"
+    assert "must not cross the helper ABI" in findings[0].detail
 
 
 def test_loop_invariant_formals_are_candidates_not_convictions(loop_shell):

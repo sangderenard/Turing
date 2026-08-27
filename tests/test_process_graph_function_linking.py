@@ -7,7 +7,7 @@ from pathlib import Path
 import sympy
 
 from src.common.tensors.topological_reducer import reduce_abstract_tensor_topology
-from src.common.dt_system.dt_scaler import Metrics
+from src.common.dt_system.dt_scaler import Metrics, coerce_metrics
 from src.compiler.process_graph_function_linking import link_process_graph_functions
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.symbolic_equation_compiler import compile_sympy_equations
@@ -298,7 +298,8 @@ def test_direct_source_lowers_declared_record_literal_and_bool_return():
     assert metrics.record_id in layouts
     assert len(outputs[root.name]) == 1 + len(layouts[metrics.record_id])
     assert any(
-        instruction.op == "LAnd"
+        instruction.op in {"LAnd", "Select"}
+        and instruction.attributes.get("semantic_family") == "logical_and"
         for block in root.blocks.values()
         for instruction in block.instrs
     )
@@ -348,6 +349,7 @@ def test_record_return_call_refreshes_completed_physical_field_surface():
     for child_output, caller_output_id in zip(
         child_outputs, linked.attributes["output_ids"]
     ):
+        assert projections[int(caller_output_id)].id == int(caller_output_id)
         assert projections[int(caller_output_id)].dtype == child_output.dtype
     record = next(iter(module.call_table[root.name]))
     assert record.resolution == "native_call"
@@ -417,6 +419,59 @@ def test_record_parameter_call_uses_fields_without_python_receiver_handle():
     assert len(linked.args) == len(callee.args)
 
 
+def test_late_record_result_rebinds_aliased_fields_in_following_call_frame():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def make_metrics(value):\n"
+        "    return Metrics(max_vel=value, max_flux=value, div_inf=0.0, "
+        "mass_err=0.0)\n\n"
+        "def read_metrics(metrics):\n"
+        "    return metrics.max_vel + metrics.max_flux\n\n"
+        "def root(value):\n"
+        "    metrics = make_metrics(value)\n"
+        "    return read_metrics(metrics)\n",
+        "root",
+        name="late_record_alias_frame",
+        python_bindings={"Metrics": Metrics},
+        extraction_contract=CONTRACT,
+    )
+
+    root = module.functions["late_record_alias_frame__root"]
+    read = module.functions["late_record_alias_frame__read_metrics"]
+    read_record = next(
+        descriptor
+        for descriptor in module.record_tables[read.name].records.values()
+        if descriptor.identity.endswith(".Metrics")
+    )
+    fields = {field.name: field for field in read_record.fields}
+    frame = next(
+        record
+        for record in module.call_table[root.name]
+        if record.callee_symbol == read.name
+    )
+    physical = {
+        int(callee_id): int(caller_id)
+        for callee_id, kind, caller_id in frame.frame_bindings
+        if kind == "caller_storage"
+    }
+
+    assert physical[fields["max_vel"].value_ids[0]] == physical[
+        fields["max_flux"].value_ids[0]
+    ]
+    assert max(
+        int(value.id)
+        for function in module.functions.values()
+        for value in (
+            *function.args,
+            *(
+                instruction.res
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.res is not None
+            ),
+        )
+    ) < 1_000_000_000
+
+
 def test_forwarded_record_parameter_reuses_only_demanded_caller_field_storage():
     module, _outputs, _exports = lower_ast_source_to_ssa(
         "def child(state):\n"
@@ -453,6 +508,81 @@ def test_forwarded_record_parameter_reuses_only_demanded_caller_field_storage():
         if argument.id in child_dx.value_ids
     )
     assert linked.args[child_dx_index].id in root_dx.value_ids
+
+
+def test_nested_record_forwarding_retries_outer_call_after_inner_linking():
+    module, outputs, _exports = lower_ast_source_to_ssa(
+        "def leaf(state):\n"
+        "    return state.dx + 1.0\n\n"
+        "def middle(state):\n"
+        "    return leaf(state)\n\n"
+        "def root(state):\n"
+        "    return middle(state)\n",
+        "root",
+        name="nested_record_forwarding",
+        extraction_contract=CONTRACT,
+    )
+
+    for name in (
+        "nested_record_forwarding__middle",
+        "nested_record_forwarding__root",
+    ):
+        function = module.functions[name]
+        calls = tuple(module.call_table[name])
+        assert len(calls) == 1
+        assert calls[0].resolution == "native_call"
+        assert not function.metadata.get("unresolved_call_diagnostics")
+        assert any(
+            instruction.op == "Call"
+            for block in function.blocks.values()
+            for instruction in block.instrs
+        )
+        assert outputs[name]
+
+
+def test_post_loop_call_uses_the_exact_break_aware_loop_result_port():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def step(value):\n"
+        "    return value, value, value\n\n"
+        "def root(limit, value, boundaries):\n"
+        "    total = 0.0\n"
+        "    second = value\n"
+        "    while total < limit:\n"
+        "        current = value\n"
+        "        for boundary in boundaries:\n"
+        "            if boundary > total:\n"
+        "                current = boundary - total\n"
+        "                break\n"
+        "        first, second, used = step(current)\n"
+        "        if used <= 0:\n"
+        "            break\n"
+        "        total += used\n"
+        "    return total, second\n",
+        "root",
+        name="break_aware_loop_call",
+    )
+
+    root = module.functions["break_aware_loop_call__root"]
+    linked = next(
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("callee")
+        == "break_aware_loop_call__step"
+    )
+    loop_result = next(
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "loop_result_port"
+        and instruction.res is linked.args[0]
+    )
+
+    assert loop_result.res.id == linked.args[0].id
+    assert len(loop_result.args) == 2
+    assert not root.metadata.get("unresolved_call_diagnostics")
+    assert not root.metadata.get("structural_output_shortfalls")
 
 
 def test_structural_boolean_call_feed_is_materialized_before_linking():
@@ -547,6 +677,136 @@ def test_keyed_mapping_lowers_to_token_and_value_vectors():
     assert accounting["program_abi_keyed_values"] == slots[
         "error_channels.values"
     ].id
+    assert max(int(value.id) for value in root.args) < 1_000_000_000
+
+
+def test_dynamic_dict_literal_is_populated_and_returned_with_its_record():
+    module, outputs, _exports = lower_ast_source_to_ssa(
+        "def root(value):\n"
+        "    return Metrics(max_vel=value, max_flux=value, div_inf=0.0, "
+        "mass_err=0.0, error_channels={'residual': value})\n",
+        "root",
+        name="dynamic_keyed_record_literal",
+        python_bindings={"Metrics": Metrics},
+        extraction_contract=CONTRACT,
+    )
+
+    root = module.functions["dynamic_keyed_record_literal__root"]
+    record = next(iter(module.record_tables[root.name].records.values()))
+    keyed = {
+        field.name: field
+        for field in record.fields
+        if field.name.startswith("error_channels.")
+    }
+    assert set(keyed) == {
+        "error_channels.length",
+        "error_channels.keys",
+        "error_channels.values",
+    }
+    returned_ids = {int(value.id) for value in outputs[root.name]}
+    assert {
+        int(field.value_ids[0]) for field in keyed.values()
+    }.issubset(returned_ids)
+    assert any(
+        instruction.op == "Call"
+        and instruction.attributes.get("ssa_sequence_operation") == "add"
+        for block in root.blocks.values()
+        for instruction in block.instrs
+    )
+    assert max(
+        int(value.id)
+        for value in (
+            *root.args,
+            *(
+                instruction.res
+                for block in root.blocks.values()
+                for instruction in block.instrs
+                if instruction.res is not None
+            ),
+        )
+    ) < 1_000_000_000
+
+
+def test_linked_record_type_guard_prunes_terminal_normalization_tail():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def root(value):\n"
+        "    metrics = Metrics(max_vel=value, max_flux=value, div_inf=0.0, "
+        "mass_err=0.0)\n"
+        "    return coerce_metrics(metrics)\n",
+        "root",
+        name="linked_record_type_guard",
+        python_bindings={
+            "Metrics": Metrics,
+            "coerce_metrics": coerce_metrics,
+        },
+        extraction_contract=CONTRACT,
+    )
+
+    callee = module.functions[
+        "linked_record_type_guard__coerce_metrics"
+    ]
+    assert tuple(module.record_tables[callee.name].records) == ()
+    returned = next(
+        instruction.args
+        for block in callee.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret"
+    )
+    assert len(returned) == 1
+
+
+def test_present_physical_record_field_folds_identity_with_none():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def choose(state):\n"
+        "    floor = state.dx if state.dx is not None else 1.0\n"
+        "    return floor + 0.0\n\n"
+        "def root(state):\n"
+        "    return choose(state)\n",
+        "root",
+        name="physical_field_none_guard",
+        extraction_contract=CONTRACT,
+    )
+
+    root = module.functions["physical_field_none_guard__choose"]
+    floor_id = next(
+        int(value_id)
+        for name, value_id in root.metadata.get("value_names", ())
+        if name == "floor"
+    )
+    floor_argument = next(
+        argument for argument in root.args if int(argument.id) == floor_id
+    )
+    assert (floor_argument.accounting or {})["program_abi_field"] == "dx"
+
+
+def test_selected_branch_value_replaces_external_merge_placeholder():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def choose(state, osc):\n"
+        "    if state.dx is not None:\n"
+        "        floor_t = state.dx + 0.0\n"
+        "    value = state.dx\n"
+        "    if osc:\n"
+        "        value = value + floor_t\n"
+        "    return value\n\n"
+        "def root(state, osc):\n"
+        "    return choose(state, osc)\n",
+        "root",
+        name="selected_branch_placeholder",
+        extraction_contract=CONTRACT,
+    )
+
+    choose = module.functions["selected_branch_placeholder__choose"]
+    floor_ids = tuple(
+        int(value_id)
+        for name, value_id in choose.metadata.get("value_names", ())
+        if name == "floor_t"
+    )
+    assert floor_ids
+    assert not any(
+        int(argument.id) == floor_ids[-1]
+        and not (argument.accounting or {}).get("program_abi_parameter")
+        for argument in choose.args
+    )
 
 
 def test_mapping_iteration_walks_its_own_key_and_value_vectors():
@@ -659,19 +919,23 @@ def test_comprehension_element_is_evaluated_inside_its_own_loop():
     ]
     assert consumers, "the loaded element has no consumer in the loop body"
 
-    # ... and that work is the element expression's own region.
-    region_call = next(
+    # ... and that work is the element expression itself, either retained as
+    # direct loop-local control SSA or enclosed by its numerical region.
+    direct = [instruction for instruction in consumers if instruction.op == "Gt"]
+    region_calls = [
         instruction for instruction in consumers
         if instruction.op == "Call"
         and "planned_region" in str(instruction.attributes.get("callee", ""))
-    )
-    region = module.functions[str(region_call.attributes["callee"])]
-    region_ops = [
-        instruction.op
-        for block in region.blocks.values()
-        for instruction in block.instrs
     ]
-    assert "Cast" in region_ops and "Gt" in region_ops
+    assert direct or region_calls
+    if region_calls:
+        region = module.functions[str(region_calls[0].attributes["callee"])]
+        region_ops = [
+            instruction.op
+            for block in region.blocks.values()
+            for instruction in block.instrs
+        ]
+        assert "Gt" in region_ops
 
     # Nothing in the element expression is left as a pre-loop argument.
     entry = root.blocks["entry"]
@@ -710,10 +974,10 @@ def test_comprehension_reduction_reads_the_collection_the_loop_publishes():
     ]
     publication = next(
         instruction for instruction in instructions
-        if instruction.attributes.get("binding") == "collection_publication"
-        and instruction.op == "GetElementPtr"
+        if instruction.op == "Call"
+        and instruction.attributes.get("ssa_sequence_operation") == "append"
     )
-    collection_id = int(publication.attributes["collection_value_id"])
+    collection_id = int(publication.attributes["sequence_id"])
 
     def reduces(callee_name: str) -> bool:
         callee = module.functions.get(callee_name)
@@ -884,6 +1148,11 @@ def test_loop_carried_call_record_is_expanded_on_public_return():
     assert len(returned) == 1 + len(next(iter(layouts.values())))
     assert outputs[root.name] == tuple(returned)
     assert not root.metadata.get("unresolved_call_diagnostics")
+    assert not any(
+        instruction.attributes.get("plan_callsite_marker")
+        for block in root.blocks.values()
+        for instruction in block.instrs
+    )
 
 
 def test_specialized_function_argument_is_erased_from_runtime_frame():

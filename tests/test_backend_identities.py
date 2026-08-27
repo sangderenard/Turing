@@ -212,6 +212,45 @@ def test_process_graph_gemm_swaps_to_the_custom_webgpu_kernel_intrinsic():
     assert lowered.op == "Call"  # universal repository SSA is unchanged
 
 
+def test_preselected_matmul_fallback_recovers_abstract_tensor_gemm_identity():
+    """AOT regions may select the portable call before tensor lowering."""
+
+    left = SSAValue(200, "float32", shape=(1, 4))
+    right = SSAValue(201, "float32", shape=(4, 6))
+    result = SSAValue(202, "float32", shape=(1, 6))
+    function = Function("captured", [left, right], {
+        "entry": BasicBlock("entry", [
+            Instr("Call", [left, right], result, attributes={
+                "callee": "matmul_double",
+                "tensor_operation": "matmul",
+                "lowered_from": "c_backend_llvm_ssa.TRANSLATIONS",
+            }),
+            Instr("Ret", [result], None),
+        ]),
+    })
+    module = IRModule({function.name: function})
+
+    assert lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference()
+    ) == ()
+    lowered = module.functions["captured"].blocks["entry"].instrs[0]
+    assert lowered.attributes["backend_intrinsic_family"] == "blas.gemm"
+    assert lowered.attributes["backend_intrinsic_candidate"] == {
+        "semantic_identity": (
+            "src.common.tensors.abstraction.AbstractTensor.matmul"
+        ),
+        "lowering_namespace": "abstract_tensor",
+        "ingested_fallback": False,
+    }
+    swapped = apply_backend_identities(
+        module, {"captured": (result,)}, backend="webgpu",
+        licensed_inexact=False,
+    )
+    intrinsic = swapped.module.functions["captured"].blocks["entry"].instrs[0]
+    assert intrinsic.op == "BackendIntrinsic"
+    assert intrinsic.attributes["backend_intrinsic"]["semantic_family"] == "blas.gemm"
+
+
 def test_glsl_intrinsic_receipts_the_contract_selected_source_algorithm():
     module, result, _lowered = _lower_flagged_matmul()
     from src.compiler.work_contract import (

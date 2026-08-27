@@ -125,6 +125,21 @@ def test_a_constant_authored_inside_a_body_survives_materialization():
     assert "x + t1" in source
 
 
+def test_none_value_materializes_as_python_none_not_zero():
+    absent = SSAValue(1, dtype="none")
+    function = _one_block(
+        Instr("NoneValue", [], absent),
+        Instr("Ret", [absent], None),
+        name="absent",
+    )
+
+    body, _ = materialize_function_body(function)
+    source = to_source(ast.Module(body=body, type_ignores=[]))
+
+    assert "t1 = None" in source
+    assert "return t1" in source
+
+
 # -- classes ---------------------------------------------------------------
 
 

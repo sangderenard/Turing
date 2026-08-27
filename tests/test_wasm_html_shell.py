@@ -333,6 +333,7 @@ def test_published_webgl_shader_graduates_page_to_execution_surface():
     assert "window.TuringWasmRuntime" in html
     assert "outputFrame()" in html
     assert "uploadOutputTexture()" in html
+    assert "channels[0][index] * channelScale" in html
     assert "wasm: window.TuringWasmRuntime || null" in html
     assert "start({continuous = true, preferContiguous = true} = {})" in html
     assert "preferContiguous && contiguousRunner" in html
@@ -357,6 +358,28 @@ def test_published_webgl_shader_graduates_page_to_execution_surface():
     assert "Process graph" in html
     assert 'id="run"' in html
     assert 'id="canvas"' in html
+
+
+def test_canvas_presentation_needs_no_published_shader_url():
+    shell = shell_for_artifact(
+        _artifact(),
+        shader_execution={
+            "url": None,
+            "language": "canvas2d",
+            "stage": "none",
+            "role": "shader-surface",
+            "autostart": True,
+            "configuration": {
+                "channels": ["red", "green", "blue"],
+                "channel_scale": 255.0,
+            },
+        },
+    )
+
+    assert '"language": "canvas2d"' in shell.html
+    assert "channels[0][index] * channelScale" in shell.html
+    assert "context2d.imageSmoothingEnabled = false" in shell.html
+    assert "0, 0, canvas.width, canvas.height" in shell.html
 
 
 def test_the_emitted_source_travels_with_the_page_for_reading():

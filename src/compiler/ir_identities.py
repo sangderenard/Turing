@@ -214,6 +214,56 @@ _PURE_REGION_OPS = frozenset({
 })
 
 
+def drop_dead_pure_structural_instructions(functions) -> int:
+    """Remove unconsumed frontend structural values with no side effects."""
+
+    removed = 0
+    for function in functions.values():
+        protected: set[int] = set()
+        for key in (
+            "source_output_value_ids", "required_source_value_ids"
+        ):
+            protected.update(map(int, function.metadata.get(key) or ()))
+        for named_output in function.metadata.get("named_outputs") or ():
+            try:
+                protected.add(int(named_output[1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+        changed = True
+        while changed:
+            changed = False
+            consumed = {
+                int(argument.id)
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                for argument in instruction.args
+            }
+            for block in function.blocks.values():
+                retained = []
+                for instruction in block.instrs:
+                    result_id = (
+                        None if instruction.res is None
+                        else int(instruction.res.id)
+                    )
+                    is_structural = (
+                        instruction.attributes.get("structural_operation")
+                        is not None
+                    )
+                    if (
+                        result_id is not None
+                        and result_id not in consumed
+                        and result_id not in protected
+                        and is_structural
+                        and instruction.op in _PURE_REGION_OPS
+                    ):
+                        removed += 1
+                        changed = True
+                        continue
+                    retained.append(instruction)
+                block.instrs = retained
+    return removed
+
+
 def drop_dead_pure_region_calls(functions) -> int:
     """Remove aggregate region-call groups whose projections nobody reads.
 

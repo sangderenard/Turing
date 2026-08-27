@@ -367,6 +367,32 @@ def kernel(max_iters):
     assert initial != updated
 
 
+def test_overwritten_before_read_value_is_carried_when_live_after_loop():
+    module = ast.parse(
+        """
+def kernel(max_iters):
+    result = 1
+    while max_iters > 0:
+        result = 2
+        max_iters -= 1
+    return result
+"""
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+
+    reduce_abstract_tensor_topology(graph)
+
+    loop = module.body[0].body[1]
+    carried = (
+        graph.G.nodes[id(loop)].get("attributes") or {}
+    ).get("loop_carried_bindings", {})
+    assert "result" in carried
+    initial, updated = carried["result"]
+    assert initial != updated
+
+
 def test_only_name_assign_and_call_receive_existing_process_graph_aliases():
     graph = ProcessGraph(materialize_memory=False)
     with contextlib.redirect_stdout(io.StringIO()):

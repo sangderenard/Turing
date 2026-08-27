@@ -58,6 +58,7 @@ def compile_sympy_equations(
     name: str = "symbolic_equation_step",
     schedule: str = "asap",
     publications: Sequence[SymbolicPublication] = (),
+    dtype: str = "float64",
 ) -> SymbolicEquationCompilation:
     """Lower simultaneous named SymPy equations into repository SSA.
 
@@ -101,6 +102,8 @@ def compile_sympy_equations(
             + ", ".join(sorted(unknown_publications))
         )
 
+    if dtype not in {"float32", "float64"}:
+        raise ValueError("symbolic equation dtype must be float32 or float64")
     graph = ProcessGraph(materialize_memory=False, source_language="sympy")
     roots = ingest_sympy_expressions(
         graph,
@@ -120,7 +123,7 @@ def compile_sympy_equations(
         # verification. Declaring it here fixes every target at once.
         spelling = str(data.get("op") or data.get("type") or "")
         data["tensor"] = {
-            "dtype": "bool" if spelling in PREDICATE_OPERATIONS else "float64",
+            "dtype": "bool" if spelling in PREDICATE_OPERATIONS else dtype,
             "shape": (),
         }
         if str(data.get("type") or data.get("op") or "").casefold() in {
@@ -169,6 +172,15 @@ def compile_sympy_equations(
     scheduled = tuple(
         process_graph_to_ssa_instrs(copy.deepcopy(graph), schedule=schedule)
     )
+    if dtype == "float32":
+        # The scheduler historically spells exact numeric constants as f64
+        # even when their graph node carries an explicit f32 contract.  A
+        # symbolic WebGPU program needs one consistent storage dtype, so
+        # preserve predicates and narrow only those residual numeric values.
+        for instruction in scheduled:
+            for value in (*instruction.args, instruction.res):
+                if value is not None and value.dtype in {None, "float64", "double", "f64"}:
+                    value.dtype = "float32"
     input_instructions = {
         int(instruction.res.id): instruction
         for instruction in scheduled
@@ -200,7 +212,12 @@ def compile_sympy_equations(
                 source_span=instruction.source_span,
             )
         body.append(instruction)
-    output_values = [SSAValue(int(root), "float64") for root in roots]
+    if dtype == "float32":
+        for instruction in body:
+            for value in (*instruction.args, instruction.res):
+                if value is not None and value.dtype in {None, "float64", "double", "f64"}:
+                    value.dtype = "float32"
+    output_values = [SSAValue(int(root), dtype) for root in roots]
     body.append(Instr("Ret", output_values, None))
     function = Function(
         name,
@@ -218,6 +235,7 @@ def compile_sympy_equations(
             ),
             "symbolic_equations": tuple(sympy.srepr(eq) for eq in authored),
             "symbolic_source": "sympy",
+            "symbolic_dtype": dtype,
             "publications": tuple(
                 {
                     "output": row.output,
@@ -237,6 +255,13 @@ def compile_sympy_equations(
     from .ir_identities import reduce_constant_exponent_pow
 
     reduce_constant_exponent_pow(module.functions)
+    if dtype == "float32":
+        for current in module.functions.values():
+            for block in current.blocks.values():
+                for instruction in block.instrs:
+                    for value in (*instruction.args, instruction.res):
+                        if value is not None and value.dtype in {None, "float64", "double", "f64"}:
+                            value.dtype = "float32"
     return SymbolicEquationCompilation(
         equations=authored,
         process_graph=authored_graph,

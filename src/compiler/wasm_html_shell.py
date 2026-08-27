@@ -4417,6 +4417,11 @@ fn fs(vertexOut: VertexOut) -> @location(0) vec4<f32> {
     const configuration = SHADER.configuration || {};
     const channelNames = Array.isArray(configuration.channels)
       ? configuration.channels : ["red", "green", "blue"];
+    const channelScale = Number.isFinite(Number(configuration.channel_scale))
+      ? Number(configuration.channel_scale) : 1;
+    const sourceCanvas = document.createElement("canvas");
+    const sourceContext = sourceCanvas.getContext("2d");
+    if (!sourceContext) throw new Error("2D source canvas is unavailable");
     domLayout.latest = await settledLayout(document);
 
     function paint() {
@@ -4436,12 +4441,24 @@ fn fs(vertexOut: VertexOut) -> @location(0) vec4<f32> {
           const pixels = new Uint8ClampedArray(count * 4);
           for (let index = 0; index < count; index += 1) {
             const base = index * 4;
-            pixels[base] = Math.max(0, Math.min(255, Math.round(channels[0][index])));
-            pixels[base + 1] = Math.max(0, Math.min(255, Math.round(channels[1][index])));
-            pixels[base + 2] = Math.max(0, Math.min(255, Math.round(channels[2][index])));
+            pixels[base] = Math.max(0, Math.min(255, Math.round(channels[0][index] * channelScale)));
+            pixels[base + 1] = Math.max(0, Math.min(255, Math.round(channels[1][index] * channelScale)));
+            pixels[base + 2] = Math.max(0, Math.min(255, Math.round(channels[2][index] * channelScale)));
             pixels[base + 3] = 255;
           }
-          context2d.putImageData(new ImageData(pixels, frame.width, frame.height), 0, 0);
+          if (sourceCanvas.width !== frame.width || sourceCanvas.height !== frame.height) {
+            sourceCanvas.width = frame.width;
+            sourceCanvas.height = frame.height;
+          }
+          sourceContext.putImageData(
+            new ImageData(pixels, frame.width, frame.height), 0, 0
+          );
+          context2d.imageSmoothingEnabled = false;
+          context2d.clearRect(0, 0, canvas.width, canvas.height);
+          context2d.drawImage(
+            sourceCanvas, 0, 0, frame.width, frame.height,
+            0, 0, canvas.width, canvas.height,
+          );
         }
       }
       requestAnimationFrame(paint);
@@ -5165,7 +5182,8 @@ def emit_html_shell(
     if shader_execution is not None:
         shader = dict(shader_execution)
         interior_display = shader.get("display_ownership") == "program-interior"
-        if not shader.get("url") and not interior_display:
+        canvas_display = shader.get("language") == "canvas2d"
+        if not shader.get("url") and not interior_display and not canvas_display:
             raise ValueError("shader execution requires a published shader URL")
         if shader.get("role") != "shader-surface":
             raise ValueError("shader execution requires the shader-surface role")

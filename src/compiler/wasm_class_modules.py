@@ -400,6 +400,7 @@ def emit_control_region_modules(
     owner_name: str,
     module_dir: str,
     dtype: str = "float64",
+    logical_input_names: Mapping[int, str] | None = None,
     reduction_cache=None,
     progress=None,
 ) -> tuple[dict[int, object], dict]:
@@ -409,6 +410,11 @@ def emit_control_region_modules(
     Values crossing region boundaries are assigned shared-memory identities;
     the companion control coordinator invokes these exact kernels according
     to the planner-owned loop/state-machine structure.
+
+    ``logical_input_names`` names external region values whose identity comes
+    from a caller-owned contract rather than capture provenance. State-carried
+    values are the motivating case: a region sees the previous ``next_phase``
+    value, while the public input through which it returns is named ``phase``.
 
     ``reduction_cache`` (a ``ReductionArtifactStore``), when given, persists each
     lowered region under its content key so an interrupted or repeated bake
@@ -446,6 +452,10 @@ def emit_control_region_modules(
     programs = {
         region: getattr(region_programs[region], "program", region_programs[region])
         for region in ordered_regions
+    }
+    contract_input_names = {
+        int(value_id): str(name)
+        for value_id, name in dict(logical_input_names or {}).items()
     }
     producer: dict[int, tuple[str, str]] = {}
     module_names = {
@@ -549,7 +559,9 @@ def emit_control_region_modules(
                 continue
             origin = origins.get(value_id, origins.get(str(value_id), {}))
             logical_name = str(
-                origin.get("binding_name") or f"input_{value_id}"
+                origin.get("binding_name")
+                or contract_input_names.get(value_id)
+                or f"input_{value_id}"
             )
             logical_inputs.setdefault(logical_name, []).append(
                 (module_name, input_name)
@@ -1045,6 +1057,8 @@ def build_embedded_class_graph(
     embed_binaries: bool = True,
     module_dir: str = "modules",
     storage_redirects: Mapping[str, str] | None = None,
+    input_names: Sequence[str] = (),
+    allow_external_outputs: bool = False,
 ) -> dict:
     """Adapt ``build_manifest`` for a logical program's browser shell.
 
@@ -1059,6 +1073,12 @@ def build_embedded_class_graph(
     ``describe_process_graph_api`` uses, so a shell's input row (one per
     logical parameter) knows every ``(module, input)`` pair its value has
     to be delivered to, even when more than one chunk needs it directly.
+
+    ``storage_redirects`` aliases logical input storage to logical outputs.
+    When a redirect names an external feed whose capture provenance is absent,
+    ``input_names`` supplies the source ABI order.  The fallback is applied
+    only when every unnamed external feed is accounted for by a redirect, so
+    an incomplete contract cannot silently attach state to the wrong value.
     """
 
     import base64
@@ -1078,12 +1098,55 @@ def build_embedded_class_graph(
         else:
             module_entries.append(dict(entry))
 
+    external_value_ids = {
+        int(value_id)
+        for value_entries in manifest["graph_input_value_ids"].values()
+        for value_id, _input_name in value_entries
+    }
+    unnamed_value_ids = [
+        int(value_id)
+        for value_id in ordered_feed_ids(program)
+        if int(value_id) in external_value_ids
+        and not (origins.get(value_id) or origins.get(str(value_id)))
+    ]
+    unnamed_value_ids.extend(sorted(
+        external_value_ids - set(unnamed_value_ids) - {
+            int(value_id)
+            for value_id in external_value_ids
+            if origins.get(value_id) or origins.get(str(value_id))
+        }
+    ))
+    redirects = dict(storage_redirects or {})
+    known_names = {
+        str(origin.get("binding_name"))
+        for value_id in external_value_ids
+        for origin in (origins.get(value_id) or origins.get(str(value_id)) or {},)
+        if origin.get("binding_name")
+    }
+    missing_redirect_inputs = set(redirects) - known_names
+    ordered_redirect_inputs = [
+        str(name) for name in input_names if str(name) in missing_redirect_inputs
+    ]
+    ordered_redirect_inputs.extend(
+        name for name in redirects
+        if name in missing_redirect_inputs and name not in ordered_redirect_inputs
+    )
+    fallback_names = (
+        dict(zip(unnamed_value_ids, ordered_redirect_inputs))
+        if len(unnamed_value_ids) == len(ordered_redirect_inputs)
+        else {}
+    )
+
     logical_inputs: dict[str, list[tuple[str, str]]] = {}
     for module_name, value_entries in manifest["graph_input_value_ids"].items():
         for value_id, input_name in value_entries:
-            origin = origins.get(value_id)
+            origin = origins.get(value_id) or origins.get(str(value_id))
             binding_name = origin.get("binding_name") if origin else None
-            logical_name = binding_name or f"input_{value_id}"
+            logical_name = (
+                binding_name
+                or fallback_names.get(int(value_id))
+                or f"input_{value_id}"
+            )
             logical_inputs.setdefault(logical_name, []).append(
                 (module_name, input_name)
             )
@@ -1101,6 +1164,8 @@ def build_embedded_class_graph(
     for output_name, value_id in program.outputs.items():
         producer = producer_of_value.get(value_id)
         if producer is None:
+            if allow_external_outputs and int(value_id) in external_value_ids:
+                continue
             raise ValueError(
                 f"segmented program output {output_name!r} value {value_id} "
                 "has no producing module"
@@ -1108,11 +1173,13 @@ def build_embedded_class_graph(
         logical_outputs[output_name] = list(producer)
 
     resolved_redirects = {}
-    for input_name, output_name in dict(storage_redirects or {}).items():
+    for input_name, output_name in redirects.items():
         if input_name not in logical_inputs:
             raise ValueError(f"storage redirect names unknown input {input_name!r}")
         producer = logical_outputs.get(output_name)
         if producer is None:
+            if allow_external_outputs:
+                continue
             raise ValueError(f"storage redirect names unknown output {output_name!r}")
         resolved_redirects[f"in::{input_name}"] = (
             f"out::{producer[0]}::{producer[1]}"

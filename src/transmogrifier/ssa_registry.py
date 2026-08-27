@@ -220,6 +220,12 @@ class Handler(Enum):
     # Misc
     Select        = "Select"
     Const         = "Const"  # literal constants
+    # The language-level absence value.  It is deliberately distinct from
+    # Const: a missing Const payload has historically also meant malformed
+    # IR, and numeric backends must never guess that None means numeric zero.
+    # Object-capable targets may materialize this directly; numeric targets
+    # must first lower an optional to an explicit presence/payload ABI.
+    NoneValue     = "NoneValue"
     # A fixed-width identity for a program object. Unlike ``ptr`` this is not
     # a dereferenceable repository address; it may name host-resident state.
     StaticRef     = "StaticRef"
@@ -378,6 +384,10 @@ ast_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
         'bytes',
         'nameconstant',
         'ellipsis',
+    ),
+    Handler.NoneValue: (
+        'constant:none',
+        'none',
     ),
     Handler.Alloca: (
         'list',
