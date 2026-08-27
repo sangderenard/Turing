@@ -1986,28 +1986,41 @@ def _vehicle_gpu_graph_adapters(
         )
         mu = f"contact_feed[{ci['mu_static']}u * {lanes}u + {lane}u]"
         wheel_lines.extend([
-            f"  vehicle_feed[{vi[f'longitudinal_force_{wheel}']}u] = {dot_force(forward)};",
-            f"  vehicle_feed[{vi[f'slip_longitudinal_{wheel}']}u] = contact_feed[{ci['slip_longitudinal']}u * {lanes}u + {lane}u];",
-            f"  vehicle_feed[{vi[f'target_compression_{wheel}']}u] = contact_feed[{ci['geometric_compression']}u * {lanes}u + {lane}u];",
-            f"  vehicle_feed[{vi[f'wheel_support_{wheel}']}u] = contact_feed[{ci['support']}u * {lanes}u + {lane}u];",
-            f"  vehicle_feed[{vi[f'linkage_motion_ratio_{wheel}']}u] = contact_feed[{ci['linkage_motion_ratio']}u * {lanes}u + {lane}u];",
+            f"  vehicle_feed[{vi[f'longitudinal_force_{wheel}']}u] = finite_or({dot_force(forward)}, 0.0f);",
+            f"  vehicle_feed[{vi[f'slip_longitudinal_{wheel}']}u] = "
+            f"finite_or(contact_feed[{ci['slip_longitudinal']}u * {lanes}u + {lane}u], 0.0f);",
+            f"  vehicle_feed[{vi[f'target_compression_{wheel}']}u] = "
+            f"finite_or(contact_feed[{ci['geometric_compression']}u * {lanes}u + {lane}u], 0.0f);",
+            f"  vehicle_feed[{vi[f'wheel_support_{wheel}']}u] = "
+            f"finite_or(contact_feed[{ci['support']}u * {lanes}u + {lane}u], 0.0f);",
+            f"  vehicle_feed[{vi[f'linkage_motion_ratio_{wheel}']}u] = "
+            f"finite_or(contact_feed[{ci['linkage_motion_ratio']}u * {lanes}u + {lane}u], 1.0f);",
             f"  let normal_load_{lane} = {normal_load};",
-            f"  vehicle_feed[{vi[f'measured_friction_utilization_{wheel}']}u] = sqrt({tangent_squared}) / max(1.0e-5f, {mu} * normal_load_{lane});",
+            f"  vehicle_feed[{vi[f'measured_friction_utilization_{wheel}']}u] = "
+            f"finite_or(sqrt({tangent_squared}) / max(1.0e-5f, {mu} * normal_load_{lane}), 0.0f);",
         ])
     assembly = f'''@group(0) @binding(0) var<storage, read> contact_outputs: array<f32>;
 @group(0) @binding(1) var<storage, read> reduced_wrench: array<f32>;
 @group(0) @binding(2) var<storage, read> contact_feed: array<f32>;
 @group(0) @binding(3) var<storage, read_write> vehicle_feed: array<f32>;
 @group(0) @binding(4) var<storage, read> controls: array<f32>;
+// NaN is the only float unequal to itself under IEEE-754, on every conformant
+// GPU without exception -- unlike min()/max(), which rely on NaN-suppressing
+// semantics some hardware does not implement.  This is the one place contact
+// data crosses into the vehicle's own state; scrubbing here keeps a stray NaN
+// on any one wheel from poisoning the whole integration.
+fn finite_or(value: f32, fallback: f32) -> f32 {{
+  return select(fallback, value, value == value);
+}}
 @compute @workgroup_size(1, 1, 1)
 fn assemble_vehicle_graph_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {{
   if (gid.x != 0u) {{ return; }}
-  vehicle_feed[{vi['contact_wrench_force_x']}u] = reduced_wrench[0u];
-  vehicle_feed[{vi['contact_wrench_force_y']}u] = reduced_wrench[1u];
-  vehicle_feed[{vi['contact_wrench_force_z']}u] = reduced_wrench[2u];
-  vehicle_feed[{vi['contact_wrench_torque_x']}u] = reduced_wrench[3u];
-  vehicle_feed[{vi['contact_wrench_torque_y']}u] = reduced_wrench[4u];
-  vehicle_feed[{vi['contact_wrench_torque_z']}u] = reduced_wrench[5u];
+  vehicle_feed[{vi['contact_wrench_force_x']}u] = finite_or(reduced_wrench[0u], 0.0f);
+  vehicle_feed[{vi['contact_wrench_force_y']}u] = finite_or(reduced_wrench[1u], 0.0f);
+  vehicle_feed[{vi['contact_wrench_force_z']}u] = finite_or(reduced_wrench[2u], 0.0f);
+  vehicle_feed[{vi['contact_wrench_torque_x']}u] = finite_or(reduced_wrench[3u], 0.0f);
+  vehicle_feed[{vi['contact_wrench_torque_y']}u] = finite_or(reduced_wrench[4u], 0.0f);
+  vehicle_feed[{vi['contact_wrench_torque_z']}u] = finite_or(reduced_wrench[5u], 0.0f);
   vehicle_feed[{vi['yaw_cos']}u] = cos(vehicle_feed[{vi['yaw']}u]);
   vehicle_feed[{vi['yaw_sin']}u] = sin(vehicle_feed[{vi['yaw']}u]);
   vehicle_feed[{vi['throttle']}u] = controls[0u];
