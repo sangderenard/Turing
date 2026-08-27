@@ -2052,9 +2052,21 @@ fn assemble_vehicle_graph_inputs(@builtin(global_invocation_id) gid: vec3<u32>) 
         "engine_angular_speed_next": "engine_angular_speed",
     }
     for output, feed in direct.items():
-        commits.append(f"  vehicle_feed[{vi[feed]}u] = vehicle_outputs[{vo[output]}u];")
+        # This is the vehicle's own persistent state, read back as "now" by
+        # every kernel next tick.  A single non-finite output here does not
+        # cost one bad frame -- it becomes the truck's new reality forever,
+        # since nothing downstream has any way to know it was garbage.
+        # Holding the previous value on a bad frame is what makes a single
+        # stray NaN survivable instead of permanent.
+        commits.append(
+            f"  vehicle_feed[{vi[feed]}u] = "
+            f"finite_or(vehicle_outputs[{vo[output]}u], vehicle_feed[{vi[feed]}u]);"
+        )
     commit = f'''@group(0) @binding(0) var<storage, read> vehicle_outputs: array<f32>;
 @group(0) @binding(1) var<storage, read_write> vehicle_feed: array<f32>;
+fn finite_or(value: f32, fallback: f32) -> f32 {{
+  return select(fallback, value, value == value);
+}}
 @compute @workgroup_size(1, 1, 1)
 fn commit_vehicle_graph_state(@builtin(global_invocation_id) gid: vec3<u32>) {{
   if (gid.x != 0u) {{ return; }}
