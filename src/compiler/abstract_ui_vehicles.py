@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any, Mapping
 
 import sympy
@@ -87,6 +88,9 @@ VEHICLE_STATE_OUTPUTS = (
     "engine_mount_torque_y", "engine_mount_torque_z",
     "wheel_gyroscopic_reaction_torque_x", "wheel_gyroscopic_reaction_torque_y",
     "wheel_gyroscopic_reaction_torque_z",
+    "traction_control_dissipation_torque", "service_brake_reaction_torque",
+    "rolling_resistance_reaction_torque", "tire_contact_reaction_torque",
+    "drivetrain_chassis_reaction_torque",
 )
 
 
@@ -281,6 +285,8 @@ class VehicleConfiguration:
             **{f"crank_axis_{axis}": crank_axis[index]
                for index, axis in enumerate("xyz")},
             "brake_torque": _number(drivetrain, "brake_torque_nm", positive=True),
+            "differential_brake_torque": _number(
+                drivetrain, "differential_brake_torque_nm", positive=True),
             "wheel_inertia": self.wheel_rotational_inertia(),
             "differential_lock_stiffness": _number(
                 drivetrain, "differential_lock_stiffness_nm_per_rad_s", positive=True),
@@ -348,7 +354,8 @@ def vehicle_configuration_from_mapping(value: Mapping[str, Any]) -> VehicleConfi
                           "penetration_bias", "maximum_correction_speed", "cage_contact_radius",
                           "cage_contact_stiffness", "cage_contact_damping", "cage_contact_maximum_force",
                           "cage_static_friction", "cage_kinetic_friction"},
-        "drivetrain": {"brake_torque_nm", "front_drive_fraction", "rear_drive_fraction",
+        "drivetrain": {"brake_torque_nm", "differential_brake_torque_nm",
+                       "front_drive_fraction", "rear_drive_fraction",
                        "rolling_resistance_torque_nm", "maximum_wheel_speed_rad_s",
                        "wheel_mass_kg", "tire_mass_kg", "rotational_inertia_scale",
                        "differential_lock_stiffness_nm_per_rad_s",
@@ -486,8 +493,7 @@ def _symbols() -> dict[str, sympy.Symbol]:
         "position_x", "position_y", "position_z", "velocity_x", "velocity_y", "velocity_z",
         "roll", "pitch", "yaw", "roll_velocity", "pitch_velocity", "yaw_velocity",
         "dt", "throttle", "brake", "drive_direction", "yaw_cos", "yaw_sin",
-        "inverse_mass", "gravity", "suspension_rest_length", "suspension_travel",
-        "chassis_clearance",
+        "inverse_mass", "gravity", "suspension_travel",
         "spring_stiffness", "pneumatic_compression_damping", "pneumatic_rebound_damping",
         "pneumatic_efficiency", "maximum_compression_speed", "active_damping_minimum_scale",
         "active_damping_maximum_scale", "active_damping_body_velocity_gain_s_per_m",
@@ -506,11 +512,14 @@ def _symbols() -> dict[str, sympy.Symbol]:
         "engine_position_z", "transmission_position_x", "transmission_position_y",
         "transmission_position_z", "transfer_case_position_x", "transfer_case_position_y",
         "transfer_case_position_z", "crank_axis_x", "crank_axis_y", "crank_axis_z",
-        "brake_torque", "wheel_inertia", "wheel_radius", "differential_lock",
+        "brake_torque", "wheel_inertia", "wheel_radius",
+        "front_differential_lock", "rear_differential_lock", "center_differential_lock",
+        "front_differential_brake", "rear_differential_brake", "differential_brake_torque",
         "differential_lock_stiffness", "differential_lock_maximum_torque",
         "rolling_resistance_torque", "maximum_wheel_speed",
         "target_friction_utilization", "throttle_intervention_gain", "brake_intervention_gain",
         "slip_growth_gain", "slip_growth_reference_m_s2", "minimum_torque_fraction",
+        "traction_control_enabled", "abs_enabled", "traction_control_authority", "abs_authority",
         "slip_sensor_frequency_hz", "slip_sensor_damping_ratio",
         "utilization_sensor_frequency_hz", "utilization_sensor_damping_ratio",
         "total_force_x", "total_force_y", "total_force_z",
@@ -519,7 +528,7 @@ def _symbols() -> dict[str, sympy.Symbol]:
         "contact_wrench_torque_x", "contact_wrench_torque_y", "contact_wrench_torque_z",
     ]
     for wheel in WHEEL_NAMES:
-        names.extend((f"compression_{wheel}", f"wheel_height_{wheel}", f"wheel_support_{wheel}",
+        names.extend((f"compression_{wheel}", f"wheel_support_{wheel}",
                       f"target_compression_{wheel}",
                       f"wheel_omega_{wheel}", f"longitudinal_force_{wheel}",
                       f"slip_longitudinal_{wheel}", f"previous_slip_longitudinal_{wheel}",
@@ -527,7 +536,8 @@ def _symbols() -> dict[str, sympy.Symbol]:
                       f"measured_friction_utilization_{wheel}",
                       f"friction_utilization_{wheel}",
                       f"friction_utilization_sensor_velocity_{wheel}",
-                      f"drive_fraction_{wheel}", f"linkage_motion_ratio_{wheel}"))
+                      f"drive_fraction_{wheel}", f"linkage_motion_ratio_{wheel}",
+                      f"brake_lock_{wheel}"))
     return {name: sympy.Symbol(name, real=True) for name in names}
 
 
@@ -647,18 +657,12 @@ def symbolic_vehicle_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, 
                          * sympy.tanh(s["clutch_stiffness"]
                                       * (s["engine_angular_speed"] - coupled_crank_speed)
                                       / s["clutch_maximum_torque"]))
-    # During launch a friction clutch/torque converter cannot transmit more
-    # positive torque than the crank is presently producing without stalling
-    # it. Preserve negative overrun torque as a separate branch so engine
-    # braking remains physical once road speed has engaged the overrun clutch.
-    requested_drive_torque = _c2_positive(raw_clutch_torque, sympy.Float("0.01"))
-    requested_overrun_torque = raw_clutch_torque - requested_drive_torque
-    launch_torque_limit = (_c2_positive(engine_torque, sympy.Float("0.01"))
-                           * sympy.Float("0.90"))
-    transmitted_drive_torque = launch_torque_limit * sympy.tanh(
-        requested_drive_torque / (launch_torque_limit + sympy.Float("0.001"))
-    )
-    clutch_torque = transmitted_drive_torque + requested_overrun_torque
+    # The clutch torque is a bounded reaction to relative crank/input-shaft
+    # speed.  It is allowed to exceed instantaneous combustion torque: that is
+    # how a real engaged clutch decelerates and, under enough load, stalls the
+    # engine.  Capping it below engine torque manufactured permanent slip and
+    # made stalling impossible.
+    clutch_torque = raw_clutch_torque
     transmission_output_torque = clutch_torque * signed_gear * s["clutch_efficiency"]
     transfer_case_input_torque = transmission_output_torque * s["transfer_case_ratio"]
     transfer_case_direction = (transfer_case_input_torque
@@ -668,10 +672,6 @@ def symbolic_vehicle_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, 
         sympy.Float("0.5"))
     driveline_torque = (transfer_case_output_torque * s["transfer_case_efficiency"]
                         * s["final_drive_ratio"] * s["driveline_efficiency"])
-    front_differential_torque = driveline_torque * (
-        s["drive_fraction_front_left"] + s["drive_fraction_front_right"])
-    rear_differential_torque = driveline_torque * (
-        s["drive_fraction_rear_left"] + s["drive_fraction_rear_right"])
     transmitted_crank_load = clutch_torque
     engine_acceleration_torque = engine_torque - transmitted_crank_load
     engine_angular_acceleration = engine_acceleration_torque / s["engine_rotating_inertia"]
@@ -743,7 +743,29 @@ def symbolic_vehicle_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, 
     wheel_omegas: dict[str, sympy.Basic] = {}
     traction_scales: dict[str, sympy.Basic] = {}
     brake_scales: dict[str, sympy.Basic] = {}
+    delivered_axle_torques: dict[str, sympy.Basic] = {}
+    traction_intervention_torques: dict[str, sympy.Basic] = {}
+    service_brake_torques: dict[str, sympy.Basic] = {}
+    rolling_resistance_torques: dict[str, sympy.Basic] = {}
+    tire_reaction_torques: dict[str, sympy.Basic] = {}
+    drivetrain_chassis_reactions: dict[str, sympy.Basic] = {}
     drive_torque = driveline_torque
+    front_axle_speed = (s["wheel_omega_front_left"] + s["wheel_omega_front_right"]) / 2
+    rear_axle_speed = (s["wheel_omega_rear_left"] + s["wheel_omega_rear_right"]) / 2
+    # The transfer-case coupling is the same bounded speed-sensitive clutch law
+    # as an axle differential.  A continuous command gives three useful device
+    # states without changing kernels: 0=open, a fractional capacity=LSD, and
+    # 1=fully locked.  Positive torque flows from a faster rear shaft to the
+    # slower front shaft; the equal negative term keeps it internal to the
+    # complete driveline graph.
+    center_coupling_torque = (
+        s["center_differential_lock"] * s["differential_lock_maximum_torque"]
+        * sympy.tanh(
+            s["differential_lock_stiffness"]
+            * (rear_axle_speed - front_axle_speed)
+            / s["differential_lock_maximum_torque"]
+        )
+    )
     opposite_wheel = {
         "front_left": "front_right", "front_right": "front_left",
         "rear_left": "rear_right", "rear_right": "rear_left",
@@ -798,48 +820,88 @@ def symbolic_vehicle_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, 
             sympy.Float("0.08"),
         )
         traction_target = 1 / (
-            1 + s["throttle_intervention_gain"] * utilization_excess
-            + s["slip_growth_gain"] * slip_growth
+            1 + s["traction_control_enabled"] * s["traction_control_authority"] * (
+                s["throttle_intervention_gain"] * utilization_excess
+                + s["slip_growth_gain"] * slip_growth
+            )
         )
         brake_target = 1 / (
-            1 + s["brake_intervention_gain"] * utilization_excess
-            + s["slip_growth_gain"] * slip_growth
+            1 + s["abs_enabled"] * s["abs_authority"] * (
+                s["brake_intervention_gain"] * utilization_excess
+                + s["slip_growth_gain"] * slip_growth
+            )
         )
         traction_scales[wheel] = _c2_clamp(traction_target, s["minimum_torque_fraction"], 1,
                                             sympy.Float("0.035"))
         brake_scales[wheel] = _c2_clamp(brake_target, s["minimum_torque_fraction"], 1,
                                         sympy.Float("0.035"))
         smooth_direction = omega / _smooth_abs(omega, epsilon="0.6")
-        axle_torque = drive_torque * s[f"drive_fraction_{wheel}"] * traction_scales[wheel]
-        lock_torque = (s["differential_lock"] * s["differential_lock_maximum_torque"]
+        center_share = center_coupling_torque / 2 if wheel.startswith("front") else -center_coupling_torque / 2
+        raw_axle_torque = drive_torque * s[f"drive_fraction_{wheel}"] + center_share
+        traction_intervention = raw_axle_torque * (1 - traction_scales[wheel])
+        axle_torque = raw_axle_torque - traction_intervention
+        delivered_axle_torques[wheel] = axle_torque
+        traction_intervention_torques[wheel] = traction_intervention
+        axle_lock = (s["front_differential_lock"] if wheel.startswith("front")
+                     else s["rear_differential_lock"])
+        lock_torque = (axle_lock * s["differential_lock_maximum_torque"]
                        * sympy.tanh(s["differential_lock_stiffness"]
                                     * (s[f"wheel_omega_{opposite_wheel[wheel]}"] - omega)
                                     / s["differential_lock_maximum_torque"]))
         tire_reaction = s[f"longitudinal_force_{wheel}"] * s["wheel_radius"]
-        resisting = smooth_direction * (s["brake_torque"] * s["brake"] * brake_scales[wheel]
-                                         + s["rolling_resistance_torque"])
-        # Drive torque crosses a clutch and a gear/transfer-case/final-drive
-        # reduction before it ever reaches this wheel; what resists it on the
-        # way is the engine's rotating inertia reflected through that ratio,
-        # not the wheel's own bare inertia -- exactly as the engine side of
-        # this same clutch already divides by engine_rotating_inertia alone.
-        # Omitting this term let axle_torque, multiplied by a first-gear/
-        # low-range ratio near 64:1, act against a 2.5 kg*m2 wheel: tens of
-        # thousands of Nm over a wheel that small snaps wheel_omega to its
-        # speed cap in a single tick, in whatever sign the torque happened to
-        # have -- which then feeds coupled_crank_speed on the engine side and
-        # is the actual mechanism behind the clutch torque sign flipping
-        # between a sane value and +-30,000 Nm at extreme total ratio.  The
-        # reflected share is split by this wheel's own drive fraction so the
-        # four wheels sum back to exactly one engine's inertia, and it
-        # correctly vanishes with the gear ratio when the clutch is neutral.
-        reflected_ratio = signed_gear * s["transfer_case_ratio"] * s["final_drive_ratio"]
-        reflected_inertia = (s["engine_rotating_inertia"] * reflected_ratio ** 2
-                             * s[f"drive_fraction_{wheel}"])
-        effective_wheel_inertia = s["wheel_inertia"] + reflected_inertia
-        raw_omega = omega + dt * (axle_torque + lock_torque - tire_reaction - resisting) / effective_wheel_inertia
-        wheel_omegas[wheel] = (s["maximum_wheel_speed"] * raw_omega
-                               / sympy.sqrt(s["maximum_wheel_speed"] ** 2 + raw_omega ** 2))
+        tire_reaction_torques[wheel] = tire_reaction
+        brake_command = _c2_clamp(
+            s["brake"] * brake_scales[wheel] + s[f"brake_lock_{wheel}"],
+            0, 1, sympy.Float("0.01"),
+        )
+        differential_brake_command = (s["front_differential_brake"] if wheel.startswith("front")
+                                      else s["rear_differential_brake"])
+        # A driveline brake acts on the axle before its differential. Split its
+        # torque across the two outputs, and pass it through the same ABS scale
+        # as their measured contact states. Explicit wheel holds remain hard
+        # parking locks and intentionally bypass ABS.
+        differential_brake_torque = (smooth_direction * s["differential_brake_torque"]
+                                     * differential_brake_command * brake_scales[wheel] / 2)
+        service_brake_torque = (smooth_direction * s["brake_torque"] * brake_command
+                                + differential_brake_torque)
+        rolling_resistance_torque = smooth_direction * s["rolling_resistance_torque"]
+        service_brake_torques[wheel] = service_brake_torque
+        rolling_resistance_torques[wheel] = rolling_resistance_torque
+        resisting = service_brake_torque + rolling_resistance_torque
+        drivetrain_chassis_reactions[wheel] = (
+            -raw_axle_torque - lock_torque + traction_intervention
+            + tire_reaction + service_brake_torque + rolling_resistance_torque)
+        # The engine is already a separately integrated rotating body and the
+        # finite clutch torque is the coupling between it and the wheel graph.
+        # Reflecting engine inertia through ratio**2 here would only be valid
+        # after imposing a locked-speed constraint; doing it while this clutch
+        # is slipping double-counts engine inertia and becomes a crawler-gear
+        # wheel-speed governor.  Wheel acceleration therefore uses the actual
+        # wheel/tire inertia acted on by the delivered axle torque.
+        raw_omega = omega + dt * (axle_torque + lock_torque
+                                  - tire_reaction - resisting) / s["wheel_inertia"]
+        # Wheel speed has no independent governor. Engine speed, selected
+        # ratios, clutch torque, contact force and losses determine it. The
+        # configured display maximum remains useful for HUD normalization but
+        # must not saturate authoritative angular momentum.
+        wheel_omegas[wheel] = raw_omega
+
+    # These publications are the torque that actually reaches each axle after
+    # front/rear proportioning, broken-halfshaft routing and traction control.
+    # The previous pre-intervention values could misleadingly show torque on
+    # an axle whose wheel paths had already been reduced to zero.
+    front_differential_torque = sum(delivered_axle_torques[wheel]
+                                    for wheel in WHEEL_NAMES if wheel.startswith("front"))
+    rear_differential_torque = sum(delivered_axle_torques[wheel]
+                                   for wheel in WHEEL_NAMES if wheel.startswith("rear"))
+    traction_control_dissipation_torque = sum(traction_intervention_torques.values())
+    service_brake_reaction_torque = sum(service_brake_torques.values())
+    rolling_resistance_reaction_torque = sum(rolling_resistance_torques.values())
+    tire_contact_reaction_torque = sum(tire_reaction_torques.values())
+    drivetrain_chassis_reaction_torque = sum(drivetrain_chassis_reactions.values())
+    pitch_velocity_next = (s["pitch_velocity"] + dt * (
+        pitch_torque + drivetrain_chassis_reaction_torque) * s["inverse_inertia_pitch"]
+    ) / (1 + dt * s["angular_damping"])
 
     expressions: dict[str, sympy.Basic] = {
         "position_x_next": s["position_x"] + dt * velocity_x_next,
@@ -884,6 +946,11 @@ def symbolic_vehicle_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, 
            for index, axis in enumerate("xyz")},
         **{f"wheel_gyroscopic_reaction_torque_{axis}": wheel_gyroscopic_reaction[index]
            for index, axis in enumerate("xyz")},
+        "traction_control_dissipation_torque": traction_control_dissipation_torque,
+        "service_brake_reaction_torque": service_brake_reaction_torque,
+        "rolling_resistance_reaction_torque": rolling_resistance_reaction_torque,
+        "tire_contact_reaction_torque": tire_contact_reaction_torque,
+        "drivetrain_chassis_reaction_torque": drivetrain_chassis_reaction_torque,
     }
     equations = tuple(sympy.Eq(sympy.Symbol(name, real=True), expression, evaluate=False)
                       for name, expression in expressions.items())
@@ -944,6 +1011,120 @@ def compile_symbolic_vehicle_physics_webgpu() -> WGSLModule:
             item.format() for item in artifact.shortfalls
         ))
     return artifact
+
+
+@lru_cache(maxsize=1)
+def compile_symbolic_vehicle_physics_webgpu_stages() -> tuple[dict[str, Any], ...]:
+    """Lower one symbolic vehicle graph into independently compilable kernels.
+
+    Every stage reads the same resident input buffer and writes a disjoint,
+    256-byte-aligned view of one output GPUBuffer.  The split is therefore a
+    compiler/scheduling boundary, not a host memory handoff.
+    """
+
+    compiled = compile_symbolic_vehicle_physics_gpu_ssa()
+    returned = next(
+        instruction.args
+        for block in compiled.function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op.lower() in {"ret", "return"}
+    )
+    values = dict(zip(VEHICLE_STATE_OUTPUTS, returned, strict=True))
+    groups = {
+        "chassis-transition": tuple(name for name in VEHICLE_STATE_OUTPUTS if
+                                    name.startswith(("position_", "velocity_", "roll_", "pitch_", "yaw_"))
+                                    or name in {"roll_next", "pitch_next", "yaw_next"}),
+        "tire-suspension-control": tuple(name for name in VEHICLE_STATE_OUTPUTS if
+                                         name.startswith(("wheel_omega_", "slip_", "friction_", "traction_",
+                                                          "brake_", "compression_", "spring_", "damper_"))),
+    }
+    assigned = set().union(*groups.values())
+    groups["powertrain-reactions"] = tuple(name for name in VEHICLE_STATE_OUTPUTS if name not in assigned)
+    stages: list[dict[str, Any]] = []
+    # Storage-buffer binding offsets must satisfy WebGPU's conservative
+    # 256-byte alignment. Each stage gets a view into this one allocation.
+    output_cursor = 0
+    for identity, names in groups.items():
+        output_cursor = ((output_cursor + 63) // 64) * 64
+        artifact = emit_webgpu_module(
+            compiled.module, name=compiled.function.name,
+            outputs={compiled.function.name: tuple(values[name] for name in names)},
+            count=1, packed_outputs=True,
+        )
+        if not artifact.complete:
+            raise RuntimeError(f"vehicle physics stage {identity} does not lower to WebGPU: " + "; ".join(
+                item.format() for item in artifact.shortfalls
+            ))
+        stages.append({
+            "identity": identity, "outputs": names, "output_offset_floats": output_cursor,
+            "kernel": artifact,
+        })
+        output_cursor += len(names)
+    return tuple(stages)
+
+
+@lru_cache(maxsize=1)
+def compile_default_specialized_vehicle_physics_gpu_ssa() -> SymbolicEquationCompilation:
+    """Compile the default vehicle with stable configuration constants folded."""
+
+    equations, symbols = symbolic_vehicle_equations()
+    defaults = load_default_car_configuration().parameter_defaults()
+    always_live = {
+        "engine_angular_speed", "drive_direction", "forward_gear_ratio", "reverse_gear_ratio",
+        *(f"linkage_motion_ratio_{wheel}" for wheel in WHEEL_NAMES),
+    }
+    substitutions = {
+        symbols[name]: sympy.Float(str(value))
+        for name, value in defaults.items()
+        if name in symbols and name not in always_live
+    }
+    specialized = tuple(sympy.Eq(equation.lhs, equation.rhs.xreplace(substitutions), evaluate=False)
+                        for equation in equations)
+    publications = tuple(SymbolicPublication(name, f"world.vehicle.{name}")
+                         for name in VEHICLE_STATE_OUTPUTS)
+    return compile_sympy_equations(
+        specialized, name="abstract_ui_vehicle_step_gpu_default_fixed",
+        publications=publications, dtype="float32",
+    )
+
+
+@lru_cache(maxsize=1)
+def compile_default_specialized_vehicle_physics_webgpu_stages() -> tuple[dict[str, Any], ...]:
+    compiled = compile_default_specialized_vehicle_physics_gpu_ssa()
+    returned = next(
+        instruction.args
+        for block in compiled.function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op.lower() in {"ret", "return"}
+    )
+    values = dict(zip(VEHICLE_STATE_OUTPUTS, returned, strict=True))
+    groups = {
+        "chassis-transition": tuple(name for name in VEHICLE_STATE_OUTPUTS if
+                                    name.startswith(("position_", "velocity_", "roll_", "pitch_", "yaw_"))
+                                    or name in {"roll_next", "pitch_next", "yaw_next"}),
+        "tire-suspension-control": tuple(name for name in VEHICLE_STATE_OUTPUTS if
+                                         name.startswith(("wheel_omega_", "slip_", "friction_", "traction_",
+                                                          "brake_", "compression_", "spring_", "damper_"))),
+    }
+    assigned = set().union(*groups.values())
+    groups["powertrain-reactions"] = tuple(name for name in VEHICLE_STATE_OUTPUTS if name not in assigned)
+    stages: list[dict[str, Any]] = []
+    output_cursor = 0
+    for identity, names in groups.items():
+        output_cursor = ((output_cursor + 63) // 64) * 64
+        artifact = emit_webgpu_module(
+            compiled.module, name=compiled.function.name,
+            outputs={compiled.function.name: tuple(values[name] for name in names)},
+            count=1, packed_outputs=True,
+        )
+        if not artifact.complete:
+            raise RuntimeError(f"default-fixed vehicle stage {identity} does not lower to WebGPU: " + "; ".join(
+                item.format() for item in artifact.shortfalls
+            ))
+        stages.append({"identity": identity, "outputs": names,
+                       "output_offset_floats": output_cursor, "kernel": artifact})
+        output_cursor += len(names)
+    return tuple(stages)
 
 
 @lru_cache(maxsize=1)
@@ -1613,6 +1794,9 @@ def _vehicle_terrain_contact_webgpu(
 // Axis-aligned solid wall prisms, packed as minimum.xyz, maximum.xyz.
 // They are uploaded only when authored world geometry changes.
 @group(0) @binding(5) var<storage, read> wall_colliders: array<f32>;
+// Resident 4 x 15 quadrature samples. This buffer is shared directly with
+// the snapshot stage; no host adapter moves it between kernels.
+@group(0) @binding(6) var<storage, read_write> radial_probes: array<f32>;
 
 const RADIAL_ANGLES: array<f32, 5> = array<f32, 5>(-0.95f, -0.48f, 0.0f, 0.48f, 0.95f);
 const LATERAL_FRACTIONS: array<f32, 3> = array<f32, 3>(-0.38f, 0.0f, 0.38f);
@@ -1636,34 +1820,46 @@ fn rotate_body(v: vec3<f32>, roll: f32, pitch: f32, yaw: f32) -> vec3<f32> {
   let p = vec3<f32>(r.x * cp - r.y * sp, r.x * sp + r.y * cp, r.z);
   return vec3<f32>(p.x * cy - p.z * sy, p.y, p.x * sy + p.z * cy);
 }
-fn terrain_sample(x: f32, z: f32) -> TerrainSample {
-  let origin_x = terrain_parameters[0u]; let origin_y = terrain_parameters[1u];
-  let origin_z = terrain_parameters[2u]; let cell_x = terrain_parameters[3u];
-  let cell_z = terrain_parameters[4u]; let columns = u32(terrain_parameters[5u]);
-  let rows = u32(terrain_parameters[6u]); let minimum_x = terrain_parameters[7u];
-  let maximum_x = terrain_parameters[8u]; let minimum_z = terrain_parameters[9u];
-  let maximum_z = terrain_parameters[10u];
-  if (columns < 2u || rows < 2u || x < minimum_x || x > maximum_x || z < minimum_z || z > maximum_z) {
-    return TerrainSample(0.0f, vec3<f32>(0.0f, 1.0f, 0.0f), 1u);
+fn terrain_sample(x: f32, z: f32, query_y: f32) -> TerrainSample {
+  // Header: field_count, wall_count. Each field then owns twelve floats:
+  // origin.xyz, cell.xz, columns, rows, domain x/x/z/z, height-buffer offset.
+  // Selecting locally by domain and reachable height allows a raised ramp to
+  // overlap the ground below it without becoming an infinite collision plane.
+  let field_count = u32(terrain_parameters[0u]);
+  var best = TerrainSample(0.0f, vec3<f32>(0.0f, 1.0f, 0.0f), 0u);
+  var best_height = -1.0e20f;
+  for (var field_index = 0u; field_index < field_count; field_index += 1u) {
+    let base = 2u + field_index * 12u;
+    let origin_x = terrain_parameters[base]; let origin_y = terrain_parameters[base + 1u];
+    let origin_z = terrain_parameters[base + 2u]; let cell_x = terrain_parameters[base + 3u];
+    let cell_z = terrain_parameters[base + 4u]; let columns = u32(terrain_parameters[base + 5u]);
+    let rows = u32(terrain_parameters[base + 6u]); let minimum_x = terrain_parameters[base + 7u];
+    let maximum_x = terrain_parameters[base + 8u]; let minimum_z = terrain_parameters[base + 9u];
+    let maximum_z = terrain_parameters[base + 10u]; let height_offset = u32(terrain_parameters[base + 11u]);
+    if (columns < 2u || rows < 2u || x < minimum_x || x > maximum_x || z < minimum_z || z > maximum_z) {
+      continue;
+    }
+    let u = clamp((x - origin_x) / cell_x, 0.0f, f32(columns - 1u));
+    let v = clamp((z - origin_z) / cell_z, 0.0f, f32(rows - 1u));
+    let column = min(columns - 2u, u32(floor(u))); let row = min(rows - 2u, u32(floor(v)));
+    let tx = u - f32(column); let tz = v - f32(row); let sample_base = height_offset + row * columns + column;
+    let h00 = terrain_heights[sample_base]; let h10 = terrain_heights[sample_base + 1u];
+    let h01 = terrain_heights[sample_base + columns]; let h11 = terrain_heights[sample_base + columns + 1u];
+    var height: f32; var gradient: vec2<f32>;
+    if (tx >= tz) {
+      height = origin_y + h00 + (h10 - h00) * tx + (h11 - h10) * tz;
+      gradient = vec2<f32>((h10 - h00) / cell_x, (h11 - h10) / cell_z);
+    } else {
+      height = origin_y + h00 + (h11 - h01) * tx + (h01 - h00) * tz;
+      gradient = vec2<f32>((h11 - h01) / cell_x, (h01 - h00) / cell_z);
+    }
+    if (height <= query_y + @@CONTACT_REACH@@ && height > best_height) {
+      best_height = height;
+      best = TerrainSample(height, safe_normalize(vec3<f32>(-gradient.x, 1.0f, -gradient.y),
+        vec3<f32>(0.0f, 1.0f, 0.0f)), 1u);
+    }
   }
-  let u = clamp((x - origin_x) / cell_x, 0.0f, f32(columns - 1u));
-  let v = clamp((z - origin_z) / cell_z, 0.0f, f32(rows - 1u));
-  let column = min(columns - 2u, u32(floor(u))); let row = min(rows - 2u, u32(floor(v)));
-  let tx = u - f32(column); let tz = v - f32(row);
-  let h00 = terrain_heights[row * columns + column];
-  let h10 = terrain_heights[row * columns + column + 1u];
-  let h01 = terrain_heights[(row + 1u) * columns + column];
-  let h11 = terrain_heights[(row + 1u) * columns + column + 1u];
-  var height: f32; var gradient: vec2<f32>;
-  if (tx >= tz) {
-    height = h00 + (h10 - h00) * tx + (h11 - h10) * tz;
-    gradient = vec2<f32>((h10 - h00) / cell_x, (h11 - h10) / cell_z);
-  } else {
-    height = h00 + (h11 - h01) * tx + (h01 - h00) * tz;
-    gradient = vec2<f32>((h11 - h01) / cell_x, (h01 - h00) / cell_z);
-  }
-  return TerrainSample(origin_y + height, safe_normalize(vec3<f32>(-gradient.x, 1.0f, -gradient.y),
-    vec3<f32>(0.0f, 1.0f, 0.0f)), 1u);
+  return best;
 }
 
 // A CAGE PATCH IS A CONTACT ROW, NOT A SECOND FORCE LAW.
@@ -1680,7 +1876,7 @@ fn vehicle_cage_patch_contact(lane: u32, position: vec3<f32>, velocity: vec3<f32
   let patch_local = CAGE_PATCH_LOCAL[lane - @@WHEEL_LANES@@u];
   let patch_offset = rotate_body(patch_local, roll, pitch, yaw);
   let patch_world = position + patch_offset;
-  let sample = terrain_sample(patch_world.x, patch_world.z);
+  let sample = terrain_sample(patch_world.x, patch_world.z, patch_world.y);
   let squash = sample.height + @@CAGE_RADIUS@@ - patch_world.y;
   let touching = select(0.0f, 1.0f, sample.valid != 0u && squash > 0.0f
     && squash <= @@CAGE_MAXIMUM_SQUASH@@);
@@ -1719,20 +1915,25 @@ fn vehicle_terrain_contact_geometry(@builtin(global_invocation_id) gid: vec3<u32
   let angular = forward_axis * @@ROLL_VELOCITY@@ + vec3<f32>(0.0f, @@YAW_VELOCITY@@, 0.0f)
     + pitch_axis * @@PITCH_VELOCITY@@;
   let hub_velocity = velocity + cross(angular, hub_offset);
-  let steer = select(0.0f, -controls[1u] * @@MAX_STEER@@, lane < 2u);
+  // Actual knuckle coordinates arrive from the steering-wrench subgraph.
+  // They are not direct DOM/control angles and both axles may participate.
+  let steer = select(controls[18u], controls[17u], lane < 2u);
   let rolling_axis = forward_axis * cos(steer) + right_axis * sin(steer);
   let axle = right_axis * cos(steer) - forward_axis * sin(steer);
   var best_score = -1.0e20f; var surface_point = world_hub + down * @@TIRE_RADIUS@@;
   var surface_normal = vec3<f32>(0.0f, 1.0f, 0.0f); var support = 0.0f;
   var support_position = position; var tire_radial_compression = 0.0f;
+  var integral_weight = 0.0f; var integral_penetration = 0.0f;
+  var integral_point = vec3<f32>(0.0f); var integral_normal = vec3<f32>(0.0f);
+  var integral_position = vec3<f32>(0.0f);
   for (var radial_index = 0u; radial_index < 5u; radial_index += 1u) {
     let angle = RADIAL_ANGLES[radial_index];
     let radial = down * cos(angle) + rolling_axis * sin(angle);
     for (var lateral_index = 0u; lateral_index < 3u; lateral_index += 1u) {
       let probe = world_hub + radial * @@TIRE_RADIUS@@ + axle * (@@TIRE_WIDTH@@ * LATERAL_FRACTIONS[lateral_index]);
       let probe_velocity = velocity + cross(angular, probe - position); let next_probe = probe + probe_velocity * @@FIXED_DT@@;
-      let sample = terrain_sample(probe.x, probe.z); let next_sample = terrain_sample(next_probe.x, next_probe.z);
-      let hub_sample = terrain_sample(world_hub.x, world_hub.z);
+      let sample = terrain_sample(probe.x, probe.z, probe.y); let next_sample = terrain_sample(next_probe.x, next_probe.z, next_probe.y);
+      let hub_sample = terrain_sample(world_hub.x, world_hub.z, world_hub.y);
       let current_clearance = probe.y - sample.height; let next_clearance = next_probe.y - next_sample.height;
       let hub_clearance = world_hub.y - hub_sample.height;
       // Spatial crossing recovers a tire whose outer probe is already below
@@ -1748,12 +1949,12 @@ fn vehicle_terrain_contact_geometry(@builtin(global_invocation_id) gid: vec3<u32
       if (spatial_crossing) {
         let fraction = clamp(hub_clearance / max(1.0e-6f, hub_clearance - current_clearance), 0.0f, 1.0f);
         let crossing_probe = mix(world_hub, probe, fraction);
-        let crossing_sample = terrain_sample(crossing_probe.x, crossing_probe.z);
+        let crossing_sample = terrain_sample(crossing_probe.x, crossing_probe.z, crossing_probe.y);
         point = vec3<f32>(crossing_probe.x, crossing_sample.height, crossing_probe.z);
         candidate_normal = crossing_sample.normal;
       } else if (temporal_crossing) {
         let fraction = clamp(current_clearance / max(1.0e-6f, current_clearance - next_clearance), 0.0f, 1.0f);
-        let crossing_probe = mix(probe, next_probe, fraction); let crossing_sample = terrain_sample(crossing_probe.x, crossing_probe.z);
+        let crossing_probe = mix(probe, next_probe, fraction); let crossing_sample = terrain_sample(crossing_probe.x, crossing_probe.z, crossing_probe.y);
         point = vec3<f32>(crossing_probe.x, crossing_sample.height, crossing_probe.z);
         candidate_normal = crossing_sample.normal;
         evaluation_hub = world_hub + hub_velocity * (@@FIXED_DT@@ * fraction);
@@ -1761,22 +1962,41 @@ fn vehicle_terrain_contact_geometry(@builtin(global_invocation_id) gid: vec3<u32
       }
       let hub_to_surface = evaluation_hub - point; let radial_distance = max(1.0e-8f, length(hub_to_surface));
       let normal_distance = dot(hub_to_surface, candidate_normal); let alignment = normal_distance / radial_distance;
-      let penetration = @@TIRE_RADIUS@@ - normal_distance; let score = penetration + alignment * 0.003f;
-      if (sample.valid != 0u && (crossed_skin || normal_distance <= @@CONTACT_REACH@@) && alignment >= 0.12f && score > best_score) {
-        best_score = score; surface_point = point; surface_normal = candidate_normal;
-        support_position = evaluation_position; tire_radial_compression = max(0.0f, penetration);
+      let penetration = max(0.0f, @@TIRE_RADIUS@@ - normal_distance);
+      let valid_probe = sample.valid != 0u && (crossed_skin || normal_distance <= @@CONTACT_REACH@@)
+        && alignment >= 0.12f && penetration > 0.0f;
+      let integrated_penetration = select(0.0f, penetration, valid_probe);
+      radial_probes[lane * 15u + radial_index * 3u + lateral_index] = integrated_penetration;
+      if (valid_probe) {
+        // Equal-cell quadrature over the authored 5 x 3 tire grid.  The
+        // penetration-weighted centroid and normal preserve every active
+        // sample; no closest or top-1 probe becomes the tire contact.
+        integral_weight += penetration; integral_penetration += penetration;
+        integral_point += point * penetration; integral_normal += candidate_normal * penetration;
+        integral_position += evaluation_position * penetration;
       }
     }
+  }
+  if (integral_weight > 1.0e-9f) {
+    surface_point = integral_point / integral_weight;
+    surface_normal = safe_normalize(integral_normal, vec3<f32>(0.0f, 1.0f, 0.0f));
+    support_position = integral_position / integral_weight;
+    tire_radial_compression = integral_penetration / 15.0f;
+    best_score = tire_radial_compression;
   }
   // A tire is a short capsule along its axle.  This radial closest-point
   // query lets the same tire touch wall faces and edges; drivetrain torque
   // then acts in the wall tangent, allowing a climb only when geometry,
   // available torque, normal load and Coulomb friction permit it.
-  let wall_count = u32(terrain_parameters[11u]);
+  let wall_count = u32(terrain_parameters[1u]);
   for (var wall_index = 0u; wall_index < wall_count; wall_index += 1u) {
     let base = wall_index * 6u;
     let wall_minimum = vec3<f32>(wall_colliders[base], wall_colliders[base + 1u], wall_colliders[base + 2u]);
     let wall_maximum = vec3<f32>(wall_colliders[base + 3u], wall_colliders[base + 4u], wall_colliders[base + 5u]);
+    let broadphase_reach = vec3<f32>(@@TIRE_RADIUS@@ + @@TIRE_WIDTH@@ + @@CONTACT_REACH@@);
+    if (any(world_hub < wall_minimum - broadphase_reach) || any(world_hub > wall_maximum + broadphase_reach)) {
+      continue;
+    }
     for (var lateral_index = 0u; lateral_index < 3u; lateral_index += 1u) {
       let slice_hub = world_hub + axle * (@@TIRE_WIDTH@@ * LATERAL_FRACTIONS[lateral_index]);
       var point = clamp(slice_hub, wall_minimum, wall_maximum);
@@ -1819,7 +2039,7 @@ fn vehicle_terrain_contact_geometry(@builtin(global_invocation_id) gid: vec3<u32
   // the bottom of the carcass (reporting at the hub reads as a fully bottomed
   // suspension and the law answers with tens of kilonewtons).
   if (best_score <= -1.0e19f) {
-    let buried_sample = terrain_sample(world_hub.x, world_hub.z);
+    let buried_sample = terrain_sample(world_hub.x, world_hub.z, world_hub.y + @@TIRE_RADIUS@@);
     let buried_depth = buried_sample.height - world_hub.y;
     if (buried_sample.valid != 0u && buried_depth > -@@TIRE_RADIUS@@) {
       let squash = clamp(buried_depth + @@TIRE_RADIUS@@, 0.0f, 0.06f);
@@ -1971,12 +2191,11 @@ fn vehicle_terrain_contact_geometry(@builtin(global_invocation_id) gid: vec3<u32
             "workgroup_size": [lanes, 1, 1], "dispatch": [1, 1, 1], "invocations": lanes,
             "lane_mapping": [identity for _, identity in contact_patch_lanes()],
             "bindings": ["terrain_heights", "terrain_parameters", "vehicle_feed", "contact_feed", "controls",
-                         "wall_colliders"],
+            "wall_colliders", "radial_probes"],
         },
         "terrain_parameter_abi": [
-            "origin_x", "origin_y", "origin_z", "cell_x", "cell_z", "columns", "rows",
-            "minimum_x", "maximum_x", "minimum_z", "maximum_z",
-            "wall_count",
+            "field_count", "wall_count",
+            "field[12]:origin_xyz,cell_xz,columns,rows,domain_xxzz,height_offset",
         ],
     }
 
@@ -1984,6 +2203,7 @@ fn vehicle_terrain_contact_geometry(@builtin(global_invocation_id) gid: vec3<u32
 def _vehicle_gpu_graph_adapters(
     contact_inputs: tuple[str, ...], contact_outputs: tuple[str, ...],
     vehicle_inputs: tuple[str, ...], vehicle_outputs: tuple[str, ...],
+    vehicle_output_slots: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Generate storage-to-storage graph edges around compiler kernels."""
 
@@ -1991,7 +2211,7 @@ def _vehicle_gpu_graph_adapters(
     co = {name: index for index, name in enumerate(contact_outputs)}
     vi = {name: index for index, name in enumerate(vehicle_inputs)}
     lanes = contact_lane_count()
-    vo = {name: index for index, name in enumerate(vehicle_outputs)}
+    vo = dict(vehicle_output_slots or {name: index for index, name in enumerate(vehicle_outputs)})
     wheel_lines: list[str] = []
     for lane, wheel in enumerate(WHEEL_NAMES):
         force = [f"contact_outputs[{co[f'chassis_force_{axis}']}u * {lanes}u + {lane}u]" for axis in "xyz"]
@@ -2048,8 +2268,25 @@ fn assemble_vehicle_graph_inputs(@builtin(global_invocation_id) gid: vec3<u32>) 
   vehicle_feed[{vi['forward_gear_ratio']}u] = controls[3u];
   vehicle_feed[{vi['reverse_gear_ratio']}u] = controls[4u];
   vehicle_feed[{vi['transfer_case_ratio']}u] = controls[5u];
-  vehicle_feed[{vi['differential_lock']}u] = controls[6u];
+  vehicle_feed[{vi['front_differential_lock']}u] = controls[6u];
+  vehicle_feed[{vi['rear_differential_lock']}u] = controls[13u];
+  vehicle_feed[{vi['traction_control_enabled']}u] = controls[15u];
+  vehicle_feed[{vi['abs_enabled']}u] = controls[16u];
+  vehicle_feed[{vi['traction_control_authority']}u] = controls[19u];
+  vehicle_feed[{vi['abs_authority']}u] = controls[20u];
+  vehicle_feed[{vi['center_differential_lock']}u] = controls[21u];
+  vehicle_feed[{vi['front_differential_brake']}u] = controls[22u];
+  vehicle_feed[{vi['rear_differential_brake']}u] = controls[23u];
   vehicle_feed[{vi['drive_direction']}u] = controls[7u];
+  vehicle_feed[{vi['brake_lock_front_left']}u] = controls[8u];
+  vehicle_feed[{vi['brake_lock_front_right']}u] = controls[9u];
+  vehicle_feed[{vi['brake_lock_rear_left']}u] = controls[10u];
+  vehicle_feed[{vi['brake_lock_rear_right']}u] = controls[11u];
+  let front_share = select(clamp(controls[12u], 0.05f, 0.95f), 0.5f, controls[14u] > 0.5f);
+  vehicle_feed[{vi['drive_fraction_front_left']}u] = front_share * 0.5f;
+  vehicle_feed[{vi['drive_fraction_front_right']}u] = front_share * 0.5f;
+  vehicle_feed[{vi['drive_fraction_rear_left']}u] = (1.0f - front_share) * 0.5f;
+  vehicle_feed[{vi['drive_fraction_rear_right']}u] = (1.0f - front_share) * 0.5f;
 {chr(10).join(wheel_lines)}
 }}'''
     commits: list[str] = []
@@ -2096,8 +2333,15 @@ fn commit_vehicle_graph_state(@builtin(global_invocation_id) gid: vec3<u32>) {{
         "schema": "abstract-ui-vehicle-gpu-graph-adapters-v0",
         "authority": "compiler-published-packed-abis",
         "control_abi": ["throttle", "steering", "brake", "forward_gear_ratio",
-                        "reverse_gear_ratio", "transfer_case_ratio", "differential_lock",
-                        "drive_direction"],
+                        "reverse_gear_ratio", "transfer_case_ratio", "front_differential_lock",
+                        "drive_direction", "brake_lock_front_left", "brake_lock_front_right",
+                        "brake_lock_rear_left", "brake_lock_rear_right", "front_drive_share",
+                        "rear_differential_lock", "center_transfer_lock",
+                        "traction_control_enabled", "abs_enabled",
+                        "front_knuckle_steer_angle", "rear_knuckle_steer_angle",
+                        "traction_control_authority", "abs_authority",
+                        "center_differential_coupling",
+                        "front_differential_brake", "rear_differential_brake"],
         "assembly": {
             "source": assembly, "entrypoint": "assemble_vehicle_graph_inputs",
             "workgroup_size": [1, 1, 1], "dispatch": [1, 1, 1],
@@ -2123,13 +2367,37 @@ def vehicle_webgpu_program_model(config: VehicleConfiguration) -> dict[str, Any]
     reduction = compile_vehicle_wrench_reduction_webgpu()
     reduction_program = reduction.artifacts[0]
     vehicle_compilation = compile_symbolic_vehicle_physics_gpu_ssa()
-    vehicle_program = compile_symbolic_vehicle_physics_webgpu()
-    contact_inputs = tuple(tensor_contact.argument_names)
+    vehicle_stages = compile_symbolic_vehicle_physics_webgpu_stages()
+    fixed_compilation = compile_default_specialized_vehicle_physics_gpu_ssa()
+    fixed_stages = {stage["identity"]: stage
+                    for stage in compile_default_specialized_vehicle_physics_webgpu_stages()}
     vehicle_inputs = tuple(vehicle_compilation.function.metadata["argument_names"])
+    fixed_inputs = tuple(fixed_compilation.function.metadata["argument_names"])
+    vehicle_input_slots = {name: index for index, name in enumerate(vehicle_inputs)}
+    fixed_to_resident = tuple(vehicle_input_slots[name] for name in fixed_inputs)
+
+    def resident_feed_source(source: str) -> str:
+        return re.sub(
+            r"feeds\[(\d+)u \+ linear_index\]",
+            lambda match: f"feeds[{fixed_to_resident[int(match.group(1))]}u + linear_index]",
+            source,
+        )
+    vehicle_output_slots = {
+        name: int(stage["output_offset_floats"]) + index
+        for stage in vehicle_stages
+        for index, name in enumerate(stage["outputs"])
+    }
+    vehicle_output_buffer_floats = max(vehicle_output_slots.values()) + 1
+    contact_inputs = tuple(tensor_contact.argument_names)
     adapters = _vehicle_gpu_graph_adapters(
         contact_inputs, tuple(tensor_contact.output_names),
         vehicle_inputs, tuple(VEHICLE_STATE_OUTPUTS),
+        vehicle_output_slots,
     )
+    adapters["dispatch_order"] = ["terrain_contact_geometry", "compiled_contact_law",
+                                  "backend_gemm_wrench_reduction", "assemble_vehicle_inputs",
+                                  *(f"compiled_vehicle_{stage['identity']}" for stage in vehicle_stages),
+                                  "commit_vehicle_state"]
     return {
         "schema": "abstract-ui-vehicle-webgpu-program-v0",
         "identity": f"{config.identity}/programs/wheel-contact-webgpu",
@@ -2189,16 +2457,34 @@ def vehicle_webgpu_program_model(config: VehicleConfiguration) -> dict[str, Any]
             "source_language": "sympy-equation-set-to-repository-ssa",
             "inputs": list(vehicle_compilation.function.metadata["argument_names"]),
             "outputs": list(VEHICLE_STATE_OUTPUTS),
+            "output_slots": vehicle_output_slots,
+            "output_buffer_floats": vehicle_output_buffer_floats,
             "state_residency": "gpu-persistent-with-passive-presentation-snapshots",
-            "kernel": {
-                "source": vehicle_program.source,
-                "entrypoint": "main",
-                "workgroup_size": list(vehicle_program.launch_plan.workgroup_size),
-                "dispatch": list(vehicle_program.launch_plan.groups),
-                "invocations": 1,
-                "io": vehicle_program.api.to_mapping()["metadata"]["io_layout"],
-                "output_span": vehicle_program.api.to_mapping()["metadata"]["output_span"],
+            "shared_output_buffer": "one-allocation-disjoint-256-byte-aligned-storage-views",
+            "host_transfers_between_stages": 0,
+            "default_specialization": {
+                "policy": "eager-fixed-default/lazy-parametric-on-nondefault-configuration",
+                "resident_feed_abi": list(vehicle_inputs), "fixed_inputs": list(fixed_inputs),
+                "folded_inputs": [name for name in vehicle_inputs if name not in set(fixed_inputs)],
+                "pipeline_swap_moves_state": False,
             },
+            "stages": [{
+                "identity": stage["identity"], "outputs": list(stage["outputs"]),
+                "output_offset_floats": int(stage["output_offset_floats"]),
+                "kernel": {
+                    "source": resident_feed_source(fixed_stages[stage["identity"]]["kernel"].source),
+                    "entrypoint": "main",
+                    "workgroup_size": list(fixed_stages[stage["identity"]]["kernel"].launch_plan.workgroup_size),
+                    "dispatch": list(fixed_stages[stage["identity"]]["kernel"].launch_plan.groups), "invocations": 1,
+                    "io": fixed_stages[stage["identity"]]["kernel"].api.to_mapping()["metadata"]["io_layout"],
+                    "output_span": fixed_stages[stage["identity"]]["kernel"].api.to_mapping()["metadata"]["output_span"],
+                },
+                "parametric_kernel": {
+                    "source": stage["kernel"].source, "entrypoint": "main",
+                    "workgroup_size": list(stage["kernel"].launch_plan.workgroup_size),
+                    "dispatch": list(stage["kernel"].launch_plan.groups), "invocations": 1,
+                },
+            } for stage in vehicle_stages],
         },
         "paired_force_rule": "wheel_force_is_exact_negative_of_published_chassis_force",
         "reduction": "AbstractTensor GEMM maps four wheel-wrench rows to one chassis wrench",
@@ -2241,9 +2527,21 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
         pa = next(item["reference_position"] for item in nodes if item["identity"] == a)
         pb = next(item["reference_position"] for item in nodes if item["identity"] == b)
         rest_length = math.sqrt(sum((pa[axis] - pb[axis]) ** 2 for axis in range(3)))
+        area = math.pi * radius ** 2
+        decorative = constraint.startswith("rigid-lamp") or "headlamp" in identity
+        damage = None if decorative else {
+            "model": "elastic-plastic-member-with-shear-fracture",
+            "natural_rest_length": rest_length,
+            "plastic_strain_limit": .0025 if constraint != "spring-damper" else .035,
+            "fracture_strain": .075 if constraint != "spring-damper" else .24,
+            "axial_yield_force_n": area * 250_000_000 * .72,
+            "shear_force_limit_n": area * 250_000_000 * .42,
+            "failure_response": "constraint-opens-and-load-path-is-removed",
+            "respawn_response": "restore-authored-natural-length-and-health",
+        }
         edges.append({"identity": identity, "a": a, "b": b, "constraint": constraint,
                       "rest_length": rest_length, "radius": radius, "palette_role": palette,
-                      **attributes})
+                      **({"damage": damage} if damage else {}), **attributes})
 
     # Rigid frame: four load nodes, perimeter rails, and both triangulating diagonals.
     for longitudinal, x in (("front", wheelbase), ("rear", -wheelbase)):
@@ -2346,6 +2644,7 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
             "upper_ball_joint": [x, hub_y + .085, knuckle_z],
             "lower_ball_joint": [x, hub_y - .085, knuckle_z],
             "knuckle": [x, hub_y, knuckle_z],
+            "halfshaft_joint": [x, hub_y, knuckle_z],
             "hub": [x, hub_y, hub_z],
             "wheel_rim": [x, hub_y, hub_z],
             "tire_carcass": [x, hub_y, hub_z],
@@ -2354,15 +2653,17 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
             "coilover_chassis": [x - .025, frame_y + .13, side * half_width * .30],
             "contact_patch": [x, hub_y - wheel_radius, hub_z],
         }
-        if longitudinal == "front":
-            points["steering_rack"] = [x - .08, hub_y + .025, side * half_width * .24]
-            points["steering_arm"] = [x - .045, hub_y + .025, knuckle_z - side * .025]
+        rack_x = x - .08 if longitudinal == "front" else x + .08
+        arm_x = x - .045 if longitudinal == "front" else x + .045
+        points["steering_rack"] = [rack_x, hub_y + .025, side * half_width * .24]
+        points["steering_arm"] = [arm_x, hub_y + .025, knuckle_z - side * .025]
         for name, position in points.items():
             fixed = name.endswith("pickup_forward") or name.endswith("pickup_rear") \
                 or name in {"coilover_chassis", "steering_rack"}
             node(f"{prefix}.{name}", position,
                  "contact-patch" if name == "contact_patch" else
-                 "upright-knuckle" if name == "knuckle" else
+                  "upright-knuckle" if name == "knuckle" else
+                  "halfshaft-universal-joint" if name == "halfshaft_joint" else
                  "wheel-hub" if name == "hub" else
                  "wheel-rim" if name == "wheel_rim" else
                  "pneumatic-tire-carcass" if name == "tire_carcass" else
@@ -2394,13 +2695,44 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
              "rotational-bearing", radius=.012, palette="rollbar-silver",
              polar_inertia_kg_m2=config.wheel_rotational_inertia(),
              gyroscopic_reaction="signed-omega-cross-angular-momentum-to-knuckle-and-chassis",
+             structural_constraint="five-axis-support-one-axis-free-rotation",
+             radial_stiffness_n_per_m=8.5e7, axial_stiffness_n_per_m=6.2e7,
+             moment_stiffness_nm_per_rad=1.8e5, radial_yield_force_n=145_000.0,
+             axial_yield_force_n=92_000.0, moment_yield_nm=18_000.0,
              force_path="upright-through-bearing-to-wheel")
+        edge(f"{prefix}.outer_halfshaft_joint", f"{prefix}.halfshaft_joint", f"{prefix}.hub",
+             "universal-joint-hub-spindle", radius=.010, palette="drivetrain-black",
+             polar_inertia_kg_m2=config.wheel_rotational_inertia(),
+             generalized_coordinate=f"steering_angle_{longitudinal}",
+             force_path="halfshaft-universal-joint-to-wheel-hub")
         edge(f"{prefix}.coilover", f"{prefix}.coilover_chassis", f"{prefix}.lower_ball_joint",
              "spring-damper", radius=.017, palette="suspension-yellow",
              stiffness=float(suspension["stiffness"]),
+             static_preload_compression_m=static_compression,
+             visualization={
+                 "kind": "helical-coilover",
+                 "wire_radius_m": max(.0026, min(.0062, .0026 +
+                     float(suspension["stiffness"]) / 45_000_000.0)),
+                 "active_turns": max(5.5, min(10.5, 10.5 -
+                     float(suspension["stiffness"]) / 45_000.0)),
+                 "preload_collar": True,
+                 "damper_shaft_radius_m": .006,
+             },
              compression_damping=float(suspension["pneumatic_compression_damping"]),
              rebound_damping=float(suspension["pneumatic_rebound_damping"]),
+             bump_stop={"start_compression_m": float(suspension["travel"]) * .82,
+                        "progressive_stiffness_n_per_m": float(suspension["stiffness"]) * 6.5,
+                        "maximum_compression_m": float(suspension["travel"])},
              force_path="lower-arm-to-chassis")
+        edge(f"{prefix}.droop_limit_strap", f"{prefix}.coilover_chassis",
+             f"{prefix}.lower_ball_joint", "tension-limit-strap", radius=.006,
+             palette="suspension-yellow", tension_only=True,
+             maximum_length_m=math.sqrt(sum((points["coilover_chassis"][axis] -
+                 points["lower_ball_joint"][axis]) ** 2 for axis in range(3))) +
+                 float(suspension["travel"]) * .16,
+             axial_stiffness_n_per_m=1.9e6, tensile_yield_force_n=42_000.0,
+             failure_response="strap-fracture-allows-full-droop-until-other-member-limit",
+             force_path="lower-arm-droop-stop-to-coilover-tower")
         edge(f"{prefix}.coilover_tower", f"{prefix}.coilover_chassis",
              f"cage.{longitudinal}_{lateral}.lower", "rigid-distance", radius=.015,
              palette="rollbar-silver", force_path="coilover-top-to-roll-cage-and-frame")
@@ -2409,10 +2741,13 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
              polar_inertia_kg_m2=config.wheel_rotational_inertia(), force_path="halfshaft-to-wheel")
         edge(f"{prefix}.rotor_mount", f"{prefix}.wheel_rim", f"{prefix}.brake_rotor",
              "rigid-rotor-mount", radius=.009, palette="drivetrain-black",
-             force_path="wheel-to-brake-rotor")
+             torsional_stiffness_nm_per_rad=2.4e5, torsional_yield_nm=24_000.0,
+             force_path="wheel-hub-to-brake-rotor")
         edge(f"{prefix}.caliper_mount", f"{prefix}.knuckle", f"{prefix}.brake_caliper",
              "rigid-caliper-mount", radius=.009, palette="suspension-yellow",
-             force_path="brake-reaction-to-upright")
+             shear_stiffness_n_per_m=7.5e7, moment_stiffness_nm_per_rad=1.4e5,
+             shear_yield_force_n=110_000.0, moment_yield_nm=16_000.0,
+             force_path="brake-reaction-to-knuckle-upright-and-both-control-arms")
         edge(f"{prefix}.service_brake", f"{prefix}.brake_rotor", f"{prefix}.brake_caliper",
              "friction-brake-torque-couple", radius=.008, palette="suspension-yellow",
              torque_channel=f"brake_torque * brake * brake_scale_{corner}",
@@ -2422,14 +2757,31 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
         edge(f"{prefix}.tire", f"{prefix}.tire_carcass", f"{prefix}.contact_patch",
              "pneumatic-contact", radius=.01, palette="drivetrain-black",
              force_path="terrain-wrench-entry")
-        if longitudinal == "front":
-            edge(f"{prefix}.steering_arm", f"{prefix}.hub", f"{prefix}.steering_arm",
-                 "rigid-offset", radius=.009, palette="suspension-yellow",
-                 force_path="steering-moment-to-upright")
-            edge(f"{prefix}.tie_rod", f"{prefix}.steering_rack", f"{prefix}.steering_arm",
-                 "steering-link", radius=.009, palette="suspension-yellow",
-                 generalized_coordinate="steering_angle",
-                 force_path="rack-to-upright-steering-moment")
+        edge(f"{prefix}.steering_arm", f"{prefix}.knuckle", f"{prefix}.steering_arm",
+             "rigid-offset", radius=.009, palette="suspension-yellow",
+             generalized_coordinate=f"steering_angle_{longitudinal}",
+             force_path="steering-moment-to-upright")
+        edge(f"{prefix}.tie_rod", f"{prefix}.steering_rack", f"{prefix}.steering_arm",
+             "steering-link", radius=.009, palette="suspension-yellow",
+             generalized_coordinate=f"steering_angle_{longitudinal}",
+             joint_a="spherical", joint_b="spherical",
+             force_path="rack-to-upright-steering-moment")
+
+    # One torsion stabilizer per axle connects the two lower arms. It is an
+    # ordinary load-path member and therefore shares the same plastic/shear
+    # damage contract as the wishbones, shocks, frame and transfer rods.
+    for axle in ("front", "rear"):
+        edge(f"suspension.{axle}.anti_roll_bar",
+             f"suspension.{axle}_left.lower_ball_joint",
+             f"suspension.{axle}_right.lower_ball_joint", "torsion-stabilizer",
+             radius=.012, palette="suspension-yellow",
+             torsional_stiffness_nm_per_rad=float(suspension["stiffness"]) * .018,
+             force_path="left-lower-arm-to-right-lower-arm")
+        edge(f"suspension.{axle}.coilover_tower_cross_brace",
+             f"suspension.{axle}_left.coilover_chassis",
+             f"suspension.{axle}_right.coilover_chassis", "rigid-distance",
+             radius=.016, palette="rollbar-silver",
+             force_path="left-coilover-tower-to-right-coilover-tower-and-cage")
 
     # Complete driver-to-upright steering topology.  The black ring and column
     # are control/drivetrain hardware; the yellow tie rods remain suspension
@@ -2468,12 +2820,32 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
          generalized_coordinate="steering_angle")
     node("steering.rack.center", rack_center, "steering-rack",
          generalized_coordinate="steering_angle")
+    rear_left_rack = next(item for item in nodes
+                          if item["identity"] == "suspension.rear_left.steering_rack")
+    rear_right_rack = next(item for item in nodes
+                           if item["identity"] == "suspension.rear_right.steering_rack")
+    rear_rack_center = [(rear_left_rack["reference_position"][axis]
+                         + rear_right_rack["reference_position"][axis]) * .5 for axis in range(3)]
+    proportioner = [column_lower[0] + .07, column_lower[1] - .035, column_lower[2] + .03]
+    rear_pinion = [rear_rack_center[0] + .08, rear_rack_center[1] + .035, rear_rack_center[2]]
+    node("steering.proportioner", proportioner, "front-rear-steering-proportion-gearbox",
+         generalized_coordinate="steering_front_rear_proportion")
+    node("steering.rear_pinion", rear_pinion, "steering-pinion",
+         generalized_coordinate="steering_angle_rear")
+    node("steering.rear_rack.center", rear_rack_center, "steering-rack",
+         generalized_coordinate="steering_angle_rear")
     edge("steering.column.upper", "steering.wheel.center", "steering.column.lower",
          "steering-torque-shaft", radius=.009, palette="drivetrain-black",
          generalized_coordinate="steering_angle")
-    edge("steering.column.lower", "steering.column.lower", "steering.pinion",
+    edge("steering.column.lower", "steering.column.lower", "steering.proportioner",
          "universal-joint-steering-shaft", radius=.008, palette="drivetrain-black",
          generalized_coordinate="steering_angle")
+    edge("steering.proportioner.front", "steering.proportioner", "steering.pinion",
+         "steering-torque-shaft", radius=.008, palette="drivetrain-black",
+         generalized_coordinate="steering_angle_front")
+    edge("steering.proportioner.rear", "steering.proportioner", "steering.rear_pinion",
+         "steering-torque-shaft", radius=.008, palette="drivetrain-black",
+         generalized_coordinate="steering_angle_rear")
     edge("steering.rack_and_pinion", "steering.pinion", "steering.rack.center",
          "rack-and-pinion-angle-to-translation", radius=.009, palette="drivetrain-black",
          generalized_coordinate="steering_angle")
@@ -2483,6 +2855,15 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
     edge("steering.rack.right", "steering.rack.center",
          "suspension.front_right.steering_rack", "rack-translation", radius=.008,
          palette="drivetrain-black", generalized_coordinate="steering_angle")
+    edge("steering.rear_rack_and_pinion", "steering.rear_pinion", "steering.rear_rack.center",
+         "rack-and-pinion-angle-to-translation", radius=.009, palette="drivetrain-black",
+         generalized_coordinate="steering_angle_rear")
+    edge("steering.rear_rack.left", "steering.rear_rack.center",
+         "suspension.rear_left.steering_rack", "rack-translation", radius=.008,
+         palette="drivetrain-black", generalized_coordinate="steering_angle_rear")
+    edge("steering.rear_rack.right", "steering.rear_rack.center",
+         "suspension.rear_right.steering_rack", "rack-translation", radius=.008,
+         palette="drivetrain-black", generalized_coordinate="steering_angle_rear")
 
     engine_position = [float(value) for value in powertrain["engine_position"]]
     power_nodes = {
@@ -2493,6 +2874,8 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
         "powertrain.center_shaft": [-.12, .06, 0.0],
         "powertrain.front_differential": [wheelbase, .065, 0.0],
         "powertrain.rear_differential": [-wheelbase, .065, 0.0],
+        "powertrain.front_differential_brake": [wheelbase + .105, .065, 0.0],
+        "powertrain.rear_differential_brake": [-wheelbase - .105, .065, 0.0],
         "mount.engine_left": [engine_position[0], .075, -half_width * .58],
         "mount.engine_right": [engine_position[0], .075, half_width * .58],
         "mount.transmission_left": [engine_position[0] + .28, .055, -half_width * .52],
@@ -2507,10 +2890,18 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
         "powertrain.rear_differential": "rear_differential",
     }
     for identity, position in power_nodes.items():
-        node(identity, position, "powertrain-mount" if identity.startswith("mount.") else "rotating-mass",
+        differential_brake = identity.endswith("_differential_brake")
+        node(identity, position, "powertrain-mount" if identity.startswith("mount.") else
+             "differential-driveline-brake" if identity.endswith("_differential_brake") else "rotating-mass",
              fixed_to="chassis" if identity.startswith("mount.") else None,
-             mass_kg=component_masses.get(graph_mass_names.get(identity, ""), 0.0),
-             mass_in_total=identity in graph_mass_names)
+             mass_kg=(22.0 if differential_brake else
+                      component_masses.get(graph_mass_names.get(identity, ""), 0.0)),
+             mass_in_total=identity in graph_mass_names,
+             polar_inertia_kg_m2=(.5 * 22.0 * .082 ** 2 if differential_brake else None),
+             inertia_axis="axle-input-shaft" if differential_brake else None,
+             mass_integration_status=(
+                 "declared-part-budget-existing-lumped-vehicle-mass-remains-authoritative"
+                 if differential_brake else None))
     torque_edges = (
         ("engine_to_clutch", "powertrain.engine", "powertrain.clutch", "engine_torque"),
         ("clutch_to_transmission", "powertrain.clutch", "powertrain.transmission", "clutch_torque"),
@@ -2523,11 +2914,25 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
         edge(f"drivetrain.{name}", a, b, "torque-shaft", radius=.011,
              palette="drivetrain-black", torque_channel=channel)
     for axle in ("front", "rear"):
+        edge(f"drivetrain.{axle}_differential_brake",
+             f"powertrain.{axle}_differential", f"powertrain.{axle}_differential_brake",
+             "friction-brake-torque-couple", radius=.018, palette="suspension-yellow",
+             torque_channel=f"{axle}_differential_brake_torque",
+             command=f"{axle}_differential_brake",
+             modulation="abs-authority-before-axle-differential",
+             reaction_path="differential-housing-to-axle-and-chassis",
+             rotor_radius_m=.082, rotor_mass_kg=22.0,
+             rotor_polar_inertia_kg_m2=.5 * 22.0 * .082 ** 2,
+             angular_velocity_coordinate=f"({axle}_left_wheel_omega+{axle}_right_wheel_omega)/2",
+             momentum_integration_status="declared-for-next-driveline-mass-matrix-pass")
+    for axle in ("front", "rear"):
         for lateral in ("left", "right"):
             corner = f"{axle}_{lateral}"
             edge(f"drivetrain.{corner}_halfshaft", f"powertrain.{axle}_differential",
-                 f"suspension.{corner}.hub", "constant-velocity-torque-shaft", radius=.009,
-                 palette="drivetrain-black", torque_channel=f"wheel_torque_{corner}")
+                 f"suspension.{corner}.halfshaft_joint", "constant-velocity-torque-shaft", radius=.009,
+                 palette="drivetrain-black", torque_channel=f"wheel_torque_{corner}",
+                 torsional_yield_torque_nm=4200.0, torsional_fracture_torque_nm=6500.0,
+                 failure_response="open-halfshaft-requiring-locker-to-route-torque-to-intact-side")
     for component, mounts in (("engine", ("engine_left", "engine_right")),
                               ("transmission", ("transmission_left", "transmission_right")),
                               ("transfer_case", ("transfer_case_left", "transfer_case_right"))):
@@ -2535,6 +2940,72 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
             edge(f"mount.{component}.{mount}", f"powertrain.{component}", f"mount.{mount}",
                  "six-axis-compliant-mount", radius=.012, palette="drivetrain-black",
                  transfer="force-and-moment-to-chassis")
+
+    # A reusable routed tension actuator. The cable does not pretend to be a
+    # rigid tie rod: its fixed guides define a bendable route, the inner cable
+    # transmits tension only, and a small table maps pedal travel to throttle-
+    # lever travel. This control-rate graph is deliberately outside the tire/
+    # contact kernel; the already filtered throttle coordinate drives it.
+    throttle_points = {
+        "controls.throttle.pedal": [.03, .23, -half_width * .25],
+        "controls.throttle.guide_cabin": [.18, .24, -half_width * .31],
+        "controls.throttle.guide_firewall": [.30, .20, -half_width * .27],
+        "powertrain.intake.plenum": [engine_position[0] - .015, .205, 0.0],
+        "powertrain.intake.throttle_body": [engine_position[0] + .075, .205, -half_width * .13],
+        "powertrain.intake.throttle_lever": [engine_position[0] + .075, .225, -half_width * .18],
+    }
+    for identity, position in throttle_points.items():
+        node(identity, position,
+             "cable-guide" if ".guide_" in identity else
+             "table-actuator-input" if identity.endswith("pedal") else
+             "throttle-lever" if identity.endswith("lever") else "intake-component",
+             fixed_to="chassis", generalized_coordinate=(
+                 "throttle_cable_travel" if identity.endswith(("pedal", "lever")) else None))
+    cable_route = (
+        "controls.throttle.pedal", "controls.throttle.guide_cabin",
+        "controls.throttle.guide_firewall", "powertrain.intake.throttle_lever",
+    )
+    for index, (a, b) in enumerate(zip(cable_route, cable_route[1:])):
+        edge(f"actuator.throttle.cable_{index}", a, b, "routed-tension-cable",
+             radius=.004, palette="actuator-yellow", tension_only=True,
+             stretch_coefficient_m_per_n=1.8e-5, bend_relaxation="guide-node-catenary-low-rate",
+             force_path="pedal-inner-cable-to-throttle-return-spring")
+    edge("actuator.throttle.lever", "powertrain.intake.throttle_body",
+         "powertrain.intake.throttle_lever", "table-actuator-linear-link",
+         radius=.006, palette="actuator-yellow", generalized_coordinate="throttle_cable_travel",
+         joint_a="revolute", joint_b="cable-eye",
+         travel_table=[[0.0, 0.0], [.18, .006], [.50, .019], [.78, .030], [1.0, .038]],
+         return_spring_n_per_m=880.0, viscous_drag_n_s_per_m=3.2,
+         force_law="positive-tension-minus-elastic-stretch-and-return-spring")
+    energy_points = {
+        "energy.storage": [-half_length * .48, .18, 0.0],
+        "energy.delivery.guide_rear": [-half_length * .26, .14, -half_width * .30],
+        "energy.delivery.guide_front": [engine_position[0] - .12, .16, -half_width * .30],
+        "powertrain.fuel_rail": [engine_position[0], .19, -half_width * .18],
+        "powertrain.intake.air_filter": [engine_position[0] - .12, .22, half_width * .25],
+        "powertrain.exhaust.header_left": [engine_position[0], .14, -half_width * .27],
+        "powertrain.exhaust.header_right": [engine_position[0], .14, half_width * .27],
+    }
+    for identity, position in energy_points.items():
+        node(identity, position,
+             "interchangeable-energy-storage" if identity == "energy.storage" else
+             "delivery-route-guide" if ".guide_" in identity else
+             "fuel-rail" if identity.endswith("fuel_rail") else
+             "air-intake" if "air_filter" in identity else "exhaust-header",
+             fixed_to="chassis")
+    energy_route = ("energy.storage", "energy.delivery.guide_rear",
+                    "energy.delivery.guide_front", "powertrain.fuel_rail")
+    for index, (a, b) in enumerate(zip(energy_route, energy_route[1:])):
+        edge(f"energy.delivery.segment_{index}", a, b, "routed-energy-line",
+             radius=.005, palette="engine-accent", route_support="bend-guides",
+             medium_rate_state="fuel-pressure-flow-or-voltage-current-selected-by-power-unit")
+    edge("powertrain.intake.air_path", "powertrain.intake.air_filter",
+         "powertrain.intake.plenum", "intake-flow-path", radius=.014,
+         palette="engine-metal", medium_rate_state="air-mass-flow")
+    for side in ("left", "right"):
+        edge(f"powertrain.exhaust.{side}", "powertrain.engine",
+             f"powertrain.exhaust.header_{side}", "exhaust-flow-path", radius=.012,
+             palette="engine-accent", medium_rate_state="exhaust-pulse-pressure-and-temperature")
     corner_loads = {}
     gravity = abs(float(source["world"]["gravity"]))
     for corner in WHEEL_NAMES:
@@ -2561,12 +3032,71 @@ def _vehicle_mechanical_graph(config: VehicleConfiguration) -> dict[str, Any]:
         "corners": corner_loads,
         "spring_load_sum_n": sum(item["design_static_load_n"] for item in corner_loads.values()),
     }
+    for member in edges:
+        if member["palette_role"] == "suspension-yellow":
+            member["subsystem_class"] = "articulation-linkage"
+            member["end_behavior"] = "pivoting-or-spherical-as-declared"
+        elif member["palette_role"] == "actuator-yellow":
+            member["subsystem_class"] = "routed-control-actuator"
+            member["end_behavior"] = "tension-only-cable-or-table-driven-lever"
+        elif member["palette_role"] == "drivetrain-black":
+            member["subsystem_class"] = "rotary-transmission"
+        else:
+            member["subsystem_class"] = "load-bearing-structure"
     return {
         "schema": "abstract-ui-mechanical-wrench-graph-v1",
         "authority": "json-parameters-expanded-by-python-compiler",
         "coordinate_system": "chassis-local-x-forward-y-up-z-right",
         "state_law": "node-force-and-node-moment-reduced-through-edge-constraints",
         "nodes": nodes, "edges": edges, "load_audit": load_audit,
+        "steering_system": {
+            "topology": "steering-wheel-column-proportioner-two-pinions-two-racks-four-knuckles",
+            "input": "steering-wheel-wrench",
+            "output": "rack-force-to-tie-rod-to-knuckle-moment",
+            "axle_selection": "independent-front-and-rear-with-continuous-proportion",
+            "disconnected_behavior": "knuckle-steer-coordinate-free-with-contact-caster-damping",
+            "default": "both-axles-active-counter-phase",
+        },
+        "control_actuators": [{
+            "identity": "actuator.throttle",
+            "kind": "table-routed-tension-actuator",
+            "input": "filtered-throttle-pedal-travel",
+            "route": list(cable_route),
+            "output": "powertrain.intake.throttle_lever",
+            "evaluation_rate": "control-rate-low-cost",
+            "constitutive_law": "tension-only-elastic-inner-cable-with-return-spring",
+            "hydraulic_reuse_boundary": "route-geometry-only-pressure-flow-compliance-require-a-distinct-law",
+        }],
+        "wheel_end_system": {
+            "topology": "tire-bead-rim-rotor-hub-bearing-knuckle-upright-control-arms",
+            "bearing_constraint": "five-axis-structural-support-with-one-free-spin-axis",
+            "brake_reaction": "rotor-friction-pair-to-caliper-knuckle-upright-and-control-arms",
+            "angular_momentum": "wheel-rotor-bearing-polar-inertia-reacts-gyroscopically-through-knuckle",
+            "integration_status": "declared-graph-contract-current-chassis-kernel-uses-lumped-wheel-end-wrench",
+        },
+        "energy_system": {
+            "topology": "interchangeable-storage-through-routed-delivery-to-power-unit",
+            "storage_node": "energy.storage", "delivery_route": list(energy_route),
+            "reservoir_manifold": {
+                "supported_modes": ["primary", "reserve-sequence", "metered-blend"],
+                "controls": ["primary-selection", "reserve-changeover", "carrier-mix-fraction"],
+                "compatibility_rule": "carrier-properties-must-be-solved-before-flow-can-affect-cylinder-charge",
+                "unsafe_example": "nitromethane-in-gasoline-calibration-causes-knock-or-failure-not-free-power",
+            },
+            "combustion_outputs": ["air-mass-flow", "fuel-mass-flow", "mixture-lambda",
+                                   "cylinder-charge", "header-pulse-state"],
+            "electric_outputs": ["bus-voltage", "phase-current", "inverter-loss", "shaft-torque"],
+            "mass_rule": "storage-shell-and-live-carrier-contribute-to-chassis-mass-center-and-inertia",
+        },
+        "execution_bands": {
+            "fast_critical_120_hz": ["contact-inequalities", "tire-force-integral",
+                                      "wheel-and-driveline-angular-momentum", "chassis-wrench-step"],
+            "medium_critical_30_to_60_hz": ["routed-control-actuators", "mixture-or-inverter-state",
+                                             "cylinder-or-pole-events", "mount-vibration-envelope"],
+            "audio_48_khz_non_authoritative": ["pcm-from-published-engine-event-state"],
+            "slow_1_to_10_hz": ["fuel-or-charge-inventory", "thermal-state", "wear-and-workshop-state"],
+            "handoff": "versioned-common-buffers-with-single-writer-fields-and-no-dom-authority",
+        },
         "constraint_reduction": {
             "suspension": "double-wishbone-four-bar-plus-coilover-motion-ratio",
             "contact": "tire-patch-and-cage-node/member-midpoint-terrain-wrenches-to-chassis",
@@ -2613,6 +3143,256 @@ def vehicle_slot_model(root: str, actor: str) -> dict[str, Any]:
         "pose_reduction": "sum-node-forces-and-r-cross-f-then-compiled-rigid-chassis-step",
     }
     mechanical_graph = _vehicle_mechanical_graph(config)
+    chassis_member_edges = [edge for edge in mechanical_graph["edges"]
+                            if edge["identity"].startswith(("frame.", "cage."))]
+
+    def chassis_profile(identity: str, label: str, material: str, *, outer_diameter_mm: float,
+                        wall_thickness_mm: float, density: float, youngs_modulus: float,
+                        yield_strength: float, shear_strength: float) -> dict[str, Any]:
+        outer = outer_diameter_mm / 1000
+        wall = wall_thickness_mm / 1000
+        inner = outer - 2 * wall
+        area = math.pi * (outer ** 2 - inner ** 2) / 4
+        second_moment = math.pi * (outer ** 4 - inner ** 4) / 64
+        total_length = sum(float(edge["rest_length"]) for edge in chassis_member_edges)
+        return {
+            "identity": identity, "label": label, "material": material,
+            "outer_diameter_m": outer, "wall_thickness_m": wall,
+            "section_area_m2": area, "second_moment_area_m4": second_moment,
+            "density_kg_m3": density, "youngs_modulus_pa": youngs_modulus,
+            "yield_strength_pa": yield_strength, "shear_strength_pa": shear_strength,
+            "joint_efficiency": .72,
+            "member_length_m": total_length, "member_mass_kg": total_length * area * density,
+            "axial_yield_force_n": area * yield_strength * .72,
+            "shear_force_limit_n": area * shear_strength * .72,
+            "solver_policy": "profile-swaps-physical-member-limits-mass-and-rigid-body-inertia",
+        }
+
+    chassis_profiles = [
+        chassis_profile("chromoly-4130-38x2", "38.1 × 2.4 mm · 4130 chromoly", "AISI 4130 chromoly",
+                        outer_diameter_mm=38.1, wall_thickness_mm=2.4, density=7850,
+                        youngs_modulus=205_000_000_000, yield_strength=435_000_000,
+                        shear_strength=260_000_000),
+        chassis_profile("dom-44x3", "44.5 × 3.0 mm · DOM steel", "1020 DOM steel",
+                        outer_diameter_mm=44.5, wall_thickness_mm=3.0, density=7850,
+                        youngs_modulus=205_000_000_000, yield_strength=350_000_000,
+                        shear_strength=210_000_000),
+        chassis_profile("mild-51x3", "50.8 × 3.2 mm · mild steel", "A36 mild steel",
+                        outer_diameter_mm=50.8, wall_thickness_mm=3.2, density=7850,
+                        youngs_modulus=200_000_000_000, yield_strength=250_000_000,
+                        shear_strength=145_000_000),
+        chassis_profile("aluminum-6061-64x5", "63.5 × 4.8 mm · 6061-T6 aluminum", "6061-T6 aluminum",
+                        outer_diameter_mm=63.5, wall_thickness_mm=4.8, density=2700,
+                        youngs_modulus=69_000_000_000, yield_strength=276_000_000,
+                        shear_strength=207_000_000),
+    ]
+    default_chassis_profile = next(item for item in chassis_profiles if item["identity"] == "dom-44x3")
+    for edge in chassis_member_edges:
+        edge["chassis_profile_member"] = True
+        edge["radius"] = default_chassis_profile["outer_diameter_m"] / 2
+        if edge.get("damage"):
+            edge["damage"].update({
+                "material": default_chassis_profile["material"],
+                "section_area_m2": default_chassis_profile["section_area_m2"],
+                "youngs_modulus_pa": default_chassis_profile["youngs_modulus_pa"],
+                "axial_stiffness_n_per_m": default_chassis_profile["youngs_modulus_pa"]
+                * default_chassis_profile["section_area_m2"] / max(1e-9, float(edge["rest_length"])),
+                "yield_strength_pa": default_chassis_profile["yield_strength_pa"],
+                "shear_strength_pa": default_chassis_profile["shear_strength_pa"],
+                "axial_yield_force_n": default_chassis_profile["axial_yield_force_n"],
+                "shear_force_limit_n": default_chassis_profile["shear_force_limit_n"],
+            })
+    def power_unit_preset(identity: str, label: str, kind: str, *, displacement: float,
+                          bmep: float, braking_bmep: float, idle: float, torque_peak: float,
+                          power_peak: float, redline: float, inertia: float, mass: float,
+                          clutch_torque: float, combustion_efficiency: float,
+                          coupling_efficiency: float,
+                          mechanical_roles: tuple[str, ...] = ("propulsion",)) -> dict[str, Any]:
+        rpm_to_rad_s = 2 * math.pi / 60
+        return {
+            "identity": identity, "label": label, "kind": kind,
+            "curve_reference": f"springtail-power-unit-curves-v0:{identity}",
+            "curve_storage": "immutable-parameter-pack-selected-by-reference",
+            "mechanical_roles": list(mechanical_roles),
+            "configuration": {"displacement_liters": displacement,
+                              "brake_mean_effective_pressure_pa": bmep,
+                              "engine_braking_mean_effective_pressure_pa": braking_bmep,
+                              "idle_rpm": idle, "torque_peak_rpm": torque_peak,
+                              "power_peak_rpm": power_peak, "redline_rpm": redline,
+                              "engine_rotating_inertia_kg_m2": inertia,
+                              "engine_mass_kg": mass, "clutch_maximum_torque_nm": clutch_torque,
+                              "combustion_efficiency": combustion_efficiency,
+                              "clutch_efficiency": coupling_efficiency},
+            "parameters": {"engine_displacement_m3": displacement / 1000,
+                           "brake_mean_effective_pressure": bmep,
+                           "engine_braking_mean_effective_pressure": braking_bmep,
+                           "engine_idle_angular_speed": idle * rpm_to_rad_s,
+                           "engine_torque_peak_angular_speed": torque_peak * rpm_to_rad_s,
+                           "engine_power_peak_angular_speed": power_peak * rpm_to_rad_s,
+                           "engine_redline_angular_speed": redline * rpm_to_rad_s,
+                           "engine_rotating_inertia": inertia, "engine_mass": mass,
+                           "clutch_maximum_torque": clutch_torque,
+                           "combustion_efficiency": combustion_efficiency,
+                           "clutch_efficiency": coupling_efficiency},
+        }
+    power_unit_presets = [
+        power_unit_preset("aircooled-flat-four-1584", "1584 cc air-cooled flat-four", "combustion",
+                          displacement=1.584, bmep=720_000, braking_bmep=125_000, idle=850,
+                          torque_peak=2800, power_peak=4100, redline=4800, inertia=.31,
+                          mass=102, clutch_torque=155, combustion_efficiency=.82,
+                          coupling_efficiency=.93),
+        power_unit_preset("springtail-i4-1600", "Springtail 1.6 L trail I4", "combustion",
+                          displacement=1.6, bmep=1_600_000, braking_bmep=165_000, idle=850,
+                          torque_peak=3600, power_peak=5200, redline=6400, inertia=.22,
+                          mass=142, clutch_torque=260, combustion_efficiency=.88,
+                          coupling_efficiency=.94),
+        power_unit_preset("superbike-i4-1340", "1340 cc superbike I4", "combustion",
+                          displacement=1.34, bmep=1_720_000, braking_bmep=190_000, idle=1250,
+                          torque_peak=7000, power_peak=9700, redline=11000, inertia=.085,
+                          mass=82, clutch_torque=205, combustion_efficiency=.91,
+                          coupling_efficiency=.95),
+        power_unit_preset("gt-flat-six-4000", "4.0 L GT flat-six", "combustion",
+                          displacement=4.0, bmep=1_650_000, braking_bmep=210_000, idle=900,
+                          torque_peak=6250, power_peak=8400, redline=9000, inertia=.19,
+                          mass=190, clutch_torque=610, combustion_efficiency=.92,
+                          coupling_efficiency=.96),
+        power_unit_preset("supercharged-drag-v8-8200", "8.2 L supercharged drag V8", "combustion",
+                          displacement=8.2, bmep=6_200_000, braking_bmep=420_000, idle=1150,
+                          torque_peak=6500, power_peak=8700, redline=9600, inertia=.46,
+                          mass=338, clutch_torque=4_800, combustion_efficiency=.94,
+                          coupling_efficiency=.97),
+        power_unit_preset("monster-540-blown-methanol", "540 ci blown-methanol monster V8", "combustion",
+                          displacement=8.849, bmep=2_850_000, braking_bmep=360_000, idle=1100,
+                          torque_peak=5200, power_peak=7100, redline=8000, inertia=.55,
+                          mass=345, clutch_torque=2_900, combustion_efficiency=.93,
+                          coupling_efficiency=.97),
+        power_unit_preset("monster-632-twin-turbo", "632 ci twin-turbo monster big-block", "combustion",
+                          displacement=10.357, bmep=3_650_000, braking_bmep=410_000, idle=1050,
+                          torque_peak=4400, power_peak=6500, redline=7300, inertia=.70,
+                          mass=425, clutch_torque=4_500, combustion_efficiency=.94,
+                          coupling_efficiency=.97),
+        power_unit_preset("dual-motor-ev-reference", "dual-motor EV drive unit", "electric",
+                          displacement=4.0, bmep=1_420_000, braking_bmep=760_000, idle=120,
+                          torque_peak=900, power_peak=9000, redline=18000, inertia=.12,
+                          mass=205, clutch_torque=720, combustion_efficiency=.99,
+                          coupling_efficiency=.98),
+        power_unit_preset("servo-direct-drive-400", "400 Nm direct-drive servo", "servo-electric",
+                          displacement=.80, bmep=6_300_000, braking_bmep=1_900_000, idle=60,
+                          torque_peak=120, power_peak=4200, redline=8000, inertia=.075,
+                          mass=52, clutch_torque=400, combustion_efficiency=.995,
+                          coupling_efficiency=.985, mechanical_roles=("propulsion", "steering-assist",
+                              "chassis-articulation", "auxiliary-actuation")),
+    ]
+    architecture_by_preset = {
+        "aircooled-flat-four-1584": ("flat-four", 4, 2, 180.0, [1, 4, 3, 2]),
+        "springtail-i4-1600": ("inline-four", 4, 1, 0.0, [1, 3, 4, 2]),
+        "superbike-i4-1340": ("inline-four", 4, 1, 0.0, [1, 2, 4, 3]),
+        "gt-flat-six-4000": ("flat-six", 6, 2, 180.0, [1, 6, 2, 4, 3, 5]),
+        "supercharged-drag-v8-8200": ("crossplane-v8", 8, 2, 90.0, [1, 8, 4, 3, 6, 5, 7, 2]),
+        "monster-540-blown-methanol": ("crossplane-v8", 8, 2, 90.0, [1, 8, 4, 3, 6, 5, 7, 2]),
+        "monster-632-twin-turbo": ("crossplane-v8", 8, 2, 90.0, [1, 8, 4, 3, 6, 5, 7, 2]),
+        "dual-motor-ev-reference": ("dual-electric", 0, 2, 0.0, []),
+        "servo-direct-drive-400": ("servo-electric", 0, 1, 0.0, []),
+    }
+    for preset in power_unit_presets:
+        layout, cylinders, banks, bank_angle, firing_order = architecture_by_preset[preset["identity"]]
+        four_stroke_events = [index * 720.0 / max(1, cylinders) for index in range(cylinders)]
+        electric = preset["kind"] != "combustion"
+        methanol = "methanol" in preset["identity"]
+        storage_mass = 340.0 if preset["kind"] == "electric" else 82.0 if electric else 64.0 if methanol else 48.0
+        preset["architecture"] = {
+            "schema": "springtail-engine-architecture-v0", "layout": layout,
+            "cylinders": cylinders, "banks": banks, "bank_angle_degrees": bank_angle,
+            "firing_order": firing_order, "cycle_degrees": 720.0 if cylinders else 360.0,
+            "event_phases_degrees": four_stroke_events,
+            "mount_vibration_reference": f"springtail-mount-vibration-v0:{preset['identity']}",
+            "mount_harmonics": ([1.0, 2.0, cylinders / 2] if cylinders else [6.0, 12.0, 24.0]),
+            "workshop_bake": "cylinder-pressure-impulses-crank-balance-and-mount-transfer-function",
+        }
+        preset["energy_system"] = {
+            "schema": "springtail-power-energy-system-v0",
+            "carrier": "electricity" if electric else "methanol" if methanol else "gasoline",
+            "storage_kind": "battery-pack" if electric else "baffled-fuel-tank",
+            "installed_storage_mass_kg": storage_mass,
+            "delivery_kind": "high-voltage-cables-and-inverter" if electric else "tank-pump-line-and-fuel-rail",
+            "conversion": "inverter-phase-current-to-electromagnetic-torque" if electric else
+                "intake-air-plus-metered-fuel-to-cylinder-charge-and-bmep",
+            "air_path": None if electric else "filter-throttle-body-plenum-runners-intake-valves",
+            "exhaust_path": None if electric else "exhaust-valves-headers-collectors",
+            "mass_authority": "storage-shell-plus-live-carrier-mass-belongs-in-rigid-body-mass-and-inertia",
+            "current_torque_authority": "compiled-bmep-curve-until-consumable-flow-state-is-linked",
+            "reservoir_options": ([] if electric else [
+                {"identity": "primary", "carrier": "methanol" if methanol else "gasoline",
+                 "selection": "default", "mass_and_inertia": "live-fill-state-required"},
+                {"identity": "reserve", "carrier": "same-as-primary",
+                 "selection": "sequenced-changeover", "mass_and_inertia": "live-fill-state-required"},
+                {"identity": "auxiliary-oxidizer-or-fuel", "carrier": "user-selected",
+                 "selection": "metered-blend", "mass_and_inertia": "live-fill-state-required"},
+            ]),
+            "mixture_control": (None if electric else {
+                "authority": "medium-rate-manifold-flow-state",
+                "required_inputs": ["carrier-properties", "mass-flow", "air-flow", "spark-timing",
+                                    "compression-ratio", "charge-temperature"],
+                "failure_modes": ["lean-misfire", "knock", "pre-ignition", "over-fueling", "stall"],
+                "torque_status": "declared-hook-not-yet-authoritative",
+            }),
+            "ignition_system": (None if electric else {
+                "parts": ["trigger-distributor", "coil-bank", "plug-leads", "spark-plugs"],
+                "event_source": "architecture-firing-order-and-cycle-phase",
+                "timing_status": "published-for-mesh-and-audio-not-yet-cylinder-pressure-authority",
+            }),
+        }
+    base_transmission = dict(config.source["transmission"])
+    def transmission_preset(identity: str, label: str, ratios: list[float], reverse: float,
+                            low_range: float, upshift: list[float], downshift: list[float]) -> dict[str, Any]:
+        configuration = dict(base_transmission)
+        configuration.update({"forward_ratios": ratios, "reverse_ratio": reverse,
+                              "ultra_low_range_ratio": low_range,
+                              "upshift_wheel_speed_rad_s": upshift,
+                              "downshift_wheel_speed_rad_s": downshift,
+                              "starting_gear": min(2, len(ratios))})
+        return {"identity": identity, "label": label, "configuration": configuration,
+                "runtime_policy": "live-ratio-control-no-symbolic-recompile"}
+    transmission_presets = [
+        transmission_preset("trail-six-speed", "trail 6-speed · 6.40 crawler",
+                            list(base_transmission["forward_ratios"]), float(base_transmission["reverse_ratio"]),
+                            float(base_transmission["ultra_low_range_ratio"]),
+                            list(base_transmission["upshift_wheel_speed_rad_s"]),
+                            list(base_transmission["downshift_wheel_speed_rad_s"])),
+        transmission_preset("expedition-super-crawl", "expedition 6-speed · 12.80 crawler",
+                            [12.8, 6.8, 3.8, 2.3, 1.4, 1.0], 10.4, 3.8,
+                            [4.0, 7.5, 13.0, 21.0, 34.0, 55.0], [0.0, 2.5, 5.0, 9.0, 16.0, 27.0]),
+        transmission_preset("close-ratio-six-speed", "close-ratio 6-speed",
+                            [3.2, 2.2, 1.62, 1.26, 1.0, .82], 3.0, 2.1,
+                            [12.0, 21.0, 31.0, 42.0, 55.0, 72.0], [0.0, 8.0, 15.0, 23.0, 33.0, 45.0]),
+        transmission_preset("drag-three-speed", "drag 3-speed · reinforced",
+                            [2.48, 1.56, 1.0], 2.2, 1.0,
+                            [27.0, 52.0, 88.0], [0.0, 18.0, 38.0]),
+    ]
+    wheel_parts = [
+        {"identity": "balloon-black-current", "label": "big black balloon tires",
+         "realization": "parametric-pneumatic-wheel-renderer", "default": True,
+         "radius_scale": 1.0, "width_scale": 1.0, "rim_scale": 1.0,
+         "carcass_profile": "high-sidewall-balloon", "cold_pressure_kpa": 82.0,
+         "compound": "off-road-compliant", "dry_grip_scale": 1.0,
+         "tire_color": "#202624", "tread_color": "#687672"},
+        {"identity": "legacy-small-brown", "label": "tacky brown racing tires",
+         "realization": "parametric-pneumatic-wheel-renderer", "default": False,
+         "radius_scale": .72, "width_scale": .78, "rim_scale": .72,
+         "carcass_profile": "low-sidewall-racing", "cold_pressure_kpa": 175.0,
+         "compound": "tacky-race-rubber", "dry_grip_scale": 1.22,
+         "tire_color": "#6b4b32", "tread_color": "#a77850"},
+    ]
+    body_shells = [
+        {"identity": "clear-polycarbonate-rc", "label": "clear tinted polycarbonate RC shell",
+         "realization": "shader-presentation-only-chassis-relative", "physics": False, "default": True,
+         "material_identity": "acrylic_pmma", "material_profile": "transmissive-phong-plastic",
+         "palette_role": "body-shell-glass", "ior": 1.586, "transmission": .72, "opacity": .30},
+        {"identity": "fiberglass-monster-pickup", "label": "fiberglass monster pickup",
+         "realization": "shader-presentation-only-chassis-relative", "physics": False, "default": False},
+        {"identity": "bare-frame", "label": "bare frame",
+         "realization": "no-cosmetic-shell", "physics": False, "default": False},
+    ]
     torque_graph = {
         "schema": "abstract-ui-vehicle-torque-graph-v0",
         "authority": "compiled-sympy-abstract-tensor-ssa-wgsl",
@@ -2677,7 +3457,7 @@ def vehicle_slot_model(root: str, actor: str) -> dict[str, Any]:
             "mounted_vehicle": f"{root}/vehicles/springtail",
             "placement": "at-player-spawn",
             "presentation": "full-viewport-driving",
-            "browser_fullscreen": "request-on-first-user-gesture",
+            "browser_fullscreen": "user-invoked-only",
             "dismount_enabled": True,
         },
         "allowed_kinds": ["car"],
@@ -2687,6 +3467,44 @@ def vehicle_slot_model(root: str, actor: str) -> dict[str, Any]:
             "identity": f"{root}/vehicles/springtail", "archetype": config.identity,
             "name": config.name, "kind": "car", "configuration": config.to_data(),
             "configuration_defaults": config.parameter_defaults(),
+            "power_unit_presets": power_unit_presets,
+            "transmission_presets": transmission_presets,
+            "wheel_parts": wheel_parts,
+            "wheel_part": "balloon-black-current",
+            "body_shells": body_shells,
+            "body_shell": "clear-polycarbonate-rc",
+            "steering_control": {
+                "front_axle_enabled": True, "rear_axle_enabled": True,
+                "front_share": .5, "rear_phase": -1.0,
+                "maximum_steering_wheel_torque_nm": 38.0,
+                "column_torsional_stiffness_nm_per_rad": 92.0,
+                "pinion_radius_m": .018, "rack_compliance_m_per_n": 1.8e-6,
+                "knuckle_response_frequency_hz": 5.5, "knuckle_damping_ratio": .92,
+                "free_knuckle_caster_frequency_hz": .75,
+                "input_authority": "steering-wheel-wrench-through-rotary-transmission-subgraph",
+            },
+            "chassis_profiles": chassis_profiles,
+            "chassis_profile": default_chassis_profile["identity"],
+            "chassis_profile_reference": {
+                "identity": default_chassis_profile["identity"],
+                "vehicle_mass_kg": float(config.source["mass"]),
+                "member_mass_kg": default_chassis_profile["member_mass_kg"],
+            },
+            "chassis_leveling": {
+                "authority": "worker-owned-slow-second-order-rest-geometry-actuators",
+                "enabled": False,
+                "target_ride_height_offset_m": 0.0,
+                "target_roll_rad": 0.0,
+                "target_pitch_rad": 0.0,
+                "response_frequency_hz": 0.55,
+                "damping_ratio": 1.05,
+                "maximum_actuator_rate_m_s": 0.055,
+                "maximum_corner_offset_m": min(.12, float(config.source["suspension"]["travel"]) * .35),
+                "pose_law": "roll-pitch-height-error-to-four-corner-rest-length-targets",
+                "force_law": "pose-changes-only-through-existing-spring-contact-wrenches",
+            },
+            "transmission_preset": "trail-six-speed",
+            "power_unit_preset": "springtail-i4-1600",
             "physics": {"authority": "resident-compiled-sympy-abstract-tensor-ssa-wgsl",
                         "parallel_spring_lanes": list(WHEEL_NAMES),
                         "webgpu_program": webgpu["identity"],
@@ -2709,6 +3527,16 @@ def vehicle_slot_model(root: str, actor: str) -> dict[str, Any]:
                             "default": "automatic-second-gear-launch",
                             "crawler_entry": "torque-reserve-insufficient-in-second",
                             "manual_controls": ["automatic", "gear-down", "gear-up"],
+                        },
+                        "damage_model": {
+                            "authority": "worker-owned-elastic-plastic-mechanical-graph-state",
+                            "default_mode": "locked-baked-elastic-graph",
+                            "parameter_change_mode": "compiled-wasm-parametric-damage-graph",
+                            "spring": "progressive-bump-stop-then-plastic-set-then-fracture",
+                            "natural_geometry": "deformed-rest-lengths-drive-node-and-vertex-solve",
+                            "members": "axial-yield-plus-shear-fracture-on-frame-cage-rods-shocks-and-stabilizers",
+                            "halfshafts": "torsional-fracture-opens-path-until-corresponding-axle-lock-reroutes",
+                            "reset": "authored-natural-lengths-and-full-health-on-respawn",
                         },
                         "chassis_structure": chassis_structure,
                         "torque_graph": torque_graph},
@@ -2736,6 +3564,7 @@ __all__ = [
     "symbolic_vehicle_equations", "symbolic_vehicle_physics_wasm_plugin",
     "symbolic_wheel_contact_equations", "symbolic_wheel_contact_wasm_plugin",
     "compile_symbolic_vehicle_physics_gpu_ssa", "compile_symbolic_vehicle_physics_webgpu",
+    "compile_symbolic_vehicle_physics_webgpu_stages",
     "vehicle_webgpu_program_model",
     "vehicle_configuration_from_mapping", "vehicle_slot_model",
 ]

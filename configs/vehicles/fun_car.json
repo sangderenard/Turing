@@ -66,6 +66,7 @@
   },
   "drivetrain": {
     "brake_torque_nm": 2200.0,
+    "differential_brake_torque_nm": 3600.0,
     "front_drive_fraction": 0.42,
     "rear_drive_fraction": 0.58,
     "rolling_resistance_torque_nm": 3.8,

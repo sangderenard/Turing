@@ -13,25 +13,36 @@ def test_living_map_separates_fixed_physics_from_presenting_graphics():
     assert "setInterval(tick" in source
     assert 'm.type==="recycle"' in source
     assert 'm.type==="impulse"' in source
+    assert 'm.type==="player-jump"' in source
+    assert 'armEngine("player-jump-force")' in source
     assert 'm.type==="support"' in source
     assert "function topSupport(previous,next,r,excluded)" in source
     assert "function sampledTerrainSupport(previous,next,r,excluded)" in source
     assert "previous[1]-r>=top-.012&&next[1]-r<=top+.006" in source
     assert "WebAssembly.instantiate" in source
     assert "new ArrayBuffer(snapshotCapacity*SNAPSHOT_STRIDE*8)" in source
-    assert "const SNAPSHOT_STRIDE=71" in source
+    assert "const SNAPSHOT_STRIDE=153" in source
+    assert "vehicle.radial-probe-penetration[4][15]" in str(model["channels"][0]["record_layout"])
     assert "FIXED_DT=" in source
     assert 'dt=engineStage==="kinematic-coast"?1/30:FIXED_DT' in source
     assert "snapshot.buffer.mapAsync(GPUMapMode.READ).then" in source
+    assert "snapshot.epoch=Number(body.gpuEpoch||0)" in source
+    assert "bodies.get(body.identity)!==body" in source
     assert "async function tick" not in source
     assert "await step(body,dt)" not in source
     assert "resident-webgpu-graph" in source
     assert "resident-webgpu-fault" in source
     assert "checkedShaderModule" in source
     assert "wallColliders" in source
-    assert "if(!vehicleGpu.terrainReady)" in source
-    assert "vehicleWasm" not in source
-    assert "contactWasm" not in source
+    assert "const fields=allColliders.filter" in source
+    assert "parameters=new Float32Array([fields.length,walls.length,...descriptors])" in source
+    assert "vehicleGpu?.residentGraph&&vehicleGpu.terrainReady" in source
+    assert "function residentVehicleWasmStep(body,dt)" in source
+    assert "runScalarWasm(contactInstance,contactAbi" in source
+    assert "runScalarWasm(vehicleInstance,vehicleAbi" in source
+    assert "else if(vehicleInstance&&contactInstance)residentVehicleWasmStep(body,dt)" in source
+    assert 'type:"vehicle-wasm-fallback"' in source
+    assert '"resident-wasm-fallback"' in source
     assert "vehicle-contact-bridge" not in source
     assert "dispatchVehicleContacts" not in source
     channel = next(item for item in model["channels"] if "world.body-pose" in item["fields"])
@@ -77,7 +88,35 @@ def test_living_map_separates_fixed_physics_from_presenting_graphics():
     assert 'm.type==="vehicle-dyno"' in source
     assert 'type:"vehicle-dyno-result"' in source
     assert "function applyPendingVehicleCommands(body)" in source
-    assert "applyPendingVehicleCommands(body);" in source
+    assert "applyPendingVehicleCommands(body);prepareVehicleControls(body,dt);" in source
+    assert "function prepareVehicleControls(body,dt)" in source
+    assert 'state.reason=command.smoothLaunch?"driver-smooth-launch":"driver-direct-launch"' in source
+    assert "body.brakeLocks" in source
+    assert "brake_lock_${name}" in source
+    assert "function ensureVehicleDamage(body)" in source
+    assert "function vehicleDriveFractions(body)" in source
+    assert "function updateVehicleDamage(body,dt)" in source
+    assert 'damage.mode="parametric-damage"' in source
+    assert "requestParametricVehiclePipelines(body,`damage · ${reason}`)" in source
+    assert 'm.type==="vehicle-chassis-profile"' in source
+    assert 'm.type==="vehicle-chassis-leveling"' in source
+    assert 'm.type==="vehicle-steering-system"' in source
+    assert 'm.type==="vehicle-parameters"' in source
+    assert "function applyVehicleChassisProfile(body,profile)" in source
+    assert "function updateVehicleChassisLeveling(body,dt)" in source
+    assert "function updateVehicleSteeringWrench(body,dt)" in source
+    assert 'requestParametricVehiclePipelines(body,"shock parameter control")' in source
+    assert "Number.POSITIVE_INFINITY" in source
+    assert "body.supportSurfaceLatch" in source
+    assert "maximum_sink_depth_m" in source
+    assert "if(resolveWorldBottom(body,previousPosition))" in source
+    assert "function resetVehicleDrivetrainState(body,reason)" in source
+    assert "Object.values(output).every(Number.isFinite)" in source
+    assert "resident Wasm crossed the world-bottom guard" in source
+    assert "resident GPU crossed the world-bottom guard" in source
+    assert "halfshaftHealth" in source
+    assert "springPlasticSet" in source
+    assert 'm.type==="vehicle-power-unit"' in source
     assert "b.pendingControls={" in source
     assert 'throw new Error("vehicle graph scheduler attempted a concurrent GPU dispatch")' in source
     assert "function armEngine(reason)" in source

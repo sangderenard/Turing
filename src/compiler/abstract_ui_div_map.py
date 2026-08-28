@@ -11,6 +11,7 @@ from __future__ import annotations
 from functools import lru_cache
 import html
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -37,7 +38,9 @@ from .abstract_ui_placement import (
 )
 from .abstract_ui_projectiles import gun_tool, projectile_system_model
 from .abstract_ui_audio_fft import FFTFREE_RADIX2_C_SOURCE, compile_audio_fft_wasm
+from .engine_pcm_wasm import engine_pcm_kernel_bank_model
 from .javascript_runtime_utilities import render_javascript_utilities
+from .mechanical_creature import mechanical_creature_model
 from .state_loop_deployment import living_map_loop_deployment
 from .abstract_ui_primitives import (
     UIColor,
@@ -56,9 +59,12 @@ from .abstract_ui_software_mesh import (
 )
 from .abstract_ui_scene_mesh import SCENE_MESH_SOURCE, compile_scene_mesh_wasm
 from .abstract_ui_tools import EntityInventory, Hotbar, InventoryItem, depth_map_tool, form_tool
-from .abstract_ui_surfaces import (sampled_hoop_height_field, sampled_mud_oval_height_field,
+from .abstract_ui_surfaces import (sampled_offroad_playground_height_field,
+                                    sampled_ramp_slab,
                                     support_surface_model)
 from .abstract_ui_vehicles import (
+    symbolic_vehicle_physics_wasm_plugin,
+    symbolic_wheel_contact_wasm_plugin,
     vehicle_slot_model,
 )
 from .abstract_ui_world import (
@@ -98,8 +104,12 @@ DIV_MAP_PALETTE = palette(
         "sky-night": "#030711", "moon": "#b9d5ff", "courtyard": "#163028",
         "courtyard-face": "#2f6654", "building-face": "#4d816d",
         "room-face": "#68b89c", "courtyard-wall": "#7aa68d", "mud-terrain": "#765238",
-        "rollbar-silver": "#c8d0cf", "suspension-yellow": "#ffd21f", "drivetrain-black": "#111413",
+        "rollbar-silver": "#c8d0cf", "suspension-yellow": "#f27d22", "actuator-yellow": "#ffb000",
+        "fuel-tank-candy-red": "#b5162e", "battery-electric-blue": "#168cff",
+        "oxidizer-canister": "#c6d2d0",
+        "drivetrain-black": "#111413",
         "engine-metal": "#778482", "engine-accent": "#e87832",
+        "body-shell-glass": "#4f9fb4",
         "building-wall": "#a7c7b4", "room-wall": "#d1eadc",
         "artifact-source": "#65a9e8", "artifact-test": "#cf8eff",
         "artifact-readme": "#f2c66d", "artifact-annotation": "#ef8d78",
@@ -457,26 +467,8 @@ def world_div_map_model(
         spawn_x = float(courtyard["center"][0])
         spawn_z = float(courtyard["center"][1])
         clearance = float(vehicle["configuration"]["chassis"]["clearance"])
-        vehicle["pose"] = {"position": [spawn_x, clearance + 0.24, spawn_z], "yaw": 0.0}
-        terrain_identity = f"{world.identity}/physics/mudding-oval-height-field"
-        terrain_half_x = float(courtyard["half_extent"][0]) * .96
-        terrain_half_z = float(courtyard["half_extent"][1]) * .96
-        terrain_columns = min(129, max(49, int(round(terrain_half_x * 4)) | 1))
-        terrain_rows = min(129, max(49, int(round(terrain_half_z * 4)) | 1))
-        geometry["boxes"].append(sampled_mud_oval_height_field(
-            terrain_identity, courtyard["identity"],
-            center_x=spawn_x, center_z=spawn_z,
-            half_x=terrain_half_x, half_z=terrain_half_z,
-            columns=terrain_columns, rows=terrain_rows,
-            palette_role=vehicle["configuration"]["presentation"]["terrain_palette_role"],
-        ))
-        vehicle["offroad_terrain"] = terrain_identity
-        # A second, open field beyond the original courtyard's south gate --
-        # real space to drive in, not another room full of introspected
-        # content.  Terrain lives only in a ring near the field's own walls;
-        # the plaza in the middle and the ground around both doorways stay
-        # clear.  Directly south, sharing the gate's X so the two doors line
-        # up, with a short threshold gap rather than two walls touching.
+        # Keep the document courtyard completely flat. The driving field is
+        # open world floor beyond its gate, not another extruded courtyard.
         gate = courtyard["openings"][0]
         gate_world_x = spawn_x + float(gate.get("offset", 0.0))
         old_south_wall_z = spawn_z - float(courtyard["half_extent"][1])
@@ -484,37 +476,130 @@ def world_div_map_model(
         yard_gap = 2.5
         yard_center_x = gate_world_x
         yard_center_z = old_south_wall_z - yard_gap - yard_half
-        yard_identity = f"{world.identity}/yard/outer-field"
-        yard_gate_x = yard_center_x
-        yard_gate_z = yard_center_z + yard_half
-        yard_courtyard = {
-            "identity": yard_identity, "kind": "courtyard", "label": "Outer field",
-            "parent_identity": f"{world.identity}/representation:global",
-            "hierarchy_depth": 1,
-            "center": [yard_center_x, yard_center_z],
-            "half_extent": [yard_half, yard_half],
-            "height": 3.2, "floor_height": 0.02,
-            "wall_thickness": 0.20, "radius": 12.0,
-            "palette_role": "courtyard-face", "wall_palette_role": "courtyard-wall",
-            "openings": [{
-                "identity": f"{yard_identity}/opening:gate",
-                "kind": "gate", "side": "north", "offset": 0.0,
-                "width": float(gate.get("width", 1.1)), "height": float(gate.get("height", 0.82)),
-            }],
-            "metaphor": "open driving field",
-        }
-        geometry["boxes"].append(yard_courtyard)
-        yard_terrain_identity = f"{world.identity}/physics/outer-field-hoop-height-field"
-        yard_terrain_half = yard_half * .96
-        yard_terrain_columns = min(129, max(49, int(round(yard_terrain_half * 4)) | 1))
-        geometry["boxes"].append(sampled_hoop_height_field(
-            yard_terrain_identity, yard_identity,
-            center_x=yard_center_x, center_z=yard_center_z,
-            half_x=yard_terrain_half, half_z=yard_terrain_half,
-            door_x=yard_gate_x, door_z=yard_gate_z,
-            columns=yard_terrain_columns, rows=yard_terrain_columns,
+        play_half = 28.0
+        terrain_identity = f"{world.identity}/physics/outer-field-offroad-playground"
+        geometry["boxes"].append(sampled_offroad_playground_height_field(
+            terrain_identity, f"{world.identity}/representation:global",
+            center_x=yard_center_x, center_z=yard_center_z - 3.0,
+            half_x=play_half, half_z=play_half, columns=81, rows=81,
             palette_role=vehicle["configuration"]["presentation"]["terrain_palette_role"],
         ))
+        # The sampled field deliberately ends before the rest of the yard. Give
+        # every visually-flat apron a real shared slab so neither the player nor
+        # the truck can fall through a shader-only "mud" plane. These are also
+        # valid in the Safari/Wasm path; no terrain sampler is required.
+        apron_parent = f"{world.identity}/representation:global"
+        field_center_z = yard_center_z - 3.0
+        apron_specs = (
+            ("north", yard_center_x, field_center_z + play_half + 8.5, yard_half, 8.5),
+            ("south", yard_center_x, field_center_z - play_half - 7.0, yard_half, 7.0),
+            ("west", yard_center_x - play_half - 8.5, field_center_z, 8.5, play_half),
+            ("east", yard_center_x + play_half + 8.5, field_center_z, 8.5, play_half),
+        )
+        apron_records = []
+        for name, center_x, center_z, half_x, half_z in apron_specs:
+            apron = {
+                "identity": f"{world.identity}/physics/outer-field-{name}-apron",
+                "kind": "static-solid", "label": f"Outer yard {name} flat apron",
+                "parent_identity": apron_parent, "center": [center_x, center_z],
+                "half_extent": [half_x, half_z], "height": .32,
+                "floor_height": .32, "wall_thickness": .04,
+                "palette_role": vehicle["configuration"]["presentation"]["terrain_palette_role"],
+                "wall_palette_role": vehicle["configuration"]["presentation"]["terrain_palette_role"],
+                "geometry_mode": "solid", "openings": [],
+                "placement": {"custody": "placed", "elevation": -.32, "yaw_degrees": 0.0},
+                "physics": {"body": "static", "collider": "solid-contact-surface",
+                            "enabled": True,
+                            "contact_mode": "normal-constraint-with-coulomb-friction"},
+                "course": {"kind": "flat-outer-yard-apron", "depth_map": False},
+            }
+            geometry["boxes"].append(apron)
+            apron_records.append(apron["identity"])
+        # Practice ramps use small local depth maps for a smooth contact top and
+        # retain the whole prism beneath that top as slab support.
+        practice_ramp_records = []
+        for name, ramp_x, rise_sign in (("west", yard_center_x - 36.0, 1),
+                                        ("east", yard_center_x + 36.0, -1)):
+            ramp = sampled_ramp_slab(
+                f"{world.identity}/physics/outer-field-{name}-practice-ramp",
+                apron_parent, center_x=ramp_x, center_z=yard_center_z - 2.0,
+                half_width=2.4, half_run=4.5, low_height=.06, high_height=1.55,
+                rise_axis="z", rise_sign=rise_sign, columns=5, rows=33,
+            )
+            ramp["label"] = f"{name.title()} smooth practice ramp"
+            geometry["boxes"].append(ramp)
+            practice_ramp_records.append(ramp["identity"])
+        # A separate elevated skill road crosses above the sampled terrain.
+        # Its deck and finely segmented approaches are ordinary thick static
+        # solids. No depth-map sample or vehicle-specific support rule
+        # participates in this course.
+        course_top = 4.0
+        course_thickness = .58
+        course_z = yard_center_z - 3.0
+        course_parent = f"{world.identity}/representation:global"
+        approach_records = []
+        approach_run = 20.0
+        approach_grade = (course_top - .28) / approach_run
+        for side, center_x, rise_sign in (("west", yard_center_x - play_half - approach_run / 2, 1),
+                                          ("east", yard_center_x + play_half + approach_run / 2, -1)):
+            approach = sampled_ramp_slab(
+                f"{world.identity}/physics/elevated-skill-road-{side}-approach",
+                course_parent, center_x=center_x, center_z=course_z,
+                half_width=3.4, half_run=approach_run / 2,
+                low_height=.06, high_height=course_top,
+                rise_axis="x", rise_sign=rise_sign, columns=65, rows=5,
+            )
+            approach["label"] = f"Elevated skill road {side} smooth ramp"
+            approach["course"] = {"kind": "depth-mapped-thick-slab-ramp", "side": side,
+                                  "effective_grade_percent": round(approach_grade * 100.0, 2),
+                                  "slab_support": True}
+            geometry["boxes"].append(approach)
+            approach_records.append(approach["identity"])
+        slab_records = []
+        slab_offsets = ((-22.4, 0.0, 0.0), (-13.0, 1.15, 3.5),
+                        (-3.6, -.35, -3.0), (5.8, 1.0, 3.0),
+                        (15.2, -.55, -3.5), (24.0, 0.0, 0.0))
+        for index, (offset_x, offset_z, yaw_degrees) in enumerate(slab_offsets):
+            slab = {
+                "identity": f"{world.identity}/physics/elevated-skill-road-slab-{index + 1}",
+                "kind": "static-solid", "label": f"Floating skill slab {index + 1}",
+                "parent_identity": course_parent,
+                "center": [yard_center_x + offset_x, course_z + offset_z],
+                "half_extent": [4.42, 3.15], "height": course_thickness,
+                "floor_height": .08, "wall_thickness": .08,
+                "palette_role": "artifact-source", "wall_palette_role": "artifact-source",
+                "geometry_mode": "solid", "openings": [],
+                "placement": {"custody": "placed", "elevation": course_top - course_thickness,
+                              "yaw_degrees": yaw_degrees},
+                "physics": {"body": "static", "collider": "solid-contact-surface",
+                            "enabled": True,
+                            "contact_mode": "normal-constraint-with-coulomb-friction"},
+                "course": {"kind": "elevated-thick-slab-skill-road", "sequence": index + 1,
+                           "gap_is_skill_feature": index > 0, "depth_map": False},
+            }
+            geometry["boxes"].append(slab)
+            slab_records.append(slab["identity"])
+        truck_spawn_z = yard_center_z + play_half + 7.0
+        vehicle["pose"] = {
+            "position": [yard_center_x, clearance + 0.24, truck_spawn_z],
+            "yaw": -math.pi / 2,
+        }
+        vehicle["offroad_terrain"] = terrain_identity
+        vehicle["driving_area"] = {
+            "kind": "open-outer-yard", "center": [yard_center_x, yard_center_z],
+            "half_extent": [yard_half, yard_half], "geometry": "world-floor-no-boundary-box",
+            "play_area": terrain_identity,
+            "spawn": "flat-north-apron-next-to-play-area", "aprons": apron_records,
+            "practice_ramps": practice_ramp_records,
+        }
+        vehicle["elevated_skill_course"] = {
+            "kind": "floating-thick-slab-road", "top_height": course_top,
+            "approaches": approach_records,
+            "slabs": slab_records, "maximum_grade_percent": 18.6,
+            "contact_authority": "shared-static-solid-colliders",
+            "depth_map": "local-ramp-tops-only", "intent": "momentum-steering-and-gap-skill-without-impossible-grade",
+        }
+        vehicle_slot["initial_state"]["placement"] = "authored-world-pose"
         gun_object = gun_tool(
             f"{world.identity}/tools/physics-ball-gun",
             projectile_system["archetype"]["identity"],
@@ -616,6 +701,11 @@ def world_div_map_model(
             },
         }
         model["contact_surfaces"] = support_surface_model(world.identity)
+        model["mechanical_creature"] = mechanical_creature_model(
+            vehicle, world_identity=world.identity,
+            contact_surface_identity=model["contact_surfaces"]["identity"],
+        )
+        vehicle["mechanical_creature"] = model["mechanical_creature"]["identity"]
         player_model = model["entity_mezzanine"]["entities"][0]
         player_model["capabilities"] = [
             *player_model["capabilities"], "wield-tool", "fire-projectile",
@@ -677,6 +767,7 @@ def world_div_map_model(
              "fft_size": 64, "output_bins": 24},
     )
     model["music_room"] = music_fft.to_model()
+    model["engine_audio"] = engine_pcm_kernel_bank_model()
     model["music_room"]["room"] = {
         "identity": music_room["identity"],
         "center": list(music_room["center"]),
@@ -684,6 +775,19 @@ def world_div_map_model(
     }
     physics_model = symbolic_world_physics_equations().to_data()
     physics_plugin = symbolic_world_physics_wasm_plugin()
+    vehicle_physics_plugin = symbolic_vehicle_physics_wasm_plugin()
+    vehicle_contact_plugin = symbolic_wheel_contact_wasm_plugin()
+    model_vehicle = model["vehicle_slot"]["vehicles"][0]
+    model_vehicle["physics"]["wasm_fallback"] = {
+        "plugin": vehicle_physics_plugin.identity,
+        "selection": "worker-webgpu-unavailable-or-runtime-fault",
+        "state_transition": "same-fixed-tick-snapshot-abi",
+    }
+    model_vehicle["physics"]["contact_fallback"] = {
+        "plugin": vehicle_contact_plugin.identity,
+        "lanes": "four-wheel-scalar-calls-plus-shared-cage-contact",
+        "reduction": "worker-local-wrench-sum-before-compiled-vehicle-wasm",
+    }
     envelope = geometry["boxes"][0]
     physics_defaults = {
         "minimum_x": envelope["center"][0] - envelope["half_extent"][0],
@@ -794,6 +898,8 @@ def world_div_map_model(
             ),
             music_plugin,
             physics_plugin,
+            vehicle_physics_plugin,
+            vehicle_contact_plugin,
         ),
         performance_labels=performance_labels,
         performance_parents=performance_parents,
@@ -883,6 +989,7 @@ justify-content:flex-end;align-items:center;gap:5px;margin-bottom:4px;color:#b9d
 letter-spacing:.08em}.vehicle-contact-mode{color:var(--active);white-space:nowrap}
 .vehicle-contact-title{margin-right:auto}.vehicle-contact-monitor:not(.expanded) .vehicle-contact-title{display:none}
 .vehicle-contact-monitor:not(.expanded) .vehicle-contact-mode{display:none}
+.vehicle-transfer-hud{margin-right:auto;color:#9fffd0;white-space:nowrap;font-size:8px;letter-spacing:.04em}
 .vehicle-recover-button,.vehicle-detail-button{pointer-events:auto;border:1px solid #ffd166;border-radius:5px;background:#1d1608;
 color:#ffe29a;font:inherit;font-size:8px;padding:2px 5px;cursor:pointer}.vehicle-recover-button:hover{filter:brightness(1.3)}
 .vehicle-detail-button{border-color:#5d7c70;background:#10211c;color:#b9d4ca}.vehicle-detail-button:hover{filter:brightness(1.3)}
@@ -892,6 +999,8 @@ margin:0 0 4px;padding:3px 4px;border:1px solid #294139;border-radius:6px;backgr
 border:1px solid #5d7c70;border-radius:5px;background:#10211c;color:#d9eee5;font:inherit;font-size:9px;
 min-width:27px;padding:3px 6px;cursor:pointer}.vehicle-gear-button.active{border-color:#ffd166;color:#ffe29a;background:#2a210d}
 .vehicle-gear-button:hover{filter:brightness(1.3)}
+.vehicle-torque-split{grid-column:1/-1;display:grid;grid-template-columns:auto 1fr auto;gap:6px;align-items:center;
+color:#9fb9af;font-size:8px}.vehicle-torque-split input{pointer-events:auto;width:100%;accent-color:#ffd166}
 .vehicle-contact-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:4px;
 border:1px solid #294139;border-radius:7px;background:#0b1714}
 .vehicle-contact-corner{display:grid;grid-template-columns:9px minmax(30px,1fr);grid-template-rows:auto auto;
@@ -1419,6 +1528,9 @@ const viewportControls = {
   gamepadPrimaryDown: false,
   gamepadSecondaryDown: false,
   jumpDown: false,
+  respawnDown: false,
+  frontDifferentialBrakeDown:false,
+  rearDifferentialBrakeDown:false,
   horizontalVelocity: [0, 0],
   colliderSides: new Map(),
   representationTransition: null
@@ -1426,21 +1538,35 @@ const viewportControls = {
 
 const vehicleRuntime = {
   instance:null,plugin:null,pending:false,error:null,active:null,state:null,box:null,cabinBox:null,frameBoxes:[],
-  rollCageBoxes:[],mechanicalLinkBoxes:[],suspensionLinkBoxes:[],powertrainBoxes:[],mechanicalNodePositions:new Map(),
+  rollCageBoxes:[],mechanicalLinkBoxes:[],suspensionLinkBoxes:[],powertrainBoxes:[],bodyShellBoxes:[],mechanicalNodePositions:new Map(),
   accumulator:0,lastSpringForces:[0,0,0,0],contactAreas:[0,0,0,0],
   frictionUtilizations:[0,0,0,0],contactModes:[0,0,0,0],compressions:[0,0,0,0],
   tractionScales:[1,1,1,1],brakeScales:[1,1,1,1],damperScales:[1,1,1,1],
+  radialProbePenetrations:Array.from({length:4},()=>Array(15).fill(0)),radialProbeActiveCounts:[0,0,0,0],
   powertrain:{engineTorque:0,clutchTorque:0,transmissionOutputTorque:0,drivelineTorque:0,
     frontDifferentialTorque:0,rearDifferentialTorque:0,engineAccelerationTorque:0,
     engineAngularAcceleration:0,reactionTorque:[0,0,0],mountTorque:[0,0,0]},
   transmission:{mode:"automatic",gear:2,displayGear:2,torqueReserve:0,reason:"initial-second",
-    lowRange:false,diffLock:false},
+    lowRange:false,frontDiffLock:false,rearDiffLock:false,centerDiffLock:false,frontDriveShare:.42,
+    frontDiffMode:"open",rearDiffMode:"open",centerDiffMode:"open",
+    frontDifferentialBrake:false,rearDifferentialBrake:false,
+    smoothLaunch:false,tractionControlEnabled:true,absEnabled:true,tractionControlAuthority:1,absAuthority:1},
   dyno:null,dynoRequest:0,
   wheelBoxes:[],wheelAngles:[0,0,0,0],wheelPhaseTime:null,camera:null,
   parkedState:null,inventoryItem:null,inventorySlot:null,worldMarker:null,presentationAccumulator:0,
   cameraChassisYaw:null,
-  computeMode:"resident-webgpu-pending",gpu:null,contactMonitor:null,transmissionControls:null,
-  frameFault:null,disabledPresentationStages:new Set()
+  computeMode:"resident-webgpu-pending",gpu:null,contactMonitor:null,transmissionControls:null,transferHud:null,
+  brakeLocks:{front_left:false,front_right:false,rear_left:false,rear_right:false},
+  powerUnitPreset:null,
+  transmissionPreset:null,
+  chassisProfile:null,
+  wheelPart:null,
+  bodyShell:null,
+  chassisLeveling:null,
+  steeringSystem:null,
+  shockParameters:{},
+  damage:null,
+  frameFault:null,disabledPresentationStages:new Set(),shaderHudHitRegions:[]
 };
 
 function reportRuntimeFault(stage,error){
@@ -1466,6 +1592,70 @@ const musicRoomRuntime = {
   bands: [0, 0, 0], level: 0, button: null, loadButton: null,
   trackLabel: "generated loop", impactAt: 0, sequence: 0
 };
+
+const engineSoundRuntime={context:null,node:null,gain:null,profile:null,pending:null,lastTelemetryAt:0,error:null};
+
+function engineSoundWorkletSource(){return `
+class TuringEnginePCMProcessor extends AudioWorkletProcessor{
+  constructor(options){super();this.blockSize=options.processorOptions.blockSize;this.inputNames=options.processorOptions.inputs;
+    this.bank=new Map();this.phase=0;this.profile=options.processorOptions.initialProfile;this.metrics={rpm:0,load:0,power:0,
+      throttle:0,transient:0,damage:0,stall:1};
+    for(const descriptor of options.processorOptions.kernels){const module=new WebAssembly.Module(descriptor.binary),
+        instance=new WebAssembly.Instance(module,{}),memory=instance.exports.memory,base=Math.max(64,Math.ceil(descriptor.reservedBytes/4)*4),
+        inputOffsets=this.inputNames.map((_,index)=>base+index*this.blockSize*4),outputOffset=base+this.inputNames.length*this.blockSize*4,
+        required=outputOffset+this.blockSize*4;if(required>memory.buffer.byteLength)memory.grow(Math.ceil((required-memory.buffer.byteLength)/65536));
+      const views=inputOffsets.map(offset=>new Float32Array(memory.buffer,offset,this.blockSize)),output=new Float32Array(
+        memory.buffer,outputOffset,this.blockSize);for(let index=0;index<this.blockSize;index++)views[0][index]=index;
+      this.bank.set(descriptor.identity,{instance,views,output,run:()=>instance.exports[descriptor.entrypoint](this.blockSize,...inputOffsets,outputOffset)});}
+    this.port.onmessage=event=>{const message=event.data||{};if(message.type==='telemetry'){
+      for(const name of Object.keys(this.metrics))if(Number.isFinite(message[name]))this.metrics[name]=Number(message[name]);
+      if(this.bank.has(message.profile))this.profile=message.profile;}};
+  }
+  process(_inputs,outputs){const kernel=this.bank.get(this.profile)||this.bank.values().next().value,channel=outputs[0]?.[0];
+    if(!kernel||!channel)return true;const names=this.inputNames,values={sample_rate:sampleRate,phase_start:this.phase,...this.metrics};
+    for(let index=1;index<names.length;index++)kernel.views[index].fill(Number(values[names[index]]||0));kernel.run();channel.set(kernel.output);
+    this.phase=(this.phase+this.metrics.rpm*this.blockSize/(120*sampleRate))%1;return true;}
+}
+registerProcessor('turing-engine-pcm',TuringEnginePCMProcessor);`}
+
+function engineSoundProfileForPreset(identity){return model.engine_audio?.preset_profiles?.[identity]||"inline-four";}
+
+async function ensureEngineSound(){
+  const runtime=engineSoundRuntime,descriptor=model.engine_audio;if(!descriptor||runtime.node)return runtime;
+  if(runtime.pending)return runtime.pending;runtime.pending=(async()=>{const Context=window.AudioContext||window.webkitAudioContext,
+      context=runtime.context||(runtime.context=new Context({latencyHint:"interactive"}));if(context.state==="suspended")await context.resume();
+    const url=URL.createObjectURL(new Blob([engineSoundWorkletSource()],{type:"text/javascript"}));
+    try{await context.audioWorklet.addModule(url);}finally{URL.revokeObjectURL(url);}
+    const kernels=descriptor.kernels.map(kernel=>({identity:kernel.identity,entrypoint:kernel.entrypoint,
+      reservedBytes:kernel.reserved_bytes,binary:base64Bytes(kernel.binary_base64)})),profile=engineSoundProfileForPreset(
+        vehicleRuntime.powerUnitPreset),node=new AudioWorkletNode(context,"turing-engine-pcm",{numberOfInputs:0,numberOfOutputs:1,
+        outputChannelCount:[1],processorOptions:{blockSize:descriptor.block_size,inputs:descriptor.inputs,kernels,initialProfile:profile}}),
+      highpass=context.createBiquadFilter(),compressor=context.createDynamicsCompressor(),gain=context.createGain();
+    highpass.type="highpass";highpass.frequency.value=24;compressor.threshold.value=-12;compressor.knee.value=8;
+    compressor.ratio.value=3.2;compressor.attack.value=.004;compressor.release.value=.09;gain.gain.value=.68;
+    node.connect(highpass).connect(compressor).connect(gain).connect(context.destination);runtime.node=node;runtime.gain=gain;
+    runtime.profile=profile;runtime.pending=null;return runtime;})().catch(error=>{runtime.pending=null;runtime.error=String(error?.message||error);
+      reportRuntimeFault("engine-pcm-audio",error);return runtime;});return runtime.pending;
+}
+
+function armEngineSoundOnFirstGesture(){const enter=()=>{cleanup();ensureEngineSound().catch(()=>{});},cleanup=()=>{
+    window.removeEventListener("pointerdown",enter,true);window.removeEventListener("keydown",enter,true);};
+  window.addEventListener("pointerdown",enter,true);window.addEventListener("keydown",enter,true);
+}
+
+function updateEngineSoundTelemetry(throttle){const runtime=engineSoundRuntime,vehicle=vehicleRuntime.active;
+  if(!runtime.node||!vehicle)return;const now=performance.now();if(now-runtime.lastTelemetryAt<30)return;runtime.lastTelemetryAt=now;
+  const powertrain=vehicleRuntime.powertrain,preset=vehicle.power_unit_presets?.find(item=>item.identity===vehicleRuntime.powerUnitPreset),
+    rpm=Math.max(0,Number(powertrain.engineRPM||0)),omega=Math.max(0,Number(powertrain.engineAngularSpeed||rpm*Math.PI/30)),
+    torque=Math.abs(Number(powertrain.engineTorque||0)),maximumTorque=Math.max(1,Number(preset?.configuration?.clutch_maximum_torque_nm||400)),
+    idle=Math.max(1,Number(preset?.configuration?.idle_rpm||850)),redline=Math.max(idle+1,Number(preset?.configuration?.redline_rpm||6500)),
+    failed=Object.values(vehicleRuntime.damage?.members||{}).filter(item=>item.failed).length,
+    memberCount=Math.max(1,Object.keys(vehicleRuntime.damage?.members||{}).length),profile=engineSoundProfileForPreset(
+      vehicleRuntime.powerUnitPreset),message={type:"telemetry",profile,rpm,load:Math.min(1.5,torque/maximumTorque),
+      power:Math.min(1.5,torque*omega/(maximumTorque*redline*Math.PI/30)),throttle:Math.min(1,Math.abs(Number(throttle||0))),
+      transient:Math.min(1.5,Math.abs(Number(powertrain.engineAccelerationTorque||0))/maximumTorque),damage:failed/memberCount,
+      stall:Math.max(0,Math.min(1,1-rpm/idle))};runtime.node.port.postMessage(message);runtime.profile=profile;
+}
 
 function base64Bytes(encoded) {
   const raw=atob(encoded),bytes=new Uint8Array(raw.length);
@@ -1559,7 +1749,7 @@ function playToyImpact(speed,position) {
 
 const physicsRuntime = {
   instance: null, plugin: null, pending: false, error: null,
-  verticalVelocity: 0, last: null,
+  verticalVelocity: 0, last: null, supportSuppressedUntil: 0,
   parameters: new Map((model.physics_program?.parameters || []).map(parameter =>
     [parameter.name, Number(parameter.default)]))
 };
@@ -1568,7 +1758,8 @@ const stateLoopRuntime = {
   worker: null, workerUrl: null, ready: false, mode: "initializing",
   engineStage: "full-dynamics", engineSleeping: false, engineSleepReason: null,
   latestSequence: 0, appliedSequence: 0, bodies: new Map(), actorRegistered: false,
-  fallbackReason: null, snapshotStride: 71, snapshotCapacity: 128,
+  fallbackReason: null, lastWorkerCrash: null, forcingWasm: false,
+  snapshotStride: 153, snapshotCapacity: 128,
   freeSlots: [], slotRecords: [], slotGenerations: new Uint32Array(128)
 };
 
@@ -2920,7 +3111,7 @@ function createIdentityTexture(gl, unit, target, rgba) {
 
 function livingMapMaterialColors() {
   const unique = [];
-  const priority = ["portal-in", "portal-out"]
+  const priority = ["portal-in", "portal-out", "body-shell-glass"]
     .map(role => model.appearance.colors[role]).filter(Boolean);
   [...priority, ...Object.entries(model.appearance.colors)
     .filter(([role]) => !["portal-in", "portal-out"].includes(role))
@@ -2937,14 +3128,19 @@ function configurePluckPhongResources(gl, program, choice) {
   const pbr = [], phong = [], enamel = [], texstack = [];
   colors.forEach((color, colorIndex) => {
     const records = model.material_catalog?.records || [];
-    const material = colorIndex < 2 ? null : records.reduce((closest, candidate) => {
+    let material = colorIndex < 2 ? null : records.reduce((closest, candidate) => {
       const albedo = candidate.pbr.slice(0, 3);
       const distance = albedo.reduce((sum, value, index) =>
         sum + (value - color[index]) ** 2, 0);
       return closest === null || distance < closest.distance ? {candidate, distance} : closest;
     }, null)?.candidate;
+    if(colorIndex===2){const plastic=records.find(record=>record.identity==="acrylic_pmma");
+      material=plastic||material;}
     if (material) {
-      pbr.push(...material.pbr); phong.push(...material.phong);
+      const materialPbr=[...material.pbr],materialPhong=[...material.phong];
+      if(colorIndex===2){materialPbr.splice(0,8,.18,.52,.64,.16,0,.72,1.586,.30);
+        materialPhong.splice(0,8,.055,.62,96,.018,.035,.12,.15,0);}
+      pbr.push(...materialPbr); phong.push(...materialPhong);
       enamel.push(...material.enamel); texstack.push(...material.texture_stack);
     } else {
       pbr.push(...color, 0.78, 0.0, 0.0, 1.5, 1.0,
@@ -3017,7 +3213,7 @@ function activateViewportShader(choiceIdentity) {
   ["uResolution", "uCameraPosition", "uCameraFacing", "uSkyColor", "uLightColor",
    "uKeyLightDirection", "uAmbientLight", "uWorldTileSize", "uWorldTileMajorEvery",
    "uWorldTileStrength", "uHeadlightLeft", "uHeadlightRight", "uHeadlightForward",
-   "uHeadlightActive"]
+   "uHeadlightActive", "uRenderPass"]
     .forEach(name => shaderViewer.locations[name] = gl.getUniformLocation(program, name));
   if (choice.adapter === "living-map-camera+palette-material-textures" &&
       !shaderViewer.shaderResources.has(choice.identity)) {
@@ -3200,11 +3396,18 @@ function buildExtrudedBoxMesh(geometry, colors) {
       const chassisCenter=bodyTransform(center);
       return[origin[0]+chassisCenter[0]+turned[0],origin[1]+chassisCenter[1]+turned[1],
         origin[2]+chassisCenter[2]+turned[2]];
+    },transformNoSpin=(point,translate=true)=>{
+      const steered=[point[0]*ct+point[2]*st,point[1],-point[0]*st+point[2]*ct],turned=bodyTransform(steered);
+      if(!translate)return turned;const chassisCenter=bodyTransform(center);
+      return[origin[0]+chassisCenter[0]+turned[0],origin[1]+chassisCenter[1]+turned[1],
+        origin[2]+chassisCenter[2]+turned[2]];
     };
     const rubber=colorVector(box.appearance?.face_color||colors.line),
       tread=colorVector(colors.line||box.appearance?.face_color),
       rim=colorVector(box.appearance?.tread_color||colors["rollbar-silver"]||colors.active),
-      rotor=colorVector(colors["suspension-yellow"]||colors.active);
+      rotor=colorVector(colors["suspension-yellow"]||colors.active),
+      silver=colorVector(colors["rollbar-silver"]||colors.line),
+      black=colorVector(colors["drivetrain-black"]||colors.line);
     const emit=(point,normal,color)=>vertices.push(...transform(point),...transform(normal,false),...color);
     const profile=[[-halfWidth,radius*.82],[-halfWidth*.72,radius*.96],[0,radius],
       [halfWidth*.72,radius*.96],[halfWidth,radius*.82]],rimRadius=Number(state.rimRadius||radius*.55),
@@ -3245,6 +3448,31 @@ function buildExtrudedBoxMesh(geometry, colors) {
         pa=[Math.cos(a)*hubRadius,Math.sin(a)*hubRadius,z],pb=[Math.cos(b)*hubRadius,Math.sin(b)*hubRadius,z];
       [[pa,n],[pb,n],[[0,0,z],n]].forEach(([p,q])=>emit(p,q,rim));
     }
+    // The wheel-end hardware follows steering but not wheel spin. The graph
+    // topology is knuckle -> five-axis bearing -> hub/rotor, with the CV bell
+    // entering the hub and the steering arm beginning on the knuckle.
+    const inboard=String(state.name||"").includes("left")?1:-1,
+      fixedEmit=(point,normal,shade)=>vertices.push(...transformNoSpin(point),...transformNoSpin(normal,false),...shade),
+      fixedCuboid=(c,h,shade)=>{const points=[[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]]
+        .map(sign=>sign.map((value,index)=>c[index]+value*h[index]));
+        faces.forEach(([indices,normal])=>indices.forEach(index=>fixedEmit(points[index],normal,shade)));},
+      fixedTube=(start,end,tubeRadius,shade,sides=10)=>{const tubeAxis=normalized3(end.map((value,index)=>value-start[index])),
+        helper=Math.abs(tubeAxis[1])<.85?[0,1,0]:[1,0,0],tu=normalized3([tubeAxis[1]*helper[2]-tubeAxis[2]*helper[1],
+          tubeAxis[2]*helper[0]-tubeAxis[0]*helper[2],tubeAxis[0]*helper[1]-tubeAxis[1]*helper[0]]),
+        tv=normalized3([tubeAxis[1]*tu[2]-tubeAxis[2]*tu[1],tubeAxis[2]*tu[0]-tubeAxis[0]*tu[2],tubeAxis[0]*tu[1]-tubeAxis[1]*tu[0]]);
+        for(let segment=0;segment<sides;segment+=1){const aa=segment*Math.PI*2/sides,ab=(segment+1)*Math.PI*2/sides,
+          ra=tu.map((value,index)=>value*Math.cos(aa)+tv[index]*Math.sin(aa)),rb=tu.map((value,index)=>value*Math.cos(ab)+tv[index]*Math.sin(ab)),
+          p0=start.map((value,index)=>value+ra[index]*tubeRadius),p1=start.map((value,index)=>value+rb[index]*tubeRadius),
+          p2=end.map((value,index)=>value+rb[index]*tubeRadius),p3=end.map((value,index)=>value+ra[index]*tubeRadius);
+          [[p0,ra],[p1,rb],[p2,rb],[p0,ra],[p2,rb],[p3,ra]].forEach(([p,n])=>fixedEmit(p,n,shade));}},
+      bearingZ=inboard*(halfWidth+.010),knuckleZ=inboard*(halfWidth+.045),cvEndZ=inboard*(halfWidth+.095);
+    fixedTube([0,0,bearingZ-inboard*.012],[0,0,bearingZ+inboard*.012],rimRadius*.30,silver,16);
+    fixedTube([0,-rimRadius*.48,knuckleZ],[0,rimRadius*.48,knuckleZ],rimRadius*.105,rotor,10);
+    fixedTube([0,0,knuckleZ],[0,0,cvEndZ],rimRadius*.24,black,14);
+    fixedTube([0,0,cvEndZ],[0,0,cvEndZ+inboard*.030],rimRadius*.16,silver,12);
+    fixedTube([0,rimRadius*.18,knuckleZ],[rimRadius*.52,rimRadius*.28,knuckleZ],rimRadius*.075,rotor,9);
+    fixedCuboid([rimRadius*.16,rimRadius*.58,knuckleZ-inboard*.010],
+      [rimRadius*.20,rimRadius*.16,.022],rotor);
     const tireIdentity=`${box.identity}/tire:pneumatic-carcass`,wheelIdentity=`${box.identity}/wheel:rim-hub-brake`;
     semanticPartSpans.push({identity:tireIdentity,objectIdentity:box.identity,role:"pneumatic-tire",
       openingIdentity:null,runtimePartId:turingWorld.partRuntimeId(tireIdentity),runtimeObjectId:0,
@@ -3253,9 +3481,14 @@ function buildExtrudedBoxMesh(geometry, colors) {
       openingIdentity:null,runtimePartId:turingWorld.partRuntimeId(wheelIdentity),runtimeObjectId:0,
       firstVertex:firstVertex+tireVertexCount,vertexCount:vertices.length/9-firstVertex-tireVertexCount,
       primitive:"heavy-six-spoke-wheel-hub-and-brake",revision:shaderViewer.revision});
+    const wheelEndIdentity=`${box.identity}/wheel-end:cv-bearing-knuckle-rotor-caliper`;
+    semanticPartSpans.push({identity:wheelEndIdentity,objectIdentity:box.identity,role:"wheel-end-load-path",
+      openingIdentity:null,runtimePartId:turingWorld.partRuntimeId(wheelEndIdentity),runtimeObjectId:0,
+      firstVertex:firstVertex+tireVertexCount,vertexCount:vertices.length/9-firstVertex-tireVertexCount,
+      primitive:"cv-bearing-knuckle-steering-arm-rotor-caliper",revision:shaderViewer.revision});
     spans.push({identity:box.identity,kind:"vehicle-wheel",boxIndex,firstVertex,
       vertexCount:vertices.length/9-firstVertex,worldObjectIndex:undefined,runtimeObjectId:0,
-      semanticParts:semanticPartSpans.slice(-2),revision:shaderViewer.revision});
+      semanticParts:semanticPartSpans.slice(-3),revision:shaderViewer.revision});
   }
   function vehicleLink(box,boxIndex){
     const firstVertex=vertices.length/9,state=box.link_state,segments=8,
@@ -3274,17 +3507,44 @@ function buildExtrudedBoxMesh(geometry, colors) {
         axis[0]*helper[1]-axis[1]*helper[0]]),
       v=normalized3([axis[1]*u[2]-axis[2]*u[1],axis[2]*u[0]-axis[0]*u[2],
         axis[0]*u[1]-axis[1]*u[0]]),radius=Number(state.radius||.012),
-      color=colorVector(box.appearance?.face_color||colors.line),emit=(point,normal)=>vertices.push(...point,...normal,...color);
-    for(let segment=0;segment<segments;segment+=1){
-      const angleA=segment*Math.PI*2/segments,angleB=(segment+1)*Math.PI*2/segments,
-        radialA=u.map((value,index)=>value*Math.cos(angleA)+v[index]*Math.sin(angleA)),
-        radialB=u.map((value,index)=>value*Math.cos(angleB)+v[index]*Math.sin(angleB)),
-        a0=a.map((value,index)=>value+radialA[index]*radius),a1=a.map((value,index)=>value+radialB[index]*radius),
-        b0=b.map((value,index)=>value+radialA[index]*radius),b1=b.map((value,index)=>value+radialB[index]*radius);
-      [[a0,radialA],[b0,radialA],[b1,radialB],[a0,radialA],[b1,radialB],[a1,radialB],
-       [a,axis.map(value=>-value)],[a1,axis.map(value=>-value)],[a0,axis.map(value=>-value)],
-       [b,axis],[b0,axis],[b1,axis]].forEach(([point,normal])=>emit(point,normal));
-    }
+      color=colorVector(box.appearance?.face_color||colors.line),
+      emit=(point,normal,shade=color)=>vertices.push(...point,...normal,...shade),
+      tube=(start,end,tubeRadius,shade=color,sideCount=segments)=>{
+        const tubeAxis=normalized3(end.map((value,index)=>value-start[index])),
+          tubeHelper=Math.abs(tubeAxis[1])<.85?[0,1,0]:[1,0,0],
+          tubeU=normalized3([tubeAxis[1]*tubeHelper[2]-tubeAxis[2]*tubeHelper[1],
+            tubeAxis[2]*tubeHelper[0]-tubeAxis[0]*tubeHelper[2],tubeAxis[0]*tubeHelper[1]-tubeAxis[1]*tubeHelper[0]]),
+          tubeV=normalized3([tubeAxis[1]*tubeU[2]-tubeAxis[2]*tubeU[1],
+            tubeAxis[2]*tubeU[0]-tubeAxis[0]*tubeU[2],tubeAxis[0]*tubeU[1]-tubeAxis[1]*tubeU[0]]);
+        for(let segment=0;segment<sideCount;segment+=1){
+          const angleA=segment*Math.PI*2/sideCount,angleB=(segment+1)*Math.PI*2/sideCount,
+            radialA=tubeU.map((value,index)=>value*Math.cos(angleA)+tubeV[index]*Math.sin(angleA)),
+            radialB=tubeU.map((value,index)=>value*Math.cos(angleB)+tubeV[index]*Math.sin(angleB)),
+            a0=start.map((value,index)=>value+radialA[index]*tubeRadius),
+            a1=start.map((value,index)=>value+radialB[index]*tubeRadius),
+            b0=end.map((value,index)=>value+radialA[index]*tubeRadius),
+            b1=end.map((value,index)=>value+radialB[index]*tubeRadius);
+          [[a0,radialA],[b0,radialA],[b1,radialB],[a0,radialA],[b1,radialB],[a1,radialB]]
+            .forEach(([point,normal])=>emit(point,normal,shade));
+        }
+      };
+    if(box.mechanical_edge?.constraint==="spring-damper"){
+      const edge=box.mechanical_edge,visual=edge.visualization||{},silver=colorVector(colors["rollbar-silver"]||colors.line),
+        length=Math.max(.001,Math.hypot(...b.map((value,index)=>value-a[index]))),
+        turns=Number(visual.active_turns||8),wire=Math.max(.0015,Number(visual.wire_radius_m||radius*.24)),
+        springRadius=Math.max(radius*1.45,wire*2.8),steps=Math.max(48,Math.round(turns*10));
+      tube(a,b,Number(visual.damper_shaft_radius_m||radius*.35),silver,8);
+      let previous=null;
+      for(let step=0;step<=steps;step+=1){
+        const t=.08+.84*step/steps,angle=turns*Math.PI*2*step/steps,
+          point=a.map((value,index)=>value+axis[index]*length*t+springRadius*(u[index]*Math.cos(angle)+v[index]*Math.sin(angle)));
+        if(previous)tube(previous,point,wire,color,6);previous=point;
+      }
+      const preload=Math.max(0,Number(edge.static_preload_compression_m||0)),collarT=Math.min(.22,.07+preload/Math.max(.001,length)*.35),
+        collarCenter=a.map((value,index)=>value+axis[index]*length*collarT),collarHalf=Math.max(.006,wire*1.4);
+      tube(collarCenter.map((value,index)=>value-axis[index]*collarHalf),
+        collarCenter.map((value,index)=>value+axis[index]*collarHalf),springRadius*1.12,silver,10);
+    }else tube(a,b,radius,color,segments);
     const partIdentity=`${box.identity}/surface:member`;
     semanticPartSpans.push({identity:partIdentity,objectIdentity:box.identity,role:box.suspension_role||"mechanical-link",
       openingIdentity:null,runtimePartId:turingWorld.partRuntimeId(partIdentity),runtimeObjectId:0,
@@ -3292,6 +3552,84 @@ function buildExtrudedBoxMesh(geometry, colors) {
     spans.push({identity:box.identity,kind:box.kind,boxIndex,firstVertex,
       vertexCount:vertices.length/9-firstVertex,worldObjectIndex:undefined,runtimeObjectId:0,
       semanticParts:semanticPartSpans.slice(-1),revision:shaderViewer.revision});
+  }
+  function vehiclePowertrainPart(box,boxIndex){
+    const firstVertex=vertices.length/9,mesh=box.part_mesh||{},center=[Number(box.center[0]),Number(box.center_y),Number(box.center[1])],
+      half=[Number(box.half_extent[0]),Number(box.height)*.5,Number(box.half_extent[1])],
+      primary=colorVector(box.appearance?.face_color||colors[box.palette_role]||colors.line),
+      silver=colorVector(colors["rollbar-silver"]||colors.line),black=colorVector(colors["drivetrain-black"]||colors.line),
+      accent=colorVector(colors["engine-accent"]||colors.active),yellow=colorVector(colors["actuator-yellow"]||colors.active),
+      emit=(point,normal,shade=primary)=>vertices.push(...point,...normal,...shade),
+      cuboid=(c,h,shade=primary)=>{const p=[[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]]
+        .map(sign=>sign.map((value,index)=>c[index]+value*h[index]));
+        faces.forEach(([indices,normal])=>indices.forEach(index=>emit(p[index],normal,shade)));},
+      tube=(start,end,radius,shade=primary,sides=10)=>{const axis=normalized3(end.map((value,index)=>value-start[index])),
+        helper=Math.abs(axis[1])<.85?[0,1,0]:[1,0,0],u=normalized3([axis[1]*helper[2]-axis[2]*helper[1],
+          axis[2]*helper[0]-axis[0]*helper[2],axis[0]*helper[1]-axis[1]*helper[0]]),
+        v=normalized3([axis[1]*u[2]-axis[2]*u[1],axis[2]*u[0]-axis[0]*u[2],axis[0]*u[1]-axis[1]*u[0]]);
+        for(let side=0;side<sides;side+=1){const aa=side*Math.PI*2/sides,ab=(side+1)*Math.PI*2/sides,
+          ra=u.map((value,index)=>value*Math.cos(aa)+v[index]*Math.sin(aa)),rb=u.map((value,index)=>value*Math.cos(ab)+v[index]*Math.sin(ab)),
+          p0=start.map((value,index)=>value+ra[index]*radius),p1=start.map((value,index)=>value+rb[index]*radius),
+          p2=end.map((value,index)=>value+rb[index]*radius),p3=end.map((value,index)=>value+ra[index]*radius);
+          [[p0,ra],[p1,rb],[p2,rb],[p0,ra],[p2,rb],[p3,ra]].forEach(([point,normal])=>emit(point,normal,shade));}},
+      ellipsoid=(c,r,shade=primary,rings=8,sides=14)=>{const point=(ring,side)=>{const theta=Math.PI*ring/rings,
+        phi=Math.PI*2*side/sides,normal=normalized3([Math.sin(theta)*Math.cos(phi)/Math.max(1e-6,r[0]),
+          Math.cos(theta)/Math.max(1e-6,r[1]),Math.sin(theta)*Math.sin(phi)/Math.max(1e-6,r[2])]);
+        return{position:[c[0]+r[0]*Math.sin(theta)*Math.cos(phi),c[1]+r[1]*Math.cos(theta),
+          c[2]+r[2]*Math.sin(theta)*Math.sin(phi)],normal};};
+        for(let ring=0;ring<rings;ring+=1)for(let side=0;side<sides;side+=1){const a=point(ring,side),b=point(ring+1,side),
+          c0=point(ring+1,side+1),d=point(ring,side+1);[a,b,c0,a,c0,d].forEach(item=>emit(item.position,item.normal,shade));}},
+      ring=(c,rx,ry,wire,shade=black)=>{let previous=null;for(let step=0;step<=32;step+=1){const angle=step*Math.PI*2/32,
+        point=[c[0]+rx*Math.cos(angle),c[1]+ry*Math.sin(angle),c[2]];if(previous)tube(previous,point,wire,shade,6);previous=point;}};
+    if(mesh.shape==="fuel-tank"){
+      ellipsoid(center,[half[0],half[1],half[2]],primary,10,18);
+      for(const offset of [-half[2]*.46,half[2]*.46])ring([center[0],center[1],center[2]+offset],half[0]*1.04,half[1]*1.06,.006,black);
+      tube([center[0]+half[0]*.45,center[1]+half[1]*.72,center[2]+half[2]*.30],
+        [center[0]+half[0]*.45,center[1]+half[1]*1.55,center[2]+half[2]*.30],.018,primary,12);
+      tube([center[0]+half[0]*.45,center[1]+half[1]*1.52,center[2]+half[2]*.30],
+        [center[0]+half[0]*.45,center[1]+half[1]*1.68,center[2]+half[2]*.30],.024,silver,12);
+      tube([center[0]+half[0]*.80,center[1]-half[1]*.35,center[2]],
+        [center[0]+half[0]*1.30,center[1]-half[1]*.35,center[2]],.009,accent,8);
+    }else if(mesh.shape==="battery-pack"){
+      cuboid(center,half,primary);
+      for(const offset of [-.58,-.20,.20,.58])cuboid([center[0]+half[0]*offset,center[1]+half[1]*1.04,center[2]],
+        [half[0]*.035,half[1]*.10,half[2]*.92],silver);
+      for(const side of [-1,1]){const terminal=[center[0]+side*half[0]*.62,center[1]+half[1]*1.22,center[2]-half[2]*.50];
+        tube(terminal,[terminal[0],terminal[1]+half[1]*.28,terminal[2]],.012,side<0?black:accent,10);}
+      cuboid([center[0]+half[0]*1.34,center[1],center[2]],[half[0]*.22,half[1]*.76,half[2]*.78],black);
+    }else if(mesh.shape==="engine-cylinder"){
+      const axis=normalized3(mesh.axis||[0,1,0]),length=Math.max(.025,half[1]*1.75),start=center.map((value,index)=>value-axis[index]*length*.5),
+        end=center.map((value,index)=>value+axis[index]*length*.5);
+      tube(start,end,Math.max(half[0],half[2]),primary,12);
+      tube(end,end.map((value,index)=>value+axis[index]*length*.18),Math.max(half[0],half[2])*1.12,accent,12);
+    }else if(mesh.shape==="round-shaft"){
+      const axis=normalized3(mesh.axis||[1,0,0]),span=Math.max(half[0],half[2],half[1]),
+        start=center.map((value,index)=>value-axis[index]*span),end=center.map((value,index)=>value+axis[index]*span);
+      tube(start,end,Math.max(.009,Math.min(half[0],half[1],half[2])),primary,12);
+    }else if(mesh.shape==="throttle-body"){
+      tube([center[0],center[1],center[2]-half[2]],[center[0],center[1],center[2]+half[2]],Math.max(half[0],half[1]),primary,14);
+      tube([center[0]+half[0],center[1]+half[1],center[2]],[center[0]+half[0]*1.45,center[1]+half[1]*1.25,center[2]],.006,yellow,8);
+    }else if(mesh.shape==="differential-brake"){
+      tube([center[0]-half[0],center[1],center[2]],[center[0]+half[0],center[1],center[2]],half[2],silver,18);
+      tube([center[0]-half[0]*1.08,center[1],center[2]],[center[0]+half[0]*1.08,center[1],center[2]],half[2]*.42,black,12);
+      cuboid([center[0],center[1]+half[2]*.56,center[2]+half[2]*.58],
+        [half[0]*1.35,half[2]*.34,half[2]*.28],primary);
+    }else if(mesh.shape==="ignition-coil"){
+      cuboid(center,half,black);tube([center[0],center[1]+half[1],center[2]],
+        [center[0],center[1]+half[1]*1.72,center[2]],Math.max(.005,half[0]*.32),primary,10);
+    }else if(mesh.shape==="distributor"){
+      tube([center[0],center[1]-half[1],center[2]],[center[0],center[1]+half[1],center[2]],
+        Math.max(half[0],half[2]),black,14);
+      tube([center[0],center[1]+half[1]*.72,center[2]],[center[0],center[1]+half[1]*1.08,center[2]],
+        Math.max(half[0],half[2])*1.18,accent,14);
+    }else cuboid(center,half,primary);
+    const partIdentity=`${box.identity}/surface:procedural-part`;
+    semanticPartSpans.push({identity:partIdentity,objectIdentity:box.identity,role:mesh.shape||"powertrain-part",
+      openingIdentity:null,runtimePartId:turingWorld.partRuntimeId(partIdentity),runtimeObjectId:0,firstVertex,
+      vertexCount:vertices.length/9-firstVertex,primitive:`procedural-${mesh.shape||"part"}`,revision:shaderViewer.revision});
+    rotateBoxRealization(box,firstVertex,colliders.length);
+    spans.push({identity:box.identity,kind:box.kind,boxIndex,firstVertex,vertexCount:vertices.length/9-firstVertex,
+      worldObjectIndex:undefined,runtimeObjectId:0,semanticParts:semanticPartSpans.slice(-1),revision:shaderViewer.revision});
   }
   function rotateBoxRealization(box, firstVertex, firstCollider) {
     const rotation=box.placement?.rotation||[0,0,0],roll=Number(rotation[0]||0)*Math.PI/180,
@@ -3408,6 +3746,9 @@ function buildExtrudedBoxMesh(geometry, colors) {
     }
     if(box.geometry_mode==="vehicle-wheel"){
       vehicleWheel(box,boxIndex);return;
+    }
+    if(box.geometry_mode==="vehicle-powertrain-part"){
+      vehiclePowertrainPart(box,boxIndex);return;
     }
     if (box.geometry_mode === "sphere") {
       sphere(centerX, Number(box.center_y ?? box.radius), centerZ,
@@ -3870,9 +4211,11 @@ function installSceneMesh(mesh,{publish=true}={}) {
 }
 
 function vehiclePresentationGeometry(){
+  const useHostWheels=!shaderViewer.wheelProgram;
   return [...vehicleRuntime.frameBoxes,...vehicleRuntime.rollCageBoxes,
     ...vehicleRuntime.mechanicalLinkBoxes,...vehicleRuntime.powertrainBoxes,
-    ...(shaderViewer.wheelProgram?[]:vehicleRuntime.wheelBoxes)].filter(Boolean);
+    ...vehicleRuntime.bodyShellBoxes,
+    ...(useHostWheels?vehicleRuntime.wheelBoxes:[])].filter(Boolean);
 }
 
 function installVehiclePresentationMesh(mesh){
@@ -4085,15 +4428,21 @@ function initializeVehicleWheelRenderer(gl){
   gl.attachShader(program,compileShader(gl,gl.FRAGMENT_SHADER,VEHICLE_WHEEL_FRAGMENT_SHADER));
   gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))
     throw new Error(gl.getProgramInfoLog(program)||"vehicle wheel shader link failed");
-  const vertices=[],segments=16,emit=(position,normal)=>vertices.push(...position,...normal);
-  for(let segment=0;segment<segments;segment+=1){
+  const vertices=[],segments=48,crossSections=16,major=.75,tube=.25,
+    emit=(position,normal)=>vertices.push(...position,...normal),
+    tirePoint=(theta,phi)=>{const radial=major+tube*Math.cos(phi);return[
+      [Math.cos(theta)*radial,Math.sin(theta)*radial,.5*Math.sin(phi)],
+      [Math.cos(theta)*Math.cos(phi),Math.sin(theta)*Math.cos(phi),Math.sin(phi)]];};
+  for(let segment=0;segment<segments;segment+=1)for(let cross=0;cross<crossSections;cross+=1){
     const a=segment*Math.PI*2/segments,b=(segment+1)*Math.PI*2/segments,
-      pa=[Math.cos(a),Math.sin(a),-.5],pb=[Math.cos(b),Math.sin(b),-.5],
-      pc=[Math.cos(b),Math.sin(b),.5],pd=[Math.cos(a),Math.sin(a),.5],
-      na=[Math.cos(a),Math.sin(a),0],nb=[Math.cos(b),Math.sin(b),0];
-    [[pa,na],[pb,nb],[pc,nb],[pa,na],[pc,nb],[pd,na],
-     [pa,[0,0,-1]],[pb,[0,0,-1]],[[0,0,-.5],[0,0,-1]],
-     [pd,[0,0,1]],[[0,0,.5],[0,0,1]],[pc,[0,0,1]]].forEach(([p,n])=>emit(p,n));
+      c=cross*Math.PI*2/crossSections,d=(cross+1)*Math.PI*2/crossSections,
+      pa=tirePoint(a,c),pb=tirePoint(b,c),pc=tirePoint(b,d),pd=tirePoint(a,d);
+    [pa,pb,pc,pa,pc,pd].forEach(([p,n])=>emit(p,n));
+  }
+  for(const side of [-1,1])for(let segment=0;segment<segments;segment+=1){
+    const a=segment*Math.PI*2/segments,b=(segment+1)*Math.PI*2/segments,z=side*.501,
+      pa=[Math.cos(a)*.51,Math.sin(a)*.51,z],pb=[Math.cos(b)*.51,Math.sin(b)*.51,z],
+      normal=[0,0,side];[[pa,normal],[pb,normal],[[0,0,z],normal]].forEach(([p,n])=>emit(p,n));
   }
   const vao=gl.createVertexArray(),buffer=gl.createBuffer();gl.bindVertexArray(vao);
   gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(vertices),gl.STATIC_DRAW);
@@ -4118,9 +4467,10 @@ function drawVehicleWheels(gl,width,height,cameraPosition,cameraFacing,celestial
   if(vehicleRuntime.disabledPresentationStages.has("wheel-shader"))return;
   const state=vehicleRuntime.state||vehicleRuntime.parkedState,vehicle=vehicleRuntime.active||model.vehicle_slot?.vehicles?.[0];
   if(!state||!shaderViewer.wheelProgram||!vehicleRuntime.wheelBoxes.length)return;
-  const config=vehicle.configuration,presentation=config.presentation,radius=Number(config.tires.radius),
-    tireWidth=Number(config.tires.width),rubber=colorVector("#202624"),
-    tread=colorVector("#687672"),rim=colorVector(model.appearance.colors["rollbar-silver"]),
+  const config=vehicle.configuration,presentation=config.presentation,
+    part=vehicle.wheel_parts?.find(item=>item.identity===vehicleRuntime.wheelPart)||vehicle.wheel_parts?.[0],
+    rubber=colorVector(part?.tire_color||"#202624"),tread=colorVector(part?.tread_color||"#687672"),
+    rim=colorVector(model.appearance.colors["rollbar-silver"]),
     rotor=colorVector(model.appearance.colors["suspension-yellow"]),locations=shaderViewer.wheelLocations;
   try{
   gl.useProgram(shaderViewer.wheelProgram);gl.uniform2f(locations.uResolution,width,height);
@@ -4130,7 +4480,8 @@ function drawVehicleWheels(gl,width,height,cameraPosition,cameraFacing,celestial
   gl.uniform3fv(locations.uLightDirection,celestial.key==="sun"?celestial.sunDirection:celestial.moonDirection);
   gl.bindVertexArray(shaderViewer.wheelVao);
   vehicleRuntime.wheelBoxes.forEach((wheel,index)=>{
-    const stateData=wheel.wheel_state,center=rotateVehiclePresentationVector(stateData.localCenter,state,0),
+    const stateData=wheel.wheel_state,radius=Number(stateData.radius),tireWidth=Number(stateData.width),
+      center=rotateVehiclePresentationVector(stateData.localCenter,state,0),
       x=rotateVehiclePresentationVector([radius,0,0],state,stateData.steer),
       y=rotateVehiclePresentationVector([0,radius,0],state,stateData.steer),
       z=rotateVehiclePresentationVector([0,0,tireWidth],state,stateData.steer),
@@ -4150,8 +4501,7 @@ async function initializeShaderViewer() {
   // authored world rather than silently replacing the complete scene.
   const mountedVehicleGeometry=vehicleRuntime.active?[
     ...vehicleRuntime.frameBoxes,...vehicleRuntime.rollCageBoxes,
-    ...vehicleRuntime.mechanicalLinkBoxes,...vehicleRuntime.powertrainBoxes,
-    ...vehicleRuntime.wheelBoxes
+    ...vehicleRuntime.mechanicalLinkBoxes,...vehicleRuntime.powertrainBoxes,...vehicleRuntime.bodyShellBoxes
   ]:[];
   const geometry = [...baseGeometry,...mountedVehicleGeometry];
   const colors = model.appearance.colors;
@@ -4618,7 +4968,10 @@ function selectHotbarSlot(number) {
   hotbarState.activeSlot = number;
   hotbarState.model.active_slot = number;
   const item = hotbarState.inventory.items.find(candidate => candidate.identity === slot.item);
-  if(item?.properties?.vehicle)setActiveVehicle(item.properties.vehicle,{placeAtActor:true,inventoryItem:item});
+  if(item?.properties?.vehicle){
+    const placeAtActor=model.vehicle_slot?.initial_state?.placement==="at-player-spawn";
+    setActiveVehicle(item.properties.vehicle,{placeAtActor,inventoryItem:item});
+  }
   const routedTool = item?.properties?.tool || (item?.is_tool ? item.entity : null);
   hotbarState.inventory.active_tool = routedTool
     ? {item: item.identity, entity: routedTool} : null;
@@ -5499,11 +5852,11 @@ async function requestMobileMotionControls() {
 function bindMobileStick(element, channel) {
   const knob = element.querySelector(".mobile-stick-knob");
   let activePointer = null;
-  const update = event => {
+  const updatePoint = (clientX,clientY) => {
     const bounds = element.getBoundingClientRect();
     const radius = Math.max(1, bounds.width * 0.5 - 22);
-    let x = mobileClamp((event.clientX - (bounds.left + bounds.width * 0.5)) / radius);
-    let y = mobileClamp((event.clientY - (bounds.top + bounds.height * 0.5)) / radius);
+    let x = mobileClamp((clientX - (bounds.left + bounds.width * 0.5)) / radius);
+    let y = mobileClamp((clientY - (bounds.top + bounds.height * 0.5)) / radius);
     const length = Math.hypot(x, y);
     if (length > 1) { x /= length; y /= length; }
     mobileControlState[channel] = [x, y];
@@ -5514,15 +5867,29 @@ function bindMobileStick(element, channel) {
     activePointer = null; mobileControlState[channel] = [0, 0];
     knob.style.transform = "translate(0,0)";
   };
-  element.addEventListener("pointerdown", event => {
-    event.preventDefault(); event.stopPropagation(); activePointer = event.pointerId;
-    element.setPointerCapture?.(event.pointerId); setViewportControlHighlight(true); update(event);
-  });
-  element.addEventListener("pointermove", event => {
-    if (event.pointerId === activePointer) update(event);
-  });
-  element.addEventListener("pointerup", release);
-  element.addEventListener("pointercancel", release);
+  if("PointerEvent" in window){
+    element.addEventListener("pointerdown", event => {
+      event.preventDefault();event.stopPropagation();activePointer=event.pointerId;
+      try{element.setPointerCapture?.(event.pointerId);}catch(_){}
+      setViewportControlHighlight(true);updatePoint(event.clientX,event.clientY);
+    });
+    element.addEventListener("pointermove", event => {
+      if(event.pointerId===activePointer)updatePoint(event.clientX,event.clientY);
+    });
+    element.addEventListener("pointerup",release);element.addEventListener("pointercancel",release);
+    element.addEventListener("lostpointercapture",release);
+  }else{
+    const touch=(event,ending=false)=>{const touches=[...event.changedTouches],point=touches.find(item=>
+      activePointer===null||item.identifier===activePointer);if(!point)return;
+      event.preventDefault();event.stopPropagation();
+      if(activePointer===null){activePointer=point.identifier;setViewportControlHighlight(true);}
+      if(ending){activePointer=null;mobileControlState[channel]=[0,0];knob.style.transform="translate(0,0)";}
+      else updatePoint(point.clientX,point.clientY);};
+    element.addEventListener("touchstart",event=>touch(event),{passive:false});
+    element.addEventListener("touchmove",event=>touch(event),{passive:false});
+    element.addEventListener("touchend",event=>touch(event,true),{passive:false});
+    element.addEventListener("touchcancel",event=>touch(event,true),{passive:false});
+  }
 }
 
 function renderMobileControls() {
@@ -5586,6 +5953,10 @@ function setShaderOnlyMode(active) {
     (shaderViewer.shaderOnly ? shaderViewer.element : shaderViewer.telemetry)?.append(button);
   }
   document.body.classList.toggle("shader-only", shaderViewer.shaderOnly);
+  if(vehicleRuntime.contactMonitor){
+    if(shaderViewer.shaderOnly)vehicleRuntime.contactMonitor.classList.remove("expanded");
+    vehicleRuntime.contactMonitor.hidden=shaderViewer.shaderOnly||!vehicleRuntime.active;
+  }
   if (button) {
     button.setAttribute("aria-pressed", String(shaderViewer.shaderOnly));
     button.textContent = shaderViewer.shaderOnly ? "Exit shader only" : "Shader only";
@@ -5615,8 +5986,8 @@ function initializeVehicleFirstExperience() {
   const mounted=setActiveVehicle(identity,{placeAtActor:policy.placement==="at-player-spawn",inventoryItem});
   if(!mounted)return false;
   if(policy.presentation==="full-viewport-driving")setShaderOnlyMode(true);
-  setViewportControlHighlight(true);shaderViewer.active=true;armBrowserFullscreenOnFirstGesture();
-  setPlacementStatus(`${vehicle.name} initial drive · V dismount · first input enters browser fullscreen`);return true;
+  setViewportControlHighlight(true);shaderViewer.active=true;
+  setPlacementStatus(`${vehicle.name} initial drive · V dismount · R respawns · fullscreen is user-controlled`);return true;
 }
 
 function viewportKeyboardInput(event) {
@@ -5687,6 +6058,8 @@ function viewportInputValue(action, gamepad) {
       if (input === "gamepad:left-y-positive") value = Math.max(value, Math.max(0, leftY));
       if (input === "gamepad:left-x-negative") value = Math.max(value, Math.max(0, -leftX));
       if (input === "gamepad:left-x-positive") value = Math.max(value, Math.max(0, leftX));
+      const button=/^gamepad:button-(\d+)$/.exec(input);
+      if(button)value=Math.max(value,Number(gamepad.buttons[Number(button[1])]?.value||0));
     });
   return value < 0.12 ? 0 : value;
 }
@@ -5711,8 +6084,13 @@ async function initializeWorldPhysicsWasm() {
     const module = model.world.wasm_modules.find(item => item.content_key === plugin.module);
     const vehicle=model.vehicle_slot?.vehicles?.[0];
     if (workerPlan && module && typeof Worker === "function" && typeof Blob === "function") {
-      const raw = atob(module.binary_base64), bytes = new Uint8Array(raw.length);
-      for (let index = 0; index < raw.length; index += 1) bytes[index] = raw.charCodeAt(index);
+      const moduleBytes=descriptor=>{const raw=atob(descriptor.binary_base64),bytes=new Uint8Array(raw.length);
+        for(let index=0;index<raw.length;index+=1)bytes[index]=raw.charCodeAt(index);return bytes;},
+        bytes=moduleBytes(module),fallbackDescriptor=capability=>{const fallbackPlugin=
+          model.world.plugins.find(item=>item.capability===capability),fallbackModule=fallbackPlugin&&
+          model.world.wasm_modules.find(item=>item.content_key===fallbackPlugin.module);return fallbackPlugin&&fallbackModule?{
+            wasm:moduleBytes(fallbackModule),abi:fallbackPlugin.abi,entrypoint:fallbackPlugin.entrypoint}:null;},
+        vehicleWasm=fallbackDescriptor("vehicle-physics"),contactWasm=fallbackDescriptor("vehicle-contact-fallback");
       stateLoopRuntime.workerUrl = URL.createObjectURL(new Blob([workerPlan.source],
         {type: "text/javascript"}));
       const worker = new Worker(stateLoopRuntime.workerUrl);
@@ -5731,10 +6109,20 @@ async function initializeWorldPhysicsWasm() {
           registerActiveVehiclePhysicsBody();
         } else if(message.type==="vehicle-gpu-error"){
           vehicleRuntime.error=message.error;vehicleRuntime.computeMode="resident-webgpu-fault";
+          worker.postMessage({type:"vehicle-disable-gpu",reason:message.error||"resident WebGPU runtime fault"});
         } else if(message.type==="vehicle-gpu-recovered"){
           vehicleRuntime.error=null;vehicleRuntime.computeMode="resident-webgpu-graph";
+        } else if(message.type==="vehicle-wasm-fallback"){
+          vehicleRuntime.error=null;vehicleRuntime.computeMode="resident-wasm-fallback";
         } else if(message.type==="vehicle-dyno-result"){
           vehicleRuntime.dyno=message.result||null;updateVehicleTransmissionControls();
+        } else if(message.type==="vehicle-damage"){
+          vehicleRuntime.damage=message.damage||null;const vehicle=vehicleRuntime.active;
+          if(vehicle&&vehicleRuntime.damage){for(const edge of vehicle.physics.mechanical_graph.edges){const state=
+              vehicleRuntime.damage.members?.[edge.identity];if(state){edge.runtime_rest_length=state.restLength;
+                edge.runtime_failed=Boolean(state.failed);}}
+            if(vehicleRuntime.state){updateVehiclePresentation(vehicle,vehicleRuntime.state,0,0);
+              rebuildPortableSceneMesh({dynamicOnly:true});}updateVehicleTransmissionControls();}
         } else if (message.type === "engine-state") {
           stateLoopRuntime.engineStage=message.stage||(
             message.sleeping?"asleep":"full-dynamics");
@@ -5769,10 +6157,24 @@ async function initializeWorldPhysicsWasm() {
                 reactionTorque:Array.from(values.slice(offset+55,offset+58)),
                 mountTorque:Array.from(values.slice(offset+58,offset+61)),
                 engineAngularSpeed:values[offset+69],engineRPM:values[offset+70]};
+              Object.assign(body.powertrain,{tractionControlDissipationTorque:values[offset+143],
+                serviceBrakeReactionTorque:values[offset+144],rollingResistanceReactionTorque:values[offset+145],
+                tireContactReactionTorque:values[offset+146],drivetrainChassisReactionTorque:values[offset+147]});
               body.transmission={gear:Math.max(1,values[offset+61]),displayGear:values[offset+62],
                 mode:values[offset+63]===1?"automatic":"manual"};
               body.snapshotControlGeneration = values[offset + 64];
               body.damperScales = Array.from(values.slice(offset + 65, offset + 69));
+              body.radialProbePenetrations=Array.from({length:4},(_,wheel)=>
+                Array.from(values.slice(offset+71+wheel*15,offset+86+wheel*15)));
+              body.radialProbeActiveCounts=Array.from(values.slice(offset+131,offset+135)).map(Math.round);
+              Object.assign(body.transmission,{lowRange:values[offset+135]===1,frontDiffLock:values[offset+136]===1,
+                rearDiffLock:values[offset+137]===1,centerDiffLock:values[offset+138]===1,
+                frontDriveShare:values[offset+139],tractionControlEnabled:values[offset+140]===1,
+                absEnabled:values[offset+141]===1,smoothLaunch:values[offset+142]===1,
+                tractionControlAuthority:values[offset+148],absAuthority:values[offset+149],
+                frontDiffMode:values[offset+150]>=.7?"locked":values[offset+150]>.01?"limited-slip":"open",
+                rearDiffMode:values[offset+151]>=.7?"locked":values[offset+151]>.01?"limited-slip":"open",
+                centerDiffMode:values[offset+152]>=.7?"locked":values[offset+152]>.01?"limited-slip":"open"});
               if (vehicleRuntime.state?.identity === body.identity) {
                 vehicleRuntime.lastSpringForces = [...body.springForces];
                 vehicleRuntime.contactAreas = [...body.contactAreas];
@@ -5782,10 +6184,12 @@ async function initializeWorldPhysicsWasm() {
                 vehicleRuntime.tractionScales = [...body.tractionScales];
                 vehicleRuntime.brakeScales = [...body.brakeScales];
                 vehicleRuntime.damperScales = [...body.damperScales];
+                vehicleRuntime.radialProbePenetrations=body.radialProbePenetrations.map(samples=>[...samples]);
+                vehicleRuntime.radialProbeActiveCounts=[...body.radialProbeActiveCounts];
                 vehicleRuntime.powertrain={...body.powertrain,reactionTorque:[...body.powertrain.reactionTorque],
                   mountTorque:[...body.powertrain.mountTorque]};
-                const transmissionChanged=vehicleRuntime.transmission.mode!==body.transmission.mode||
-                  vehicleRuntime.transmission.displayGear!==body.transmission.displayGear;
+                const transmissionChanged=Object.keys(body.transmission).some(key=>
+                  vehicleRuntime.transmission[key]!==body.transmission[key]);
                 vehicleRuntime.transmission={...vehicleRuntime.transmission,...body.transmission};
                 if(transmissionChanged)updateVehicleTransmissionControls();
               }
@@ -5798,14 +6202,23 @@ async function initializeWorldPhysicsWasm() {
         }
       };
       worker.onerror = event => {
-        const reason = event.message || "physics worker failed";
+        const reason = `${event.message||"physics worker failed"} @ ${event.filename||"worker"}:${event.lineno||0}:${event.colno||0}`;
+        stateLoopRuntime.lastWorkerCrash=reason;
         physicsRuntime.error = reason;vehicleRuntime.error=reason;
         vehicleRuntime.computeMode="resident-webgpu-fault";
+        if(stateLoopRuntime.forcingWasm){worker.terminate();stateLoopRuntime.worker=null;stateLoopRuntime.ready=false;return;}
+        stateLoopRuntime.forcingWasm=true;
+        worker.terminate();model.vehicle_slot.programs[0]=null;stateLoopRuntime.worker=null;stateLoopRuntime.ready=false;
+        stateLoopRuntime.actorRegistered=false;stateLoopRuntime.bodies.clear();
+        stateLoopRuntime.latestSequence=0;stateLoopRuntime.appliedSequence=0;
+        initializePhysicsSnapshotSlots(stateLoopRuntime.snapshotCapacity);
+        queueMicrotask(()=>initializeWorldPhysicsWasm());
       };
       worker.postMessage({type: "init", wasm: bytes, abi: plugin.abi,
         entrypoint: plugin.entrypoint, parameters: Object.fromEntries(physicsRuntime.parameters),
         snapshotCapacity: stateLoopRuntime.snapshotCapacity,
         vehicleWebgpu:model.vehicle_slot?.programs?.[0],
+        vehicleWasm,contactWasm,
         worldBottom:model.contact_surfaces?.world_bottom});
       physicsRuntime.plugin = plugin; physicsRuntime.error = null;
       return;
@@ -5817,6 +6230,26 @@ async function initializeWorldPhysicsWasm() {
   } finally {
     physicsRuntime.pending = false;
   }
+}
+
+function buildVehicleBodyShell(vehicle,state){
+  if(vehicleRuntime.bodyShell==="bare-frame")return [];
+  const shell=vehicle.body_shells?.find(item=>item.identity===vehicleRuntime.bodyShell),
+    chassis=vehicle.configuration.chassis,halfLength=Number(chassis.half_length),halfWidth=Number(chassis.half_width),
+    colorRole=shell?.palette_role||vehicle.configuration.presentation.palette_role,specs=[
+      ["hood",[halfLength*.48,.32,0],[halfLength*.40,halfWidth*1.08],.30],
+      ["cab",[-halfLength*.03,.52,0],[halfLength*.32,halfWidth*1.06],.82],
+      ["bed",[-halfLength*.62,.29,0],[halfLength*.35,halfWidth*1.09],.30],
+      ["left-fender",[halfLength*.20,.24,-halfWidth*1.07],[halfLength*.74,.065],.24],
+      ["right-fender",[halfLength*.20,.24,halfWidth*1.07],[halfLength*.74,.065],.24]];
+  return specs.map(([name,localCenter,halfExtent,height])=>({identity:`${vehicle.identity}/cosmetic-shell:${name}`,
+    kind:"vehicle-cosmetic-shell",label:name,parent_identity:vehicle.identity,center:[state.position[0],state.position[2]],
+    center_y:state.position[1]+localCenter[1],half_extent:halfExtent,height,floor_height:height,wall_thickness:.012,
+    palette_role:colorRole,wall_palette_role:colorRole,geometry_mode:"solid",openings:[],local_center:localCenter,
+    appearance:{face_color:model.appearance.colors[colorRole],material_identity:shell?.material_identity||null,
+      material_profile:shell?.material_profile||"opaque"},presentation_layer:"non-physics-chassis-relative-shell",
+    placement:{custody:"placed",elevation:state.position[1]+localCenter[1]-height*.5,rotation:[0,0,0]},
+    physics:{enabled:false,collider:"none",mass:0}}));
 }
 
 function ensureVehiclePresentation(vehicle,state) {
@@ -5888,7 +6321,10 @@ function ensureVehiclePresentation(vehicle,state) {
   const mechanicalGraph=vehicle.physics.mechanical_graph;
   vehicleRuntime.mechanicalLinkBoxes=mechanicalGraph.edges.filter(edge=>
     ["rigid-distance","rigid-offset","spring-damper","steering-link","torque-shaft",
-     "constant-velocity-torque-shaft","six-axis-compliant-mount"].includes(edge.constraint)).map(edge=>({
+     "constant-velocity-torque-shaft","six-axis-compliant-mount","steering-torque-shaft",
+     "universal-joint-steering-shaft","universal-joint-hub-spindle",
+     "rack-and-pinion-angle-to-translation","rack-translation","routed-tension-cable",
+     "table-actuator-linear-link","tension-limit-strap","routed-energy-line","intake-flow-path","exhaust-flow-path"].includes(edge.constraint)).map(edge=>({
       identity:`${vehicle.identity}/mechanical:${edge.identity}`,kind:"vehicle-mechanical-edge",label:edge.identity,
       parent_identity:vehicle.identity,center:[...box.center],center_y:state.position[1],half_extent:[.015,.015],
       height:.03,floor_height:0,wall_thickness:.006,palette_role:edge.palette_role,
@@ -5900,31 +6336,86 @@ function ensureVehiclePresentation(vehicle,state) {
       placement:{custody:"placed",elevation:state.position[1],rotation:[0,0,0]},physics:{enabled:false,welded:true}}));
   const pt=config.powertrain,enginePosition=pt.engine_position.map(Number),wheelbase=Number(wheels.wheelbase_half_length),
     engineScale=Math.cbrt(Math.max(.125,Number(pt.displacement_liters||1.6)/1.6)),
-    powertrainSpecs=[
+    activePreset=vehicle.power_unit_presets?.find(item=>item.identity===vehicleRuntime.powerUnitPreset)||
+      vehicle.power_unit_presets?.find(item=>item.identity===vehicle.power_unit_preset),architecture=activePreset?.architecture||{
+        layout:"inline-four",cylinders:4,banks:1},cylinders=Math.max(0,Number(architecture.cylinders||0)),
+    cylinderSpecs=Array.from({length:cylinders},(_,index)=>{const banks=Math.max(1,Number(architecture.banks||1)),bank=index%banks,
+      bankIndex=Math.floor(index/banks),perBank=Math.ceil(cylinders/banks),x=enginePosition[0]+(bankIndex-(perBank-1)/2)*.055*engineScale,
+      side=banks===1?0:(bank===0?-1:1),kind=architecture.layout?.includes("flat")?"vehicle-flat-cylinder":
+        architecture.layout?.includes("v8")?"vehicle-v-cylinder":"vehicle-inline-cylinder";
+      return [`cylinder-${index+1}`,kind,[x,.13*engineScale,side*.072*engineScale],[.022*engineScale,.026*engineScale],
+        .082*engineScale,"engine-metal","engineTorque"];}),
+    rotorSpecs=cylinders?[]:Array.from({length:Math.max(1,Number(architecture.banks||1))},(_,index)=>[
+      `electric-stator-${index+1}`,"vehicle-electric-stator",[enginePosition[0]+index*.11,.12,(index%2?1:-1)*.045],
+      [.06*engineScale,.05*engineScale],.10*engineScale,"engine-metal","engineTorque"]),
+    ignitionSpecs=activePreset?.kind==="combustion"?[
+      ["ignition-distributor","vehicle-ignition-distributor",[enginePosition[0]-.10,.225,Number(chassis.half_width)*.18],
+        [.024,.024],.065,"engine-accent",null],
+      ["ignition-coil-left","vehicle-ignition-coil",[enginePosition[0]-.04,.235,-Number(chassis.half_width)*.20],
+        [.022,.018],.055,"engine-accent",null],
+      ["ignition-coil-right","vehicle-ignition-coil",[enginePosition[0]-.04,.235,Number(chassis.half_width)*.20],
+        [.022,.018],.055,"engine-accent",null]
+    ]:[],monsterFuelSystem=activePreset?.kind==="combustion"&&String(activePreset?.identity||"").includes("monster"),
+    auxiliaryReservoirSpecs=monsterFuelSystem?[
+      ["reserve-fuel-cell","vehicle-reserve-fuel-tank",[-Number(chassis.half_length)*.68,.20,-Number(chassis.half_width)*.42],
+        [.09,.11],.11,"fuel-tank-candy-red",null,18],
+      ["oxidizer-canister","vehicle-oxidizer-canister",[-Number(chassis.half_length)*.68,.20,Number(chassis.half_width)*.42],
+        [.07,.08],.16,"oxidizer-canister",null,14]
+    ]:[],
+    architectureSpecs=[
       ["engine-crank","vehicle-engine-crank",[enginePosition[0],.10,enginePosition[2]],[.13*engineScale,.018*engineScale],.036*engineScale,"engine-accent","engineTorque"],
-      ["engine-bank-left","vehicle-engine-bank",[enginePosition[0],.10+.055*engineScale,-.065*engineScale],[.13*engineScale,.026*engineScale],.075*engineScale,"engine-metal","engineTorque"],
-      ["engine-bank-right","vehicle-engine-bank",[enginePosition[0],.10+.055*engineScale,.065*engineScale],[.13*engineScale,.026*engineScale],.075*engineScale,"engine-metal","engineTorque"],
-      ["engine-rocker-left","vehicle-engine-rocker",[enginePosition[0],.10+.107*engineScale,-.07*engineScale],[.105*engineScale,.018*engineScale],.025*engineScale,"engine-accent","engineTorque"],
-      ["engine-rocker-right","vehicle-engine-rocker",[enginePosition[0],.10+.107*engineScale,.07*engineScale],[.105*engineScale,.018*engineScale],.025*engineScale,"engine-accent","engineTorque"],
+      ...cylinderSpecs,...rotorSpecs,...ignitionSpecs,...auxiliaryReservoirSpecs,
+      ["intake-plenum","vehicle-intake-plenum",[enginePosition[0]-.015,.205,0],[.11*engineScale,.045*engineScale],.055*engineScale,"engine-metal","engineTorque"],
+      ["throttle-body","vehicle-throttle-body",[enginePosition[0]+.075,.205,-Number(chassis.half_width)*.13],[.025,.026],.055,"actuator-yellow","engineTorque"],
+      ["header-left","vehicle-exhaust-header",[enginePosition[0],.14,-Number(chassis.half_width)*.27],[.10*engineScale,.012],.025,"engine-accent","engineTorque"],
+      ["header-right","vehicle-exhaust-header",[enginePosition[0],.14,Number(chassis.half_width)*.27],[.10*engineScale,.012],.025,"engine-accent","engineTorque"],
+      ["energy-storage",activePreset?.energy_system?.storage_kind||"baffled-fuel-tank",[-Number(chassis.half_length)*.48,.18,0],
+        [.16,Math.min(.24,Number(chassis.half_width)*.65)],.14,activePreset?.kind==="combustion"?
+          "fuel-tank-candy-red":"battery-electric-blue",null]
+    ],
+    powertrainSpecs=[...architectureSpecs,
       ["clutch","vehicle-clutch",[enginePosition[0]+.15,.10,0],[.025,.052],.038,"drivetrain-black","clutchTorque"],
       ["transmission-shaft","vehicle-transmission",[enginePosition[0]+.27,.085,0],[.095,.012],.028,"drivetrain-black","transmissionOutputTorque"],
       ["transfer-case","vehicle-transfer-case",[enginePosition[0]+.39,.065,0],[.045,.055],.06,"drivetrain-black","drivelineTorque"],
       ["center-driveshaft","vehicle-driveshaft",[-.12,.06,0],[Math.max(.12,wheelbase-.25),.010],.024,"drivetrain-black","drivelineTorque"],
       ["front-differential","vehicle-differential",[wheelbase,.065,0],[.04,.07],.038,"drivetrain-black","frontDifferentialTorque"],
       ["rear-differential","vehicle-differential",[-wheelbase,.065,0],[.04,.07],.038,"drivetrain-black","rearDifferentialTorque"],
+      ["front-differential-brake","vehicle-differential-brake",[wheelbase+.105,.065,0],[.018,.082],.052,"suspension-yellow","frontDifferentialBrakeTorque"],
+      ["rear-differential-brake","vehicle-differential-brake",[-wheelbase-.105,.065,0],[.018,.082],.052,"suspension-yellow","rearDifferentialBrakeTorque"],
       ["engine-mount","vehicle-powertrain-mount",[enginePosition[0],.075,0],[.018,Number(wheels.track_half_width)*.58],.03,"drivetrain-black","engineAccelerationTorque"],
       ["transmission-mount","vehicle-powertrain-mount",[enginePosition[0]+.28,.055,0],[.014,Number(wheels.track_half_width)*.52],.026,"drivetrain-black","transmissionOutputTorque"],
       ["transfer-case-mount","vehicle-powertrain-mount",[enginePosition[0]+.39,.045,0],[.014,Number(wheels.track_half_width)*.45],.024,"drivetrain-black","drivelineTorque"]
     ];
-  vehicleRuntime.powertrainBoxes=powertrainSpecs.map(([name,kind,localCenter,halfExtent,height,palette,torqueChannel])=>({
-    identity:`${vehicle.identity}/powertrain:${name}`,kind,label:name,parent_identity:vehicle.identity,
-    center:[...box.center],center_y:state.position[1],half_extent:halfExtent,height,floor_height:height,
-    wall_thickness:.008,palette_role:palette,wall_palette_role:palette,geometry_mode:"solid",openings:[],
-    appearance:{face_color:model.appearance.colors[palette]},local_center:localCenter,torque_channel:torqueChannel,
-    placement:{custody:"placed",elevation:state.position[1],rotation:[0,0,0]},physics:{enabled:false,welded:true}}));
+  vehicleRuntime.powertrainBoxes=powertrainSpecs.map(([name,kind,localCenter,halfExtent,height,palette,torqueChannel,explicitMass])=>{
+    const cylinder=kind.includes("cylinder"),side=Math.sign(Number(localCenter[2])||1),
+      shape=kind.includes("fuel-tank")||kind.includes("canister")?"fuel-tank":kind.includes("battery")?"battery-pack":cylinder?"engine-cylinder":
+        kind.includes("differential-brake")?"differential-brake":kind.includes("ignition-coil")?"ignition-coil":
+        kind.includes("ignition-distributor")?"distributor":
+        kind.includes("throttle-body")?"throttle-body":
+        ["vehicle-engine-crank","vehicle-exhaust-header","vehicle-transmission","vehicle-driveshaft"].includes(kind)?"round-shaft":null,
+      axis=cylinder?(kind.includes("flat")?[0,0,side]:kind.includes("v-cylinder")?[0,.72,side*.70]:[0,1,0]):
+        kind==="vehicle-throttle-body"?[0,0,1]:[1,0,0];
+    const size=[Number(halfExtent[0])*2,Number(height),Number(halfExtent[1])*2],declaredMass=Number.isFinite(explicitMass)?Number(explicitMass):
+        kind.includes("fuel-tank")||kind.includes("battery")?Number(activePreset?.energy_system?.installed_storage_mass_kg||30):
+        kind.includes("differential-brake")?22:cylinder?Math.max(4,12*engineScale):
+        kind.includes("ignition")?1.3:kind.includes("differential")?28:kind.includes("transfer")?32:
+        kind.includes("transmission")?48:kind.includes("mount")?4:8,
+      inertia={roll:declaredMass*(size[1]*size[1]+size[2]*size[2])/12,
+        pitch:declaredMass*(size[0]*size[0]+size[2]*size[2])/12,
+        yaw:declaredMass*(size[0]*size[0]+size[1]*size[1])/12};
+    return {identity:`${vehicle.identity}/powertrain:${name}`,kind,label:name,parent_identity:vehicle.identity,
+      center:[...box.center],center_y:state.position[1],half_extent:halfExtent,height,floor_height:height,
+      wall_thickness:.008,palette_role:palette,wall_palette_role:palette,
+      geometry_mode:shape?"vehicle-powertrain-part":"solid",part_mesh:shape?{shape,axis}:null,openings:[],
+      appearance:{face_color:model.appearance.colors[palette]},local_center:localCenter,torque_channel:torqueChannel,
+      mass_properties:{mass_kg:declaredMass,center_of_mass_local:[...localCenter],principal_inertia_kg_m2:inertia,
+        integration_status:"declared-part-budget-existing-vehicle-lumped-mass-remains-authoritative"},
+      placement:{custody:"placed",elevation:state.position[1],rotation:[0,0,0]},physics:{enabled:false,welded:true}};
+  });
+  vehicleRuntime.bodyShellBoxes=buildVehicleBodyShell(vehicle,state);
   vehicleRuntime.box=box;vehicleRuntime.cabinBox=null;
   shaderViewer.geometry.push(...vehicleRuntime.frameBoxes,...vehicleRuntime.rollCageBoxes,
-    ...vehicleRuntime.mechanicalLinkBoxes,...vehicleRuntime.powertrainBoxes,...vehicleRuntime.wheelBoxes);
+    ...vehicleRuntime.mechanicalLinkBoxes,...vehicleRuntime.powertrainBoxes);
   updateVehiclePresentation(vehicle,state,0,0);updateVehicleBodyPresentation(vehicle,state);
   rebuildPortableSceneMesh();return box;
 }
@@ -5933,26 +6424,29 @@ function solveVehicleMechanicalGraph(vehicle,state){
   const graph=vehicle.physics.mechanical_graph,positions=new Map(graph.nodes.map(node=>[
     node.identity,node.reference_position.map(Number)])),fixed=new Set(graph.nodes.filter(node=>node.fixed_to==="chassis")
       .map(node=>node.identity)),chassis=vehicle.configuration.chassis,wheels=vehicle.configuration.wheels,
-    suspension=vehicle.configuration.suspension;
+    suspension=vehicle.configuration.suspension,damage=vehicleRuntime.damage;
   ["front_left","front_right","rear_left","rear_right"].forEach(corner=>{
     const prefix=`suspension.${corner}`,hubIdentity=`${prefix}.hub`,referenceHub=positions.get(hubIdentity),
-      compression=Number(state.compressions[corner]||0),targetHubY=-Number(chassis.clearance)-
-        Number(suspension.rest_length)+compression+Number(vehicle.configuration.tires.radius),delta=targetHubY-referenceHub[1];
+      compression=Number(state.compressions[corner]||0),plastic=Number(damage?.springPlasticSet?.[corner]||0),
+      targetHubY=-Number(chassis.clearance)-(Number(suspension.rest_length)-plastic)+compression+
+        Number(vehicle.configuration.tires.radius),delta=targetHubY-referenceHub[1];
     graph.nodes.filter(node=>node.generalized_coordinate===`compression_${corner}`).forEach(node=>{
       const point=positions.get(node.identity);point[1]+=delta;
     });
   });
-  const constraints=graph.edges.filter(edge=>edge.constraint==="rigid-distance"||edge.constraint==="rigid-offset");
+  const constraints=graph.edges.filter(edge=>!edge.runtime_failed&&
+    (edge.constraint==="rigid-distance"||edge.constraint==="rigid-offset"));
   for(let iteration=0;iteration<18;iteration+=1){
     constraints.forEach(edge=>{const a=positions.get(edge.a),b=positions.get(edge.b);if(!a||!b)return;
       const delta=b.map((value,index)=>value-a[index]),length=Math.max(1e-8,Math.hypot(...delta)),
-        error=(length-Number(edge.rest_length))/length,aFixed=fixed.has(edge.a),bFixed=fixed.has(edge.b),
+        error=(length-Number(edge.runtime_rest_length??edge.rest_length))/length,aFixed=fixed.has(edge.a),bFixed=fixed.has(edge.b),
         aScale=aFixed?0:bFixed?1:.5,bScale=bFixed?0:aFixed?1:.5;
       for(let axis=0;axis<3;axis+=1){a[axis]+=delta[axis]*error*aScale;b[axis]-=delta[axis]*error*bScale;}
     });
     ["front_left","front_right","rear_left","rear_right"].forEach(corner=>{
       const hub=positions.get(`suspension.${corner}.hub`),compression=Number(state.compressions[corner]||0),
-        target=-Number(chassis.clearance)-Number(suspension.rest_length)+compression+Number(vehicle.configuration.tires.radius);
+        plastic=Number(damage?.springPlasticSet?.[corner]||0),target=-Number(chassis.clearance)-
+          (Number(suspension.rest_length)-plastic)+compression+Number(vehicle.configuration.tires.radius);
       hub[1]+=(target-hub[1])*.38;
     });
   }
@@ -5960,16 +6454,18 @@ function solveVehicleMechanicalGraph(vehicle,state){
     const hub=positions.get(`suspension.${corner}.hub`),patch=positions.get(`suspension.${corner}.contact_patch`);
     patch[0]=hub[0];patch[1]=hub[1]-Number(vehicle.configuration.tires.radius);patch[2]=hub[2];
   });
-  const steeringInput=Number(state.presentationSteering||0),
-    steeringAngle=-steeringInput*Number(vehicle.configuration.controls.maximum_steering_angle_degrees)*Math.PI/180;
-  ["front_left","front_right"].forEach(corner=>{const hub=positions.get(`suspension.${corner}.hub`),
-      arm=positions.get(`suspension.${corner}.steering_arm`),referenceHub=graph.nodes.find(
-        node=>node.identity===`suspension.${corner}.hub`).reference_position,
-      referenceArm=graph.nodes.find(node=>node.identity===`suspension.${corner}.steering_arm`).reference_position,
-      vector=referenceArm.map((value,index)=>value-referenceHub[index]),angle=steeringAngle,
-      cosine=Math.cos(angle),sine=Math.sin(angle);
-    arm[0]=hub[0]+vector[0]*cosine-vector[2]*sine;arm[1]=hub[1]+vector[1];
-    arm[2]=hub[2]+vector[0]*sine+vector[2]*cosine;});
+  const steeringInput=Number(state.presentationSteering||0),frontAngle=Number(state.presentationFrontSteering||0),
+    rearAngle=Number(state.presentationRearSteering||0);
+  [["front_left",frontAngle],["front_right",frontAngle],["rear_left",rearAngle],["rear_right",rearAngle]].forEach(([corner,steeringAngle])=>{
+    const knuckle=positions.get(`suspension.${corner}.knuckle`),cosine=Math.cos(steeringAngle),sine=Math.sin(steeringAngle),
+      rotateAboutKnuckle=identity=>{const point=positions.get(`suspension.${corner}.${identity}`);if(!point||!knuckle)return;
+        const dx=point[0]-knuckle[0],dz=point[2]-knuckle[2];point[0]=knuckle[0]+dx*cosine-dz*sine;
+        point[2]=knuckle[2]+dx*sine+dz*cosine;};
+    // The upright/kingpin is the steering pivot. The hub spindle, wheel-side
+    // CV yoke and yellow steering arm articulate about it; the inner halfshaft
+    // remains attached to the differential and visibly breaks angle at the yoke.
+    ["hub","wheel_rim","tire_carcass","brake_rotor","contact_patch","steering_arm"].forEach(rotateAboutKnuckle);
+  });
   const steeringCenter=positions.get("steering.wheel.center"),wheelAngle=-steeringInput*1.5,
     wheelCos=Math.cos(wheelAngle),wheelSin=Math.sin(wheelAngle);
   if(steeringCenter)for(let index=0;index<8;index+=1){
@@ -5979,18 +6475,36 @@ function solveVehicleMechanicalGraph(vehicle,state){
     point[1]=steeringCenter[1]+dy*wheelCos-dz*wheelSin;
     point[2]=steeringCenter[2]+dy*wheelSin+dz*wheelCos;
   }
-  const rackShift=steeringInput*.045;
-  ["steering.rack.center","suspension.front_left.steering_rack",
-   "suspension.front_right.steering_rack"].forEach(identity=>{
-    const point=positions.get(identity),reference=graph.nodes.find(node=>node.identity===identity)?.reference_position;
-    if(point&&reference)point[2]=reference[2]+rackShift;
-  });
+  [[frontAngle,["steering.rack.center","suspension.front_left.steering_rack","suspension.front_right.steering_rack"]],
+   [rearAngle,["steering.rear_rack.center","suspension.rear_left.steering_rack","suspension.rear_right.steering_rack"]]]
+    .forEach(([angle,identities])=>identities.forEach(identity=>{
+      const point=positions.get(identity),reference=graph.nodes.find(node=>node.identity===identity)?.reference_position;
+      if(point&&reference)point[2]=reference[2]-Number(angle)*.045;
+    }));
+  const throttle=Math.max(0,Math.min(1,Math.abs(Number(state.presentationThrottle||0)))),lever=positions.get(
+      "powertrain.intake.throttle_lever"),leverReference=graph.nodes.find(node=>
+        node.identity==="powertrain.intake.throttle_lever")?.reference_position;
+  if(lever&&leverReference){const table=graph.edges.find(edge=>edge.identity==="actuator.throttle.lever")?.travel_table||[[0,0],[1,.038]];
+    let lower=table[0],upper=table.at(-1);for(let index=1;index<table.length;index++)if(throttle<=Number(table[index][0])){
+      lower=table[index-1];upper=table[index];break;}const span=Math.max(1e-8,Number(upper[0])-Number(lower[0])),mix=Math.max(0,
+      Math.min(1,(throttle-Number(lower[0]))/span)),travel=Number(lower[1])+(Number(upper[1])-Number(lower[1]))*mix;
+    lever[0]=Number(leverReference[0])+travel;lever[1]=Number(leverReference[1])-travel*.18;}
   vehicleRuntime.mechanicalNodePositions=positions;return positions;
 }
 
 function updateVehiclePresentation(vehicle,state,dt,steering){
   const config=vehicle.configuration,chassis=config.chassis,wheels=config.wheels;
-  state.presentationSteering=Number(steering||0)*Number(config.controls.maximum_steering_angle_degrees)*Math.PI/180;
+  state.presentationSteering=Number(steering||0);
+  state.presentationThrottle=Number(vehicleRuntime.state?.lastThrottle??state.presentationThrottle??0);
+  const steeringPolicy=vehicleRuntime.steeringSystem||config.steering_control||{},share=Math.max(0,Math.min(1,
+      Number(steeringPolicy.front_share??.5))),maximum=Number(config.controls.maximum_steering_angle_degrees)*Math.PI/180,
+    frontGain=steeringPolicy.front_axle_enabled===false?0:Math.min(1,share*2),
+    rearGain=steeringPolicy.rear_axle_enabled===false?0:Math.min(1,(1-share)*2),phase=Number(steeringPolicy.rear_phase??-1),
+    blend=Math.min(1,Math.max(0,dt)*Math.max(1,Number(steeringPolicy.knuckle_response_frequency_hz||5.5))*4);
+  state.presentationFrontSteering=Number(state.presentationFrontSteering||0)+
+    (-Number(steering||0)*maximum*frontGain-Number(state.presentationFrontSteering||0))*blend;
+  state.presentationRearSteering=Number(state.presentationRearSteering||0)+
+    (-Number(steering||0)*maximum*rearGain*phase-Number(state.presentationRearSteering||0))*blend;
   const names=["front_left","front_right","rear_left","rear_right"],
     positions=solveVehicleMechanicalGraph(vehicle,state);
   names.forEach((name,index)=>{
@@ -6000,7 +6514,7 @@ function updateVehiclePresentation(vehicle,state,dt,steering){
     if(!wheel)return;
     wheel.center=[state.position[0],state.position[2]];wheel.center_y=state.position[1];
     wheel.wheel_state={...wheel.wheel_state,spin:vehicleRuntime.wheelAngles[index],
-      steer:index<2?-Number(steering||0)*Number(config.controls.maximum_steering_angle_degrees)*Math.PI/180:0,
+      steer:index<2?state.presentationFrontSteering:state.presentationRearSteering,
       chassisPosition:[...state.position],chassisRotation:[state.roll,state.yaw,state.pitch],
       localCenter:[...positions.get(`suspension.${name}.hub`)]};
   });
@@ -6030,11 +6544,14 @@ function updateVehicleBodyPresentation(vehicle,state){
   const positions=vehicleRuntime.mechanicalNodePositions.size?vehicleRuntime.mechanicalNodePositions:
     solveVehicleMechanicalGraph(vehicle,state);
   vehicleRuntime.mechanicalLinkBoxes.forEach(member=>{
-    const edge=member.mechanical_edge;member.link_state={...member.link_state,
-      localA:[...positions.get(edge.a)],localB:[...positions.get(edge.b)],radius:Number(edge.radius||.012),
+    const edge=member.mechanical_edge,a=[...positions.get(edge.a)],authoredB=[...positions.get(edge.b)],
+      b=edge.runtime_failed?a.map((value,index)=>value+(authoredB[index]-value)*.43):authoredB;
+    member.appearance.face_color=edge.runtime_failed?"#ff4f62":model.appearance.colors[edge.palette_role];
+    member.link_state={...member.link_state,
+      localA:a,localB:b,radius:Number(edge.radius||.012),
       chassisPosition:[...state.position],chassisRotation:[state.roll,state.yaw,state.pitch]};
   });
-  [...vehicleRuntime.rollCageBoxes,...vehicleRuntime.powertrainBoxes].forEach(member=>{
+  [...vehicleRuntime.rollCageBoxes,...vehicleRuntime.powertrainBoxes,...vehicleRuntime.bodyShellBoxes].forEach(member=>{
     const offset=rotateVehiclePresentationVector(member.local_center,state,0);
     member.center=[state.position[0]+offset[0],state.position[2]+offset[2]];
     member.center_y=state.position[1]+offset[1];member.placement.elevation=member.center_y-member.height*.5;
@@ -6098,16 +6615,20 @@ function vehicleTerrainRestPose(vehicle,position,yaw,compressions){
   return {roll,pitch,yaw,bodyY:Math.max(...bodyHeights)+.008};
 }
 
-function vehicleSpawnState(vehicle,placeAtActor){
-  if(!placeAtActor&&vehicleRuntime.parkedState)return cloneVehicleState(vehicleRuntime.parkedState);
-  const position=viewportControls.position||vehicle.pose.position,config=vehicle.configuration;
+function vehicleSpawnState(vehicle,placeAtActor,{reuseParked=true}={}){
+  if(!placeAtActor&&reuseParked&&vehicleRuntime.parkedState)return cloneVehicleState(vehicleRuntime.parkedState);
+  const position=placeAtActor?(viewportControls.position||vehicle.pose.position):vehicle.pose.position,
+    config=vehicle.configuration;
   const audit=vehicle.physics?.mechanical_graph?.load_audit,corners=audit?.corners||{},
     names=["front_left","front_right","rear_left","rear_right"],compressions=Object.fromEntries(names.map(name=>[
       name,Math.min(Number(config.suspension.travel),Number(corners[name]?.design_spring_compression_m||0))])),
-    yaw=Number(viewportControls.yaw??vehicle.pose.yaw??0),rest=vehicleTerrainRestPose(vehicle,position,yaw,compressions);
+    yaw=Number(placeAtActor?(viewportControls.yaw??vehicle.pose.yaw??0):(vehicle.pose.yaw??0)),
+    rest=vehicleTerrainRestPose(vehicle,position,yaw,compressions),
+    inheritedVelocity=placeAtActor?[viewportControls.horizontalVelocity[0]||0,0,
+      viewportControls.horizontalVelocity[1]||0]:[0,0,0];
   return {identity:vehicle.identity,
     position:[position[0],rest.bodyY,position[2]],
-    velocity:[viewportControls.horizontalVelocity[0]||0,0,viewportControls.horizontalVelocity[1]||0],
+    velocity:inheritedVelocity,
     roll:rest.roll,pitch:rest.pitch,yaw:rest.yaw,
     rollVelocity:0,pitchVelocity:0,yawVelocity:0,
     wheelOmegas:{front_left:0,front_right:0,rear_left:0,rear_right:0},
@@ -6123,14 +6644,27 @@ function setActiveVehicle(identity,{placeAtActor=false,inventoryItem=null}={}) {
   vehicleRuntime.transmission={mode:vehicle.configuration.transmission.mode_default,
     gear:Number(vehicle.configuration.transmission.starting_gear),
     displayGear:Number(vehicle.configuration.transmission.starting_gear),torqueReserve:0,reason:"initial-second",
-    lowRange:false,diffLock:false};
+    lowRange:false,frontDiffLock:false,rearDiffLock:false,centerDiffLock:false,
+    frontDiffMode:"open",rearDiffMode:"open",centerDiffMode:"open",
+    frontDriveShare:Number(vehicle.configuration.drivetrain.front_drive_fraction||.5),smoothLaunch:false,
+    tractionControlEnabled:true,absEnabled:true,tractionControlAuthority:1,absAuthority:1};
+  vehicleRuntime.brakeLocks={front_left:false,front_right:false,rear_left:false,rear_right:false};
+  vehicleRuntime.powerUnitPreset=vehicle.power_unit_preset||vehicle.power_unit_presets?.[0]?.identity||null;
+  vehicleRuntime.transmissionPreset=vehicle.transmission_preset||vehicle.transmission_presets?.[0]?.identity||null;
+  vehicleRuntime.chassisProfile=vehicle.chassis_profile||vehicle.chassis_profiles?.[0]?.identity||null;
+  vehicleRuntime.wheelPart=vehicle.wheel_part||"balloon-black-current";
+  vehicleRuntime.bodyShell=vehicle.body_shell||"clear-polycarbonate-rc";
+  vehicleRuntime.chassisLeveling={...(vehicle.chassis_leveling||{}),cornerOffsets:{front_left:0,front_right:0,rear_left:0,rear_right:0}};
+  vehicleRuntime.steeringSystem={...(vehicle.steering_control||vehicle.configuration.steering_control||{})};
+  vehicleRuntime.shockParameters={...vehicle.configuration_defaults};
+  vehicleRuntime.damage=null;
   vehicleRuntime.wheelAngles=[0,0,0,0];vehicleRuntime.camera=null;vehicleRuntime.presentationAccumulator=0;
-  vehicleRuntime.state=vehicleSpawnState(vehicle,placeAtActor||!vehicleRuntime.parkedState);
+  vehicleRuntime.state=vehicleSpawnState(vehicle,placeAtActor);
   viewportControls.yaw=vehicleRuntime.state.yaw;viewportControls.pitch=0;
   vehicleRuntime.cameraChassisYaw=vehicleRuntime.state.yaw;
   ensureVehiclePresentation(vehicle,vehicleRuntime.state);
   ensureVehicleWorldMarker(vehicle)?.classList.add("active");
-  if(vehicleRuntime.contactMonitor)vehicleRuntime.contactMonitor.hidden=false;
+  if(vehicleRuntime.contactMonitor)vehicleRuntime.contactMonitor.hidden=shaderViewer.shaderOnly;
   const actorIdentity=viewportControls.policy?.actor;
   if(stateLoopRuntime.ready&&actorIdentity){stateLoopRuntime.worker.postMessage({type:"remove",identity:actorIdentity});
     releasePhysicsSnapshotSlot(actorIdentity);stateLoopRuntime.actorRegistered=false;}
@@ -6177,39 +6711,220 @@ function recoverActiveVehicle(){
 }
 
 
-function respawnActiveVehicleAtOrigin(){
+function respawnActiveVehicleAtAuthoredPose(){
   const vehicle=vehicleRuntime.active,state=vehicleRuntime.state;if(!vehicle||!state)return false;
-  const rest=vehicleTerrainRestPose(vehicle,[0,0,0],0,state.compressions||{}),position=[0,rest.bodyY,0];
-  state.position=[...position];state.velocity=[0,0,0];state.roll=rest.roll;state.pitch=rest.pitch;state.yaw=0;
-  state.rollVelocity=0;state.pitchVelocity=0;state.yawVelocity=0;
-  Object.keys(state.wheelOmegas).forEach(name=>state.wheelOmegas[name]=0);
-  Object.keys(state.previousSlips).forEach(name=>state.previousSlips[name]=0);
-  vehicleRuntime.camera=null;vehicleRuntime.cameraChassisYaw=state.yaw;viewportControls.yaw=0;
-  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-respawn",identity:vehicle.identity,
-    position:[...position],yaw:state.yaw,roll:state.roll,pitch:state.pitch});
+  const spawn=vehicleSpawnState(vehicle,false,{reuseParked:false});
+  state.position=[...spawn.position];state.velocity=[...spawn.velocity];state.roll=spawn.roll;
+  state.pitch=spawn.pitch;state.yaw=spawn.yaw;state.rollVelocity=0;state.pitchVelocity=0;state.yawVelocity=0;
+  state.wheelOmegas={...spawn.wheelOmegas};state.previousSlips={...spawn.previousSlips};
+  state.compressions={...spawn.compressions};
+  vehicleRuntime.damage=null;vehicle.physics.mechanical_graph.edges.forEach(edge=>{
+    delete edge.runtime_rest_length;delete edge.runtime_failed;});
+  Object.keys(vehicleRuntime.brakeLocks).forEach(name=>vehicleRuntime.brakeLocks[name]=false);
+  vehicleRuntime.transmission.frontDifferentialBrake=false;
+  vehicleRuntime.transmission.rearDifferentialBrake=false;
+  vehicleRuntime.powertrain={engineTorque:0,clutchTorque:0,transmissionOutputTorque:0,drivelineTorque:0,
+    frontDifferentialTorque:0,rearDifferentialTorque:0,engineAccelerationTorque:0,
+    engineAngularAcceleration:0,reactionTorque:[0,0,0],mountTorque:[0,0,0]};
+  vehicleRuntime.camera=null;vehicleRuntime.cameraChassisYaw=state.yaw;viewportControls.yaw=spawn.yaw;
+  if(stateLoopRuntime.ready){stateLoopRuntime.worker.postMessage({type:"remove",identity:vehicle.identity});
+    releasePhysicsSnapshotSlot(vehicle.identity);registerActiveVehiclePhysicsBody();}
   updateVehiclePresentation(vehicle,state,0,0);updateVehicleBodyPresentation(vehicle,state);
-  rebuildPortableSceneMesh({dynamicOnly:true});setPlacementStatus("Springtail respawned at world origin");return true;
+  rebuildPortableSceneMesh({dynamicOnly:true});setPlacementStatus(
+    "Springtail respawned on the solid flat apron · drivetrain and brake holds reset");
+  updateVehicleTransmissionControls();return true;
 }
 
-function controlVehicleTransmission({mode=null,gearDelta=null,lowRange=null,diffLock=null}={}){
+function respawnViewportActor(){
+  if(vehicleRuntime.active)return respawnActiveVehicleAtAuthoredPose();
+  const actor=entityState.get(viewportControls.policy?.actor),spawn=actor?.entity?.pose?.position||actor?.record?.pose?.position;
+  if(!Array.isArray(spawn))return false;
+  const identity=viewportControls.policy.actor;
+  if(stateLoopRuntime.ready&&identity){stateLoopRuntime.worker.postMessage({type:"remove",identity});
+    releasePhysicsSnapshotSlot(identity);stateLoopRuntime.actorRegistered=false;}
+  viewportControls.position=[...spawn];viewportControls.horizontalVelocity=[0,0];physicsRuntime.verticalVelocity=0;
+  registerPlayerPhysicsBody();setPlacementStatus("Player respawned at the authored start");return true;
+}
+
+function controlVehicleTransmission({mode=null,gearDelta=null,lowRange=null,frontDiffLock=null,
+    rearDiffLock=null,centerDiffLock=null,frontDriveShare=null,smoothLaunch=null,
+    frontDiffMode=null,rearDiffMode=null,centerDiffMode=null,
+    frontDifferentialBrake=null,rearDifferentialBrake=null,
+    tractionControlEnabled=null,absEnabled=null,tractionControlAuthority=null,absAuthority=null,
+    gearset=null,transmissionPreset=null,
+    brakeLock=null,releaseAllBrakes=false}={}){
   const vehicle=vehicleRuntime.active;if(!vehicle)return false;
+  if(gearset&&Array.isArray(gearset.forward_ratios)){
+    vehicle.configuration.transmission={...vehicle.configuration.transmission,...gearset};
+    vehicleRuntime.transmissionPreset=transmissionPreset||"custom";
+  }
   const transmission=vehicle.configuration.transmission,state=vehicleRuntime.transmission;
+  if(gearset){state.gear=Math.max(1,Math.min(transmission.forward_ratios.length,Number(transmission.starting_gear||1)));
+    state.displayGear=state.gear;state.engagedRatio=Number(transmission.forward_ratios[state.gear-1]);}
   if(mode==="automatic")state.mode="automatic";
   if(Number.isFinite(gearDelta)){state.mode="manual";state.gear=Math.max(1,Math.min(
     transmission.forward_ratios.length,Math.round(state.gear+Number(gearDelta))));state.displayGear=state.gear;}
   if(typeof lowRange==="boolean")state.lowRange=lowRange;
-  if(typeof diffLock==="boolean")state.diffLock=diffLock;
+  if(typeof frontDiffLock==="boolean")state.frontDiffLock=frontDiffLock;
+  if(typeof rearDiffLock==="boolean")state.rearDiffLock=rearDiffLock;
+  if(typeof centerDiffLock==="boolean")state.centerDiffLock=centerDiffLock;
+  for(const [key,value] of Object.entries({frontDiffMode,rearDiffMode,centerDiffMode}))if(
+      ["open","limited-slip","locked"].includes(value)){state[key]=value;
+    state[key.replace("Mode","Lock")]=value==="locked";}
+  if(Number.isFinite(frontDriveShare))state.frontDriveShare=Math.max(.05,Math.min(.95,Number(frontDriveShare)));
+  if(typeof smoothLaunch==="boolean")state.smoothLaunch=smoothLaunch;
+  if(typeof frontDifferentialBrake==="boolean")state.frontDifferentialBrake=frontDifferentialBrake;
+  if(typeof rearDifferentialBrake==="boolean")state.rearDifferentialBrake=rearDifferentialBrake;
+  if(typeof tractionControlEnabled==="boolean")state.tractionControlEnabled=tractionControlEnabled;
+  if(typeof absEnabled==="boolean")state.absEnabled=absEnabled;
+  if(Number.isFinite(tractionControlAuthority))state.tractionControlAuthority=Math.max(0,Math.min(1,Number(tractionControlAuthority)));
+  if(Number.isFinite(absAuthority))state.absAuthority=Math.max(0,Math.min(1,Number(absAuthority)));
+  if(brakeLock&&brakeLock.name in vehicleRuntime.brakeLocks)
+    vehicleRuntime.brakeLocks[brakeLock.name]=Boolean(brakeLock.locked);
+  if(releaseAllBrakes)Object.keys(vehicleRuntime.brakeLocks).forEach(name=>vehicleRuntime.brakeLocks[name]=false);
   if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-transmission",identity:vehicle.identity,
-    mode,gearDelta,lowRange,diffLock});
+    mode,gearDelta,lowRange,frontDiffLock,rearDiffLock,centerDiffLock,frontDiffMode,rearDiffMode,centerDiffMode,
+    frontDriveShare,smoothLaunch,frontDifferentialBrake,rearDifferentialBrake,
+    tractionControlEnabled,absEnabled,tractionControlAuthority,absAuthority,
+    gearset,transmissionPreset,brakeLock,releaseAllBrakes});
   updateVehicleTransmissionControls();
   setPlacementStatus(`${state.mode==="automatic"?"Springtail automatic":`Springtail manual · gear ${state.gear}`} · ${
-    state.lowRange?"ultra low":"high range"} · ${state.diffLock?"differentials locked":"differentials open"}`);return true;
+    state.lowRange?"ultra low":"high range"} · F${Math.round(state.frontDriveShare*100)}/R${Math.round((1-state.frontDriveShare)*100)}`);return true;
+}
+
+function selectVehicleTransmissionPreset(presetIdentity){
+  const vehicle=vehicleRuntime.active,preset=vehicle?.transmission_presets?.find(item=>item.identity===presetIdentity);
+  if(!preset)return false;
+  controlVehicleTransmission({gearset:preset.configuration,transmissionPreset:preset.identity});
+  setPlacementStatus(`${preset.label} selected · ratios remain live compiled inputs`);return true;
+}
+
+function selectVehiclePowerUnit(presetIdentity){
+  const vehicle=vehicleRuntime.active,preset=vehicle?.power_unit_presets?.find(item=>item.identity===presetIdentity);
+  if(!vehicle||!preset)return false;
+  vehicle.power_unit_preset=preset.identity;vehicleRuntime.powerUnitPreset=preset.identity;
+  Object.assign(vehicle.configuration_defaults,preset.parameters);
+  Object.assign(vehicle.configuration.powertrain,preset.configuration);
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-power-unit",identity:vehicle.identity,
+    preset:{identity:preset.identity,kind:preset.kind,parameters:preset.parameters,configuration:preset.configuration}});
+  vehicleRuntime.state.defaults={...vehicle.configuration_defaults};
+  // The selected architecture owns its cylinder/bank or stator layout and
+  // energy-storage presentation. Rebuild only this vehicle's presentation;
+  // physics state and the resident compiled buffers remain in place.
+  shaderViewer.geometry=shaderViewer.geometry.filter(item=>item.identity!==vehicle.identity&&item.parent_identity!==vehicle.identity);
+  vehicleRuntime.box=null;vehicleRuntime.cabinBox=null;vehicleRuntime.frameBoxes=[];vehicleRuntime.rollCageBoxes=[];
+  vehicleRuntime.mechanicalLinkBoxes=[];vehicleRuntime.suspensionLinkBoxes=[];vehicleRuntime.powertrainBoxes=[];
+  vehicleRuntime.bodyShellBoxes=[];vehicleRuntime.wheelBoxes=[];ensureVehiclePresentation(vehicle,vehicleRuntime.state);
+  updateVehicleTransmissionControls();setPlacementStatus(`${preset.label} selected · baked curve ${preset.curve_reference}`);
+  return true;
+}
+
+function applyChassisProfileToVehicle(vehicle,profile){
+  const reference=vehicle.chassis_profile_reference||{},baseMass=Number(reference.vehicle_mass_kg||vehicle.configuration.mass),
+    baseMemberMass=Number(reference.member_mass_kg||0),newMass=Math.max(1,baseMass-baseMemberMass+Number(profile.member_mass_kg||0)),
+    massScale=newMass/Math.max(1,baseMass),graph=vehicle.physics?.mechanical_graph;
+  for(const edge of graph?.edges||[]){if(!edge.chassis_profile_member)continue;
+    edge.radius=Number(profile.outer_diameter_m)/2;
+    if(edge.damage)Object.assign(edge.damage,{material:profile.material,section_area_m2:profile.section_area_m2,
+      youngs_modulus_pa:profile.youngs_modulus_pa,yield_strength_pa:profile.yield_strength_pa,
+      shear_strength_pa:profile.shear_strength_pa,axial_yield_force_n:profile.axial_yield_force_n,
+      shear_force_limit_n:profile.shear_force_limit_n,axial_stiffness_n_per_m:Number(profile.youngs_modulus_pa)*
+        Number(profile.section_area_m2)/Math.max(1e-9,Number(edge.rest_length))});}
+  vehicle.configuration.mass=newMass;
+  vehicle.configuration_defaults.inverse_mass=1/newMass;
+  for(const axis of ["roll","pitch","yaw"]){const key=`inverse_inertia_${axis}`,
+      baseKey=`_chassis_reference_${key}`;
+    if(!Number.isFinite(vehicle[baseKey]))vehicle[baseKey]=Number(vehicle.configuration_defaults[key]);
+    vehicle.configuration_defaults[key]=Number(vehicle[baseKey])/massScale;}
+  return {newMass,massScale};
+}
+
+function selectVehicleChassisProfile(profileIdentity){
+  const vehicle=vehicleRuntime.active,profile=vehicle?.chassis_profiles?.find(item=>item.identity===profileIdentity);
+  if(!vehicle||!profile)return false;
+  vehicle.chassis_profile=profile.identity;vehicleRuntime.chassisProfile=profile.identity;
+  const physical=applyChassisProfileToVehicle(vehicle,profile);vehicleRuntime.state.defaults={...vehicle.configuration_defaults};
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-chassis-profile",identity:vehicle.identity,
+    profile:{...profile,vehicle_mass_kg:physical.newMass}});
+  updateVehicleTransmissionControls();setPlacementStatus(`${profile.label} · ${physical.newMass.toFixed(1)} kg vehicle · physical frame limits active`);
+  return true;
+}
+
+function selectVehicleWheelPart(partIdentity){
+  const vehicle=vehicleRuntime.active,part=vehicle?.wheel_parts?.find(item=>item.identity===partIdentity);
+  if(!vehicle||!part)return false;
+  vehicle.wheel_part=part.identity;vehicleRuntime.wheelPart=part.identity;
+  const tires=vehicle.configuration.tires,wheels=vehicle.configuration.wheels;
+  vehicleRuntime.wheelBoxes.forEach(wheel=>{const radius=Number(tires.radius)*Number(part.radius_scale||1),
+      width=Number(tires.width)*Number(part.width_scale||1);
+    wheel.height=radius*2;wheel.half_extent=[radius,width*.5];wheel.appearance.face_color=part.tire_color;
+    wheel.appearance.tread_color=part.tread_color;wheel.wheel_state={...wheel.wheel_state,radius,
+      rimRadius:Number(wheels.rim_radius)*Number(part.rim_scale||part.radius_scale||1),width,
+      coldPressureKpa:Number(part.cold_pressure_kpa||0),compound:part.compound,
+      carcassProfile:part.carcass_profile,dryGripScale:Number(part.dry_grip_scale||1)};});
+  rebuildPortableSceneMesh();updateVehicleTransmissionControls();setPlacementStatus(`${part.label} selected`);return true;
+}
+
+function selectVehicleBodyShell(shellIdentity){
+  const vehicle=vehicleRuntime.active,shell=vehicle?.body_shells?.find(item=>item.identity===shellIdentity);
+  if(!vehicle||!shell)return false;vehicle.body_shell=shell.identity;vehicleRuntime.bodyShell=shell.identity;
+  vehicleRuntime.bodyShellBoxes=buildVehicleBodyShell(vehicle,vehicleRuntime.state);updateVehicleBodyPresentation(vehicle,vehicleRuntime.state);
+  rebuildPortableSceneMesh();updateVehicleTransmissionControls();setPlacementStatus(`${shell.label} · presentation only · zero physics mass/contact`);
+  return true;
+}
+
+function controlVehicleChassisLeveling(update){
+  const vehicle=vehicleRuntime.active;if(!vehicle)return false;
+  const leveling=vehicleRuntime.chassisLeveling||={...(vehicle.chassis_leveling||{})};
+  if(typeof update.enabled==="boolean")leveling.enabled=update.enabled;
+  for(const key of ["target_ride_height_offset_m","target_roll_rad","target_pitch_rad"])
+    if(Number.isFinite(update[key]))leveling[key]=Number(update[key]);
+  vehicle.chassis_leveling={...leveling};
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-chassis-leveling",identity:vehicle.identity,
+    leveling:{...leveling}});
+  updateVehicleTransmissionControls();setPlacementStatus(`chassis leveling ${leveling.enabled?"armed":"off"} · ride ${
+    Number(leveling.target_ride_height_offset_m||0).toFixed(2)} m · roll/pitch targets ${
+    (Number(leveling.target_roll_rad||0)*180/Math.PI).toFixed(1)}°/${
+    (Number(leveling.target_pitch_rad||0)*180/Math.PI).toFixed(1)}°`);return true;
+}
+
+function controlVehicleSteeringSystem(update){
+  const vehicle=vehicleRuntime.active;if(!vehicle)return false;
+  const steeringSystem=vehicleRuntime.steeringSystem||={...(vehicle.steering_control||vehicle.configuration.steering_control||{})};
+  if(typeof update.front_axle_enabled==="boolean")steeringSystem.front_axle_enabled=update.front_axle_enabled;
+  if(typeof update.rear_axle_enabled==="boolean")steeringSystem.rear_axle_enabled=update.rear_axle_enabled;
+  for(const key of ["front_share","rear_phase"])if(Number.isFinite(update[key]))steeringSystem[key]=Number(update[key]);
+  vehicle.steering_control={...steeringSystem};vehicle.configuration.steering_control={...steeringSystem};
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-steering-system",identity:vehicle.identity,
+    steering:{...steeringSystem}});
+  updateVehicleTransmissionControls();setPlacementStatus(`steering · ${steeringSystem.front_axle_enabled?"front":"front free"} / ${
+    steeringSystem.rear_axle_enabled?"rear":"rear free"} · ${Math.round(Number(steeringSystem.front_share||0)*100)}% front authority · ${
+    Number(steeringSystem.rear_phase||-1)<0?"counter-phase":"same-phase"}`);return true;
+}
+
+function controlVehicleShockParameters(parameters){
+  const vehicle=vehicleRuntime.active;if(!vehicle)return false;
+  const clean={};for(const [name,value] of Object.entries(parameters||{}))if(Number.isFinite(value))clean[name]=Number(value);
+  if(!Object.keys(clean).length)return false;Object.assign(vehicle.configuration_defaults,clean);
+  vehicleRuntime.shockParameters={...vehicle.configuration_defaults};
+  const suspension=vehicle.configuration.suspension,mapping={suspension_rest_length:"rest_length",suspension_travel:"travel",
+    spring_stiffness:"stiffness",pneumatic_compression_damping:"pneumatic_compression_damping",
+    pneumatic_rebound_damping:"pneumatic_rebound_damping",pneumatic_efficiency:"pneumatic_efficiency",
+    active_damping_minimum_scale:"active_damping_minimum_scale",active_damping_maximum_scale:"active_damping_maximum_scale",
+    active_damping_body_velocity_gain_s_per_m:"active_damping_body_velocity_gain_s_per_m",
+    active_damping_rebound_release_gain_s_per_m:"active_damping_rebound_release_gain_s_per_m"};
+  for(const [parameter,key] of Object.entries(mapping))if(Number.isFinite(clean[parameter]))suspension[key]=clean[parameter];
+  vehicleRuntime.state.defaults={...vehicle.configuration_defaults};updateVehicleTransmissionControls();
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-parameters",identity:vehicle.identity,parameters:clean});
+  setPlacementStatus(`parametric shock control · ${Object.entries(clean).map(([name,value])=>`${name}=${Number(value).toPrecision(4)}`).join(" · ")}`);
+  return true;
 }
 
 function updateActiveVehicle(dt,throttle,steering,brake) {
   const vehicle=vehicleRuntime.active,state=vehicleRuntime.state;
   if(!vehicle||!state)return false;
   try{
+  state.lastThrottle=Number(throttle||0);
   if(stateLoopRuntime.ready){
     registerActiveVehiclePhysicsBody();
     stateLoopRuntime.worker.postMessage({type:"vehicle-control",identity:vehicle.identity,
@@ -6229,7 +6944,7 @@ function updateActiveVehicle(dt,throttle,steering,brake) {
     viewportControls.horizontalVelocity=[state.velocity[0],state.velocity[2]];
     const actor=entityState.get(viewportControls.policy?.actor);
     if(actor){actor.worldPosition=[...viewportControls.position];actor.velocity=[...state.velocity];}
-    uploadVehiclePresentationMesh(dt);return true;
+    uploadVehiclePresentationMesh(dt);updateEngineSoundTelemetry(throttle);return true;
   }
   // Initialization owns the detailed pipeline error.  Do not overwrite it on
   // every presentation frame with a generic not-ready symptom.
@@ -6266,8 +6981,15 @@ function registerActiveVehiclePhysicsBody() {
     previousSlips:{...state.previousSlips},
     compressions:{...state.compressions},controls:{throttle:0,steering:0,brake:0},
     transmission:{...vehicleRuntime.transmission},
-    config:{...vehicle.configuration,mechanical_graph:vehicle.physics.mechanical_graph},
+    brakeLocks:{...vehicleRuntime.brakeLocks},
+    config:{...vehicle.configuration,mechanical_graph:vehicle.physics.mechanical_graph,
+      chassis_leveling:{...vehicleRuntime.chassisLeveling},steering_control:{...vehicleRuntime.steeringSystem}},
+    steeringSystem:{...vehicleRuntime.steeringSystem},
     defaults:vehicle.configuration_defaults,overrides:{}}});
+  if(model.vehicle_slot?.initial_state?.placement==="authored-world-pose"){
+    stateLoopRuntime.worker.postMessage({type:"vehicle-respawn",identity:vehicle.identity,
+      position:[...state.position],yaw:state.yaw,roll:state.roll,pitch:state.pitch});
+  }
 }
 
 function setPhysicsParameter(name, rawValue) {
@@ -6645,12 +7367,14 @@ function requestViewportJump() {
   const grounded = (physicsRuntime.grounded || height <= eyeHeight + 0.035) && verticalVelocity <= 0.15;
   if (!identity || !grounded) return false;
   cancelEntityNavigation(identity);
+  physicsRuntime.grounded=false;
+  physicsRuntime.supportSuppressedUntil=performance.now()+180;
   if (stateLoopRuntime.ready && body) {
-    body.velocity[1] = jumpSpeed;
-    stateLoopRuntime.worker.postMessage({type: "impulse", identity,
-      velocity: [body.velocity[0], jumpSpeed, body.velocity[2]]});
+    body.velocity[1] += jumpSpeed;
+    stateLoopRuntime.worker.postMessage({type: "player-jump", identity,
+      deltaVelocity: jumpSpeed});
   } else {
-    physicsRuntime.verticalVelocity = jumpSpeed;
+    physicsRuntime.verticalVelocity += jumpSpeed;
   }
   const actor = entityState.get(identity);
   if (actor) actor.velocity[1] = jumpSpeed;
@@ -6697,6 +7421,8 @@ function resolvePlayerVerticalSupport(previousY,nextY,verticalVelocity) {
   const eyeHeight=Number(model.viewer.camera.eye_height),radius=Number(
     model.viewer.camera.collision_radius||.001),x=viewportControls.position[0],z=viewportControls.position[2];
   const previousFoot=previousY-eyeHeight,nextFoot=nextY-eyeHeight;
+  if(performance.now()<physicsRuntime.supportSuppressedUntil&&verticalVelocity>0)
+    return {y:nextY,velocity:verticalVelocity,identity:null};
   const surfaceContact=sampleContactSurface(x,z,previousFoot,nextFoot,verticalVelocity,.055);
   if(surfaceContact){
     const tangentConstraintVelocity=viewportControls.horizontalVelocity[0]*surfaceContact.gradient[0]+
@@ -6760,6 +7486,17 @@ function updateViewportControls(dt) {
   const jumping = viewportInputValue("jump", gamepad) > 0;
   if (jumping && !viewportControls.jumpDown && !vehicleRuntime.active) requestViewportJump();
   viewportControls.jumpDown = jumping;
+  const respawning=viewportInputValue("respawn",gamepad)>0;
+  if(respawning&&!viewportControls.respawnDown)respawnViewportActor();
+  viewportControls.respawnDown=respawning;
+  const frontDifferentialBrake=viewportInputValue("front-differential-brake-toggle",gamepad)>0,
+    rearDifferentialBrake=viewportInputValue("rear-differential-brake-toggle",gamepad)>0;
+  if(vehicleRuntime.active&&frontDifferentialBrake&&!viewportControls.frontDifferentialBrakeDown)
+    controlVehicleTransmission({frontDifferentialBrake:!vehicleRuntime.transmission.frontDifferentialBrake});
+  if(vehicleRuntime.active&&rearDifferentialBrake&&!viewportControls.rearDifferentialBrakeDown)
+    controlVehicleTransmission({rearDifferentialBrake:!vehicleRuntime.transmission.rearDifferentialBrake});
+  viewportControls.frontDifferentialBrakeDown=frontDifferentialBrake;
+  viewportControls.rearDifferentialBrakeDown=rearDifferentialBrake;
   const forward = mobileClamp(viewportInputValue("move-forward", gamepad) -
     viewportInputValue("move-backward", gamepad) - mobileControlState.move[1]);
   const strafe = mobileClamp(viewportInputValue("strafe-right", gamepad) -
@@ -6985,19 +7722,26 @@ function drawShaderCrosshair(gl, width, height) {
 }
 
 function drawVehicleShaderHud(gl,width,height){
-  const program=shaderViewer.vehicleHudProgram,vehicle=vehicleRuntime.active,
-    expanded=vehicleRuntime.contactMonitor?.classList.contains("expanded");
-  if(!program||!vehicle||!shaderViewer.shaderOnly||expanded)return;
+  const program=shaderViewer.vehicleHudProgram,vehicle=vehicleRuntime.active;
+  if(!program||!vehicle||!shaderViewer.shaderOnly){vehicleRuntime.shaderHudHitRegions=[];return;}
+  vehicleRuntime.shaderHudHitRegions=[];
   const locations=shaderViewer.vehicleHudLocations,ratio=Math.min(2,window.devicePixelRatio||1),
-    panelWidth=154*ratio,panelHeight=144*ratio,panelX=width-panelWidth-14*ratio,panelY=62*ratio,
-    travel=Math.max(1e-6,Number(vehicle.configuration.suspension.travel)),
-    patchColors=["#52635d","#54e39b","#ffd166","#ff5f7d"];
+    panelWidth=154*ratio,panelHeight=286*ratio,panelX=width-panelWidth-14*ratio,panelY=62*ratio,
+    travel=Math.max(1e-6,Number(vehicle.configuration.suspension.travel));
   const rgba=(color,alpha=1)=>[...colorVector(color),alpha],draw=(x,y,w,h,color,ellipse=false,angle=0)=>{
     if(w<=0||h<=0)return;gl.uniform4f(locations.uRect,x,y,w,h);
     gl.uniform1f(locations.uAngle,angle);
     gl.uniform4fv(locations.uColor,color);gl.uniform1f(locations.uEllipse,ellipse?1:0);
     gl.drawArrays(gl.TRIANGLES,0,6);
   },controlColor=value=>rgba(value>.65?"#ff5f7d":value>.25?"#ffd166":"#54e39b",.88),
+    glyphs={A:["010","101","111","101","101"],B:["110","101","110","101","110"],
+      C:["011","100","100","100","011"],S:["011","100","010","001","110"],
+      T:["111","010","010","010","010"],F:["111","100","110","100","100"],
+      H:["101","101","111","101","101"],L:["100","100","100","100","111"],
+      R:["110","101","110","101","101"],V:["101","101","101","101","010"]},
+    glyphText=(text,x,y,scale,color)=>{let cursor=x;for(const character of text){const rows=glyphs[character]||[];
+      rows.forEach((bits,row)=>[...bits].forEach((bit,column)=>{if(bit==="1")draw(cursor+column*scale,y+row*scale,scale,scale,color);}));
+      cursor+=4*scale;}},
     dial=(cx,cy,r,value,color)=>{
       const level=Math.max(0,Math.min(1,Number(value)||0)),needle=-2.35+4.7*level;
       draw(cx-r,cy-r,r*2,r*2,rgba("#30443e",.96),true);
@@ -7035,10 +7779,6 @@ function drawVehicleShaderHud(gl,width,height){
   [0,1,2,3].forEach(index=>{
     const column=index%2,row=Math.floor(index/2),x=panelX+(6+column*73)*ratio,y=panelY+(43+row*47)*ratio,
       compression=Math.max(0,Math.min(1,Number(vehicleRuntime.compressions[index]||0)/travel)),
-      area=Math.max(0,Number(vehicleRuntime.contactAreas[index]||0)),tires=vehicle.configuration.tires,
-      areaRange=Math.max(1e-8,Number(tires.maximum_contact_area)-Number(tires.minimum_contact_area)),
-      areaLevel=Math.max(0,Math.min(1,(area-Number(tires.minimum_contact_area))/areaRange)),
-      mode=Math.max(0,Math.min(3,Math.round(vehicleRuntime.contactModes[index]||0))),
       damper=Math.max(.5,Math.min(1.5,vehicleRuntime.damperScales[index]??1)),
       tc=1-Math.max(0,Math.min(1,vehicleRuntime.tractionScales[index]??1)),
       abs=1-Math.max(0,Math.min(1,vehicleRuntime.brakeScales[index]??1)),
@@ -7048,13 +7788,13 @@ function drawVehicleShaderHud(gl,width,height){
     draw(x+5*ratio,y+5*ratio,6*ratio,32*ratio,rgba("#31483f",.8));
     draw(x+6*ratio,y+(36-30*compression)*ratio,4*ratio,30*compression*ratio,
       rgba(damper>1.05?"#66d9ff":damper<.96?"#b28cff":compression>.82?"#ff5f7d":compression>.58?"#ffd166":"#fff2a8",.95));
-    const patchWidth=(22+22*areaLevel)*ratio;
-    draw(x+(43*ratio-patchWidth*.5),y+5*ratio,patchWidth,10*ratio,rgba(patchColors[mode],.96),true);
-    draw(x+55*ratio,y+5*ratio,9*ratio,9*ratio,rgba("#0b1513",.96),true);
-    const wheelNeedleCenterX=x+(59.5+Math.sin(wheelNeedle)*1.6)*ratio,
-      wheelNeedleCenterY=y+(9.5-Math.cos(wheelNeedle)*1.6)*ratio;
-    draw(wheelNeedleCenterX-.6*ratio,wheelNeedleCenterY-2.6*ratio,
-      1.2*ratio,5.2*ratio,rgba("#66d9ff",.96),false,wheelNeedle);
+    // Reserved for the compiled per-probe force integral. Penetration probes
+    // are deliberately not drawn as force/heat; that would be false telemetry.
+    const tireX=x+16*ratio,tireY=y+4*ratio,tireW=48*ratio,tireH=14*ratio;
+    draw(tireX,tireY,tireW,tireH,rgba("#0b1513",.98));
+    const wheelNeedleCenterX=x+(12+Math.sin(wheelNeedle)*1.6)*ratio,
+      wheelNeedleCenterY=y+(10-Math.cos(wheelNeedle)*1.6)*ratio;
+    draw(wheelNeedleCenterX-.6*ratio,wheelNeedleCenterY-2.6*ratio,1.2*ratio,5.2*ratio,rgba("#66d9ff",.96),false,wheelNeedle);
     draw(x+18*ratio,y+21*ratio,44*ratio,5*ratio,rgba("#263b34",.9));
     draw(x+18*ratio,y+21*ratio,44*tc*ratio,5*ratio,controlColor(tc));
     for(let segment=0;segment<4;segment+=1){
@@ -7063,7 +7803,84 @@ function drawVehicleShaderHud(gl,width,height){
       draw(x+(18+segment*11)*ratio,y+31*ratio,9*segmentValue*ratio,5*ratio,controlColor(abs));
     }
   });
+  const transmission=vehicleRuntime.transmission,indicatorY=panelY+133*ratio,
+    indicator=(label,x,mode)=>{const color=mode==="locked"?"#1b6b4b":mode==="limited-slip"?"#69551f":"#252d2b",
+      glyph=mode==="locked"?"#8effc7":mode==="limited-slip"?"#ffd166":"#71817b";
+      draw(x,indicatorY,15*ratio,7*ratio,rgba(color,.96));glyphText(label,x+5*ratio,indicatorY+1*ratio,ratio,rgba(glyph,1));};
+  indicator(transmission.lowRange?"L":"H",panelX+7*ratio,"locked");
+  indicator("C",panelX+25*ratio,transmission.centerDiffMode||"open");
+  indicator("F",panelX+43*ratio,transmission.frontDiffMode||"open");
+  indicator("R",panelX+61*ratio,transmission.rearDiffMode||"open");
+  draw(panelX+82*ratio,indicatorY,64*ratio,7*ratio,rgba("#263b34",.9));
+  draw(panelX+82*ratio,indicatorY,64*Math.max(.05,Math.min(.95,Number(transmission.frontDriveShare||.5)))*ratio,
+    7*ratio,rgba("#66d9ff",.9));
+  const buttonY=panelY+141*ratio,buttonH=18*ratio,tcX=panelX+7*ratio,absX=panelX+81*ratio,buttonW=66*ratio,
+    tcEnabled=vehicleRuntime.transmission.tractionControlEnabled!==false,
+    absEnabled=vehicleRuntime.transmission.absEnabled!==false;
+  [[tcX,"TC",tcEnabled,"traction-control"],[absX,"ABS",absEnabled,"abs"]].forEach(([x,label,enabled,action])=>{
+    draw(x,buttonY,buttonW,buttonH,rgba(enabled?"#1b6b4b":"#3b2929",.96));
+    draw(x+1*ratio,buttonY+1*ratio,buttonW-2*ratio,buttonH-2*ratio,rgba(enabled?"#123f30":"#1b1717",.96));
+    glyphText(label,x+(label.length===2?25:23)*ratio,buttonY+4*ratio,2*ratio,rgba(enabled?"#8effc7":"#ff8c9d",1));
+    vehicleRuntime.shaderHudHitRegions.push({action,x,y:buttonY,w:buttonW,h:buttonH});
+  });
+  const authorityY=panelY+163*ratio,authorityRadius=9*ratio;
+  [[panelX+26*ratio,"T",Number(transmission.tractionControlAuthority??1),"traction-authority"],
+   [panelX+100*ratio,"A",Number(transmission.absAuthority??1),"abs-authority"]].forEach(([cx,label,value,action])=>{
+    dial(cx,authorityY+authorityRadius,authorityRadius,value,rgba("#66d9ff",.98));
+    glyphText(label,cx+13*ratio,authorityY+5*ratio,ratio,rgba("#a8bbb4",1));
+    vehicleRuntime.shaderHudHitRegions.push({action,x:cx-authorityRadius,y:authorityY,
+      w:45*ratio,h:authorityRadius*2,valueX:cx-authorityRadius,valueWidth:authorityRadius*2});
+  });
+  const levelingY=panelY+187*ratio,levelingEnabled=Boolean(vehicleRuntime.chassisLeveling?.enabled);
+  draw(panelX+7*ratio,levelingY,140*ratio,17*ratio,rgba(levelingEnabled?"#173f37":"#252d2b",.96));
+  glyphText("LVL",panelX+59*ratio,levelingY+3*ratio,2*ratio,rgba(levelingEnabled?"#8effc7":"#71817b",1));
+  vehicleRuntime.shaderHudHitRegions.push({action:"chassis-leveling",x:panelX+7*ratio,y:levelingY,w:140*ratio,h:17*ratio});
+  // Actual mechanical graph damage, projected top-down. Every edge is drawn;
+  // damageable members shade green -> amber -> red, while non-damageable
+  // reference members remain muted. This is presentation of worker-owned
+  // plastic strain/fracture state, never a DOM approximation.
+  const graph=vehicle.physics?.mechanical_graph,nodes=new Map((graph?.nodes||[]).map(node=>[node.identity,
+      vehicleRuntime.mechanicalNodePositions.get(node.identity)||node.reference_position])),
+    edges=graph?.edges||[],damage=vehicleRuntime.damage||{},damageX=panelX+7*ratio,damageY=panelY+222*ratio,
+    damageW=140*ratio,damageH=57*ratio,positions=[...nodes.values()],
+    minX=Math.min(-1,...positions.map(value=>Number(value?.[0]||0))),maxX=Math.max(1,...positions.map(value=>Number(value?.[0]||0))),
+    minZ=Math.min(-1,...positions.map(value=>Number(value?.[2]||0))),maxZ=Math.max(1,...positions.map(value=>Number(value?.[2]||0)));
+  draw(damageX,damageY,damageW,damageH,rgba("#0b1513",.96));
+  edges.forEach(edge=>{const a=nodes.get(edge.a),b=nodes.get(edge.b);if(!a||!b)return;
+    const ax=damageX+(Number(a[2])-minZ)/Math.max(1e-6,maxZ-minZ)*damageW,
+      ay=damageY+(maxX-Number(a[0]))/Math.max(1e-6,maxX-minX)*damageH,
+      bx=damageX+(Number(b[2])-minZ)/Math.max(1e-6,maxZ-minZ)*damageW,
+      by=damageY+(maxX-Number(b[0]))/Math.max(1e-6,maxX-minX)*damageH,
+      dx=bx-ax,dy=by-ay,length=Math.max(.8*ratio,Math.hypot(dx,dy)),state=damage.members?.[edge.identity],
+      halfshaftName=["front_left","front_right","rear_left","rear_right"].find(name=>edge.identity.includes(`${name}_halfshaft`)),
+      springName=["front_left","front_right","rear_left","rear_right"].find(name=>edge.identity===`suspension.${name}.coilover`),
+      fracture=Math.max(1e-8,Number(edge.damage?.fracture_strain||.08)),plastic=state?Number(state.plasticStrain||0)/fracture:0,
+      health=halfshaftName?Number(damage.halfshaftHealth?.[halfshaftName]??1):springName?
+        Number(damage.springHealth?.[springName]??1):state?.failed?0:state?Math.max(0,1-plastic):null,
+      color=health===null?"#3b5049":health<=0?"#ff3f62":health<.45?"#ff8a4c":health<.82?"#ffd166":"#54e39b",
+      thickness=Math.max(1.1,Math.min(3.2,Number(edge.radius||.01)*90))*ratio,
+      angle=Math.atan2(dx,-dy);
+    draw((ax+bx)/2-thickness/2,(ay+by)/2-length/2,thickness,length,rgba(color,.94),false,angle);
+  });
   gl.disable(gl.BLEND);gl.enable(gl.DEPTH_TEST);
+}
+
+function handleVehicleShaderHudPointer(event){
+  if(!shaderViewer.shaderOnly||event.button!==0||!vehicleRuntime.active)return false;
+  const canvas=shaderViewer.canvas,bounds=canvas?.getBoundingClientRect();if(!bounds)return false;
+  const x=(event.clientX-bounds.left)*canvas.width/Math.max(1,bounds.width),
+    y=(event.clientY-bounds.top)*canvas.height/Math.max(1,bounds.height),
+    hit=vehicleRuntime.shaderHudHitRegions.find(region=>x>=region.x&&x<=region.x+region.w&&y>=region.y&&y<=region.y+region.h);
+  if(!hit)return false;
+  if(hit.action==="traction-control")controlVehicleTransmission({tractionControlEnabled:
+    vehicleRuntime.transmission.tractionControlEnabled===false});
+  else if(hit.action==="abs")controlVehicleTransmission({absEnabled:vehicleRuntime.transmission.absEnabled===false});
+  else if(hit.action==="traction-authority")controlVehicleTransmission({tractionControlAuthority:
+    Math.max(0,Math.min(1,(x-hit.valueX)/Math.max(1,hit.valueWidth)))});
+  else if(hit.action==="abs-authority")controlVehicleTransmission({absAuthority:
+    Math.max(0,Math.min(1,(x-hit.valueX)/Math.max(1,hit.valueWidth)))});
+  else if(hit.action==="chassis-leveling")controlVehicleChassisLeveling({enabled:!vehicleRuntime.chassisLeveling?.enabled});
+  return true;
 }
 
 function drawVehicleCanvasHud(context,width,height){
@@ -7212,7 +8029,12 @@ function updateShaderViewer() {
       if(headlightLocations.uHeadlightForward!==null)gl.uniform3fv(headlightLocations.uHeadlightForward,forward);
       if(headlightLocations.uHeadlightActive!==null)gl.uniform1f(headlightLocations.uHeadlightActive,1);
     }else if(headlightLocations.uHeadlightActive!==null)gl.uniform1f(headlightLocations.uHeadlightActive,0);
-    drawSceneMeshes(gl);
+    const renderPass=shaderViewer.locations.uRenderPass;
+    if(renderPass!==null){
+      gl.disable(gl.BLEND);gl.depthMask(true);gl.uniform1i(renderPass,1);drawSceneMeshes(gl);
+      gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
+      gl.uniform1i(renderPass,2);drawSceneMeshes(gl);gl.depthMask(true);gl.disable(gl.BLEND);gl.uniform1i(renderPass,0);
+    }else drawSceneMeshes(gl);
     drawVehicleWheels(gl,width,height,cameraPosition,cameraFacing,celestial);
     drawVehicleShaderHud(gl,width,height);
     drawShaderCrosshair(gl, width, height);
@@ -8016,8 +8838,7 @@ function updateVehicleTransmissionControls(){
     gearLabel=transmission.displayGear<0?"R":String(Math.max(1,Math.round(
       transmission.displayGear||transmission.gear||config.transmission.starting_gear))),
     readout=root.querySelector("[data-transmission-readout]"),
-    text=`${transmission.mode==="automatic"?"AUTO":"MANUAL"} · ${gearLabel}${transmission.lowRange?" · LOW":""}${
-      transmission.diffLock?" · LOCK":""}`;
+    text=`${transmission.mode==="automatic"?"AUTO":"MANUAL"} · ${gearLabel}${transmission.lowRange?" · LOW":""}`;
   if(readout&&readout.textContent!==text)readout.textContent=text;
   root.querySelectorAll("[data-transmission-mode]").forEach(button=>{const active=
     button.dataset.transmissionMode===transmission.mode;if(button.classList.contains("active")!==active)
@@ -8025,6 +8846,48 @@ function updateVehicleTransmissionControls(){
   root.querySelectorAll("[data-drivetrain-toggle]").forEach(button=>{const key=button.dataset.drivetrainToggle,
     active=Boolean(transmission[key]);button.classList.toggle("active",active);
     button.setAttribute("aria-pressed",String(active));});
+  root.querySelectorAll("[data-differential-mode]").forEach(select=>{const key=`${select.dataset.differentialMode}DiffMode`,
+    value=transmission[key]||"open";if(document.activeElement!==select&&select.value!==value)select.value=value;});
+  root.querySelectorAll("[data-brake-lock]").forEach(button=>{const name=button.dataset.brakeLock,
+    active=Boolean(vehicleRuntime.brakeLocks[name]);button.classList.toggle("active",active);
+    button.setAttribute("aria-pressed",String(active));});
+  const split=root.querySelector("[data-front-drive-share]");if(split){const percent=Math.round(transmission.frontDriveShare*100);
+    if(document.activeElement!==split)split.value=String(percent);const value=root.querySelector("[data-torque-split-value]");
+    if(value)value.textContent=`F${percent}/R${100-percent}`;}
+  const powerUnit=root.querySelector("[data-power-unit-preset]");if(powerUnit&&
+      powerUnit.value!==vehicle.power_unit_preset)powerUnit.value=vehicle.power_unit_preset;
+  const transmissionPreset=root.querySelector("[data-transmission-preset]");if(transmissionPreset&&
+      transmissionPreset.value!==vehicleRuntime.transmissionPreset)transmissionPreset.value=vehicleRuntime.transmissionPreset;
+  const chassisProfile=root.querySelector("[data-chassis-profile]");if(chassisProfile&&
+      chassisProfile.value!==vehicleRuntime.chassisProfile)chassisProfile.value=vehicleRuntime.chassisProfile;
+  const wheelPart=root.querySelector("[data-wheel-part]");if(wheelPart&&
+      wheelPart.value!==vehicleRuntime.wheelPart)wheelPart.value=vehicleRuntime.wheelPart;
+  const bodyShell=root.querySelector("[data-body-shell]");if(bodyShell&&
+      bodyShell.value!==vehicleRuntime.bodyShell)bodyShell.value=vehicleRuntime.bodyShell;
+  root.querySelectorAll("[data-shock-parameter]").forEach(input=>{const name=input.dataset.shockParameter,
+    value=Number(vehicleRuntime.shockParameters?.[name]??vehicle.configuration_defaults?.[name]);
+    if(document.activeElement!==input&&Number.isFinite(value)&&Number(input.value)!==value)input.value=String(value);});
+  const levelingButton=root.querySelector("[data-chassis-leveling-toggle]"),leveling=vehicleRuntime.chassisLeveling;
+  if(levelingButton&&leveling){levelingButton.classList.toggle("active",Boolean(leveling.enabled));
+    levelingButton.setAttribute("aria-pressed",String(Boolean(leveling.enabled)));}
+  const steeringSystem=vehicleRuntime.steeringSystem||{};
+  root.querySelectorAll("[data-steering-axle]").forEach(button=>{const key=`${button.dataset.steeringAxle}_axle_enabled`,
+      active=steeringSystem[key]!==false;button.classList.toggle("active",active);button.setAttribute("aria-pressed",String(active));});
+  const steeringShare=root.querySelector("[data-steering-front-share]");if(steeringShare){const percent=Math.round(
+      Number(steeringSystem.front_share??.5)*100);if(document.activeElement!==steeringShare)steeringShare.value=String(percent);
+    const value=root.querySelector("[data-steering-share-value]");if(value)value.textContent=`F${percent}/R${100-percent}`;}
+  const steeringPhase=root.querySelector("[data-steering-rear-phase]");if(steeringPhase){const counter=Number(
+      steeringSystem.rear_phase??-1)<0;steeringPhase.textContent=counter?"REAR COUNTER":"REAR SAME";
+    steeringPhase.classList.toggle("active",counter);steeringPhase.setAttribute("aria-pressed",String(counter));}
+  const lockedBrakes=Object.values(vehicleRuntime.brakeLocks).filter(Boolean).length;
+  const failedShafts=Object.values(vehicleRuntime.damage?.halfshaftHealth||{}).filter(value=>value<=0).length,
+    failedMembers=Object.values(vehicleRuntime.damage?.members||{}).filter(value=>value.failed).length;
+  const modeGlyph=mode=>mode==="locked"?"✓":mode==="limited-slip"?"≈":"○";
+  if(vehicleRuntime.transferHud)vehicleRuntime.transferHud.textContent=`${transmission.lowRange?"LOW":"HIGH"} · ${
+    `C${modeGlyph(transmission.centerDiffMode)}`}/${`F${modeGlyph(transmission.frontDiffMode)}`}/${
+    `R${modeGlyph(transmission.rearDiffMode)}`} · ${Math.round(transmission.frontDriveShare*100)}/${
+    Math.round((1-transmission.frontDriveShare)*100)}${lockedBrakes?` · B${lockedBrakes}`:""}${
+      failedShafts||failedMembers?` · DMG ${failedShafts}S/${failedMembers}M`:""}`;
   const dyno=root.querySelector("[data-vehicle-dyno-readout]");if(dyno){const result=vehicleRuntime.dyno;
     dyno.textContent=!result?"DYNO idle":`${result.status==="telemetry"?"LIVE":result.pass?"PASS":"FAULT"} · ${result.compute} · `+
       `${(result.forceY||[]).reduce((sum,value)=>sum+Number(value||0),0).toFixed(0)} N load · `+
@@ -8042,7 +8905,7 @@ function requestVehicleDyno(){
 
 function updateVehicleContactMonitor() {
   const root=vehicleRuntime.contactMonitor;if(!root)return;
-  const vehicle=vehicleRuntime.active,config=vehicle?.configuration;root.hidden=!vehicle;
+  const vehicle=vehicleRuntime.active,config=vehicle?.configuration;root.hidden=!vehicle||shaderViewer.shaderOnly;
   if(!vehicle||!config)return;
   const mode=root.querySelector(".vehicle-contact-mode"),names=["FL","FR","RL","RR"],
     modeNames=["airborne","static grip","at limit","kinetic slide"],
@@ -8142,7 +9005,7 @@ function updateViewportTelemetry(now) {
   // The compact live vehicle instruments are drawn by the viewport shader.
   // The DOM graph is an explicitly opened diagnostic, so do not synchronize
   // it from every animation frame while it is collapsed.
-  if(vehicleRuntime.contactMonitor?.classList.contains("expanded"))updateVehicleContactMonitor();
+  if(!shaderViewer.shaderOnly&&vehicleRuntime.contactMonitor?.classList.contains("expanded"))updateVehicleContactMonitor();
   const gamepad = viewportGamepad();
   shaderViewer.element?.querySelectorAll("[data-control-source]").forEach(element => {
     const value = deviceSignalValue(element.dataset.controlSource, gamepad, now);
@@ -8417,12 +9280,142 @@ function renderVehicleTransmissionSettings(){
     button.addEventListener("pointerdown",event=>event.stopPropagation());button.addEventListener("click",event=>{
       event.preventDefault();event.stopPropagation();controlVehicleTransmission({mode,gearDelta});});
     controls.append(button);});
-  [["ULTRA LOW","lowRange"],["DIFF LOCK","diffLock"]].forEach(([label,key])=>{const button=document.createElement("button");
+  [["ULTRA LOW","lowRange"],["SMOOTH LAUNCH","smoothLaunch"],
+    ["TRACTION CONTROL","tractionControlEnabled"],["ABS","absEnabled"]].forEach(([label,key])=>{const button=document.createElement("button");
     button.type="button";button.className="vehicle-gear-button";button.textContent=label;
     button.dataset.drivetrainToggle=key;button.setAttribute("aria-pressed","false");
     button.addEventListener("pointerdown",event=>event.stopPropagation());button.addEventListener("click",event=>{
       event.preventDefault();event.stopPropagation();controlVehicleTransmission({[key]:!vehicleRuntime.transmission[key]});});
     controls.append(button);});
+  [["center diff","center"],["front diff","front"],["rear diff","rear"]].forEach(([label,axle])=>{
+    const row=div("vehicle-torque-split"),caption=div("",label),select=document.createElement("select"),hint=div("","speed clutch");
+    select.className="vehicle-gear-button";select.dataset.differentialMode=axle;
+    [["open","OPEN"],["limited-slip","LIMITED SLIP"],["locked","LOCKED"]].forEach(([value,text])=>{
+      const option=document.createElement("option");option.value=value;option.textContent=text;select.append(option);});
+    select.addEventListener("pointerdown",event=>event.stopPropagation());select.addEventListener("change",event=>{
+      event.stopPropagation();controlVehicleTransmission({[`${axle}DiffMode`]:select.value});});
+    row.append(caption,select,hint);controls.append(row);
+  });
+  [["FRONT DIFF BRAKE","frontDifferentialBrake"],["REAR DIFF BRAKE","rearDifferentialBrake"]]
+    .forEach(([label,key])=>{const button=document.createElement("button");button.type="button";
+      button.className="vehicle-gear-button";button.textContent=label;button.dataset.drivetrainToggle=key;
+      button.setAttribute("aria-pressed","false");button.addEventListener("pointerdown",event=>event.stopPropagation());
+      button.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();
+        controlVehicleTransmission({[key]:!vehicleRuntime.transmission[key]});});controls.append(button);});
+  [["FL HOLD","front_left"],["FR HOLD","front_right"],["RL HOLD","rear_left"],["RR HOLD","rear_right"]]
+    .forEach(([label,name])=>{const button=document.createElement("button");button.type="button";
+      button.className="vehicle-gear-button";button.textContent=label;button.dataset.brakeLock=name;
+      button.setAttribute("aria-pressed","false");button.addEventListener("pointerdown",event=>event.stopPropagation());
+      button.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();
+        controlVehicleTransmission({brakeLock:{name,locked:!vehicleRuntime.brakeLocks[name]}});});controls.append(button);});
+  const release=document.createElement("button");release.type="button";release.className="vehicle-gear-button";
+  release.textContent="RELEASE BRAKES";release.addEventListener("pointerdown",event=>event.stopPropagation());
+  release.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();
+    controlVehicleTransmission({releaseAllBrakes:true});});controls.append(release);
+  const split=div("vehicle-torque-split"),splitLabel=div("","front / rear"),slider=document.createElement("input"),
+    splitValue=div("","F42/R58");slider.type="range";slider.min="5";slider.max="95";slider.step="1";
+  slider.value="42";slider.dataset.frontDriveShare="true";splitValue.dataset.torqueSplitValue="true";
+  slider.addEventListener("pointerdown",event=>event.stopPropagation());slider.addEventListener("input",event=>{
+    event.stopPropagation();controlVehicleTransmission({frontDriveShare:Number(slider.value)/100});});
+  split.append(splitLabel,slider,splitValue);controls.append(split);
+  const powerUnitRow=div("vehicle-torque-split"),powerUnitLabel=div("","power unit"),
+    powerUnitSelect=document.createElement("select"),curveLabel=div("","baked curve");
+  powerUnitSelect.dataset.powerUnitPreset="true";powerUnitSelect.className="vehicle-gear-button";
+  (model.vehicle_slot?.vehicles?.[0]?.power_unit_presets||[]).forEach(preset=>{const option=document.createElement("option");
+    option.value=preset.identity;option.textContent=preset.label;powerUnitSelect.append(option);});
+  powerUnitSelect.addEventListener("pointerdown",event=>event.stopPropagation());
+  powerUnitSelect.addEventListener("change",event=>{event.stopPropagation();selectVehiclePowerUnit(powerUnitSelect.value);});
+  powerUnitRow.append(powerUnitLabel,powerUnitSelect,curveLabel);controls.append(powerUnitRow);
+  const wheelPartRow=div("vehicle-torque-split"),wheelPartLabel=div("","wheel part"),
+    wheelPartSelect=document.createElement("select"),wheelPartHint=div("","exclusive");
+  wheelPartSelect.dataset.wheelPart="true";wheelPartSelect.className="vehicle-gear-button";
+  (model.vehicle_slot?.vehicles?.[0]?.wheel_parts||[]).forEach(part=>{const option=document.createElement("option");
+    option.value=part.identity;option.textContent=part.label;wheelPartSelect.append(option);});
+  wheelPartSelect.addEventListener("pointerdown",event=>event.stopPropagation());
+  wheelPartSelect.addEventListener("change",event=>{event.stopPropagation();selectVehicleWheelPart(wheelPartSelect.value);});
+  wheelPartRow.append(wheelPartLabel,wheelPartSelect,wheelPartHint);controls.append(wheelPartRow);
+  const bodyShellRow=div("vehicle-torque-split"),bodyShellLabel=div("","cosmetic body"),
+    bodyShellSelect=document.createElement("select"),bodyShellHint=div("","shader only");
+  bodyShellSelect.dataset.bodyShell="true";bodyShellSelect.className="vehicle-gear-button";
+  (model.vehicle_slot?.vehicles?.[0]?.body_shells||[]).forEach(shell=>{const option=document.createElement("option");
+    option.value=shell.identity;option.textContent=shell.label;bodyShellSelect.append(option);});
+  bodyShellSelect.addEventListener("pointerdown",event=>event.stopPropagation());bodyShellSelect.addEventListener("change",event=>{
+    event.stopPropagation();selectVehicleBodyShell(bodyShellSelect.value);});
+  bodyShellRow.append(bodyShellLabel,bodyShellSelect,bodyShellHint);controls.append(bodyShellRow);
+  const transmissionPresetRow=div("vehicle-torque-split"),transmissionPresetLabel=div("","gearset"),
+    transmissionPresetSelect=document.createElement("select"),ratioLabel=div("","live ratios");
+  transmissionPresetSelect.dataset.transmissionPreset="true";transmissionPresetSelect.className="vehicle-gear-button";
+  (model.vehicle_slot?.vehicles?.[0]?.transmission_presets||[]).forEach(preset=>{const option=document.createElement("option");
+    option.value=preset.identity;option.textContent=preset.label;transmissionPresetSelect.append(option);});
+  transmissionPresetSelect.addEventListener("pointerdown",event=>event.stopPropagation());
+  transmissionPresetSelect.addEventListener("change",event=>{event.stopPropagation();
+    selectVehicleTransmissionPreset(transmissionPresetSelect.value);});
+  transmissionPresetRow.append(transmissionPresetLabel,transmissionPresetSelect,ratioLabel);controls.append(transmissionPresetRow);
+  const chassisProfileRow=div("vehicle-torque-split"),chassisProfileLabel=div("","chassis tubes"),
+    chassisProfileSelect=document.createElement("select"),chassisPhysicsLabel=div("","mass + limits");
+  chassisProfileSelect.dataset.chassisProfile="true";chassisProfileSelect.className="vehicle-gear-button";
+  (model.vehicle_slot?.vehicles?.[0]?.chassis_profiles||[]).forEach(profile=>{const option=document.createElement("option");
+    option.value=profile.identity;option.textContent=profile.label;chassisProfileSelect.append(option);});
+  chassisProfileSelect.addEventListener("pointerdown",event=>event.stopPropagation());
+  chassisProfileSelect.addEventListener("change",event=>{event.stopPropagation();
+    selectVehicleChassisProfile(chassisProfileSelect.value);});
+  chassisProfileRow.append(chassisProfileLabel,chassisProfileSelect,chassisPhysicsLabel);controls.append(chassisProfileRow);
+  const shockDetails=document.createElement("details"),shockSummary=document.createElement("summary");
+  shockSummary.textContent="SHOCK / SPRING PARAMETERS";shockSummary.addEventListener("pointerdown",event=>event.stopPropagation());
+  shockDetails.append(shockSummary);
+  [["spring N/m","spring_stiffness",5000,180000,500],
+   ["compression N·s/m","pneumatic_compression_damping",100,20000,50],
+   ["rebound N·s/m","pneumatic_rebound_damping",100,24000,50],
+   ["rest length m","suspension_rest_length",.1,.8,.005],
+   ["travel m","suspension_travel",.08,.8,.005],
+   ["pneumatic efficiency","pneumatic_efficiency",.1,1,.01],
+   ["active minimum","active_damping_minimum_scale",.1,1,.01],
+   ["active maximum","active_damping_maximum_scale",1,3,.01],
+   ["body velocity gain","active_damping_body_velocity_gain_s_per_m",0,4,.01],
+   ["rebound release gain","active_damping_rebound_release_gain_s_per_m",0,4,.01]]
+    .forEach(([label,name,minimum,maximum,step])=>{const row=div("vehicle-torque-split"),caption=div("",label),
+        input=document.createElement("input"),value=div("","");input.type="number";input.min=String(minimum);input.max=String(maximum);
+      input.step=String(step);input.value=String((vehicleRuntime.active?.configuration_defaults||
+        model.vehicle_slot?.vehicles?.[0]?.configuration_defaults||{})[name]??minimum);input.dataset.shockParameter=name;
+      value.textContent=name;input.addEventListener("pointerdown",event=>event.stopPropagation());input.addEventListener("change",event=>{
+        event.stopPropagation();const numeric=Math.max(minimum,Math.min(maximum,Number(input.value)));input.value=String(numeric);
+        controlVehicleShockParameters({[name]:numeric});});row.append(caption,input,value);shockDetails.append(row);});
+  controls.append(shockDetails);
+  const steeringRow=div("vehicle-torque-split"),steeringLabel=div("","steering authority"),
+    steeringSlider=document.createElement("input"),steeringValue=div("","F50/R50");
+  steeringSlider.type="range";steeringSlider.min="0";steeringSlider.max="100";steeringSlider.step="1";steeringSlider.value="50";
+  steeringSlider.dataset.steeringFrontShare="true";steeringValue.dataset.steeringShareValue="true";
+  steeringSlider.title="front/rear steering authority; center gives full travel to both axles";
+  steeringSlider.addEventListener("pointerdown",event=>event.stopPropagation());steeringSlider.addEventListener("input",event=>{
+    event.stopPropagation();controlVehicleSteeringSystem({front_share:Number(steeringSlider.value)/100});});
+  steeringRow.append(steeringLabel,steeringSlider,steeringValue);controls.append(steeringRow);
+  [["FRONT STEER","front"],["REAR STEER","rear"]].forEach(([label,axle])=>{const button=document.createElement("button");
+    button.type="button";button.className="vehicle-gear-button active";button.textContent=label;button.dataset.steeringAxle=axle;
+    button.setAttribute("aria-pressed","true");button.addEventListener("pointerdown",event=>event.stopPropagation());
+    button.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();const key=`${axle}_axle_enabled`;
+      controlVehicleSteeringSystem({[key]:vehicleRuntime.steeringSystem?.[key]===false});});controls.append(button);});
+  const steeringPhase=document.createElement("button");steeringPhase.type="button";steeringPhase.className="vehicle-gear-button active";
+  steeringPhase.textContent="REAR COUNTER";steeringPhase.dataset.steeringRearPhase="true";steeringPhase.setAttribute("aria-pressed","true");
+  steeringPhase.addEventListener("pointerdown",event=>event.stopPropagation());steeringPhase.addEventListener("click",event=>{
+    event.preventDefault();event.stopPropagation();controlVehicleSteeringSystem({rear_phase:Number(
+      vehicleRuntime.steeringSystem?.rear_phase??-1)<0?1:-1});});controls.append(steeringPhase);
+  const levelingRow=div("vehicle-torque-split"),levelingButton=document.createElement("button"),
+    rideSlider=document.createElement("input"),levelingLabel=div("","slow 2nd-order");
+  levelingButton.type="button";levelingButton.className="vehicle-gear-button";levelingButton.textContent="LEVEL";
+  levelingButton.dataset.chassisLevelingToggle="true";levelingButton.addEventListener("pointerdown",event=>event.stopPropagation());
+  levelingButton.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();
+    controlVehicleChassisLeveling({enabled:!vehicleRuntime.chassisLeveling?.enabled});});
+  rideSlider.type="range";rideSlider.min="-80";rideSlider.max="100";rideSlider.step="5";rideSlider.value="0";
+  rideSlider.title="preferred chassis ride-height trim, millimetres";rideSlider.addEventListener("pointerdown",event=>event.stopPropagation());
+  rideSlider.addEventListener("input",event=>{event.stopPropagation();
+    controlVehicleChassisLeveling({target_ride_height_offset_m:Number(rideSlider.value)/1000});});
+  levelingRow.append(levelingButton,rideSlider,levelingLabel);controls.append(levelingRow);
+  [["preferred roll","target_roll_rad"],["preferred pitch","target_pitch_rad"]].forEach(([label,key])=>{
+    const row=div("vehicle-torque-split"),name=div("",label),slider=document.createElement("input"),value=div("","±12°");
+    slider.type="range";slider.min="-12";slider.max="12";slider.step="0.5";slider.value="0";
+    slider.addEventListener("pointerdown",event=>event.stopPropagation());slider.addEventListener("input",event=>{
+      event.stopPropagation();controlVehicleChassisLeveling({[key]:Number(slider.value)*Math.PI/180});});
+    row.append(name,slider,value);controls.append(row);});
   const dynoButton=document.createElement("button");dynoButton.type="button";dynoButton.className="vehicle-gear-button";
   dynoButton.textContent="DYNO";dynoButton.addEventListener("pointerdown",event=>event.stopPropagation());
   dynoButton.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();requestVehicleDyno();});
@@ -8434,6 +9427,7 @@ function renderVehicleContactMonitor() {
   const root=div("vehicle-contact-monitor");root.hidden=true;
   root.setAttribute("role","status");root.setAttribute("aria-live","polite");
   const head=div("vehicle-contact-head"),title=div("vehicle-contact-title","springs / patches"),
+    transferHud=div("vehicle-transfer-hud","HIGH · C○/F○/R○ · 42/58"),
     details=document.createElement("button"),recover=document.createElement("button"),
     respawn=document.createElement("button");recover.type="button";respawn.type="button";
   details.type="button";details.className="vehicle-detail-button";details.textContent="STATS";
@@ -8445,8 +9439,9 @@ function renderVehicleContactMonitor() {
     event.preventDefault();event.stopPropagation();recoverActiveVehicle();});
   respawn.className="vehicle-recover-button";respawn.textContent="RESPAWN";
   respawn.addEventListener("pointerdown",event=>event.stopPropagation());respawn.addEventListener("click",event=>{
-    event.preventDefault();event.stopPropagation();respawnActiveVehicleAtOrigin();});
-  head.append(title,div("vehicle-contact-mode","not mounted"),details,recover,respawn);root.append(head);
+    event.preventDefault();event.stopPropagation();respawnActiveVehicleAtAuthoredPose();});
+  head.append(title,transferHud,div("vehicle-contact-mode","not mounted"),details,recover,respawn);root.append(head);
+  vehicleRuntime.transferHud=transferHud;
   const massReadout=div("vehicle-mass-readout","mass model pending");massReadout.dataset.vehicleMassReadout="true";root.append(massReadout);
   const grid=div("vehicle-contact-grid"),labels=["FL","FR","RL","RR"];
   labels.forEach((label,index)=>{const corner=div("vehicle-contact-corner");corner.dataset.wheelIndex=String(index);
@@ -8687,6 +9682,9 @@ function renderShaderViewport() {
     if (!controlFocus.dialogue) requestViewportControls();
   });
   canvas.addEventListener("pointerdown", event => {
+    if(handleVehicleShaderHudPointer(event)){
+      event.preventDefault();event.stopPropagation();return;
+    }
     if (event.button === 0 && viewportBinding("primary-action", "pointer:button-0")) {
       beginViewportPrimary(null,"pointer");
     }
@@ -8889,9 +9887,11 @@ renderJavaScriptDistrict();
 inspectNode(model, null);
 initializeVehicleFirstExperience();
 initializeWorldPhysicsWasm();
+armEngineSoundOnFirstGesture();
 window.addEventListener("beforeunload", () => {
   stateLoopRuntime.worker?.postMessage({type: "stop"});
   if (stateLoopRuntime.workerUrl) URL.revokeObjectURL(stateLoopRuntime.workerUrl);
+  engineSoundRuntime.context?.close?.();
 });
 requestAnimationFrame(runEntityCycle);"""
 
@@ -8899,7 +9899,7 @@ requestAnimationFrame(runEntityCycle);"""
 def project_world_to_div_map(
     world: AbstractUIWorld,
     *,
-    title: str = "AbstractUI · top-down data map",
+    title: str = "Mechanical Creature · living meta-object map",
     entity_mezzanine: EntityMezzanine | None = None,
 ) -> AbstractUI:
     """Compile a world into one portable HTML/CSS/JavaScript document."""
@@ -8915,7 +9915,7 @@ def project_world_to_div_map(
     structure = f"""<div class="shell">
   <div class="map-scroll">
     <div class="mast">
-      <div><div class="eyebrow">AbstractUI / div-map projection</div><div class="title">{safe_heading}</div>
+      <div><div class="eyebrow">MechanicalCreature / AbstractUI projection</div><div class="title">{safe_heading}</div>
       <div class="legend"><span>program data</span><span class="js">executing source</span></div></div>
       <div class="status" id="map-status">constructing the living map…</div>
     </div>

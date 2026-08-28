@@ -10,9 +10,11 @@ import pytest
 import sympy
 
 from src.compiler.abstract_ui_div_map import project_class_to_div_map
+from src.compiler.mechanical_creature import MechanicalCreature
 from src.compiler.abstract_ui_surfaces import (
     linear_gradient_solid,
     sampled_mud_oval_height_field,
+    sampled_offroad_playground_height_field,
     support_surface_model,
 )
 from src.compiler.abstract_ui_vehicles import (
@@ -47,23 +49,23 @@ def test_json_car_configuration_is_strict_parametric_and_content_addressed():
     assert sum(config.source["mass_distribution"].values()) == pytest.approx(1.0)
     assert config.parameter_defaults()["inverse_mass"] == pytest.approx(1 / 620)
     assert config.source["powertrain"]["displacement_liters"] == 1.6
-    assert config.source["powertrain"]["brake_mean_effective_pressure_pa"] == 800000.0
+    assert config.source["powertrain"]["brake_mean_effective_pressure_pa"] == 1600000.0
     assert config.parameter_defaults()["engine_rotating_inertia"] == pytest.approx(.22)
     mass = config.mass_properties()
     assert mass["total_mass_kg"] == pytest.approx(620)
-    assert mass["allocated_component_mass_kg"] == pytest.approx(366)
-    assert mass["residual_frame_cage_driver_mass_kg"] == pytest.approx(254)
+    assert mass["allocated_component_mass_kg"] == pytest.approx(402)
+    assert mass["residual_frame_cage_driver_mass_kg"] == pytest.approx(218)
     assert sum(item["mass_kg"] for item in mass["components"]) == pytest.approx(620)
-    assert mass["center_of_mass"] == pytest.approx([-.02480645, .06838232, 0], abs=1e-8)
+    assert mass["center_of_mass"] == pytest.approx([-.02480645, .03557670, 0], abs=1e-8)
     assert mass["derived_axle_fractions"]["front"] == pytest.approx(.4799948)
     for axis in ("roll", "pitch", "yaw"):
         assert config.parameter_defaults()[f"inverse_inertia_{axis}"] == pytest.approx(
             1 / mass["inertia_kg_m2"][axis])
     assert config.source["powertrain"]["transmission_mass_kg"] == 58
     assert config.source["powertrain"]["transfer_case_mass_kg"] == 24
-    assert config.source["drivetrain"]["wheel_mass_kg"] == 14
-    assert config.source["drivetrain"]["tire_mass_kg"] == 12
-    assert config.wheel_rotational_inertia() == pytest.approx(.84656)
+    assert config.source["drivetrain"]["wheel_mass_kg"] == 17
+    assert config.source["drivetrain"]["tire_mass_kg"] == 18
+    assert config.wheel_rotational_inertia() == pytest.approx(2.53952)
     assert [config.parameter_defaults()[f"crank_axis_{axis}"] for axis in "xyz"] == pytest.approx([1, 0, 0])
     assert config.source["suspension"]["pneumatic_compression_damping"] == 3200.0
     assert config.source["suspension"]["pneumatic_rebound_damping"] == 4100.0
@@ -129,6 +131,21 @@ def test_sampled_mud_oval_has_crawler_relief_and_a_smooth_cut_course():
         "authority": "outer-courtyard-depth-map",
     }
     assert terrain["geometry_mode"] == "sampled-height-field-prism"
+
+
+def test_offroad_playground_has_distinct_obstacles_on_a_bounded_grid():
+    terrain = sampled_offroad_playground_height_field(
+        "terrain", "world", center_x=0, center_z=0, half_x=28, half_z=28,
+    )
+    surface = terrain["surface"]
+    assert surface["resolution"] == [81, 81]
+    assert surface["tracking_scope"] == "bounded-play-area-only"
+    assert surface["features"]["zones"] == [
+        "hill-climb", "rock-crawl", "whoops", "dry-creek-bed",
+        "sampled-opposing-ramps",
+    ]
+    assert max(surface["heights"]) - min(surface["heights"]) >= 2.5
+    assert len(set(surface["heights"])) > 500
 
 
 def test_contact_patch_equations_publish_pneumatic_load_and_coulomb_force_pair():
@@ -202,15 +219,15 @@ def test_contact_patch_equations_publish_pneumatic_load_and_coulomb_force_pair()
                 assert tangent_load <= values["mu_static"] * 1.18 * normal_load + 1e-6
 
 
-def test_contact_patch_compiles_through_repository_ssa_to_four_lane_webgpu():
+def test_contact_patch_compiles_through_repository_ssa_to_vectorized_webgpu():
     compiled = compile_wheel_contact_ssa()
     assert compiled.function.metadata["symbolic_dtype"] == "float32"
     assert compiled.process_graph.G.graph["sympy_translation_fallbacks"] == ()
     emitted = compile_wheel_contact_webgpu()
     assert emitted.complete
-    assert emitted.launch_plan.workgroup_size == (4, 1, 1)
-    assert emitted.launch_plan.groups == (1, 1, 1)
-    assert "@compute @workgroup_size(4, 1, 1)" in emitted.source
+    assert emitted.launch_plan.workgroup_size == (16, 1, 1)
+    assert emitted.launch_plan.groups == (2, 1, 1)
+    assert "@compute @workgroup_size(16, 1, 1)" in emitted.source
     assert len(CONTACT_PATCH_OUTPUTS) == 7
     vehicle_equations, _ = symbolic_vehicle_equations()
     arguments = {
@@ -230,6 +247,7 @@ def test_scalar_contact_wasm_fallback_puts_spring_load_into_the_chassis():
     values = {name: 0.0 for name in artifact.input_names}
     values.update({
         "dt": 1 / 120, "support": 1, "geometric_compression": .2,
+        "suspension_alignment": 1.0,
         "previous_compression": .2, "normal_y": 1, "forward_x": 1, "right_z": 1,
         "corner_weight": 620 * 9.81 / 4, "suspension_travel": .34,
         "spring_stiffness": 7200, "linkage_motion_ratio": 1,
@@ -271,7 +289,7 @@ def test_sympy_contact_precompile_is_one_opt_in_packed_tensor_dispatch():
     assert regions == ["numerical_region_0"]
     assert compiled.packed_outputs is True
     assert artifact.complete
-    assert artifact.launch_plan.workgroup_size == (4, 1, 1)
+    assert artifact.launch_plan.workgroup_size == (16, 1, 1)
     assert metadata["packed_outputs"] is True
     assert compiled.output_names == CONTACT_PATCH_OUTPUTS
     assert metadata["output_span"][-1] < metadata["output_span"][0]
@@ -311,20 +329,124 @@ def test_living_map_has_a_vehicle_slot_not_a_car_specific_control_mode():
     projection = project_class_to_div_map(VehicleProbe, seed="vehicle-probe")
     slot = projection.model["vehicle_slot"]
     vehicle = slot["vehicles"][0]
+    creature = projection.model["mechanical_creature"]
+    assert creature["subject_class"].endswith(".MechanicalCreature")
+    assert creature["active_instance"] == vehicle["identity"]
+    assert vehicle["mechanical_creature"] == creature["identity"]
+    assert set(creature["meta_objects"]) == {
+        "structure", "actuators", "stabilizers", "contact_surfaces", "parametric_engine",
+    }
+    assert creature["buffer_policy"] == "common-resident-locations-no-inter-stage-host-transfer"
+    assert set(MechanicalCreature.__annotations__) == {
+        "structure", "actuators", "stabilizers", "contact_surfaces", "parametric_engine",
+    }
+    assert vehicle["wheel_part"] == "balloon-black-current"
+    assert [part["identity"] for part in vehicle["wheel_parts"]] == [
+        "balloon-black-current", "legacy-small-brown",
+    ]
+    assert all(part["realization"] == "parametric-pneumatic-wheel-renderer"
+               for part in vehicle["wheel_parts"])
+    brown = next(part for part in vehicle["wheel_parts"]
+                 if part["identity"] == "legacy-small-brown")
+    assert brown["compound"] == "tacky-race-rubber"
+    assert brown["dry_grip_scale"] > 1
+    assert vehicle["body_shell"] == "clear-polycarbonate-rc"
+    assert {shell["identity"] for shell in vehicle["body_shells"]} == {
+        "clear-polycarbonate-rc", "fiberglass-monster-pickup", "bare-frame",
+    }
+    assert all(shell["physics"] is False for shell in vehicle["body_shells"])
+    assert any(preset["identity"] == "monster-540-blown-methanol"
+               for preset in vehicle["power_unit_presets"])
+    assert any(preset["identity"] == "monster-632-twin-turbo"
+               for preset in vehicle["power_unit_presets"])
+    assert all(preset["architecture"]["mount_vibration_reference"]
+               for preset in vehicle["power_unit_presets"])
+    assert all(preset["energy_system"]["mass_authority"].startswith("storage-shell")
+               for preset in vehicle["power_unit_presets"])
+    monster = next(preset for preset in vehicle["power_unit_presets"]
+                   if preset["identity"] == "monster-632-twin-turbo")
+    assert monster["architecture"]["cylinders"] == 8
+    assert monster["architecture"]["banks"] == 2
+    assert monster["energy_system"]["conversion"].startswith("intake-air")
+    servo = next(preset for preset in vehicle["power_unit_presets"]
+                 if preset["identity"] == "servo-direct-drive-400")
+    assert servo["kind"] == "servo-electric"
+    assert {"propulsion", "steering-assist", "chassis-articulation",
+            "auxiliary-actuation"} <= set(servo["mechanical_roles"])
+    assert vehicle["steering_control"]["front_axle_enabled"] is True
+    assert vehicle["steering_control"]["rear_axle_enabled"] is True
+    assert vehicle["steering_control"]["rear_phase"] == -1.0
+    graph = vehicle["physics"]["mechanical_graph"]
+    nodes = {node["identity"] for node in graph["nodes"]}
+    assert {"steering.proportioner", "steering.rear_pinion", "steering.rear_rack.center"} <= nodes
+    edges = {edge["identity"]: edge for edge in graph["edges"]}
+    assert edges["actuator.throttle.cable_0"]["subsystem_class"] == "routed-control-actuator"
+    assert edges["actuator.throttle.cable_0"]["tension_only"] is True
+    assert edges["actuator.throttle.lever"]["travel_table"][-1] == [1.0, .038]
+    assert graph["execution_bands"]["medium_critical_30_to_60_hz"]
+    assert edges["steering.proportioner.rear"]["subsystem_class"] == "rotary-transmission"
+    assert edges["suspension.rear_left.tie_rod"]["subsystem_class"] == "articulation-linkage"
+    for corner in WHEEL_NAMES:
+        assert edges[f"drivetrain.{corner}_halfshaft"]["b"] == (
+            f"suspension.{corner}.halfshaft_joint")
+        assert edges[f"suspension.{corner}.outer_halfshaft_joint"]["a"] == (
+            f"suspension.{corner}.halfshaft_joint")
+        assert edges[f"suspension.{corner}.outer_halfshaft_joint"]["b"] == f"suspension.{corner}.hub"
+        assert edges[f"suspension.{corner}.steering_arm"]["a"] == f"suspension.{corner}.knuckle"
+    assert edges["drivetrain.front_differential_brake"]["modulation"].startswith("abs-authority")
+    assert edges["drivetrain.rear_differential_brake"]["command"] == "rear_differential_brake"
+    assert edges["drivetrain.front_differential_brake"]["rotor_polar_inertia_kg_m2"] > 0
+    assert edges["drivetrain.front_differential_brake"]["momentum_integration_status"].startswith(
+        "declared-for-next")
+    coilover = edges["suspension.front_left.coilover"]
+    assert coilover["visualization"]["kind"] == "helical-coilover"
+    assert coilover["static_preload_compression_m"] > 0
     terrain = next(box for box in projection.model["document_geometry"]["boxes"]
                    if box["identity"] == vehicle["offroad_terrain"])
     courtyard = next(box for box in projection.model["document_geometry"]["boxes"]
                      if box["kind"] == "courtyard")
-    assert terrain["parent_identity"] == courtyard["identity"]
-    assert terrain["center"] == courtyard["center"]
-    assert terrain["half_extent"] == pytest.approx(
-        [value * .96 for value in courtyard["half_extent"]])
-    assert max(terrain["surface"]["cell_size"]) <= .51
+    boxes = projection.model["document_geometry"]["boxes"]
+    assert terrain["parent_identity"].endswith("/representation:global")
+    assert terrain["half_extent"] == [28.0, 28.0]
+    assert terrain["surface"]["resolution"] == [81, 81]
+    assert max(terrain["surface"]["cell_size"]) <= .71
+    assert sum(box["kind"] == "courtyard" for box in boxes) == 1
+    assert not any(box["surface"]["kind"] == "sampled-height-field"
+                   and box["parent_identity"] == courtyard["identity"]
+                   for box in boxes if box.get("surface"))
+    assert vehicle["driving_area"]["geometry"] == "world-floor-no-boundary-box"
+    spawn_x, _, spawn_z = vehicle["pose"]["position"]
+    terrain_x, terrain_z = terrain["center"]
+    assert abs(spawn_x - terrain_x) <= terrain["half_extent"][0]
+    assert spawn_z > terrain_z + terrain["half_extent"][1]
+    practice_ramps = [box for box in boxes if "practice-ramp" in box["identity"]]
+    assert len(practice_ramps) == 2
+    course = vehicle["elevated_skill_course"]
+    course_boxes = [box for box in boxes if box["identity"] in {
+        *course["approaches"], *course["slabs"],
+    }]
+    assert course["kind"] == "floating-thick-slab-road"
+    assert course["depth_map"] == "local-ramp-tops-only"
+    assert course["maximum_grade_percent"] < 20
+    assert len(course["approaches"]) == 2
+    assert len(course["slabs"]) == 6
+    approaches = [box for box in course_boxes if box["identity"] in course["approaches"]]
+    slabs = [box for box in course_boxes if box["identity"] in course["slabs"]]
+    assert all(box["surface"]["kind"] == "sampled-height-field" for box in approaches)
+    assert all(box["surface"]["features"]["support"] == "full-depth-slab" for box in approaches)
+    assert all(box["kind"] == "static-solid" and not box.get("surface") for box in slabs)
+    assert all(box["physics"]["collider"] == "solid-contact-surface" for box in course_boxes)
     inventory_item = next(item for item in projection.model["inventory"]["items"] if item["slot"] == 9)
     depth_item = next(item for item in projection.model["inventory"]["items"] if item["slot"] == 10)
     assert inventory_item["properties"]["operation"] == "mount-vehicle-slot"
     assert depth_item["name"] == "Depth map"
     assert vehicle["physics"]["parallel_spring_lanes"] == list(WHEEL_NAMES)
+    fallback_capabilities = {plugin["capability"] for plugin in projection.model["world"]["plugins"]}
+    assert {"vehicle-physics", "vehicle-contact-fallback"} <= fallback_capabilities
+    assert vehicle["physics"]["wasm_fallback"]["selection"] == (
+        "worker-webgpu-unavailable-or-runtime-fault"
+    )
+    assert vehicle["physics"]["contact_fallback"]["plugin"]
     webgpu_program = next(
         program for program in slot["programs"]
         if program["identity"] == vehicle["physics"]["webgpu_program"]
@@ -342,27 +464,51 @@ def test_living_map_has_a_vehicle_slot_not_a_car_specific_control_mode():
     assert tensor_contact["precompile_output_translation"] == "reducer-publications-to-authored-contact-abi"
     assert tensor_contact["wrench_row_start"] == 0
     assert tensor_contact["wrench_row_count"] == 6
-    assert wrench["input_shapes"] == [[6, 4], [4, 1]]
+    published_contact_values = len(CONTACT_PATCH_OUTPUTS) * len(WHEEL_NAMES)
+    assert wrench["input_shapes"] == [[6, published_contact_values], [published_contact_values, 1]]
     assert wrench["output_shape"] == [6, 1]
     assert ".matmul(" in wrench["abstract_tensor_source"]
     assert wrench["kernel"]["backend_variant"] == "webgpu_tiled_gemm"
-    assert wrench["kernel"]["problem_shape"] == {"m": 6, "n": 1, "k": 4}
+    assert wrench["kernel"]["problem_shape"] == {
+        "m": 6, "n": 1, "k": published_contact_values,
+    }
     assert wrench["kernel"]["scalars"] == {"alpha": 1.0, "beta": 0.0}
     assert integration["outputs"] == list(VEHICLE_STATE_OUTPUTS)
     assert integration["state_residency"] == "gpu-persistent-with-passive-presentation-snapshots"
-    assert len(integration["kernel"]["io"]["feeds"]) == 1
-    assert len(integration["kernel"]["io"]["outputs"]) == 1
+    assert integration["host_transfers_between_stages"] == 0
+    assert integration["shared_output_buffer"].startswith("one-allocation")
+    assert integration["default_specialization"]["pipeline_swap_moves_state"] is False
+    assert integration["default_specialization"]["folded_inputs"]
+    assert {"throttle", "brake", "engine_angular_speed",
+            "traction_control_authority", "abs_authority",
+            "center_differential_lock"} <= set(
+                integration["default_specialization"]["fixed_inputs"])
+    assert [stage["identity"] for stage in integration["stages"]] == [
+        "chassis-transition", "tire-suspension-control", "powertrain-reactions",
+    ]
+    assert all(len(stage["kernel"]["io"]["feeds"]) == 1 for stage in integration["stages"])
+    assert all(len(stage["kernel"]["io"]["outputs"]) == 1 for stage in integration["stages"])
+    assert all("parametric_kernel" in stage for stage in integration["stages"])
+    assert set(integration["output_slots"]) == set(VEHICLE_STATE_OUTPUTS)
+    assert all(stage["output_offset_floats"] % 64 == 0 for stage in integration["stages"])
     assert "var<workgroup> tile_A" in wrench["kernel"]["source"]
     assert projection.model["motion_cues"]["world_tiling"]["physics_effect"] == "none"
     assert projection.model["motion_cues"]["vehicle_camera"]["writes"] == ["presentation-camera"]
     assert projection.model["motion_cues"]["camera_depth"]["format"] == "DEPTH_COMPONENT24"
     assert projection.model["motion_cues"]["camera_depth"]["resolution"] == "half-viewport"
     script = projection.javascript
+    assert "architectureSpecs=[" in script
+    assert '"routed-tension-cable"' in script
+    assert 'body.appliedThrottle=Number(body.effectiveThrottle' in script
+    assert 'body.appliedThrottle=secondOrderChannel(body,"appliedThrottle"' not in script
     assert "function updateVehicleChaseCamera" in script
     assert "function initializeVehicleFirstExperience" in script
     assert "function armBrowserFullscreenOnFirstGesture" in script
     assert "initializeVehicleFirstExperience();" in script
     assert 'setShaderOnlyMode(true)' in script
+    assert 'worker.postMessage({type:"vehicle-disable-gpu"' in script
+    assert '"body-shell-glass"' in script
+    assert "gl.uniform1i(renderPass,2)" in script
     assert "function renderCameraDepthPass" in script
     assert 'box.geometry_mode==="vehicle-wheel"' in script
     assert "wheelAngles[index]+omega" in script
@@ -373,7 +519,15 @@ def test_living_map_has_a_vehicle_slot_not_a_car_specific_control_mode():
     assert "function applyDepthMapTool" in script
     assert 'recover.textContent="RIGHT CAR"' in script
     assert 'respawn.textContent="RESPAWN"' in script
-    assert "function respawnActiveVehicleAtOrigin" in script
+    assert "function respawnActiveVehicleAtAuthoredPose" in script
+    assert "respawnActiveVehicleAtOrigin" not in script
+    assert 'vehicleSpawnState(vehicle,false,{reuseParked:false})' in script
+    assert 'viewportControls.yaw=spawn.yaw' in script
+    assert 'model.vehicle_slot?.initial_state?.placement==="authored-world-pose"' in script
+    assert 'const placeAtActor=model.vehicle_slot?.initial_state?.placement==="at-player-spawn"' in script
+    assert 'setActiveVehicle(item.properties.vehicle,{placeAtActor:true,inventoryItem:item})' not in script
+    assert 'position:[...state.position],yaw:state.yaw,roll:state.roll,pitch:state.pitch' in script
+    assert "respawned at world origin" not in script
     assert 'box.geometry_mode==="sampled-height-field-prism"' in script
     assert "...vehicleRuntime.rollCageBoxes" in script
     assert "...vehicleRuntime.powertrainBoxes" in script
@@ -382,13 +536,23 @@ def test_living_map_has_a_vehicle_slot_not_a_car_specific_control_mode():
     assert 'geometry_mode:"vehicle-link"' in script
     assert "solveVehicleMechanicalGraph" in script
     assert "controlVehicleTransmission" in script
-    assert '[["ULTRA LOW","lowRange"],["DIFF LOCK","diffLock"]]' in script
+    assert '[["ULTRA LOW","lowRange"],["FRONT LOCK","frontDiffLock"],["REAR LOCK","rearDiffLock"]' in script
+    assert '"CENTER LOCK","centerDiffLock"' in script
+    assert 'dataset.frontDriveShare="true"' in script
+    assert 'powerUnitSelect.dataset.powerUnitPreset="true"' in script
+    assert 'wheelPartSelect.dataset.wheelPart="true"' in script
+    assert 'vehicleRuntime.wheelPart!=="balloon-black-current"' in script
+    assert "function selectVehicleWheelPart" in script
     assert 'button.textContent=label' in script
     assert "rebuildPortableSceneMesh({dynamicOnly:true})" in script
     assert "removeVehicleInventoryItem" in script
     assert 'event.code==="KeyV"' in script
     assert "viewportControls.yaw=state.yaw" not in script
     assert 'reportRuntimeFault("vehicle-step"' in script
+    assert 'type: "player-jump"' in script
+    assert "supportSuppressedUntil" in script
+    assert 'SMOOTH LAUNCH' in script
+    assert 'FL HOLD' in script and 'RR HOLD' in script
     assert 'reportRuntimeFault(vehicleRuntime.active?"mounted-frame":"world-frame"' in script
     assert 'disabledPresentationStages.add("wheel-shader")' in script
     assert "function synchronizeVehicleLookYaw" in script
@@ -406,7 +570,7 @@ def test_living_map_has_a_vehicle_slot_not_a_car_specific_control_mode():
     assert "drawVehicleShaderHud(gl,width,height)" in script
     assert "function drawVehicleCanvasHud" in script
     assert 'if(!liveDom)return' in script
-    assert 'if(vehicleRuntime.contactMonitor?.classList.contains("expanded"))updateVehicleContactMonitor();' in script
+    assert 'if(!shaderViewer.shaderOnly&&vehicleRuntime.contactMonitor?.classList.contains("expanded"))updateVehicleContactMonitor();' in script
     assert 'if(vehicleRuntime.contactMonitor)vehicleRuntime.contactMonitor.hidden=false;' in script
     assert 'if(vehicleRuntime.contactMonitor)vehicleRuntime.contactMonitor.hidden=true;' in script
     assert 'kind:"vehicle-driver-seat"' not in script
@@ -445,7 +609,11 @@ def test_living_map_has_a_vehicle_slot_not_a_car_specific_control_mode():
     assert fallback_plugin["abi"]["authority"] == "same-symbolic-law-as-primary-webgpu-contact-kernel"
     assert "if(!Number.isFinite(state.shiftAge))" in worker
     assert "ultra_low_range_ratio" in worker
-    assert "differential_lock:body.transmission?.diffLock?1:0" in worker
+    assert 'body.transmission?.frontDiffMode==="limited-slip"?.32' in worker
+    assert 'body.transmission?.rearDiffMode==="limited-slip"?.32' in worker
+    assert 'body.transmission?.centerDiffMode==="limited-slip"?.32' in worker
+    assert "traction_control_authority" in worker
+    assert "abs_authority" in worker
     assert '"chassis_torque_x","chassis_torque_y","chassis_torque_z"' in worker
     assert "attachment[1]*force[2]-attachment[2]*force[1]" not in worker
     assert "geometric_compression:geometricCompression" in worker
@@ -485,9 +653,16 @@ def test_living_map_has_a_vehicle_slot_not_a_car_specific_control_mode():
     assert "frontDifferentialTorque:out.front_differential_torque" in worker
     assert 'm.type==="vehicle-recover"' in worker
     assert 'm.type==="vehicle-respawn"' in worker
+    assert 'm.type==="vehicle-chassis-profile"' in worker
+    assert 'm.type==="vehicle-chassis-leveling"' in worker
+    assert "function updateVehicleChassisLeveling(body,dt)" in worker
+    assert "body.levelingOffsets" in worker
+    assert "function selectVehicleChassisProfile" in script
+    assert "function controlVehicleChassisLeveling" in script
+    assert 'action:"chassis-leveling"' in script
     assert "body.damperScales" in worker
     assert "resolveVehicleSuspensionTravelStop(body)" in worker
-    assert "support.height+s.rest_length-s.travel-attachment[1]" in worker
+    assert "support.height+s.rest_length+actuator-s.travel-attachment[1]" in worker
     channel = projection.model["loop_deployment"]["channels"][0]
     assert channel["record_layout"][8] == "vehicle.roll"
     structure = vehicle["physics"]["chassis_structure"]
@@ -498,6 +673,23 @@ def test_living_map_has_a_vehicle_slot_not_a_car_specific_control_mode():
     graph = vehicle["physics"]["mechanical_graph"]
     assert graph["state_law"].startswith("node-force-and-node-moment")
     assert all(node["wrench"].keys() == {"force", "moment"} for node in graph["nodes"])
+    profiles = vehicle["chassis_profiles"]
+    assert len(profiles) == 4
+    assert vehicle["chassis_profile"] == "dom-44x3"
+    assert {profile["material"] for profile in profiles} == {
+        "AISI 4130 chromoly", "1020 DOM steel", "A36 mild steel", "6061-T6 aluminum",
+    }
+    assert all(profile["outer_diameter_m"] > 2 * profile["wall_thickness_m"] > 0
+               for profile in profiles)
+    assert all(profile["member_mass_kg"] > 0 and profile["axial_yield_force_n"] > 0
+               for profile in profiles)
+    chassis_members = [edge for edge in graph["edges"] if edge.get("chassis_profile_member")]
+    assert chassis_members
+    assert all(edge["identity"].startswith(("frame.", "cage.")) for edge in chassis_members)
+    assert all(edge["damage"]["axial_stiffness_n_per_m"] > 0 for edge in chassis_members)
+    leveling = vehicle["chassis_leveling"]
+    assert leveling["force_law"].startswith("pose-changes-only-through-existing-spring")
+    assert leveling["maximum_actuator_rate_m_s"] < .1
     mass_nodes = {node["identity"]: node["mass_kg"] for node in graph["nodes"]
                   if node.get("mass_in_total")}
     assert mass_nodes["powertrain.engine"] == 142
@@ -538,9 +730,9 @@ def test_living_map_has_a_vehicle_slot_not_a_car_specific_control_mode():
     initial = slot["initial_state"]
     assert initial == {
         "mounted_vehicle": vehicle["identity"],
-        "placement": "at-player-spawn",
+        "placement": "authored-world-pose",
         "presentation": "full-viewport-driving",
-        "browser_fullscreen": "request-on-first-user-gesture",
+        "browser_fullscreen": "user-invoked-only",
         "dismount_enabled": True,
     }
     torque_graph = vehicle["physics"]["torque_graph"]
@@ -583,7 +775,8 @@ def test_chassis_wasm_contract_is_force_driven_and_persists_full_pose_and_wheel_
     assert {f"traction_scale_{wheel}" for wheel in WHEEL_NAMES} <= publications
     assert {f"brake_scale_{wheel}" for wheel in WHEEL_NAMES} <= publications
     assert {f"damper_scale_{wheel}" for wheel in WHEEL_NAMES} <= publications
-    assert {"differential_lock", "differential_lock_stiffness",
+    assert {"front_differential_lock", "rear_differential_lock", "center_differential_lock",
+            "traction_control_authority", "abs_authority", "differential_lock_stiffness",
             "differential_lock_maximum_torque"} <= arguments
     assert {"active_damping_minimum_scale", "active_damping_maximum_scale",
             "active_damping_body_velocity_gain_s_per_m"} <= arguments
@@ -611,12 +804,16 @@ def test_gpu_terrain_contact_is_spatially_and_temporally_top_skin_crossing_aware
     assert "spatial_crossing" in source
     assert "temporal_crossing" in source
     assert "mix(world_hub, probe, fraction)" in source
-    assert "support_position = evaluation_position" in source
+    assert "integral_position += evaluation_position * penetration" in source
+    assert "tire_radial_compression = integral_penetration / 15.0f" in source
+    assert "radial_probes[lane * 15u" in source
     assert "wall_colliders: array<f32>" in source
-    assert "let wall_count = u32(terrain_parameters[11u])" in source
+    assert "let wall_count = u32(terrain_parameters[1u])" in source
+    assert "let field_count = u32(terrain_parameters[0u])" in source
+    assert "if (any(world_hub < wall_minimum - broadphase_reach)" in source
     assert "let slice_hub = world_hub + axle" in source
     assert "tire_radial_compression" in source
-    assert program["terrain_contact_geometry"]["terrain_parameter_abi"][-1] == "wall_count"
+    assert program["terrain_contact_geometry"]["terrain_parameter_abi"][:2] == ["field_count", "wall_count"]
     assembly = program["graph_adapters"]["assembly"]["source"]
     assert "normal_load * normal_load" not in assembly
     assert "normal_load_0 * normal_load_0" in assembly
@@ -631,6 +828,9 @@ def test_abs_and_traction_sensors_are_compiled_persistent_second_order_states():
     publications = {str(equation.lhs) for equation in equations}
     assert "slip_sensor_frequency_hz" in symbols
     assert "utilization_sensor_frequency_hz" in symbols
+    outputs = {str(equation.lhs): equation.rhs for equation in equations}
+    assert symbols["traction_control_authority"] in outputs["traction_scale_front_left"].free_symbols
+    assert symbols["abs_authority"] in outputs["brake_scale_front_left"].free_symbols
     for wheel in WHEEL_NAMES:
         assert f"slip_sensor_velocity_{wheel}" in symbols
         assert f"measured_friction_utilization_{wheel}" in symbols
@@ -650,14 +850,65 @@ def test_symbolic_diff_lock_exchanges_equalizing_torque_across_each_axle():
 
     def wheel_pair(locked: float) -> tuple[float, float]:
         substitutions = {symbols[name]: value for name, value in values.items() if name in symbols}
-        substitutions[symbols["differential_lock"]] = locked
+        substitutions[symbols["front_differential_lock"]] = locked
         return tuple(float(outputs[f"wheel_omega_{name}_next"].evalf(subs=substitutions))
                      for name in ("front_left", "front_right"))
 
     open_left, open_right = wheel_pair(0.0)
+    limited_left, limited_right = wheel_pair(.32)
     locked_left, locked_right = wheel_pair(1.0)
+    assert locked_left < limited_left < open_left
+    assert open_right < limited_right < locked_right
     assert locked_left < open_left
     assert locked_right > open_right
+
+
+def test_symbolic_center_limited_slip_transfers_equal_torque_between_axles():
+    equations, symbols = symbolic_vehicle_equations()
+    outputs = {str(equation.lhs): equation.rhs for equation in equations}
+    config = load_default_car_configuration()
+    values = {name: 0.0 for name in symbols}
+    values.update(config.parameter_defaults())
+    values.update({"dt": 1 / 120, "yaw_cos": 1.0, "transfer_case_ratio": 1.0,
+                   "wheel_omega_front_left": 0.0, "wheel_omega_front_right": 0.0,
+                   "wheel_omega_rear_left": 12.0, "wheel_omega_rear_right": 12.0})
+
+    def wheel_speeds(coupling: float) -> tuple[float, float]:
+        substitutions = {symbols[name]: value for name, value in values.items() if name in symbols}
+        substitutions[symbols["center_differential_lock"]] = coupling
+        front = sum(float(outputs[f"wheel_omega_{name}_next"].evalf(subs=substitutions))
+                    for name in ("front_left", "front_right")) / 2
+        rear = sum(float(outputs[f"wheel_omega_{name}_next"].evalf(subs=substitutions))
+                   for name in ("rear_left", "rear_right")) / 2
+        return front, rear
+
+    open_front, open_rear = wheel_speeds(0.0)
+    limited_front, limited_rear = wheel_speeds(.32)
+    locked_front, locked_rear = wheel_speeds(1.0)
+    assert open_front < limited_front < locked_front
+    assert open_rear > limited_rear > locked_rear
+
+
+def test_symbolic_drivetrain_conserves_wheel_and_chassis_reaction_torque():
+    equations, _ = symbolic_vehicle_equations()
+    outputs = {str(equation.lhs): equation.rhs for equation in equations}
+    residual = (
+        outputs["drivetrain_chassis_reaction_torque"]
+        + outputs["front_differential_torque"]
+        + outputs["rear_differential_torque"]
+        - outputs["tire_contact_reaction_torque"]
+        - outputs["service_brake_reaction_torque"]
+        - outputs["rolling_resistance_reaction_torque"]
+    )
+    assert sympy.simplify(residual) == 0
+
+
+def test_slipping_clutch_does_not_reflect_engine_inertia_into_wheel_acceleration():
+    equations, symbols = symbolic_vehicle_equations()
+    outputs = {str(equation.lhs): equation.rhs for equation in equations}
+    wheel_step = outputs["wheel_omega_front_left_next"]
+    assert sympy.simplify(sympy.diff(wheel_step, symbols["engine_rotating_inertia"])) == 0
+    assert sympy.simplify(sympy.diff(wheel_step, symbols["maximum_wheel_speed"])) == 0
 
 
 def test_emitted_wasm_turns_pedal_into_wheel_spin_not_commanded_chassis_speed():
@@ -701,12 +952,12 @@ console.log(JSON.stringify(Array.from(memory.slice(start,start+count))));})().ca
     assert 1.0 < result["damper_scale_front_left"] <= 1.18
     assert result["damper_scale_front_left"] > result["damper_scale_front_right"]
     assert result["engine_torque"] > 0
-    assert result["clutch_torque"] < result["engine_torque"]
+    assert result["clutch_torque"] > result["engine_torque"]
     assert result["transmission_output_torque"] > result["clutch_torque"]
     assert result["driveline_torque"] > result["transmission_output_torque"]
     assert result["front_differential_torque"] == pytest.approx(result["driveline_torque"] * .42)
     assert result["rear_differential_torque"] == pytest.approx(result["driveline_torque"] * .58)
-    assert result["engine_angular_acceleration"] > 0
+    assert result["engine_angular_acceleration"] < 0
     assert result["powertrain_reaction_torque_x"] == pytest.approx(
         -result["engine_acceleration_torque"])
     assert result["powertrain_reaction_torque_y"] == pytest.approx(0)
