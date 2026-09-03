@@ -20407,8 +20407,32 @@ def _class_surface_ssa_program(
     # ABI/physical type on the formal remains authoritative; otherwise the
     # authored caller occurrence replaces a default/unaccounted formal type.
     changed_call_types = True
+    # A converging pass changes at least one value's rank or dtype and never
+    # reverts one, so the number of passes is bounded by the number of call
+    # operand facts.  A pass count beyond that bound is a cycle, and a cycle
+    # here is a defect in the unification rules, not in the program: refuse
+    # with the cycling values named instead of spinning (the managed tire's
+    # lowering sat 3.5 h in this loop on 2026-09-03).
+    call_type_passes = 0
+    call_type_pass_bound = 64 + 4 * sum(
+        len(instruction.args)
+        for caller in all_functions.values()
+        for block in caller.blocks.values()
+        for instruction in block.instrs
+        if instruction.op in {"Call", "call"}
+    )
+    call_type_pass_changes: list[str] = []
     while changed_call_types:
         changed_call_types = False
+        call_type_passes += 1
+        if call_type_passes > call_type_pass_bound:
+            raise ValueError(
+                "call rank/dtype unification did not converge after "
+                f"{call_type_passes - 1} passes (bound {call_type_pass_bound}); "
+                "the last pass still changed: "
+                + "; ".join(call_type_pass_changes[-12:])
+            )
+        call_type_pass_changes = []
         for caller in all_functions.values():
             for block in caller.blocks.values():
                 for instruction in block.instrs:
@@ -20452,6 +20476,10 @@ def _class_surface_ssa_program(
                                 "ssa_call_rank": call_rank,
                             }
                             changed_call_types = True
+                            call_type_pass_changes.append(
+                                f"rank {caller.name}->{callee.name} value "
+                                f"{int(value.id)} -> {call_rank}"
+                            )
 
                         actual_dtype = str(actual.dtype or "")
                         formal_dtype = str(formal.dtype or "")
@@ -20489,6 +20517,37 @@ def _class_surface_ssa_program(
                             # It outranks a dtype previously inferred onto the
                             # consumer formal, but never an explicit physical
                             # or program-ABI declaration.
+                            #
+                            # It also never outranks ANOTHER exact result
+                            # already contracted onto the same formal: two
+                            # call sites handing one formal exact results of
+                            # different dtypes is a conflict in the authored
+                            # program, and re-applying each site in turn
+                            # flipped the formal forever (the managed tire's
+                            # lowering sat 3.5 h in this loop on 2026-09-03).
+                            # Refuse loudly, exactly as the shape fixed point
+                            # above does.
+                            previous_source = formal_accounting.get(
+                                "ssa_call_result_source"
+                            )
+                            this_source = tuple(
+                                (actual.accounting or {})["ssa_call_result_from"]
+                            )
+                            if (
+                                formal_accounting.get("ssa_call_dtype")
+                                and previous_source is not None
+                                and tuple(previous_source) != this_source
+                            ):
+                                raise ValueError(
+                                    "conflicting exact call-result dtypes on one "
+                                    f"formal of {callee.name!r}: formal id "
+                                    f"{int(formal.id)} is {formal_dtype!r} from "
+                                    f"{tuple(previous_source)!r} and "
+                                    f"{actual_dtype!r} from {this_source!r} "
+                                    f"(caller {caller.name!r}, actual id "
+                                    f"{int(actual.id)}); the authored program "
+                                    "hands one parameter two dtypes"
+                                )
                             formal.dtype = actual.dtype
                             formal.accounting = {
                                 **formal_accounting,
@@ -20500,6 +20559,10 @@ def _class_surface_ssa_program(
                                 ),
                             }
                             changed_call_types = True
+                            call_type_pass_changes.append(
+                                f"exact-result {caller.name}->{callee.name} formal "
+                                f"{int(formal.id)} {formal_dtype!r}->{actual_dtype!r}"
+                            )
                         elif (
                             formal_is_contracted
                             and actual_is_link_storage
@@ -20513,6 +20576,10 @@ def _class_surface_ssa_program(
                                 "ssa_call_dtype": formal_dtype,
                             }
                             changed_call_types = True
+                            call_type_pass_changes.append(
+                                f"link-storage {caller.name}->{callee.name} actual "
+                                f"{int(actual.id)} {actual_dtype!r}->{formal_dtype!r}"
+                            )
                         elif (
                             actual_dtype
                             and actual_dtype != "unknown"
@@ -20525,6 +20592,10 @@ def _class_surface_ssa_program(
                                 "ssa_call_dtype": actual_dtype,
                             }
                             changed_call_types = True
+                            call_type_pass_changes.append(
+                                f"uncontracted {caller.name}->{callee.name} formal "
+                                f"{int(formal.id)} {formal_dtype!r}->{actual_dtype!r}"
+                            )
                         elif (
                             formal_dtype
                             and formal_dtype != "unknown"
@@ -20532,6 +20603,10 @@ def _class_surface_ssa_program(
                         ):
                             actual.dtype = formal.dtype
                             changed_call_types = True
+                            call_type_pass_changes.append(
+                                f"unknown-actual {caller.name}->{callee.name} actual "
+                                f"{int(actual.id)} -> {formal_dtype!r}"
+                            )
 
     # Argument equality reaches its fixed point before result projection.
     # Projecting results inside that bidirectional loop lets provisional
