@@ -49,40 +49,45 @@ from .vehicle_native_graph_program import (
 FIXTURE_CORNERS = ("front_left", "front_right", "rear_left", "rear_right")
 
 
-def _runtime_maximum(*values: Any) -> Any:
-    def combine(left, right):
-        if hasattr(left, "maximum"):
-            return left.maximum(right)
-        if hasattr(right, "maximum"):
-            return right.maximum(left)
-        return max(left, right)
-    return reduce(combine, values)
+def symbolic_abstract_tensor_source(compilation: Any, function_name: str) -> str:
+    """The AbstractTensor stage of one sympy-authored law, as Python source.
 
-
-def _runtime_minimum(*values: Any) -> Any:
-    def combine(left, right):
-        if hasattr(left, "minimum"):
-            return left.minimum(right)
-        if hasattr(right, "minimum"):
-            return right.minimum(left)
-        return min(left, right)
-    return reduce(combine, values)
-
-
-def _runtime_unary(value: Any, method: str, scalar) -> Any:
-    operation = getattr(value, method, None)
-    return operation() if operation is not None else scalar(value)
-
-
-@lru_cache(maxsize=2)
-def _vehicle_python_runtime_bindings_cached(
-    include_configured_vehicle: bool,
-) -> Mapping[str, Any]:
-    """Lambdify the exact symbolic callees used by the authored graph.
-
-    This is an eager execution boundary only.  Compiler lowering continues to
-    receive the retained process graphs and never receives these callables.
+    This is the same lowering the contact law already goes through
+    (``compile_wheel_contact_abstract_tensor``): common subexpressions are
+    named, every intrinsic is spelled as the AbstractTensor method, and the
+    function takes and returns batch columns.  It is the program the native
+    product is lowered from, so executing it eagerly IS running the program.
     """
+
+    from .abstract_ui_vehicles import _abstract_tensor_python
+
+    metadata = compilation.function.metadata
+    argument_names = tuple(metadata["argument_names"])
+    output_names = tuple(metadata["output_names"])
+    by_name = {str(equation.lhs): equation.rhs for equation in compilation.equations}
+    replacements, reduced = sympy.cse(
+        [by_name[name] for name in output_names],
+        symbols=sympy.numbered_symbols("tensor_tmp_"),
+        order="canonical",
+    )
+    lines = [f"def {function_name}({', '.join(argument_names)}):"]
+    lines.extend(
+        f"    {temporary} = {_abstract_tensor_python(expression)}"
+        for temporary, expression in replacements
+    )
+    returned = ", ".join(_abstract_tensor_python(expression) for expression in reduced)
+    lines.append(f"    return ({returned},)" if len(reduced) == 1 else f"    return {returned}")
+    return chr(10).join(lines) + chr(10)
+
+
+def _abstract_tensor_stage_callable(compilation: Any, function_name: str):
+    namespace: dict[str, Any] = {"AbstractTensor": AbstractTensor}
+    exec(symbolic_abstract_tensor_source(compilation, function_name), namespace)
+    return namespace[function_name]
+
+
+def symbolic_law_compilations(include_configured_vehicle: bool) -> dict[str, Any]:
+    """The sympy-authored laws the authored graph calls by name."""
 
     compilations = {
         "vehicle_member_material_step": compile_vehicle_member_material_ssa(),
@@ -90,29 +95,27 @@ def _vehicle_python_runtime_bindings_cached(
     if include_configured_vehicle:
         compilations["abstract_ui_vehicle_step"] = (
             compile_symbolic_vehicle_physics())
+    return compilations
+
+
+@lru_cache(maxsize=2)
+def _vehicle_python_runtime_bindings_cached(
+    include_configured_vehicle: bool,
+) -> Mapping[str, Any]:
+    """Bind each sympy-authored law as its AbstractTensor stage.
+
+    One program, three stages: authored Python -> AbstractTensor Python ->
+    native.  The bindings ARE the middle stage, the program the native
+    product is lowered from; nothing else is a faithful execution of the
+    authored graph, so nothing else is offered here.
+
+    This is an eager execution boundary only.  Compiler lowering continues to
+    receive the retained process graphs and never receives these callables.
+    """
+
     bindings = balloon_tire_python_bindings()
-    modules = [{
-        "Max": _runtime_maximum,
-        "Min": _runtime_minimum,
-        "sqrt": lambda value: _runtime_unary(value, "sqrt", math.sqrt),
-        "sin": lambda value: _runtime_unary(value, "sin", math.sin),
-        "cos": lambda value: _runtime_unary(value, "cos", math.cos),
-        "Abs": lambda value: _runtime_unary(value, "abs", abs),
-        "tanh": lambda value: _runtime_unary(value, "tanh", math.tanh),
-        "exp": lambda value: _runtime_unary(value, "exp", math.exp),
-    }]
-    for name, compilation in compilations.items():
-        metadata = compilation.function.metadata
-        equations_by_name = {
-            str(equation.lhs): equation.rhs
-            for equation in compilation.equations
-        }
-        bindings[name] = sympy.lambdify(
-            tuple(sympy.Symbol(argument) for argument in metadata["argument_names"]),
-            tuple(equations_by_name[output] for output in metadata["output_names"]),
-            modules=modules,
-            cse=True,
-        )
+    for name, compilation in symbolic_law_compilations(include_configured_vehicle).items():
+        bindings[name] = _abstract_tensor_stage_callable(compilation, name)
     return bindings
 
 
