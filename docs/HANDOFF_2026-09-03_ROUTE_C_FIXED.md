@@ -287,3 +287,22 @@ still alive in stage 1 (left alone, per the user).
   before spending a full build.
 - Vehicle-body parity (C/LLVM/Fortran, 64 frames) was launched detached
   after the kill; result in scratchpad `vehicle_parity2.log` / `vehicle_body_parity.json`.
+
+## Session 3 addendum 3: parity, Fortran, and the build-stall diagnosis
+
+- Vehicle-body parity (64 fed-back frames): C and LLVM max_abs 3.7e-9 vs the
+  sympy reference, inside the authority's own 1-ULP self-divergence (7.5e-9;
+  `air_mix_reserve_pressure_pa` is threshold-like at frame 0); C/LLVM 4.5e-13.
+  Fortran was unemittable: the Fortran SSA-op table lacked "Tanh" (its
+  lowercase "tanh" is the recorded-tape table). Fixed (`c5a015cb`), 0
+  shortfalls; the Fortran parity run of the body is NOT yet done.
+- Stale test fixed: Fortran typed literal `2.0_c_double` (`5e051f8b`).
+- Build stall: `lower_balloon_tire_managed_python_ssa(batch_size=1)` passes
+  the planner (134 s) and every shell's AOT lowering (269 s) and then stalls
+  in "lowering full planned source to repository SSA" (killed at 25 min).
+  The three constructs new to that program today (`while True`/`continue`
+  retry loop; rewritten `coerce_metrics`; `_scalar`) each lower in 1.4 s in
+  isolation (scratchpad `isolate_stall.py`), so the stall is scale- or
+  interaction-dependent. A py-spy stack dump of the stalled lowering was
+  taken next (scratchpad `lower_managed2.log`, task output) - read it before
+  attempting any full native build.
