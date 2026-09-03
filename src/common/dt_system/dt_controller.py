@@ -58,6 +58,26 @@ class Targets:
     # at all (``power_w == 0``) carries no information about a safe larger
     # step, so dt is held rather than grown.
     energy_exchange_fraction: float | None = None
+    # Shadow-trajectory amplification (see ``dt_system.shadow``).  When set,
+    # a core advanced through ``shadow_advance`` publishes ``shadow_growth``,
+    # the measured factor by which a small perturbation grew during the
+    # step, and the next attempt is pinned so a step may amplify by at most
+    # this factor: ``dt <= dt * ln(shadow_growth_max) / ln(shadow_growth)``.
+    shadow_growth_max: float | None = None
+
+
+def _shadow_dt_limit(dt_tensor, metrics: Metrics, targets: "Targets"):
+    growth_max = getattr(targets, "shadow_growth_max", None)
+    if growth_max is None:
+        return None
+    channels = metrics.error_channels or {}
+    if "shadow_growth" not in channels:
+        return None
+    from .shadow import shadow_dt_limit
+
+    return shadow_dt_limit(
+        float(dt_tensor.item()), _scalar(channels["shadow_growth"]), float(growth_max),
+    )
 
 
 def _energy_time_limit(metrics: Metrics, targets: "Targets"):
@@ -94,6 +114,9 @@ def _apply_energy_sidechain(dt_next, dt_tensor, metrics: Metrics, targets: "Targ
         dt_next = AbstractTensor.minimum(dt_next, AbstractTensor.tensor(limit))
     if _no_exchange_observed(metrics, targets):
         dt_next = AbstractTensor.minimum(dt_next, dt_tensor)
+    growth_limit = _shadow_dt_limit(dt_tensor, metrics, targets)
+    if growth_limit is not None:
+        dt_next = AbstractTensor.minimum(dt_next, AbstractTensor.tensor(growth_limit))
     return dt_next
 
 

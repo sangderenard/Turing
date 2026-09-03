@@ -1940,8 +1940,16 @@ def _passive_radial_ringdown(
 
 
 def _hard_positive(value: sympy.Basic) -> sympy.Basic:
-    """Branch-free exact positive part that lowers as scalar/tensor Abs."""
-    return (value + sympy.Abs(value)) / 2
+    """Exact positive part, spelled as the single relational select ``Max``.
+
+    ``(value + Abs(value)) / 2`` is the same function in real arithmetic but
+    relies on ``value`` and ``Abs(value)`` cancelling exactly; SymPy's
+    automatic evaluation distributes the halving and re-spells the operands,
+    so a compiled schedule keeps a few-ULP residue (measured on the member
+    material's identical gate: a phantom 2**-14 failure fraction).  ``Max``
+    is supported by every backend and by the AbstractTensor printer.
+    """
+    return sympy.Max(value, 0)
 
 
 def _hard_clamp(value: sympy.Basic, lower: sympy.Basic | float,
