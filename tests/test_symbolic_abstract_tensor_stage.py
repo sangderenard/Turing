@@ -44,8 +44,11 @@ def test_tensor_stage_source_is_batch_column_python():
     compilation = symbolic_law_compilations(False)["vehicle_member_material_step"]
     source = symbolic_abstract_tensor_source(compilation, "vehicle_member_material_step")
     assert source.startswith("def vehicle_member_material_step(")
-    assert ".maximum(" in source and ".sqrt()" in source
-    assert "lambdify" not in source and "math." not in source
+    # The compiler's own vocabulary: Max/Min as the tensor methods, the
+    # square root as the SSA's Pow with a constant exponent (``t ** t_half``),
+    # and no scalar-Python spellings anywhere.
+    assert ".maximum(" in source and " ** " in source
+    assert "lambdify" not in source and "math." not in source and "abs(" not in source
 
 
 def test_bindings_are_the_tensor_stage_and_nothing_else():

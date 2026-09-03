@@ -52,38 +52,53 @@ FIXTURE_CORNERS = ("front_left", "front_right", "rear_left", "rear_right")
 def symbolic_abstract_tensor_source(compilation: Any, function_name: str) -> str:
     """The AbstractTensor stage of one sympy-authored law, as Python source.
 
-    This is the same lowering the contact law already goes through
-    (``compile_wheel_contact_abstract_tensor``): common subexpressions are
-    named, every intrinsic is spelled as the AbstractTensor method, and the
-    function takes and returns batch columns.  It is the program the native
-    product is lowered from, so executing it eagerly IS running the program.
+    One program, three stages: the law is ingested by the compiler into the
+    process graph and SSA (``compile_sympy_equations``: CSE, identities,
+    precision contracts), and this returns the compiler's own Python
+    materialization of THAT SSA in the AbstractTensor vocabulary
+    (``ssa_python_materializer``), taking and returning batch columns.  It is
+    the very program the native product is lowered from, so executing it
+    eagerly is running the program.  No sympy printer is involved.
     """
 
-    from .abstract_ui_vehicles import _abstract_tensor_python
+    import ast
+
+    from .ssa_python_materializer import materialize_function_body
 
     metadata = compilation.function.metadata
     argument_names = tuple(metadata["argument_names"])
-    output_names = tuple(metadata["output_names"])
-    by_name = {str(equation.lhs): equation.rhs for equation in compilation.equations}
-    replacements, reduced = sympy.cse(
-        [by_name[name] for name in output_names],
-        symbols=sympy.numbered_symbols("tensor_tmp_"),
-        order="canonical",
+    statements, uses_math = materialize_function_body(
+        compilation.function, parameter_names=argument_names, tensor_vocabulary=True,
     )
-    lines = [f"def {function_name}({', '.join(argument_names)}):"]
-    lines.extend(
-        f"    {temporary} = {_abstract_tensor_python(expression)}"
-        for temporary, expression in replacements
+    function = ast.FunctionDef(
+        name=function_name,
+        args=ast.arguments(
+            posonlyargs=[], args=[ast.arg(arg=name) for name in argument_names],
+            vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[],
+        ),
+        body=list(statements), decorator_list=[], returns=None,
     )
-    returned = ", ".join(_abstract_tensor_python(expression) for expression in reduced)
-    lines.append(f"    return ({returned},)" if len(reduced) == 1 else f"    return {returned}")
-    return chr(10).join(lines) + chr(10)
+    body: list[ast.stmt] = []
+    if uses_math:
+        body.append(ast.Import(names=[ast.alias(name="math")]))
+    body.append(function)
+    module = ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
+    return ast.unparse(module) + chr(10)
 
 
 def _abstract_tensor_stage_callable(compilation: Any, function_name: str):
     namespace: dict[str, Any] = {"AbstractTensor": AbstractTensor}
     exec(symbolic_abstract_tensor_source(compilation, function_name), namespace)
-    return namespace[function_name]
+    stage = namespace[function_name]
+    output_count = len(compilation.function.metadata["output_names"])
+    if output_count == 1:
+        # The materializer returns a bare value for a one-output law; the
+        # authored graph always unpacks a tuple.
+        def stage_tuple(*arguments):
+            return (stage(*arguments),)
+        stage_tuple.__name__ = function_name
+        return stage_tuple
+    return stage
 
 
 def symbolic_law_compilations(include_configured_vehicle: bool) -> dict[str, Any]:

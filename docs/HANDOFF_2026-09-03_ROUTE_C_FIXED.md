@@ -245,3 +245,18 @@ python -m pytest tests/test_ssa_python_materializer.py tests/test_auto_port_nump
 Expect: 10 pre-existing unrelated failures (counted-loop/storage-formal
 metadata), everything else green, including the 7 new tests for the fixes
 documented here.
+
+## Session 3 addendum (same day): Phase 4 step 2 DONE
+
+`vehicle_python_compilation.symbolic_abstract_tensor_source` now calls
+`ssa_python_materializer.materialize_function_body(compilation.function,
+parameter_names=argument_names, tensor_vocabulary=True)` and assembles the
+`def` with `ast`; no sympy printer, no re-derived CSE. The eager bindings
+are therefore the compiler's own AbstractTensor materialization of the same
+SSA the native product is lowered from. `tests/test_symbolic_abstract_tensor_stage.py`
+(4 tests) passes: both laws match the sympy reference per lane on batch
+columns; the source spells Max/Min as tensor methods and sqrt as the SSA Pow
+with a constant exponent, with no `math.`/`abs(`/lambdify. Remaining
+consumer of the old printer: `compile_wheel_contact_abstract_tensor`
+(needs a WGSL build to verify; approval required). Native build PID 16920
+still alive in stage 1 (left alone, per the user).
