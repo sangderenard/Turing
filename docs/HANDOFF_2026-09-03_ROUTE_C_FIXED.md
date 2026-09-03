@@ -260,3 +260,30 @@ with a constant exponent, with no `math.`/`abs(`/lambdify. Remaining
 consumer of the old printer: `compile_wheel_contact_abstract_tensor`
 (needs a WGSL build to verify; approval required). Native build PID 16920
 still alive in stage 1 (left alone, per the user).
+
+## Session 3 addendum 2: Phase 4 steps 3 and 4 DONE; stale build killed
+
+- `compile_wheel_contact_abstract_tensor` now takes its captured source from
+  `symbolic_abstract_tensor_source(compile_wheel_contact_ssa(), ...)` (the
+  compiler's materialization of the contact SSA). WGSL precompile: complete,
+  40 lanes, zero numeric receivers, no `math.`. Targeted tests pass
+  (`test_contact_patch_compiles_through_repository_ssa_to_vectorized_webgpu`,
+  `test_sympy_contact_precompile_is_one_opt_in_packed_tensor_dispatch`,
+  `test_packed_contact_wrench_rows_translate_past_tensor_contact_area`).
+  Two assertions in the dispatch test were updated: the `(16, 1, 1)`
+  workgroup expectation was stale since 2026-08-27 (contact lanes are 40 now;
+  planner picks 32x2), and the root's spelling may be `.sqrt()` or the SSA
+  `Pow` with a constant exponent.
+- `_AbstractTensorPythonPrinter` / `_abstract_tensor_python` DELETED (no
+  consumers remain). `tests/test_symbolic_abstract_tensor_stage.py` now
+  proves all three laws (material, vehicle body, contact) against the sympy
+  reference per lane on batch columns.
+- The stale native build (PID 16920, 3.5 h in stage 1) was killed on the
+  user's instruction. Hypothesis to check BEFORE the next build: stage 1
+  lowers the managed tire including `dt_controller.step_with_dt_control_used`,
+  which this session converted from tail recursion to `while True` +
+  `continue`; the control lowering may not terminate on that shape. Verify
+  with `lower_balloon_tire_managed_python_ssa` under a hard timeout, detached,
+  before spending a full build.
+- Vehicle-body parity (C/LLVM/Fortran, 64 frames) was launched detached
+  after the kill; result in scratchpad `vehicle_parity2.log` / `vehicle_body_parity.json`.

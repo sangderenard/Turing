@@ -21,16 +21,26 @@ from src.compiler.vehicle_python_compilation import (
 from tools.frame_parity import python_backend
 
 
-@pytest.mark.parametrize("law", ("vehicle_member_material_step", "abstract_ui_vehicle_step"))
+def _law(name):
+    if name == "abstract_ui_wheel_contact":
+        from src.compiler.abstract_ui_vehicles import compile_wheel_contact_ssa
+        return compile_wheel_contact_ssa()
+    return symbolic_law_compilations(True)[name]
+
+
+@pytest.mark.parametrize("law", ("vehicle_member_material_step", "abstract_ui_vehicle_step", "abstract_ui_wheel_contact"))
 def test_tensor_stage_matches_the_sympy_reference_on_batch_columns(law):
-    compilation = symbolic_law_compilations(True)[law]
+    compilation = _law(law)
     names = tuple(compilation.function.metadata["argument_names"])
     outputs = tuple(compilation.function.metadata["output_names"])
     rng = np.random.default_rng(7)
     batch = rng.uniform(0.5, 2.0, size=(3, len(names)))
     columns = {name: AbstractTensor.tensor(batch[:, i].copy()) for i, name in enumerate(names)}
 
-    got = vehicle_python_runtime_bindings()[law](*(columns[name] for name in names))
+    from src.compiler.vehicle_python_compilation import _abstract_tensor_stage_callable
+    stage = (vehicle_python_runtime_bindings()[law] if law != "abstract_ui_wheel_contact"
+             else _abstract_tensor_stage_callable(compilation, law))
+    got = stage(*(columns[name] for name in names))
     reference = python_backend(compilation)
     want = np.stack([reference(batch[lane]) for lane in range(batch.shape[0])], axis=1)
 

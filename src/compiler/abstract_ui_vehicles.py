@@ -13,7 +13,6 @@ import re
 from typing import Any, Callable, Mapping
 
 import sympy
-from sympy.printing.pycode import PythonCodePrinter
 
 from .abstract_ui_world import WorldWasmPlugin
 from .ssa_wasm_backend import SSAWasmArtifact, emit_ssa_function_to_wasm
@@ -3935,39 +3934,6 @@ def symbolic_wheel_contact_wasm_plugin() -> WorldWasmPlugin:
     )
 
 
-class _AbstractTensorPythonPrinter(PythonCodePrinter):
-    """Spell supported SymPy intrinsics as native AbstractTensor methods."""
-
-    def _print_Pow(self, expression):  # noqa: N802 - SymPy printer protocol
-        if expression.exp == sympy.S.Half:
-            return f"({self._print(expression.base)}).sqrt()"
-        return super()._print_Pow(expression)
-
-    def _print_tanh(self, expression):
-        return f"({self._print(expression.args[0])}).tanh()"
-
-    def _print_Min(self, expression):  # noqa: N802 - SymPy printer protocol
-        rendered = self._print(expression.args[0])
-        for argument in expression.args[1:]:
-            rendered = f"({rendered}).minimum({self._print(argument)})"
-        return rendered
-
-    def _print_Max(self, expression):  # noqa: N802 - SymPy printer protocol
-        rendered = self._print(expression.args[0])
-        for argument in expression.args[1:]:
-            rendered = f"({rendered}).maximum({self._print(argument)})"
-        return rendered
-
-
-_ABSTRACT_TENSOR_PYTHON_PRINTER = _AbstractTensorPythonPrinter()
-
-
-def _abstract_tensor_python(expression: sympy.Basic) -> str:
-    """Print scalar SymPy as elementwise AbstractTensor-friendly Python."""
-
-    return _ABSTRACT_TENSOR_PYTHON_PRINTER.doprint(expression)
-
-
 @lru_cache(maxsize=2)
 def compile_wheel_contact_abstract_tensor(
     *, packed_outputs: bool = False,
@@ -3995,29 +3961,17 @@ def compile_wheel_contact_abstract_tensor(
     from .precompile_to_ssa import lower_precompile_and_control_to_ssa
     from .tensor_ssa_lowering import lower_tensor_calls_to_repository_ssa
 
-    equations, _ = symbolic_wheel_contact_equations()
-    output_symbols = {equation.lhs for equation in equations}
-    # Match ``compile_sympy_equations``' stable ABI rule directly.  Invoking
-    # the complete scalar compiler here merely to rediscover this sorted set
-    # used to make the tensor precompile pay for two independent compilations.
-    argument_names = tuple(sorted({
-        str(symbol)
-        for equation in equations
-        for symbol in equation.rhs.free_symbols - output_symbols
-    }))
-    replacements, reduced = sympy.cse(
-        [equation.rhs for equation in equations],
-        symbols=sympy.numbered_symbols("tensor_tmp_"),
-        order="canonical",
+    # One program, three stages: the contact law's AbstractTensor stage is the
+    # compiler's own materialization of the SSA that compile_wheel_contact_ssa
+    # produced (CSE, identities, precision contracts), not a sympy printer.
+    # That SSA is disk-cached per source revision, so this costs nothing.
+    from .vehicle_python_compilation import symbolic_abstract_tensor_source
+
+    compiled_law = compile_wheel_contact_ssa()
+    argument_names = tuple(compiled_law.function.metadata["argument_names"])
+    source = symbolic_abstract_tensor_source(
+        compiled_law, "abstract_ui_wheel_contact_tensor",
     )
-    lines = [f"def abstract_ui_wheel_contact_tensor({', '.join(argument_names)}):"]
-    lines.extend(
-        f"    {temporary} = {_abstract_tensor_python(expression)}"
-        for temporary, expression in replacements
-    )
-    returned = ", ".join(_abstract_tensor_python(expression) for expression in reduced)
-    lines.append(f"    return {returned}")
-    source = "\n".join(lines) + "\n"
     feeds = {name: np.ones(4, dtype=np.float32) for name in argument_names}
     # Give discovery physically non-singular bounds without baking them into
     # the program; every argument remains mutable and runtime-parametric.

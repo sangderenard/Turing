@@ -19,6 +19,7 @@ from src.compiler.abstract_ui_surfaces import (
     support_surface_model,
 )
 from src.compiler.abstract_ui_vehicles import (
+    contact_lane_count,
     CONTACT_PATCH_OUTPUTS,
     CONTACT_PATCH_TENSOR_REDUCER_OUTPUTS,
     VEHICLE_STATE_OUTPUTS,
@@ -703,15 +704,22 @@ def test_sympy_contact_precompile_is_one_opt_in_packed_tensor_dispatch():
     assert regions == ["numerical_region_0"]
     assert compiled.packed_outputs is True
     assert artifact.complete
-    assert artifact.launch_plan.workgroup_size == (16, 1, 1)
+    # The launch covers every contact lane (40 today: four tyres plus the
+    # cage nodes and member midpoints); the workgroup width is the planner's
+    # choice for that count, not a fixed number.
+    assert artifact.launch_plan.count == contact_lane_count()
+    assert artifact.launch_plan.workgroup_size[0] * artifact.launch_plan.groups[0] >= contact_lane_count()
     assert metadata["packed_outputs"] is True
     assert compiled.output_names == CONTACT_PATCH_OUTPUTS
     assert metadata["output_span"][-1] < metadata["output_span"][0]
     assert f"outputs[0u + linear_index] = v_{metadata['output_span'][0]};" in artifact.source
     assert len(metadata["io_layout"]["outputs"]) == 1
     assert len(metadata["output_span"]) == len(CONTACT_PATCH_OUTPUTS)
-    assert "tensor_sqrt" not in compiled.source
-    assert ".sqrt()" in compiled.source
+    # The stage is the compiler's own materialization of the contact SSA: the
+    # square root is the SSA Pow with a constant exponent, never a helper
+    # such as ``tensor_sqrt`` and never a scalar ``math`` spelling.
+    assert "tensor_sqrt" not in compiled.source and "math." not in compiled.source
+    assert ".sqrt()" in compiled.source or " ** " in compiled.source
 
 
 def test_packed_contact_wrench_rows_translate_past_tensor_contact_area():
