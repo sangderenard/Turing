@@ -1,6 +1,6 @@
 # Continuation report — 2026-09-03 (session cut by usage limit)
 
-Branch `nogodsnomasters`. Everything below is committed by the commit that
+Branch `codex/recursive-reduction-bridge` (the turing/ nested repo; the outer C:devPowershell repo is on `nogodsnomasters`). Everything below is committed by the commit that
 adds this file. One process was left running (see "Running processes").
 
 ## Rules stated by the user this session (binding)
