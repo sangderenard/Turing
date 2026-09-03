@@ -50,6 +50,44 @@ class ParametricEngine:
     curve_reference: str
 
 
+@dataclass(frozen=True, slots=True)
+class TickEnvelope:
+    """One deterministic time assignment shared by world-owned objects."""
+
+    tick: int
+    dt: float
+    subdt: float
+    substeps: int
+
+
+@dataclass(frozen=True, slots=True)
+class VehicleInstance:
+    """Stable reference to a car owned by the world object graph."""
+
+    identity: str
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatorRigObject:
+    """Stable reference to the world's validator/assembly rig."""
+
+    identity: str
+
+
+class MechanicalCreatureWorld:
+    """The class whose members become the explorable Living Data Map.
+
+    The host may call :meth:`tick` from the website cycle or a standalone
+    native driver.  Owned objects do no work before receiving that assignment.
+    """
+
+    initial_vehicle: VehicleInstance
+    validator_rig: ValidatorRigObject
+
+    def tick(self, tick: int, dt: float, subdt: float, substeps: int) -> None:
+        """Assign one envelope to the rig, validator, and car in stable order."""
+
+
 class MechanicalCreature:
     """Root subject projected into the map; the truck is its first instance.
 
@@ -149,5 +187,6 @@ def mechanical_creature_model(
 
 __all__ = [
     "MECHANICAL_CREATURE_VERSION", "Actuator", "ContactSurfaces", "MechanicalCreature",
-    "ParametricEngine", "Stabilizer", "Structure", "mechanical_creature_model",
+    "MechanicalCreatureWorld", "ParametricEngine", "Stabilizer", "Structure",
+    "TickEnvelope", "ValidatorRigObject", "VehicleInstance", "mechanical_creature_model",
 ]

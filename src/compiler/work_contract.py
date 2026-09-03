@@ -104,7 +104,7 @@ import dataclasses
 import os
 from typing import Any
 
-_HONORED_DEPLOYMENT = ("serial",)
+_HONORED_DEPLOYMENT = ("serial", "auto")
 _HONORED_COMPILER = ("zig-cc",)
 _HONORED_DESTINATION = ("native",)
 _HONORED_GLSL_GEMM = ("glslblas_gemm", "source_algorithm")
@@ -163,7 +163,9 @@ class WorkContract:
     resolver_epsilon: float = 1.0e-12
     # ExtractionContract instance or path; None = historical no-gate default.
     extraction: Any = None
-    # --- declared, single honored value until their layer is wired ---
+    # Repository-SSA deployment policy. ``auto`` consumes the module's
+    # proved Deploy/Join frames and selects real backend executors; ``serial``
+    # preserves the recorded linear schedule.
     deployment: str = "serial"
     destination: str = "native"
     constant_arguments: tuple[str, ...] = ()
@@ -185,8 +187,8 @@ class WorkContract:
         # quietly compile something else.
         if self.deployment not in _HONORED_DEPLOYMENT:
             raise ValueError(
-                f"deployment={self.deployment!r} is not honored yet; "
-                f"honored: {_HONORED_DEPLOYMENT} (pools exist, unwired -- P3)"
+                f"deployment={self.deployment!r} is not honored; "
+                f"honored: {_HONORED_DEPLOYMENT}"
             )
         if self.compiler not in _HONORED_COMPILER:
             raise ValueError(
@@ -214,6 +216,7 @@ class WorkContract:
             f"unroll<={self.loops.unroll_limit}",
             f"register-block={self.loops.register_block_width}",
             f"glsl-gemm={self.shaders.blas_gemm}",
+            f"deployment={self.deployment}",
         ]
         return f"{self.name}: " + ", ".join(held)
 
@@ -235,6 +238,7 @@ PRESETS: dict[str, WorkContract] = {
         # is "inexact set, STABLE ACROSS HOSTS", and native tuning is the
         # opposite of host-stable.
         compiler_flags=("-O3",),
+        deployment="auto",
     ),
     "fast": WorkContract(
         "fast", register_reuse=True, inexact_identities=True,
@@ -244,6 +248,7 @@ PRESETS: dict[str, WorkContract] = {
         # -march=native arrives via the contraction switch itself in
         # compile_artifact, so it is not restated here.
         compiler_flags=("-O3", "-ffast-math"),
+        deployment="auto",
     ),
 }
 

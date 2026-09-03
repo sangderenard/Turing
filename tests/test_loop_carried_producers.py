@@ -129,6 +129,18 @@ def train(w, epochs):
     return total
 '''
 
+_TUPLE_ASSIGNMENT_ROUND_TRIP = '''
+def update(a, b):
+    return a + 1.0, b + 2.0
+
+def train(a, b, epochs):
+    total = a + b
+    for _ in range(epochs):
+        a, b = update(a, b)
+        total = a + b
+    return total
+'''
+
 
 @pytest.mark.parametrize(
     ("label", "source"),
@@ -198,6 +210,20 @@ def test_the_count_of_carried_values_is_not_what_limits_it():
 
     module, _outputs, _exports = _lower(_TWO_CARRIED, "carried_pair")
     assert module.functions
+
+
+def test_tuple_assignment_projects_each_loop_carried_update():
+    """Every unpacked target is an authored producer in the loop body."""
+
+    module, _outputs, _exports = _lower(
+        _TUPLE_ASSIGNMENT_ROUND_TRIP, "tuple_assignment"
+    )
+    assert "tuple_assignment__train" in module.functions
+    assert not any(
+        "loop_carried" in str(shortfall)
+        for function in module.functions.values()
+        for shortfall in function.metadata.get("lowering_shortfalls", ())
+    )
 
 
 # -- a second carried value is silently dropped ---------------------------

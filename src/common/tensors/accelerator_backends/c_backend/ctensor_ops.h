@@ -97,6 +97,15 @@ void batched_matmul_indexed_double(
     int n,
     int p);
 
+void gather_values_double(
+    const double* input,
+    double* output,
+    const int* shape,
+    int ndim,
+    int dim,
+    const double* indices,
+    int index_count);
+
 void slice_copy_double(
     const double* input,
     double* output,

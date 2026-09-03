@@ -25,9 +25,10 @@ which is exactly what makes it a translation rather than a compiler (see
 ``fused_program_wasm_backend`` for why WebAssembly's structured control flow
 makes the SSA route a much larger problem).
 
-The hub also registers desktop GLSL, Fortran-through-SSA, and WebGL 2.  C and
-LLVM are inventoried here but not registered as ``FusedProgram`` printers:
-their current JIT entry points consume captured autograd tapes directly.
+The hub also registers desktop GLSL, Fortran-through-SSA, and WebGL 2.  The
+native C module backend is inventoried as an SSA consumer.  C and LLVM are
+not registered here as ``FusedProgram`` printers because their public module
+entry points consume the richer SSA representation directly.
 
 WebGL 2 is registered but deprecated (``TargetCapabilities.deprecated``):
 its fragment-raster ABI predates browser compute shaders.  ``get_target``
@@ -221,24 +222,24 @@ def operator_inventories() -> tuple[BackendOperatorInventory, ...]:
     """Inventory C, GLSL, Fortran, LLVM and WebGL without copying their lists."""
 
     from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
-        c_dispatch_operations,
         covered_operations,
     )
     from ..common.tensors.accelerator_backends.glsl_backend import GLSL_OPS
     from .fused_program_webgl_backend import supported_operations as webgl_ops
+    from .ssa_c_backend import supported_tensor_operations as c_ops
     from .ssa_fortran_backend import supported_tensor_operations
     from .ssa_webgpu_backend import supported_tensor_operations as webgpu_ops
 
     return (
         BackendOperatorInventory(
             backend="c",
-            consumes="captured_tape",
-            operations=c_dispatch_operations(),
+            consumes="ssa",
+            operations=c_ops(),
             sources=(
-                "src/common/tensors/accelerator_backends/c_backend.py:"
-                "CAbstractTensor._apply_operator__.binary_codes/unary_codes",
+                "src/compiler/ssa_c_backend.py:"
+                "supported_tensor_operations",
             ),
-            note="scalar opcode dispatch; structural kernels have separate entry points",
+            note="native module C backend; SSA control instructions are additional",
         ),
         BackendOperatorInventory(
             backend="glsl",

@@ -202,10 +202,27 @@ def _propagate_scalar_dtypes(functions) -> None:
                 elif instruction.op == "Cast":
                     inferred = instruction.attributes.get("target_dtype")
                 elif instruction.op == "Load" and instruction.args:
-                    base_id = address_base.get(int(instruction.args[0].id))
-                    inferred = (
-                        None if base_id is None else dtype_of.get(base_id)
-                    )
+                    declared = str(instruction.res.dtype or "")
+                    if declared and "ptr" not in declared.casefold():
+                        # LLVM opaque pointers do not state a pointee type.
+                        # The Load result does, as does the original Indexed
+                        # result retained by address lowering; never replace
+                        # that explicit scalar contract with ``ptr``.
+                        inferred = declared
+                    else:
+                        base_id = address_base.get(
+                            int(instruction.args[0].id)
+                        )
+                        candidate = (
+                            None if base_id is None
+                            else dtype_of.get(base_id)
+                        )
+                        inferred = (
+                            None
+                            if candidate is not None
+                            and "ptr" in str(candidate).casefold()
+                            else candidate
+                        )
                 elif instruction.op == "BitLength":
                     inferred = "int64"
                 elif instruction.op in predicates:

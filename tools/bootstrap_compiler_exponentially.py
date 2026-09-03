@@ -1245,7 +1245,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-total-gb", type=float, default=None)
     parser.add_argument("--worker-reserve-gb", type=float, default=4.0)
     parser.add_argument("--max-worker-gb", type=float, default=4.0)
-    parser.add_argument("--unit-timeout-seconds", type=float, default=300.0)
+    parser.add_argument(
+        "--unit-timeout-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "terminate a compilation unit after this many seconds "
+            "(default: disabled; use a positive value to opt in)"
+        ),
+    )
     parser.add_argument("--max-generations", type=int, default=32768)
     parser.add_argument("--max-sweeps", type=int, default=8)
     parser.add_argument(

@@ -78,6 +78,61 @@ def test_default_contract_draws_python_native_and_decompile_lines():
     )
 
 
+def test_full_native_link_gate_rejects_python_and_unresolved_boundaries():
+    from types import SimpleNamespace
+
+    from src.compiler.fortran_c_shell import (
+        _full_native_link_failures,
+        _undefined_repository_ssa_operands,
+    )
+    from src.transmogrifier.ssa import Instr, SSAValue
+
+    supplied = SSAValue(1, dtype="float64")
+    missing = SSAValue(2, dtype="float64")
+    result = SSAValue(3, dtype="float64")
+    module = SimpleNamespace(functions={
+        "root": SimpleNamespace(
+            args=[supplied],
+            blocks={"entry": SimpleNamespace(instrs=[
+                Instr("Add", [supplied, missing], result),
+            ])},
+        ),
+    })
+    undefined = _undefined_repository_ssa_operands(module)
+    assert undefined == ({
+        "function": "root",
+        "block": "entry",
+        "operation": "Add",
+        "value_id": 2,
+    },)
+
+    failures = _full_native_link_failures(
+        ({
+            "extraction_contract": {
+                "identity": "json.loads",
+                "action": "use_native",
+                "parameters": {
+                    "native_abi": "cpython-c-api",
+                    "callbacks": "reject",
+                    "shell_profiles": ["python", "cpython-c"],
+                },
+            },
+        },),
+        ({"identity": "pathlib.Path.read_bytes"},),
+        ({"caller": "main", "callsite_id": 7, "callee": "helper"},),
+        undefined,
+    )
+
+    assert len(failures["unmaterialized_boundaries"]) == 1
+    assert len(failures["unresolved_call_records"]) == 1
+    assert failures["undefined_operands"] == undefined
+    assert failures["non_native_boundaries"] == ({
+        "identity": "json.loads",
+        "action": "use_native",
+        "reasons": ("cpython-c-api", "python-shell-profile"),
+    },)
+
+
 @pytest.mark.parametrize("target", [open, io.open, Path.open, Path.read_bytes])
 def test_python_filesystem_uses_the_existing_shell_file_broker(target):
     decision = ExtractionContract(CONTRACT).decide(target)

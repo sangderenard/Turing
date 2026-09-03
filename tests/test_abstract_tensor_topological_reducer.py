@@ -125,6 +125,100 @@ def kernel(x):
         ) == record["context_tokens"]
 
 
+def test_parameter_first_read_inside_if_arm_is_one_input():
+    """A Python parameter exists from function entry: one name, one Input.
+
+    ``vehicle_material_bank_vector`` reads ``material_state`` for the first
+    time inside an early-return ``if`` arm.  The arm's environment is
+    discarded afterwards, so the next read minted a SECOND Input for the same
+    parameter: two formals for one authored argument, and a returned in/out
+    parameter whose storage the caller could no longer bind.
+    """
+
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse("""
+def bank(nodes, state, mask):
+    if nodes.shape[0] == 0:
+        return state, state[:, 0:8]
+    left = nodes.gather(mask, dim=1)
+    state[:, 0] = left
+    state[:, 1] = left * 2.0
+    return state, left
+"""))
+    reduce_abstract_tensor_topology(graph)
+
+    executable = graph.function_table.entry(
+        graph.function_table.reference("bank")
+    ).graph.G
+    state_inputs = [
+        int(node_id)
+        for node_id, data in executable.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "state"
+    ]
+    assert len(state_inputs) == 1
+    history = tuple(executable.graph["identity_table"]["state"])
+    assert history[0] == state_inputs[0]
+    assert all(
+        executable.nodes[value_id].get("type") != "Input"
+        for value_id in history
+        if value_id != state_inputs[0]
+    )
+
+
+def test_continue_arm_does_not_publish_post_conditional_phi():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse("""
+def retry(value, stable, rejected):
+    while True:
+        if rejected:
+            value, stable = value - 1, stable
+            continue
+        return stable
+"""))
+
+    reduce_abstract_tensor_topology(graph)
+    executable = graph.function_table.entry("retry").graph.G
+    conditional_phis = tuple(
+        data
+        for _node_id, data in executable.nodes(data=True)
+        if str(data.get("op") or "").casefold() == "phi"
+        and (data.get("attributes") or {}).get("source_conditional_id")
+        is not None
+    )
+
+    assert conditional_phis == ()
+
+
+def test_optional_typed_list_parameter_retains_sequence_mutation_policy():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse("""
+def append_attempts(attempts: list[dict] | None, values):
+    while values:
+        if attempts is not None:
+            attempts.append({"value": values[0]})
+        break
+"""))
+
+    reduce_abstract_tensor_topology(graph)
+    executable = graph.function_table.entry("append_attempts").graph.G
+    effects = tuple(
+        effect
+        for _node_id, data in executable.nodes(data=True)
+        for effect in (
+            (data.get("attributes") or {}).get("loop_state_effects") or ()
+        )
+        if effect["state_name"] == "attempts"
+    )
+
+    assert len(effects) == 1
+    assert effects[0]["effect_mode"] == "sequence_mutation"
+    assert effects[0]["sequence_policy"] == "duplicates"
+
+
 def test_unchanged_source_rebuilds_the_same_dense_token_ordered_ids():
     source = """
 def kernel(x):

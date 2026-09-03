@@ -135,6 +135,44 @@ def test_tensor_instruction_materializes_real_repository_ssa_kernel_operands():
     )
 
 
+def test_basic_index_publishes_exact_selected_shape_for_downstream_gather():
+    source = SSAValue(900, "float64", shape=(2, 3, 4, 6))
+    selected = SSAValue(901, "float64")
+    function = Function("selected_view", [source], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "Indexed", [source], selected,
+                attributes={
+                    "tensor_operation": "basic_index",
+                    "basic_index_axes": (
+                        ((0, 1), False),
+                        ((0, 1, 2), False),
+                        ((0, 1, 2, 3), False),
+                        ((0, 1, 2), False),
+                    ),
+                    "basic_index_source_shape": (2, 3, 4, 6),
+                },
+            ),
+            Instr("Ret", [selected], None),
+        ]),
+    })
+    module = IRModule({function.name: function})
+
+    shortfalls = lower_tensor_calls_to_repository_ssa(
+        module, c_backend_repository_ssa_reference()
+    )
+
+    assert shortfalls == ()
+    assert selected.shape == (2, 3, 4, 3)
+    index_call = next(
+        instruction
+        for instruction in function.blocks["entry"].instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("callee") == "index_select_double"
+    )
+    assert index_call.res.shape == (2, 3, 4, 3)
+
+
 def test_left_integer_literal_uses_double_scalar_tensor_abi():
     literal = SSAValue(1100, dtype="int32", shape=())
     source = SSAValue(1101, dtype="float64", shape=(4,))

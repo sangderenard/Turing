@@ -23,7 +23,10 @@ from src.transmogrifier.ssa import (
     IRModule,
     Instr,
     SSAValue,
+    SSATensorDescriptor,
+    SSATensorTable,
 )
+from src.compiler.ssa_storage_requirements import function_storage_requirements
 
 
 ELEMENTWISE_IR = """
@@ -50,6 +53,150 @@ exit:
   ret void
 }
 """
+
+
+def test_storage_requirement_uses_tensor_table_and_preserves_views():
+    storage = SSAValue(0, "float64")
+    matrix_view = SSAValue(0, "float64", (2, 3))
+    flat_view = SSAValue(0, "float64", (6,))
+    function = Function("storage_views", [storage], {
+        "entry": BasicBlock("entry", [
+            Instr("Call", [matrix_view], flat_view, attributes={
+                "tensor_operation": "reshape",
+            }),
+            Instr("Ret", [], None),
+        ]),
+    })
+    table = SSATensorTable()
+    table.register(SSATensorDescriptor(
+        tensor_id=1,
+        data_value_id=0,
+        shape=(3, 2),
+        storage="temporary",
+    ))
+    module = IRModule({function.name: function}, tensor_tables={
+        function.name: table,
+    })
+
+    requirement = function_storage_requirements(module, function.name)[0]
+
+    assert requirement.element_count == 6
+    assert set(requirement.views) == {(2, 3), (3, 2), (6,)}
+
+
+def test_fortran_legalizes_pointer_array_stack_group_to_sections():
+    left = SSAValue(0, dtype="float64", shape=(2,))
+    right = SSAValue(1, dtype="float64", shape=(2,))
+    pointers = SSAValue(2, dtype="ptrptr_float64", shape=(2,))
+    count = SSAValue(3, dtype="int32")
+    shape = SSAValue(4, dtype="int32", shape=(1,))
+    rank = SSAValue(5, dtype="int32")
+    dim = SSAValue(6, dtype="int32")
+    result = SSAValue(7, dtype="float64", shape=(2, 2))
+    function = Function("stack_group", [left, right], {
+        "entry": BasicBlock("entry", [
+            Instr("PointerArray", [left, right], pointers),
+            Instr("Const", [], count, attributes={"constant": 2}),
+            Instr("Const", [], shape, attributes={"values": (2,)}),
+            Instr("Const", [], rank, attributes={"constant": 1}),
+            Instr("Const", [], dim, attributes={"constant": 0}),
+            Instr(
+                "Call", [pointers, count, shape, rank, dim, result], result,
+                attributes={
+                    "callee": "stack_double",
+                    "ssa_output_argument": 5,
+                },
+            ),
+            Instr("Ret", [result], None),
+        ], []),
+    })
+
+    emitted = emit_module(
+        IRModule({function.name: function}),
+        outputs={function.name: (result,)},
+    )
+
+    assert emitted.complete, [item.format() for item in emitted.shortfalls]
+    assert "UNSUPPORTED PointerArray" not in emitted.source
+    assert "t7(1, :) = t0" in emitted.source
+    assert "t7(2, :) = t1" in emitted.source
+
+
+def test_fortran_legalizes_typed_memcpy_to_bounded_slice_copy():
+    destination = SSAValue(0, dtype="float64", shape=(4,))
+    source = SSAValue(1, dtype="float64", shape=(4,))
+    byte_count = SSAValue(2, dtype="int64")
+    volatile = SSAValue(3, dtype="i1")
+    function = Function("copy_group", [destination, source], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], byte_count, attributes={"constant": 32}),
+            Instr("Const", [], volatile, attributes={"constant": False}),
+            Instr(
+                "Call", [destination, source, byte_count, volatile], None,
+                attributes={"callee": "llvm.memcpy.p0.p0.i64"},
+            ),
+            Instr("Ret", [], None),
+        ], []),
+    })
+
+    emitted = emit_module(IRModule({function.name: function}))
+
+    assert emitted.complete, [item.format() for item in emitted.shortfalls]
+    assert "t0(1:int((32_c_int64_t) / 8_c_int64_t, c_int64_t))" in emitted.source
+    assert "= t1(1:int((32_c_int64_t) / 8_c_int64_t, c_int64_t))" in emitted.source
+
+
+def test_fortran_resolves_callee_dynamic_extents_from_actual_tensor_view():
+    formal = SSAValue(
+        10, dtype="float64", accounting={"ssa_call_rank": 2}
+    )
+    callee = Function("dynamic_callee", [formal], {
+        "entry": BasicBlock("entry", [Instr("Ret", [], None)], []),
+    })
+    actual = SSAValue(0, dtype="float64", shape=(2, 3))
+    caller = Function("concrete_caller", [actual], {
+        "entry": BasicBlock("entry", [
+            Instr("Call", [actual], None, attributes={"callee": callee.name}),
+            Instr("Ret", [], None),
+        ], []),
+    })
+
+    emitted = emit_module(
+        IRModule({caller.name: caller, callee.name: callee}),
+        extra_roots=(caller.name,),
+    )
+
+    assert emitted.complete, [item.format() for item in emitted.shortfalls]
+    assert "call dynamic_callee(extent_2, extent_3, t0)" in emitted.source
+    caller_entry = emitted.api.entry_point(caller.name)
+    assert not any(
+        parameter.name.startswith("extent_dynamic_")
+        for parameter in caller_entry.parameters
+    )
+
+
+def test_fortran_raw_pointer_formal_is_assumed_size_without_synthetic_extent():
+    values = SSAValue(0, dtype="ptr")
+    index = SSAValue(1, dtype="int64")
+    address = SSAValue(2, dtype="ptr")
+    loaded = SSAValue(3, dtype="float64")
+    function = Function("pointer_helper", [values, index], {
+        "entry": BasicBlock("entry", [
+            Instr("GetElementPtr", [values, index], address),
+            Instr("Load", [address], loaded),
+            Instr("Ret", [], None),
+        ], []),
+    })
+
+    emitted = emit_function(
+        function,
+        array_base_ids={values.id},
+        dynamic_array_ranks={values.id: 1},
+    )
+
+    assert emitted.complete, [item.format() for item in emitted.shortfalls]
+    assert "intent(in) :: t0(*)" in emitted.source
+    assert not emitted.extent_names
 
 
 def test_fortran_api_describes_scalar_source_projection():

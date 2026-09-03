@@ -105,6 +105,25 @@ def test_sqrt_converges_to_the_exact_root():
     assert abs(root[0] * root[0] - 2) < Fraction(1, 10 ** 40)
 
 
+def test_real_power_uses_wide_log_and_exp_instead_of_widening_a_double_answer():
+    import mpmath
+
+    base = Precision.of(AbstractTensor.get_tensor(np.asarray([0.9, 1.75])), 2)
+    exponent = Precision.of(AbstractTensor.get_tensor(np.asarray([37.25, -3.5])), 2)
+    produced = exact(base ** exponent)
+    with mpmath.workdps(70):
+        # The operator receives binary64 values.  Compare with those exact
+        # supplied values, not with the different decimal rational 9/10.
+        expected = [mpmath.power(mpmath.mpf(float(0.9)), mpmath.mpf(float(37.25))),
+                    mpmath.power(mpmath.mpf(float(1.75)), mpmath.mpf(float(-3.5)))]
+        for got, want in zip(produced, expected):
+            error = abs(mpmath.mpf(got.numerator) / got.denominator - want)
+            assert error < mpmath.mpf("1e-28")
+
+    with pytest.raises(ValueError, match="positive base"):
+        _ = Precision.of(AbstractTensor.get_tensor(np.asarray([-2.0])), 2) ** 0.5
+
+
 def test_transcendentals_are_evaluated_at_the_value_s_own_width():
     """Routed to the cores, which hold the width rather than collapsing it."""
 

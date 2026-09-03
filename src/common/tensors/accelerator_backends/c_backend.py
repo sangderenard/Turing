@@ -86,6 +86,9 @@ ffi.cdef("""
         const double* a, const double* b, double* out,
         const int* a_offsets, const int* b_offsets,
         int batch_count, int m, int n, int p);
+    void gather_values_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const double* indices, int index_count);
     void unary_double(const double* a, double* out, int n, int op);
     int ctensor_execute_primitive_program(
         const CTensorPrimitiveInstruction* instructions,

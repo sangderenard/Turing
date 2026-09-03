@@ -1,5 +1,60 @@
 # Why isn't this translating? — a decision tree
 
+## Managed multi-result calls: a control value disappears beside a record
+
+Use this branch when the full-native gate reports one undefined scalar or
+predicate after a source-linked call that also returns a record. A typical
+signature is a later `LNot`, `CondBr`, or comparison consuming an id which is
+absent from the linked call's `output_ids`, while record-field projections from
+the same call are present.
+
+Three opt-in receipts expose the boundary without changing the authored
+program:
+
+```powershell
+$env:TURING_DEBUG_STRUCTURAL_OUTPUTS = '1'
+$env:TURING_DEBUG_LINKED_CALLS = '1'
+$env:TURING_DEBUG_AGGREGATE_CALLSITE = '284'
+```
+
+- `TURING_DEBUG_STRUCTURAL_OUTPUTS` prints graph output names, named-output
+  identities, the physical `Ret` ids, and record layouts for every recovered
+  source function.
+- `TURING_DEBUG_LINKED_CALLS` prints source-linked calls and source-output
+  projections at the final full-native gate. Use it first to discover the
+  current callsite id; structural planning can renumber callsites after a
+  compiler change.
+- `TURING_DEBUG_AGGREGATE_CALLSITE` selects one exact callsite and prints its
+  semantic result bindings, expanded record layout, callee outputs, and
+  aggregate attributes immediately before and after output-view legalization.
+
+Read the receipt in this order:
+
+1. `semantic=(scalar, record)` proves the source-call result contract.
+2. `physical=(scalar, expanded fields...)` proves result expansion retained
+   the scalar.
+3. `callee_outputs=(expanded fields...)` with no scalar proves the callee's
+   physical `Ret` was built from the record alone. Do not blame subdivision,
+   scheduling, or a backend emitter.
+4. `DEBUG-AGGREGATE-BEFORE` missing the scalar means the defect precedes
+   aggregate-view legalization. If it is present before and absent after,
+   legalization may prune it only when a concrete projection is rebound and
+   there is no independent direct consumer.
+
+The generic ABI authority is the ordered `semantic_output_ids`, with each
+record identity expanded through `record_return_layouts`. The actual `Ret`,
+caller correlation, C, LLVM, and Fortran must all consume that same ordered
+surface. A record layout must never replace sibling scalar results. Scalar
+results also must not be passed through a tensor-storage alias ledger merely
+because they share a call with record storage.
+
+The validator investigation that added these receipts found exactly this
+sequence: control partition overlap, then a resolved multi-result call, then a
+boolean omitted from the callee `Ret`, and finally aggregate legalization
+correctly exposing the incomplete ABI. The focused regression is
+`test_aggregate_output_view_keeps_independently_consumed_call_result` in
+`tests/test_tensor_ssa_call_metadata.py`.
+
 The executable tree can inspect either its historical symbolic-fluid fixture
 or an already-published repository-SSA unit. The latter is the appropriate
 route when debugging the compiler compiling itself: it does not rebuild a
@@ -279,6 +334,33 @@ python tools/diagnose_translation.py --stages 1
 * **Complete** → the SSA believes it is whole. Continue.
 
 Does not prove the SSA is *correct* — only that no pass reported giving up.
+
+### Q1b — A tensor has rank `()` or incompatible reshape/batch shapes
+
+If the shortfall names `gather source has no declared rank` or reports a
+mixture such as `(2, 4, ...)` versus `(8, ...)`, stop before every emitter.
+This is a repository-SSA call-boundary failure, not a missing C, Fortran,
+LLVM, Wasm, or WebGPU operator table entry.
+
+Check the planned region call itself. `feed_ids` names storage/dependency
+identity, but it is not a sufficient tensor descriptor: one caller-owned
+buffer may be viewed through several reshapes. Each ordered call operand must
+retain the matching `feed_shapes`/`feed_dtypes` contract from the callee formal.
+A global `value_id -> first shaped occurrence` lookup is invalid for views.
+Likewise, when `wire_repository_ssa_region_products` replaces provisional
+storage with a projected producer, it must reconstruct the consumer's ordered
+view instead of installing the producer's unrelated shape object.
+
+For the vehicle family, isolate the balloon half before paying for the whole
+vehicle graph:
+
+```bash
+python -c "from src.compiler.vehicle_python_compilation import lower_balloon_tire_python_ssa; x=lower_balloon_tire_python_ssa(batch_size=8); print(x.root_name, len(x.module.functions))"
+```
+
+The batch `8` here is a compilation capacity specialization. A genuinely
+dynamic tensor needs rank plus a runtime `count` bounded by capacity; capacity
+must not be substituted for the semantic shape of every view.
 
 ---
 
@@ -728,9 +810,102 @@ no-producer check tightened to count producers in the BODY's blocks only, so
 the seed cannot stand in for a producer and mask a genuinely empty body.
 A shell trace now shows the seed as the slot's first entry.
 
-Still open in the same subsystem (`source_linked` plan-call linking): the
-body-elision above, and the dead frame-storage formal — the remaining
-regulation of the aliasing machinery.
+**A helper exists in repository SSA but its PlanCall marker survives — FIXED,
+signature kept.**  The backend reported an unknown
+`__plan_callsite_N__` symbol even though the named specialized helper and its
+planned regions were present and typed.  The linker had resolved every frame
+operand; it refused only the result because the callee's `Ret` had 50 authored
+positions (38 unique values) while the caller selected 20.  The old aggregate
+contract accepted one output or the entire return record, never an exact
+subset.
+
+*Signature:* audit unresolved call records before reading any backend table.
+If `unresolved_frame_value_ids` is empty and the sole eligibility reason is
+`unmaterialized_result`, compare the callee `Ret` identities with
+`record.result_bindings`.  An exact subset is a partial aggregate ABI, not an
+unknown helper.  The linked call now records all four correlations:
+`output_ids` (caller identities), `callee_output_ids` (callee identities),
+`output_positions` (authored `Ret` positions), and `output_slots` (deduplicated
+native output slots).  C, LLVM, and Fortran must consume that shared record;
+an emitter must not rediscover it positionally.
+
+**A synthetic aggregate container reused a real tensor id — FIXED, signature
+kept.**  After the marker was linked, C reported a cascade of “has no address”
+operands.  The first missing value was a real tensor used before the helper
+call, but the later helper call also had that integer as its aggregate result.
+The “fresh” counter had considered arguments and instruction results only;
+the tensor existed at that moment only as an operand-owned frame value.
+
+*Signature:* start with the first missing address, not the whole cascade.  For
+that id print every producer and consumer in the caller, including object
+identity.  A later synthetic `Call.res` sharing the number with an earlier
+operand is an allocator defect, not scheduling.  Linker allocation now reserves
+caller arguments, results, operands, graph-node ids, and every pending call
+binding before minting containers or projections.
+
+**A semantic PlanCall result leaked into the public frame — FIXED, signature
+kept.**  Values such as `%467` and `%718` appeared as unnamed root arguments,
+then fed planned regions that dereferenced them as pointer tables.  The linker
+had created the real native aggregate but had not replaced consumers already
+holding the semantic callsite placeholder.
+
+*Signature:* collect `plan_callsite_id` from linked aggregate calls and
+intersect it with `function.args`.  If an intersecting argument is used as an
+aggregate feed, the linker must substitute the exact placeholder object with
+the real call result and remove only that object from the frame.  Never replace
+all numerically equal ids: caller, callee, and region numbering domains can
+legitimately reuse integers.
+
+**An ordered view survived replacement of its semantic container — FIXED,
+signature kept.**  Region-call arguments are intentionally distinct
+`SSAValue` objects so one storage identity may carry the exact shape required
+at each call position.  Object-only PlanCall substitution removed the original
+placeholder formal but left its marked view undefined; C then reported the
+view followed by every downstream output as “has no address.”
+
+*Signature:* if the first missing operand is neither a formal nor an
+instruction result, inspect its accounting before touching scheduling or a
+backend allocation table.  `ssa_storage_alias=<old callsite>` means the linker
+must clone that ordered view onto the fresh physical result id, preserving its
+dtype, shape, device, and region position.  Unmarked same-number operands must
+remain untouched.  Full-native closure now audits undefined operands directly,
+so this class fails at the linker gate rather than in C, LLVM, or Fortran.
+
+**The fresh SSA counter was seeded by structural ProcessGraph identities —
+FIXED, signature kept.**  A linked aggregate result appeared as a changing
+trillion-scale value on each run.  `ProcessGraph.nodes` contains both monotonic
+value ids and structural/domain nodes keyed by Python object identity; frame
+receipts also contain integer literals.  Neither is automatically an SSA id.
+
+*Signature:* run `ssa_self_check.check_id_scale` before backend emission.  A
+changing id above its threshold is allocator-domain poisoning, not a large
+program.  Fresh allocation reserves actual SSA arguments/results/operands,
+small graph value ids, callsite/result bindings, and only frame kinds
+`caller_value`, `caller_alias`, and `caller_storage`.  Literal/default payloads
+and id()-scale structural nodes do not constrain the counter.
+
+**An ordered view did not make its aggregate escape whole — FIXED, signature
+kept.**  C used object identity to decide whether to materialize a call result
+as a native pointer table.  After correct linker rebinding, the consumer was a
+distinct ordered-view object over the same fresh storage, so C skipped the
+table and produced an address cascade.  The shared aggregate ABI now recognizes
+only the exact result object or an explicit `ssa_storage_alias` view.  C and
+LLVM consume that predicate; numeric equality alone is not evidence because
+numbering domains may collide.
+
+**PointerArray is a backend coverage question, not a Python fallback.**  Stack
+and concatenate lower to a repository `PointerArray` whose slots are tensor
+addresses.  C and LLVM materialize a native pointer table; LLVM also refuses a
+callee pointer-table formal unless its caller actually built such a table.
+Fortran must either register the equivalent interoperable table contract or
+lower the stack/cat kernel directly.  Do not declare an ordinary tensor buffer
+to be a table merely to silence the check.
+
+For the canonical balloon tire, the product entry is
+`vehicle_python_compilation.lower_balloon_tire_python_ssa`; native C and LLVM
+emitters consume that same non-fused module.  `compile_balloon_tire_python_aot`
+is retained only as the historical dual-IR compatibility adapter and is not
+the native vehicle emission route.
 
 ---
 
@@ -836,6 +1011,48 @@ the actual mismatch instead of a summary.
 **Git Bash `/tmp` is invisible to Windows Python.** Write scratch files to
 a real path under `build/` instead; a redirect that "worked" and a Python
 open that "cannot find the file" is this, not a race.
+
+---
+
+## Deployment outlining receipts (2026-09-01)
+
+The pooled-dispatch seam runs SSA-first: `deployment_outlining.
+outline_independent_iteration_lanes(module)` converts a proven single-lane
+`independent_iterations` region (a retained loop's lane template) into a
+real module function, and `ssa_c_backend` then replaces the loop execution
+with `turing_pool_deploy_span` (jumping to the join on success) while the
+serial loop remains in-text as the fallback. Read the receipts, never guess:
+
+- `OutlineReport.outlined[*]`: outline name, induction/start/stop/step ids,
+  live-in order (the outlined callee's exact formal order), and
+  `guarded_blocks` — blocks holding an order-insensitive shared append that
+  the emitter wraps in `turing_pool_effect_lock/unlock`.
+- `OutlineReport.refused[*]`: `(function, region_id, reason)`. The reasons
+  are a closed vocabulary worth trusting verbatim:
+  - "mixes lane and non-lane instructions" — a lane block contains
+    non-member instructions that are not hoisted `Const`s;
+  - "consumed outside the lane" — lane live-outs need an aggregate return
+    lowering that does not exist yet;
+  - "ordered-join lowering is required" — a shared-sequence mutation whose
+    operands are lane-DEPENDENT, so append order is iteration order.  A
+    lane-INVARIANT append is not refused: every iteration pushes an
+    identical element, so only the count is observable and the effect lock
+    preserves serial semantics (this is why the managed vehicle window
+    loop outlines);
+  - "without the induction in its address chain" — an unproven shared
+    store; induction-indexed slots are the sanctioned pattern.
+- `CModuleArtifact.pool_required` / `pooled_regions`: whether compile()
+  will link `turing_pool.c`, and exactly which regions emitted a native
+  deploy.  Emission NEVER blocks on a refusal — refusal means serial text.
+
+`plan_repository_ssa_dispatch` consumes the same records: an outlined
+iteration region plans launchable with one lane; an un-outlined one carries
+the shortfall "run outline_independent_iteration_lanes first".  There is no
+Python runtime dispatcher: execution is `turing_pool.c` inside the compiled
+artifact (the former `RepositorySSAFrameExecutor` was removed).
+
+Compile-and-run proof of the whole seam: `tests/test_deployment_outlining.py`
+(pooled numerics equal serial bit-for-bit).
 
 ---
 
@@ -1293,3 +1510,28 @@ Notes toward it:
   it can never change how many arguments a call passes. The document should
   say this plainly so structural defects are chased upstream instead of in
   the emitter.
+* **A complete emission followed by hundreds of dynamic shell extents is a
+  storage-contract failure, not permission to choose arbitrary sizes.** Check
+  `ssa_storage_requirements.function_storage_requirements` for the root. It
+  combines occurrence views and `SSATensorTable` evidence and propagates the
+  result through actual/formal call bindings. C, LLVM, and Fortran must all
+  consume that one capacity result; allocating one element in C/LLVM while
+  exposing dimensions in Fortran is the same defect wearing three costumes.
+* **Callee-local dynamic extent names do not transitively belong to the public
+  entry.** Resolve them at each call from the actual tensor view. Only a
+  genuinely unresolved caller dimension may climb another level. A blind
+  set-union over call-graph extent names preserves compilation but manufactures
+  an unusable ABI.
+* **An initialized empty private sequence is still dead when nothing observes
+  it.** The compiler-created zero store to its length cell is scaffolding, not
+  a semantic use. Remove the unused descriptor, its resident frame members,
+  and that initializer together; otherwise synthetic list columns become
+  anonymous native inputs and demand invented capacities.
+* **Imported `llvm.memcpy(product(shape) * sizeof(T))` is a semantic whole-array
+  copy when that dependency is proven.** Fortran should emit conformable array
+  assignment. A partial or unproven byte copy must remain a shortfall rather
+  than being widened.
+* **`PointerArray` followed by `stack_double`/`cat_double` is a low-level
+  C/LLVM carrier, not a Fortran data structure.** Legalize the complete group
+  to native array-section stack/concat statements; do not synthesize a pointer
+  table in Fortran.

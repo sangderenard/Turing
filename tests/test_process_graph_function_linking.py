@@ -9,10 +9,18 @@ import sympy
 from src.common.tensors.topological_reducer import reduce_abstract_tensor_topology
 from src.common.dt_system.dt_scaler import Metrics, coerce_metrics
 from src.compiler.process_graph_function_linking import link_process_graph_functions
-from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+from src.compiler.fortran_c_shell import (
+    _frame_binding_value_ids,
+    _monotonic_ssa_ids,
+    _rebind_linked_storage_alias,
+    _retained_parameter_identity,
+    lower_ast_source_to_ssa,
+)
 from src.compiler.symbolic_equation_compiler import compile_sympy_equations
 from src.compiler.ssa_reference_evaluator import SSAReferenceEvaluator
+from src.compiler.ssa_aggregate_abi import is_storage_view
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
+from src.transmogrifier.ssa import SSAValue
 
 
 CONTRACT = (
@@ -20,6 +28,79 @@ CONTRACT = (
     / "extraction_contracts"
     / "program_extraction.yaml"
 )
+
+
+def _pursued_tail_retry(value):
+    if value <= 0:
+        return value
+    return _pursued_tail_retry(value - 1)
+
+
+def test_linker_rebinds_only_proven_ordered_views_of_freshened_storage():
+    placeholder = SSAValue(7, dtype="ssa.aggregate")
+    replacement = SSAValue(41, dtype="ssa.aggregate")
+    ordered_view = SSAValue(
+        7,
+        dtype="float64",
+        shape=(2, 4),
+        accounting={
+            "ssa_storage_alias": 7,
+            "ssa_region_feed": (3, 0),
+        },
+    )
+    unrelated_collision = SSAValue(7, dtype="float64", shape=(8,))
+
+    rebound = _rebind_linked_storage_alias(
+        ordered_view, placeholder, replacement,
+    )
+
+    assert rebound is not ordered_view
+    assert rebound.id == replacement.id
+    assert rebound.dtype == "float64"
+    assert rebound.shape == (2, 4)
+    assert rebound.accounting["ssa_storage_alias"] == replacement.id
+    assert rebound.accounting["ssa_linked_storage_from"] == placeholder.id
+    assert is_storage_view(rebound, replacement)
+    assert _rebind_linked_storage_alias(
+        unrelated_collision, placeholder, replacement,
+    ) is unrelated_collision
+    assert _rebind_linked_storage_alias(
+        placeholder, placeholder, replacement,
+    ) is replacement
+
+    loop_carried_view = SSAValue(
+        7,
+        dtype="float64",
+        accounting={
+            "ssa_storage_alias": 7,
+            "ssa_region_feed": (4, 1),
+            "ssa_loop_carried_feed": 34,
+        },
+    )
+    assert _rebind_linked_storage_alias(
+        loop_carried_view, placeholder, replacement,
+    ) is loop_carried_view
+
+
+def test_linker_fresh_ids_ignore_integer_frame_payloads():
+    assert _frame_binding_value_ids((
+        (1, "caller_value", 7),
+        (2, "caller_storage", 11),
+        (3, "caller_alias", 13),
+        (4, "caller_literal", 1_503_435_042_417),
+        (5, "default_literal", 99),
+    )) == (7, 11, 13)
+    assert _monotonic_ssa_ids((3, 21, 1_503_435_042_417, "node")) == (
+        3, 21,
+    )
+
+
+def test_linker_prefers_retained_parameter_over_structural_identity_history():
+    assert _retained_parameter_identity(
+        "dt",
+        (10, 11),
+        (("ref", 299), ("dt", 11), ("state", 32)),
+    ) == 11
 
 
 def test_sympy_process_graph_is_registered_before_python_dependency_pursuit():
@@ -209,13 +290,16 @@ def test_direct_source_to_ssa_preserves_all_linked_tuple_results():
     )[-1]
     assert len(returned) == 2
     assert len(outputs["pair_direct__root"]) == 2
-    assert any(
-        instruction.op == "Call"
-        and instruction.attributes.get("callee") == "pair_direct__linked_pair"
-        and instruction.attributes.get("result_convention") == "ssa.aggregate"
+    linked_call = next(
+        instruction
         for block in root.blocks.values()
         for instruction in block.instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("callee") == "pair_direct__linked_pair"
+        and instruction.attributes.get("result_convention") == "ssa.aggregate"
     )
+    callsite_id = int(linked_call.attributes["plan_callsite_id"])
+    assert all(int(argument.id) != callsite_id for argument in root.args)
 
 
 def test_direct_source_materializes_declared_record_parameter_fields():
@@ -273,6 +357,327 @@ def test_record_field_assignment_is_a_real_inout_value():
     )
 
 
+def test_consecutive_scalar_record_writes_share_the_parameter_owner():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def update(state, value):\n"
+        "    state.last_wave_speed = value + 1.0\n"
+        "    state.last_height_violation = value + 2.0\n"
+        "    return state.last_wave_speed + state.last_height_violation\n\n"
+        "def root(state, value):\n"
+        "    return update(state, value)\n",
+        "root",
+        name="consecutive_record_field_inout",
+        extraction_contract=CONTRACT,
+    )
+
+    update = module.functions["consecutive_record_field_inout__update"]
+    record = next(
+        item for item in module.record_tables[update.name].records.values()
+        if item.identity.endswith(".SymbolicFluidGridState")
+    )
+    fields = {
+        field.name: field
+        for field in record.fields
+        if field.name in {"last_wave_speed", "last_height_violation"}
+    }
+    assert tuple(fields) == ("last_wave_speed", "last_height_violation")
+    assert all(field.writable for field in fields.values())
+    assert all(len(field.value_ids) == 1 for field in fields.values())
+    for name, field in fields.items():
+        arguments = [
+            argument for argument in update.args
+            if (argument.accounting or {}).get("program_abi_field") == name
+        ]
+        assert len(arguments) == 1
+        assert int(arguments[0].id) == int(field.value_ids[0])
+
+
+def test_callsite_specializes_generic_state_parameter_to_caller_record():
+    """Concrete record identity crosses calls even when parameter names differ."""
+
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {
+                "ExactState": {
+                    "identity": "tests.ExactState",
+                    "fields": {
+                        "metric": {
+                            "storage": "scalar",
+                            "dtype": "float64",
+                            "mutable": True,
+                        },
+                    },
+                },
+            },
+            "bindings": [{
+                "function": "*",
+                "parameter": "material",
+                "record": "ExactState",
+            }],
+            "values": [],
+        })
+    )
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def mutate(material, value):\n"
+        "    material.metric = value + 1.0\n"
+        "    return material.metric\n\n"
+        "def relay(state, value, operation):\n"
+        "    return operation(state, value)\n\n"
+        "def root(material, value):\n"
+        "    return relay(material, value, mutate)\n",
+        "root",
+        name="generic_record_specialization",
+        extraction_contract=contract,
+    )
+
+    relays = [
+        (name, function)
+        for name, function in module.functions.items()
+        if "__relay__specialized_" in name
+    ]
+    assert len(relays) == 1
+    relay_name, relay = relays[0]
+    receipt = relay.metadata.get("parameter_record_abi", {}).get("state")
+    assert receipt is not None
+    assert receipt["identity"] == "tests.ExactState"
+    record = next(
+        item for item in module.record_tables[relay_name].records.values()
+        if item.identity == "tests.ExactState"
+    )
+    field = next(item for item in record.fields if item.name == "metric")
+    assert field.writable is True
+    metric_arguments = [
+        argument for argument in relay.args
+        if (argument.accounting or {}).get("program_abi_field") == "metric"
+    ]
+    assert len(metric_arguments) == 1
+    assert int(metric_arguments[0].id) == int(field.value_ids[0])
+
+
+def test_loop_carried_record_callback_writes_caller_field_storage():
+    """A loop-carried record is an alias, not a private callback record."""
+
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {
+                "ExactState": {
+                    "identity": "tests.ExactState",
+                    "fields": {
+                        "metric": {
+                            "storage": "scalar",
+                            "dtype": "float64",
+                            "mutable": True,
+                        },
+                    },
+                },
+            },
+            "bindings": [{
+                "function": "*",
+                "parameter": "material",
+                "record": "ExactState",
+            }],
+            "values": [],
+        })
+    )
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def mutate(material, value):\n"
+        "    material.metric = value + 1.0\n"
+        "    return material.metric\n\n"
+        "def relay(state, value, operation):\n"
+        "    index = 0\n"
+        "    while index < 1:\n"
+        "        operation(state, value)\n"
+        "        index += 1\n"
+        "    return state.metric\n\n"
+        "def root(material, value):\n"
+        "    relay(material, value, mutate)\n"
+        "    return material.metric\n",
+        "root",
+        name="loop_carried_record_callback",
+        extraction_contract=contract,
+    )
+
+    root = module.functions["loop_carried_record_callback__root"]
+    metric_arguments = [
+        argument for argument in root.args
+        if (argument.accounting or {}).get("program_abi_field") == "metric"
+    ]
+    assert len(metric_arguments) == 1
+    assert (metric_arguments[0].accounting or {}).get(
+        "program_abi_field_written"
+    ) is True
+
+
+def test_direct_tail_recursion_lowers_to_control_loop_not_missing_call():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def root(value):\n"
+        "    if value <= 0:\n"
+        "        return value\n"
+        "    return root(value - 1)\n",
+        "root",
+        name="tail_retry",
+        extraction_contract=CONTRACT,
+    )
+
+    root = module.functions["tail_retry__root"]
+    instructions = [
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+    ]
+    assert not any(
+        instruction.op == "Call"
+        and instruction.attributes.get("callee") == root.name
+        for instruction in instructions
+    )
+    assert any(instruction.op in {"Br", "CondBr"} for instruction in instructions)
+    retry_call_block = next(
+        block
+        for block in root.blocks.values()
+        if any(
+            instruction.op == "Call"
+            and instruction.attributes.get("region_index") == 1
+            for instruction in block.instrs
+        )
+    )
+    assert not retry_call_block.name.startswith("unreachable")
+    retry_call_index = next(
+        index
+        for index, instruction in enumerate(retry_call_block.instrs)
+        if instruction.op == "Call"
+        and instruction.attributes.get("region_index") == 1
+    )
+    continue_index = next(
+        index
+        for index, instruction in enumerate(retry_call_block.instrs)
+        if instruction.op == "Br"
+        and instruction.attributes.get("source_control") == "continue"
+    )
+    assert retry_call_index < continue_index
+    assert any(
+        instruction.op == "Ret" and instruction.args
+        for block in root.blocks.values()
+        for instruction in block.instrs
+    )
+
+
+def test_dependency_pursuit_normalizes_direct_tail_recursion_too():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def root(value):\n"
+        "    return _pursued_tail_retry(value)\n",
+        "root",
+        name="pursued_tail_retry",
+        python_bindings={"_pursued_tail_retry": _pursued_tail_retry},
+        extraction_contract=CONTRACT,
+    )
+
+    pursued = next(
+        function
+        for function in module.functions.values()
+        if function.name.endswith("___pursued_tail_retry")
+    )
+    instructions = [
+        instruction
+        for block in pursued.blocks.values()
+        for instruction in block.instrs
+    ]
+    assert not any(
+        instruction.op == "Call"
+        and instruction.attributes.get("callee") == pursued.name
+        for instruction in instructions
+    )
+    assert any(instruction.op == "Br" for instruction in instructions)
+    assert any(
+        instruction.op == "Ret" and instruction.args
+        for instruction in instructions
+    )
+    assert not any(
+        block.name.startswith("unreachable")
+        and any(instruction.op == "Call" for instruction in block.instrs)
+        for block in pursued.blocks.values()
+    )
+
+
+def test_direct_tail_recursion_publishes_tuple_result_lanes():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def root(value):\n"
+        "    if value <= 0:\n"
+        "        return value, value + 1\n"
+        "    return root(value - 1)\n",
+        "root",
+        name="tuple_tail_retry",
+        extraction_contract=CONTRACT,
+    )
+
+    root = module.functions["tuple_tail_retry__root"]
+    returned = next(
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret"
+    )
+    assert tuple(root.metadata["source_output_value_ids"])
+    assert len(tuple(root.metadata["source_output_value_ids"])) == 2
+    assert returned.args
+
+
+def test_multi_result_call_writes_the_record_fields_read_after_assignment():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def pair(value):\n"
+        "    return value + 1.0, value + 2.0\n\n"
+        "def update(state, value):\n"
+        "    state.last_wave_speed, state.last_height_violation = pair(value)\n"
+        "    return state.last_wave_speed + state.last_height_violation\n\n"
+        "def root(state, value):\n"
+        "    return update(state, value)\n",
+        "root",
+        name="record_field_multi_result_inout",
+        extraction_contract=CONTRACT,
+    )
+
+    update = module.functions["record_field_multi_result_inout__update"]
+    call = next(
+        instruction
+        for block in update.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("callee")
+        == "record_field_multi_result_inout__pair"
+    )
+    output_ids = tuple(map(int, call.attributes["output_ids"]))
+    record = next(
+        item for item in module.record_tables[update.name].records.values()
+        if item.identity.endswith(".SymbolicFluidGridState")
+    )
+    fields = {
+        field.name: field
+        for field in record.fields
+        if field.name in {"last_wave_speed", "last_height_violation"}
+    }
+    assert tuple(fields) == ("last_wave_speed", "last_height_violation")
+    assert all(field.writable for field in fields.values())
+    assert tuple(field.value_ids[0] for field in fields.values()) == output_ids
+    assert all(len(field.value_ids) == 1 for field in fields.values())
+    region_call = next(
+        instruction
+        for block in update.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("region_index") == 1
+    )
+    assert tuple(int(argument.id) for argument in region_call.args) == output_ids
+
+
 def test_direct_source_lowers_declared_record_literal_and_bool_return():
     module, outputs, _exports = lower_ast_source_to_ssa(
         "def root(value):\n"
@@ -303,6 +708,39 @@ def test_direct_source_lowers_declared_record_literal_and_bool_return():
         for block in root.blocks.values()
         for instruction in block.instrs
     )
+
+
+def test_linked_record_result_expands_as_typed_sequence_row():
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def make(value):\n"
+        "    return Metrics(max_vel=value, max_flux=value, div_inf=value, "
+        "mass_err=value, osc_flag=value, stiff_flag=value, sim_frame=value, "
+        "proc_ms=value, dt_limit=value, "
+        "error_channels={'residual': value}, hard_failure=value, "
+        "advanced_dt=value)\n\n"
+        "def root(value):\n"
+        "    rows: list[Metrics] = []\n"
+        "    metrics = make(value)\n"
+        "    rows.append(metrics)\n"
+        "    return value\n",
+        "root",
+        name="linked_record_row_append",
+        python_bindings={"Metrics": Metrics},
+        extraction_contract=CONTRACT,
+    )
+
+    root = module.functions["linked_record_row_append__root"]
+    assert "unresolved_record_sequence_rows" not in root.metadata
+    append = next(
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("ssa_sequence_operation") == "append"
+    )
+    assert len(append.args) == len(module.functions["ssa_sequence_1_append"].args)
+    assert len(append.args) == 30
+    assert "ssa_deferred_record_row" not in append.attributes
+    assert append.attributes["ssa_record_row_identity"] == "Metrics"
 
 
 def test_record_return_call_refreshes_completed_physical_field_surface():
@@ -457,6 +895,14 @@ def test_late_record_result_rebinds_aliased_fields_in_following_call_frame():
     assert physical[fields["max_vel"].value_ids[0]] == physical[
         fields["max_flux"].value_ids[0]
     ]
+    aliases = set(map(int, root.metadata.get("value_aliases", {})))
+    assert not any(
+        int(argument.id) in aliases
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+        for argument in instruction.args
+    )
     assert max(
         int(value.id)
         for function in module.functions.values()
@@ -1086,6 +1532,389 @@ def test_record_field_storage_identity_crosses_the_call_frame():
         # call time, so naming symbolic axes there would corrupt every buffer
         # size derived from it.
         assert tuple(value.shape or ()) == (), name
+
+
+def test_exact_record_span_shape_reaches_callee_before_region_lowering():
+    """Exact record extents must select callee tensor kernels pre-link."""
+
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+    from src.common.tensors import AbstractTensor
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {
+                "ExactState": {
+                    "identity": "tests.ExactState",
+                    "fields": {
+                        "height": {
+                            "storage": "span",
+                            "dtype": "float64",
+                            "rank": 2,
+                            "shape": [2, 3],
+                        },
+                    },
+                },
+            },
+            "bindings": [{
+                "function": "root",
+                "parameter": "state",
+                "record": "ExactState",
+            }],
+            "values": [{
+                "function": "root",
+                "parameter": "indices",
+                "storage": "span",
+                "dtype": "int64",
+                "rank": 1,
+                "shape": [1],
+                "python_type": (
+                    "src.common.tensors.abstraction.AbstractTensor"
+                ),
+            }],
+        })
+    )
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def inner(grid, indices):\n"
+        "    view = grid.reshape((-1, 3))\n"
+        "    return view.gather(indices, dim=0)\n\n"
+        "def root(state, indices):\n"
+        "    return inner(state.height, indices)\n",
+        "root",
+        name="exact_span_cross",
+        python_bindings={"AbstractTensor": AbstractTensor},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        extraction_contract=contract,
+    )
+
+    carried = {
+        name: value
+        for name, function in module.functions.items()
+        for value in function.args
+        if (value.accounting or {}).get("program_abi_field") == "height"
+    }
+    assert "exact_span_cross__root" in carried
+    assert any(
+        name.startswith("exact_span_cross__inner__specialized_")
+        for name in carried
+    )
+    assert all(value.shape == (2, 3) for value in carried.values())
+    gathers = [
+        instruction
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("callee") == "gather_values_double"
+    ]
+    assert len(gathers) == 1
+    assert gathers[0].args[0].shape == (2, 3)
+
+
+def test_indexed_record_field_write_keeps_one_resident_call_frame():
+    """A post-IndexedStore field read is the mutated resident span."""
+
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {
+                "ExactState": {
+                    "identity": "tests.ExactState",
+                    "fields": {
+                        "height": {
+                            "storage": "span",
+                            "dtype": "float64",
+                            "rank": 2,
+                            "shape": [2, 3],
+                            "mutable": True,
+                        },
+                    },
+                },
+            },
+            "bindings": [{
+                "function": "root",
+                "parameter": "state",
+                "record": "ExactState",
+            }],
+            "values": [{
+                "function": "root",
+                "parameter": "dt",
+                "storage": "scalar",
+                "dtype": "float64",
+                "rank": 0,
+                "python_type": "builtins.float",
+            }],
+        })
+    )
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def consume(grid):\n"
+        "    return grid.sum()\n\n"
+        "def root(state, dt):\n"
+        "    state.height[:, 0] = dt\n"
+        "    return consume(state.height)\n",
+        "root",
+        name="indexed_record_resident",
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        extraction_contract=contract,
+    )
+
+    root = module.functions["indexed_record_resident__root"]
+    height_arguments = [
+        value for value in root.args
+        if (value.accounting or {}).get("program_abi_field") == "height"
+    ]
+    assert len(height_arguments) == 1
+    resident = height_arguments[0]
+    assert (resident.accounting or {}).get("program_abi_field_written") is True
+    assert not any(
+        (value.accounting or {}).get("split_from_unproven_alias") is not None
+        for value in root.args
+    )
+    indexed_assigns = [
+        instruction
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("callee") == "index_assign_double"
+    ]
+    assert len(indexed_assigns) == 1
+    assert indexed_assigns[0].args[0].id == resident.id
+    store_region = next(
+        function.name
+        for function in module.functions.values()
+        if any(
+            instruction is indexed_assigns[0]
+            for block in function.blocks.values()
+            for instruction in block.instrs
+        )
+    )
+    root_callees = [
+        str(instruction.attributes.get("callee") or "")
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+    ]
+    consume_index = next(
+        index for index, callee in enumerate(root_callees)
+        if "__consume" in callee
+    )
+    assert root_callees.index(store_region) < consume_index
+
+
+def test_multi_result_call_does_not_move_before_indexed_record_write():
+    """Call-frame temporary ids are not semantic pre-marker consumers."""
+
+    from src.compiler.extraction_contract import (
+        ExtractionContract,
+        ProgramABIContract,
+    )
+    from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_backend_repository_ssa_reference,
+    )
+
+    contract = ExtractionContract(CONTRACT).with_program_abi(
+        ProgramABIContract.from_mapping({
+            "records": {
+                "ExactState": {
+                    "identity": "tests.ExactState",
+                    "fields": {
+                        "height": {
+                            "storage": "span",
+                            "dtype": "float64",
+                            "rank": 2,
+                            "shape": [2, 3],
+                            "mutable": True,
+                        },
+                    },
+                },
+            },
+            "bindings": [{
+                "function": "root",
+                "parameter": "state",
+                "record": "ExactState",
+            }],
+            "values": [{
+                "function": "root",
+                "parameter": "dt",
+                "storage": "scalar",
+                "dtype": "float64",
+                "rank": 0,
+                "python_type": "builtins.float",
+            }],
+        })
+    )
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def pair(grid):\n"
+        "    return grid + 1.0, grid + 2.0\n\n"
+        "def root(state, dt):\n"
+        "    state.height[:, 0] = dt\n"
+        "    left, right = pair(state.height)\n"
+        "    return left.sum() + right.sum()\n",
+        "root",
+        name="indexed_record_multi_result_order",
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        extraction_contract=contract,
+    )
+
+    root = module.functions["indexed_record_multi_result_order__root"]
+    calls = [
+        instruction
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+    ]
+    store_index = next(
+        index for index, instruction in enumerate(calls)
+        if "__planned_region_" in str(instruction.attributes.get("callee"))
+        and any(
+            nested.op == "Call"
+            and nested.attributes.get("callee") == "index_assign_double"
+            for block in module.functions[
+                str(instruction.attributes["callee"])
+            ].blocks.values()
+            for nested in block.instrs
+        )
+    )
+    pair_index = next(
+        index for index, instruction in enumerate(calls)
+        if "__pair" in str(instruction.attributes.get("callee"))
+    )
+    assert store_index < pair_index
+
+
+def test_dependency_order_includes_canonical_parent_edges_absent_from_networkx():
+    from src.compiler.glsl_deployment_strategy import _dependency_order
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.add_node(1, type="Input", parents=())
+    graph.G.add_node(4, type="Call", parents=((9, "after_write"),))
+    graph.G.add_node(9, type="IndexedStore", parents=((1, "base"),))
+    graph.G.add_edge(1, 9)
+
+    order = _dependency_order(graph)
+    assert order.index(9) < order.index(4)
+
+
+def test_declared_record_span_is_a_planner_tensor_descriptor():
+    from src.compiler.glsl_deployment_strategy import _tensor_descriptor
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.graph["parameter_record_abi"] = {
+        "state": {
+            "identity": "tests.ExactState",
+            "fields": {
+                "height": {
+                    "storage": "span",
+                    "dtype": "float64",
+                    "rank": 3,
+                    "shape": [2, 3, 4],
+                },
+            },
+        },
+    }
+    graph.G.add_node(
+        1, type="Input", op="input",
+        attributes={"binding_name": "state"},
+    )
+    graph.G.add_node(
+        2, type="GetAttr", op="getattr",
+        attributes={"attribute": "height"},
+        parents=((1, "value"),),
+    )
+
+    assert _tensor_descriptor(graph, 2) == {
+        "shape": (2, 3, 4),
+        "dtype": "float64",
+    }
+
+
+def test_callsite_shape_discards_padded_scalar_result_descriptors():
+    from src.compiler.glsl_deployment_strategy import (
+        _apply_callsite_tensor_descriptors,
+    )
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.graph["identity_table"] = {"grid": (1,)}
+    graph.G.add_node(
+        1, type="Input", op="input",
+        attributes={"binding_name": "grid"},
+        tensor={"shape": (1, 1, 1), "dtype": "float64"},
+    )
+    graph.G.add_node(
+        2, type="Call", op="min",
+        attributes={"tensor_candidate": "min", "dim": 3},
+        parents=((1, "operand"),),
+        tensor={"shape": (1, 1, 1), "dtype": "float64"},
+    )
+
+    _apply_callsite_tensor_descriptors(
+        graph, {"grid": {"shape": (8, 4, 128, 2), "dtype": "float64"}},
+    )
+
+    assert graph.G.nodes[1]["tensor"]["shape"] == (8, 4, 128, 2)
+    assert "tensor" not in graph.G.nodes[2]
+
+
+def test_shape_constant_waits_for_authoritative_callsite_descriptor():
+    from src.compiler.glsl_deployment_strategy import (
+        _apply_callsite_tensor_descriptors,
+        _fold_callsite_structural_values,
+    )
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.graph["identity_table"] = {"grid": (1,)}
+    graph.G.add_node(
+        1, type="Input", op="input",
+        attributes={"binding_name": "grid"},
+        parents=(),
+    )
+    graph.G.add_node(
+        2, type="Call", op="min",
+        attributes={"tensor_candidate": "min", "dim": 3},
+        tensor={"shape": (1, 1, 1), "dtype": "float64"},
+        parents=((1, "operand"),),
+        expr_obj=ast.parse("grid.min(dim=3)", mode="eval").body,
+    )
+    graph.G.add_node(
+        3, type="GetAttr", op="getattr",
+        attributes={"attribute": "shape"},
+        parents=((2, "value"),),
+    )
+    graph.G.add_node(
+        4, type="Constant", op="const", constant=2,
+        attributes={"value": 2}, parents=(),
+    )
+    graph.G.add_node(
+        5, type="Indexed", op="indexed",
+        parents=((3, "base"), (4, "index")),
+    )
+    graph.G.add_edges_from(((1, 2), (2, 3), (3, 5), (4, 5)))
+    graph.roots = [5]
+
+    _fold_callsite_structural_values(graph)
+    assert graph.G.nodes[5]["type"] == "Indexed"
+
+    _apply_callsite_tensor_descriptors(
+        graph, {"grid": {"shape": (8, 4, 128, 2), "dtype": "float64"}},
+    )
+    _fold_callsite_structural_values(graph)
+
+    assert graph.G.nodes[5]["type"] == "Constant"
+    assert graph.G.nodes[5]["constant"] == 128
+    assert graph.G.nodes[5]["constant"] == 128
 
 
 def test_returned_record_fields_feed_structural_call_argument():

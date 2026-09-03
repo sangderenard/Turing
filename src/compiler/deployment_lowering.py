@@ -275,6 +275,20 @@ register_deployment_profile(DeploymentLoweringProfile(
     strategies=(SERIAL, DISPATCH),
     parallel_join_modes=("barrier",),
     executor="src/common/tensors/accelerator_backends/glsl_backend.py",
+    note="desktop OpenGL compute; retained as the historical target name",
+))
+register_deployment_profile(DeploymentLoweringProfile(
+    backend="native_glsl",
+    strategies=(SERIAL, DISPATCH),
+    parallel_join_modes=("barrier",),
+    executor=(
+        "src/common/tensors/accelerator_backends/glsl_backend.py; "
+        "src/compiler/glsl_blas_deployment.py native SDL/OpenGL shell"
+    ),
+    note=(
+        "explicit desktop-native GLSL dispatcher option; shares GLSL "
+        "operator coverage but is distinct from browser shader targets"
+    ),
 ))
 
 

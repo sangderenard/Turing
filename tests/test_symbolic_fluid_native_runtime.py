@@ -28,7 +28,6 @@ def test_native_sympy_fluid_step_rejects_rolls_back_and_lands_on_frame(tmp_path)
         ),
         STController(dt_min=1.0e-8, dt_max=0.2),
         advance,
-        max_iters=256,
         attempt_log=attempts,
     )
 

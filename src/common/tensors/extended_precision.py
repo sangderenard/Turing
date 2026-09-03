@@ -595,7 +595,11 @@ class Precision:
         """
 
         seed = like.term(0)
-        return cls(constant(seed, parts, like.limbs), like.limbs)
+        return cls(
+            [plain(plain(seed, "mul", 0.0), "add", part)
+             for part in list(parts)[:like.limbs]],
+            like.limbs,
+        )
 
     @classmethod
     def of(cls, value: Any, limbs: int = 2) -> "Precision":
@@ -608,9 +612,9 @@ class Precision:
     def collapse(self) -> Any:
         """Back to an ordinary tensor, paying the rounding once."""
 
-        total = self._stack[0]
+        total = self.term(0)
         for index in range(1, self.limbs):
-            total = plain(total, "add", self._stack[index])
+            total = plain(total, "add", self.term(index))
         return total
 
     @property
@@ -732,15 +736,20 @@ class Precision:
     # -- the representation ------------------------------------------------
 
     def term(self, index: int) -> Any:
-        return self._stack[int(index)]
+        from .abstraction import AbstractTensor
+
+        # Indexing a zero-dimensional eager backend stack may unwrap the limb
+        # to a NumPy scalar.  Re-enter through the tensor boundary so scalar
+        # equation parameters retain operator dispatch just like vector limbs.
+        return AbstractTensor.get_tensor(self._stack[int(index)])
 
     def terms(self, width: int | None = None) -> list:
         width = self.limbs if width is None else int(width)
         if width == self.limbs:
-            return [self._stack[index] for index in range(self.limbs)]
+            return [self.term(index) for index in range(self.limbs)]
         if width < self.limbs:
-            return [self._stack[index] for index in range(width)]
-        held = [self._stack[index] for index in range(self.limbs)]
+            return [self.term(index) for index in range(width)]
+        held = [self.term(index) for index in range(self.limbs)]
         zero = plain(held[0], "mul", 0.0)
         return held + [zero] * (width - self.limbs)
 
@@ -801,7 +810,12 @@ class Precision:
             if isinstance(value, Precision):
                 return value.terms(width)
             if hasattr(value, "shape"):
-                return limbs_of(value, width, value)
+                # A plain tensor meeting a Precision value is one leading
+                # limb plus exact zero tails.  It is not an already-packed
+                # interleaved buffer; treating it as one broke scalar factors
+                # such as the binade scale used by real powers.
+                value_zero = plain(value, "mul", 0.0)
+                return [value] + [value_zero for _index in range(width - 1)]
             return ([plain(template_zero, "add", value)]
                     + [template_zero for _index in range(width - 1)])
 
@@ -826,7 +840,11 @@ class Precision:
             if accumulate_output:
                 return accumulator
             pieces = accumulator.to_expansion(width)
-        return cls(interleave(pieces), width)
+        # The class owns a planar leading limb axis.  Passing the terms
+        # directly also preserves zero-dimensional scalar tensors; routing a
+        # scalar through the legacy channel interleaver has no channel axis to
+        # flatten and used to make scalar AOT parameters fail here.
+        return cls(pieces, width)
 
     def __add__(self, other): return Precision.dispatch("add", self, other)
     def __radd__(self, other): return Precision.dispatch("add", other, self)
@@ -932,22 +950,19 @@ class Precision:
         return root
 
     def __pow__(self, exponent) -> "Precision":
-        """Integer powers by repeated squaring, and nothing else.
+        """Integer powers exactly; real powers through wide log and exp.
 
-        A fractional power is a transcendental and belongs to the signal
-        cores, which state the interval they are valid on and measure
-        their own error. Answering one here would mean collapsing to a
-        double and discarding every limb the caller asked for.
+        The real route is ``exp(exponent * log(self))``.  Both transcendental
+        operations range-reduce into their proved limb-aware cores, so this is
+        not a binary64 answer widened after the fact.  A real exponent requires
+        a strictly positive base; negative-base integer powers keep using the
+        exact repeated-squaring path.
         """
 
         if isinstance(exponent, float) and exponent.is_integer():
             exponent = int(exponent)
         if not isinstance(exponent, int):
-            raise TypeError(
-                f"Precision supports integer powers; {exponent!r} is a "
-                "transcendental one -- take it through the signal cores, "
-                "which state the interval they are valid on"
-            )
+            return (exponent * self.log()).exp()
         one = Precision.of(self.collapse() * 0.0 + 1.0, self.limbs)
         if exponent == 0:
             return one
@@ -961,6 +976,11 @@ class Precision:
             if remaining:
                 base = base * base
         return result
+
+    def __rpow__(self, base) -> "Precision":
+        """A scalar/tensor base raised to this wide real exponent."""
+
+        return Precision.of(base, self.limbs) ** self
 
     # -- transcendentals: the cores, at this width -----------------------
     #
@@ -1015,7 +1035,47 @@ class Precision:
         return self._core("tan")
 
     def exp(self) -> "Precision":
-        return self._core("exp")
+        """Wide exponential with ln(2) range reduction.
+
+        The collapsed value selects an integer binade only; it never supplies
+        significant digits to the result.  The reduced remainder and final
+        product remain at this value's limb width.
+        """
+
+        import math
+
+        from .signal_symbolic import constant_limbs
+
+        ln2 = Precision.constant(self, constant_limbs("ln2", self.limbs))
+        binade = (self.collapse() / float(math.log(2.0))).round()
+        remainder = self - ln2 * binade
+        scale = 2.0 ** binade
+        return remainder._core("exp") * scale
+
+    def log(self) -> "Precision":
+        """Natural logarithm for positive values, at the owned limb width.
+
+        A binary64 logarithm chooses the binade but contributes no digits to
+        the answer.  Two square roots move the mantissa into the proved
+        ``log1p`` interval; the wide ln(2) reconstruction then restores scale.
+        """
+
+        import math
+
+        from .signal_symbolic import constant_limbs
+
+        collapsed = self.collapse()
+        try:
+            minimum = min(float(each) for each in _flatten(collapsed.tolist()))
+        except (TypeError, ValueError):
+            minimum = float("-inf")
+        if minimum <= 0.0:
+            raise ValueError("real Precision.log and real powers require a positive base")
+        binade = (collapsed.log() / float(math.log(2.0))).floor()
+        mantissa = self * (2.0 ** (-binade))
+        reduced = mantissa.sqrt().sqrt()
+        ln2 = Precision.constant(self, constant_limbs("ln2", self.limbs))
+        return (reduced - 1.0).log1p() * 4.0 + ln2 * binade
 
     def expm1(self) -> "Precision":
         return self._core("expm1")

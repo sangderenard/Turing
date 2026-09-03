@@ -526,6 +526,12 @@ class SSAReferenceEvaluator:
                 payload = attributes.get("value")
             if payload is None and "values" in attributes:
                 payload = attributes.get("values")
+            if payload is None and "llvm_literal" in attributes:
+                from .ir_literals import decode_llvm_scalar_literal
+
+                payload = decode_llvm_scalar_literal(
+                    str(attributes["llvm_literal"]),
+                )
             values[int(result.id)] = payload
             return
 
@@ -535,6 +541,20 @@ class SSAReferenceEvaluator:
                     "NoneValue requires one result and no operands or attributes"
                 )
             values[int(result.id)] = None
+            return
+
+        if operation in {"string_token", "StringToken"}:
+            token = instruction.attributes.get("token")
+            if token is None:
+                from .string_table import string_token
+
+                text = instruction.attributes.get("text")
+                if not isinstance(text, str):
+                    raise SSAEvaluationError(
+                        "string_token requires either an exact token or text"
+                    )
+                token = string_token(text)
+            values[int(result.id)] = np.int64(token)
             return
 
         if operation in {"Phi", "phi"}:
@@ -636,14 +656,85 @@ class SSAReferenceEvaluator:
         callee_name = str(instruction.attributes.get("callee") or "")
         callee = self.functions.get(callee_name)
         if callee is None:
+            intrinsic = {
+                "pow": np.power,
+                "llvm.floor.f64": np.floor,
+                "llvm.sqrt.f64": np.sqrt,
+                "llvm.fabs.f64": np.abs,
+                "llvm.round.f64": np.round,
+                "llvm.trunc.f64": np.trunc,
+                "llvm.ceil.f64": np.ceil,
+                "exp": np.exp,
+                "log": np.log,
+                "tanh": np.tanh,
+                "sin": np.sin,
+                "cos": np.cos,
+                "tan": np.tan,
+                "asin": np.arcsin,
+                "acos": np.arccos,
+                "atan": np.arctan,
+                "sinh": np.sinh,
+                "cosh": np.cosh,
+                "asinh": np.arcsinh,
+                "acosh": np.arccosh,
+                "atanh": np.arctanh,
+            }.get(callee_name)
+            if intrinsic is not None and instruction.res is not None:
+                operands = tuple(
+                    self._operand(values, argument)
+                    for argument in instruction.args
+                )
+                values[int(instruction.res.id)] = intrinsic(*operands)
+                return
             raise SSAEvaluationError(f"call to unknown function {callee_name!r}")
 
         # Formals bind positionally to the caller's operands. Arrays bind by
         # reference so a Store inside the callee is visible to the caller,
         # which is what the compiled out-param convention also does.
         inner: dict[int, Any] = {}
-        for formal, actual in zip(callee.args, instruction.args):
-            inner[int(formal.id)] = self._value(values, actual)
+        output_position = instruction.attributes.get("ssa_output_argument")
+        if output_position is None:
+            output_position = callee.metadata.get("ssa_output_argument")
+        output_position = (
+            int(output_position) if output_position is not None else None
+        )
+        declared_names = tuple(callee.metadata.get("llvm_argument_names") or ())
+        count_position = (
+            declared_names.index("n") if "n" in declared_names else None
+        )
+        output_storage: Any = None
+        for position, (formal, actual) in enumerate(
+            zip(callee.args, instruction.args)
+        ):
+            if int(actual.id) in values:
+                held = self._value(values, actual)
+            elif position == output_position:
+                shape = tuple(actual.shape or formal.shape or ())
+                count = int(np.prod(shape)) if shape else 0
+                if count <= 0 and count_position is not None:
+                    count = int(np.asarray(self._operand(
+                        values, instruction.args[count_position],
+                    )).reshape(-1)[0])
+                count = max(1, count)
+                dtype = str(formal.dtype or actual.dtype or "float64").lower()
+                held = np.zeros(
+                    count,
+                    dtype=(
+                        np.int32 if dtype in {"bool", "int32", "i1", "i32"}
+                        else np.int64 if dtype in {"int64", "i64"}
+                        else np.float64
+                    ),
+                )
+                # Output-argument calls name their destination before it has
+                # a numerical definition. Backends allocate that slot in the
+                # call frame; the evaluator must model the same storage rather
+                # than reporting an ordinary undefined-value read.
+                values[int(actual.id)] = held
+            else:
+                held = self._value(values, actual)
+            inner[int(formal.id)] = held
+            if position == output_position:
+                output_storage = held
 
         returned = self._execute(callee, inner)
 
@@ -691,7 +782,9 @@ class SSAReferenceEvaluator:
                     # value while the loop appeared to run.
                     values[value_id] = published[position]
             return
-        if instruction.res is not None:
+        if instruction.res is not None and output_storage is not None:
+            values[int(instruction.res.id)] = output_storage
+        elif instruction.res is not None:
             values[int(instruction.res.id)] = (
                 returned[0] if len(returned) == 1 else list(returned)
             )

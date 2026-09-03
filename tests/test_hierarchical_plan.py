@@ -20,6 +20,7 @@ from src.compiler.glsl_deployment_strategy import (
     PlannedOperatorImplementation,
     _build_planned_operator_implementations,
     _build_shell_hierarchy_plan,
+    _fold_callsite_structural_values,
     _planned_operator_node_ids,
 )
 from src.common.tensors.accelerator_backends.c_primitive_program import (
@@ -186,6 +187,123 @@ def test_direct_aggregate_return_binds_call_from_source_span_and_backing_storage
 
     assert isinstance(call, PlanCall)
     assert call.result_bindings == ((1, 5),)
+
+
+def test_exact_peer_descriptor_folds_shape_with_unsettled_parameter():
+    process = nx.DiGraph()
+    process.graph["function_name"] = "reshape_peer"
+    process.add_node(
+        0,
+        type="Input",
+        attributes={"binding_name": "rest"},
+        tensor={"shape": (128, 3), "dtype": "float64"},
+    )
+    process.add_node(
+        1, type="Input", attributes={"binding_name": "unsettled"}
+    )
+    process.add_node(
+        2,
+        type="Attribute",
+        parents=((0, "value"),),
+        attributes={"attribute": "shape"},
+        expr_obj=ast.parse("rest.shape", mode="eval").body,
+    )
+    process.add_node(3, type="Constant", attributes={"value": 0})
+    process.add_node(
+        4,
+        type="Indexed",
+        parents=((2, "base"), (3, "index")),
+        expr_obj=ast.parse("rest.shape[0]", mode="eval").body,
+    )
+    for node_id, value in ((5, -1), (6, 4), (7, 3)):
+        process.add_node(node_id, type="Constant", attributes={"value": value})
+    process.add_node(
+        8,
+        type="Tuple",
+        parents=((5, "elts"), (6, "elts"), (4, "elts"), (7, "elts")),
+        expr_obj=ast.parse("(-1, 4, rest.shape[0], 3)", mode="eval").body,
+    )
+    process.add_node(
+        9,
+        type="Input",
+        attributes={"binding_name": "source"},
+        tensor={"shape": (8, 4, 128, 3), "dtype": "float64"},
+    )
+    process.add_node(
+        10,
+        type="reshape",
+        op="reshape",
+        parents=((9, "operand"), (8, "arg:0")),
+        attributes={"tensor_candidate": "reshape"},
+        expr_obj=ast.parse(
+            "source.reshape((-1, 4, rest.shape[0], 3))", mode="eval"
+        ).body,
+    )
+    for node_id, data in tuple(process.nodes(data=True)):
+        for parent, _role in data.get("parents") or ():
+            process.add_edge(int(parent), int(node_id))
+
+    _fold_callsite_structural_values(SimpleNamespace(G=process, roots=[10]))
+
+    assert process.nodes[10]["tensor"]["shape"] == (8, 4, 128, 3)
+
+
+def test_call_result_projection_is_not_also_owned_by_numeric_region():
+    child_graph = nx.DiGraph()
+    child_graph.add_node(10, type="Input", attributes={"binding_name": "a"})
+    child_graph.add_node(11, type="Input", attributes={"binding_name": "b"})
+    child_graph.graph.update({
+        "identity_table": {"a": (10,), "b": (11,)},
+        "function_outputs": ("a", "b"),
+    })
+    child = SimpleNamespace(
+        process_graph=SimpleNamespace(G=child_graph),
+        dispatch_subgraphs=(),
+        callsite_function_shells={},
+        loop_plans=(),
+        shell_control_program=None,
+        _captured_return_value_ids=(),
+    )
+    process = nx.DiGraph()
+    process.add_node(0, type="Input", attributes={"binding_name": "x"})
+    process.add_node(5, type="Call", parents=((0, "arg:0"),), attributes={})
+    process.add_node(8, type="Constant", attributes={"value": 0})
+    process.add_node(
+        6,
+        type="Indexed",
+        op="indexed",
+        parents=((5, "base"), (8, "index")),
+        attributes={},
+    )
+    process.add_node(
+        7,
+        type="add",
+        op="add",
+        parents=((6, "lhs"), (0, "rhs")),
+        attributes={},
+    )
+    process.add_edges_from(((0, 5), (5, 6), (8, 6), (6, 7), (0, 7)))
+    process.graph["identity_table"] = {"x": (0,)}
+    region = nx.DiGraph()
+    region.graph["deployment_nodes"] = (6, 7)
+    shell = SimpleNamespace(
+        process_graph=SimpleNamespace(G=process),
+        dispatch_subgraphs=(SimpleNamespace(G=region),),
+        callsite_function_shells={5: child},
+        loop_plans=(),
+        shell_control_program=None,
+    )
+
+    plan = _build_shell_hierarchy_plan(shell)
+    call = next(item for item in plan.items if isinstance(item, PlanCall))
+    planned_region = next(
+        item for item in plan.items
+        if isinstance(item, PlanClosure) and item.name == "region_0"
+    )
+
+    assert call.result_bindings == ((10, 6),)
+    assert planned_region.captures == (6, 0)
+    assert tuple(line.outputs for line in planned_region.items) == ((7,),)
 
 
 def test_loop_carried_initializer_is_region_capture_not_body_constant():
@@ -1148,6 +1266,33 @@ def test_python_integer_chain_is_int64_before_backend_lowering():
         3: "int64", 4: "int64", 5: "int64", 6: "int64",
         7: "int64", 8: "int64",
     }
+
+
+def test_scalar_tensor_tagged_extrema_become_primitive_ssa_in_plan_lowering():
+    region = PlanClosure(
+        "region_0",
+        captures=(1, 2),
+        items=(PlanLine.create(
+            "Call",
+            inputs=(1, 2),
+            outputs=(3,),
+            attributes={
+                "callee": "max",
+                "tensor_operation": "max",
+                "lowered_from": "c_backend_llvm_ssa.TRANSLATIONS",
+            },
+        ),),
+        value_shapes=tuple(
+            (value_id, (), "float64") for value_id in (1, 2, 3)
+        ),
+    )
+
+    instructions = plan_region_to_ssa_instrs(region)
+
+    assert len(instructions) == 1
+    assert instructions[0].op == "Max"
+    assert "callee" not in instructions[0].attributes
+    assert "tensor_operation" not in instructions[0].attributes
 
 
 import ast

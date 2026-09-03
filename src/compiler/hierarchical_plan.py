@@ -359,15 +359,30 @@ def plan_region_to_ssa_instrs(
             and not tuple(result.shape)
             and all(not tuple(value(value_id).shape) for value_id in semantic_inputs)
         )
-        if is_scalar and opcode.casefold() in scalar_spelling:
-            opcode = scalar_spelling[opcode.casefold()]
+        semantic_opcode = str(
+            attributes.get("tensor_operation")
+            or attributes.get("tensor_candidate")
+            or opcode
+        )
+        if is_scalar and semantic_opcode.casefold() in scalar_spelling:
+            opcode = scalar_spelling[semantic_opcode.casefold()]
 
         # Python's variadic min/max and the tensor clamp convenience are
         # ordinary binary SSA folds.  Decomposing them here keeps evaluation
         # order and data dependencies visible, and gives every backend the
         # same primitive program instead of four bespoke builtin handlers.
-        fold_opcode = {"max": "Max", "min": "Min"}.get(opcode.casefold())
+        fold_opcode = {"max": "Max", "min": "Min"}.get(
+            semantic_opcode.casefold()
+        )
         if is_scalar and fold_opcode is not None and len(semantic_inputs) >= 2:
+            scalar_attributes = {
+                key: value
+                for key, value in attributes.items()
+                if key not in {
+                    "callee", "lowered_from", "tensor",
+                    "tensor_candidate", "tensor_operation",
+                }
+            }
             operands = [value(value_id) for value_id in semantic_inputs]
             accumulator = operands[0]
             for position, operand in enumerate(operands[1:], 1):
@@ -380,7 +395,10 @@ def plan_region_to_ssa_instrs(
                     [accumulator, operand],
                     fold_result,
                     arg_roles=["left", "right"],
-                    attributes={**attributes, "source_operator": opcode},
+                    attributes={
+                        **scalar_attributes,
+                        "source_operator": semantic_opcode,
+                    },
                 ))
                 accumulator = fold_result
             continue

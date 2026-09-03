@@ -58,3 +58,9 @@ python -m src.rendering.precompiled_graph_demo `
   --entrypoint train `
   --extraction-contract extraction_contracts/program_extraction.yaml
 ```
+
+`vehicle_full_native_execution.yaml` is an execution overlay used by the
+Python-authored vehicle module. It deliberately reuses the exhaustive callable
+classification rules above while changing success to native whole-program
+closure: unlowered behavior and Python callbacks are rejected. The overlay
+text participates in the derived extraction fingerprint.

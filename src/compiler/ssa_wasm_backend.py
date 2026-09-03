@@ -452,6 +452,7 @@ class WasmCoreArtifact:
     binary: bytes
     parameters: tuple[tuple[str, int], ...]
     shortfalls: tuple[WasmEmissionShortfall, ...]
+    output_order: tuple[int, ...] = ()
     precision_sections: bool = False
 
     @property
@@ -475,6 +476,13 @@ def emit_ssa_module_to_wasm_core(
 
     name = str(entry_name or function_name)
     root: Function = module.functions[function_name]
+    root_returns = tuple(
+        instruction.args
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if str(instruction.op) in {"Ret", "ret", "Return", "return"}
+    )
+    returned_values = root_returns[-1] if root_returns else ()
     shortfalls: list[WasmEmissionShortfall] = []
     reachable = [function_name]
     for block in root.blocks.values():
@@ -537,6 +545,15 @@ def emit_ssa_module_to_wasm_core(
         else:
             parameters.append(("f64", value_id))
             parameter_types.append("f64")
+    argument_ids = {int(value.id) for value in root.args}
+    output_parameter_indices: dict[int, int] = {}
+    for output in returned_values:
+        value_id = int(output.id)
+        if value_id in argument_ids:
+            continue
+        output_parameter_indices[value_id] = len(parameters)
+        parameters.append(("buffer", value_id))
+        parameter_types.append("i32")
 
     builder = CodeBuilder("f64", parameter_count=len(parameters))
     precision_present = False
@@ -775,6 +792,22 @@ def emit_ssa_module_to_wasm_core(
                 builder.end()
                 continue
             if operation in ("Ret", "Return"):
+                for returned in instruction.args:
+                    output_parameter = output_parameter_indices.get(
+                        int(returned.id)
+                    )
+                    if output_parameter is None:
+                        continue
+                    if int(returned.id) in pointer_ids or returned.shape:
+                        shortfalls.append(WasmEmissionShortfall(
+                            "Ret",
+                            "aggregate return requires an explicit output-arena "
+                            f"copy: %t{returned.id}",
+                        ))
+                        continue
+                    builder.local_get(output_parameter)
+                    if push(root_env, returned):
+                        builder.store()
                 builder.raw(_OP_RETURN)
                 continue
             emit_straight_instruction(root_env, instruction)
@@ -793,6 +826,7 @@ def emit_ssa_module_to_wasm_core(
         binary=binary,
         parameters=tuple(parameters),
         shortfalls=tuple(shortfalls),
+        output_order=tuple(int(value.id) for value in returned_values),
         precision_sections=precision_present,
     )
 

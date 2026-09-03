@@ -1250,7 +1250,14 @@ def dispatch_region_to_fused_program(
     for node_id in region.node_ids:
         data = graph.G.nodes[node_id]
         raw_op = _operation(graph, node_id)
-        reduction = raw_op in AXIS_REDUCTION_FOLDS
+        parents = list(data.get("parents") or ())
+        # ``max``/``min`` name both Python's binary scalar operations and
+        # tensor axis reductions.  Arity disambiguates them at this semantic
+        # boundary: a reduction consumes one tensor; a two-parent node is the
+        # ordinary elementwise binary operation and may legitimately carry a
+        # scalar constant operand (for example ``max(speed, 1e-30)`` in the
+        # managed-dt controller).
+        reduction = raw_op in AXIS_REDUCTION_FOLDS and len(parents) == 1
         # The builder is a faithful transcriber, not a translator: an op that is
         # neither a fused-elementwise op nor an axis reduction (a reshape/view/
         # cast/native kernel) is emitted under its own name with its operands
@@ -1261,6 +1268,9 @@ def dispatch_region_to_fused_program(
         if reduction:
             elementwise = False
             op = raw_op
+        elif raw_op in {"min", "max"} and len(parents) == 2:
+            elementwise = True
+            op = {"min": "minimum", "max": "maximum"}[raw_op]
         else:
             try:
                 op = canonical_elementwise_op(raw_op)[0]
@@ -1269,7 +1279,6 @@ def dispatch_region_to_fused_program(
                 op = raw_op
                 elementwise = False
         structural = not reduction and not elementwise
-        parents = list(data.get("parents") or ())
         value_parents: list[int] = []
         scalar_parent: tuple[int, Any] | None = None
         for parent_id, _role in parents:

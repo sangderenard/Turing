@@ -490,17 +490,27 @@ def world_graph_model(
     performance_labels: Iterable[Mapping[str, Any]] = (),
     performance_parents: Mapping[str, str] | None = None,
     external_owners: Iterable[str] = (),
+    conceptual_objects: Iterable[WorldObject] = (),
+    properties: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Assemble the portable world registry and realization ABI."""
 
     external_owner_values = tuple(external_owners)
+    conceptual_values = tuple(conceptual_objects)
     structural_objects = document_world_objects(
-        system_root, geometry, external_owners=external_owner_values,
+        system_root,
+        geometry,
+        external_owners=(
+            *external_owner_values,
+            *(item.identity for item in conceptual_values),
+        ),
     )
     observations = performance_observation_objects(
         performance_labels, performance_parents or {},
     )
-    objects = structural_objects + observations
+    # Conceptual owners precede their geometry realizations in registry order;
+    # render adapters may still consume ``structural_object_order`` directly.
+    objects = conceptual_values + structural_objects + observations
     identity_specialization = identity_specialization_table(objects)
     known_identities = {
         system_root, *external_owner_values, *(item.identity for item in objects),
@@ -527,7 +537,9 @@ def world_graph_model(
         "object_order": [item.identity for item in objects],
         "structural_object_order": [item.identity for item in structural_objects],
         "observation_object_order": [item.identity for item in observations],
+        "conceptual_object_order": [item.identity for item in conceptual_values],
         "objects": [item.to_data() for item in objects],
+        "properties": dict(properties or {}),
         "identity_specialization": identity_specialization,
         "mesh_packet": {
             "schema": WORLD_MESH_PACKET_VERSION,

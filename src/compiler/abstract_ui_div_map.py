@@ -37,6 +37,14 @@ from .abstract_ui_placement import (
     PlacementPolicy, default_placement_recipes, placement_tool,
 )
 from .abstract_ui_projectiles import gun_tool, projectile_system_model
+from .abstract_ui_validator_rig import (
+    validator_rig_assembly,
+    validator_rig_geometry_boxes,
+)
+from .abstract_ui_dually_axle import (
+    roadside_dually_axle_assembly,
+    roadside_dually_axle_geometry_boxes,
+)
 from .abstract_ui_audio_fft import FFTFREE_RADIX2_C_SOURCE, compile_audio_fft_wasm
 from .engine_pcm_wasm import engine_pcm_kernel_bank_model
 from .javascript_runtime_utilities import render_javascript_utilities
@@ -108,6 +116,8 @@ DIV_MAP_PALETTE = palette(
         "fuel-tank-candy-red": "#b5162e", "battery-electric-blue": "#168cff",
         "oxidizer-canister": "#c6d2d0",
         "drivetrain-black": "#111413",
+        "axle-rust": "#6f4a35", "brake-red": "#8d3028",
+        "tire-rubber": "#171918",
         "engine-metal": "#778482", "engine-accent": "#e87832",
         "body-shell-glass": "#4f9fb4",
         "building-wall": "#a7c7b4", "room-wall": "#d1eadc",
@@ -577,8 +587,95 @@ def world_div_map_model(
                 "course": {"kind": "elevated-thick-slab-skill-road", "sequence": index + 1,
                            "gap_is_skill_feature": index > 0, "depth_map": False},
             }
-            geometry["boxes"].append(slab)
+            # Quarantined from the active course: these opaque disconnected slabs
+            # have produced underside/teleport contacts.  Keep their authored IDs
+            # for later repair, but do not render or register them as colliders.
             slab_records.append(slab["identity"])
+        # A separate low-speed pleasure road snakes across the north apron. It
+        # deliberately avoids an inversion: alternating C2 climbs and descents
+        # are a useful tire-contact test without requiring adhesion to a loop.
+        pleasure_points = (
+            (-40.0, 36.0, .08), (-30.0, 36.0, 1.15), (-30.0, 28.0, .48),
+            (-18.0, 28.0, 1.80), (-18.0, 38.0, .72), (-6.0, 38.0, 2.25),
+            (-6.0, 28.0, .38), (6.0, 28.0, 1.45), (6.0, 38.0, .62),
+            (18.0, 38.0, 2.05), (18.0, 28.0, .44), (30.0, 28.0, 1.35),
+            (30.0, 36.0, .54), (40.0, 36.0, .08),
+        )
+        pleasure_records = []
+        for index, ((start_x, start_z, start_height),
+                    (end_x, end_z, end_height)) in enumerate(zip(pleasure_points, pleasure_points[1:])):
+            delta_x, delta_z = end_x - start_x, end_z - start_z
+            rise_axis = "x" if abs(delta_x) > abs(delta_z) else "z"
+            signed_run = delta_x if rise_axis == "x" else delta_z
+            height_delta = end_height - start_height
+            rise_sign = 1 if height_delta * signed_run >= 0 else -1
+            segment = sampled_ramp_slab(
+                f"{world.identity}/physics/blue-pleasure-road-segment-{index + 1}",
+                course_parent, center_x=yard_center_x + (start_x + end_x) * .5,
+                center_z=yard_center_z + (start_z + end_z) * .5,
+                half_width=2.25, half_run=abs(signed_run) * .5,
+                low_height=min(start_height, end_height), high_height=max(start_height, end_height),
+                rise_axis=rise_axis, rise_sign=rise_sign,
+                columns=29 if rise_axis == "x" else 5, rows=29 if rise_axis == "z" else 5,
+                palette_role="artifact-source",
+            )
+            segment["label"] = f"Blue pleasure road wave {index + 1}"
+            segment["course"] = {"kind": "meandering-c2-pleasure-road", "sequence": index + 1,
+                                 "inversion": False, "one_sided_top_contact": True}
+            geometry["boxes"].append(segment)
+            pleasure_records.append(segment["identity"])
+        for index, (offset_x, offset_z, top_height) in enumerate(pleasure_points):
+            joint_thickness = .12
+            joint = {
+                "identity": f"{world.identity}/physics/blue-pleasure-road-joint-{index + 1}",
+                "kind": "static-solid", "label": f"Blue pleasure road joint {index + 1}",
+                "parent_identity": course_parent,
+                "center": [yard_center_x + offset_x, yard_center_z + offset_z],
+                "half_extent": [2.30, 2.30], "height": joint_thickness,
+                "floor_height": joint_thickness, "wall_thickness": .04,
+                "palette_role": "artifact-source", "wall_palette_role": "artifact-source",
+                "geometry_mode": "solid", "openings": [],
+                "placement": {"custody": "placed", "elevation": top_height - joint_thickness,
+                              "yaw_degrees": 0.0},
+                "physics": {"body": "static", "collider": "solid-contact-surface", "enabled": True,
+                            "contact_mode": "one-sided-swept-top-face-with-coulomb-friction"},
+                "course": {"kind": "meandering-road-rounded-junction", "sequence": index + 1},
+            }
+            geometry["boxes"].append(joint)
+            pleasure_records.append(joint["identity"])
+        # A deliberately honest non-adhesive loop test.  The resident radial
+        # tire gather already supports every face of static AABB solids, so a
+        # finely stepped ring exercises wall and ceiling crossings without
+        # inventing magnetic/downforce adhesion or a presentation-only mesh.
+        loop_center_x, loop_center_z, loop_radius = yard_center_x + 34.0, yard_center_z + 8.0, 5.5
+        loop_half_width, loop_skin, loop_count = 2.15, .11, 32
+        loop_records = []
+        for index in range(loop_count):
+            angle_a, angle_b = 2 * math.pi * index / loop_count, 2 * math.pi * (index + 1) / loop_count
+            point_a = (loop_center_x + loop_radius * math.sin(angle_a),
+                       .08 + loop_radius * (1 - math.cos(angle_a)))
+            point_b = (loop_center_x + loop_radius * math.sin(angle_b),
+                       .08 + loop_radius * (1 - math.cos(angle_b)))
+            minimum_x, maximum_x = min(point_a[0], point_b[0]), max(point_a[0], point_b[0])
+            minimum_y, maximum_y = min(point_a[1], point_b[1]), max(point_a[1], point_b[1])
+            segment = {
+                "identity": f"{world.identity}/physics/blue-nonadhesive-loop-segment-{index + 1}",
+                "kind": "static-solid", "label": f"Blue loop crossing panel {index + 1}",
+                "parent_identity": course_parent, "center": [(minimum_x + maximum_x) * .5, loop_center_z],
+                "half_extent": [(maximum_x - minimum_x) * .5 + loop_skin, loop_half_width],
+                "height": maximum_y - minimum_y + 2 * loop_skin,
+                "floor_height": .08, "wall_thickness": loop_skin,
+                "palette_role": "artifact-source", "wall_palette_role": "artifact-source",
+                "geometry_mode": "solid", "openings": [],
+                "placement": {"custody": "placed", "elevation": minimum_y - loop_skin,
+                              "yaw_degrees": 0.0},
+                "physics": {"body": "static", "collider": "solid-contact-surface", "enabled": True,
+                            "contact_mode": "all-face-radial-swept-crossing-no-adhesion"},
+                "course": {"kind": "nonadhesive-loop-ground-contact-test", "sequence": index + 1,
+                           "expected_failure": "gravity-detachment-is-valid-and-must-not-be-hidden"},
+            }
+            geometry["boxes"].append(segment)
+            loop_records.append(segment["identity"])
         truck_spawn_z = yard_center_z + play_half + 7.0
         vehicle["pose"] = {
             "position": [yard_center_x, clearance + 0.24, truck_spawn_z],
@@ -593,11 +690,24 @@ def world_div_map_model(
             "practice_ramps": practice_ramp_records,
         }
         vehicle["elevated_skill_course"] = {
-            "kind": "floating-thick-slab-road", "top_height": course_top,
+            "kind": "thin-clear-ramp-road", "top_height": course_top,
             "approaches": approach_records,
-            "slabs": slab_records, "maximum_grade_percent": 18.6,
+            "slabs": [], "disabled_opaque_slabs": slab_records, "maximum_grade_percent": 18.6,
             "contact_authority": "shared-static-solid-colliders",
-            "depth_map": "local-ramp-tops-only", "intent": "momentum-steering-and-gap-skill-without-impossible-grade",
+            "depth_map": "local-ramp-tops-only", "intent": "thin translucent ramps retained; opaque slabs quarantined",
+        }
+        vehicle["pleasure_course"] = {
+            "kind": "blue-meandering-wave-road", "segments": pleasure_records,
+            "maximum_height": max(point[2] for point in pleasure_points),
+            "contact_authority": "shared-one-sided-top-surface-sampler",
+            "intent": "pleasant-serpentine-driving-and-repeated-tire-crossing-validation",
+        }
+        vehicle["loop_test"] = {
+            "kind": "blue-stepped-nonadhesive-loop", "segments": loop_records,
+            "radius_m": loop_radius, "width_m": loop_half_width * 2,
+            "contact_authority": "resident-radial-tire-versus-all-static-solid-faces",
+            "adhesion": False,
+            "pass_condition": "crossings-remain-finite-and-one-sided-even-if-the-vehicle-falls",
         }
         vehicle_slot["initial_state"]["placement"] = "authored-world-pose"
         gun_object = gun_tool(
@@ -674,6 +784,26 @@ def world_div_map_model(
         }
         model["projectiles"] = projectile_system
         model["vehicle_slot"] = vehicle_slot
+        validator_rig = validator_rig_assembly(
+            world.identity,
+            pointer_identity,
+            vehicle,
+            projectile_system["archetype"],
+            center_x=yard_center_x + 8.0,
+            center_z=yard_center_z + 24.0,
+        )
+        model["validator_rig"] = dict(validator_rig.model)
+        model["world_properties"] = dict(validator_rig.model["world_properties"])
+        geometry["boxes"].extend(validator_rig_geometry_boxes(validator_rig))
+        roadside_axle = roadside_dually_axle_assembly(
+            world.identity,
+            center_x=yard_center_x + 17.0,
+            center_z=yard_center_z + 31.0,
+        )
+        model["roadside_dually_axle"] = dict(roadside_axle.model)
+        geometry["boxes"].extend(
+            roadside_dually_axle_geometry_boxes(roadside_axle)
+        )
         vehicle_presentation = vehicle["configuration"]["presentation"]
         model["motion_cues"] = {
             "authority": "json-parameterized-render-adapter",
@@ -903,6 +1033,15 @@ def world_div_map_model(
         ),
         performance_labels=performance_labels,
         performance_parents=performance_parents,
+        conceptual_objects=(
+            () if pointer_identity is None else (
+                *validator_rig.world_objects,
+                *roadside_axle.world_objects,
+            )
+        ),
+        properties=(
+            {} if pointer_identity is None else model["world_properties"]
+        ),
     )
     model["scene_mesh"]["module"] = model["world"]["plugins"][0]["module"]
     model["software_mesh"]["module"] = model["world"]["plugins"][2]["module"]
@@ -1238,6 +1377,24 @@ border-radius:5px;color:var(--muted);transition:background .12s,color .12s,
 box-shadow .12s}.action-edge-row.recent{background:#725126;color:#fff3d5;
 box-shadow:0 0 14px #e9b87266 inset}.edge-cell{overflow:hidden;text-overflow:ellipsis;
 white-space:nowrap}.edge-count{text-align:right;font-variant-numeric:tabular-nums}
+.qualification-gate{position:fixed;inset:0;z-index:200;display:grid;place-items:center;padding:22px;
+background:radial-gradient(circle at 50% 30%,#173129 0,#07100f 58%,#020504 100%);color:#d7eee5}
+.qualification-panel{width:min(980px,96vw);border:1px solid #416b5c;border-radius:14px;padding:18px;
+background:#091713f2;box-shadow:0 24px 80px #000b}.qualification-title{font-size:18px;letter-spacing:.05em}
+.qualification-subtitle,.qualification-status{color:#8eb6a7;margin-top:6px;font-size:11px}
+.qualification-triptych{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:16px 0}
+.qualification-view{border:1px solid #29473d;border-radius:9px;background:#06100d;padding:7px}
+.qualification-view-label{font-size:9px;color:#75b99f;text-transform:uppercase;letter-spacing:.12em}
+.qualification-view canvas{display:block;width:100%;height:150px}.qualification-metrics{display:grid;
+grid-template-columns:repeat(5,minmax(100px,1fr));gap:7px}.qualification-metric{padding:7px;border:1px solid #263f37;
+border-radius:6px;background:#0d1c17}.qualification-metric span{display:block;color:#7f9f93;font-size:8px;text-transform:uppercase}
+.qualification-metric strong{font-size:12px;font-variant-numeric:tabular-nums}.qualification-progress{height:5px;
+margin-top:13px;border-radius:4px;background:#182b25;overflow:hidden}.qualification-progress>i{display:block;height:100%;
+width:0;background:#54e39b;transition:width .08s linear}.qualification-gate.failed .qualification-panel{border-color:#c7695c}
+.qualification-gate.failed .qualification-progress>i{background:#d56f62}.qualification-failures{margin-top:10px;color:#ef9c91;font-size:10px}
+body.qualification-pending .shell,body.qualification-pending .entity-layer{visibility:hidden}
+@media(max-width:760px){.qualification-triptych{grid-template-columns:1fr}.qualification-view canvas{height:100px}
+.qualification-metrics{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:850px){.shell{grid-template-columns:1fr}.inspector{position:relative;
 height:auto;border-left:0;border-top:1px solid var(--line)}.status{text-align:left}
 .mast{align-items:start;flex-direction:column}}
@@ -1250,6 +1407,7 @@ DIV_MAP_CSS = f"{_palette_css(palette_data(DIV_MAP_PALETTE))}\n{_DIV_MAP_CSS_BOD
 DIV_MAP_JAVASCRIPT = r"""const SELF_SCRIPT = document.currentScript;
 const SELF_SOURCE = SELF_SCRIPT.textContent.replace(/^\n/, "").trimEnd();
 const model = JSON.parse(document.getElementById("abstract-ui-model").textContent);
+document.body.classList.add("qualification-pending");
 const turingWasmModules = turingCreateWasmRegistry(model.world.wasm_modules);
 const turingWorld = turingCreateWorldRegistry(model.world);
 const turingWorldRevisions = turingCreateRevisionChannel(
@@ -1305,9 +1463,14 @@ uniform vec3 uHeadlightLeft;
 uniform vec3 uHeadlightRight;
 uniform vec3 uHeadlightForward;
 uniform float uHeadlightActive;
+uniform vec3 uTailLightLeft;
+uniform vec3 uTailLightRight;
+uniform vec3 uVehicleRearward;
+uniform float uTailLightActive;
+uniform float uBrakeLightActive;
 void main(){
   if(vDepth<=0.04)discard;
-  vec3 normal=normalize(vNormal);
+  vec3 normal=normalize(gl_FrontFacing?vNormal:-vNormal);
   vec3 keyLight=normalize(uKeyLightDirection);
   vec3 fillLight=normalize(vec3(0.72,0.35,-0.28));
   float key=max(dot(normal,keyLight),0.0);
@@ -1319,9 +1482,20 @@ void main(){
   float headlight=uHeadlightActive*(
     leftCone*max(dot(normal,-leftDirection),0.0)/(1.0+.10*leftDistance*leftDistance)+
     rightCone*max(dot(normal,-rightDirection),0.0)/(1.0+.10*rightDistance*rightDistance));
+  vec3 tailLeftRay=vWorldPosition-uTailLightLeft,tailRightRay=vWorldPosition-uTailLightRight;
+  float tailLeftDistance=max(.05,length(tailLeftRay)),tailRightDistance=max(.05,length(tailRightRay));
+  vec3 tailLeftDirection=tailLeftRay/tailLeftDistance,tailRightDirection=tailRightRay/tailRightDistance;
+  vec3 rearward=normalize(uVehicleRearward);
+  float tailLeftCone=smoothstep(.68,.92,dot(tailLeftDirection,rearward));
+  float tailRightCone=smoothstep(.68,.92,dot(tailRightDirection,rearward));
+  float tailSurface=(
+    tailLeftCone*max(dot(normal,-tailLeftDirection),0.0)/(1.0+.55*tailLeftDistance*tailLeftDistance)+
+    tailRightCone*max(dot(normal,-tailRightDirection),0.0)/(1.0+.55*tailRightDistance*tailRightDistance));
+  float tailLight=(.42*uTailLightActive+1.35*uBrakeLightActive)*tailSurface;
   float illumination=uAmbientLight+0.72*key+
     0.28*max(dot(normal,fillLight),0.0);
-  float fog=exp(-vDepth*0.018);
+  float blueCourse=smoothstep(.10,.34,vColor.b-max(vColor.r,vColor.g)*.72);
+  float fog=max(exp(-vDepth*0.018),blueCourse*.48);
   float tileSize=max(0.05,uWorldTileSize);
   vec2 tileCoordinate=vWorldPosition.xz/tileSize;
   vec2 tileEdge=min(fract(tileCoordinate),1.0-fract(tileCoordinate));
@@ -1332,8 +1506,8 @@ void main(){
   float upward=smoothstep(0.55,0.92,normal.y);
   float motionGrid=upward*max(grid*0.38,major)*uWorldTileStrength;
   vec3 tiledColor=mix(vColor,vColor+vec3(0.22,0.19,0.10),motionGrid);
-  vec3 lit=tiledColor*(illumination+3.2*headlight)+uLightColor*key*0.10+
-    vec3(1.0,.86,.62)*headlight*.36;
+  vec3 lit=tiledColor*(illumination+3.2*headlight+.55*tailLight)+uLightColor*key*0.10+
+    vec3(1.0,.86,.62)*headlight*.36+vec3(1.0,.055,.018)*tailLight+vColor*blueCourse*.22;
   lit=clamp((lit*(2.51*lit+0.03))/(lit*(2.43*lit+0.59)+0.14),0.0,1.0);
   fragmentColor=vec4(mix(uSkyColor,lit,fog),1.0);
 }`;
@@ -1531,6 +1705,9 @@ const viewportControls = {
   respawnDown: false,
   frontDifferentialBrakeDown:false,
   rearDifferentialBrakeDown:false,
+  headlightsDown:false,
+  hornDown:false,
+  ignitionDown:false,starterDown:false,
   horizontalVelocity: [0, 0],
   colliderSides: new Map(),
   representationTransition: null
@@ -1547,10 +1724,10 @@ const vehicleRuntime = {
     frontDifferentialTorque:0,rearDifferentialTorque:0,engineAccelerationTorque:0,
     engineAngularAcceleration:0,reactionTorque:[0,0,0],mountTorque:[0,0,0]},
   transmission:{mode:"automatic",gear:2,displayGear:2,torqueReserve:0,reason:"initial-second",
-    lowRange:false,frontDiffLock:false,rearDiffLock:false,centerDiffLock:false,frontDriveShare:.42,
+    lowRange:false,transferRange:"high",frontDiffLock:false,rearDiffLock:false,centerDiffLock:false,frontDriveShare:.42,
     frontDiffMode:"open",rearDiffMode:"open",centerDiffMode:"open",
     frontDifferentialBrake:false,rearDifferentialBrake:false,
-    smoothLaunch:false,tractionControlEnabled:true,absEnabled:true,tractionControlAuthority:1,absAuthority:1},
+    smoothLaunch:false,tractionControlEnabled:true,absEnabled:true,tiltEnabled:true,tractionControlAuthority:1,absAuthority:1},
   dyno:null,dynoRequest:0,
   wheelBoxes:[],wheelAngles:[0,0,0,0],wheelPhaseTime:null,camera:null,
   parkedState:null,inventoryItem:null,inventorySlot:null,worldMarker:null,presentationAccumulator:0,
@@ -1558,13 +1735,27 @@ const vehicleRuntime = {
   computeMode:"resident-webgpu-pending",gpu:null,contactMonitor:null,transmissionControls:null,transferHud:null,
   brakeLocks:{front_left:false,front_right:false,rear_left:false,rear_right:false},
   powerUnitPreset:null,
+  engineEquationMode:"linear-playable",
   transmissionPreset:null,
   chassisProfile:null,
   wheelPart:null,
+  clutchPreset:null,
+  wheelAlignment:null,
   bodyShell:null,
+  turretSystem:{fireTakeover:true,ammoCount:60,target:null,targetDistance:0,interlockReason:"no-target",turrets:[],
+    outriggers:{commanded:false,extension:0,anchors:{}}},
   chassisLeveling:null,
   steeringSystem:null,
   shockParameters:{},
+  electrical:{headlightsOn:false,hornOn:false,ignitionOn:true,starterEngaged:false,stateOfCharge:1,
+    fuelMassKg:0,totalMassKg:0,fuelIdentity:"pump-gasoline-93",ignitionProfileIdentity:"gasoline-distributor",
+    requestedIgnitionProfileIdentity:"gasoline-distributor",ignitionTimingOffsetCycles:0,combustionSharpness:1,
+    timingErrorDegrees:0,combustionStress:0,computerOnline:true,ecuOnline:true,lightingCircuitOnline:true,
+    tailLightsOn:false,brakeLightsOn:false,tirePressurePa:155000,tirePressureTargetPa:155000,
+    pneumaticCompressorOn:false,pneumaticCompressorPowerW:0,hydraulicPumpOn:false,hydraulicPumpPowerW:0},
+  driverAssistance:{drivingMode:"road",governorRpm:6500,cruiseEnabled:false,
+    cruiseTargetSpeedMps:0,cruiseIntegral:0,cruiseThrottle:0,cruiseBrake:0,tiltEnabled:true,
+    tiltAuthority:0,tiltRisk:0,tiltGovernorRpm:6500,rearDifferentialBrakeCommand:0},
   damage:null,
   frameFault:null,disabledPresentationStages:new Set(),shaderHudHitRegions:[]
 };
@@ -1594,12 +1785,26 @@ const musicRoomRuntime = {
 };
 
 const engineSoundRuntime={context:null,node:null,gain:null,profile:null,pending:null,lastTelemetryAt:0,error:null};
+const vehicleHornRuntime={oscillators:[],gain:null};
+
+async function setVehicleHorn(active){
+  if(!active){for(const oscillator of vehicleHornRuntime.oscillators)try{oscillator.stop();}catch(_error){}
+    vehicleHornRuntime.oscillators=[];vehicleHornRuntime.gain=null;return;}
+  if(vehicleHornRuntime.oscillators.length)return;const engine=await ensureEngineSound(),context=engine.context;
+  if(!context)return;const now=context.currentTime,gain=context.createGain();gain.gain.setValueAtTime(.0001,now);
+  gain.gain.exponentialRampToValueAtTime(.075,now+.025);gain.connect(context.destination);
+  vehicleHornRuntime.gain=gain;vehicleHornRuntime.oscillators=[285,359].map((frequency,index)=>{
+    const oscillator=context.createOscillator();oscillator.type=index?"square":"sawtooth";
+    oscillator.frequency.value=frequency;oscillator.connect(gain);oscillator.start(now);return oscillator;});
+}
 
 function engineSoundWorkletSource(){return `
 class TuringEnginePCMProcessor extends AudioWorkletProcessor{
   constructor(options){super();this.blockSize=options.processorOptions.blockSize;this.inputNames=options.processorOptions.inputs;
     this.bank=new Map();this.phase=0;this.profile=options.processorOptions.initialProfile;this.metrics={rpm:0,load:0,power:0,
-      throttle:0,transient:0,damage:0,stall:1};
+      throttle:0,transient:0,damage:0,stall:1,ignition_timing_cycles:0,combustion_character:1};this.filterCoefficients=Float32Array.from(
+      options.processorOptions.rolloffCoefficients||[1]);this.filterHistory=new Float32Array(this.filterCoefficients.length);
+    this.filterCursor=0;
     for(const descriptor of options.processorOptions.kernels){const module=new WebAssembly.Module(descriptor.binary),
         instance=new WebAssembly.Instance(module,{}),memory=instance.exports.memory,base=Math.max(64,Math.ceil(descriptor.reservedBytes/4)*4),
         inputOffsets=this.inputNames.map((_,index)=>base+index*this.blockSize*4),outputOffset=base+this.inputNames.length*this.blockSize*4,
@@ -1613,7 +1818,11 @@ class TuringEnginePCMProcessor extends AudioWorkletProcessor{
   }
   process(_inputs,outputs){const kernel=this.bank.get(this.profile)||this.bank.values().next().value,channel=outputs[0]?.[0];
     if(!kernel||!channel)return true;const names=this.inputNames,values={sample_rate:sampleRate,phase_start:this.phase,...this.metrics};
-    for(let index=1;index<names.length;index++)kernel.views[index].fill(Number(values[names[index]]||0));kernel.run();channel.set(kernel.output);
+    for(let index=1;index<names.length;index++)kernel.views[index].fill(Number(values[names[index]]||0));kernel.run();
+    const coefficients=this.filterCoefficients,history=this.filterHistory,n=coefficients.length;
+    for(let sample=0;sample<channel.length;sample++){history[this.filterCursor]=kernel.output[sample];let filtered=0;
+      for(let tap=0;tap<n;tap++)filtered+=coefficients[tap]*history[(this.filterCursor-tap+n)%n];
+      channel[sample]=filtered;this.filterCursor=(this.filterCursor+1)%n;}
     this.phase=(this.phase+this.metrics.rpm*this.blockSize/(120*sampleRate))%1;return true;}
 }
 registerProcessor('turing-engine-pcm',TuringEnginePCMProcessor);`}
@@ -1629,9 +1838,11 @@ async function ensureEngineSound(){
     const kernels=descriptor.kernels.map(kernel=>({identity:kernel.identity,entrypoint:kernel.entrypoint,
       reservedBytes:kernel.reserved_bytes,binary:base64Bytes(kernel.binary_base64)})),profile=engineSoundProfileForPreset(
         vehicleRuntime.powerUnitPreset),node=new AudioWorkletNode(context,"turing-engine-pcm",{numberOfInputs:0,numberOfOutputs:1,
-        outputChannelCount:[1],processorOptions:{blockSize:descriptor.block_size,inputs:descriptor.inputs,kernels,initialProfile:profile}}),
+        outputChannelCount:[1],processorOptions:{blockSize:descriptor.block_size,inputs:descriptor.inputs,kernels,initialProfile:profile,
+          rolloffCoefficients:descriptor.mid_high_rolloff?.coefficients||[1]}}),
       highpass=context.createBiquadFilter(),compressor=context.createDynamicsCompressor(),gain=context.createGain();
-    highpass.type="highpass";highpass.frequency.value=24;compressor.threshold.value=-12;compressor.knee.value=8;
+    highpass.type="highpass";highpass.frequency.value=24;
+    compressor.threshold.value=-12;compressor.knee.value=8;
     compressor.ratio.value=3.2;compressor.attack.value=.004;compressor.release.value=.09;gain.gain.value=.68;
     node.connect(highpass).connect(compressor).connect(gain).connect(context.destination);runtime.node=node;runtime.gain=gain;
     runtime.profile=profile;runtime.pending=null;return runtime;})().catch(error=>{runtime.pending=null;runtime.error=String(error?.message||error);
@@ -1643,18 +1854,23 @@ function armEngineSoundOnFirstGesture(){const enter=()=>{cleanup();ensureEngineS
   window.addEventListener("pointerdown",enter,true);window.addEventListener("keydown",enter,true);
 }
 
-function updateEngineSoundTelemetry(throttle){const runtime=engineSoundRuntime,vehicle=vehicleRuntime.active;
+function updateEngineSoundTelemetry(throttle){const runtime=engineSoundRuntime,vehicle=vehicleRuntime.active||
+    (vehicleRuntime.parkedState?model.vehicle_slot?.vehicles?.[0]:null);
   if(!runtime.node||!vehicle)return;const now=performance.now();if(now-runtime.lastTelemetryAt<30)return;runtime.lastTelemetryAt=now;
   const powertrain=vehicleRuntime.powertrain,preset=vehicle.power_unit_presets?.find(item=>item.identity===vehicleRuntime.powerUnitPreset),
     rpm=Math.max(0,Number(powertrain.engineRPM||0)),omega=Math.max(0,Number(powertrain.engineAngularSpeed||rpm*Math.PI/30)),
     torque=Math.abs(Number(powertrain.engineTorque||0)),maximumTorque=Math.max(1,Number(preset?.configuration?.clutch_maximum_torque_nm||400)),
     idle=Math.max(1,Number(preset?.configuration?.idle_rpm||850)),redline=Math.max(idle+1,Number(preset?.configuration?.redline_rpm||6500)),
     failed=Object.values(vehicleRuntime.damage?.members||{}).filter(item=>item.failed).length,
-    memberCount=Math.max(1,Object.keys(vehicleRuntime.damage?.members||{}).length),profile=engineSoundProfileForPreset(
+    memberCount=Math.max(1,Object.keys(vehicleRuntime.damage?.members||{}).length),combustionDamage=Number(
+      vehicleRuntime.electrical.combustionDamage||0),profile=engineSoundProfileForPreset(
       vehicleRuntime.powerUnitPreset),message={type:"telemetry",profile,rpm,load:Math.min(1.5,torque/maximumTorque),
       power:Math.min(1.5,torque*omega/(maximumTorque*redline*Math.PI/30)),throttle:Math.min(1,Math.abs(Number(throttle||0))),
-      transient:Math.min(1.5,Math.abs(Number(powertrain.engineAccelerationTorque||0))/maximumTorque),damage:failed/memberCount,
-      stall:Math.max(0,Math.min(1,1-rpm/idle))};runtime.node.port.postMessage(message);runtime.profile=profile;
+      transient:Math.min(1.5,Math.abs(Number(powertrain.engineAccelerationTorque||0))/maximumTorque),
+      damage:Math.max(failed/memberCount,combustionDamage),
+      stall:Math.max(0,Math.min(1,1-rpm/idle)),ignition_timing_cycles:Number(
+        vehicleRuntime.electrical.ignitionTimingOffsetCycles||0),combustion_character:Number(
+        vehicleRuntime.electrical.combustionSharpness||1)};runtime.node.port.postMessage(message);runtime.profile=profile;
 }
 
 function base64Bytes(encoded) {
@@ -1759,9 +1975,102 @@ const stateLoopRuntime = {
   engineStage: "full-dynamics", engineSleeping: false, engineSleepReason: null,
   latestSequence: 0, appliedSequence: 0, bodies: new Map(), actorRegistered: false,
   fallbackReason: null, lastWorkerCrash: null, forcingWasm: false,
-  snapshotStride: 153, snapshotCapacity: 128,
+  snapshotStride: 162, snapshotCapacity: 128,
   freeSlots: [], slotRecords: [], slotGenerations: new Uint32Array(128)
 };
+
+const vehicleQualification = {
+  active:true,complete:false,passed:false,startSequence:null,lastSequence:null,engineStarted:false,starterReleased:false,
+  simulatedSeconds:0,initialY:null,passiveEnergyBaseline:null,passiveEnergyMinimum:null,maximumEnergyCreationJ:0,
+  maximumPenetrationM:0,contactDropoutTicks:0,longestContactDropoutTicks:0,oscillations:0,
+  previousVerticalVelocity:0,maximumTiltRad:0,epsilon:0,failures:new Set(),animationStarted:false,
+};
+
+function qualificationMetric(name,value){const element=document.querySelector(`[data-qmetric="${name}"]`);
+  if(element)element.textContent=value;}
+function qualificationStatus(value){const element=document.querySelector("[data-qualification-status]");
+  if(element)element.textContent=value;}
+function drawQualificationView(canvas,view,body){
+  const context=canvas?.getContext("2d");if(!context)return;const width=canvas.width,height=canvas.height;
+  context.clearRect(0,0,width,height);context.strokeStyle="#18372d";context.lineWidth=1;
+  for(let x=0;x<width;x+=28){context.beginPath();context.moveTo(x,0);context.lineTo(x,height);context.stroke();}
+  for(let y=10;y<height;y+=28){context.beginPath();context.moveTo(0,y);context.lineTo(width,y);context.stroke();}
+  context.strokeStyle="#75b99f";context.lineWidth=2;context.save();context.translate(width/2,height*.58);
+  const roll=Number(body?.roll||0),pitch=Number(body?.pitch||0),yaw=Number(body?.yaw||0),compression=body?.compressions||[];
+  if(view==="front")context.rotate(-roll);else if(view==="side")context.rotate(pitch);else context.rotate(yaw);
+  context.strokeRect(view==="front"?-52:-72,view==="top"?-35:-18,view==="front"?104:144,view==="top"?70:36);
+  context.fillStyle="#89d7ba";context.globalAlpha=.22;context.fillRect(view==="front"?-52:-72,
+    view==="top"?-35:-18,view==="front"?104:144,view==="top"?70:36);context.globalAlpha=1;
+  context.fillStyle="#1d2925";context.strokeStyle="#d7eee5";
+  const wheels=view==="front"?[[-66,16,compression[0]], [66,16,compression[1]]]:
+    view==="side"?[[-62,18,compression[2]], [62,18,compression[0]]]:
+    [[-58,-43,compression[2]],[-58,43,compression[3]],[58,-43,compression[0]],[58,43,compression[1]]];
+  for(const [x,y,c] of wheels){context.beginPath();context.ellipse(x,y-Number(c||0)*70,view==="top"?13:12,
+    view==="top"?5:18,0,0,Math.PI*2);context.fill();context.stroke();}context.restore();
+  if(view!=="top"){context.strokeStyle="#5b9d86";context.beginPath();context.moveTo(8,height*.83);
+    context.lineTo(width-8,height*.83);context.stroke();}
+}
+function drawVehicleQualificationTriptych(body){document.querySelectorAll("[data-qualification-view]").forEach(canvas=>
+  drawQualificationView(canvas,canvas.dataset.qualificationView,body));}
+function launchQualifiedLivingMap(){
+  if(vehicleQualification.animationStarted)return;vehicleQualification.animationStarted=true;
+  document.body.classList.remove("qualification-pending");document.getElementById("vehicle-qualification")?.remove();
+  registerPlayerPhysicsBody();requestAnimationFrame(runEntityCycle);
+}
+function finishVehicleQualification(body){
+  if(!vehicleQualification.active)return;const q=vehicleQualification,vehicle=vehicleRuntime.active,
+    tireSection=Number(vehicle?.configuration?.tires?.toroid_section_radius_m||vehicle?.configuration?.tires?.radius*.22||.1),
+    penetrationLimit=Math.max(.035,tireSection*.85),energyLimit=Math.max(1500,Math.abs(q.passiveEnergyBaseline||0)*.08);
+  if(q.maximumPenetrationM>penetrationLimit)q.failures.add(`tire crossing ${(q.maximumPenetrationM*1000).toFixed(1)} mm exceeds ${(penetrationLimit*1000).toFixed(1)} mm`);
+  if(q.longestContactDropoutTicks>30)q.failures.add(`required wheel contact absent for ${(q.longestContactDropoutTicks/120).toFixed(2)} s`);
+  if(q.maximumEnergyCreationJ>energyLimit)q.failures.add(`passive energy creation ${q.maximumEnergyCreationJ.toFixed(0)} J exceeds ${energyLimit.toFixed(0)} J`);
+  if(q.oscillations>10)q.failures.add(`suspension retained ${q.oscillations} meaningful vertical oscillations`);
+  if(q.maximumTiltRad>.72)q.failures.add(`body tilt reached ${(q.maximumTiltRad*180/Math.PI).toFixed(1)}°`);
+  q.active=false;q.complete=true;q.passed=q.failures.size===0;
+  stateLoopRuntime.worker?.postMessage({type:"vehicle-auxiliary",identity:vehicle?.identity,
+    ignitionOn:q.passed,starterEngaged:false});
+  const gate=document.getElementById("vehicle-qualification"),failures=gate?.querySelector("[data-qualification-failures]");
+  if(q.passed){qualificationStatus(`qualified · residual ε ${q.epsilon.toExponential(3)} recorded (non-gating) · opening living map`);
+    setTimeout(launchQualifiedLivingMap,700);}else{gate?.classList.add("failed");qualificationStatus("configuration failed physical qualification · living map withheld");
+    if(failures)failures.textContent=[...q.failures].join(" · ");}
+}
+function updateVehicleQualification(body,sequence){
+  const q=vehicleQualification,vehicle=vehicleRuntime.active;if(!q.active||body.identity!==vehicle?.identity)return;
+  if(q.startSequence===null){q.startSequence=sequence;q.lastSequence=sequence;q.initialY=Number(body.position[1]);
+    qualificationStatus("passive suspension settling · engine off");return;}
+  const deltaTicks=Math.max(1,sequence-Number(q.lastSequence||sequence));q.lastSequence=sequence;
+  q.simulatedSeconds=(sequence-q.startSequence)/120;
+  const finite=[...body.position,...body.velocity,body.roll,body.pitch,body.rollVelocity,body.pitchVelocity,
+    ...(body.compressions||[]),...(body.springForces||[])].every(Number.isFinite);
+  if(!finite)q.failures.add("non-finite vehicle state");
+  const contacts=(body.contactModes||[]).filter(value=>Number(value)>0).length;
+  if(q.simulatedSeconds>1&&contacts<4)q.contactDropoutTicks+=deltaTicks;else q.contactDropoutTicks=0;
+  q.longestContactDropoutTicks=Math.max(q.longestContactDropoutTicks,q.contactDropoutTicks);
+  const penetration=Math.max(0,...(body.radialProbePenetrations||[]).flat().map(value=>Number(value)||0));
+  q.maximumPenetrationM=Math.max(q.maximumPenetrationM,penetration);q.maximumTiltRad=Math.max(q.maximumTiltRad,
+    Math.hypot(Number(body.roll||0),Number(body.pitch||0)));
+  const mass=Math.max(1,Number(vehicleRuntime.electrical.totalMassKg||vehicle.configuration.mass||1)),gravity=Math.abs(
+    Number(vehicle.configuration.world?.gravity||-9.81)),speed2=body.velocity.reduce((sum,value)=>sum+value*value,0),
+    springEnergy=(body.compressions||[]).reduce((sum,value)=>sum+.5*Number(vehicle.configuration.suspension.stiffness)*Number(value||0)**2,0),
+    energy=.5*mass*speed2+mass*gravity*(Number(body.position[1])-q.initialY)+springEnergy;
+  if(q.simulatedSeconds>=1&&q.simulatedSeconds<10){if(q.passiveEnergyBaseline===null){q.passiveEnergyBaseline=energy;q.passiveEnergyMinimum=energy;}
+    q.passiveEnergyMinimum=Math.min(q.passiveEnergyMinimum,energy);q.maximumEnergyCreationJ=Math.max(q.maximumEnergyCreationJ,
+      energy-q.passiveEnergyMinimum);const vertical=Number(body.velocity[1]||0);
+    if(vertical*q.previousVerticalVelocity<0&&(Math.abs(vertical)>.015||Math.abs(q.previousVerticalVelocity)>.015))q.oscillations+=1;
+    q.previousVerticalVelocity=vertical;}
+  if(q.simulatedSeconds>=10&&!q.engineStarted){q.engineStarted=true;stateLoopRuntime.worker.postMessage({type:"vehicle-auxiliary",
+      identity:vehicle.identity,ignitionOn:true,starterEngaged:true});qualificationStatus("engine start · powered stability observation");}
+  if(q.simulatedSeconds>=11.5&&!q.starterReleased){q.starterReleased=true;stateLoopRuntime.worker.postMessage({type:"vehicle-auxiliary",
+      identity:vehicle.identity,starterEngaged:false});}
+  q.epsilon=Math.hypot(...body.velocity,Number(body.rollVelocity||0),Number(body.pitchVelocity||0),Number(body.yawVelocity||0));
+  qualificationMetric("time",`${Math.min(20,q.simulatedSeconds).toFixed(2)} s`);qualificationMetric("contacts",`${contacts} / 4`);
+  qualificationMetric("penetration",`${(q.maximumPenetrationM*1000).toFixed(1)} mm`);
+  qualificationMetric("energy",`${q.maximumEnergyCreationJ.toFixed(0)} J`);qualificationMetric("epsilon",q.epsilon.toExponential(2));
+  const progress=document.querySelector(".qualification-progress>i");if(progress)progress.style.width=`${Math.min(100,q.simulatedSeconds*5)}%`;
+  if(sequence%30<deltaTicks)stateLoopRuntime.worker?.postMessage({type:"vehicle-control",identity:vehicle.identity,
+    throttle:0,steering:0,brake:0});
+  drawVehicleQualificationTriptych(body);if(q.simulatedSeconds>=20||q.failures.has("non-finite vehicle state"))finishVehicleQualification(body);
+}
 
 function initializePhysicsSnapshotSlots(capacity) {
   stateLoopRuntime.snapshotCapacity = capacity;
@@ -3213,7 +3522,8 @@ function activateViewportShader(choiceIdentity) {
   ["uResolution", "uCameraPosition", "uCameraFacing", "uSkyColor", "uLightColor",
    "uKeyLightDirection", "uAmbientLight", "uWorldTileSize", "uWorldTileMajorEvery",
    "uWorldTileStrength", "uHeadlightLeft", "uHeadlightRight", "uHeadlightForward",
-   "uHeadlightActive", "uRenderPass"]
+   "uHeadlightActive", "uTailLightLeft", "uTailLightRight", "uVehicleRearward",
+   "uTailLightActive", "uBrakeLightActive", "uRenderPass"]
     .forEach(name => shaderViewer.locations[name] = gl.getUniformLocation(program, name));
   if (choice.adapter === "living-map-camera+palette-material-textures" &&
       !shaderViewer.shaderResources.has(choice.identity)) {
@@ -3356,7 +3666,7 @@ function buildExtrudedBoxMesh(geometry, colors) {
       for (let longitude = 0; longitude < 12; longitude += 1) {
         const a = point(latitude, longitude), b = point(latitude + 1, longitude);
         const c = point(latitude + 1, longitude + 1), d = point(latitude, longitude + 1);
-        [a, b, c, a, c, d].forEach(emit);
+        [a, c, b, a, d, c].forEach(emit);
       }
     }
     semanticPartSpans.push({
@@ -3378,7 +3688,11 @@ function buildExtrudedBoxMesh(geometry, colors) {
   }
   function vehicleWheel(box,boxIndex){
     const firstVertex=vertices.length/9,state=box.wheel_state,segments=24;
-    const radius=Number(state.radius),halfWidth=Number(state.width)*.5;
+    const nominalRadius=Number(state.radius),pressureRatio=Math.max(.28,Math.min(1.65,Number(
+      state.tirePressurePa||155000)/Math.max(1,Number(state.referenceTirePressurePa||155000)))),
+      carcassScale=.94+.06*Math.sqrt(pressureRatio),flatten=Math.max(0,.11*(1-pressureRatio)),
+      radius=nominalRadius*carcassScale,halfWidth=Number(state.width)*.5*(1+Math.max(-.08,Math.min(.22,(1-pressureRatio)*.24))),
+      deformedRadius=(angle,value)=>value*(1-flatten*Math.pow(Math.max(0,-Math.sin(angle)),4));
     const spin=Number(state.spin||0),steer=Number(state.steer||0);
     const rotation=state.chassisRotation||[0,0,0],roll=rotation[0],yaw=rotation[1],pitch=rotation[2];
     const cr=Math.cos(roll),sr=Math.sin(roll),cp=Math.cos(pitch),sp=Math.sin(pitch),
@@ -3402,28 +3716,32 @@ function buildExtrudedBoxMesh(geometry, colors) {
       return[origin[0]+chassisCenter[0]+turned[0],origin[1]+chassisCenter[1]+turned[1],
         origin[2]+chassisCenter[2]+turned[2]];
     };
-    const rubber=colorVector(box.appearance?.face_color||colors.line),
-      tread=colorVector(colors.line||box.appearance?.face_color),
-      rim=colorVector(box.appearance?.tread_color||colors["rollbar-silver"]||colors.active),
+    const rubber=colorVector(state.tireColor||box.appearance?.face_color||colors.line),
+      tread=colorVector(state.treadColor||box.appearance?.tread_color||colors.line),
+      rim=colorVector(state.rimColor||colors["rollbar-silver"]||colors.active),
       rotor=colorVector(colors["suspension-yellow"]||colors.active),
       silver=colorVector(colors["rollbar-silver"]||colors.line),
       black=colorVector(colors["drivetrain-black"]||colors.line);
     const emit=(point,normal,color)=>vertices.push(...transform(point),...transform(normal,false),...color);
-    const profile=[[-halfWidth,radius*.82],[-halfWidth*.72,radius*.96],[0,radius],
-      [halfWidth*.72,radius*.96],[halfWidth,radius*.82]],rimRadius=Number(state.rimRadius||radius*.55),
+    const agricultural=state.carcassProfile==="thin-agricultural-steel-disc",
+      profile=agricultural?[[-halfWidth,radius*.90],[-halfWidth*.78,radius*.985],[0,radius],
+        [halfWidth*.78,radius*.985],[halfWidth,radius*.90]]:[[-halfWidth,radius*.82],[-halfWidth*.72,radius*.96],[0,radius],
+        [halfWidth*.72,radius*.96],[halfWidth,radius*.82]],rimRadius=Number(state.rimRadius||radius*.55),
       hubRadius=rimRadius*.24;
     for(let ring=0;ring<profile.length-1;ring+=1)for(let segment=0;segment<segments;segment+=1){
       const a=segment*Math.PI*2/segments,b=(segment+1)*Math.PI*2/segments,
         [za,ra]=profile[ring],[zb,rb]=profile[ring+1],shoulder=(rb-ra)/(zb-za||1),
-        pa=[Math.cos(a)*ra,Math.sin(a)*ra,za],pb=[Math.cos(b)*ra,Math.sin(b)*ra,za],
-        pc=[Math.cos(b)*rb,Math.sin(b)*rb,zb],pd=[Math.cos(a)*rb,Math.sin(a)*rb,zb],
+        dra=deformedRadius(a,ra),drb=deformedRadius(b,ra),drc=deformedRadius(b,rb),drd=deformedRadius(a,rb),
+        pa=[Math.cos(a)*dra,Math.sin(a)*dra,za],pb=[Math.cos(b)*drb,Math.sin(b)*drb,za],
+        pc=[Math.cos(b)*drc,Math.sin(b)*drc,zb],pd=[Math.cos(a)*drd,Math.sin(a)*drd,zb],
         na=[Math.cos(a),Math.sin(a),-shoulder],nb=[Math.cos(b),Math.sin(b),-shoulder],
         treadColor=ring===2&&segment%2?rim:tread;
       [[pa,na],[pb,nb],[pc,nb],[pa,na],[pc,nb],[pd,na]].forEach(([p,n])=>emit(p,n,treadColor));
     }
     for(const side of [-1,1])for(let segment=0;segment<segments;segment+=1){
       const a=segment*Math.PI*2/segments,b=(segment+1)*Math.PI*2/segments,z=side*halfWidth,
-        outerA=[Math.cos(a)*radius*.82,Math.sin(a)*radius*.82,z],outerB=[Math.cos(b)*radius*.82,Math.sin(b)*radius*.82,z],
+        sideRadiusA=deformedRadius(a,radius*.82),sideRadiusB=deformedRadius(b,radius*.82),
+        outerA=[Math.cos(a)*sideRadiusA,Math.sin(a)*sideRadiusA,z],outerB=[Math.cos(b)*sideRadiusB,Math.sin(b)*sideRadiusB,z],
         innerA=[Math.cos(a)*rimRadius,Math.sin(a)*rimRadius,z],innerB=[Math.cos(b)*rimRadius,Math.sin(b)*rimRadius,z],n=[0,0,side];
       [[outerA,n],[outerB,n],[innerB,n],[outerA,n],[innerB,n],[innerA,n]].forEach(([p,q])=>emit(p,q,rubber));
     }
@@ -3435,7 +3753,14 @@ function buildExtrudedBoxMesh(geometry, colors) {
         riA=[Math.cos(a)*rotorInner,Math.sin(a)*rotorInner,rz],riB=[Math.cos(b)*rotorInner,Math.sin(b)*rotorInner,rz];
       [[roA,n],[roB,n],[riB,n],[roA,n],[riB,n],[riA,n]].forEach(([p,q])=>emit(p,q,rotor));
     }
-    for(const side of [-1,1])for(let spoke=0;spoke<6;spoke+=1){
+    if(agricultural)for(const side of [-1,1])for(let segment=0;segment<segments;segment+=1){
+      const a=segment*Math.PI*2/segments,b=(segment+1)*Math.PI*2/segments,z=side*(halfWidth+.003),n=[0,0,side],
+        inner=hubRadius*.72,outer=rimRadius*.985,
+        ia=[Math.cos(a)*inner,Math.sin(a)*inner,z],ib=[Math.cos(b)*inner,Math.sin(b)*inner,z],
+        oa=[Math.cos(a)*outer,Math.sin(a)*outer,z],ob=[Math.cos(b)*outer,Math.sin(b)*outer,z];
+      [[ia,n],[ib,n],[ob,n],[ia,n],[ob,n],[oa,n]].forEach(([p,q])=>emit(p,q,rim));
+    }
+    if(!agricultural)for(const side of [-1,1])for(let spoke=0;spoke<6;spoke+=1){
       const angle=spoke*Math.PI/3,width=.10,z=side*(halfWidth+.003),n=[0,0,side],
         a=angle-width,b=angle+width,inner=hubRadius,outer=rimRadius*.94,
         points=[[Math.cos(a)*inner,Math.sin(a)*inner,z],[Math.cos(b)*inner,Math.sin(b)*inner,z],
@@ -3448,9 +3773,9 @@ function buildExtrudedBoxMesh(geometry, colors) {
         pa=[Math.cos(a)*hubRadius,Math.sin(a)*hubRadius,z],pb=[Math.cos(b)*hubRadius,Math.sin(b)*hubRadius,z];
       [[pa,n],[pb,n],[[0,0,z],n]].forEach(([p,q])=>emit(p,q,rim));
     }
-    // The wheel-end hardware follows steering but not wheel spin. The graph
-    // topology is knuckle -> five-axis bearing -> hub/rotor, with the CV bell
-    // entering the hub and the steering arm beginning on the knuckle.
+    // The rotor above uses the hub/wheel spin transform. The caliper, bearing
+    // outer race, upright and steering arm below use the knuckle transform and
+    // therefore steer but do not rotate with the hub.
     const inboard=String(state.name||"").includes("left")?1:-1,
       fixedEmit=(point,normal,shade)=>vertices.push(...transformNoSpin(point),...transformNoSpin(normal,false),...shade),
       fixedCuboid=(c,h,shade)=>{const points=[[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]]
@@ -3544,6 +3869,9 @@ function buildExtrudedBoxMesh(geometry, colors) {
         collarCenter=a.map((value,index)=>value+axis[index]*length*collarT),collarHalf=Math.max(.006,wire*1.4);
       tube(collarCenter.map((value,index)=>value-axis[index]*collarHalf),
         collarCenter.map((value,index)=>value+axis[index]*collarHalf),springRadius*1.12,silver,10);
+    }else if(box.mechanical_edge?.routing==="relaxed-multi-segment-harness"){
+      const route=(state.routeLocalPoints?.length>=2?state.routeLocalPoints:[state.localA,state.localB]).map(world);
+      for(let index=1;index<route.length;index+=1)tube(route[index-1],route[index],radius,color,6);
     }else tube(a,b,radius,color,segments);
     const partIdentity=`${box.identity}/surface:member`;
     semanticPartSpans.push({identity:partIdentity,objectIdentity:box.identity,role:box.suspension_role||"mechanical-link",
@@ -3580,7 +3908,16 @@ function buildExtrudedBoxMesh(geometry, colors) {
         for(let ring=0;ring<rings;ring+=1)for(let side=0;side<sides;side+=1){const a=point(ring,side),b=point(ring+1,side),
           c0=point(ring+1,side+1),d=point(ring,side+1);[a,b,c0,a,c0,d].forEach(item=>emit(item.position,item.normal,shade));}},
       ring=(c,rx,ry,wire,shade=black)=>{let previous=null;for(let step=0;step<=32;step+=1){const angle=step*Math.PI*2/32,
-        point=[c[0]+rx*Math.cos(angle),c[1]+ry*Math.sin(angle),c[2]];if(previous)tube(previous,point,wire,shade,6);previous=point;}};
+        point=[c[0]+rx*Math.cos(angle),c[1]+ry*Math.sin(angle),c[2]];if(previous)tube(previous,point,wire,shade,6);previous=point;}},
+      annularDiscX=(c,outer,inner,halfThickness,shade=silver,sides=24)=>{
+        const point=(x,radius,angle)=>[c[0]+x,c[1]+radius*Math.cos(angle),c[2]+radius*Math.sin(angle)];
+        for(let side=0;side<sides;side+=1){const aa=side*Math.PI*2/sides,ab=(side+1)*Math.PI*2/sides,
+          op0=point(halfThickness,outer,aa),op1=point(halfThickness,outer,ab),ip0=point(halfThickness,inner,aa),
+          ip1=point(halfThickness,inner,ab),om0=point(-halfThickness,outer,aa),om1=point(-halfThickness,outer,ab),
+          im0=point(-halfThickness,inner,aa),im1=point(-halfThickness,inner,ab);
+          [op0,op1,ip0,op1,ip1,ip0].forEach(p=>emit(p,[1,0,0],shade));
+          [om0,im0,om1,om1,im0,im1].forEach(p=>emit(p,[-1,0,0],shade));
+        }};
     if(mesh.shape==="fuel-tank"){
       ellipsoid(center,[half[0],half[1],half[2]],primary,10,18);
       for(const offset of [-half[2]*.46,half[2]*.46])ring([center[0],center[1],center[2]+offset],half[0]*1.04,half[1]*1.06,.006,black);
@@ -3611,6 +3948,7 @@ function buildExtrudedBoxMesh(geometry, colors) {
       tube([center[0]+half[0],center[1]+half[1],center[2]],[center[0]+half[0]*1.45,center[1]+half[1]*1.25,center[2]],.006,yellow,8);
     }else if(mesh.shape==="differential-brake"){
       tube([center[0]-half[0],center[1],center[2]],[center[0]+half[0],center[1],center[2]],half[2],silver,18);
+      annularDiscX(center,half[2]*.96,half[2]*.30,half[0]*.96,silver,28);
       tube([center[0]-half[0]*1.08,center[1],center[2]],[center[0]+half[0]*1.08,center[1],center[2]],half[2]*.42,black,12);
       cuboid([center[0],center[1]+half[2]*.56,center[2]+half[2]*.58],
         [half[0]*1.35,half[2]*.34,half[2]*.28],primary);
@@ -4040,6 +4378,8 @@ function livingEditPayload() {
     placement_recipes: Object.fromEntries((model.placement?.recipes || []).map(recipe =>
       [recipe.identity, recipe.stock])),
     tool_modes: Object.fromEntries(toolModeState.byTool),
+    vehicle_hydraulics: model.vehicle_slot?.vehicles?.[0]?.chassis_leveling||null,
+    vehicle_tire_pressure_target_pa:Number(vehicleRuntime.electrical?.tirePressureTargetPa||0),
     physics: Object.fromEntries(physicsRuntime.parameters)});
 }
 
@@ -4174,6 +4514,25 @@ function restoreLivingEdits() {
         `[data-physics-parameter="${CSS.escape(name)}"]`);
       if (input) input.value = String(value);
     });
+    const savedVehicle = model.vehicle_slot?.vehicles?.[0];
+    if (savedVehicle && saved.vehicle_hydraulics) {
+      savedVehicle.chassis_leveling = {
+        ...savedVehicle.chassis_leveling,
+        ...saved.vehicle_hydraulics,
+        enabled: false,
+        manual_corner_targets_m: {
+          ...savedVehicle.chassis_leveling.manual_corner_targets_m,
+          ...(saved.vehicle_hydraulics.manual_corner_targets_m || {}),
+        },
+        programmed_poses: {
+          ...(savedVehicle.chassis_leveling.programmed_poses || {}),
+          ...(saved.vehicle_hydraulics.programmed_poses || {}),
+        },
+      };
+    }
+    if (savedVehicle && Number(saved.vehicle_tire_pressure_target_pa) > 0) {
+      savedVehicle.tire_pressure_target_pa = Number(saved.vehicle_tire_pressure_target_pa);
+    }
     shaderViewer.revision = Number(saved.revision || 0);
     model.scene_mesh.revision = shaderViewer.revision;
     refreshInventoryCounts();
@@ -4244,7 +4603,8 @@ function rebuildPortableSceneMesh({dynamicOnly=false}={}) {
   if(dynamicOnly){
     installVehiclePresentationMesh(buildExtrudedBoxMesh(dynamicGeometry,model.appearance.colors).mesh);return;
   }
-  const dynamicSet=new Set(dynamicGeometry),staticGeometry=shaderViewer.geometry.filter(box=>!dynamicSet.has(box)),
+  const dynamicSet=new Set(dynamicGeometry),staticGeometry=shaderViewer.geometry.filter(box=>
+      !dynamicSet.has(box)&&!String(box.identity||"").includes("/elevated-skill-road-slab-")),
     realization=buildExtrudedBoxMesh(staticGeometry,model.appearance.colors),
     dynamicRealization=buildExtrudedBoxMesh(dynamicGeometry,model.appearance.colors);
   shaderViewer.baseMesh = realization.mesh;
@@ -4470,7 +4830,7 @@ function drawVehicleWheels(gl,width,height,cameraPosition,cameraFacing,celestial
   const config=vehicle.configuration,presentation=config.presentation,
     part=vehicle.wheel_parts?.find(item=>item.identity===vehicleRuntime.wheelPart)||vehicle.wheel_parts?.[0],
     rubber=colorVector(part?.tire_color||"#202624"),tread=colorVector(part?.tread_color||"#687672"),
-    rim=colorVector(model.appearance.colors["rollbar-silver"]),
+    rim=colorVector(part?.rim_color||model.appearance.colors["rollbar-silver"]),
     rotor=colorVector(model.appearance.colors["suspension-yellow"]),locations=shaderViewer.wheelLocations;
   try{
   gl.useProgram(shaderViewer.wheelProgram);gl.uniform2f(locations.uResolution,width,height);
@@ -5614,8 +5974,84 @@ function routeActiveToolHook(action, position = null) {
   return true;
 }
 
+function turretBallisticDirection(origin,target,speed){
+  const dx=target[0]-origin[0],dz=target[2]-origin[2],horizontal=Math.hypot(dx,dz),dy=target[1]-origin[1],
+    gravity=9.81,v=Math.max(1,Number(speed||1)),root=v**4-gravity*(gravity*horizontal**2+2*dy*v**2);
+  if(horizontal<1e-5)return{direction:[0,Math.sign(dy)||1,0],reachable:true};
+  if(root<0)return{direction:normalized3([dx,dy,dz]),reachable:false};
+  const angle=Math.atan((v*v-Math.sqrt(root))/(gravity*horizontal)),cosine=Math.cos(angle);
+  return{direction:[dx/horizontal*cosine,Math.sin(angle),dz/horizontal*cosine],reachable:true};
+}
+
+function turretFriendlyRayEntry(origin,direction,targetDistance,turretName){
+  const own=[vehicleRuntime.box,...vehicleRuntime.bodyShellBoxes].filter(box=>box&&
+    box.turret_name!==turretName&&box.turret_part!=="post"&&box.turret_part!=="gimbal"&&box.turret_part!=="weapon");
+  for(const box of own){const distance=rayBoxDistance(origin,direction,box);
+    if(distance!==null&&distance>.14&&distance<targetDistance-.06)return{identity:box.identity,distance};}
+  const actor=viewportControls.policy?.actor;
+  for(const runtime of entityState.values()){
+    if(!runtime?.position||runtime.entity?.traits?.projectile)continue;
+    if(runtime.entity?.principal!==actor&&runtime.entity?.identity!==actor&&!runtime.entity?.traits?.friendly)continue;
+    const center=runtime.position,offset=origin.map((value,index)=>value-center[index]),along=offset.reduce(
+      (sum,value,index)=>sum+value*direction[index],0),radius=Number(runtime.entity?.geometry?.parameters?.radius||.28),
+      discriminant=along*along-(offset.reduce((sum,value)=>sum+value*value,0)-radius*radius);
+    if(discriminant>=0){const distance=-along-Math.sqrt(discriminant);if(distance>.14&&distance<targetDistance-.06)
+      return{identity:runtime.entity.identity,distance};}
+  }
+  return null;
+}
+
+function updateVehicleTurretTargeting(vehicle,state){
+  const runtime=vehicleRuntime.turretSystem,assembly=vehicle.body_shells?.find(item=>item.identity==="six-body-pin-carrier");
+  if(vehicleRuntime.bodyShell!==assembly?.identity){runtime.target=null;runtime.turrets=[];runtime.interlockReason="carrier-not-installed";return;}
+  const viewOrigin=shaderViewer.cameraPosition||viewportControls.position,viewDirection=normalized3(shaderViewer.cameraFacing||[1,0,0]),
+    hit=raySceneTriangle(viewOrigin,viewDirection),target=hit?.position||null,speed=Number(assembly.ammunition?.muzzle_speed_m_s||72);
+  runtime.target=target;runtime.targetDistance=Number(hit?.distance||0);runtime.interlockReason=target?null:"no-surface-at-focus";
+  runtime.turrets=(assembly.turrets||[]).map(turret=>{
+    const offset=rotateVehiclePresentationVector(turret.local_position,state,0),pivot=state.position.map((value,index)=>value+offset[index]),
+      solution=target?turretBallisticDirection(pivot,target,speed):{direction:rotateVehiclePresentationVector([1,0,0],state,0),reachable:false},
+      direction=normalized3(solution.direction),yaw=Math.atan2(direction[2],direction[0]),pitch=Math.atan2(direction[1],Math.hypot(direction[0],direction[2])),
+      relativeYaw=Math.atan2(Math.sin(yaw-state.yaw),Math.cos(yaw-state.yaw)),weapon=assembly.weapon||{},
+      inGimbal=Math.abs(relativeYaw)<=Number(weapon.yaw_limit_degrees||175)*Math.PI/180&&
+        pitch>=Number(weapon.pitch_min_degrees||-28)*Math.PI/180&&pitch<=Number(weapon.pitch_max_degrees||72)*Math.PI/180,
+      muzzle=pivot.map((value,index)=>value+direction[index]*.34),friendly=target?
+        turretFriendlyRayEntry(muzzle,direction,Math.hypot(...target.map((value,index)=>value-muzzle[index])),turret.identity):null,
+      inhibited=!target||!solution.reachable||!inGimbal||Boolean(friendly),reason=!target?"no-target":!solution.reachable?
+        "ballistic-range":!inGimbal?"gimbal-limit":friendly?`friendly:${friendly.identity}`:null;
+    return{name:turret.identity,pivot,muzzle,direction,yaw,pitch,relativeYaw,inhibited,reason};
+  });
+  const blocked=runtime.turrets.filter(turret=>turret.inhibited);runtime.interlockReason=blocked.length?
+    blocked.map(turret=>`${turret.name}:${turret.reason}`).join(" · "):null;
+}
+
+function fireVehicleTurrets(){
+  const vehicle=vehicleRuntime.active,runtime=vehicleRuntime.turretSystem,
+    assembly=vehicle?.body_shells?.find(item=>item.identity==="six-body-pin-carrier");
+  if(!vehicle||vehicleRuntime.bodyShell!==assembly?.identity)return false;
+  if(!vehicleRuntime.electrical.computerOnline){setPlacementStatus("turret computer offline · firing disengaged");return true;}
+  updateVehicleTurretTargeting(vehicle,vehicleRuntime.state);
+  const friendlyBlock=runtime.turrets.find(turret=>String(turret.reason||"").startsWith("friendly:"));
+  if(friendlyBlock){setPlacementStatus(`friendly-fire interlock · whole volley disengaged · ${friendlyBlock.reason}`);return true;}
+  const ready=runtime.turrets.filter(turret=>!turret.inhibited).slice(0,Math.max(0,runtime.ammoCount));
+  if(!ready.length){setPlacementStatus(`turret interlock · ${runtime.interlockReason||"no ammunition"}`);return true;}
+  const ammunition=assembly.ammunition||{},shots=[];
+  for(const turret of ready){if(firePhysicsBall(1,{ammunitionAuthority:"vehicle-turret",origin:turret.muzzle,
+      direction:turret.direction,speed:Number(ammunition.muzzle_speed_m_s||72),massKg:Number(ammunition.round_mass_kg||0),
+      owner:vehicle.identity})){
+    shots.push({turretIdentity:turret.name,localPosition:[...(assembly.turrets.find(item=>item.identity===turret.name)?.local_position||[0,0,0])],
+      direction:[...turret.direction],recoilImpulseNs:Number(ammunition.recoil_impulse_n_s||49)});}}
+  runtime.ammoCount=Math.max(0,runtime.ammoCount-shots.length);
+  if(stateLoopRuntime.ready&&shots.length)stateLoopRuntime.worker.postMessage({type:"vehicle-body-wrenches",identity:vehicle.identity,
+    assemblyIdentity:assembly.identity,shots,ammoCount:runtime.ammoCount,roundMassKg:Number(ammunition.round_mass_kg||0)});
+  setPlacementStatus(`turret volley · ${shots.length} fired · ${runtime.ammoCount} rounds · ${runtime.interlockReason||"clear"}`);
+  updateVehicleTransmissionControls();return true;
+}
+
 function beginViewportPrimary(position=null,source="pointer") {
   issueViewportAction("primary-action","press");
+  if(vehicleRuntime.active&&vehicleRuntime.bodyShell==="six-body-pin-carrier"&&vehicleRuntime.turretSystem.fireTakeover){
+    if(primaryActionState.down)return false;primaryActionState.down=true;primaryActionState.source=source;
+    return fireVehicleTurrets();}
   const tool=activeToolObject(),mode=activeToolMode(tool);
   if(tool?.name!=="Physics-ball gun"||mode?.name!=="attractor"){
     return routeActiveToolHook("primary-action",position);
@@ -6105,7 +6541,7 @@ async function initializeWorldPhysicsWasm() {
           stateLoopRuntime.ready = true; stateLoopRuntime.mode = "dedicated-worker";
           vehicleRuntime.computeMode=message.vehicleCompute||"resident-webgpu-fault";
           worker.postMessage({type: "colliders", colliders: shaderViewer.colliders});
-          registerPlayerPhysicsBody();
+          if(!vehicleQualification.active)registerPlayerPhysicsBody();
           registerActiveVehiclePhysicsBody();
         } else if(message.type==="vehicle-gpu-error"){
           vehicleRuntime.error=message.error;vehicleRuntime.computeMode="resident-webgpu-fault";
@@ -6121,8 +6557,20 @@ async function initializeWorldPhysicsWasm() {
           if(vehicle&&vehicleRuntime.damage){for(const edge of vehicle.physics.mechanical_graph.edges){const state=
               vehicleRuntime.damage.members?.[edge.identity];if(state){edge.runtime_rest_length=state.restLength;
                 edge.runtime_failed=Boolean(state.failed);}}
+            const shellPrefix=vehicleRuntime.bodyShell==="six-body-pin-carrier"?"armor.mount.":"body_shell.mount.",
+              shellMounts=vehicle.physics.mechanical_graph.edges.filter(edge=>edge.identity.startsWith(shellPrefix));
+            if(shellMounts.length&&shellMounts.every(edge=>vehicleRuntime.damage.members?.[edge.identity]?.failed))
+              vehicleRuntime.bodyShellBoxes=[];
             if(vehicleRuntime.state){updateVehiclePresentation(vehicle,vehicleRuntime.state,0,0);
               rebuildPortableSceneMesh({dynamicOnly:true});}updateVehicleTransmissionControls();}
+        } else if(message.type==="vehicle-energy"){
+          if(message.identity===(vehicleRuntime.active?.identity||vehicleRuntime.parkedState?.identity)){
+            vehicleRuntime.electrical={...vehicleRuntime.electrical,...(message.energy||{})};
+            vehicleRuntime.driverAssistance={...vehicleRuntime.driverAssistance,...(message.driverAssistance||{})};
+            updateVehicleTransmissionControls();}
+        } else if(message.type==="vehicle-alignment"){
+          if(message.identity===vehicleRuntime.active?.identity){vehicleRuntime.wheelAlignment=message.alignment||vehicleRuntime.wheelAlignment;
+            updateVehicleTransmissionControls();}
         } else if (message.type === "engine-state") {
           stateLoopRuntime.engineStage=message.stage||(
             message.sleeping?"asleep":"full-dynamics");
@@ -6175,7 +6623,24 @@ async function initializeWorldPhysicsWasm() {
                 frontDiffMode:values[offset+150]>=.7?"locked":values[offset+150]>.01?"limited-slip":"open",
                 rearDiffMode:values[offset+151]>=.7?"locked":values[offset+151]>.01?"limited-slip":"open",
                 centerDiffMode:values[offset+152]>=.7?"locked":values[offset+152]>.01?"limited-slip":"open"});
-              if (vehicleRuntime.state?.identity === body.identity) {
+              body.frontKnuckleSteerAngle=values[offset+153];body.rearKnuckleSteerAngle=values[offset+154];
+              body.wheelSteerAngles={front_left:values[offset+155],front_right:values[offset+156],
+                rear_left:values[offset+157],rear_right:values[offset+158]};
+              body.steeringWrench={columnAngle:values[offset+159],frontRackTravel:values[offset+160],
+                rearRackTravel:values[offset+161]};
+              const presentedState=vehicleRuntime.state?.identity===body.identity?vehicleRuntime.state:
+                vehicleRuntime.parkedState?.identity===body.identity?vehicleRuntime.parkedState:null;
+              if(presentedState){presentedState.position=[...body.position];presentedState.velocity=[...body.velocity];
+                presentedState.roll=body.roll;presentedState.pitch=body.pitch;presentedState.yaw=body.yaw;
+                presentedState.rollVelocity=body.rollVelocity;presentedState.pitchVelocity=body.pitchVelocity;
+                presentedState.yawVelocity=body.yawVelocity;presentedState.frontKnuckleSteerAngle=body.frontKnuckleSteerAngle;
+                presentedState.rearKnuckleSteerAngle=body.rearKnuckleSteerAngle;
+                presentedState.wheelSteerAngles={...body.wheelSteerAngles};
+                presentedState.steeringWrench={...body.steeringWrench};
+                ["front_left","front_right","rear_left","rear_right"].forEach((name,index)=>{
+                  presentedState.wheelOmegas[name]=body.wheelOmegas?.[index]||0;
+                  presentedState.compressions[name]=body.compressions?.[index]||0;});}
+              if (presentedState) {
                 vehicleRuntime.lastSpringForces = [...body.springForces];
                 vehicleRuntime.contactAreas = [...body.contactAreas];
                 vehicleRuntime.frictionUtilizations = [...body.frictionUtilizations];
@@ -6188,6 +6653,8 @@ async function initializeWorldPhysicsWasm() {
                 vehicleRuntime.radialProbeActiveCounts=[...body.radialProbeActiveCounts];
                 vehicleRuntime.powertrain={...body.powertrain,reactionTorque:[...body.powertrain.reactionTorque],
                   mountTorque:[...body.powertrain.mountTorque]};
+                presentedState.frontKnuckleSteerAngle=body.frontKnuckleSteerAngle;
+                presentedState.rearKnuckleSteerAngle=body.rearKnuckleSteerAngle;
                 const transmissionChanged=Object.keys(body.transmission).some(key=>
                   vehicleRuntime.transmission[key]!==body.transmission[key]);
                 vehicleRuntime.transmission={...vehicleRuntime.transmission,...body.transmission};
@@ -6195,6 +6662,7 @@ async function initializeWorldPhysicsWasm() {
               }
               body.contactIdentity = shaderViewer.colliders.find(collider =>
                 collider.runtimePartId === body.contactRuntimePartId)?.identity || null;
+              updateVehicleQualification(body,message.sequence);
             });
           }
           worker.postMessage({type: "recycle", sequence: message.sequence,
@@ -6235,7 +6703,74 @@ async function initializeWorldPhysicsWasm() {
 function buildVehicleBodyShell(vehicle,state){
   if(vehicleRuntime.bodyShell==="bare-frame")return [];
   const shell=vehicle.body_shells?.find(item=>item.identity===vehicleRuntime.bodyShell),
-    chassis=vehicle.configuration.chassis,halfLength=Number(chassis.half_length),halfWidth=Number(chassis.half_width),
+    chassis=vehicle.configuration.chassis,halfLength=Number(chassis.half_length),halfWidth=Number(chassis.half_width);
+  if(shell?.identity==="six-body-pin-carrier"){
+    const steel=model.appearance.colors["drivetrain-black"]||"#30383c",accent=model.appearance.colors["engine-accent"]||"#db9f3e",
+      armorHeight=.39,armorY=.29,armorThickness=.018,
+      armorSpecs=[
+        ["armor-left",[0,armorY,-halfWidth*1.04],[halfLength*.91,armorThickness],armorHeight],
+        ["armor-right",[0,armorY,halfWidth*1.04],[halfLength*.91,armorThickness],armorHeight],
+        ["armor-front",[halfLength*.91,armorY,0],[armorThickness,halfWidth*1.04],armorHeight],
+        ["armor-rear",[-halfLength*.91,armorY,0],[armorThickness,halfWidth*1.04],armorHeight],
+        ["armor-left-upper",[-.02,.58,-halfWidth*.79],[halfLength*.62,armorThickness],.25],
+        ["armor-right-upper",[-.02,.58,halfWidth*.79],[halfLength*.62,armorThickness],.25]],
+      parts=armorSpecs.map(([name,localCenter,halfExtent,height])=>({identity:`${vehicle.identity}/turret-carrier:${name}`,
+        kind:"vehicle-armor-segment",label:name,parent_identity:vehicle.identity,center:[...state.position],center_y:state.position[1],
+        half_extent:halfExtent,height,floor_height:height,wall_thickness:armorThickness,palette_role:"drivetrain-black",
+        wall_palette_role:"drivetrain-black",geometry_mode:"solid",openings:[],local_center:localCenter,
+        appearance:{face_color:steel,material_profile:"quenched-steel-plate"},presentation_layer:"mounted-breakable-armor",
+        placement:{custody:"placed",elevation:state.position[1],rotation:[0,0,0]},
+        physics:{enabled:true,collider:"segmented-armor-contact",mass:Number(shell.armor?.mass_kg||0)/armorSpecs.length,
+          mount_authority:"body-assembly-wrench-interface"}}));
+    for(const turret of shell.turrets||[]){
+      const name=turret.identity,base=[...turret.local_position],postHeight=Number(turret.post_height_m||.4),
+        postCenter=[base[0],base[1]-postHeight*.5,base[2]],gimbalCenter=[base[0],base[1]+.04,base[2]];
+      parts.push({identity:`${vehicle.identity}/turret:${name}:post`,kind:"vehicle-turret-post",label:`${name} post`,
+        parent_identity:vehicle.identity,center:[...state.position],center_y:state.position[1],half_extent:[.055,.055],height:postHeight,
+        floor_height:postHeight,wall_thickness:.012,palette_role:"rollbar-silver",wall_palette_role:"rollbar-silver",
+        geometry_mode:"solid",openings:[],local_center:postCenter,turret_name:name,turret_part:"post",
+        appearance:{face_color:model.appearance.colors["rollbar-silver"]},placement:{custody:"placed",elevation:0,rotation:[0,0,0]},
+        physics:{enabled:true,collider:"turret-post",mount_authority:"body-assembly-wrench-interface"}});
+      parts.push({identity:`${vehicle.identity}/turret:${name}:gimbal`,kind:"vehicle-turret-gimbal",label:`${name} gimbal`,
+        parent_identity:vehicle.identity,center:[...state.position],center_y:state.position[1],half_extent:[.13,.12],height:.16,
+        floor_height:.16,wall_thickness:.01,palette_role:"engine-accent",wall_palette_role:"engine-accent",
+        geometry_mode:"solid",openings:[],local_center:gimbalCenter,turret_name:name,turret_part:"gimbal",
+        appearance:{face_color:accent},placement:{custody:"placed",elevation:0,rotation:[0,0,0]},physics:{enabled:false,welded:false}});
+      parts.push({identity:`${vehicle.identity}/turret:${name}:weapon`,kind:"vehicle-turret-weapon",label:`${name} weapon`,
+        parent_identity:vehicle.identity,center:[...state.position],center_y:state.position[1],half_extent:[.29,.036],height:.072,
+        floor_height:.072,wall_thickness:.008,palette_role:"drivetrain-black",wall_palette_role:"drivetrain-black",
+        geometry_mode:"solid",openings:[],local_center:gimbalCenter,turret_name:name,turret_part:"weapon",
+        appearance:{face_color:steel},placement:{custody:"placed",elevation:0,rotation:[0,0,0]},physics:{enabled:false,welded:false}});
+    }
+    for(const name of shell.outriggers?.feet||[]){const front=name.startsWith("front")?1:-1,left=name.endsWith("left")?-1:1,
+      mount=[front*halfLength*.56,.20,left*halfWidth*.88];
+      parts.push({identity:`${vehicle.identity}/outrigger:${name}:actuator`,kind:"vehicle-hydraulic-outrigger",label:`${name} outrigger`,
+        parent_identity:vehicle.identity,center:[...state.position],center_y:state.position[1],half_extent:[.38,.032],height:.064,
+        floor_height:.064,wall_thickness:.01,palette_role:"actuator-yellow",wall_palette_role:"actuator-yellow",geometry_mode:"solid",
+        openings:[],local_center:mount,outrigger_name:name,outrigger_part:"actuator",outrigger_mount_local:mount,
+        appearance:{face_color:model.appearance.colors["actuator-yellow"]||accent},placement:{custody:"placed",elevation:0,rotation:[0,0,0]},
+        physics:{enabled:false,mount_authority:"body-assembly-wrench-interface"}});
+      parts.push({identity:`${vehicle.identity}/outrigger:${name}:reserve`,kind:"vehicle-outrigger-reserve-tube",
+        label:`${name} inboard reserve tube`,parent_identity:vehicle.identity,center:[...state.position],center_y:state.position[1],
+        half_extent:[Number(shell.outriggers?.inboard_reserve_m||.72)*.5,.044],height:.088,floor_height:.088,wall_thickness:.012,
+        palette_role:"rollbar-silver",wall_palette_role:"rollbar-silver",geometry_mode:"solid",openings:[],local_center:mount,
+        outrigger_name:name,outrigger_part:"reserve",outrigger_mount_local:mount,
+        appearance:{face_color:model.appearance.colors["rollbar-silver"]},placement:{custody:"placed",elevation:0,rotation:[0,0,0]},
+        physics:{enabled:true,collider:"inboard-reserve-tube",mount_authority:"body-assembly-wrench-interface"}});
+      parts.push({identity:`${vehicle.identity}/outrigger:${name}:foot`,kind:"vehicle-outrigger-foot",label:`${name} welded foot`,
+        parent_identity:vehicle.identity,center:[...state.position],center_y:state.position[1],half_extent:[.12,.10],height:.045,
+        floor_height:.045,wall_thickness:.01,palette_role:"drivetrain-black",wall_palette_role:"drivetrain-black",geometry_mode:"solid",
+        openings:[],local_center:mount,outrigger_name:name,outrigger_part:"foot",outrigger_mount_local:mount,
+        appearance:{face_color:steel},placement:{custody:"placed",elevation:0,rotation:[0,0,0]},
+        physics:{enabled:true,collider:"terrain-weld-foot",mount_authority:"body-assembly-wrench-interface"}});}
+    parts.push({identity:`${vehicle.identity}/turret-carrier:fire-control`,kind:"vehicle-fire-control-computer",
+      label:"independent turret fire-control computer",parent_identity:vehicle.identity,center:[...state.position],center_y:state.position[1],
+      half_extent:[.20,.16],height:.20,floor_height:.20,wall_thickness:.01,palette_role:"engine-accent",wall_palette_role:"engine-accent",
+      geometry_mode:"solid",openings:[],local_center:[-.30,.36,0],appearance:{face_color:accent},
+      placement:{custody:"placed",elevation:0,rotation:[0,0,0]},physics:{enabled:true,collider:"equipment-box"}});
+    return parts;
+  }
+  const
     colorRole=shell?.palette_role||vehicle.configuration.presentation.palette_role,specs=[
       ["hood",[halfLength*.48,.32,0],[halfLength*.40,halfWidth*1.08],.30],
       ["cab",[-halfLength*.03,.52,0],[halfLength*.32,halfWidth*1.06],.82],
@@ -6247,9 +6782,10 @@ function buildVehicleBodyShell(vehicle,state){
     center_y:state.position[1]+localCenter[1],half_extent:halfExtent,height,floor_height:height,wall_thickness:.012,
     palette_role:colorRole,wall_palette_role:colorRole,geometry_mode:"solid",openings:[],local_center:localCenter,
     appearance:{face_color:model.appearance.colors[colorRole],material_identity:shell?.material_identity||null,
-      material_profile:shell?.material_profile||"opaque"},presentation_layer:"non-physics-chassis-relative-shell",
+      material_profile:shell?.material_profile||"opaque"},presentation_layer:"mounted-breakable-contact-shell",
     placement:{custody:"placed",elevation:state.position[1]+localCenter[1]-height*.5,rotation:[0,0,0]},
-    physics:{enabled:false,collider:"none",mass:0}}));
+    physics:{enabled:true,collider:"subdivided-shell-samples",mass:Number(vehicle.configuration.body_shell.shell_mass_kg||0)/specs.length,
+      mount_authority:"mechanical-graph-body-shell-mounts"}}));
 }
 
 function ensureVehiclePresentation(vehicle,state) {
@@ -6271,7 +6807,8 @@ function ensureVehiclePresentation(vehicle,state) {
     placement:{custody:"placed",elevation:state.position[1]-.0375,
       rotation:[state.roll*180/Math.PI,state.yaw*180/Math.PI,state.pitch*180/Math.PI]},
     physics:{body:"dynamic-vehicle",collider:"chassis",enabled:true,welded:true}};
-  const presentation=vehicle.configuration.presentation,wheels=vehicle.configuration.wheels;
+  const presentation=vehicle.configuration.presentation,wheels=vehicle.configuration.wheels,
+    wheelPart=vehicle.wheel_parts?.find(item=>item.identity===vehicleRuntime.wheelPart)||vehicle.wheel_parts?.[0];
   vehicleRuntime.wheelBoxes=["front_left","front_right","rear_left","rear_right"].map((name,index)=>({
     identity:`${vehicle.identity}/wheel:${name}`,kind:"vehicle-wheel",label:name,parent_identity:vehicle.identity,
     center:[state.position[0],state.position[2]],center_y:state.position[1],half_extent:[Number(config.tires.radius),Number(config.tires.width)*.5],
@@ -6281,14 +6818,16 @@ function ensureVehiclePresentation(vehicle,state) {
       tread_color:model.appearance.colors[presentation.wheel_tread_palette_role||"active"]},
     placement:{custody:"placed",elevation:0,rotation:[0,0,0]},physics:{enabled:false,welded:true},
     wheel_state:{name,index,radius:Number(config.tires.radius),rimRadius:Number(wheels.rim_radius),
-      width:Number(config.tires.width),spin:0,steer:0,
+      width:Number(config.tires.width),spin:0,steer:0,tireColor:wheelPart?.tire_color,
+      treadColor:wheelPart?.tread_color,rimColor:wheelPart?.rim_color,
+      carcassProfile:wheelPart?.carcass_profile,rimProfile:wheelPart?.rim_profile,treadPattern:wheelPart?.tread_pattern,
       chassisPosition:[...state.position],chassisRotation:[state.roll,state.yaw,state.pitch],localCenter:[0,0,0]}
   }));
   const frameColor=model.appearance.colors["rollbar-silver"],frameSpecs=[
-    ["rail-left",[0,Number(chassis.height)*.72,-Number(wheels.track_half_width)],[Number(chassis.half_length)*.88,.025]],
-    ["rail-right",[0,Number(chassis.height)*.72,Number(wheels.track_half_width)],[Number(chassis.half_length)*.88,.025]],
-    ["axle-front",[Number(wheels.wheelbase_half_length),Number(chassis.height)*.72,0],[.025,Number(wheels.track_half_width)]],
-    ["axle-rear",[-Number(wheels.wheelbase_half_length),Number(chassis.height)*.72,0],[.025,Number(wheels.track_half_width)]]
+    ["rail-left",[0,Number(chassis.height)*.72,-Number(chassis.half_width)*.78],[Number(chassis.half_length),.025]],
+    ["rail-right",[0,Number(chassis.height)*.72,Number(chassis.half_width)*.78],[Number(chassis.half_length),.025]],
+    ["frame-front",[Number(chassis.half_length),Number(chassis.height)*.72,0],[.025,Number(chassis.half_width)*.78]],
+    ["frame-rear",[-Number(chassis.half_length),Number(chassis.height)*.72,0],[.025,Number(chassis.half_width)*.78]]
   ];
   vehicleRuntime.frameBoxes=frameSpecs.map(([name,localCenter,halfExtent])=>({
     identity:`${vehicle.identity}/frame:${name}`,kind:"vehicle-frame-member",label:name,parent_identity:vehicle.identity,
@@ -6324,7 +6863,10 @@ function ensureVehiclePresentation(vehicle,state) {
      "constant-velocity-torque-shaft","six-axis-compliant-mount","steering-torque-shaft",
      "universal-joint-steering-shaft","universal-joint-hub-spindle",
      "rack-and-pinion-angle-to-translation","rack-translation","routed-tension-cable",
-     "table-actuator-linear-link","tension-limit-strap","routed-energy-line","intake-flow-path","exhaust-flow-path"].includes(edge.constraint)).map(edge=>({
+     "table-actuator-linear-link","tension-limit-strap","routed-energy-line","intake-flow-path","exhaust-flow-path",
+     "insulated-copper-wire","pressure-rated-hydraulic-line","pressure-rated-air-line",
+     "flexible-hydraulic-hose","flexible-air-line","flexible-air-line-with-rotary-union",
+     "steering-assist-torque-coupling"].includes(edge.constraint)).map(edge=>({
       identity:`${vehicle.identity}/mechanical:${edge.identity}`,kind:"vehicle-mechanical-edge",label:edge.identity,
       parent_identity:vehicle.identity,center:[...box.center],center_y:state.position[1],half_extent:[.015,.015],
       height:.03,floor_height:0,wall_thickness:.006,palette_role:edge.palette_role,
@@ -6382,6 +6924,8 @@ function ensureVehiclePresentation(vehicle,state) {
       ["rear-differential","vehicle-differential",[-wheelbase,.065,0],[.04,.07],.038,"drivetrain-black","rearDifferentialTorque"],
       ["front-differential-brake","vehicle-differential-brake",[wheelbase+.105,.065,0],[.018,.082],.052,"suspension-yellow","frontDifferentialBrakeTorque"],
       ["rear-differential-brake","vehicle-differential-brake",[-wheelbase-.105,.065,0],[.018,.082],.052,"suspension-yellow","rearDifferentialBrakeTorque"],
+      ["steering-servo","vehicle-steering-servo",[.08,.29,-.10],[.035,.045],.075,"active",null,
+        Number(config.electrical.steering_servo_mass_kg||3.2)],
       ["engine-mount","vehicle-powertrain-mount",[enginePosition[0],.075,0],[.018,Number(wheels.track_half_width)*.58],.03,"drivetrain-black","engineAccelerationTorque"],
       ["transmission-mount","vehicle-powertrain-mount",[enginePosition[0]+.28,.055,0],[.014,Number(wheels.track_half_width)*.52],.026,"drivetrain-black","transmissionOutputTorque"],
       ["transfer-case-mount","vehicle-powertrain-mount",[enginePosition[0]+.39,.045,0],[.014,Number(wheels.track_half_width)*.45],.024,"drivetrain-black","drivelineTorque"]
@@ -6422,31 +6966,34 @@ function ensureVehiclePresentation(vehicle,state) {
 
 function solveVehicleMechanicalGraph(vehicle,state){
   const graph=vehicle.physics.mechanical_graph,positions=new Map(graph.nodes.map(node=>[
-    node.identity,node.reference_position.map(Number)])),fixed=new Set(graph.nodes.filter(node=>node.fixed_to==="chassis")
+    node.identity,node.reference_position.map(Number)])),fixed=new Set(graph.nodes.filter(node=>node.fixed_to==="chassis"&&!node.structural_deformable)
       .map(node=>node.identity)),chassis=vehicle.configuration.chassis,wheels=vehicle.configuration.wheels,
     suspension=vehicle.configuration.suspension,damage=vehicleRuntime.damage;
   ["front_left","front_right","rear_left","rear_right"].forEach(corner=>{
     const prefix=`suspension.${corner}`,hubIdentity=`${prefix}.hub`,referenceHub=positions.get(hubIdentity),
       compression=Number(state.compressions[corner]||0),plastic=Number(damage?.springPlasticSet?.[corner]||0),
-      targetHubY=-Number(chassis.clearance)-(Number(suspension.rest_length)-plastic)+compression+
+      leveling=Number(vehicleRuntime.electrical.levelingOffsets?.[corner]||0),
+      targetHubY=-Number(chassis.clearance)-(Number(suspension.rest_length)+leveling-plastic)+compression+
         Number(vehicle.configuration.tires.radius),delta=targetHubY-referenceHub[1];
     graph.nodes.filter(node=>node.generalized_coordinate===`compression_${corner}`).forEach(node=>{
       const point=positions.get(node.identity);point[1]+=delta;
     });
   });
   const constraints=graph.edges.filter(edge=>!edge.runtime_failed&&
-    (edge.constraint==="rigid-distance"||edge.constraint==="rigid-offset"));
+    (edge.constraint==="rigid-distance"||edge.constraint==="rigid-offset"||edge.constraint==="steering-link"));
   for(let iteration=0;iteration<18;iteration+=1){
     constraints.forEach(edge=>{const a=positions.get(edge.a),b=positions.get(edge.b);if(!a||!b)return;
       const delta=b.map((value,index)=>value-a[index]),length=Math.max(1e-8,Math.hypot(...delta)),
-        error=(length-Number(edge.runtime_rest_length??edge.rest_length))/length,aFixed=fixed.has(edge.a),bFixed=fixed.has(edge.b),
+        targetLength=Number(edge.runtime_rest_length??edge.rest_length)+Number(vehicleRuntime.electrical.linkLengthModifiers?.[edge.identity]||0),
+        error=(length-targetLength)/length,aFixed=fixed.has(edge.a),bFixed=fixed.has(edge.b),
         aScale=aFixed?0:bFixed?1:.5,bScale=bFixed?0:aFixed?1:.5;
       for(let axis=0;axis<3;axis+=1){a[axis]+=delta[axis]*error*aScale;b[axis]-=delta[axis]*error*bScale;}
     });
     ["front_left","front_right","rear_left","rear_right"].forEach(corner=>{
       const hub=positions.get(`suspension.${corner}.hub`),compression=Number(state.compressions[corner]||0),
-        plastic=Number(damage?.springPlasticSet?.[corner]||0),target=-Number(chassis.clearance)-
-          (Number(suspension.rest_length)-plastic)+compression+Number(vehicle.configuration.tires.radius);
+        plastic=Number(damage?.springPlasticSet?.[corner]||0),leveling=Number(vehicleRuntime.electrical.levelingOffsets?.[corner]||0),
+        target=-Number(chassis.clearance)-(Number(suspension.rest_length)+leveling-plastic)+compression+
+          Number(vehicle.configuration.tires.radius);
       hub[1]+=(target-hub[1])*.38;
     });
   }
@@ -6454,9 +7001,11 @@ function solveVehicleMechanicalGraph(vehicle,state){
     const hub=positions.get(`suspension.${corner}.hub`),patch=positions.get(`suspension.${corner}.contact_patch`);
     patch[0]=hub[0];patch[1]=hub[1]-Number(vehicle.configuration.tires.radius);patch[2]=hub[2];
   });
-  const steeringInput=Number(state.presentationSteering||0),frontAngle=Number(state.presentationFrontSteering||0),
-    rearAngle=Number(state.presentationRearSteering||0);
-  [["front_left",frontAngle],["front_right",frontAngle],["rear_left",rearAngle],["rear_right",rearAngle]].forEach(([corner,steeringAngle])=>{
+  const steeringInput=Number(state.presentationSteering||0),wheelSteer=state.wheelSteerAngles||{};
+  [["front_left",Number(wheelSteer.front_left??state.presentationFrontSteering??0)],
+   ["front_right",Number(wheelSteer.front_right??state.presentationFrontSteering??0)],
+   ["rear_left",Number(wheelSteer.rear_left??state.presentationRearSteering??0)],
+   ["rear_right",Number(wheelSteer.rear_right??state.presentationRearSteering??0)]].forEach(([corner,steeringAngle])=>{
     const knuckle=positions.get(`suspension.${corner}.knuckle`),cosine=Math.cos(steeringAngle),sine=Math.sin(steeringAngle),
       rotateAboutKnuckle=identity=>{const point=positions.get(`suspension.${corner}.${identity}`);if(!point||!knuckle)return;
         const dx=point[0]-knuckle[0],dz=point[2]-knuckle[2];point[0]=knuckle[0]+dx*cosine-dz*sine;
@@ -6464,9 +7013,10 @@ function solveVehicleMechanicalGraph(vehicle,state){
     // The upright/kingpin is the steering pivot. The hub spindle, wheel-side
     // CV yoke and yellow steering arm articulate about it; the inner halfshaft
     // remains attached to the differential and visibly breaks angle at the yoke.
-    ["hub","wheel_rim","tire_carcass","brake_rotor","contact_patch","steering_arm"].forEach(rotateAboutKnuckle);
+    ["hub","brake_rotor","contact_patch","steering_arm"].forEach(rotateAboutKnuckle);
   });
-  const steeringCenter=positions.get("steering.wheel.center"),wheelAngle=-steeringInput*1.5,
+  const steeringCenter=positions.get("steering.wheel.center"),wheelAngle=Number(
+      state.steeringWrench?.columnAngle??(-steeringInput*1.5)),
     wheelCos=Math.cos(wheelAngle),wheelSin=Math.sin(wheelAngle);
   if(steeringCenter)for(let index=0;index<8;index+=1){
     const identity=`steering.wheel.ring_${index}`,point=positions.get(identity),reference=graph.nodes.find(
@@ -6475,11 +7025,11 @@ function solveVehicleMechanicalGraph(vehicle,state){
     point[1]=steeringCenter[1]+dy*wheelCos-dz*wheelSin;
     point[2]=steeringCenter[2]+dy*wheelSin+dz*wheelCos;
   }
-  [[frontAngle,["steering.rack.center","suspension.front_left.steering_rack","suspension.front_right.steering_rack"]],
-   [rearAngle,["steering.rear_rack.center","suspension.rear_left.steering_rack","suspension.rear_right.steering_rack"]]]
-    .forEach(([angle,identities])=>identities.forEach(identity=>{
+  [[Number(state.steeringWrench?.frontRackTravel||0),["steering.rack.center","suspension.front_left.steering_rack","suspension.front_right.steering_rack"]],
+   [Number(state.steeringWrench?.rearRackTravel||0),["steering.rear_rack.center","suspension.rear_left.steering_rack","suspension.rear_right.steering_rack"]]]
+    .forEach(([travel,identities])=>identities.forEach(identity=>{
       const point=positions.get(identity),reference=graph.nodes.find(node=>node.identity===identity)?.reference_position;
-      if(point&&reference)point[2]=reference[2]-Number(angle)*.045;
+      if(point&&reference)point[2]=reference[2]+Number(travel);
     }));
   const throttle=Math.max(0,Math.min(1,Math.abs(Number(state.presentationThrottle||0)))),lever=positions.get(
       "powertrain.intake.throttle_lever"),leverReference=graph.nodes.find(node=>
@@ -6496,15 +7046,10 @@ function updateVehiclePresentation(vehicle,state,dt,steering){
   const config=vehicle.configuration,chassis=config.chassis,wheels=config.wheels;
   state.presentationSteering=Number(steering||0);
   state.presentationThrottle=Number(vehicleRuntime.state?.lastThrottle??state.presentationThrottle??0);
-  const steeringPolicy=vehicleRuntime.steeringSystem||config.steering_control||{},share=Math.max(0,Math.min(1,
-      Number(steeringPolicy.front_share??.5))),maximum=Number(config.controls.maximum_steering_angle_degrees)*Math.PI/180,
-    frontGain=steeringPolicy.front_axle_enabled===false?0:Math.min(1,share*2),
-    rearGain=steeringPolicy.rear_axle_enabled===false?0:Math.min(1,(1-share)*2),phase=Number(steeringPolicy.rear_phase??-1),
-    blend=Math.min(1,Math.max(0,dt)*Math.max(1,Number(steeringPolicy.knuckle_response_frequency_hz||5.5))*4);
-  state.presentationFrontSteering=Number(state.presentationFrontSteering||0)+
-    (-Number(steering||0)*maximum*frontGain-Number(state.presentationFrontSteering||0))*blend;
-  state.presentationRearSteering=Number(state.presentationRearSteering||0)+
-    (-Number(steering||0)*maximum*rearGain*phase-Number(state.presentationRearSteering||0))*blend;
+  // Rendering consumes the worker's constrained knuckle coordinates. It does
+  // not synthesize a second steering animation from the input command.
+  state.presentationFrontSteering=Number(state.frontKnuckleSteerAngle||0);
+  state.presentationRearSteering=Number(state.rearKnuckleSteerAngle||0);
   const names=["front_left","front_right","rear_left","rear_right"],
     positions=solveVehicleMechanicalGraph(vehicle,state);
   names.forEach((name,index)=>{
@@ -6514,7 +7059,9 @@ function updateVehiclePresentation(vehicle,state,dt,steering){
     if(!wheel)return;
     wheel.center=[state.position[0],state.position[2]];wheel.center_y=state.position[1];
     wheel.wheel_state={...wheel.wheel_state,spin:vehicleRuntime.wheelAngles[index],
-      steer:index<2?state.presentationFrontSteering:state.presentationRearSteering,
+      steer:Number(state.wheelSteerAngles?.[name]??(index<2?state.presentationFrontSteering:state.presentationRearSteering)),
+      tirePressurePa:Number(vehicleRuntime.electrical.tirePressurePa||config.tires.pressure_pa),
+      referenceTirePressurePa:Number(config.tires.reference_pressure_pa||155000),
       chassisPosition:[...state.position],chassisRotation:[state.roll,state.yaw,state.pitch],
       localCenter:[...positions.get(`suspension.${name}.hub`)]};
   });
@@ -6529,6 +7076,7 @@ function uploadVehiclePresentationMesh(dt){
 function updateVehicleBodyPresentation(vehicle,state){
   const chassis=vehicle.configuration.chassis,rotation=[state.roll*180/Math.PI,
     state.yaw*180/Math.PI,state.pitch*180/Math.PI],box=ensureVehiclePresentation(vehicle,state);
+  updateVehicleTurretTargeting(vehicle,state);
   box.center=[state.position[0],state.position[2]];box.center_y=state.position[1];
   box.placement.elevation=state.position[1]-Number(box.height)*.5;box.placement.rotation=rotation;
   const cabin=vehicleRuntime.cabinBox;if(cabin){cabin.center=[state.position[0],state.position[2]];
@@ -6547,8 +7095,35 @@ function updateVehicleBodyPresentation(vehicle,state){
     const edge=member.mechanical_edge,a=[...positions.get(edge.a)],authoredB=[...positions.get(edge.b)],
       b=edge.runtime_failed?a.map((value,index)=>value+(authoredB[index]-value)*.43):authoredB;
     member.appearance.face_color=edge.runtime_failed?"#ff4f62":model.appearance.colors[edge.palette_role];
+    if(edge.identity.startsWith("lighting.headlamp."))member.appearance.face_color=
+      vehicleRuntime.electrical.headlightsOn&&vehicleRuntime.electrical.lightingCircuitOnline?"#ffe4a3":"#554f42";
+    if(edge.identity.startsWith("lighting.tail."))member.appearance.face_color=vehicleRuntime.electrical.brakeLightsOn?
+      "#ff2638":vehicleRuntime.electrical.tailLightsOn?"#b81426":"#3b161b";
+    if(edge.identity.startsWith("electrical.wire."))member.appearance.face_color=
+      vehicleRuntime.electrical.computerOnline?"#d88935":"#34281f";
+    let routeLocalPoints=null;
+    if(edge.routing==="relaxed-multi-segment-harness"){
+      const now=performance.now()*.001,previous=member.link_state.routeLocalPoints,
+        elapsed=Math.min(.1,Math.max(0,now-Number(member.link_state.routeUpdatedAt||now))),
+        rate=Math.max(.1,Number(edge.relaxation_rate_hz||6)),alpha=1-Math.exp(-rate*elapsed),
+        delta=b.map((value,index)=>value-a[index]),span=Math.max(.001,Math.hypot(...delta)),
+        slack=Math.max(1,Number(edge.slack_ratio||1.05)),bendRelax=Math.min(1,Math.max(.1,Number(edge.bend_relaxation||.6))),
+        minimumBend=Math.max(.005,Number(edge.minimum_bend_radius_m||.02)),
+        sag=Math.max(minimumBend*.8*bendRelax,Math.min(span*.28,span*Math.sqrt(Math.max(0,slack*slack-1))*.55*bendRelax)),
+        horizontal=Math.hypot(delta[0],delta[2]),side=horizontal>.0001?[-delta[2]/horizontal,0,delta[0]/horizontal]:[1,0,0],
+        handedness=[...edge.identity].reduce((sum,character)=>sum+character.charCodeAt(0),0)%2?1:-1,
+        target=Array.from({length:7},(_,index)=>{const t=index/6,sine=Math.sin(Math.PI*t),bow=Math.sin(Math.PI*2*t);
+          return a.map((value,axis)=>value+delta[axis]*t+(axis===1?-sag*sine:0)+
+            side[axis]*handedness*minimumBend*.32*bendRelax*bow);});
+      routeLocalPoints=previous?.length===target.length?target.map((point,index)=>
+        index===0||index===target.length-1?point:point.map((value,axis)=>
+          previous[index][axis]+(value-previous[index][axis])*alpha)):target;
+      member.link_state.routeUpdatedAt=now;
+    }
     member.link_state={...member.link_state,
       localA:a,localB:b,radius:Number(edge.radius||.012),
+      routeLocalPoints:routeLocalPoints||undefined,
+      routeUpdatedAt:member.link_state.routeUpdatedAt,
       chassisPosition:[...state.position],chassisRotation:[state.roll,state.yaw,state.pitch]};
   });
   [...vehicleRuntime.rollCageBoxes,...vehicleRuntime.powertrainBoxes,...vehicleRuntime.bodyShellBoxes].forEach(member=>{
@@ -6556,6 +7131,31 @@ function updateVehicleBodyPresentation(vehicle,state){
     member.center=[state.position[0]+offset[0],state.position[2]+offset[2]];
     member.center_y=state.position[1]+offset[1];member.placement.elevation=member.center_y-member.height*.5;
     member.placement.rotation=[...rotation];
+    if(member.outrigger_name){const front=member.outrigger_name.startsWith("front")?1:-1,
+      left=member.outrigger_name.endsWith("left")?-1:1,mountOffset=rotateVehiclePresentationVector(member.outrigger_mount_local,state,0),
+      mount=state.position.map((value,index)=>value+mountOffset[index]),localDirection=normalized3([front*.18,-.78,left*.60]),
+      worldDirection=normalized3(rotateVehiclePresentationVector(localDirection,state,0)),extension=Number(
+        vehicleRuntime.electrical.outriggerExtension||0),anchor=vehicleRuntime.electrical.outriggerAnchors?.[member.outrigger_name],
+      endpoint=anchor?.position?[...anchor.position]:mount.map((value,index)=>value+worldDirection[index]*(.18+extension)),
+      direction=normalized3(endpoint.map((value,index)=>value-mount[index])),yaw=Math.atan2(direction[2],direction[0]),
+      pitch=Math.atan2(direction[1],Math.hypot(direction[0],direction[2]));
+      if(member.outrigger_part==="actuator"){const center=mount.map((value,index)=>(value+endpoint[index])*.5);
+        member.center=[center[0],center[2]];member.center_y=center[1];member.half_extent[0]=Math.max(.08,Math.hypot(...endpoint.map(
+          (value,index)=>value-mount[index]))*.5);member.placement.elevation=center[1]-member.height*.5;
+        member.placement.rotation=[0,yaw*180/Math.PI,pitch*180/Math.PI];}
+      else if(member.outrigger_part==="reserve"){const reserve=.72,center=mount.map((value,index)=>value-direction[index]*reserve*.5);
+        member.center=[center[0],center[2]];member.center_y=center[1];member.half_extent[0]=reserve*.5;
+        member.placement.elevation=center[1]-member.height*.5;member.placement.rotation=[0,yaw*180/Math.PI,pitch*180/Math.PI];}
+      else{member.center=[endpoint[0],endpoint[2]];member.center_y=endpoint[1];member.placement.elevation=endpoint[1]-member.height*.5;
+        member.placement.rotation=[0,state.yaw*180/Math.PI,0];member.appearance.face_color=anchor?"#65d89b":model.appearance.colors[member.palette_role];}}
+    const turret=member.turret_name?vehicleRuntime.turretSystem.turrets.find(item=>item.name===member.turret_name):null;
+    if(turret&&(member.turret_part==="weapon"||member.turret_part==="gimbal")){
+      const direction=turret.direction,center=member.turret_part==="weapon"?
+        turret.pivot.map((value,index)=>value+direction[index]*.29):turret.pivot;
+      member.center=[center[0],center[2]];member.center_y=center[1];member.placement.elevation=center[1]-member.height*.5;
+      member.placement.rotation=[0,turret.yaw*180/Math.PI,turret.pitch*180/Math.PI];
+      member.appearance.face_color=turret.inhibited?"#6d2028":model.appearance.colors[member.palette_role];
+    }
     if(member.torque_channel)member.appearance.face_color=model.appearance.colors[member.palette_role];
   });
   return box;
@@ -6594,16 +7194,17 @@ function removeVehicleInventoryItem(item){
 function cloneVehicleState(state){
   return {...state,position:[...state.position],velocity:[...state.velocity],
     wheelOmegas:{...state.wheelOmegas},previousSlips:{...state.previousSlips},
+    wheelSteerAngles:{...(state.wheelSteerAngles||{})},steeringWrench:{...(state.steeringWrench||{})},
     compressions:{...state.compressions},defaults:{...state.defaults}};
 }
 
 function vehicleTerrainRestPose(vehicle,position,yaw,compressions){
   const config=vehicle.configuration,wheels=config.wheels,chassis=config.chassis,suspension=config.suspension,
     names=["front_left","front_right","rear_left","rear_right"],
-    corners=[[wheels.wheelbase_half_length,-wheels.track_half_width],
-      [wheels.wheelbase_half_length,wheels.track_half_width],
-      [-wheels.wheelbase_half_length,-wheels.track_half_width],
-      [-wheels.wheelbase_half_length,wheels.track_half_width]],cy=Math.cos(yaw),sy=Math.sin(yaw),
+    axleOffset=Number(wheels.axle_group_offset_x_m||0),corners=[[axleOffset+Number(wheels.wheelbase_half_length),-wheels.track_half_width],
+      [axleOffset+Number(wheels.wheelbase_half_length),wheels.track_half_width],
+      [axleOffset-Number(wheels.wheelbase_half_length),-wheels.track_half_width],
+      [axleOffset-Number(wheels.wheelbase_half_length),wheels.track_half_width]],cy=Math.cos(yaw),sy=Math.sin(yaw),
     samples=corners.map(([forward,right])=>cameraGroundHeight(position[0]+forward*cy-right*sy,
       position[2]+forward*sy+right*cy)),wheelbase=Math.max(1e-6,Number(wheels.wheelbase_half_length)),
     track=Math.max(1e-6,Number(wheels.track_half_width)),forwardSlope=(samples[0]+samples[1]-samples[2]-samples[3])/(4*wheelbase),
@@ -6632,6 +7233,7 @@ function vehicleSpawnState(vehicle,placeAtActor,{reuseParked=true}={}){
     roll:rest.roll,pitch:rest.pitch,yaw:rest.yaw,
     rollVelocity:0,pitchVelocity:0,yawVelocity:0,
     wheelOmegas:{front_left:0,front_right:0,rear_left:0,rear_right:0},
+    wheelSteerAngles:{front_left:0,front_right:0,rear_left:0,rear_right:0},
     previousSlips:{front_left:0,front_right:0,rear_left:0,rear_right:0},
     compressions,defaults:{...vehicle.configuration_defaults}};
 }
@@ -6644,17 +7246,42 @@ function setActiveVehicle(identity,{placeAtActor=false,inventoryItem=null}={}) {
   vehicleRuntime.transmission={mode:vehicle.configuration.transmission.mode_default,
     gear:Number(vehicle.configuration.transmission.starting_gear),
     displayGear:Number(vehicle.configuration.transmission.starting_gear),torqueReserve:0,reason:"initial-second",
-    lowRange:false,frontDiffLock:false,rearDiffLock:false,centerDiffLock:false,
+    lowRange:false,transferRange:"high",frontDiffLock:false,rearDiffLock:false,centerDiffLock:false,
     frontDiffMode:"open",rearDiffMode:"open",centerDiffMode:"open",
     frontDriveShare:Number(vehicle.configuration.drivetrain.front_drive_fraction||.5),smoothLaunch:false,
-    tractionControlEnabled:true,absEnabled:true,tractionControlAuthority:1,absAuthority:1};
+    tractionControlEnabled:true,absEnabled:true,tiltEnabled:true,tractionControlAuthority:1,absAuthority:1};
   vehicleRuntime.brakeLocks={front_left:false,front_right:false,rear_left:false,rear_right:false};
   vehicleRuntime.powerUnitPreset=vehicle.power_unit_preset||vehicle.power_unit_presets?.[0]?.identity||null;
+  vehicleRuntime.engineEquationMode=vehicle.engine_kernel_switch?.default_equation_mode||"linear-playable";
   vehicleRuntime.transmissionPreset=vehicle.transmission_preset||vehicle.transmission_presets?.[0]?.identity||null;
+  vehicleRuntime.clutchPreset=vehicle.clutch_preset||vehicle.clutch_presets?.[0]?.identity||null;
   vehicleRuntime.chassisProfile=vehicle.chassis_profile||vehicle.chassis_profiles?.[0]?.identity||null;
   vehicleRuntime.wheelPart=vehicle.wheel_part||"balloon-black-current";
   vehicleRuntime.bodyShell=vehicle.body_shell||"clear-polycarbonate-rc";
+  const turretAssembly=vehicle.body_shells?.find(item=>item.identity==="six-body-pin-carrier");
+  const turretAmmo=turretAssembly?.ammunition||{},turretCapacity=Math.max(0,Math.min(Number(turretAmmo.capacity_count||0),
+    Math.floor(Number(turretAmmo.capacity_mass_kg||0)/Math.max(1e-9,Number(turretAmmo.round_mass_kg||1))),
+    Math.floor(Number(turretAmmo.capacity_volume_m3||0)/Math.max(1e-9,Number(turretAmmo.round_volume_m3||1)))));
+  vehicleRuntime.turretSystem={fireTakeover:turretAssembly?.fire_control?.primary_fire_takeover_default!==false,
+    ammoCount:Math.min(turretCapacity,Number(turretAmmo.initial_count||0)),target:null,targetDistance:0,
+    interlockReason:"no-target",turrets:[],outriggers:{commanded:false,extension:0,anchors:{}}};
+  vehicleRuntime.electrical={headlightsOn:false,hornOn:false,ignitionOn:true,starterEngaged:false,
+    stateOfCharge:Number(vehicle.configuration.electrical?.initial_state_of_charge||1),
+    fuelMassKg:Number(vehicle.configuration.fuel_system?.initial_fuel_mass_kg||0),
+    totalMassKg:Number(vehicle.configuration.mass||0),fuelIdentity:vehicle.fuel_profile||"pump-gasoline-93",
+    ignitionProfileIdentity:vehicle.ignition_profile||"gasoline-distributor",ignitionTimingOffsetCycles:0,
+    requestedIgnitionProfileIdentity:vehicle.ignition_profile||"gasoline-distributor",combustionSharpness:1,
+    timingErrorDegrees:0,combustionStress:0,computerOnline:true,ecuOnline:true,lightingCircuitOnline:true,
+    tailLightsOn:false,brakeLightsOn:false,tirePressurePa:Number(vehicle.configuration.tires?.pressure_pa||155000),
+    tirePressureTargetPa:Number(vehicle.tire_pressure_target_pa||vehicle.configuration.tires?.pressure_pa||155000),pneumaticCompressorOn:false,
+    pneumaticCompressorPowerW:0,hydraulicPumpOn:false,hydraulicPumpPowerW:0};
+  vehicleRuntime.driverAssistance={drivingMode:vehicle.driving_mode||"road",
+    governorRpm:Number(vehicle.configuration.powertrain?.redline_rpm||6500),cruiseEnabled:false,
+    cruiseTargetSpeedMps:0,cruiseIntegral:0,cruiseThrottle:0,cruiseBrake:0,tiltEnabled:true,
+    tiltAuthority:0,tiltRisk:0,tiltGovernorRpm:Number(vehicle.configuration.powertrain?.redline_rpm||6500),
+    rearDifferentialBrakeCommand:0};
   vehicleRuntime.chassisLeveling={...(vehicle.chassis_leveling||{}),cornerOffsets:{front_left:0,front_right:0,rear_left:0,rear_right:0}};
+  vehicleRuntime.wheelAlignment=JSON.parse(JSON.stringify(vehicle.wheel_alignment||{}));
   vehicleRuntime.steeringSystem={...(vehicle.steering_control||vehicle.configuration.steering_control||{})};
   vehicleRuntime.shockParameters={...vehicle.configuration_defaults};
   vehicleRuntime.damage=null;
@@ -6676,6 +7303,7 @@ function setActiveVehicle(identity,{placeAtActor=false,inventoryItem=null}={}) {
 
 function clearActiveVehicle() {
   if(!vehicleRuntime.active)return;
+  void setVehicleHorn(false);
   const state=vehicleRuntime.state,config=vehicleRuntime.active.configuration;
   vehicleRuntime.parkedState=cloneVehicleState(state);
   model.vehicle_slot.active=null;vehicleRuntime.active=null;vehicleRuntime.state=null;
@@ -6686,8 +7314,12 @@ function clearActiveVehicle() {
   if(vehicleRuntime.cabinBox)vehicleRuntime.cabinBox.placement.custody="placed";
   vehicleRuntime.wheelBoxes.forEach(wheel=>wheel.placement.custody="placed");
   vehicleRuntime.worldMarker?.classList.remove("active");
-  if(stateLoopRuntime.ready&&state){stateLoopRuntime.worker.postMessage({type:"remove",identity:state.identity});
-    releasePhysicsSnapshotSlot(state.identity);}
+  // Dismount relinquishes the controls, not the machine.  Its resident solver body,
+  // engine, fuel, battery, driveline, contacts, and damage continue to advance.
+  if(stateLoopRuntime.ready&&state)stateLoopRuntime.worker.postMessage({type:"vehicle-control",identity:state.identity,
+    throttle:0,steering:0,brake:0});
+  if(stateLoopRuntime.ready&&state)stateLoopRuntime.worker.postMessage({type:"vehicle-auxiliary",identity:state.identity,
+    hornOn:false,starterEngaged:false});
   if(state){
     viewportControls.position=[state.position[0],state.position[1]+Number(config.chassis.camera_height),
       state.position[2]+Number(config.chassis.half_width)+.18];
@@ -6746,11 +7378,11 @@ function respawnViewportActor(){
   registerPlayerPhysicsBody();setPlacementStatus("Player respawned at the authored start");return true;
 }
 
-function controlVehicleTransmission({mode=null,gearDelta=null,lowRange=null,frontDiffLock=null,
+function controlVehicleTransmission({mode=null,gearDelta=null,lowRange=null,transferRange=null,frontDiffLock=null,
     rearDiffLock=null,centerDiffLock=null,frontDriveShare=null,smoothLaunch=null,
     frontDiffMode=null,rearDiffMode=null,centerDiffMode=null,
     frontDifferentialBrake=null,rearDifferentialBrake=null,
-    tractionControlEnabled=null,absEnabled=null,tractionControlAuthority=null,absAuthority=null,
+    tractionControlEnabled=null,absEnabled=null,tiltEnabled=null,tractionControlAuthority=null,absAuthority=null,
     gearset=null,transmissionPreset=null,
     brakeLock=null,releaseAllBrakes=false}={}){
   const vehicle=vehicleRuntime.active;if(!vehicle)return false;
@@ -6764,7 +7396,8 @@ function controlVehicleTransmission({mode=null,gearDelta=null,lowRange=null,fron
   if(mode==="automatic")state.mode="automatic";
   if(Number.isFinite(gearDelta)){state.mode="manual";state.gear=Math.max(1,Math.min(
     transmission.forward_ratios.length,Math.round(state.gear+Number(gearDelta))));state.displayGear=state.gear;}
-  if(typeof lowRange==="boolean")state.lowRange=lowRange;
+  if(["high","l1","l2"].includes(transferRange)){state.transferRange=transferRange;state.lowRange=transferRange!=="high";}
+  else if(typeof lowRange==="boolean"){state.lowRange=lowRange;state.transferRange=lowRange?"l2":"high";}
   if(typeof frontDiffLock==="boolean")state.frontDiffLock=frontDiffLock;
   if(typeof rearDiffLock==="boolean")state.rearDiffLock=rearDiffLock;
   if(typeof centerDiffLock==="boolean")state.centerDiffLock=centerDiffLock;
@@ -6777,19 +7410,58 @@ function controlVehicleTransmission({mode=null,gearDelta=null,lowRange=null,fron
   if(typeof rearDifferentialBrake==="boolean")state.rearDifferentialBrake=rearDifferentialBrake;
   if(typeof tractionControlEnabled==="boolean")state.tractionControlEnabled=tractionControlEnabled;
   if(typeof absEnabled==="boolean")state.absEnabled=absEnabled;
+  if(typeof tiltEnabled==="boolean")state.tiltEnabled=tiltEnabled;
   if(Number.isFinite(tractionControlAuthority))state.tractionControlAuthority=Math.max(0,Math.min(1,Number(tractionControlAuthority)));
   if(Number.isFinite(absAuthority))state.absAuthority=Math.max(0,Math.min(1,Number(absAuthority)));
   if(brakeLock&&brakeLock.name in vehicleRuntime.brakeLocks)
     vehicleRuntime.brakeLocks[brakeLock.name]=Boolean(brakeLock.locked);
   if(releaseAllBrakes)Object.keys(vehicleRuntime.brakeLocks).forEach(name=>vehicleRuntime.brakeLocks[name]=false);
   if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-transmission",identity:vehicle.identity,
-    mode,gearDelta,lowRange,frontDiffLock,rearDiffLock,centerDiffLock,frontDiffMode,rearDiffMode,centerDiffMode,
+    mode,gearDelta,lowRange,transferRange,frontDiffLock,rearDiffLock,centerDiffLock,frontDiffMode,rearDiffMode,centerDiffMode,
     frontDriveShare,smoothLaunch,frontDifferentialBrake,rearDifferentialBrake,
-    tractionControlEnabled,absEnabled,tractionControlAuthority,absAuthority,
+    tractionControlEnabled,absEnabled,tiltEnabled,tractionControlAuthority,absAuthority,
     gearset,transmissionPreset,brakeLock,releaseAllBrakes});
   updateVehicleTransmissionControls();
   setPlacementStatus(`${state.mode==="automatic"?"Springtail automatic":`Springtail manual · gear ${state.gear}`} · ${
-    state.lowRange?"ultra low":"high range"} · F${Math.round(state.frontDriveShare*100)}/R${Math.round((1-state.frontDriveShare)*100)}`);return true;
+    `${String(state.transferRange||"high").toUpperCase()} transfer`} · F${Math.round(state.frontDriveShare*100)}/R${Math.round((1-state.frontDriveShare)*100)}`);return true;
+}
+
+function controlVehicleAuxiliary(update={}){
+  const vehicle=vehicleRuntime.active;if(!vehicle)return false;const state=vehicleRuntime.electrical;
+  for(const name of ["headlightsOn","hornOn","ignitionOn","starterEngaged"])
+    if(typeof update[name]==="boolean")state[name]=update[name];
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-auxiliary",identity:vehicle.identity,
+    headlightsOn:state.headlightsOn,hornOn:state.hornOn,ignitionOn:state.ignitionOn,
+    starterEngaged:state.starterEngaged});
+  if(typeof update.hornOn==="boolean")void setVehicleHorn(state.hornOn);
+  return true;
+}
+
+function controlVehicleFuelIgnition(update={}){
+  const vehicle=vehicleRuntime.active;if(!vehicle)return false;
+  if(typeof update.fuelIdentity==="string"){vehicle.fuel_profile=update.fuelIdentity;vehicleRuntime.electrical.fuelIdentity=update.fuelIdentity;}
+  if(typeof update.ignitionProfileIdentity==="string"){vehicle.ignition_profile=update.ignitionProfileIdentity;
+    vehicleRuntime.electrical.ignitionProfileIdentity=update.ignitionProfileIdentity;
+    vehicleRuntime.electrical.requestedIgnitionProfileIdentity=update.ignitionProfileIdentity;}
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-fuel-ignition",identity:vehicle.identity,
+    fuelIdentity:vehicleRuntime.electrical.fuelIdentity,ignitionProfileIdentity:vehicleRuntime.electrical.ignitionProfileIdentity});
+  updateVehicleTransmissionControls();return true;
+}
+
+function controlVehicleDriverAssistance(update={}){
+  const vehicle=vehicleRuntime.active;if(!vehicle)return false;const state=vehicleRuntime.driverAssistance;
+  if(typeof update.drivingMode==="string"&&(vehicle.driving_modes||[]).some(item=>item.identity===update.drivingMode))
+    state.drivingMode=update.drivingMode;
+  if(Number.isFinite(update.governorRpm))state.governorRpm=Math.max(500,Math.min(Number(
+    vehicle.configuration.powertrain?.redline_rpm||6500),Number(update.governorRpm)));
+  if(typeof update.cruiseEnabled==="boolean"){state.cruiseEnabled=update.cruiseEnabled;
+    if(update.cruiseEnabled&&!Number.isFinite(update.cruiseTargetSpeedMps))state.cruiseTargetSpeedMps=Math.hypot(
+      Number(vehicleRuntime.state?.velocity?.[0]||0),Number(vehicleRuntime.state?.velocity?.[2]||0));}
+  if(Number.isFinite(update.cruiseTargetSpeedMps))state.cruiseTargetSpeedMps=Math.max(0,Number(update.cruiseTargetSpeedMps));
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-driver-assistance",identity:vehicle.identity,
+    drivingMode:state.drivingMode,governorRpm:state.governorRpm,cruiseEnabled:state.cruiseEnabled,
+    cruiseTargetSpeedMps:state.cruiseTargetSpeedMps});
+  updateVehicleTransmissionControls();return true;
 }
 
 function selectVehicleTransmissionPreset(presetIdentity){
@@ -6799,14 +7471,54 @@ function selectVehicleTransmissionPreset(presetIdentity){
   setPlacementStatus(`${preset.label} selected · ratios remain live compiled inputs`);return true;
 }
 
+function selectVehicleClutchPreset(presetIdentity){
+  const vehicle=vehicleRuntime.active,preset=vehicle?.clutch_presets?.find(item=>item.identity===presetIdentity),
+    reference=vehicle?.clutch_presets?.find(item=>item.default)||vehicle?.clutch_presets?.[0],
+    powerPreset=vehicle?.power_unit_presets?.find(item=>item.identity===vehicleRuntime.powerUnitPreset);
+  if(!vehicle||!preset||!reference)return false;
+  vehicle.clutch_preset=preset.identity;vehicleRuntime.clutchPreset=preset.identity;
+  const baseInertia=Number(powerPreset?.parameters?.engine_rotating_inertia||vehicle.configuration.powertrain.engine_rotating_inertia_kg_m2),
+    effectiveInertia=Math.max(.001,baseInertia+Number(preset.driven_inertia_kg_m2)-Number(reference.driven_inertia_kg_m2));
+  Object.assign(vehicle.configuration.powertrain,{clutch_stiffness_nm_per_rad_s:Number(preset.stiffness_nm_per_rad_s),
+    clutch_maximum_torque_nm:Number(preset.maximum_torque_nm),clutch_efficiency:Number(preset.efficiency),
+    engine_rotating_inertia_kg_m2:effectiveInertia});
+  Object.assign(vehicle.configuration_defaults,{clutch_stiffness:Number(preset.stiffness_nm_per_rad_s),
+    clutch_maximum_torque:Number(preset.maximum_torque_nm),clutch_efficiency:Number(preset.efficiency),
+    engine_rotating_inertia:effectiveInertia});vehicleRuntime.state.defaults={...vehicle.configuration_defaults};
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-clutch-preset",identity:vehicle.identity,
+    preset:{...preset,reference_mass_kg:Number(reference.mass_kg),effective_engine_inertia_kg_m2:effectiveInertia}});
+  updateVehicleTransmissionControls();setPlacementStatus(`${preset.label} · ${preset.maximum_torque_nm} Nm · ${preset.engagement}`);
+  return true;
+}
+
 function selectVehiclePowerUnit(presetIdentity){
   const vehicle=vehicleRuntime.active,preset=vehicle?.power_unit_presets?.find(item=>item.identity===presetIdentity);
   if(!vehicle||!preset)return false;
   vehicle.power_unit_preset=preset.identity;vehicleRuntime.powerUnitPreset=preset.identity;
-  Object.assign(vehicle.configuration_defaults,preset.parameters);
-  Object.assign(vehicle.configuration.powertrain,preset.configuration);
+  const clutch=vehicle.clutch_presets?.find(item=>item.identity===vehicleRuntime.clutchPreset),
+    referenceClutch=vehicle.clutch_presets?.find(item=>item.default)||vehicle.clutch_presets?.[0],
+    inertiaDelta=clutch&&referenceClutch?Number(clutch.driven_inertia_kg_m2)-Number(referenceClutch.driven_inertia_kg_m2):0,
+    parameters={...preset.parameters,engine_rotating_inertia:Number(preset.parameters.engine_rotating_inertia)+inertiaDelta,
+      clutch_stiffness:Number(clutch?.stiffness_nm_per_rad_s??vehicle.configuration_defaults.clutch_stiffness),
+      clutch_maximum_torque:Number(clutch?.maximum_torque_nm??vehicle.configuration_defaults.clutch_maximum_torque),
+      clutch_efficiency:Number(clutch?.efficiency??vehicle.configuration_defaults.clutch_efficiency)},
+    configuration={...preset.configuration,engine_rotating_inertia_kg_m2:Number(
+      preset.configuration.engine_rotating_inertia_kg_m2)+inertiaDelta,
+      clutch_stiffness_nm_per_rad_s:Number(clutch?.stiffness_nm_per_rad_s??vehicle.configuration.powertrain.clutch_stiffness_nm_per_rad_s),
+      clutch_maximum_torque_nm:Number(clutch?.maximum_torque_nm??vehicle.configuration.powertrain.clutch_maximum_torque_nm),
+      clutch_efficiency:Number(clutch?.efficiency??vehicle.configuration.powertrain.clutch_efficiency)};
+  Object.assign(vehicle.configuration_defaults,parameters);
+  Object.assign(vehicle.configuration.powertrain,configuration);
+  const packageFit=preset.package?.chassis_fit;
+  if(packageFit)selectVehicleChassisGeometry({
+    chassisLengthM:2*Number(packageFit.chassis_half_length_m),
+    wheelbaseM:Number(packageFit.wheelbase_m)});
   if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-power-unit",identity:vehicle.identity,
-    preset:{identity:preset.identity,kind:preset.kind,parameters:preset.parameters,configuration:preset.configuration}});
+    preset:{identity:preset.identity,kind:preset.kind,kernelSelector:preset.kernel_selector,
+      equationMode:vehicleRuntime.engineEquationMode,parameters,configuration,
+      compatibleFuelProfiles:[...(preset.compatible_fuel_profiles||[])],
+      fuelCompatibility:{...(preset.fuel_compatibility||{})},
+      ignitionCompatibility:{...(preset.ignition_compatibility||{})}}});
   vehicleRuntime.state.defaults={...vehicle.configuration_defaults};
   // The selected architecture owns its cylinder/bank or stator layout and
   // energy-storage presentation. Rebuild only this vehicle's presentation;
@@ -6819,12 +7531,18 @@ function selectVehiclePowerUnit(presetIdentity){
   return true;
 }
 
+function selectVehicleEngineEquationMode(mode){
+  if(!["linear-playable","symbolic-fidelity"].includes(mode)||!vehicleRuntime.active)return false;
+  vehicleRuntime.engineEquationMode=mode;return selectVehiclePowerUnit(vehicleRuntime.powerUnitPreset);
+}
+
 function applyChassisProfileToVehicle(vehicle,profile){
   const reference=vehicle.chassis_profile_reference||{},baseMass=Number(reference.vehicle_mass_kg||vehicle.configuration.mass),
     baseMemberMass=Number(reference.member_mass_kg||0),newMass=Math.max(1,baseMass-baseMemberMass+Number(profile.member_mass_kg||0)),
     massScale=newMass/Math.max(1,baseMass),graph=vehicle.physics?.mechanical_graph;
   for(const edge of graph?.edges||[]){if(!edge.chassis_profile_member)continue;
     edge.radius=Number(profile.outer_diameter_m)/2;
+    edge.mass_kg=Number(edge.rest_length)*Number(profile.section_area_m2)*Number(profile.density_kg_m3);
     if(edge.damage)Object.assign(edge.damage,{material:profile.material,section_area_m2:profile.section_area_m2,
       youngs_modulus_pa:profile.youngs_modulus_pa,yield_strength_pa:profile.yield_strength_pa,
       shear_strength_pa:profile.shear_strength_pa,axial_yield_force_n:profile.axial_yield_force_n,
@@ -6850,35 +7568,133 @@ function selectVehicleChassisProfile(profileIdentity){
   return true;
 }
 
+function selectVehicleChassisGeometry({chassisLengthM,wheelbaseM}){
+  const vehicle=vehicleRuntime.active,spec=vehicle?.chassis_geometry_parameters,graph=vehicle?.physics?.mechanical_graph;
+  if(!vehicle||!spec||!graph)return false;
+  const clamp=(value,range)=>Math.max(Number(range[0]),Math.min(Number(range[1]),Number(value))),
+    length=clamp(chassisLengthM??spec.chassis_length_m,spec.chassis_length_range_m),
+    requestedWheelbase=clamp(wheelbaseM??spec.wheelbase_m,spec.wheelbase_range_m),
+    wheelbase=requestedWheelbase,
+    halfLength=length/2,halfWheelbase=wheelbase/2,
+    axleOffset=Number(vehicle.configuration.wheels.axle_group_offset_x_m||0),positions=new Map();
+  vehicle.configuration.chassis.half_length=halfLength;vehicle.configuration.wheels.wheelbase_half_length=halfWheelbase;
+  spec.chassis_length_m=length;spec.wheelbase_m=wheelbase;
+  for(const node of graph.nodes){const parameter=node.longitudinal_parameterization||{},point=node.reference_position;
+    if(parameter.authority==="axle-group-offset-plus-wheelbase-half-length")point[0]=axleOffset+Number(parameter.sign)*halfWheelbase+Number(parameter.offset_m||0);
+    else if(parameter.authority==="chassis-half-length")point[0]=Number(parameter.fraction||0)*halfLength;
+    positions.set(node.identity,point);}
+  for(const edge of graph.edges){const a=positions.get(edge.a),b=positions.get(edge.b);if(!a||!b)continue;
+    const previous=Math.max(1e-9,Number(edge.rest_length)),next=Math.hypot(...b.map((value,index)=>value-a[index]));
+    edge.rest_length=next;if(edge.damage){edge.damage.natural_rest_length=next;
+      edge.damage.axial_stiffness_n_per_m=Number(edge.damage.axial_stiffness_n_per_m||0)*previous/Math.max(1e-9,next);}
+    const state=vehicleRuntime.damage?.members?.[edge.identity];if(state){state.restLength=next*(1+Number(state.elasticStrain||0)+
+      Number(state.plasticStrain||0));edge.runtime_rest_length=state.restLength;}}
+  const profile=vehicle.chassis_profiles?.find(item=>item.identity===vehicleRuntime.chassisProfile);
+  if(profile){const memberLength=graph.edges.filter(edge=>edge.chassis_profile_member).reduce(
+      (sum,edge)=>sum+Number(edge.rest_length),0),dynamic={...profile,member_length_m:memberLength,
+      member_mass_kg:memberLength*Number(profile.section_area_m2)*Number(profile.density_kg_m3)};
+    applyChassisProfileToVehicle(vehicle,dynamic);}
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-chassis-geometry",identity:vehicle.identity,
+    geometry:{chassisHalfLength:halfLength,wheelbaseHalfLength:halfWheelbase,mechanicalGraph:graph,
+      mass:Number(vehicle.configuration.mass),defaults:{...vehicle.configuration_defaults}}});
+  vehicleRuntime.state.defaults={...vehicle.configuration_defaults};
+  shaderViewer.geometry=shaderViewer.geometry.filter(item=>item.identity!==vehicle.identity&&item.parent_identity!==vehicle.identity);
+  vehicleRuntime.box=null;vehicleRuntime.cabinBox=null;vehicleRuntime.frameBoxes=[];vehicleRuntime.rollCageBoxes=[];
+  vehicleRuntime.mechanicalLinkBoxes=[];vehicleRuntime.suspensionLinkBoxes=[];vehicleRuntime.powertrainBoxes=[];
+  vehicleRuntime.bodyShellBoxes=[];vehicleRuntime.wheelBoxes=[];ensureVehiclePresentation(vehicle,vehicleRuntime.state);
+  updateVehicleTransmissionControls();setPlacementStatus(`chassis ${length.toFixed(2)} m · wheelbase ${wheelbase.toFixed(2)} m · graph rebuilt`);
+  return true;
+}
+
 function selectVehicleWheelPart(partIdentity){
   const vehicle=vehicleRuntime.active,part=vehicle?.wheel_parts?.find(item=>item.identity===partIdentity);
   if(!vehicle||!part)return false;
   vehicle.wheel_part=part.identity;vehicleRuntime.wheelPart=part.identity;
-  const tires=vehicle.configuration.tires,wheels=vehicle.configuration.wheels;
-  vehicleRuntime.wheelBoxes.forEach(wheel=>{const radius=Number(tires.radius)*Number(part.radius_scale||1),
-      width=Number(tires.width)*Number(part.width_scale||1);
+  const tires=vehicle.configuration.tires,wheels=vehicle.configuration.wheels,drivetrain=vehicle.configuration.drivetrain,
+    reference=vehicle.wheel_part_reference||={radius:Number(tires.radius),width:Number(tires.width),rimRadius:Number(wheels.rim_radius),
+      wheelMassKg:Number(drivetrain.wheel_mass_kg),tireMassKg:Number(drivetrain.tire_mass_kg),
+      rotationalInertiaScale:Number(drivetrain.rotational_inertia_scale),toroidSectionRadiusM:Number(tires.toroid_section_radius_m),
+      effectiveTreadWidthFraction:Number(tires.effective_tread_width_fraction),gasPolytropicExponent:Number(tires.gas_polytropic_exponent),
+      radialCarcassLossNsPerM:Number(tires.radial_carcass_loss_n_s_per_m),
+      sidewallShearStiffnessLongitudinalNPerM:Number(tires.sidewall_shear_stiffness_longitudinal_n_per_m),
+      sidewallShearStiffnessLateralNPerM:Number(tires.sidewall_shear_stiffness_lateral_n_per_m),
+      sidewallShearDampingNsPerM:Number(tires.sidewall_shear_damping_n_s_per_m),
+      longitudinalModeFrequencyHz:Number(tires.longitudinal_deformation_mode_frequency_hz),
+      lateralModeFrequencyHz:Number(tires.lateral_deformation_mode_frequency_hz),
+      deformationDampingRatio:Number(tires.sidewall_deformation_damping_ratio),
+      maximumSidewallDeformationM:Number(tires.maximum_sidewall_deformation_m)},
+    radius=reference.radius*Number(part.radius_scale||1),width=reference.width*Number(part.width_scale||1),
+    rimRadius=reference.rimRadius*Number(part.rim_scale||part.radius_scale||1),
+    wheelMassKg=Number(part.wheel_mass_kg||reference.wheelMassKg),tireMassKg=Number(part.tire_mass_kg||reference.tireMassKg),
+    inertiaScale=Number(part.rotational_inertia_scale||reference.rotationalInertiaScale),
+    wheelInertia=inertiaScale*(wheelMassKg*rimRadius**2+.5*tireMassKg*(rimRadius**2+radius**2));
+  Object.assign(tires,{radius,width,pressure_pa:Number(part.cold_pressure_kpa||tires.pressure_pa/1000)*1000,
+    toroid_section_radius_m:Number(part.toroid_section_radius_m||reference.toroidSectionRadiusM),
+    effective_tread_width_fraction:Number(part.effective_tread_width_fraction||reference.effectiveTreadWidthFraction),
+    gas_polytropic_exponent:Number(part.gas_polytropic_exponent||reference.gasPolytropicExponent),
+    radial_carcass_loss_n_s_per_m:Number(part.radial_carcass_loss_n_s_per_m||reference.radialCarcassLossNsPerM),
+    sidewall_shear_stiffness_longitudinal_n_per_m:Number(part.sidewall_shear_stiffness_longitudinal_n_per_m||reference.sidewallShearStiffnessLongitudinalNPerM),
+    sidewall_shear_stiffness_lateral_n_per_m:Number(part.sidewall_shear_stiffness_lateral_n_per_m||reference.sidewallShearStiffnessLateralNPerM),
+    sidewall_shear_damping_n_s_per_m:Number(part.sidewall_shear_damping_n_s_per_m||reference.sidewallShearDampingNsPerM),
+    longitudinal_deformation_mode_frequency_hz:Number(part.longitudinal_deformation_mode_frequency_hz||reference.longitudinalModeFrequencyHz),
+    lateral_deformation_mode_frequency_hz:Number(part.lateral_deformation_mode_frequency_hz||reference.lateralModeFrequencyHz),
+    sidewall_deformation_damping_ratio:Number(part.sidewall_deformation_damping_ratio||reference.deformationDampingRatio),
+    maximum_sidewall_deformation_m:Number(part.maximum_sidewall_deformation_m||reference.maximumSidewallDeformationM)});
+  Object.assign(wheels,{rim_radius:rimRadius});Object.assign(drivetrain,{wheel_mass_kg:wheelMassKg,tire_mass_kg:tireMassKg,
+    rotational_inertia_scale:inertiaScale});Object.assign(vehicle.configuration_defaults,{wheel_radius:radius,wheel_inertia:wheelInertia,
+    tire_longitudinal_deformation_frequency_hz:tires.longitudinal_deformation_mode_frequency_hz,
+    tire_lateral_deformation_frequency_hz:tires.lateral_deformation_mode_frequency_hz,
+    tire_sidewall_deformation_damping_ratio:tires.sidewall_deformation_damping_ratio,
+    tire_maximum_sidewall_deformation:tires.maximum_sidewall_deformation_m});
+  vehicleRuntime.wheelBoxes.forEach(wheel=>{
     wheel.height=radius*2;wheel.half_extent=[radius,width*.5];wheel.appearance.face_color=part.tire_color;
     wheel.appearance.tread_color=part.tread_color;wheel.wheel_state={...wheel.wheel_state,radius,
-      rimRadius:Number(wheels.rim_radius)*Number(part.rim_scale||part.radius_scale||1),width,
+      rimRadius,width,tireColor:part.tire_color,treadColor:part.tread_color,rimColor:part.rim_color,
       coldPressureKpa:Number(part.cold_pressure_kpa||0),compound:part.compound,
-      carcassProfile:part.carcass_profile,dryGripScale:Number(part.dry_grip_scale||1)};});
-  rebuildPortableSceneMesh();updateVehicleTransmissionControls();setPlacementStatus(`${part.label} selected`);return true;
+      carcassProfile:part.carcass_profile,rimProfile:part.rim_profile,treadPattern:part.tread_pattern,
+      dryGripScale:Number(part.dry_grip_scale||1)};});
+  vehicleRuntime.state.defaults={...vehicle.configuration_defaults};
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-wheel-part",identity:vehicle.identity,part:{...part}});
+  if(Number(part.cold_pressure_kpa)>0)controlVehicleTirePressure(Number(part.cold_pressure_kpa)*1000);
+  rebuildPortableSceneMesh();updateVehicleTransmissionControls();setPlacementStatus(`${part.label} · ${radius.toFixed(2)} m radius · ${
+    (wheelMassKg+tireMassKg).toFixed(0)} kg each · physical tyre graph rebuilding`);return true;
 }
 
 function selectVehicleBodyShell(shellIdentity){
   const vehicle=vehicleRuntime.active,shell=vehicle?.body_shells?.find(item=>item.identity===shellIdentity);
   if(!vehicle||!shell)return false;vehicle.body_shell=shell.identity;vehicleRuntime.bodyShell=shell.identity;
   vehicleRuntime.bodyShellBoxes=buildVehicleBodyShell(vehicle,vehicleRuntime.state);updateVehicleBodyPresentation(vehicle,vehicleRuntime.state);
-  rebuildPortableSceneMesh();updateVehicleTransmissionControls();setPlacementStatus(`${shell.label} · presentation only · zero physics mass/contact`);
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-body-shell",identity:vehicle.identity,shellIdentity,
+    assembly:shell,ammoCount:shell.identity==="six-body-pin-carrier"?vehicleRuntime.turretSystem.ammoCount:0});
+  rebuildPortableSceneMesh();updateVehicleTransmissionControls();setPlacementStatus(`${shell.label} · breakable mounted collision shell`);
   return true;
+}
+
+function controlVehicleOutriggers(deployed){
+  const vehicle=vehicleRuntime.active;if(!vehicle||vehicleRuntime.bodyShell!=="six-body-pin-carrier")return false;
+  vehicleRuntime.turretSystem.outriggers.commanded=Boolean(deployed);
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-outriggers",identity:vehicle.identity,deployed:Boolean(deployed)});
+  setPlacementStatus(deployed?"outriggers extending · feet weld on first terrain crossing":
+    "outriggers withdrawing · terrain welds hold until fully retracted");updateVehicleTransmissionControls();return true;
+}
+
+function pumpVehicleOutriggerAccumulator(){
+  const vehicle=vehicleRuntime.active;if(!vehicle||vehicleRuntime.bodyShell!=="six-body-pin-carrier")return false;
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-outrigger-hand-pump",identity:vehicle.identity});
+  setPlacementStatus("emergency outrigger accumulator · one hand-pump compression cycle");return true;
 }
 
 function controlVehicleChassisLeveling(update){
   const vehicle=vehicleRuntime.active;if(!vehicle)return false;
   const leveling=vehicleRuntime.chassisLeveling||={...(vehicle.chassis_leveling||{})};
   if(typeof update.enabled==="boolean")leveling.enabled=update.enabled;
-  for(const key of ["target_ride_height_offset_m","target_roll_rad","target_pitch_rad"])
+  if(typeof update.mode==="string")leveling.mode=update.mode;
+  if(typeof update.active_pose==="string")leveling.active_pose=update.active_pose;
+  for(const key of ["target_ride_height_offset_m","target_roll_rad","target_pitch_rad","pose_lerp_rate_m_s"])
     if(Number.isFinite(update[key]))leveling[key]=Number(update[key]);
+  if(update.manual_corner_targets_m)leveling.manual_corner_targets_m={...(leveling.manual_corner_targets_m||{}),
+    ...Object.fromEntries(Object.entries(update.manual_corner_targets_m).filter(([,value])=>Number.isFinite(value)))};
+  if(update.programmed_poses)leveling.programmed_poses={...(leveling.programmed_poses||{}),...update.programmed_poses};
   vehicle.chassis_leveling={...leveling};
   if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-chassis-leveling",identity:vehicle.identity,
     leveling:{...leveling}});
@@ -6886,6 +7702,30 @@ function controlVehicleChassisLeveling(update){
     Number(leveling.target_ride_height_offset_m||0).toFixed(2)} m · roll/pitch targets ${
     (Number(leveling.target_roll_rad||0)*180/Math.PI).toFixed(1)}°/${
     (Number(leveling.target_pitch_rad||0)*180/Math.PI).toFixed(1)}°`);return true;
+}
+
+function applyVehicleHydraulicPose(identity){
+  const leveling=vehicleRuntime.chassisLeveling,pose=(leveling.pose_presets||[]).find(item=>item.identity===identity)||
+    leveling.programmed_poses?.[identity];if(!pose)return false;
+  return controlVehicleChassisLeveling({enabled:true,mode:"manual-wheel",active_pose:identity,
+    manual_corner_targets_m:{...pose.corners}});
+}
+
+function programVehicleHydraulicPose(slot){
+  const leveling=vehicleRuntime.chassisLeveling;if(!leveling)return false;const corners={...(leveling.manual_corner_targets_m||{})},
+    pose={identity:slot,label:slot,corners};controlVehicleChassisLeveling({programmed_poses:{[slot]:pose}});
+  saveLivingEdits(null);
+  setPlacementStatus(`hydraulic pose ${slot} stored from four wheel-height targets`);return true;
+}
+
+function controlVehicleTirePressure(targetPa){
+  const vehicle=vehicleRuntime.active;if(!vehicle||!Number.isFinite(targetPa))return false;
+  const electrical=vehicle.configuration.electrical,minimum=Number(electrical.minimum_tire_pressure_pa||45000),
+    maximum=Number(electrical.maximum_tire_pressure_pa||260000);
+  vehicleRuntime.electrical.tirePressureTargetPa=Math.max(minimum,Math.min(maximum,Number(targetPa)));
+  vehicle.tire_pressure_target_pa=vehicleRuntime.electrical.tirePressureTargetPa;saveLivingEdits(null);
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-pneumatics",identity:vehicle.identity,
+    tirePressureTargetPa:vehicleRuntime.electrical.tirePressureTargetPa});updateVehicleTransmissionControls();return true;
 }
 
 function controlVehicleSteeringSystem(update){
@@ -6920,6 +7760,20 @@ function controlVehicleShockParameters(parameters){
   return true;
 }
 
+function controlVehicleWheelAlignment({corner,parameter,value,linked=false,calibrationMode=null}={}){
+  const vehicle=vehicleRuntime.active,alignment=vehicleRuntime.wheelAlignment;if(!vehicle||!alignment)return false;
+  if(calibrationMode){alignment.calibration={...(alignment.calibration||{}),requested:calibrationMode!=="static",
+      continuous:calibrationMode==="full-time-auto",settledTicks:0,status:calibrationMode};}
+  else if(alignment.corners?.[corner]&&["camber_deg","caster_deg","toe_deg"].includes(parameter)&&Number.isFinite(value)){
+    const range=alignment.ranges?.[parameter]||[-12,12],numeric=Math.max(Number(range[0]),Math.min(Number(range[1]),Number(value))),
+      targets=linked?Object.keys(alignment.corners):[corner];for(const name of targets)alignment.corners[name][parameter]=numeric;
+  }else return false;
+  if(stateLoopRuntime.ready)stateLoopRuntime.worker.postMessage({type:"vehicle-wheel-alignment",identity:vehicle.identity,
+    alignment:JSON.parse(JSON.stringify(alignment))});updateVehicleTransmissionControls();
+  setPlacementStatus(calibrationMode?`alignment mode · ${calibrationMode}`:
+    `${linked?"linked":"corner"} alignment · ${parameter} ${Number(value).toFixed(2)}°`);return true;
+}
+
 function updateActiveVehicle(dt,throttle,steering,brake) {
   const vehicle=vehicleRuntime.active,state=vehicleRuntime.state;
   if(!vehicle||!state)return false;
@@ -6952,6 +7806,16 @@ function updateActiveVehicle(dt,throttle,steering,brake) {
   }catch(error){reportRuntimeFault("vehicle-step",error);return false;}
 }
 
+function updateParkedVehicle(dt){
+  const vehicle=model.vehicle_slot?.vehicles?.[0],state=vehicleRuntime.parkedState;
+  if(vehicleRuntime.active||!vehicle||!state)return false;
+  const body=stateLoopRuntime.bodies.get(vehicle.identity);if(body){state.position=[...body.position];state.velocity=[...body.velocity];
+    state.roll=body.roll||0;state.pitch=body.pitch||0;state.yaw=body.yaw||0;
+    state.rollVelocity=body.rollVelocity||0;state.pitchVelocity=body.pitchVelocity||0;state.yawVelocity=body.yawVelocity||0;}
+  updateVehiclePresentation(vehicle,state,dt,0);updateVehicleBodyPresentation(vehicle,state);
+  uploadVehiclePresentationMesh(dt);updateEngineSoundTelemetry(0);return true;
+}
+
 function registerPlayerPhysicsBody() {
   if (!stateLoopRuntime.ready || stateLoopRuntime.actorRegistered || !viewportControls.position) return;
   const identity = viewportControls.policy?.actor;
@@ -6978,12 +7842,28 @@ function registerActiveVehiclePhysicsBody() {
     radius:Number(vehicle.configuration.chassis.half_width),roll:state.roll,pitch:state.pitch,yaw:state.yaw,
     rollVelocity:state.rollVelocity,pitchVelocity:state.pitchVelocity,yawVelocity:state.yawVelocity,
     wheelOmegas:{...state.wheelOmegas},
+    wheelSteerAngles:{...(state.wheelSteerAngles||{})},
     previousSlips:{...state.previousSlips},
-    compressions:{...state.compressions},controls:{throttle:0,steering:0,brake:0},
+    compressions:{...state.compressions},controls:{throttle:0,steering:0,brake:0},bodyShell:vehicleRuntime.bodyShell,
+    fuelProfile:vehicle.fuel_profile,ignitionProfile:vehicle.ignition_profile,bodyAssemblies:vehicle.body_shells,
+    bodyAssemblyInterface:vehicle.body_assembly_interface,turretAmmoCount:vehicleRuntime.turretSystem.ammoCount,
+    fuelProfiles:vehicle.fuel_profiles,ignitionProfiles:vehicle.ignition_profiles,
+    powerUnitCompatibleFuels:[...(vehicle.power_unit_presets?.find(item=>item.identity===vehicleRuntime.powerUnitPreset)?.compatible_fuel_profiles||[])],
+    powerUnitFuelCompatibility:{...(vehicle.power_unit_presets?.find(item=>item.identity===vehicleRuntime.powerUnitPreset)?.fuel_compatibility||{})},
+    powerUnitIgnitionCompatibility:{...(vehicle.power_unit_presets?.find(item=>item.identity===vehicleRuntime.powerUnitPreset)?.ignition_compatibility||{})},
+    engineKernelSwitch:vehicle.engine_kernel_switch,
+    engineEquationMode:vehicleRuntime.engineEquationMode,
+    engineProfileSelector:Number(vehicle.power_unit_presets?.find(item=>item.identity===vehicleRuntime.powerUnitPreset)?.kernel_selector||0)*2+
+      (vehicleRuntime.engineEquationMode==="symbolic-fidelity"?1:0),
+    drivingMode:vehicleRuntime.driverAssistance.drivingMode,drivingModes:vehicle.driving_modes,
+    driverAssistance:{...vehicleRuntime.driverAssistance},
+    energySeed:{...vehicleRuntime.electrical},
     transmission:{...vehicleRuntime.transmission},
     brakeLocks:{...vehicleRuntime.brakeLocks},
     config:{...vehicle.configuration,mechanical_graph:vehicle.physics.mechanical_graph,
-      chassis_leveling:{...vehicleRuntime.chassisLeveling},steering_control:{...vehicleRuntime.steeringSystem}},
+      chassis_leveling:{...vehicleRuntime.chassisLeveling},wheel_alignment:JSON.parse(JSON.stringify(vehicleRuntime.wheelAlignment)),
+      steering_control:{...vehicleRuntime.steeringSystem}},
+    wheelAlignment:JSON.parse(JSON.stringify(vehicleRuntime.wheelAlignment)),
     steeringSystem:{...vehicleRuntime.steeringSystem},
     defaults:vehicle.configuration_defaults,overrides:{}}});
   if(model.vehicle_slot?.initial_state?.placement==="authored-world-pose"){
@@ -7497,6 +8377,18 @@ function updateViewportControls(dt) {
     controlVehicleTransmission({rearDifferentialBrake:!vehicleRuntime.transmission.rearDifferentialBrake});
   viewportControls.frontDifferentialBrakeDown=frontDifferentialBrake;
   viewportControls.rearDifferentialBrakeDown=rearDifferentialBrake;
+  const headlights=viewportInputValue("vehicle-headlights-toggle",gamepad)>0,
+    horn=viewportInputValue("vehicle-horn",gamepad)>0,
+    ignition=viewportInputValue("vehicle-ignition-toggle",gamepad)>0,
+    starter=viewportInputValue("vehicle-starter",gamepad)>0;
+  if(vehicleRuntime.active&&headlights&&!viewportControls.headlightsDown)
+    controlVehicleAuxiliary({headlightsOn:!vehicleRuntime.electrical.headlightsOn});
+  if(vehicleRuntime.active&&horn!==viewportControls.hornDown)controlVehicleAuxiliary({hornOn:horn});
+  if(vehicleRuntime.active&&ignition&&!viewportControls.ignitionDown)
+    controlVehicleAuxiliary({ignitionOn:!vehicleRuntime.electrical.ignitionOn});
+  if(vehicleRuntime.active&&starter!==viewportControls.starterDown)controlVehicleAuxiliary({starterEngaged:starter});
+  viewportControls.headlightsDown=headlights;viewportControls.hornDown=horn;
+  viewportControls.ignitionDown=ignition;viewportControls.starterDown=starter;
   const forward = mobileClamp(viewportInputValue("move-forward", gamepad) -
     viewportInputValue("move-backward", gamepad) - mobileControlState.move[1]);
   const strafe = mobileClamp(viewportInputValue("strafe-right", gamepad) -
@@ -7807,7 +8699,7 @@ function drawVehicleShaderHud(gl,width,height){
     indicator=(label,x,mode)=>{const color=mode==="locked"?"#1b6b4b":mode==="limited-slip"?"#69551f":"#252d2b",
       glyph=mode==="locked"?"#8effc7":mode==="limited-slip"?"#ffd166":"#71817b";
       draw(x,indicatorY,15*ratio,7*ratio,rgba(color,.96));glyphText(label,x+5*ratio,indicatorY+1*ratio,ratio,rgba(glyph,1));};
-  indicator(transmission.lowRange?"L":"H",panelX+7*ratio,"locked");
+  indicator(String(transmission.transferRange||(transmission.lowRange?"l2":"high")).toUpperCase(),panelX+7*ratio,"locked");
   indicator("C",panelX+25*ratio,transmission.centerDiffMode||"open");
   indicator("F",panelX+43*ratio,transmission.frontDiffMode||"open");
   indicator("R",panelX+61*ratio,transmission.rearDiffMode||"open");
@@ -7923,6 +8815,10 @@ function cameraGroundHeight(worldX,worldZ){
   const terrainSources=shaderViewer.colliders.length?shaderViewer.colliders:
     (model.document_geometry?.boxes||[]).filter(box=>box.surface);
   terrainSources.forEach(source=>{
+    if(!source.surface&&Array.isArray(source.minimum)&&Array.isArray(source.maximum)&&
+        worldX>=source.minimum[0]&&worldX<=source.maximum[0]&&worldZ>=source.minimum[2]&&worldZ<=source.maximum[2]){
+      height=Math.max(height,Number(source.maximum[1]||0));return;
+    }
     const surface=source.surface,domain=surface?.domain;if(!surface||!domain)return;
     if(worldX<domain.minimum_x||worldX>domain.maximum_x||worldZ<domain.minimum_z||worldZ>domain.maximum_z)return;
     height=Math.max(height,sampleDeclaredSurface(surface,worldX,worldZ).height);
@@ -8019,16 +8915,37 @@ function updateShaderViewer() {
       headlightVehicle=vehicleRuntime.active||model.vehicle_slot?.vehicles?.[0],headlightLocations=shaderViewer.locations;
     if(headlightState&&headlightVehicle){
       const chassis=headlightVehicle.configuration.chassis,lampX=Number(chassis.half_length)+.045,
+        tailX=-Number(chassis.half_length)-.035,
         left=rotateVehiclePresentationVector([lampX,.095,-.14],headlightState,0),
         right=rotateVehiclePresentationVector([lampX,.095,.14],headlightState,0),
-        forward=rotateVehiclePresentationVector([1,-.025,0],headlightState,0);
+        tailLeft=rotateVehiclePresentationVector([tailX,.095,-.14],headlightState,0),
+        tailRight=rotateVehiclePresentationVector([tailX,.095,.14],headlightState,0),
+        forward=rotateVehiclePresentationVector([1,-.025,0],headlightState,0),
+        rearward=rotateVehiclePresentationVector([-1,-.01,0],headlightState,0);
       if(headlightLocations.uHeadlightLeft!==null)gl.uniform3fv(headlightLocations.uHeadlightLeft,
         [headlightState.position[0]+left[0],headlightState.position[1]+left[1],headlightState.position[2]+left[2]]);
       if(headlightLocations.uHeadlightRight!==null)gl.uniform3fv(headlightLocations.uHeadlightRight,
         [headlightState.position[0]+right[0],headlightState.position[1]+right[1],headlightState.position[2]+right[2]]);
       if(headlightLocations.uHeadlightForward!==null)gl.uniform3fv(headlightLocations.uHeadlightForward,forward);
-      if(headlightLocations.uHeadlightActive!==null)gl.uniform1f(headlightLocations.uHeadlightActive,1);
-    }else if(headlightLocations.uHeadlightActive!==null)gl.uniform1f(headlightLocations.uHeadlightActive,0);
+      if(headlightLocations.uTailLightLeft!==null)gl.uniform3fv(headlightLocations.uTailLightLeft,
+        [headlightState.position[0]+tailLeft[0],headlightState.position[1]+tailLeft[1],headlightState.position[2]+tailLeft[2]]);
+      if(headlightLocations.uTailLightRight!==null)gl.uniform3fv(headlightLocations.uTailLightRight,
+        [headlightState.position[0]+tailRight[0],headlightState.position[1]+tailRight[1],headlightState.position[2]+tailRight[2]]);
+      if(headlightLocations.uVehicleRearward!==null)gl.uniform3fv(headlightLocations.uVehicleRearward,rearward);
+      if(headlightLocations.uHeadlightActive!==null)gl.uniform1f(headlightLocations.uHeadlightActive,
+        vehicleRuntime.electrical.headlightsOn&&vehicleRuntime.electrical.lightingCircuitOnline&&
+          vehicleRuntime.electrical.stateOfCharge>0?1:0);
+      const lightingPowered=vehicleRuntime.electrical.lightingCircuitOnline&&
+        vehicleRuntime.electrical.stateOfCharge>0;
+      if(headlightLocations.uTailLightActive!==null)gl.uniform1f(headlightLocations.uTailLightActive,
+        lightingPowered&&vehicleRuntime.electrical.tailLightsOn?1:0);
+      if(headlightLocations.uBrakeLightActive!==null)gl.uniform1f(headlightLocations.uBrakeLightActive,
+        lightingPowered&&vehicleRuntime.electrical.brakeLightsOn?1:0);
+    }else{
+      if(headlightLocations.uHeadlightActive!==null)gl.uniform1f(headlightLocations.uHeadlightActive,0);
+      if(headlightLocations.uTailLightActive!==null)gl.uniform1f(headlightLocations.uTailLightActive,0);
+      if(headlightLocations.uBrakeLightActive!==null)gl.uniform1f(headlightLocations.uBrakeLightActive,0);
+    }
     const renderPass=shaderViewer.locations.uRenderPass;
     if(renderPass!==null){
       gl.disable(gl.BLEND);gl.depthMask(true);gl.uniform1i(renderPass,1);drawSceneMeshes(gl);
@@ -8415,10 +9332,10 @@ function expireProjectile(state, reason) {
   rebuildPortableSceneMesh();
 }
 
-function firePhysicsBall(exitVelocityScale=1) {
+function firePhysicsBall(exitVelocityScale=1,launchOverride=null) {
   const system = model.projectiles, archetype = system?.archetype;
-  const ammo = projectileAmmoItem();
-  if (!system || !archetype || !ammo || ammo.quantity <= 0) {
+  const mountedRound=launchOverride?.ammunitionAuthority==="vehicle-turret",ammo=mountedRound?null:projectileAmmoItem();
+  if (!system || !archetype || (!mountedRound&&(!ammo || ammo.quantity <= 0))) {
     setPlacementStatus("physics-ball gun is empty"); return false;
   }
   if (!physicsRuntime.instance && !stateLoopRuntime.ready) {
@@ -8427,25 +9344,25 @@ function firePhysicsBall(exitVelocityScale=1) {
   const active = [...projectileState.values()].filter(state=>!state.sleeping)
     .sort((a, b) => a.born - b.born);
   if (active.length >= archetype.maximum_active) sleepProjectilePhysics(active[0], "active-capacity");
-  const facing = normalized3(shaderViewer.cameraFacing || [0, 0, -1]);
-  const camera = vehicleRuntime.active&&vehicleRuntime.state
+  const facing = normalized3(launchOverride?.direction||shaderViewer.cameraFacing||[0,0,-1]);
+  const camera = launchOverride?.origin||(vehicleRuntime.active&&vehicleRuntime.state
     ? [vehicleRuntime.state.position[0],vehicleRuntime.state.position[1]+Number(
         vehicleRuntime.active.configuration.chassis.camera_height),vehicleRuntime.state.position[2]]
-    : (shaderViewer.cameraPosition || viewportControls.position);
+    : (shaderViewer.cameraPosition || viewportControls.position));
   if (!camera) return false;
-  const radius = Number(archetype.geometry.radius);
+  const radius = Number(archetype.geometry.radius),projectilePhysics={...archetype.physics,
+    mass:Math.max(.001,Number(launchOverride?.massKg||archetype.physics.mass||.001))};
   ensureMusicRoomAudio().catch(()=>{});
   const projectileColor=spectrumColorHex(projectileSequence*.11);
   const identity = `${system.identity}/instances/ball-${++projectileSequence}`;
-  const position = [camera[0] + facing[0] * (radius + .18),
-    camera[1] + facing[1] * (radius + .18),
-    camera[2] + facing[2] * (radius + .18)];
-  const launchSpeed=Number(archetype.launch_speed)*Math.max(.1,Number(exitVelocityScale)||1);
+  const muzzleClearance=mountedRound ? .12 : radius+.18,position = [camera[0] + facing[0] * muzzleClearance,
+    camera[1] + facing[1] * muzzleClearance,camera[2] + facing[2] * muzzleClearance];
+  const launchSpeed=Number(launchOverride?.speed||archetype.launch_speed)*Math.max(.1,Number(exitVelocityScale)||1);
   const carrierVelocity=vehicleRuntime.active?.identity&&vehicleRuntime.state
     ? vehicleRuntime.state.velocity:[0,0,0];
   const velocity = facing.map((value,index) => value * launchSpeed+carrierVelocity[index]);
   const box = {identity, kind: "physics-ball", label: `Physics ball ${projectileSequence}`,
-    parent_identity: viewportControls.policy?.actor || model.identity,
+    parent_identity: launchOverride?.owner||viewportControls.policy?.actor||model.identity,
     spatial_container: model.document_geometry.boxes[0].identity,
     center: [position[0], position[2]], center_y: position[1],
     half_extent: [radius, radius], radius, height: radius * 2,
@@ -8453,13 +9370,13 @@ function firePhysicsBall(exitVelocityScale=1) {
     wall_palette_role: archetype.palette_role, geometry_mode: "sphere", openings: [],
     appearance: {face_color: projectileColor},
     placement: {custody: "placed", placement_kind: "projectile"},
-    physics: {...archetype.physics, enabled: true}};
+    physics: {...projectilePhysics, enabled: true}};
   const record = {identity, kind: "physics-ball", name: box.label,
     archetype: archetype.identity, owner: box.parent_identity,
     organization: system.organization, status: "active", born_at: performance.now(),
     pose: {position: [...position], velocity: [...velocity]},
     lifetime: archetype.lifetime, geometry: archetype.geometry,
-    physics: archetype.physics};
+    physics: projectilePhysics};
   const entity = {
     identity, kind: "entity", name: box.label, archetype: "physics-ball-entity",
     geometry: {kind: "sphere", parameters: {radius}},
@@ -8486,7 +9403,7 @@ function firePhysicsBall(exitVelocityScale=1) {
     form: {recipe: "sphere", radius}, material_bindings: {body: archetype.palette_role},
     capabilities: ["inspect", "collide", "expire"],
     semantic_parts: [{identity: `${identity}/surface:body`, role: "projectile-body",
-      material_role: archetype.palette_role}], physics: archetype.physics,
+      material_role: archetype.palette_role}], physics: projectilePhysics,
     persistence: {authority: "projectile-lifecycle", revision: shaderViewer.revision},
     extensions: {"abstract_ui.projectile": record}});
   model.world.object_order.push(identity);
@@ -8512,10 +9429,11 @@ function firePhysicsBall(exitVelocityScale=1) {
     born: performance.now(), age: 0};
   projectileState.set(identity, state); shaderViewer.geometry.push(box);
   registerProjectilePhysicsMembership(state);
-  ammo.quantity -= 1; shaderViewer.revision += 1;
+  if(ammo)ammo.quantity-=1;shaderViewer.revision+=1;
   model.scene_mesh.revision = shaderViewer.revision;
   rebuildPortableSceneMesh(); refreshInventoryCounts();
-  setPlacementStatus(`fired ${box.label} · ${launchSpeed.toFixed(2)} m/s · ${ammo.quantity} remaining`);
+  setPlacementStatus(mountedRound?`turret fired · ${launchSpeed.toFixed(2)} m/s`:
+    `fired ${box.label} · ${launchSpeed.toFixed(2)} m/s · ${ammo.quantity} remaining`);
   return true;
 }
 
@@ -8838,13 +9756,17 @@ function updateVehicleTransmissionControls(){
     gearLabel=transmission.displayGear<0?"R":String(Math.max(1,Math.round(
       transmission.displayGear||transmission.gear||config.transmission.starting_gear))),
     readout=root.querySelector("[data-transmission-readout]"),
-    text=`${transmission.mode==="automatic"?"AUTO":"MANUAL"} · ${gearLabel}${transmission.lowRange?" · LOW":""}`;
+    text=`${transmission.mode==="automatic"?"AUTO":"MANUAL"} · ${gearLabel} · ${String(transmission.transferRange||
+      (transmission.lowRange?"l2":"high")).toUpperCase()}`;
   if(readout&&readout.textContent!==text)readout.textContent=text;
   root.querySelectorAll("[data-transmission-mode]").forEach(button=>{const active=
     button.dataset.transmissionMode===transmission.mode;if(button.classList.contains("active")!==active)
       button.classList.toggle("active",active);});
   root.querySelectorAll("[data-drivetrain-toggle]").forEach(button=>{const key=button.dataset.drivetrainToggle,
     active=Boolean(transmission[key]);button.classList.toggle("active",active);
+    button.setAttribute("aria-pressed",String(active));});
+  root.querySelectorAll("[data-transfer-range]").forEach(button=>{const active=button.dataset.transferRange===(
+    transmission.transferRange||(transmission.lowRange?"l2":"high"));button.classList.toggle("active",active);
     button.setAttribute("aria-pressed",String(active));});
   root.querySelectorAll("[data-differential-mode]").forEach(select=>{const key=`${select.dataset.differentialMode}DiffMode`,
     value=transmission[key]||"open";if(document.activeElement!==select&&select.value!==value)select.value=value;});
@@ -8856,20 +9778,76 @@ function updateVehicleTransmissionControls(){
     if(value)value.textContent=`F${percent}/R${100-percent}`;}
   const powerUnit=root.querySelector("[data-power-unit-preset]");if(powerUnit&&
       powerUnit.value!==vehicle.power_unit_preset)powerUnit.value=vehicle.power_unit_preset;
+  const equationMode=root.querySelector("[data-engine-equation-mode]");if(equationMode&&
+      equationMode.value!==vehicleRuntime.engineEquationMode)equationMode.value=vehicleRuntime.engineEquationMode;
   const transmissionPreset=root.querySelector("[data-transmission-preset]");if(transmissionPreset&&
       transmissionPreset.value!==vehicleRuntime.transmissionPreset)transmissionPreset.value=vehicleRuntime.transmissionPreset;
   const chassisProfile=root.querySelector("[data-chassis-profile]");if(chassisProfile&&
       chassisProfile.value!==vehicleRuntime.chassisProfile)chassisProfile.value=vehicleRuntime.chassisProfile;
+  const geometry=vehicle.chassis_geometry_parameters||{};root.querySelectorAll("[data-chassis-geometry]").forEach(input=>{
+    if(document.activeElement===input)return;const value=input.dataset.chassisGeometry==="chassisLengthM"?
+      geometry.chassis_length_m:geometry.wheelbase_m;if(Number.isFinite(Number(value)))input.value=Number(value).toFixed(2);});
   const wheelPart=root.querySelector("[data-wheel-part]");if(wheelPart&&
       wheelPart.value!==vehicleRuntime.wheelPart)wheelPart.value=vehicleRuntime.wheelPart;
+  const clutchPreset=root.querySelector("[data-clutch-preset]");if(clutchPreset&&
+      clutchPreset.value!==vehicleRuntime.clutchPreset)clutchPreset.value=vehicleRuntime.clutchPreset;
   const bodyShell=root.querySelector("[data-body-shell]");if(bodyShell&&
       bodyShell.value!==vehicleRuntime.bodyShell)bodyShell.value=vehicleRuntime.bodyShell;
+  const turretTakeover=root.querySelector("[data-turret-fire-takeover]");if(turretTakeover){
+    turretTakeover.checked=Boolean(vehicleRuntime.turretSystem.fireTakeover);turretTakeover.disabled=vehicleRuntime.bodyShell!=="six-body-pin-carrier";}
+  const turretReadout=root.querySelector("[data-turret-readout]");if(turretReadout){const turret=vehicleRuntime.turretSystem;
+    turretReadout.textContent=vehicleRuntime.bodyShell==="six-body-pin-carrier"?`${turret.ammoCount} rounds · ${
+      turret.interlockReason||"interlock clear"}`:"carrier not installed";}
+  const outrigger=root.querySelector("[data-outrigger-toggle]");if(outrigger){const active=Boolean(
+    vehicleRuntime.turretSystem.outriggers.commanded);outrigger.classList.toggle("active",active);
+    outrigger.setAttribute("aria-pressed",String(active));outrigger.disabled=vehicleRuntime.bodyShell!=="six-body-pin-carrier";
+    outrigger.textContent=active?"WITHDRAW OUTRIGGERS":"DEPLOY OUTRIGGERS";}
+  root.querySelectorAll("[data-vehicle-auxiliary]").forEach(button=>{const key=button.dataset.vehicleAuxiliary,
+    active=Boolean(vehicleRuntime.electrical[key]);button.classList.toggle("active",active);
+    button.setAttribute("aria-pressed",String(active));});
+  const energyReadout=root.querySelector("[data-vehicle-energy-readout]");if(energyReadout){const energy=vehicleRuntime.electrical;
+    energyReadout.textContent=`${Number(energy.fuelMassKg||0).toFixed(1)}kg fuel · ${Math.round(Number(energy.stateOfCharge||0)*100)}% battery · ${
+      Number(energy.alternatorPowerW||0).toFixed(0)}W alt · timing ${Number(energy.timingErrorDegrees||0)>=0?"+":""}${
+      Number(energy.timingErrorDegrees||0).toFixed(0)}° · ECU ${energy.ecuOnline?"ON":"OFF"} · ${Math.round(Number(
+        energy.tirePressurePa||0)/1000)}kPa${energy.pneumaticCompressorOn?" AIR":""}${energy.hydraulicPumpOn?" HYD":""}`;}
+  root.querySelectorAll("[data-vehicle-chemistry]").forEach(select=>{const value=vehicleRuntime.electrical[
+    select.dataset.vehicleChemistry];if(document.activeElement!==select&&value&&select.value!==value)select.value=value;});
+  const assistance=vehicleRuntime.driverAssistance,drivingMode=root.querySelector("[data-driving-mode]");
+  if(drivingMode&&document.activeElement!==drivingMode&&drivingMode.value!==assistance.drivingMode)
+    drivingMode.value=assistance.drivingMode;
+  const governor=root.querySelector("[data-governor-rpm]");if(governor&&document.activeElement!==governor)
+    governor.value=String(Math.round(Number(assistance.governorRpm||6500)));
+  const governorValue=root.querySelector("[data-governor-value]");if(governorValue)
+    governorValue.textContent=`${Math.round(Number(assistance.governorRpm||6500))} rpm`;
+  const cruise=root.querySelector("[data-cruise-toggle]");if(cruise){cruise.classList.toggle("active",Boolean(
+    assistance.cruiseEnabled));cruise.setAttribute("aria-pressed",String(Boolean(assistance.cruiseEnabled)));}
+  const cruiseTarget=root.querySelector("[data-cruise-target]");if(cruiseTarget&&document.activeElement!==cruiseTarget)
+    cruiseTarget.value=String(Math.round(Number(assistance.cruiseTargetSpeedMps||0)*3.6));
+  const cruiseValue=root.querySelector("[data-cruise-value]");if(cruiseValue)cruiseValue.textContent=`${Math.round(Number(
+    assistance.cruiseTargetSpeedMps||0)*3.6)} km/h · T${Math.round(Number(assistance.cruiseThrottle||0)*100)} B${Math.round(
+    Number(assistance.cruiseBrake||0)*100)}`;
   root.querySelectorAll("[data-shock-parameter]").forEach(input=>{const name=input.dataset.shockParameter,
     value=Number(vehicleRuntime.shockParameters?.[name]??vehicle.configuration_defaults?.[name]);
     if(document.activeElement!==input&&Number.isFinite(value)&&Number(input.value)!==value)input.value=String(value);});
+  const alignmentStatus=root.querySelector("[data-alignment-status]");if(alignmentStatus){const calibration=
+    vehicleRuntime.wheelAlignment?.calibration||{};alignmentStatus.textContent=`${calibration.continuous?"AUTO · ":""}${
+      calibration.status||"static"}${Number.isFinite(calibration.maximumErrorDeg)?` · ${Number(calibration.maximumErrorDeg).toFixed(2)}° max`:""}`;}
   const levelingButton=root.querySelector("[data-chassis-leveling-toggle]"),leveling=vehicleRuntime.chassisLeveling;
   if(levelingButton&&leveling){levelingButton.classList.toggle("active",Boolean(leveling.enabled));
     levelingButton.setAttribute("aria-pressed",String(Boolean(leveling.enabled)));}
+  root.querySelectorAll("[data-hydraulic-pose]").forEach(button=>button.classList.toggle("active",
+    leveling?.active_pose===button.dataset.hydraulicPose));
+  root.querySelectorAll("[data-wheel-height]").forEach(input=>{const value=Number(
+    leveling?.manual_corner_targets_m?.[input.dataset.wheelHeight]||0)*1000;
+    if(document.activeElement!==input)input.value=String(Math.round(value));});
+  const poseRate=root.querySelector("[data-pose-lerp-rate]");if(poseRate&&document.activeElement!==poseRate)
+    poseRate.value=String(Math.round(Number(leveling?.pose_lerp_rate_m_s||.055)*1000));
+  const poseRateValue=root.querySelector("[data-pose-lerp-value]");if(poseRateValue)
+    poseRateValue.textContent=`${Math.round(Number(leveling?.pose_lerp_rate_m_s||.055)*1000)} mm/s`;
+  const pressure=root.querySelector("[data-tire-pressure]");if(pressure&&document.activeElement!==pressure)
+    pressure.value=String(Math.round(Number(vehicleRuntime.electrical.tirePressureTargetPa||155000)/1000));
+  const pressureValue=root.querySelector("[data-tire-pressure-value]");if(pressureValue)pressureValue.textContent=`${Math.round(
+    Number(vehicleRuntime.electrical.tirePressurePa||155000)/1000)} kPa${vehicleRuntime.electrical.pneumaticCompressorOn?" · PUMP":""}`;
   const steeringSystem=vehicleRuntime.steeringSystem||{};
   root.querySelectorAll("[data-steering-axle]").forEach(button=>{const key=`${button.dataset.steeringAxle}_axle_enabled`,
       active=steeringSystem[key]!==false;button.classList.toggle("active",active);button.setAttribute("aria-pressed",String(active));});
@@ -8883,10 +9861,13 @@ function updateVehicleTransmissionControls(){
   const failedShafts=Object.values(vehicleRuntime.damage?.halfshaftHealth||{}).filter(value=>value<=0).length,
     failedMembers=Object.values(vehicleRuntime.damage?.members||{}).filter(value=>value.failed).length;
   const modeGlyph=mode=>mode==="locked"?"✓":mode==="limited-slip"?"≈":"○";
-  if(vehicleRuntime.transferHud)vehicleRuntime.transferHud.textContent=`${transmission.lowRange?"LOW":"HIGH"} · ${
+  if(vehicleRuntime.transferHud)vehicleRuntime.transferHud.textContent=`${String(transmission.transferRange||(
+    transmission.lowRange?"l2":"high")).toUpperCase()} · ${
     `C${modeGlyph(transmission.centerDiffMode)}`}/${`F${modeGlyph(transmission.frontDiffMode)}`}/${
     `R${modeGlyph(transmission.rearDiffMode)}`} · ${Math.round(transmission.frontDriveShare*100)}/${
     Math.round((1-transmission.frontDriveShare)*100)}${lockedBrakes?` · B${lockedBrakes}`:""}${
+      Number(vehicleRuntime.driverAssistance?.tiltAuthority||0)>.01?` · TILT ${Math.round(Number(
+        vehicleRuntime.driverAssistance.tiltAuthority)*100)}%`:""}${
       failedShafts||failedMembers?` · DMG ${failedShafts}S/${failedMembers}M`:""}`;
   const dyno=root.querySelector("[data-vehicle-dyno-readout]");if(dyno){const result=vehicleRuntime.dyno;
     dyno.textContent=!result?"DYNO idle":`${result.status==="telemetry"?"LIVE":result.pass?"PASS":"FAULT"} · ${result.compute} · `+
@@ -8974,8 +9955,10 @@ function updateVehicleContactMonitor() {
   const reaction=root.querySelector(".vehicle-reaction-value"),r=vehicleRuntime.powertrain.reactionTorque||[0,0,0];
   if(reaction)reaction.textContent=`reaction ${Math.hypot(...r).toFixed(0)} Nm`;
   const massReadout=root.querySelector("[data-vehicle-mass-readout]");
-  if(massReadout&&loadAudit){const cg=loadAudit.center_of_mass||[0,0,0];massReadout.textContent=
-    `${Number(loadAudit.total_mass_kg).toFixed(0)}kg total · CG ${Number(cg[0]).toFixed(2)}, ${Number(cg[1]).toFixed(2)}, ${Number(cg[2]).toFixed(2)}m`;}
+  if(massReadout&&loadAudit){const cg=loadAudit.center_of_mass||[0,0,0],liveMass=Number(
+    vehicleRuntime.electrical.totalMassKg||loadAudit.total_mass_kg);massReadout.textContent=
+    `${liveMass.toFixed(1)}kg live · ${Number(vehicleRuntime.electrical.fuelMassKg||0).toFixed(1)}kg fuel · `+
+    `CG ${Number(cg[0]).toFixed(2)}, ${Number(cg[1]).toFixed(2)}, ${Number(cg[2]).toFixed(2)}m`;}
 }
 
 function deviceSignalValue(source, gamepad, now) {
@@ -9057,6 +10040,7 @@ function runEntityCycle(now) {
   updateMusicRoomAnalysis();
   updateEntityNavigation(dt);
   stepCompiledWorldPhysics(dt);
+  updateParkedVehicle(dt);
   updatePhysicsBalls(dt);
   updateHeldToolPrimary(dt);
   updateHeldToolSecondary(dt);
@@ -9280,8 +10264,13 @@ function renderVehicleTransmissionSettings(){
     button.addEventListener("pointerdown",event=>event.stopPropagation());button.addEventListener("click",event=>{
       event.preventDefault();event.stopPropagation();controlVehicleTransmission({mode,gearDelta});});
     controls.append(button);});
-  [["ULTRA LOW","lowRange"],["SMOOTH LAUNCH","smoothLaunch"],
-    ["TRACTION CONTROL","tractionControlEnabled"],["ABS","absEnabled"]].forEach(([label,key])=>{const button=document.createElement("button");
+  [["HIGH","high"],["L1","l1"],["L2 CRAWL","l2"]].forEach(([label,range])=>{const button=document.createElement("button");
+    button.type="button";button.className="vehicle-gear-button";button.textContent=label;button.dataset.transferRange=range;
+    button.setAttribute("aria-pressed",String(range==="high"));button.addEventListener("pointerdown",event=>event.stopPropagation());
+    button.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();controlVehicleTransmission({transferRange:range});});
+    controls.append(button);});
+  [["SMOOTH LAUNCH","smoothLaunch"],
+    ["TRACTION CONTROL","tractionControlEnabled"],["ABS","absEnabled"],["TILT","tiltEnabled"]].forEach(([label,key])=>{const button=document.createElement("button");
     button.type="button";button.className="vehicle-gear-button";button.textContent=label;
     button.dataset.drivetrainToggle=key;button.setAttribute("aria-pressed","false");
     button.addEventListener("pointerdown",event=>event.stopPropagation());button.addEventListener("click",event=>{
@@ -9326,6 +10315,13 @@ function renderVehicleTransmissionSettings(){
   powerUnitSelect.addEventListener("pointerdown",event=>event.stopPropagation());
   powerUnitSelect.addEventListener("change",event=>{event.stopPropagation();selectVehiclePowerUnit(powerUnitSelect.value);});
   powerUnitRow.append(powerUnitLabel,powerUnitSelect,curveLabel);controls.append(powerUnitRow);
+  const equationRow=div("vehicle-torque-split"),equationLabel=div("","engine equations"),equationSelect=document.createElement("select"),
+    equationHint=div("","both baked");equationSelect.className="vehicle-gear-button";equationSelect.dataset.engineEquationMode="true";
+  for(const [value,label] of [["linear-playable","LINEAR · PLAYABLE"],["symbolic-fidelity","NONLINEAR · FIDELITY"]]){
+    const option=document.createElement("option");option.value=value;option.textContent=label;equationSelect.append(option);}
+  equationSelect.addEventListener("pointerdown",event=>event.stopPropagation());equationSelect.addEventListener("change",event=>{
+    event.stopPropagation();selectVehicleEngineEquationMode(equationSelect.value);});equationRow.append(
+      equationLabel,equationSelect,equationHint);controls.append(equationRow);
   const wheelPartRow=div("vehicle-torque-split"),wheelPartLabel=div("","wheel part"),
     wheelPartSelect=document.createElement("select"),wheelPartHint=div("","exclusive");
   wheelPartSelect.dataset.wheelPart="true";wheelPartSelect.className="vehicle-gear-button";
@@ -9334,14 +10330,88 @@ function renderVehicleTransmissionSettings(){
   wheelPartSelect.addEventListener("pointerdown",event=>event.stopPropagation());
   wheelPartSelect.addEventListener("change",event=>{event.stopPropagation();selectVehicleWheelPart(wheelPartSelect.value);});
   wheelPartRow.append(wheelPartLabel,wheelPartSelect,wheelPartHint);controls.append(wheelPartRow);
+  const clutchRow=div("vehicle-torque-split"),clutchLabel=div("","clutch"),clutchSelect=document.createElement("select"),
+    clutchHint=div("","swappable friction pack");clutchSelect.dataset.clutchPreset="true";
+  clutchSelect.className="vehicle-gear-button";(model.vehicle_slot?.vehicles?.[0]?.clutch_presets||[]).forEach(preset=>{
+    const option=document.createElement("option");option.value=preset.identity;option.textContent=preset.label;clutchSelect.append(option);});
+  clutchSelect.addEventListener("pointerdown",event=>event.stopPropagation());clutchSelect.addEventListener("change",event=>{
+    event.stopPropagation();selectVehicleClutchPreset(clutchSelect.value);});clutchRow.append(clutchLabel,clutchSelect,clutchHint);controls.append(clutchRow);
   const bodyShellRow=div("vehicle-torque-split"),bodyShellLabel=div("","cosmetic body"),
-    bodyShellSelect=document.createElement("select"),bodyShellHint=div("","shader only");
+    bodyShellSelect=document.createElement("select"),bodyShellHint=div("","mounted collider");
   bodyShellSelect.dataset.bodyShell="true";bodyShellSelect.className="vehicle-gear-button";
   (model.vehicle_slot?.vehicles?.[0]?.body_shells||[]).forEach(shell=>{const option=document.createElement("option");
     option.value=shell.identity;option.textContent=shell.label;bodyShellSelect.append(option);});
   bodyShellSelect.addEventListener("pointerdown",event=>event.stopPropagation());bodyShellSelect.addEventListener("change",event=>{
     event.stopPropagation();selectVehicleBodyShell(bodyShellSelect.value);});
   bodyShellRow.append(bodyShellLabel,bodyShellSelect,bodyShellHint);controls.append(bodyShellRow);
+  const turretDetails=document.createElement("details"),turretSummary=document.createElement("summary"),
+    turretRow=div("vehicle-torque-split"),turretLabel=div("","turret fire takeover"),turretToggle=document.createElement("input"),
+    turretReadout=div("","carrier not installed"),outriggerButton=document.createElement("button"),
+    handPumpButton=document.createElement("button");
+  turretSummary.textContent="WEAPON BODY / FIRE CONTROL";turretSummary.addEventListener("pointerdown",event=>event.stopPropagation());
+  turretToggle.type="checkbox";turretToggle.checked=true;turretToggle.dataset.turretFireTakeover="true";
+  turretReadout.dataset.turretReadout="true";turretToggle.addEventListener("pointerdown",event=>event.stopPropagation());
+  turretToggle.addEventListener("change",event=>{event.stopPropagation();vehicleRuntime.turretSystem.fireTakeover=turretToggle.checked;
+    setPlacementStatus(turretToggle.checked?"driver primary fire routed to turret computer":"driver primary fire routed to handheld tool");});
+  outriggerButton.type="button";outriggerButton.className="vehicle-gear-button";outriggerButton.textContent="DEPLOY OUTRIGGERS";
+  outriggerButton.dataset.outriggerToggle="true";outriggerButton.setAttribute("aria-pressed","false");
+  outriggerButton.addEventListener("pointerdown",event=>event.stopPropagation());outriggerButton.addEventListener("click",event=>{
+    event.preventDefault();event.stopPropagation();controlVehicleOutriggers(!vehicleRuntime.turretSystem.outriggers.commanded);});
+  handPumpButton.type="button";handPumpButton.className="vehicle-gear-button";handPumpButton.textContent="HAND PUMP ×1";
+  handPumpButton.dataset.outriggerHandPump="true";handPumpButton.addEventListener("pointerdown",event=>event.stopPropagation());
+  handPumpButton.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();pumpVehicleOutriggerAccumulator();});
+  turretRow.append(turretLabel,turretToggle,turretReadout);turretDetails.append(turretSummary,turretRow,outriggerButton,
+    handPumpButton);controls.append(turretDetails);
+  for(const [label,items,key] of [["fuel",model.vehicle_slot?.vehicles?.[0]?.fuel_profiles||[],"fuelIdentity"],
+      ["ignition timing",model.vehicle_slot?.vehicles?.[0]?.ignition_profiles||[],"ignitionProfileIdentity"]]){
+    const row=div("vehicle-torque-split"),caption=div("",label),select=document.createElement("select"),hint=div("","independent");
+    select.className="vehicle-gear-button";select.dataset.vehicleChemistry=key;for(const item of items){const option=document.createElement("option");
+      option.value=item.identity;option.textContent=item.label;select.append(option);}select.addEventListener("pointerdown",event=>event.stopPropagation());
+    select.addEventListener("change",event=>{event.stopPropagation();controlVehicleFuelIgnition({[key]:select.value});});
+    row.append(caption,select,hint);controls.append(row);
+  }
+  const modeRow=div("vehicle-torque-split"),modeLabel=div("","pedal curve"),modeSelect=document.createElement("select"),
+    modeHint=div("","solver actuator");modeSelect.className="vehicle-gear-button";modeSelect.dataset.drivingMode="true";
+  (model.vehicle_slot?.vehicles?.[0]?.driving_modes||[]).forEach(mode=>{const option=document.createElement("option");
+    option.value=mode.identity;option.textContent=mode.label;modeSelect.append(option);});
+  modeSelect.addEventListener("pointerdown",event=>event.stopPropagation());modeSelect.addEventListener("change",event=>{
+    event.stopPropagation();controlVehicleDriverAssistance({drivingMode:modeSelect.value});});
+  modeRow.append(modeLabel,modeSelect,modeHint);controls.append(modeRow);
+  const governorRow=div("vehicle-torque-split"),governorLabel=div("","governor"),governor=document.createElement("input"),
+    governorValue=div("","6500 rpm");governor.type="range";governor.min="500";governor.max=String(Number(
+      model.vehicle_slot?.vehicles?.[0]?.configuration?.powertrain?.redline_rpm||6500));governor.step="50";governor.value=governor.max;
+  governor.dataset.governorRpm="true";governorValue.dataset.governorValue="true";
+  governor.addEventListener("pointerdown",event=>event.stopPropagation());governor.addEventListener("input",event=>{
+    event.stopPropagation();controlVehicleDriverAssistance({governorRpm:Number(governor.value)});});
+  governorRow.append(governorLabel,governor,governorValue);controls.append(governorRow);
+  const cruiseRow=div("vehicle-torque-split"),cruise=document.createElement("button"),cruiseTarget=document.createElement("input"),
+    cruiseValue=div("","0 km/h");cruise.type="button";cruise.className="vehicle-gear-button";cruise.textContent="CRUISE SET";
+  cruise.dataset.cruiseToggle="true";cruise.setAttribute("aria-pressed","false");cruiseTarget.type="number";
+  cruiseTarget.min="0";cruiseTarget.max="180";cruiseTarget.step="1";cruiseTarget.value="0";
+  cruiseTarget.dataset.cruiseTarget="true";cruiseValue.dataset.cruiseValue="true";
+  cruise.addEventListener("pointerdown",event=>event.stopPropagation());cruise.addEventListener("click",event=>{
+    event.preventDefault();event.stopPropagation();const enable=!vehicleRuntime.driverAssistance.cruiseEnabled,
+      speed=Math.hypot(Number(vehicleRuntime.state?.velocity?.[0]||0),Number(vehicleRuntime.state?.velocity?.[2]||0));
+    controlVehicleDriverAssistance({cruiseEnabled:enable,cruiseTargetSpeedMps:enable?speed:
+      vehicleRuntime.driverAssistance.cruiseTargetSpeedMps});});
+  cruiseTarget.addEventListener("pointerdown",event=>event.stopPropagation());cruiseTarget.addEventListener("change",event=>{
+    event.stopPropagation();controlVehicleDriverAssistance({cruiseTargetSpeedMps:Math.max(0,Number(cruiseTarget.value))/3.6});});
+  cruiseRow.append(cruise,cruiseTarget,cruiseValue);controls.append(cruiseRow);
+  const auxiliaryRow=div("vehicle-torque-split"),lights=document.createElement("button"),horn=document.createElement("button"),
+    ignition=document.createElement("button"),starter=document.createElement("button"),energyReadout=div("","fuel / battery pending");
+  for(const [button,label] of [[lights,"LIGHTS · L"],[horn,"HORN · H"],[ignition,"IGN · K"],[starter,"START · I"]]){button.type="button";
+    button.className="vehicle-gear-button";button.textContent=label;button.addEventListener("pointerdown",event=>event.stopPropagation());}
+  lights.dataset.vehicleAuxiliary="headlightsOn";horn.dataset.vehicleAuxiliary="hornOn";
+  ignition.dataset.vehicleAuxiliary="ignitionOn";starter.dataset.vehicleAuxiliary="starterEngaged";
+  lights.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();controlVehicleAuxiliary({
+    headlightsOn:!vehicleRuntime.electrical.headlightsOn});updateVehicleTransmissionControls();});
+  ignition.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();controlVehicleAuxiliary({
+    ignitionOn:!vehicleRuntime.electrical.ignitionOn});updateVehicleTransmissionControls();});
+  for(const [eventName,active] of [["pointerdown",true],["pointerup",false],["pointercancel",false],["pointerleave",false]])
+    horn.addEventListener(eventName,event=>{event.preventDefault();event.stopPropagation();controlVehicleAuxiliary({hornOn:active});});
+  for(const [eventName,active] of [["pointerdown",true],["pointerup",false],["pointercancel",false],["pointerleave",false]])
+    starter.addEventListener(eventName,event=>{event.preventDefault();event.stopPropagation();controlVehicleAuxiliary({starterEngaged:active});});
+  energyReadout.dataset.vehicleEnergyReadout="true";auxiliaryRow.append(lights,horn,ignition,starter,energyReadout);controls.append(auxiliaryRow);
   const transmissionPresetRow=div("vehicle-torque-split"),transmissionPresetLabel=div("","gearset"),
     transmissionPresetSelect=document.createElement("select"),ratioLabel=div("","live ratios");
   transmissionPresetSelect.dataset.transmissionPreset="true";transmissionPresetSelect.className="vehicle-gear-button";
@@ -9360,6 +10430,15 @@ function renderVehicleTransmissionSettings(){
   chassisProfileSelect.addEventListener("change",event=>{event.stopPropagation();
     selectVehicleChassisProfile(chassisProfileSelect.value);});
   chassisProfileRow.append(chassisProfileLabel,chassisProfileSelect,chassisPhysicsLabel);controls.append(chassisProfileRow);
+  const geometrySpec=model.vehicle_slot?.vehicles?.[0]?.chassis_geometry_parameters||{},geometryRow=div("vehicle-torque-split"),
+    geometryLabel=div("","chassis / wheelbase"),lengthInput=document.createElement("input"),wheelbaseInput=document.createElement("input");
+  for(const [input,key,value,range] of [[lengthInput,"chassisLengthM",geometrySpec.chassis_length_m,
+      geometrySpec.chassis_length_range_m],[wheelbaseInput,"wheelbaseM",geometrySpec.wheelbase_m,geometrySpec.wheelbase_range_m]]){
+    input.type="number";input.step="0.02";input.min=String(range?.[0]||.5);input.max=String(range?.[1]||4);
+    input.value=Number(value||1).toFixed(2);input.dataset.chassisGeometry=key;input.addEventListener("pointerdown",event=>event.stopPropagation());
+    input.addEventListener("change",event=>{event.stopPropagation();selectVehicleChassisGeometry({
+      chassisLengthM:Number(lengthInput.value),wheelbaseM:Number(wheelbaseInput.value)});});}
+  geometryRow.append(geometryLabel,lengthInput,wheelbaseInput);controls.append(geometryRow);
   const shockDetails=document.createElement("details"),shockSummary=document.createElement("summary");
   shockSummary.textContent="SHOCK / SPRING PARAMETERS";shockSummary.addEventListener("pointerdown",event=>event.stopPropagation());
   shockDetails.append(shockSummary);
@@ -9381,6 +10460,29 @@ function renderVehicleTransmissionSettings(){
         event.stopPropagation();const numeric=Math.max(minimum,Math.min(maximum,Number(input.value)));input.value=String(numeric);
         controlVehicleShockParameters({[name]:numeric});});row.append(caption,input,value);shockDetails.append(row);});
   controls.append(shockDetails);
+  const alignmentDetails=document.createElement("details"),alignmentSummary=document.createElement("summary"),
+    alignmentHeader=div("vehicle-torque-split"),cornerSelect=document.createElement("select"),linked=document.createElement("input"),
+    alignmentStatus=div("","static compiled settings");alignmentSummary.textContent="WHEEL ALIGNMENT";
+  alignmentSummary.addEventListener("pointerdown",event=>event.stopPropagation());cornerSelect.className="vehicle-gear-button";
+  for(const corner of ["front_left","front_right","rear_left","rear_right"]){const option=document.createElement("option");
+    option.value=corner;option.textContent=corner.replace("_"," ").toUpperCase();cornerSelect.append(option);}
+  linked.type="checkbox";linked.checked=true;linked.title="edit all four wheels in unison";alignmentStatus.dataset.alignmentStatus="true";
+  cornerSelect.addEventListener("pointerdown",event=>event.stopPropagation());linked.addEventListener("pointerdown",event=>event.stopPropagation());
+  alignmentHeader.append(cornerSelect,linked,alignmentStatus);alignmentDetails.append(alignmentSummary,alignmentHeader);
+  const alignmentInputs={};for(const [label,key] of [["camber °","camber_deg"],["caster °","caster_deg"],["toe-in °","toe_deg"]]){
+    const row=div("vehicle-torque-split"),caption=div("",label),input=document.createElement("input"),hint=div("","real link trim"),
+      range=model.vehicle_slot?.vehicles?.[0]?.wheel_alignment?.ranges?.[key]||[-10,10];input.type="number";input.min=String(range[0]);
+    input.max=String(range[1]);input.step="0.05";input.value=String(model.vehicle_slot?.vehicles?.[0]?.wheel_alignment?.corners?.front_left?.[key]||0);
+    input.addEventListener("pointerdown",event=>event.stopPropagation());input.addEventListener("change",event=>{event.stopPropagation();
+      controlVehicleWheelAlignment({corner:cornerSelect.value,parameter:key,value:Number(input.value),linked:linked.checked});});
+    alignmentInputs[key]=input;row.append(caption,input,hint);alignmentDetails.append(row);}
+  cornerSelect.addEventListener("change",()=>{const corner=vehicleRuntime.wheelAlignment?.corners?.[cornerSelect.value]||{};
+    for(const [key,input] of Object.entries(alignmentInputs))input.value=String(Number(corner[key]||0));});
+  const calibrationRow=div("vehicle-wheel-controls");for(const [label,mode] of [["STATIC","static"],["FREE CAL","free-calibrate"],
+      ["FULL AUTO","full-time-auto"]]){const button=document.createElement("button");button.type="button";button.className="vehicle-gear-button";
+    button.textContent=label;button.addEventListener("pointerdown",event=>event.stopPropagation());button.addEventListener("click",event=>{
+      event.preventDefault();event.stopPropagation();controlVehicleWheelAlignment({calibrationMode:mode});});calibrationRow.append(button);}
+  alignmentDetails.append(calibrationRow);controls.append(alignmentDetails);
   const steeringRow=div("vehicle-torque-split"),steeringLabel=div("","steering authority"),
     steeringSlider=document.createElement("input"),steeringValue=div("","F50/R50");
   steeringSlider.type="range";steeringSlider.min="0";steeringSlider.max="100";steeringSlider.step="1";steeringSlider.value="50";
@@ -9401,20 +10503,58 @@ function renderVehicleTransmissionSettings(){
       vehicleRuntime.steeringSystem?.rear_phase??-1)<0?1:-1});});controls.append(steeringPhase);
   const levelingRow=div("vehicle-torque-split"),levelingButton=document.createElement("button"),
     rideSlider=document.createElement("input"),levelingLabel=div("","slow 2nd-order");
-  levelingButton.type="button";levelingButton.className="vehicle-gear-button";levelingButton.textContent="LEVEL";
+  levelingButton.type="button";levelingButton.className="vehicle-gear-button";levelingButton.textContent="LVL";
   levelingButton.dataset.chassisLevelingToggle="true";levelingButton.addEventListener("pointerdown",event=>event.stopPropagation());
   levelingButton.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();
     controlVehicleChassisLeveling({enabled:!vehicleRuntime.chassisLeveling?.enabled});});
   rideSlider.type="range";rideSlider.min="-80";rideSlider.max="100";rideSlider.step="5";rideSlider.value="0";
   rideSlider.title="preferred chassis ride-height trim, millimetres";rideSlider.addEventListener("pointerdown",event=>event.stopPropagation());
   rideSlider.addEventListener("input",event=>{event.stopPropagation();
-    controlVehicleChassisLeveling({target_ride_height_offset_m:Number(rideSlider.value)/1000});});
+    controlVehicleChassisLeveling({enabled:true,mode:"derived-pose",active_pose:"derived",
+      target_ride_height_offset_m:Number(rideSlider.value)/1000});});
   levelingRow.append(levelingButton,rideSlider,levelingLabel);controls.append(levelingRow);
+  const hydraulicDetails=document.createElement("details"),hydraulicSummary=document.createElement("summary");
+  hydraulicSummary.textContent="HYDRAULIC POSES / PNEUMATICS";hydraulicSummary.addEventListener("pointerdown",event=>event.stopPropagation());
+  hydraulicDetails.append(hydraulicSummary);
+  const poseButtons=div("vehicle-torque-split"),poseLabel=div("","pose presets"),poseGroup=div("vehicle-wheel-controls"),
+    poseHint=div("","four corner targets");
+  (model.vehicle_slot?.vehicles?.[0]?.chassis_leveling?.pose_presets||[]).forEach(pose=>{const button=document.createElement("button");
+    button.type="button";button.className="vehicle-gear-button";button.textContent=pose.label;button.dataset.hydraulicPose=pose.identity;
+    button.addEventListener("pointerdown",event=>event.stopPropagation());button.addEventListener("click",event=>{
+      event.preventDefault();event.stopPropagation();applyVehicleHydraulicPose(pose.identity);});poseGroup.append(button);});
+  poseButtons.append(poseLabel,poseGroup,poseHint);hydraulicDetails.append(poseButtons);
+  const programRow=div("vehicle-torque-split"),programLabel=div("","programmable"),programGroup=div("vehicle-wheel-controls"),
+    programHint=div("","apply / save");
+  for(const slot of model.vehicle_slot?.vehicles?.[0]?.chassis_leveling?.programmable_slots||[]){
+    const apply=document.createElement("button"),save=document.createElement("button");for(const button of [apply,save]){
+      button.type="button";button.className="vehicle-gear-button";button.addEventListener("pointerdown",event=>event.stopPropagation());}
+    apply.textContent=slot;apply.dataset.hydraulicPose=slot;apply.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();
+      applyVehicleHydraulicPose(slot);});save.textContent=`SAVE ${slot}`;save.addEventListener("click",event=>{event.preventDefault();
+      event.stopPropagation();programVehicleHydraulicPose(slot);});programGroup.append(apply,save);}
+  programRow.append(programLabel,programGroup,programHint);hydraulicDetails.append(programRow);
+  for(const [corner,label] of [["front_left","FL wheel"],["front_right","FR wheel"],["rear_left","RL wheel"],["rear_right","RR wheel"]]){
+    const row=div("vehicle-torque-split"),caption=div("",label),slider=document.createElement("input"),value=div("","-120 / +620 mm");
+    slider.type="range";slider.min="-120";slider.max="620";slider.step="2";slider.value="0";slider.dataset.wheelHeight=corner;
+    slider.addEventListener("pointerdown",event=>event.stopPropagation());slider.addEventListener("input",event=>{event.stopPropagation();
+      controlVehicleChassisLeveling({enabled:true,mode:"manual-wheel",active_pose:"manual",
+        manual_corner_targets_m:{[corner]:Number(slider.value)/1000}});});row.append(caption,slider,value);hydraulicDetails.append(row);}
+  const rateRow=div("vehicle-torque-split"),rateLabel=div("","pose lerp"),rate=document.createElement("input"),
+    rateValue=div("","55 mm/s");rate.type="range";rate.min="5";rate.max="180";rate.step="5";rate.value="55";
+  rate.dataset.poseLerpRate="true";rateValue.dataset.poseLerpValue="true";rate.addEventListener("pointerdown",event=>event.stopPropagation());
+  rate.addEventListener("input",event=>{event.stopPropagation();controlVehicleChassisLeveling({pose_lerp_rate_m_s:Number(rate.value)/1000});});
+  rateRow.append(rateLabel,rate,rateValue);hydraulicDetails.append(rateRow);
+  const pressureRow=div("vehicle-torque-split"),pressureLabel=div("","tire pressure"),pressure=document.createElement("input"),
+    pressureValue=div("","155 kPa");pressure.type="range";pressure.min="45";pressure.max="260";pressure.step="5";pressure.value="155";
+  pressure.dataset.tirePressure="true";pressureValue.dataset.tirePressureValue="true";
+  pressure.addEventListener("pointerdown",event=>event.stopPropagation());pressure.addEventListener("input",event=>{
+    event.stopPropagation();controlVehicleTirePressure(Number(pressure.value)*1000);});
+  pressureRow.append(pressureLabel,pressure,pressureValue);hydraulicDetails.append(pressureRow);controls.append(hydraulicDetails);
   [["preferred roll","target_roll_rad"],["preferred pitch","target_pitch_rad"]].forEach(([label,key])=>{
     const row=div("vehicle-torque-split"),name=div("",label),slider=document.createElement("input"),value=div("","±12°");
     slider.type="range";slider.min="-12";slider.max="12";slider.step="0.5";slider.value="0";
     slider.addEventListener("pointerdown",event=>event.stopPropagation());slider.addEventListener("input",event=>{
-      event.stopPropagation();controlVehicleChassisLeveling({[key]:Number(slider.value)*Math.PI/180});});
+      event.stopPropagation();controlVehicleChassisLeveling({enabled:true,mode:"derived-pose",active_pose:"derived",
+        [key]:Number(slider.value)*Math.PI/180});});
     row.append(name,slider,value);controls.append(row);});
   const dynoButton=document.createElement("button");dynoButton.type="button";dynoButton.className="vehicle-gear-button";
   dynoButton.textContent="DYNO";dynoButton.addEventListener("pointerdown",event=>event.stopPropagation());
@@ -9886,6 +11026,7 @@ renderFilesystemDistrict();
 renderJavaScriptDistrict();
 inspectNode(model, null);
 initializeVehicleFirstExperience();
+vehicleRuntime.electrical.ignitionOn=false;vehicleRuntime.electrical.starterEngaged=false;
 initializeWorldPhysicsWasm();
 armEngineSoundOnFirstGesture();
 window.addEventListener("beforeunload", () => {
@@ -9893,7 +11034,7 @@ window.addEventListener("beforeunload", () => {
   if (stateLoopRuntime.workerUrl) URL.revokeObjectURL(stateLoopRuntime.workerUrl);
   engineSoundRuntime.context?.close?.();
 });
-requestAnimationFrame(runEntityCycle);"""
+"""
 
 
 def project_world_to_div_map(
@@ -9923,7 +11064,26 @@ def project_world_to_div_map(
   </div>
   <div class="inspector" aria-live="polite"><div id="inspector-content"></div></div>
 </div>
-<div class="entity-layer" id="entity-layer"></div>"""
+<div class="entity-layer" id="entity-layer"></div>
+<section class="qualification-gate" id="vehicle-qualification" aria-live="polite">
+  <div class="qualification-panel"><div class="qualification-title">Vehicle configuration qualification</div>
+    <div class="qualification-subtitle">20 simulated seconds · passive settling until 10 s · automatic engine start at 10 s</div>
+    <div class="qualification-triptych">
+      <div class="qualification-view"><div class="qualification-view-label">front orthographic</div><canvas width="280" height="150" data-qualification-view="front"></canvas></div>
+      <div class="qualification-view"><div class="qualification-view-label">side orthographic</div><canvas width="280" height="150" data-qualification-view="side"></canvas></div>
+      <div class="qualification-view"><div class="qualification-view-label">top orthographic</div><canvas width="280" height="150" data-qualification-view="top"></canvas></div>
+    </div>
+    <div class="qualification-metrics">
+      <div class="qualification-metric"><span>simulated time</span><strong data-qmetric="time">0.00 s</strong></div>
+      <div class="qualification-metric"><span>contacts</span><strong data-qmetric="contacts">—</strong></div>
+      <div class="qualification-metric"><span>max crossing</span><strong data-qmetric="penetration">0 mm</strong></div>
+      <div class="qualification-metric"><span>energy creation</span><strong data-qmetric="energy">measuring</strong></div>
+      <div class="qualification-metric"><span>residual ε</span><strong data-qmetric="epsilon">measuring</strong></div>
+    </div>
+    <div class="qualification-progress"><i></i></div><div class="qualification-status" data-qualification-status>waiting for physics worker…</div>
+    <div class="qualification-failures" data-qualification-failures></div>
+  </div>
+</section>"""
     prefix = f"{world.identity}:div-map"
     packets = (
         AbstractUIPacket(

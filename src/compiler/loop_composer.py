@@ -49,6 +49,7 @@ from .loop_ir import (
     SemanticLoop,
 )
 from .hierarchical_plan import PlanClosure, PlanLine
+from .process_graph_value_ids import next_process_value_id
 
 
 class LoopStrategy(str, Enum):
@@ -455,12 +456,9 @@ def evaporate_unrolled_loops(
         default=-1,
     ) + 1
     handled_loop_ids: set[int] = set()
-    next_value_id = max(graph.G.nodes, default=-1) + 1
 
     def add_clone(source_id: int, parents: tuple[tuple[int, str], ...]) -> int:
-        nonlocal next_value_id
-        clone_id = next_value_id
-        next_value_id += 1
+        clone_id = next_process_value_id(graph)
         cloned = copy.deepcopy(dict(graph.G.nodes[int(source_id)]))
         cloned["parents"] = list(parents)
         cloned["children"] = []
@@ -472,9 +470,7 @@ def evaporate_unrolled_loops(
         return clone_id
 
     def add_constant(value: object, loop_id: int) -> int:
-        nonlocal next_value_id
-        constant_id = next_value_id
-        next_value_id += 1
+        constant_id = next_process_value_id(graph)
         expression = ast.Constant(value=value)
         graph.G.add_node(
             constant_id,
@@ -1155,7 +1151,6 @@ def materialize_retained_loop_ports(
 
     if not graph.G.graph.get("canonical_value_ids"):
         raise ValueError("retained loop ports require canonical value IDs")
-    next_value_id = max(graph.G.nodes, default=-1) + 1
     identities = {
         str(name): list(value_ids)
         for name, value_ids in (
@@ -1170,9 +1165,26 @@ def materialize_retained_loop_ports(
         parents: tuple[tuple[int, str], ...],
         attributes: dict[str, object],
     ) -> int:
-        nonlocal next_value_id
-        node_id = next_value_id
-        next_value_id += 1
+        node_id = next_process_value_id(graph)
+        semantic_sources = tuple(
+            int(parent)
+            for parent, role in parents
+            if str(role) in {"value", "state"} and int(parent) in graph.G
+        )
+        port_attributes = dict(attributes)
+        port_tensor = {}
+        if len(semantic_sources) == 1:
+            source_id = semantic_sources[0]
+            source_data = graph.G.nodes[source_id]
+            port_attributes["value_source_id"] = source_id
+            port_tensor = copy.deepcopy(dict(source_data.get("tensor") or {}))
+            source_attributes = source_data.get("attributes") or {}
+            for key in (
+                "producer_kind", "aggregate_kind",
+                "aggregate_leaf_value_ids", "tensor_output_descriptors",
+            ):
+                if key in source_attributes:
+                    port_attributes[key] = copy.deepcopy(source_attributes[key])
         graph.G.add_node(
             node_id,
             type=node_type,
@@ -1182,7 +1194,8 @@ def materialize_retained_loop_ports(
             value_id=node_id,
             parents=list(parents),
             children=[],
-            attributes=attributes,
+            attributes=port_attributes,
+            tensor=port_tensor,
         )
         return node_id
 
@@ -3309,10 +3322,6 @@ def analyze_shader_loop_reductions(
         ))
         nested_body_nodes = expanded_loop_body_nodes(loop)
         body = set(nested_body_nodes)
-        lexical_position = {
-            int(node_id): position
-            for position, node_id in enumerate(nested_body_nodes)
-        }
         expression_nodes = {
             id(data.get("expr_obj")): int(node_id)
             for node_id, data in graph.G.nodes(data=True)
@@ -3340,6 +3349,36 @@ def analyze_shader_loop_reductions(
                 expression_signature(expression)
             ))
 
+        # ``expanded_loop_body_nodes`` is a graph expansion, not a lexical
+        # traversal.  In particular, an expression nested below an assignment
+        # can appear after the following ``continue`` node.  Sorting region
+        # markers against loop-control edges with that order places the
+        # calculation in an unreachable block after the terminator.  Derive
+        # the primary rank from the authored AST: all descendants of one
+        # statement execute before the next statement begins.  Keep graph
+        # expansion only as a deterministic fallback for synthesized nodes
+        # which have no correlated source expression.
+        lexical_nodes: list[int] = []
+        loop_expression = graph.G.nodes[int(loop.node_id)].get("expr_obj")
+        if isinstance(loop_expression, (ast.For, ast.AsyncFor, ast.While)):
+            for statement in loop_expression.body:
+                for expression in ast.walk(statement):
+                    node_id = node_for_expression(expression)
+                    if (
+                        node_id is not None
+                        and int(node_id) in body
+                        and int(node_id) not in lexical_nodes
+                    ):
+                        lexical_nodes.append(int(node_id))
+        lexical_nodes.extend(
+            int(node_id)
+            for node_id in nested_body_nodes
+            if int(node_id) not in lexical_nodes
+        )
+        lexical_position = {
+            node_id: position for position, node_id in enumerate(lexical_nodes)
+        }
+
         # A guard whose only true-arm action is raise is compiled validation,
         # including when it is lexically inside a retained loop.  Record it at
         # its source position so it runs on every iteration, not once after the
@@ -3361,17 +3400,23 @@ def analyze_shader_loop_reductions(
             statement = graph.G.nodes[node_id].get("expr_obj")
             if not isinstance(statement, ast.If):
                 continue
-            body_is_raise = bool(statement.body) and all(
-                isinstance(item, ast.Raise) for item in statement.body
+            # A validation arm may prepare diagnostics before its terminal
+            # raise.  Requiring every statement in the arm to be ``Raise``
+            # rejects ordinary authored guards such as ``if failed: log();
+            # raise RuntimeError(...)`` once they live in a retained loop.
+            # The preceding statements remain owned by the conditional; only
+            # the terminal transfer becomes the validation edge.
+            body_is_raise = bool(statement.body) and isinstance(
+                statement.body[-1], ast.Raise
             )
-            orelse_is_raise = bool(statement.orelse) and all(
-                isinstance(item, ast.Raise) for item in statement.orelse
+            orelse_is_raise = bool(statement.orelse) and isinstance(
+                statement.orelse[-1], ast.Raise
             )
             if body_is_raise and not statement.orelse:
-                raise_items = statement.body
+                raise_items = (statement.body[-1],)
                 raises_when_true = True
             elif orelse_is_raise and not body_is_raise:
-                raise_items = statement.orelse
+                raise_items = (statement.orelse[-1],)
                 raises_when_true = False
             else:
                 continue
@@ -3382,8 +3427,11 @@ def analyze_shader_loop_reductions(
             predicate_id = node_for_expression(test)
             if predicate_id is None:
                 continue
+            raise_node_id = node_for_expression(raise_items[0])
+            if raise_node_id is None:
+                continue
             validations.append((
-                int(node_id),
+                int(raise_node_id),
                 int(predicate_id),
                 not raises_when_true,
             ))

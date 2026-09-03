@@ -459,7 +459,18 @@ class MetaLoopRunner:
                 eps=round_node.plan.eps,
                 event_boundaries=round_node.plan.event_boundaries,
                 attempt_log=attempt_log,
+                rollback_threshold_multiplier=(
+                    round_node.plan.rollback_threshold_multiplier
+                ),
             )
+            if (
+                float(total) < float(window) - round_node.plan.eps
+                or bool(getattr(metrics, "hard_failure", False))
+            ):
+                raise RuntimeError(
+                    "scientific dt controller failed to complete its window: "
+                    f"advanced={float(total):.17g} window={float(window):.17g}"
+                )
         except Exception:
             transaction.restore(window_checkpoint)
             del round_stats.attempted[attempted_before:]

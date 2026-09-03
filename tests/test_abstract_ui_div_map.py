@@ -1017,6 +1017,21 @@ def test_browser_packet_hosts_control_input_and_isolated_entity_cycle():
     assert '`.entity-sprite[data-entity="${identity}"]`' in script
 
 
+def test_armored_turret_carrier_routes_focus_fire_and_stabilizers():
+    script = DIV_MAP_JAVASCRIPT
+    assert "function updateVehicleTurretTargeting(vehicle,state)" in script
+    assert "function turretFriendlyRayEntry" in script
+    assert "function fireVehicleTurrets()" in script
+    assert 'ammunitionAuthority:"vehicle-turret"' in script
+    assert 'type:"vehicle-body-wrenches"' in script
+    assert "turretSystem.fireTakeover" in script
+    assert "data-turret-fire-takeover" in script
+    assert "function controlVehicleOutriggers(deployed)" in script
+    assert 'outriggerButton.dataset.outriggerToggle="true"' in script
+    assert 'handPumpButton.dataset.outriggerHandPump="true"' in script
+    assert "function pumpVehicleOutriggerAccumulator" in script
+
+
 def test_javascript_root_timer_updates_and_lights_action_edge_rows():
     projection = _projection()
     timer = projection.model["action_mezzanine"]["timer"]
@@ -1057,3 +1072,36 @@ def test_embedded_graph_is_json_safe_and_does_not_execute_program_values():
 
 def test_projection_is_byte_deterministic_for_same_world_and_title():
     assert _projection().html == _projection().html
+
+
+def test_saved_vehicle_settings_restore_only_inside_persistence_scope():
+    restore_start = DIV_MAP_JAVASCRIPT.index("function restoreLivingEdits()")
+    restore_end = DIV_MAP_JAVASCRIPT.index("function installSceneMesh", restore_start)
+    restore_source = DIV_MAP_JAVASCRIPT[restore_start:restore_end]
+    stick_start = DIV_MAP_JAVASCRIPT.index("function bindMobileStick")
+    stick_end = DIV_MAP_JAVASCRIPT.index("function renderMobileControls", stick_start)
+    stick_source = DIV_MAP_JAVASCRIPT[stick_start:stick_end]
+
+    assert "const saved = JSON.parse(payload)" in restore_source
+    assert "saved.vehicle_hydraulics" in restore_source
+    assert "enabled: false" in restore_source
+    assert "source.maximum[1]" in DIV_MAP_JAVASCRIPT
+    assert "saved.vehicle_tire_pressure_target_pa" in restore_source
+    assert "saved." not in stick_source
+
+
+def test_vehicle_qualification_gates_world_opening_on_twenty_simulated_seconds():
+    script = DIV_MAP_JAVASCRIPT
+    assert 'document.body.classList.add("qualification-pending")' in script
+    assert "function updateVehicleQualification(body,sequence)" in script
+    assert "q.simulatedSeconds=(sequence-q.startSequence)/120" in script
+    assert 'q.simulatedSeconds>=10&&!q.engineStarted' in script
+    assert "ignitionOn:true,starterEngaged:true" in script
+    assert 'q.simulatedSeconds>=11.5&&!q.starterReleased' in script
+    assert "q.simulatedSeconds>=20" in script
+    assert "q.epsilon.toExponential" in script
+    assert "if(sequence%30<deltaTicks)" in script
+    assert "q.failures.add" in script
+    assert "finishVehicleQualification(body)" in script
+    assert "registerPlayerPhysicsBody();requestAnimationFrame(runEntityCycle)" in script
+    assert "if(!vehicleQualification.active)registerPlayerPhysicsBody()" in script

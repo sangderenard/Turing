@@ -77,6 +77,22 @@ def test_reference_directed_cast_is_repository_ssa_in_all_four_lanes():
     assert wasm_artifact.complete, wasm_artifact.shortfalls
 
 
+def test_direct_c_spells_repository_ssa_tanh_with_libm():
+    value = SSAValue(0, "float64")
+    result = SSAValue(1, "float64")
+    function = Function(
+        "tanh_kernel", [value],
+        {"entry": BasicBlock("entry", [
+            Instr("Tanh", [value], result), Instr("Ret", [result], None),
+        ])},
+        metadata={"argument_names": ("value",), "output_names": ("result",)},
+    )
+    artifact = emit_ssa_function_to_c(IRModule({function.name: function}), function.name)
+
+    assert artifact.complete, artifact.shortfalls
+    assert "tanh(in[0])" in artifact.source
+
+
 def test_sympy_fluid_emits_and_runs_direct_repository_ssa_c(tmp_path, deploy_contract):
     compiled = compile_symbolic_fluid_step()
     artifact = emit_ssa_function_to_c(compiled.module, compiled.function.name)

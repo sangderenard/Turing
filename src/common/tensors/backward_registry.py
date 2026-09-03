@@ -131,6 +131,13 @@ def unbroadcast(G, target_shape):
     g_shape = list(getattr(G, "shape", ()))
     t_shape = list(target_shape)
 
+    # A precision wrapper deliberately supports arithmetic but not a general
+    # reshape surface.  Scalar vehicle equations arrive here already at their
+    # target shape, so preserve the value (and its limbs) instead of crossing
+    # the precision boundary merely to perform an identity reshape.
+    if tuple(g_shape) == tuple(t_shape):
+        return G
+
     # If gradient is a scalar, broadcast directly to target shape
     if not g_shape and t_shape:
         return AbstractTensor.ones(tuple(t_shape), dtype=getattr(G, "dtype", None), device=getattr(G, "device", None)) * G

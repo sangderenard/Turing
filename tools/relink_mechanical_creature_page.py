@@ -15,12 +15,17 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from src.compiler.abstract_ui import javascript_with_system_root
 from src.compiler.abstract_ui_div_map import DIV_MAP_JAVASCRIPT
 from src.compiler.javascript_runtime_utilities import render_javascript_utilities
+from src.compiler.state_loop_deployment import emit_javascript_physics_worker
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--legacy-fixed-kernels", action="store_true",
+        help="keep one 1/120 step for a cached page whose specialized kernels baked that dt",
+    )
     arguments = parser.parse_args()
     source = arguments.source.resolve()
     destination = arguments.output.resolve()
@@ -35,6 +40,21 @@ def main() -> int:
     expected = "introspection-world:python:src.compiler.mechanical_creature.MechanicalCreature"
     if identity != expected:
         raise ValueError(f"refusing to relink unexpected world {identity!r}")
+
+    if arguments.legacy_fixed_kernels:
+        worker_source = emit_javascript_physics_worker()
+        marker = "PHYSICS_SUBSTEPS=3,SUBSTEP_DT=FIXED_DT/PHYSICS_SUBSTEPS"
+        if marker not in worker_source:
+            raise ValueError("could not locate the three-substep worker marker")
+        worker_source = worker_source.replace(
+            marker, "PHYSICS_SUBSTEPS=1,SUBSTEP_DT=FIXED_DT", 1,
+        )
+        model["loop_deployment"]["workers"][0]["source"] = worker_source
+        encoded_model = json.dumps(model, ensure_ascii=False, separators=(",", ":"))
+        if "</script>" in encoded_model.lower():
+            raise ValueError("updated model contains an unsafe script terminator")
+        document = document[:model_start] + encoded_model + document[model_end:]
+        model_end = model_start + len(encoded_model)
 
     script_open = document.index("<script>", model_end)
     script_start = script_open + len("<script>")

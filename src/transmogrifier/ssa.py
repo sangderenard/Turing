@@ -363,8 +363,22 @@ class SSARecordTable:
             compatible_identity = existing.identity == descriptor.identity
             existing_fields = {field.name: field for field in existing.fields}
             incoming_fields = {field.name: field for field in descriptor.fields}
+            def same_physical_field(left, right):
+                return (
+                    left.name == right.name
+                    and left.storage == right.storage
+                    and left.storage_identity == right.storage_identity
+                    and left.value_ids == right.value_ids
+                    and left.sequence_id == right.sequence_id
+                    and left.record_id == right.record_id
+                    and left.offset == right.offset
+                    and left.dtype == right.dtype
+                )
+
             compatible_overlap = all(
-                existing_fields[name] == incoming_fields[name]
+                same_physical_field(
+                    existing_fields[name], incoming_fields[name]
+                )
                 for name in existing_fields.keys() & incoming_fields.keys()
             )
             compatible_pool = (
@@ -378,11 +392,30 @@ class SSARecordTable:
                 # fields it touches. Merge those complementary views under
                 # the already-correlated record id; this is not an id
                 # collision and no field spelling is reinterpreted.
+                merged_fields = tuple(
+                    SSARecordFieldDescriptor(
+                        name=resident.name,
+                        storage=resident.storage,
+                        storage_identity=resident.storage_identity,
+                        value_ids=resident.value_ids,
+                        sequence_id=resident.sequence_id,
+                        record_id=resident.record_id,
+                        offset=resident.offset,
+                        dtype=resident.dtype,
+                        writable=(
+                            bool(resident.writable)
+                            or bool(incoming_fields[resident.name].writable)
+                            if resident.name in incoming_fields
+                            else bool(resident.writable)
+                        ),
+                    )
+                    for resident in existing.fields
+                )
                 descriptor = SSARecordDescriptor(
                     descriptor.record_id,
                     descriptor.identity,
                     (
-                        *existing.fields,
+                        *merged_fields,
                         *(
                             field for field in descriptor.fields
                             if field.name not in existing_fields

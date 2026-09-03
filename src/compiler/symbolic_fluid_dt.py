@@ -206,7 +206,6 @@ def symbolic_fluid_frame(state, targets, controller, frame_duration, dt_initial)
         targets,
         controller,
         symbolic_fluid_advance,
-        max_iters=256,
     )
     return (
         state.height,

@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,16 +18,239 @@ from src.compiler.compiled_program_api import (
     Parameter,
 )
 from src.compiler.fortran_c_shell import (
+    NativeObjectSection,
     compile_ast_fortran_c_shell,
     compile_fortran_module_c_shell,
+    compile_native_program_c_shell,
+    emit_native_c_shell_source,
 )
 from src.compiler.fortran_c_shell import emit_fortran_c_shell_source
+from src.compiler.fortran_c_shell import (
+    _drop_unused_private_sequences,
+    _drop_unused_root_private_formals,
+    _prune_unused_callee_formals,
+)
 from src.compiler.ssa_fortran_backend import FortranModule, fortran_compiler
 from src.compiler.ssa_fortran_backend import FortranEmissionError
 from src.compiler.ssa_fortran_backend import compile_module
 from src.compiler.shell_io import (
     ShellIOManifest, ShellIORequest, SystemPort, attach_shell_io,
 )
+
+
+def test_fortran_shell_name_is_alias_of_backend_neutral_native_renderer():
+    assert emit_fortran_c_shell_source is emit_native_c_shell_source
+
+
+def test_native_object_section_records_mixed_link_language(tmp_path):
+    object_path = tmp_path / "section.o"
+    object_path.write_bytes(b"")
+
+    section = NativeObjectSection(object_path, "LLVM", ("linked_helper",))
+
+    assert section.language == "llvm"
+    assert section.path == object_path.resolve()
+    assert section.symbols == ("linked_helper",)
+    with pytest.raises(ValueError, match="c, fortran, or llvm"):
+        NativeObjectSection(object_path, "python")
+
+
+def test_backend_neutral_c_shell_links_a_c_object(tmp_path):
+    compiler = fortran_compiler()
+    if compiler is None:
+        pytest.skip("native toolchain is unavailable")
+    gcc = Path(compiler).with_name("gcc.exe" if os.name == "nt" else "gcc")
+    if not gcc.is_file():
+        pytest.skip("C compiler beside gfortran is unavailable")
+    source = tmp_path / "native_section.c"
+    object_path = tmp_path / "native_section.o"
+    source.write_text(
+        "void native_entry(double *input, double *output) { "
+        "output[0] = input[0] * 2.0; }\n",
+        encoding="utf-8",
+    )
+    import subprocess
+
+    subprocess.run(
+        [
+            sys.executable, "-m", "ziglang", "cc", "-c",
+            "-fno-sanitize=all", source.name, "-o", object_path.name,
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    api = CompiledProgramAPI(
+        module="native_section",
+        language="mixed-native",
+        entry="native_entry",
+        entry_points=(EntryPoint(
+            "native_entry", "native_entry", "numerical",
+            parameters=(
+                Parameter(
+                    "input", "input", "float64", "double", "c_double",
+                    "reference", (1,), source_name="input",
+                ),
+                Parameter(
+                    "output", "output", "float64", "double", "c_double",
+                    "reference", (1,), source_name="output",
+                ),
+            ),
+        ),),
+    )
+
+    product = compile_native_program_c_shell(
+        api,
+        {"input": np.asarray([3.0], dtype=np.float64)},
+        tmp_path / "product",
+        object_sections=(NativeObjectSection(object_path, "c"),),
+        entrypoint="native_entry",
+        name="native_section_shell",
+    )
+    completed = product.run(frames=1)
+
+    assert completed.returncode == 0
+    assert np.fromfile(product.final_outputs_path, dtype=np.float64).tolist() == [6.0]
+
+
+def test_unused_private_sequence_does_not_survive_as_native_workspace():
+    from src.transmogrifier.ssa import (
+        BasicBlock, Function, Instr, SSASequenceDescriptor,
+        SSASequenceTable, SSAValue,
+    )
+
+    column = SSAValue(10, accounting={"compiler_frame_storage": "root"})
+    length = SSAValue(11, "int64", (1,), accounting={
+        "compiler_frame_storage": "root"
+    })
+    capacity = SSAValue(12, "int64", accounting={
+        "compiler_frame_storage": "root"
+    })
+    status = SSAValue(13, "int32", (1,), accounting={
+        "compiler_frame_storage": "root"
+    })
+    zero = SSAValue(14, "int64")
+    address = SSAValue(15, "ptr")
+    function = Function("root", [column, length, capacity, status], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], zero, attributes={"constant": 0}),
+            Instr("GetElementPtr", [length, zero], address, attributes={
+                "binding": "ssa_local_sequence_length",
+            }),
+            Instr("Store", [zero, address], None),
+            Instr("Ret", [], None),
+        ]),
+    })
+    table = SSASequenceTable()
+    table.register(SSASequenceDescriptor(
+        sequence_id=10,
+        column_value_ids=(10,),
+        length_address_id=11,
+        capacity_value_id=12,
+        status_address_id=13,
+        column_dtypes=("float64",),
+        capacity_policy="fixed",
+        writable=True,
+    ))
+
+    assert _drop_unused_private_sequences(function, table) == 1
+    assert function.args == []
+    assert table.sequences == {}
+    assert all(
+        instruction.op not in {"GetElementPtr", "Store"}
+        for instruction in function.blocks["entry"].instrs
+    )
+
+
+def test_unused_unbound_variant_formal_does_not_reach_root_abi():
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    dead = SSAValue(8, accounting={"unbound_variant_source_id": 3})
+    live = SSAValue(9, "float64", accounting={"program_abi_parameter": "x"})
+    function = Function("root", [dead, live], {
+        "entry": BasicBlock("entry", [Instr("Ret", [live], None)]),
+    }, metadata={"parameter_names": (("x", 9),)})
+
+    assert _drop_unused_root_private_formals(function) == 1
+    assert [argument.id for argument in function.args] == [9]
+
+
+def test_unused_anonymous_formal_does_not_reach_root_abi():
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    dead = SSAValue(8, "float64")
+    live = SSAValue(9, "float64", accounting={"program_abi_parameter": "x"})
+    function = Function("root", [dead, live], {
+        "entry": BasicBlock("entry", [Instr("Ret", [live], None)]),
+    }, metadata={"parameter_names": (("x", 9),)})
+
+    assert _drop_unused_root_private_formals(function) == 1
+    assert [argument.id for argument in function.args] == [9]
+
+
+def test_locally_defined_call_result_does_not_remain_a_root_formal():
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    local = SSAValue(8, "float64", accounting={
+        "ssa_call_result_from": "region",
+    })
+    source = SSAValue(9, "float64", accounting={"program_abi_parameter": "x"})
+    function = Function("root", [local, source], {
+        "entry": BasicBlock("entry", [
+            Instr("Add", [source, source], local),
+            Instr("Mul", [local, source], SSAValue(10, "float64")),
+            Instr("Ret", [], None),
+        ]),
+    }, metadata={"parameter_names": (("x", 9),)})
+
+    assert _drop_unused_root_private_formals(function) == 1
+    assert [argument.id for argument in function.args] == [9]
+
+
+def test_dead_callee_formal_and_matching_region_operand_are_pruned_together():
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    live = SSAValue(10, dtype="float64")
+    dead = SSAValue(11, dtype="float64")
+    result = SSAValue(12, dtype="float64")
+    callee = Function("region", [live, dead], {
+        "entry": BasicBlock("entry", [
+            Instr("Add", [live, live], result),
+            Instr("Ret", [], None),
+        ], []),
+    }, metadata={
+        "source_region_integral": {
+            "capture_value_ids": (live.id, dead.id),
+        },
+    })
+    actual_live = SSAValue(0, dtype="float64")
+    actual_dead = SSAValue(1, dtype="float64")
+    call = Instr(
+        "Call", [actual_live, actual_dead], None,
+        attributes={
+            "callee": callee.name,
+            "feed_ids": (actual_live.id, actual_dead.id),
+            "feed_shapes": ((), ()),
+            "feed_dtypes": ("float64", "float64"),
+        },
+    )
+    caller = Function("root", [actual_live, actual_dead], {
+        "entry": BasicBlock("entry", [call, Instr("Ret", [], None)], []),
+    })
+
+    removed = _prune_unused_callee_formals({
+        caller.name: caller,
+        callee.name: callee,
+    })
+
+    assert removed == 1
+    assert [value.id for value in callee.args] == [live.id]
+    assert [value.id for value in call.args] == [actual_live.id]
+    assert call.attributes["feed_ids"] == (actual_live.id,)
+    assert callee.metadata["source_region_integral"]["capture_value_ids"] == (
+        live.id,
+    )
 
 
 def test_dead_pure_structural_value_is_removed_but_public_value_is_kept():

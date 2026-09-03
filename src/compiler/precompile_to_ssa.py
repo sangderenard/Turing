@@ -45,7 +45,12 @@ from .precompile_ssa_validator import (
     validate_precompile_ssa_compatibility,
 )
 from .ssa_features import XOROSHIRO128SS_FILL, link_required_ssa_features
-from ..common.tensors.fused_ir import FusedProgram, Meta, OpStep
+from ..common.tensors.fused_ir import (
+    FusedProgram,
+    Meta,
+    OpStep,
+    canonicalize_elementwise_steps,
+)
 from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
     LLVM_SSA_MODULE,
     translations_for_operation,
@@ -100,6 +105,36 @@ class SSACycle:
     @property
     def represented_by_phi(self) -> bool:
         return bool(self.phi_blocks)
+
+
+def _typed_region_occurrence(
+    value: SSAValue,
+    canonical: SSAValue,
+    authoritative: Meta | None,
+) -> SSAValue:
+    """Retype one region occurrence without erasing its authored view.
+
+    A repository SSA id identifies storage, not one eternal tensor shape.
+    Reshape/view operations intentionally reuse the id with different shapes.
+    Dtype reconciliation may use the region-wide contract, but a non-empty
+    occurrence shape is more specific and must survive.
+    """
+
+    dtype = (
+        str(authoritative.dtype)
+        if authoritative is not None
+        and str(authoritative.dtype or "") not in {"", "unknown"}
+        else value.dtype or canonical.dtype
+    )
+    shape = tuple(value.shape or canonical.shape or ())
+    device = value.device or canonical.device
+    if (
+        value.dtype == dtype
+        and tuple(value.shape or ()) == shape
+        and value.device == device
+    ):
+        return value
+    return replace(value, dtype=dtype, shape=shape, device=device)
 
 
 @dataclass(frozen=True)
@@ -175,6 +210,8 @@ def lower_fused_program_to_ssa(
        Tests may call this function only to verify the lowerer itself; a test
        call is not precedent for production use.
     """
+
+    program = canonicalize_elementwise_steps(program)
 
     from .evolution_metagraph import (
         EvolutionComponentRef,
@@ -281,6 +318,25 @@ def lower_fused_program_to_ssa(
         return translations[0].llvm_symbol
 
     for index, step in enumerate(program.steps):
+        argument_count = step.attrs.get("argument_count")
+        if (
+            step.attrs.get("python_replacement_kind") == "operator"
+            and isinstance(argument_count, int)
+            and 0 <= argument_count < len(step.input_ids)
+        ):
+            # Intrinsic-call capture can retain the callable/static-reference
+            # node before the authored operands.  The identity receipt states
+            # the actual Python arity; only its trailing authored operands
+            # belong to the numeric SSA call.  Passing the reference pointer
+            # made unary ``float(x)`` a two-argument native cast and likewise
+            # shifted _restore_type's cast_like value/reference pair.
+            step = replace(
+                step,
+                input_ids=(
+                    list(step.input_ids[-argument_count:])
+                    if argument_count else []
+                ),
+            )
         location = f"{function_name}:step[{index}]"
         algorithm = tensor_algorithm(step)
         handler = (
@@ -678,13 +734,20 @@ def resolve_sequence_schemas(
     """
     column_counts: dict[int, int] = {}
     policies: dict[int, str] = {}
+    origins: dict[int, str] = {}
     writable_union: dict[int, bool] = {}
     retains_union: dict[int, bool] = {}
     nested_union: dict[int, bool] = {}
     conflicted: set[int] = set()
     shortfalls: list[SSALoweringShortfall] = []
 
-    def _observe(sequence_id: object, column_count: object, policy: object, writable: object) -> None:
+    def _observe(
+        sequence_id: object,
+        column_count: object,
+        policy: object,
+        writable: object,
+        origin: object,
+    ) -> None:
         sid = int(sequence_id)
         if sid in column_counts and (
             column_counts[sid] != int(column_count) or policies[sid] != str(policy)
@@ -694,18 +757,21 @@ def resolve_sequence_schemas(
                     "ssa-sequence", "resolved-schema-conflict", location,
                     f"sequence value {sid} was declared with "
                     f"{column_counts[sid]} column(s)/policy {policies[sid]!r} "
-                    "in one function and "
+                    f"in {origins[sid]} and "
                     f"{int(column_count)} column(s)/policy {str(policy)!r} "
-                    "in another -- every function touching a shared "
+                    f"in {str(origin)} -- every function touching a shared "
                     "sequence must agree on its shape",
                 ))
                 conflicted.add(sid)
             return
         column_counts[sid] = int(column_count)
         policies[sid] = str(policy)
+        origins[sid] = str(origin)
         writable_union[sid] = writable_union.get(sid, False) or bool(writable)
 
     for shell in shells:
+        function_name = shell.get("function_name", "<unknown-function>")
+        sequence_names = dict(shell.get("sequence_names") or {})
         deletion_ids = {
             int(sequence_id)
             for _effect_id, _key_id, sequence_id, _storage_identity
@@ -718,13 +784,17 @@ def resolve_sequence_schemas(
         for sequence_id, policy, column_count, writable in shell.get(
             "sequence_declarations", ()
         ):
-            _observe(sequence_id, column_count, policy, writable)
+            names = tuple(sequence_names.get(int(sequence_id), ()))
+            origin = f"{function_name}{names!r}"
+            _observe(sequence_id, column_count, policy, writable, origin)
             sid = int(sequence_id)
             retains_union[sid] = retains_union.get(sid, False) or sid in deletion_ids
             nested_union[sid] = nested_union.get(sid, False) or sid in nested_ids
         for sequence_id, policy, column_count in shell.get(
             "sequence_initializations", ()
         ):
+            names = tuple(sequence_names.get(int(sequence_id), ()))
+            origin = f"{function_name}{names!r}"
             descriptor_policy = (
                 "duplicates"
                 if str(policy).startswith(("fill=", "literal_bytes="))
@@ -732,7 +802,9 @@ def resolve_sequence_schemas(
                 if str(policy).startswith("literal_table=")
                 else str(policy)
             )
-            _observe(sequence_id, column_count, descriptor_policy, True)
+            _observe(
+                sequence_id, column_count, descriptor_policy, True, origin,
+            )
             sid = int(sequence_id)
             retains_union[sid] = retains_union.get(sid, False) or sid in deletion_ids
             nested_union[sid] = nested_union.get(sid, False) or sid in nested_ids
@@ -780,6 +852,7 @@ class _ControlSSABuilder:
         region_signatures: dict[
             int, tuple[tuple[int, ...], tuple[int, ...]]
         ] | None,
+        region_feed_meta: Mapping[int, tuple[Meta, ...]] | None = None,
         region_value_meta: Mapping[int, Meta] | None = None,
         plan_callsite_bindings: Mapping[
             int, tuple[tuple[int, ...], tuple[int, ...]]
@@ -872,6 +945,10 @@ class _ControlSSABuilder:
                 int(signature_index), f"numerical_region_{int(signature_index)}"
             )
         self.region_signatures = dict(region_signatures or {})
+        self.region_feed_meta = {
+            int(region): tuple(metadata)
+            for region, metadata in (region_feed_meta or {}).items()
+        }
         # callsite_id -> (caller argument value ids, caller result value ids).
         self.plan_callsite_bindings = dict(plan_callsite_bindings or {})
         self.plan_callsite_by_result = {
@@ -881,6 +958,11 @@ class _ControlSSABuilder:
             for result_id in result_ids
         }
         self.emitted_plan_callsites: set[int] = set()
+        # While-latch condition regions may repeat a preheader region whose
+        # output list also contains carried seed identities.  The header Phi
+        # owns those identities throughout the loop; latch recomputation must
+        # project colliding outputs to scratch instead of rebinding the Phi.
+        self.preserved_region_output_ids: set[int] = set()
         self.arguments: list[SSAValue] = []
         self.external_values: dict[int, SSAValue] = {}
         self.declared_parameter_only_ids: set[int] = set()
@@ -2361,8 +2443,11 @@ class _ControlSSABuilder:
         value_id = int(value_id)
         value = self.external_values.get(value_id)
         if value is not None:
-            if value in self.arguments and value_id not in self.inout_value_ids:
-                if claim_provisional_definition:
+            if value in self.arguments:
+                if (
+                    claim_provisional_definition
+                    and value_id not in self.inout_value_ids
+                ):
                     # Region/control construction is not lexical emission
                     # order.  A later-emitted coordinator load can therefore
                     # be the real definition of a value that an earlier-built
@@ -2381,8 +2466,18 @@ class _ControlSSABuilder:
                 # region.  SSA versions the write; it is not an identity
                 # conflict.  The source value ID stays in accounting so the
                 # public arena-address policy can rotate the two versions.
-                value = self.fresh_value(dtype=dtype)
-                value.accounting["source_value_id"] = value_id
+                value = self.fresh_value(
+                    dtype=dtype or value.dtype,
+                    shape=tuple(value.shape),
+                )
+                value.accounting.update({
+                    **dict(self.external_values[value_id].accounting or {}),
+                    "source_value_id": value_id,
+                    **(
+                        {"ssa_inout_write_version": True}
+                        if value_id in self.inout_value_ids else {}
+                    ),
+                })
                 self.external_values[value_id] = value
             return value
         value = self._value_from_meta(value_id, dtype=dtype)
@@ -2560,6 +2655,54 @@ class _ControlSSABuilder:
         arguments = [
             self.external_value(int(value_id)) for value_id in argument_ids
         ]
+        marker_attributes = {
+            "callee": f"__plan_callsite_{int(callsite_id)}__",
+            "plan_callsite_marker": True,
+            "plan_callsite_id": int(callsite_id),
+            "output_ids": tuple(int(v) for v in result_ids),
+        }
+        if len(result_ids) > 1:
+            # A multi-result call publishes EVERY bound caller result here,
+            # at its scheduled position, through the same aggregate
+            # convention a region call uses.  Publishing only the first
+            # result left the others without a producer at this position;
+            # inside a loop body that is exactly the carried update whose
+            # latch operand the loop machinery must see produced.  The
+            # placeholder projections own the result objects by identity;
+            # frame linking rebinds the linked call's projections onto them.
+            aggregate = self.fresh_value(dtype="ssa.aggregate")
+            self.emit(
+                Handler.Call,
+                arguments,
+                aggregate,
+                attributes={
+                    **marker_attributes,
+                    "result_convention": "ssa.aggregate",
+                },
+            )
+            for output_index, output_id in enumerate(result_ids):
+                projection_attributes = {
+                    "plan_callsite_marker_projection": True,
+                    "plan_callsite_id": int(callsite_id),
+                    "aggregate_index": int(output_index),
+                    "source_output_id": int(output_id),
+                }
+                address = self.fresh_value(dtype="ptr")
+                self.emit(
+                    Handler.GetElementPtr,
+                    [aggregate, self.constant_value(output_index)],
+                    address,
+                    attributes=projection_attributes,
+                )
+                # The projection's dtype/shape are the region-declared facts
+                # of the caller result, not the aggregate handle's dtype.
+                result = self.produced_value(int(output_id))
+                self.emit(
+                    Handler.Load, [address], result,
+                    attributes=projection_attributes,
+                )
+            self.emitted_plan_callsites.add(int(callsite_id))
+            return
         result = None
         if result_ids:
             primary = int(result_ids[0])
@@ -2571,12 +2714,7 @@ class _ControlSSABuilder:
             Handler.Call,
             arguments,
             result,
-            attributes={
-                "callee": f"__plan_callsite_{int(callsite_id)}__",
-                "plan_callsite_marker": True,
-                "plan_callsite_id": int(callsite_id),
-                "output_ids": tuple(int(v) for v in result_ids),
-            },
+            attributes=marker_attributes,
         )
         self.emitted_plan_callsites.add(int(callsite_id))
 
@@ -2601,11 +2739,42 @@ class _ControlSSABuilder:
             region_index, ((), ())
         )
         array_feeds = self.region_array_feed_ids.get(int(region_index), set())
-        arguments = [
+        storage_arguments = [
             self.variant_row_values.get(int(value_id), self.external_value(value_id))
             if int(value_id) in array_feeds
             else self.external_value(value_id)
             for value_id in feeds
+        ]
+        feed_meta = self.region_feed_meta.get(int(region_index), ())
+        arguments = [
+            SSAValue(
+                storage.id,
+                dtype=(
+                    str(feed_meta[position].dtype)
+                    if position < len(feed_meta) else storage.dtype
+                ),
+                shape=(
+                    tuple(feed_meta[position].shape)
+                    if position < len(feed_meta) else tuple(storage.shape)
+                ),
+                device=(
+                    feed_meta[position].device
+                    if position < len(feed_meta) else storage.device
+                ),
+                accounting={
+                    **dict(storage.accounting or {}),
+                    "ssa_storage_alias": int(storage.id),
+                    "ssa_region_feed": (int(region_index), int(position)),
+                    **(
+                        {"ssa_loop_carried_feed": int(value_id)}
+                        if int(value_id) in self.preserved_region_output_ids
+                        else {}
+                    ),
+                },
+            )
+            for position, (value_id, storage) in enumerate(zip(
+                feeds, storage_arguments,
+            ))
         ]
         aggregate = (
             self.fresh_value(dtype="ssa.aggregate")
@@ -2620,6 +2789,8 @@ class _ControlSSABuilder:
                 "callee": callee,
                 "region_index": region_index,
                 "feed_ids": feeds,
+                "feed_shapes": tuple(tuple(value.shape) for value in arguments),
+                "feed_dtypes": tuple(str(value.dtype or "") for value in arguments),
                 "output_ids": outputs,
                 "result_convention": "ssa.aggregate",
             },
@@ -2627,24 +2798,46 @@ class _ControlSSABuilder:
         if aggregate is not None:
             for output_index, output_id in enumerate(outputs):
                 index = self.constant_value(output_index)
-                self.indexed_load(
-                    aggregate,
-                    index,
-                    output_id,
-                    attributes={
-                        "region_index": region_index,
-                        "aggregate_index": output_index,
-                        "source_output_id": output_id,
-                    },
-                    # Control construction can encounter a consumer before
-                    # lexical scheduling emits the region which defines it.
-                    # ``external_value`` provisionally exposes that identity as
-                    # a formal.  This load is its exact planned definition, so
-                    # claim the same SSAValue object and retire the provisional
-                    # formal.  ``produced_value`` still refuses this transition
-                    # for declared in/out storage and versions those writes.
-                    claim_provisional_definition=True,
-                )
+                attributes = {
+                    "region_index": region_index,
+                    "aggregate_index": output_index,
+                    "source_output_id": output_id,
+                }
+                if int(output_id) in self.preserved_region_output_ids:
+                    address = self.fresh_value(dtype="ptr")
+                    self.emit(
+                        Handler.GetElementPtr,
+                        [aggregate, index],
+                        address,
+                        attributes=attributes,
+                    )
+                    contract = self._value_from_meta(int(output_id))
+                    scratch = self.fresh_value(
+                        dtype=contract.dtype,
+                        shape=contract.shape,
+                    )
+                    self.emit(
+                        Handler.Load, [address], scratch,
+                        attributes={
+                            **attributes,
+                            "discarded_carried_seed_projection": True,
+                        },
+                    )
+                else:
+                    self.indexed_load(
+                        aggregate,
+                        index,
+                        output_id,
+                        attributes=attributes,
+                        # Control construction can encounter a consumer before
+                        # lexical scheduling emits the region which defines it.
+                        # ``external_value`` provisionally exposes that identity as
+                        # a formal.  This load is its exact planned definition, so
+                        # claim the same SSAValue object and retire the provisional
+                        # formal.  ``produced_value`` still refuses this transition
+                        # for declared in/out storage and versions those writes.
+                        claim_provisional_definition=True,
+                    )
         for kind, table_arguments in self.table_region_post_operations.get(
             int(region_index), ()
         ):
@@ -2942,7 +3135,8 @@ class _ControlSSABuilder:
                 extent,
                 attributes={
                     "tensor_operation": "extent",
-                    "dim": 0,
+                    "extent_kind": "dim",
+                    "axis": 0,
                     "binding": "iterable_extent",
                     "source_value_id": iterable_id,
                 },
@@ -3920,7 +4114,7 @@ class _ControlSSABuilder:
                 "destination uniqueness policy is unresolved",
             ))
             return
-        if not mutation.argument_value_ids and operation != "pop":
+        if not mutation.argument_value_ids and operation not in {"clear", "pop"}:
             self.shortfalls.append(SSALoweringShortfall(
                 "ssa-sequence",
                 operation,
@@ -3935,6 +4129,35 @@ class _ControlSSABuilder:
             location=location,
         )
         if destination is None:
+            return
+
+        if operation == "clear" and not mutation.argument_kind.startswith(
+            "mapping_"
+        ):
+            if mutation.argument_value_ids:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-sequence", operation, location,
+                    "resident sequence clear takes no arguments",
+                ))
+                return
+            storage = self.sequence_storage_values[
+                int(destination.sequence_id)
+            ]
+            length_address = storage[len(destination.column_value_ids)]
+            self.emit(
+                Handler.Store,
+                [self.constant_value(0), length_address],
+                attributes={
+                    "binding": "ssa_sequence_clear",
+                    "sequence_id": int(destination.sequence_id),
+                    "source_effect_node_id": int(mutation.effect_node_id),
+                    **({
+                        "extraction_identity": str(
+                            mutation.extraction_identity
+                        ),
+                    } if mutation.extraction_identity is not None else {}),
+                },
+            )
             return
 
         if operation == "pop" and not mutation.argument_kind.startswith(
@@ -5231,6 +5454,10 @@ class _ControlSSABuilder:
                         source = self.external_value(
                             iterable_id, dtype=target_dtype
                         )
+                        source.accounting.update({
+                            "projected_row_source_id": int(iterable_id),
+                            "projected_row_column": int(column_projection),
+                        })
                     else:
                         source = self.fresh_value(dtype=target_dtype)
                         source.accounting.update({
@@ -5303,6 +5530,7 @@ class _ControlSSABuilder:
                 target_id,
                 attributes={
                     "binding": "projected_iterable",
+                    "iterable_id": int(iterable_id),
                     "induction": loop.induction,
                     "projection": projection,
                 },
@@ -5610,6 +5838,7 @@ class _ControlSSABuilder:
             },
         )
         self.external_values[int(loop.predicate_value_id)] = current_predicate
+        carried_phis: dict[int, Instr] = {}
         for updated_id, initial_id, initial, updated, current in carried:
             self.emit(
                 Handler.Phi,
@@ -5623,6 +5852,7 @@ class _ControlSSABuilder:
                     "recursion_region_id": recursion_region_id,
                 },
             )
+            carried_phis[updated_id] = self.current.instrs[-1]
             self.external_values[initial_id] = current
         self.conditional_branch(current_predicate, body, exit_block)
 
@@ -5637,6 +5867,11 @@ class _ControlSSABuilder:
             "break_edges": [],
         }
         self.loop_exit_contexts.append(exit_context)
+        preserved_before_body = set(self.preserved_region_output_ids)
+        self.preserved_region_output_ids.update(
+            int(initial_id) for _updated_id, initial_id, *_rest in carried
+        )
+        blocks_before_body = {id(existing) for existing in self.blocks.values()}
         try:
             self.lower(loop.body, path=f"{path}.body")
             for mutation in loop.sequence_mutations:
@@ -5644,8 +5879,54 @@ class _ControlSSABuilder:
             for terminal in loop.terminal_controls:
                 self.lower(terminal, path=f"{path}.terminal")
         finally:
+            self.preserved_region_output_ids = preserved_before_body
             self.loop_exit_contexts.pop()
             self.loop_targets.pop()
+        body_blocks = [
+            candidate
+            for candidate in self.blocks.values()
+            if id(candidate) not in blocks_before_body or candidate is body
+        ]
+        carried_updates: dict[int, SSAValue] = {}
+        for updated_id, _initial_id, _initial, reserved, _current in carried:
+            published = self.external_values.get(updated_id, reserved)
+            carried_updates[updated_id] = published
+            if published is not reserved:
+                carried_phis[updated_id].args[1] = published
+        produced_results = {
+            id(instruction.res)
+            for basic_block in body_blocks
+            for instruction in basic_block.instrs
+            if instruction.res is not None
+        }
+        for updated_id, _initial_id, _initial, _updated, current in carried:
+            if id(carried_updates[updated_id]) not in produced_results:
+                declared_outputs = tuple(
+                    region_index
+                    for region_index, (_feeds, outputs)
+                    in self.region_signatures.items()
+                    if updated_id in outputs
+                )
+                if not declared_outputs:
+                    # A syntactic identity assignment (``value = value``) or
+                    # an untouched arm of a partial assignment has no body
+                    # instruction to publish. Its latch definition is the
+                    # current iteration's header Phi, not the producerless
+                    # placeholder reserved for a possible real update.
+                    carried_phis[updated_id].args[1] = current
+                    carried_updates[updated_id] = current
+                    self.external_values[updated_id] = current
+                    current.accounting["ssa_identity_backedge"] = True
+                    continue
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control",
+                    "loop_carried",
+                    f"{path}.body",
+                    f"carried update value {updated_id} has no producer "
+                    "inside the while-loop body; "
+                    f"alias_source={self.value_aliases.get(updated_id)!r}; "
+                    f"declared_region_outputs={declared_outputs}",
+                ))
         if not self.current.successors:
             self.branch(latch)
 
@@ -5665,7 +5946,14 @@ class _ControlSSABuilder:
                 updated_id, updated
             )
         self.external_values[int(loop.predicate_value_id)] = next_predicate
-        self.lower(loop.condition, path=f"{path}.condition.latch")
+        preserved_before = set(self.preserved_region_output_ids)
+        self.preserved_region_output_ids.update(
+            int(initial_id) for _updated_id, initial_id, *_rest in carried
+        )
+        try:
+            self.lower(loop.condition, path=f"{path}.condition.latch")
+        finally:
+            self.preserved_region_output_ids = preserved_before
         if loop.predicate_expression is not None:
             self.lower_control_expression(
                 loop.predicate_expression,
@@ -5769,11 +6057,39 @@ class _ControlSSABuilder:
         # (scorecard level 17: (0.5, 0.5) for 0.5).
         superseded: set[int] = set()
         carried_port_values = getattr(self, "_carried_port_values", {})
+
+        def existing_value(value_id: int) -> SSAValue | None:
+            """Resolve an authored assignment alias without inventing an ABI input.
+
+            An alias chain such as ``surface_velocity[..., 1] = ...`` over
+            ``surface_velocity[..., 2] = ...`` over ``point * 0.0`` names ONE
+            storage in successive versions.  The region that performs the
+            writes publishes the version it produced (the latest), not the
+            root arena, so the published value is found by checking each
+            version from the returned identity toward the root and taking the
+            first one that exists.  Looking up only the root dropped every
+            return built by in-place stores, and for an in/out parameter
+            returned the pre-write arena that the stale-identity filter then
+            removed.
+            """
+            value_id = int(value_id)
+            seen: set[int] = set()
+            while True:
+                found = self.external_values.get(value_id)
+                if found is not None:
+                    return found
+                if value_id in self.value_aliases and value_id not in seen:
+                    seen.add(value_id)
+                    value_id = int(self.value_aliases[value_id])
+                    continue
+                return None
+
         for name, history in self.named_output_histories.items():
             value = next((
-                self.external_values[value_id]
+                resolved
                 for value_id in reversed(history)
-                if value_id in self.external_values
+                for resolved in (existing_value(value_id),)
+                if resolved is not None
             ), None)
             if value is None:
                 continue
@@ -6169,6 +6485,7 @@ def lower_control_program_to_ssa(
     region_signatures: dict[
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] | None = None,
+    region_feed_meta: Mapping[int, tuple[Meta, ...]] | None = None,
     region_value_meta: Mapping[int, Meta] | None = None,
     plan_callsite_bindings: Mapping[
         int, tuple[tuple[int, ...], tuple[int, ...]]
@@ -6215,6 +6532,7 @@ def lower_control_program_to_ssa(
         first_value_id=first_value_id,
         region_callees=region_callees,
         region_signatures=region_signatures,
+        region_feed_meta=region_feed_meta,
         region_value_meta=region_value_meta,
         plan_callsite_bindings=plan_callsite_bindings,
         value_aliases=value_aliases,
@@ -6696,6 +7014,49 @@ def _inject_field_slot_access(
         )
         for slot, slot_dtype in slot_dtypes.items()
     }
+    # Graph identities are not SSA versions.  A SetAttr result may therefore
+    # carry the same numeric id as the receiver column which must receive it
+    # (for example ``self.dt_max = computed`` can name both values ``18``).
+    # Give the computed definition its own SSA identity while retaining the
+    # receiver column's public/call-frame id.  The Store below then provides
+    # the explicit bridge which was previously lost as an apparent self-write.
+    field_write_sources: dict[int, SSAValue] = {}
+    receiver_column_ids = {
+        int(value.id) for value in column_arrays.values()
+    }
+    for kind, value_id, _slot in field_ops:
+        value_id = int(value_id)
+        if kind != "write" or value_id not in receiver_column_ids:
+            continue
+        producers = [
+            instruction
+            for block in control_function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+            and int(instruction.res.id) == value_id
+        ]
+        if len(producers) != 1:
+            continue
+        producer = producers[0]
+        original = producer.res
+        version = SSAValue(
+            fresh(),
+            dtype=original.dtype,
+            shape=tuple(original.shape),
+            device=original.device,
+            accounting={
+                **dict(original.accounting or {}),
+                "ssa_field_write_version_of": value_id,
+            },
+        )
+        producer.res = version
+        for block in control_function.blocks.values():
+            for instruction in block.instrs:
+                instruction.args = [
+                    version if argument is original else argument
+                    for argument in instruction.args
+                ]
+        field_write_sources[value_id] = version
     const_sources = dict(field_const_sources or {})
     reference_sources = {
         int(value_id): dict(payload)
@@ -6731,10 +7092,12 @@ def _inject_field_slot_access(
         for instruction in block.instrs
     ]
     producer_position: dict[int, int] = {}
+    produced_values: dict[int, SSAValue] = {}
     first_consumer_position: dict[int, int] = {}
     for position, (_name, instruction) in enumerate(flat):
         if instruction.res is not None:
             producer_position.setdefault(int(instruction.res.id), position)
+            produced_values.setdefault(int(instruction.res.id), instruction.res)
         for argument in instruction.args:
             first_consumer_position.setdefault(int(argument.id), position)
 
@@ -6792,6 +7155,12 @@ def _inject_field_slot_access(
             group = []
             reference = reference_sources.get(int(value_id))
             source_dtype = "opaque_ref" if reference is not None else slot_dtype
+            stored_source = field_write_sources.get(
+                int(value_id),
+                produced_values.get(
+                    int(value_id), SSAValue(int(value_id), dtype=source_dtype),
+                ),
+            )
             # A constant field write (self.x = None / 5 / "s") has no producer
             # in the control body, so materialise its source here -- the
             # tokenizer then turns a None/str/bytes const into a token.
@@ -6828,7 +7197,7 @@ def _inject_field_slot_access(
                 *prelude,
                 Instr(
                     "Store",
-                    [SSAValue(int(value_id), dtype=source_dtype), address],
+                    [stored_source, address],
                     None,
                     attributes={
                         "opaque_reference_storage": True,
@@ -6836,7 +7205,7 @@ def _inject_field_slot_access(
                     } if source_dtype == "opaque_ref" else {},
                 ),
             ]
-            producer = producer_position.get(int(value_id))
+            producer = producer_position.get(int(stored_source.id))
             # After the producer; a parameter source has none, so at the top.
             position = producer + 1 if producer is not None else 0
         home = flat[position][0] if position < len(flat) else (
@@ -6937,80 +7306,203 @@ def _schedule_loop_callsites(
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] | None = None,
 ) -> tuple[ControlProgram, dict[int, tuple[tuple[int, ...], tuple[int, ...]]]]:
-    """Make in-loop callsites schedulable statements where nothing else is.
+    """Install this closure's PlanCalls as ordinary scheduled statements.
 
-    The control program historically had no vocabulary for an authored call:
-    calls were stitched into the lowered SSA afterwards by lexical anchors.
-    A loop body whose ONLY content is a call was therefore empty in the
-    plan's own language, and its carried update had no producer -- the
-    elided-body failure. This walks the hierarchy's PlanCalls and, for a
-    callsite enclosed in a loop whose result is that loop's carried update
-    and which no scheduled region publishes, appends a call STATEMENT to the
-    loop body. Position from the plan, bindings from the linker.
-
-    Deliberately narrow: only the case the old overlay could not express.
-    Calls whose results feed regions already ride behind those regions.
+    The hierarchy plan already interleaves calls and numerical regions. Carry
+    that order into local Control IR: a call precedes the next retained region,
+    or remains at its enclosing loop/closure boundary when it is trailing.
+    The dependency pass below can then order calls by their exact argument and
+    result identities just as it orders numerical regions. Linking supplies
+    the final physical frame later; it does not rediscover execution position.
     """
 
     if hierarchy_plan is None:
         return control, {}
 
     bindings: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}
-    planned_calls: dict[int, PlanCall] = {}
-    loop_enclosed: list[tuple[int, tuple[int, ...]]] = []
-
-    def collect(closure: "PlanClosure") -> None:
-        for item in closure.items:
-            if isinstance(item, PlanClosure):
-                collect(item)
-            elif isinstance(item, PlanCall):
-                planned_calls[int(item.callsite_id)] = item
-                argument_ids = tuple(
-                    int(caller_id)
-                    for caller_id, _callee_id in item.argument_bindings
-                ) or tuple(int(v) for v in item.argument_value_ids)
-                result_ids = tuple(
-                    int(caller_id)
-                    for _callee_id, caller_id in item.result_bindings
-                ) or tuple(int(v) for v in item.result_value_ids)
-                bindings[int(item.callsite_id)] = (argument_ids, result_ids)
-                if item.enclosing_loop_ids and result_ids:
-                    loop_enclosed.append(
-                        (int(item.callsite_id), result_ids)
-                    )
-
-    collect(hierarchy_plan)
-    region_published = {
-        int(output)
-        for _feeds, outputs in (region_signatures or {}).values()
-        for output in outputs
+    planned_calls: dict[int, PlanCall] = {
+        int(item.callsite_id): item
+        for item in hierarchy_plan.items
+        if isinstance(item, PlanCall)
     }
+    for callsite_id, item in planned_calls.items():
+        argument_ids = tuple(
+            int(caller_id)
+            for caller_id, _callee_id in item.argument_bindings
+        ) or tuple(int(v) for v in item.argument_value_ids)
+        result_ids = tuple(
+            int(caller_id)
+            for _callee_id, caller_id in item.result_bindings
+        ) or tuple(int(v) for v in item.result_value_ids)
+        bindings[callsite_id] = (argument_ids, result_ids)
+
+    # Value dependencies are not the whole execution-order contract.  A
+    # mutable aggregate write can publish a fresh graph identity while the
+    # following call is deliberately rebound to the same resident storage.
+    # At that boundary the call arguments and the write-region outputs need
+    # not share an SSA value id, but their order is still explicit in the
+    # hierarchy.  Preserve that order as a precedence chain among the
+    # hierarchy statements which survive in this control closure.  Structural
+    # producers not represented by a PlanCall/region remain free to move ahead
+    # when the ordinary dependency analysis below proves that necessary.
+    hierarchy_statement_rank: dict[tuple[str, int], int] = {}
+    for position, item in enumerate(hierarchy_plan.items):
+        if isinstance(item, PlanCall):
+            hierarchy_statement_rank[("call", int(item.callsite_id))] = position
+        elif (
+            isinstance(item, PlanClosure)
+            and item.name.startswith("region_")
+        ):
+            hierarchy_statement_rank[(
+                "region", int(item.name.split("_", 1)[1])
+            )] = position
+
+    def scheduled_region(block: Any) -> int | None:
+        if not isinstance(block, StatementBlock) or len(block.lines) != 1:
+            return None
+        match = _REGION_MARKER.fullmatch(str(block.lines[0]))
+        return None if match is None else int(match.group(1))
+
+    retained_regions: set[int] = set()
+    present_loop_ids: set[int] = set()
+
+    def discover_control(block: Any) -> None:
+        region = scheduled_region(block)
+        if region is not None:
+            retained_regions.add(region)
+        if isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                discover_control(child)
+        elif isinstance(block, ConditionalBlock):
+            discover_control(block.body)
+            if block.orelse is not None:
+                discover_control(block.orelse)
+        elif isinstance(block, LoopBlock):
+            induction = str(block.induction)
+            if induction.startswith("iteration_"):
+                try:
+                    present_loop_ids.add(int(induction[len("iteration_"):]))
+                except ValueError:
+                    pass
+            discover_control(block.body)
+        elif isinstance(block, WhileBlock):
+            if block.source_loop_node_id is not None:
+                present_loop_ids.add(int(block.source_loop_node_id))
+            discover_control(block.condition)
+            discover_control(block.body)
+        elif isinstance(block, CallBlock):
+            discover_control(block.callee)
+
+    discover_control(control.root)
+    calls_before: dict[int, list[int]] = {}
+    replaced_projection_regions: set[int] = set()
+    pending: list[int] = []
+
+    def is_call_projection_region(
+        closure: "PlanClosure", call: PlanCall,
+    ) -> bool:
+        """Whether ``closure`` only unpacks outputs already bound by ``call``."""
+
+        result_ids = set(bindings[int(call.callsite_id)][1])
+        if not result_ids:
+            return False
+        projected_ids: set[int] = set()
+        for line in closure.items:
+            opcode = str(getattr(line, "opcode", "")).casefold()
+            if opcode == "const":
+                continue
+            inputs = tuple(map(int, getattr(line, "inputs", ())))
+            outputs = tuple(map(int, getattr(line, "outputs", ())))
+            if (
+                opcode != "indexed"
+                or not inputs
+                or inputs[0] != int(call.callsite_id)
+                or not outputs
+                or not set(outputs).issubset(result_ids)
+            ):
+                return False
+            projected_ids.update(outputs)
+        return projected_ids == result_ids
+
+    for item in hierarchy_plan.items:
+        if isinstance(item, PlanCall):
+            pending.append(int(item.callsite_id))
+            continue
+        if not (
+            isinstance(item, PlanClosure)
+            and item.name.startswith("region_")
+        ):
+            continue
+        region = int(item.name.split("_", 1)[1])
+        if region in retained_regions and pending:
+            calls_before.setdefault(region, []).extend(pending)
+            if is_call_projection_region(item, planned_calls[pending[-1]]):
+                replaced_projection_regions.add(region)
+            pending = []
+    trailing_at_loop: dict[int, list[int]] = {}
+    trailing_at_root: list[int] = []
+    for callsite_id in pending:
+        item = planned_calls[callsite_id]
+        loop_id = next((
+            int(candidate)
+            for candidate in reversed(item.enclosing_loop_ids)
+            if int(candidate) in present_loop_ids
+        ), None)
+        if loop_id is None:
+            trailing_at_root.append(callsite_id)
+        else:
+            trailing_at_loop.setdefault(loop_id, []).append(callsite_id)
+
+    def marker(callsite_ids: Iterable[int]) -> StatementBlock:
+        return StatementBlock(tuple(
+            f"__plan_callsite_{int(callsite_id)}__"
+            for callsite_id in callsite_ids
+        ))
+
+    def sequence(*blocks: Any) -> SequenceBlock:
+        return SequenceBlock(tuple(
+            child
+            for block in blocks
+            for child in (
+                block.blocks if isinstance(block, SequenceBlock) else (block,)
+            )
+        ))
 
     def rebuild(block: Any) -> Any:
+        region = scheduled_region(block)
+        if region is not None:
+            before = calls_before.get(region, ())
+            if region in replaced_projection_regions:
+                return marker(before)
+            return block if not before else sequence(marker(before), block)
         if isinstance(block, SequenceBlock):
-            return SequenceBlock(tuple(rebuild(child) for child in block.blocks))
-        if isinstance(block, (LoopBlock, WhileBlock)):
+            return sequence(*(rebuild(child) for child in block.blocks))
+        if isinstance(block, LoopBlock):
             rebuilt_body = rebuild(block.body)
-            # Matched on the carried values themselves, not on a loop id:
-            # LoopBlock carries no source node id, and the semantic condition
-            # never needed one -- a loop-enclosed callsite belongs to the
-            # loop whose carried update its result IS.
-            carried_updates = {
-                int(updated) for updated, _initial in block.carried_aliases
-            }
-            markers: list[str] = []
-            for callsite_id, result_ids in loop_enclosed:
-                if any(
-                    int(result_id) in carried_updates
-                    and int(result_id) not in region_published
-                    for result_id in result_ids
-                ):
-                    markers.append(f"__plan_callsite_{callsite_id}__")
-            if markers:
-                rebuilt_body = SequenceBlock((
-                    rebuilt_body, StatementBlock(tuple(markers)),
-                ))
+            induction = str(block.induction)
+            loop_id = (
+                int(induction[len("iteration_"):])
+                if induction.startswith("iteration_")
+                and induction[len("iteration_"):].isdigit()
+                else None
+            )
+            trailing = trailing_at_loop.get(loop_id, ())
+            if trailing:
+                rebuilt_body = sequence(rebuilt_body, marker(trailing))
             return replace(block, body=rebuilt_body)
+        if isinstance(block, WhileBlock):
+            rebuilt_condition = rebuild(block.condition)
+            rebuilt_body = rebuild(block.body)
+            trailing = trailing_at_loop.get(
+                None if block.source_loop_node_id is None
+                else int(block.source_loop_node_id),
+                (),
+            )
+            if trailing:
+                rebuilt_body = sequence(rebuilt_body, marker(trailing))
+            return replace(
+                block, condition=rebuilt_condition, body=rebuilt_body
+            )
         if isinstance(block, ConditionalBlock):
             return replace(
                 block,
@@ -7022,7 +7514,10 @@ def _schedule_loop_callsites(
             )
         return block
 
-    rebuilt_control = replace(control, root=rebuild(control.root))
+    rebuilt_root = rebuild(control.root)
+    if trailing_at_root:
+        rebuilt_root = sequence(rebuilt_root, marker(trailing_at_root))
+    rebuilt_control = replace(control, root=rebuilt_root)
 
     def produced_sequences(block: Any) -> set[int]:
         """Resident sequence arenas populated by one control subtree."""
@@ -7049,124 +7544,6 @@ def _schedule_loop_callsites(
             produced.update(produced_sequences(block.callee))
         return produced
 
-    def scheduled_region(block: Any) -> int | None:
-        if not isinstance(block, StatementBlock) or len(block.lines) != 1:
-            return None
-        match = _REGION_MARKER.fullmatch(str(block.lines[0]))
-        return None if match is None else int(match.group(1))
-
-    def schedule_generator_calls(block: Any) -> Any:
-        """Put a plan call after the generator that supplies its sequence.
-
-        A post-hoc call is normally materialized at the first use of its
-        result.  That is too late to establish the reverse dependency when
-        one of its arguments is a list-comprehension arena: a source-position
-        pass can leave the generator after the result's consuming region, so
-        the call observes an empty arena.  The hierarchy already owns the
-        exact caller argument/result correlation.  Use it to make the call a
-        control statement immediately after the producer loop and move that
-        unit before the first region consuming the call result.
-        """
-
-        if isinstance(block, SequenceBlock):
-            children = [schedule_generator_calls(child) for child in block.blocks]
-            children = [
-                grandchild
-                for child in children
-                for grandchild in (
-                    child.blocks if isinstance(child, SequenceBlock) else (child,)
-                )
-            ]
-            for loop in tuple(children):
-                if not isinstance(loop, LoopBlock):
-                    continue
-                produced = produced_sequences(loop)
-                if not produced:
-                    continue
-                matching = []
-                for callsite_id, item in planned_calls.items():
-                    if item.enclosing_loop_ids:
-                        continue
-                    arguments, results = bindings[callsite_id]
-                    if produced.intersection(map(int, arguments)) and results:
-                        matching.append((callsite_id, tuple(map(int, results))))
-                if not matching:
-                    continue
-                result_ids = {
-                    result_id
-                    for _callsite, results in matching
-                    for result_id in results
-                }
-                consumer_index = next((
-                    index
-                    for index, candidate in enumerate(children)
-                    for region_index in (scheduled_region(candidate),)
-                    if region_index is not None
-                    and result_ids.intersection({
-                        *map(int, region_signatures.get(
-                            region_index, ((), ()),
-                        )[0]),
-                        *map(int, (region_dependency_signatures or {}).get(
-                            region_index, ((), ()),
-                        )[0]),
-                    })
-                ), None)
-                if consumer_index is None:
-                    continue
-                loop_index = children.index(loop)
-                unit_indexes = {loop_index}
-                # A scalar query over the same generator is part of the
-                # producer unit and must retain loop-before-query order.
-                for index, candidate in enumerate(children):
-                    if (
-                        isinstance(candidate, SequenceQueryBlock)
-                        and loop.source_loop_node_id is not None
-                        and candidate.producer_loop_node_id is not None
-                        and int(candidate.producer_loop_node_id)
-                        == int(loop.source_loop_node_id)
-                    ):
-                        unit_indexes.add(index)
-                queries = [
-                    children[index]
-                    for index in sorted(unit_indexes)
-                    if index != loop_index
-                ]
-                marker = StatementBlock(tuple(
-                    f"__plan_callsite_{callsite_id}__"
-                    for callsite_id, _results in sorted(matching)
-                ))
-                anchor = min(consumer_index, min(unit_indexes))
-                retained = [
-                    candidate
-                    for index, candidate in enumerate(children)
-                    if index not in unit_indexes
-                ]
-                adjusted = sum(
-                    1 for index in range(anchor) if index not in unit_indexes
-                )
-                retained[adjusted:adjusted] = [loop, *queries, marker]
-                children = retained
-            return replace(block, blocks=tuple(children))
-        if isinstance(block, ConditionalBlock):
-            return replace(
-                block,
-                body=schedule_generator_calls(block.body),
-                orelse=(
-                    None if block.orelse is None
-                    else schedule_generator_calls(block.orelse)
-                ),
-            )
-        if isinstance(block, LoopBlock):
-            return replace(block, body=schedule_generator_calls(block.body))
-        if isinstance(block, WhileBlock):
-            return replace(
-                block,
-                condition=schedule_generator_calls(block.condition),
-                body=schedule_generator_calls(block.body),
-            )
-        if isinstance(block, CallBlock):
-            return replace(block, callee=schedule_generator_calls(block.callee))
-        return block
 
     def dependency_signature(
         block: Any,
@@ -7287,6 +7664,27 @@ def _schedule_loop_callsites(
             )
         return None
 
+    def hierarchy_statement_position(block: Any) -> int | None:
+        """Return this scheduled statement's position in the hierarchy."""
+
+        if not isinstance(block, StatementBlock):
+            return None
+        region_index = scheduled_region(block)
+        if region_index is not None:
+            return hierarchy_statement_rank.get(("region", region_index))
+        callsites = []
+        for line in block.lines:
+            match = _CALLSITE_MARKER.fullmatch(str(line))
+            if match is None:
+                return None
+            callsites.append(int(match.group(1)))
+        positions = tuple(
+            hierarchy_statement_rank[("call", callsite_id)]
+            for callsite_id in callsites
+            if ("call", callsite_id) in hierarchy_statement_rank
+        )
+        return min(positions) if positions else None
+
     def dependency_order(block: Any) -> Any:
         """Stable-toposort exact structural dependencies in one lexical arm.
 
@@ -7324,6 +7722,21 @@ def _schedule_loop_callsites(
                         elif later:
                             required.add(min(later))
                     dependencies.append(required)
+                hierarchy_positions = [
+                    hierarchy_statement_position(child) for child in run
+                ]
+                ranked = sorted(
+                    (
+                        (int(hierarchy_position), position)
+                        for position, hierarchy_position
+                        in enumerate(hierarchy_positions)
+                        if hierarchy_position is not None
+                    ),
+                )
+                for (_prior_rank, prior), (_rank, current) in zip(
+                    ranked, ranked[1:]
+                ):
+                    dependencies[current].add(prior)
                 remaining = list(range(len(run)))
                 placed: set[int] = set()
                 while remaining:
@@ -7370,10 +7783,9 @@ def _schedule_loop_callsites(
             return replace(block, callee=dependency_order(block.callee))
         return block
 
-    scheduled_root = schedule_generator_calls(rebuilt_control.root)
     return replace(
         rebuilt_control,
-        root=dependency_order(scheduled_root),
+        root=dependency_order(rebuilt_control.root),
     ), bindings
 
 
@@ -7632,6 +8044,7 @@ def lower_control_sections_to_ssa(
     function_outputs: tuple[str, ...] = (),
     function_parameters: tuple[str, ...] = (),
     value_dtypes: Mapping[int, str] | None = None,
+    value_shapes: Mapping[int, tuple[int, ...]] | None = None,
     constant_values: Mapping[int, Any] | None = None,
     required_output_value_ids: tuple[int, ...] = (),
     region_output_value_ids: Mapping[int, tuple[int, ...]] | None = None,
@@ -7714,6 +8127,7 @@ def lower_control_sections_to_ssa(
     functions: dict[str, Function] = {}
     region_callees: dict[int, str] = {}
     region_signatures: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}
+    region_feed_meta: dict[int, tuple[Meta, ...]] = {}
     region_value_meta: dict[int, Meta] = {}
     nested_row_target_ids: set[int] = set()
     selected_nested_sequence_ids: set[int] = set()
@@ -8007,16 +8421,29 @@ def lower_control_sections_to_ssa(
             if instruction.op in {"Indexed", "IndexedStore", "GetElementPtr"}
             and instruction.args
         }
+        statically_shaped_ids = {
+            int(value_id)
+            for value_id, meta in region_value_meta.items()
+            if tuple(meta.shape or ())
+        }
+        statically_shaped_ids.update(
+            int(value_id)
+            for value_id, shape in dict(value_shapes or {}).items()
+            if tuple(shape or ())
+        )
         variant_projected_target_ids.update(
             target_id
             for target_id in nested_row_target_ids
             if target_id in scalar_use_ids
+            and target_id not in statically_shaped_ids
         )
         # The same heterogeneous contract is required when source pursuit has
         # specialized away the owning loop and left its payload as a direct
         # method input.  Its uses, not its spelling, prove the two columns.
         variant_projected_target_ids.update(
-            (indexed_base_ids & scalar_use_ids) - declared_sequence_ids
+            (indexed_base_ids & scalar_use_ids)
+            - declared_sequence_ids
+            - statically_shaped_ids
         )
         for planned in hierarchy_plan.items:
             if not (
@@ -8232,6 +8659,30 @@ def lower_control_sections_to_ssa(
     plan_line_produced: set[int] = set()
     plan_line_consumed: set[int] = set()
 
+    def region_free_value_ids(
+        instructions: Sequence[Instr],
+    ) -> tuple[int, ...]:
+        """Return exact body operands with no local SSA definition.
+
+        Planner captures are scheduling evidence, but the emitted region body
+        is the final authority for its callable ABI.  Structural rewrites can
+        expose an operand the hierarchy capture set omitted; failing to add it
+        creates a function whose instructions reference a value absent from
+        its formals.
+        """
+
+        produced = {
+            int(instruction.res.id)
+            for instruction in instructions
+            if instruction.res is not None
+        }
+        return tuple(dict.fromkeys(
+            int(argument.id)
+            for instruction in instructions
+            for argument in instruction.args
+            if int(argument.id) not in produced
+        ))
+
     def collect_resolved_plan_dependencies(closure: PlanClosure) -> None:
         """Collect the dependency boundary already resolved by the planner."""
 
@@ -8433,6 +8884,7 @@ def lower_control_sections_to_ssa(
                 ]
             effective_captures = tuple(dict.fromkeys((
                 *map(int, region.captures),
+                *region_free_value_ids(instructions),
                 *(
                     int(operation[0])
                     for operation in row_loads
@@ -8475,8 +8927,7 @@ def lower_control_sections_to_ssa(
                 for value_id in effective_captures
                 if (
                     value_id in region_inout_ids
-                    or value_id in consumed_after_field_resolution
-                    and value_id not in produced_after_field_resolution
+                    or value_id in region_free_value_ids(instructions)
                 )
             )
             if not instructions:
@@ -8940,10 +9391,15 @@ def lower_control_sections_to_ssa(
                         else str(semantic.dtype)
                     ),
                     shape=(
-                        tuple(map(int, authoritative.shape))
-                        if authoritative is not None
-                        else tuple(semantic.shape)
+                        # One storage identity may enter different planned
+                        # regions through different reshape/view contracts.
+                        # The instruction occurrence is the exact local view;
+                        # the id-keyed region-wide metadata is only a fallback
+                        # for otherwise shapeless occurrences.
+                        tuple(semantic.shape)
                         if semantic is not None and semantic.shape
+                        else tuple(map(int, authoritative.shape))
+                        if authoritative is not None
                         else tuple(map(int, shape))
                     ),
                 )
@@ -8973,17 +9429,49 @@ def lower_control_sections_to_ssa(
                     ),
                 )
 
-            # One SSA identity has one contract inside the function.  Rebind
-            # the instruction graph itself, not only its formal arguments and
-            # outputs, so target inference cannot see a stale float result and
-            # an integer function output for the same value ID.
+            # One SSA identity has one storage/dtype contract, but may have
+            # several shaped views. Retype each occurrence independently so
+            # reshape metadata is not collapsed by the id-keyed canonical
+            # table. Target inference must see the authored view at each op.
             for instruction in instructions:
                 instruction.args = [
-                    typed_region_value(value.id) for value in instruction.args
+                    _typed_region_occurrence(
+                        value,
+                        typed_region_value(value.id),
+                        region_value_meta.get(int(value.id)),
+                    )
+                    for value in instruction.args
                 ]
                 if instruction.res is not None:
-                    instruction.res = typed_region_value(instruction.res.id)
+                    instruction.res = _typed_region_occurrence(
+                        instruction.res,
+                        typed_region_value(instruction.res.id),
+                        region_value_meta.get(int(instruction.res.id)),
+                    )
 
+            # An aggregate formal IS the tuple of its member formals: its
+            # ``Tuple`` constructor has no physical value.  Every projection
+            # of it is aliased to a member, and a starred call argument
+            # (``step(inputs, *tire_constants)``) is expanded by the linker
+            # into those members, so a plan-level reference to the tuple id
+            # is never a physical use.  A backend has no spelling for the
+            # constructor and must not be asked for one: keep it only while
+            # an instruction in this region consumes it, or it is itself an
+            # authored function output.
+            consumed_in_region = {
+                int(argument.id)
+                for instr in instructions
+                for argument in instr.args
+            }
+            instructions = [
+                instr for instr in instructions
+                if not (
+                    str(instr.op) in {"Tuple", "tuple"}
+                    and instr.res is not None
+                    and int(instr.res.id) not in consumed_in_region
+                    and int(instr.res.id) not in authored_output_value_ids
+                )
+            ]
             produced = {
                 int(instr.res.id)
                 for instr in instructions
@@ -8996,10 +9484,13 @@ def lower_control_sections_to_ssa(
             }
             effective_captures = tuple(
                 value_id
-                for value_id in effective_captures
+                for value_id in dict.fromkeys((
+                    *effective_captures,
+                    *region_free_value_ids(instructions),
+                ))
                 if (
                     value_id in region_inout_ids
-                    or value_id in consumed and value_id not in produced
+                    or value_id in region_free_value_ids(instructions)
                 )
             )
             # The resolved hierarchy plan owns the dependency calculation.
@@ -9016,17 +9507,80 @@ def lower_control_sections_to_ssa(
                 ))
                 | set(map(int, record_field_write_value_ids))
             )
-            outputs = tuple(sorted(produced & required_outputs))
-            outputs = tuple(
-                value_id for value_id in outputs
-                if value_id not in region_value_aliases
-            )
+            def resident_root(value_id: int) -> int:
+                current = int(value_id)
+                seen: set[int] = set()
+                while (
+                    current in region_value_aliases
+                    and current not in seen
+                ):
+                    seen.add(current)
+                    current = int(region_value_aliases[current])
+                return current
+
+            # An IndexedStore versions resident memory: every version id in
+            # ``region_value_aliases`` names the SAME storage as its root
+            # arena.  A requirement on a version is therefore a requirement
+            # on that storage, so the produced root is published; and the
+            # required version is published AS ITSELF, because the version id
+            # is the identity every later stage keys on (the identity ledger,
+            # the structural-output recovery, ``emit_outputs`` and the call
+            # linker all name a returned store chain by its final version).
+            # This is exactly what the repository-call lowering of the same
+            # store already does (``index_assign`` results are published next
+            # to their arena).  Intermediate versions nothing requires stay
+            # private.  A version whose root is a CAPTURE (a parameter or an
+            # earlier region's arena written in place here) is not published:
+            # the write is already visible through that storage, and a copied
+            # output slot would turn an in/out write into a second value.
+            # Dropping every aliased id silently removed each authored output
+            # built by in-place slice stores (``surface_velocity = point *
+            # 0.0; surface_velocity[..., 0] = ...``) from the region and then
+            # from the function's Ret.
+            required_roots = {
+                resident_root(value_id) for value_id in required_outputs
+            }
+            outputs = tuple(sorted(
+                value_id for value_id in produced
+                if (
+                    value_id in required_outputs
+                    and (
+                        value_id not in region_value_aliases
+                        or resident_root(value_id) in produced
+                    )
+                )
+                or (
+                    value_id in required_roots
+                    and value_id not in region_value_aliases
+                )
+            ))
             # The region's formal parameters are its captures only. Its outputs
             # are declared as ``intent(out)`` dummies by the target from the
             # ``outputs`` map (returned below as ``section_outputs``), exactly as
             # the fused numerical region path does -- never by placing them in
             # ``args``, which would misread an output as an in/out alias.
-            arguments = [typed_region_value(vid) for vid in effective_captures]
+            def region_argument(value_id: int) -> SSAValue:
+                canonical = typed_region_value(value_id)
+                occurrences = tuple(
+                    argument
+                    for instruction in instructions
+                    for argument in instruction.args
+                    if int(argument.id) == int(value_id)
+                    and tuple(argument.shape or ())
+                )
+                contracts = {
+                    (tuple(value.shape), str(value.dtype or ""))
+                    for value in occurrences
+                }
+                # A sole concrete use is the exact ordered region view. When
+                # several reshapes share the storage id, keep the canonical
+                # formal neutral; the individual op occurrences above retain
+                # their own views.
+                if len(contracts) == 1:
+                    return occurrences[0]
+                return canonical
+
+            arguments = [region_argument(vid) for vid in effective_captures]
             region_function = Function(
                 region_name,
                 arguments,
@@ -9068,6 +9622,14 @@ def lower_control_sections_to_ssa(
             region_signatures[region_index] = (
                 tuple(int(vid) for vid in effective_captures),
                 outputs,
+            )
+            region_feed_meta[region_index] = tuple(
+                Meta(
+                    tuple(argument.shape),
+                    str(argument.dtype or "unknown"),
+                    argument.device,
+                )
+                for argument in arguments
             )
             section_outputs[region_name] = tuple(
                 typed_region_value(vid) for vid in outputs
@@ -9124,12 +9686,18 @@ def lower_control_sections_to_ssa(
     graph_value_ids.extend(int(value_id) for _kind, value_id, _slot in field_ops)
     if self_value_id is not None:
         graph_value_ids.append(int(self_value_id))
-    for value_id, value_dtype in (value_dtypes or {}).items():
+    for value_id in set(value_dtypes or {}) | set(value_shapes or {}):
         value_id = int(value_id)
         existing = region_value_meta.get(value_id)
         region_value_meta[value_id] = Meta(
-            tuple(existing.shape or ()) if existing is not None else (),
-            str(value_dtype),
+            tuple((value_shapes or {}).get(
+                value_id,
+                tuple(existing.shape or ()) if existing is not None else (),
+            )),
+            str((value_dtypes or {}).get(
+                value_id,
+                existing.dtype if existing is not None else "float64",
+            )),
             existing.device if existing is not None else None,
         )
     # Keep the hierarchy's pre-rewrite dataflow as scheduling authority.  A
@@ -9194,6 +9762,7 @@ def lower_control_sections_to_ssa(
         first_value_id=max(graph_value_ids) + 1,
         region_callees=region_callees,
         region_signatures=region_signatures,
+        region_feed_meta=region_feed_meta,
         region_value_meta=region_value_meta,
         plan_callsite_bindings=plan_callsite_bindings,
         value_aliases=region_value_aliases,
@@ -9364,12 +9933,10 @@ def lower_control_sections_to_ssa(
     from .ir_sequence_tables import lower_sequence_aggregate_constants
 
     lower_sequence_aggregate_constants(functions, sequence_tables)
-    # Lower subscript ops (Indexed/IndexedStore) to the universal address
-    # vocabulary (GetElementPtr + Load/Store) that every backend already speaks,
-    # so the subscript lowering lives once at the SSA level, not per backend.
-    from .ir_indexing import lower_indexing_to_ssa_addressing
-
-    lower_indexing_to_ssa_addressing(functions)
+    # Tensor SSA gets first refusal on shaped subscripts below.  Any scalar
+    # Indexed/IndexedStore operations left afterward become universal address
+    # primitives; doing that here erased the tensor selection before its
+    # repository kernel could see it.
     # Tokenize every string constant to its universal fnv1a token before
     # emission, so a word is a 64-bit value the target expresses like any other
     # constant instead of an inexpressible literal.
@@ -9538,7 +10105,11 @@ def lower_control_sections_to_ssa(
     )
     tensor_reference_shortfalls = ()
     if tensor_ssa_reference is not None:
-        from .tensor_ssa_lowering import lower_tensor_calls_to_repository_ssa
+        from .tensor_ssa_lowering import (
+            legalize_aggregate_adapters,
+            lower_tensor_calls_to_repository_ssa,
+            propagate_repository_ssa_call_metadata,
+        )
 
         tensor_reference_shortfalls = tuple(
             SSALoweringShortfall(
@@ -9551,6 +10122,11 @@ def lower_control_sections_to_ssa(
                 module, tensor_ssa_reference
             )
         )
+    from .ir_indexing import lower_indexing_to_ssa_addressing
+
+    lower_indexing_to_ssa_addressing(module.functions)
+    if tensor_ssa_reference is not None and legalize_aggregate_adapters(module):
+        propagate_repository_ssa_call_metadata(module)
     return module, tuple((
         *shortfalls,
         *control_shortfalls,
@@ -9698,6 +10274,7 @@ def lower_precompile_and_control_to_ssa(
     region_signatures: dict[
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] = {}
+    region_feed_meta: dict[int, tuple[Meta, ...]] = {}
     region_value_meta: dict[int, Meta] = {}
     region_shortfalls: list[SSALoweringShortfall] = []
     for region_index, region_artifact in sorted(
@@ -9721,6 +10298,10 @@ def lower_precompile_and_control_to_ssa(
                 int(value_id)
                 for value_id in region_program.outputs.values()
             ),
+        )
+        region_feed_meta[int(region_index)] = tuple(
+            region_program.meta[int(value_id)]
+            for value_id in region_signatures[int(region_index)][0]
         )
         # A region states the dtype and shape of the values it consumes and
         # produces. The control program refers to those same value ids but
@@ -9765,6 +10346,14 @@ def lower_precompile_and_control_to_ssa(
                 tuple(int(value_id) for value_id in region.captures),
                 outputs,
             )
+            shape_by_id = {
+                int(value_id): Meta(tuple(map(int, shape)), str(dtype))
+                for value_id, shape, dtype in region.value_shapes
+            }
+            region_feed_meta[region_index] = tuple(
+                shape_by_id.get(int(value_id), Meta((), "unknown"))
+                for value_id in region.captures
+            )
             known_operations = {handler.value for handler in Handler}
             region_shortfalls.extend(
                 SSALoweringShortfall(
@@ -9787,6 +10376,7 @@ def lower_precompile_and_control_to_ssa(
         first_value_id=max(used_ids, default=-1) + 1,
         region_callees=region_callees,
         region_signatures=region_signatures,
+        region_feed_meta=region_feed_meta,
         region_value_meta=region_value_meta,
         output_value_ids=(
             tuple(map(int, program.outputs.values()))
@@ -9807,11 +10397,8 @@ def lower_precompile_and_control_to_ssa(
     from .ir_sequence_tables import lower_sequence_aggregate_constants
 
     lower_sequence_aggregate_constants(functions, sequence_tables)
-    # Structural subscripts are valid SSA vocabulary during composition, then
-    # become the universal address primitives every backend already consumes.
-    from .ir_indexing import lower_indexing_to_ssa_addressing
-
-    lower_indexing_to_ssa_addressing(functions)
+    # Preserve shaped subscripts until tensor SSA has selected its repository
+    # kernels. Scalar structural subscripts are addressed after that pass.
     module = IRModule(
         link_required_ssa_features(functions),
         recursion_table={
@@ -9823,7 +10410,11 @@ def lower_precompile_and_control_to_ssa(
     )
     tensor_reference_shortfalls = ()
     if tensor_ssa_reference is not None:
-        from .tensor_ssa_lowering import lower_tensor_calls_to_repository_ssa
+        from .tensor_ssa_lowering import (
+            legalize_aggregate_adapters,
+            lower_tensor_calls_to_repository_ssa,
+            propagate_repository_ssa_call_metadata,
+        )
 
         tensor_reference_shortfalls = tuple(
             SSALoweringShortfall(
@@ -9836,6 +10427,11 @@ def lower_precompile_and_control_to_ssa(
                 module, tensor_ssa_reference
             )
         )
+    from .ir_indexing import lower_indexing_to_ssa_addressing
+
+    lower_indexing_to_ssa_addressing(module.functions)
+    if tensor_ssa_reference is not None and legalize_aggregate_adapters(module):
+        propagate_repository_ssa_call_metadata(module)
     cycles = (
         *find_ssa_cycles(numerical),
         *find_ssa_cycles(control_function),

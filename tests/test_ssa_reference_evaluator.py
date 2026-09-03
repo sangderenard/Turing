@@ -101,6 +101,47 @@ def test_scalar_bit_shift_uses_the_planners_canonical_spelling():
     assert int(evaluated.returned[0]) == 48
 
 
+def test_string_token_preserves_the_compilers_exact_integer_identity():
+    from src.compiler.string_table import string_token
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    token = SSAValue(0, dtype="int64")
+    block = BasicBlock("entry", [
+        Instr(
+            "string_token", [], token,
+            attributes={"text": "maximum_substep_displacement_m"},
+        ),
+        Instr("Ret", [token], None),
+    ])
+
+    class _Module:
+        functions = {"f": Function("f", [], {"entry": block})}
+
+    evaluated = SSAReferenceEvaluator(_Module()).run("f", {})
+
+    assert int(evaluated.returned[0]) == string_token(
+        "maximum_substep_displacement_m"
+    )
+
+
+def test_linked_math_intrinsic_uses_backend_equivalent_semantics():
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    angle = SSAValue(0, dtype="float64")
+    result = SSAValue(1, dtype="float64")
+    block = BasicBlock("entry", [
+        Instr("Call", [angle], result, attributes={"callee": "cos"}),
+        Instr("Ret", [result], None),
+    ])
+
+    class _Module:
+        functions = {"f": Function("f", [angle], {"entry": block})}
+
+    evaluated = SSAReferenceEvaluator(_Module()).run("f", {0: 0.25})
+
+    assert float(evaluated.returned[0]) == pytest.approx(np.cos(0.25), abs=0)
+
+
 def test_reading_an_undefined_value_raises():
     """A use its definition does not dominate is a defect, not a zero."""
     from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
@@ -114,6 +155,60 @@ def test_reading_an_undefined_value_raises():
 
     with pytest.raises(SSAEvaluationError, match="before it was defined"):
         SSAReferenceEvaluator(_Module()).run("f", {})
+
+
+def test_repository_output_argument_allocates_caller_owned_result_storage():
+    """An out-param is storage declared by the call, not an undefined read."""
+    from src.transmogrifier.ssa import BasicBlock, Function, Instr, SSAValue
+
+    left = SSAValue(0, "float64")
+    right = SSAValue(1, "float64")
+    output = SSAValue(2, "float64")
+    count = SSAValue(3, "int32")
+    index = SSAValue(4, "int64")
+    address = SSAValue(5, "ptr")
+    summed = SSAValue(6, "float64")
+    helper = Function("out_helper", [left, right, output, count], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], index, attributes={"llvm_literal": "i64 0"}),
+            Instr("GetElementPtr", [output, index], address),
+            Instr("Add", [left, right], summed),
+            Instr("Store", [summed, address], None),
+            Instr("Ret", [], None),
+        ]),
+    }, metadata={
+        "llvm_argument_names": ("a", "b", "out", "n"),
+        "ssa_output_argument": 2,
+    })
+
+    caller_left = SSAValue(10, "float64")
+    caller_right = SSAValue(11, "float64")
+    caller_output = SSAValue(12, "float64")
+    caller_count = SSAValue(13, "int32")
+    caller = Function("caller", [caller_left, caller_right], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], caller_count, attributes={"llvm_literal": "i32 1"}),
+            Instr(
+                "Call",
+                [caller_left, caller_right, caller_output, caller_count],
+                caller_output,
+                attributes={
+                    "callee": helper.name,
+                    "ssa_output_argument": 2,
+                },
+            ),
+            Instr("Ret", [caller_output], None),
+        ]),
+    })
+
+    class _Module:
+        functions = {caller.name: caller, helper.name: helper}
+
+    evaluated = SSAReferenceEvaluator(_Module()).run(
+        caller.name, {10: 2.5, 11: 4.0},
+    )
+
+    assert np.asarray(evaluated.returned[0]).tolist() == [6.5]
 
 
 # -- calibration against independently known truth ------------------------

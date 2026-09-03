@@ -225,10 +225,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--unit-timeout-seconds", type=float, default=300.0,
+        "--unit-timeout-seconds", type=float, default=0.0,
         help=(
             "terminate and record a unit after this many seconds "
-            "(default: 300; use 0 to disable)"
+            "(default: disabled; use a positive value to opt in)"
         ),
     )
     parser.add_argument(

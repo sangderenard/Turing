@@ -142,6 +142,13 @@ PRECOMPILE_TO_SSA: dict[str, Handler] = {
     "less_equal": Handler.Le,
     "greater": Handler.Gt,
     "greater_equal": Handler.Ge,
+    # AbstractTensor.tensor(value) is an idempotent schema normalization at
+    # this already-typed SSA boundary.  CastLike preserves the value while
+    # carrying the result dtype selected by the captured metadata.  The same
+    # instruction is the direct repository-SSA spelling of _restore_type's
+    # captured cast_like identity.
+    "tensor": Handler.CastLike,
+    "cast_like": Handler.CastLike,
     "int_trunc": Handler.Trunc,
     "trunc": Handler.Trunc,
     "zext": Handler.ZExt,

@@ -339,6 +339,45 @@ def test_structural_fold_does_not_specialize_a_public_parameter_default():
     assert graph.G.out_degree(input_id) > 0
 
 
+def test_structural_fold_treats_specialized_scalar_tensor_as_non_none():
+    graph = _function_graph(
+        "def select_reference(dt, ref=None):\n"
+        "    ref = dt if ref is None else ref\n"
+        "    return ref\n",
+        "select_reference",
+    )
+    ref_input_id = next(
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "ref"
+    )
+    graph.G.graph["parameter_value_abi"] = {
+        "ref": {
+            "storage": "scalar",
+            "dtype": "float64",
+            "rank": 0,
+            "python_type": "builtins.float",
+        },
+    }
+    if_exp_id = next(
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.IfExp)
+    )
+    graph.G.nodes[if_exp_id].setdefault("attributes", {})[
+        "loop_carried_bindings"
+    ] = {"ref": (ref_input_id, ref_input_id)}
+
+    _fold_callsite_structural_values(graph)
+
+    assert not any(
+        isinstance(data.get("expr_obj"), ast.IfExp)
+        for _node_id, data in graph.G.nodes(data=True)
+    )
+    assert ref_input_id in graph.G
+
+
 def test_grounded_method_resolution_uses_declared_parameter_record_identity():
     graph = ProcessGraph(materialize_memory=False)
     with contextlib.redirect_stdout(io.StringIO()):

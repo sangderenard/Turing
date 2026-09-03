@@ -65,6 +65,28 @@ static void pool_notify_all(turing_pool_cond* cond) {
 
 #define TURING_POOL_MAX_WORKERS 64
 
+// Numerical determinism across threads: on x86 the MXCSR control register
+// (flush-to-zero / denormals-are-zero, rounding mode) is PER THREAD, and a
+// host process often runs with FTZ set on its main thread while fresh
+// workers get the architectural default.  Denormal-range arithmetic then
+// differs by which thread claimed a lane -- observed as run-to-run
+// non-reproducibility at ~1e-309 magnitudes.  Every frame therefore
+// carries the DEPLOYING thread's control word, and each drainer adopts it
+// for the duration of the frame, so pooled execution is bitwise identical
+// to the deploying thread running the same schedule serially.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <xmmintrin.h>
+#define TURING_POOL_HAS_FPENV 1
+typedef unsigned int turing_fp_env;
+static turing_fp_env turing_fp_env_get(void) { return _mm_getcsr(); }
+static void turing_fp_env_set(turing_fp_env env) { _mm_setcsr(env); }
+#else
+#define TURING_POOL_HAS_FPENV 0
+typedef int turing_fp_env;
+static turing_fp_env turing_fp_env_get(void) { return 0; }
+static void turing_fp_env_set(turing_fp_env env) { (void)env; }
+#endif
+
 typedef struct {
     turing_lane_fn fn;
     void* context;
@@ -73,6 +95,7 @@ typedef struct {
     long cursor;
     long completed;
     long observers;
+    turing_fp_env fp_env;
 } turing_pool_frame;
 
 static turing_pool_lock g_lock = TURING_POOL_LOCK_INIT;
@@ -88,11 +111,14 @@ static TURING_POOL_TLS int t_in_lane = 0;
 // from the deploying thread; with zero workers this loop on the deploying
 // thread IS the serial fallback.
 static void pool_drain(turing_pool_frame* frame) {
+    turing_fp_env entry_env = turing_fp_env_get();
+    turing_fp_env_set(frame->fp_env);
     for (;;) {
         long index;
         pool_lock(&g_lock);
         if (frame->cursor >= frame->total) {
             pool_unlock(&g_lock);
+            turing_fp_env_set(entry_env);
             return;
         }
         index = frame->cursor++;
@@ -210,6 +236,7 @@ int turing_pool_deploy(turing_lane_fn fn, void* context, long lane_count,
     frame.cursor = 0;
     frame.completed = 0;
     frame.observers = 0;
+    frame.fp_env = turing_fp_env_get();
 
     pool_lock(&g_lock);
     while (g_frame != NULL) {
@@ -269,6 +296,15 @@ int turing_pool_deploy_span(turing_span_fn fn, void* context, long item_count,
     span.chunk_size = chunk_size;
     return turing_pool_deploy(turing_span_lane, &span, claims, 1);
 }
+
+// Dedicated lock for order-insensitive lane effects (see turing_pool.h).
+// Never shared with g_lock: effect sections run inside lanes, and lanes
+// must be free to take this lock while the scheduler lock cycles around
+// claim bookkeeping on other threads.
+static turing_pool_lock g_effect_lock = TURING_POOL_LOCK_INIT;
+
+void turing_pool_effect_lock(void) { pool_lock(&g_effect_lock); }
+void turing_pool_effect_unlock(void) { pool_unlock(&g_effect_lock); }
 
 void turing_pool_stop(void) {
     int count;

@@ -74,6 +74,7 @@ from .control_source import (
     project_control_regions,
 )
 from .hierarchical_control import compose_hierarchical_control
+from .process_graph_value_ids import next_process_value_id
 from .hierarchical_plan import (
     PlanCall,
     PlanClosure,
@@ -162,13 +163,35 @@ def _dependency_order(graph: Any) -> tuple[int, ...]:
     """
 
     G = graph.G
-    fingerprint = (G.number_of_nodes(), G.number_of_edges())
+    semantic_parent_edges = tuple(
+        (int(parent), int(node_id))
+        for node_id, data in G.nodes(data=True)
+        for parent, _role in (data.get("parents") or ())
+        if int(parent) in G and int(parent) != int(node_id)
+    )
+    semantic_fingerprint = sum(
+        ((left * 1_000_003) ^ right)
+        for left, right in semantic_parent_edges
+    )
+    # Counts alone collide: removing two dead constants and adding two
+    # edge-less member inputs leaves every count and the edge hash unchanged
+    # while the node identity set differs, so a stale order would name nodes
+    # that no longer exist.  The identity set is part of the fingerprint.
+    node_fingerprint = sum(
+        (int(node_id) * 1_000_003) ^ (int(node_id) >> 3) for node_id in G
+    )
+    fingerprint = (
+        G.number_of_nodes(), G.number_of_edges(),
+        len(semantic_parent_edges), semantic_fingerprint, node_fingerprint,
+    )
     cached = G.graph.get("_dependency_order_cache")
     if cached is not None and cached[0] == fingerprint:
         return cached[1]
+    dependency_graph = G.copy()
+    dependency_graph.add_edges_from(semantic_parent_edges)
     try:
         order = tuple(nx.lexicographical_topological_sort(
-            G, key=lambda value_id: int(value_id)
+            dependency_graph, key=lambda value_id: int(value_id)
         ))
     except nx.NetworkXUnfeasible:
         recursive = G.graph.get("recursion_table")
@@ -1617,6 +1640,85 @@ def _method_parameter_layout(graph: Any) -> tuple[
     return receiver, call_positional, all_parameters
 
 
+def _authored_aggregate_leaves(graph: Any, value_id: int) -> tuple[int, ...]:
+    """Return the exact leaf ledger for an authored aggregate value.
+
+    ``*value`` has its own AST node, while the aggregate ledger belongs to
+    ``value``. Follow only that explicit Starred-to-value edge; absence of a
+    ledger is absence of a compiler fact and must not trigger reconstruction
+    from shapes, names, or neighboring values.
+    """
+
+    value_id = int(value_id)
+    if value_id not in graph.G:
+        return ()
+    data = graph.G.nodes[value_id]
+    attributes = data.get("attributes") or {}
+    leaves = tuple(map(int, attributes.get("aggregate_leaf_value_ids", ())))
+    if leaves:
+        return leaves
+    if not isinstance(data.get("expr_obj"), ast.Starred):
+        return ()
+    sources = tuple(
+        int(parent)
+        for parent, role in data.get("parents") or ()
+        if str(role) in {"value", "operand", "arg:0"}
+    )
+    if len(sources) != 1 or sources[0] not in graph.G:
+        return ()
+    source_attributes = graph.G.nodes[sources[0]].get("attributes") or {}
+    return tuple(map(
+        int, source_attributes.get("aggregate_leaf_value_ids", ()),
+    ))
+
+
+def _expanded_callsite_argument_edges(
+    graph: Any, node_id: int,
+) -> tuple[tuple[int, str], ...]:
+    """Apply Python's positional ``*aggregate`` binding to graph edges.
+
+    Expansion is permitted only from ProcessGraph's authored aggregate-leaf
+    ledger. An unrecorded aggregate remains unexpanded so the missing source
+    identity becomes an honest call-boundary error instead of an inferred ABI.
+    """
+
+    raw = tuple(
+        (int(parent), str(role))
+        for parent, role in graph.G.nodes[int(node_id)].get("parents") or ()
+        if str(role) not in {"callee", "func", "definition"}
+    )
+    positional = sorted(
+        (
+            (_positional_argument_index(role), parent)
+            for parent, role in raw
+            if _positional_argument_index(role) is not None
+        ),
+        key=lambda item: int(item[0]),
+    )
+    non_positional = tuple(
+        (parent, role)
+        for parent, role in raw
+        if _positional_argument_index(role) is None
+    )
+    expanded: list[tuple[int, str]] = []
+    next_position = 0
+    for original_position, parent in positional:
+        next_position = max(next_position, int(original_position))
+        parent_data = graph.G.nodes.get(int(parent), {})
+        if isinstance(parent_data.get("expr_obj"), ast.Starred):
+            leaves = _authored_aggregate_leaves(graph, int(parent))
+            if leaves:
+                expanded.extend(
+                    (leaf, f"arg:{next_position + offset}")
+                    for offset, leaf in enumerate(leaves)
+                )
+                next_position += len(leaves)
+                continue
+        expanded.append((int(parent), f"arg:{next_position}"))
+        next_position += 1
+    return (*expanded, *non_positional)
+
+
 def _declared_output_terminals(
     graph: Any,
     *,
@@ -1705,10 +1807,62 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
     """Freeze call/region ownership before backend source composition."""
 
     graph = shell.process_graph
+    # The plan freezes tensor descriptors into ``PlanClosure.value_shapes``.
+    # Some catalogue and callsite shells are constructed before their
+    # ProgramABI descriptors arrive; freezing them at that point permanently
+    # records reshape results as scalars even though the graph can now resolve
+    # their structural shape tuples. Make the documented ordering invariant
+    # local to the freeze operation itself. The fold is structural,
+    # idempotent, and executes no numerical source code.
+    if graph.G.graph.get("function_name"):
+        _fold_callsite_structural_values(graph)
+    # An Indexed successor used to unpack a multi-result source call is a
+    # call-boundary projection, not a numerical gather owned by a region.
+    # Dispatch regions can be carved before callsite shells are attached, so
+    # remove these exact projection nodes when freezing final ownership. If
+    # both the PlanCall and a stale region produce the same caller value, the
+    # repository-SSA type linker sees two physical definitions and can
+    # oscillate between their shapes indefinitely.
+    def call_result_projections(value_id: int) -> set[int]:
+        # Every literal-index projection below a call result is a structural
+        # path onto that call's outputs: ``r[1]`` (an intermediate aggregate
+        # with no physical value of its own) as much as ``r[1][0]`` (a bound
+        # leaf).  None of them is an operator a region may compute.
+        found: set[int] = set()
+        pending = [int(value_id)]
+        while pending:
+            current = pending.pop()
+            for successor in graph.G.successors(current):
+                successor_data = graph.G.nodes[successor]
+                if str(
+                    successor_data.get("op")
+                    or successor_data.get("type")
+                    or ""
+                ).casefold() != "indexed":
+                    continue
+                if not any(
+                    str(role) in {"value", "base", "operand", "object"}
+                    and int(parent) == current
+                    for parent, role in successor_data.get("parents") or ()
+                ):
+                    continue
+                if int(successor) in found:
+                    continue
+                found.add(int(successor))
+                pending.append(int(successor))
+        return found
+
+    call_result_projection_ids = {
+        projection
+        for callsite_id in shell.callsite_function_shells
+        if int(callsite_id) in graph.G
+        for projection in call_result_projections(int(callsite_id))
+    }
     region_by_node = {
         int(node_id): int(region_index)
         for region_index, subgraph in enumerate(shell.dispatch_subgraphs)
         for node_id in subgraph.G.graph.get("deployment_nodes", ())
+        if int(node_id) not in call_result_projection_ids
     }
     emitted_regions = set()
     items = []
@@ -1791,13 +1945,7 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         if child is not None:
             call_attributes = graph.G.nodes[node_id].get("attributes") or {}
             constructor_call = call_attributes.get("constructor_ref") is not None
-            call_parents = tuple(
-                (int(parent), str(role))
-                for parent, role in (
-                    graph.G.nodes[node_id].get("parents") or ()
-                )
-                if str(role) not in {"callee", "func", "definition"}
-            )
+            call_parents = _expanded_callsite_argument_edges(graph, node_id)
             parents = tuple(parent for parent, _role in call_parents)
             child_graph = child.process_graph.G
             child_identities = (
@@ -1860,6 +2008,12 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     and parent_operation not in {"loopresult", "loopexit"}
                 ):
                     call_position = source_position(int(node_id))
+                    # ``state, out = f(state)`` spells its targets left of
+                    # the call.  A definition that consumes this call's
+                    # result is a successor of the call, so it can never be
+                    # a preceding definition regardless of its column; using
+                    # it feeds the call its own result and leaves the loop
+                    # carry without a producer.
                     candidates = [
                         int(definition)
                         for definition in caller_identities.get(
@@ -1867,6 +2021,9 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                         )
                         if (
                             int(definition) in order_index
+                            and not nx.has_path(
+                                graph.G, int(node_id), int(definition)
+                            )
                             and (
                                 call_position is not None
                                 and source_position(int(definition)) is not None
@@ -1908,10 +2065,61 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                 else:
                     name = None
                 identities = child_identities.get(name, ())
-                if identities:
-                    argument_bindings.append(
-                        (parent, int(identities[0]))
+                caller_leaves = _authored_aggregate_leaves(
+                    graph, int(parent),
+                )
+                # Member formals materialized for an aggregate parameter
+                # carry their exact member index.  They outlive the
+                # shapeless aggregate formal, which is dropped once every
+                # authored projection reads its member directly, so the
+                # member binding must not depend on that formal's identity.
+                member_inputs = {
+                    int(member_attributes["aggregate_index"]): int(member_id)
+                    for member_id, member_data in child_graph.nodes(data=True)
+                    if member_data.get("type") == "Input"
+                    and str(
+                        (member_data.get("attributes") or {}).get(
+                            "aggregate_parent_binding"
+                        )
+                    ) == str(name)
+                    for member_attributes in (
+                        member_data.get("attributes") or {},
                     )
+                    if member_attributes.get("aggregate_index") is not None
+                }
+                if member_inputs:
+                    if not caller_leaves or max(member_inputs) >= len(
+                        caller_leaves
+                    ):
+                        raise ValueError(
+                            f"aggregate call binding for {name!r} names "
+                            f"member {max(member_inputs)} but the caller "
+                            f"aggregate has {len(caller_leaves)} leaves"
+                        )
+                    for index in sorted(member_inputs):
+                        argument_bindings.append((
+                            int(caller_leaves[index]), member_inputs[index],
+                        ))
+                if identities and not member_inputs:
+                    # With member formals bound above, the aggregate itself
+                    # has no physical storage to pass: the callee's formal is
+                    # the tuple of its members.  Binding it too would turn an
+                    # authored tuple node into an untyped caller argument.
+                    child_input = int(identities[0])
+                    argument_bindings.append((parent, child_input))
+                    child_leaves = _authored_aggregate_leaves(
+                        child.process_graph, child_input,
+                    )
+                    if caller_leaves or child_leaves:
+                        if len(caller_leaves) != len(child_leaves):
+                            raise ValueError(
+                                f"aggregate call binding for {name!r} has "
+                                "different caller/callee arity: "
+                                f"{len(caller_leaves)} != {len(child_leaves)}"
+                            )
+                        argument_bindings.extend(zip(
+                            caller_leaves, child_leaves, strict=True,
+                        ))
             bound_child_inputs = {
                 int(child_input)
                 for _caller, child_input in argument_bindings
@@ -1931,6 +2139,9 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     for definition in caller_identities.get(name, ())
                     if (
                         int(definition) in order_index
+                        and not nx.has_path(
+                            graph.G, int(node_id), int(definition)
+                        )
                         and (
                             (
                                 call_position is not None
@@ -1981,11 +2192,33 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                 )))
             if not child_outputs:
                 child_outputs = direct_return_value_ids(child_graph)
-            unpacked = {}
-            for successor in graph.G.successors(node_id):
-                successor_data = graph.G.nodes[successor]
+            # A returned aggregate is a structural path, not one position in
+            # a flat list.  ``return total, (hub, angle), valid`` has leaf
+            # paths (0,), (1, 0), (1, 1), (2,); the caller's ``r[1][0]`` is
+            # the projection path (1, 0).  Expanding the callee leaves and
+            # zipping them against the caller's first-level projections
+            # shifts every member after the aggregate onto the wrong result.
+            child_output_paths: dict[tuple[int, ...], int] = {}
+
+            def expand_child_output(
+                path: tuple[int, ...], value_id: int,
+            ) -> None:
+                leaves = _authored_aggregate_leaves(
+                    child.process_graph, int(value_id),
+                )
+                if not leaves:
+                    child_output_paths[path] = int(value_id)
+                    return
+                for index, leaf in enumerate(leaves):
+                    expand_child_output((*path, int(index)), int(leaf))
+
+            for position, child_output in enumerate(child_outputs):
+                expand_child_output((int(position),), int(child_output))
+
+            def literal_projection_index(successor: int) -> int | None:
+                successor_data = graph.G.nodes[int(successor)]
                 if str(successor_data.get("op", "")).lower() != "indexed":
-                    continue
+                    return None
                 index_parents = tuple(
                     int(parent)
                     for parent, role in (
@@ -1993,24 +2226,45 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     )
                     if str(role) == "index"
                 )
-                if not index_parents:
-                    continue
+                if len(index_parents) != 1:
+                    return None
                 index_data = graph.G.nodes[index_parents[0]]
                 index_value = index_data.get("constant")
                 if index_value is None:
                     index_value = (
                         index_data.get("attributes") or {}
                     ).get("value")
-                if isinstance(index_value, int):
-                    unpacked[int(index_value)] = int(successor)
-            if len(child_outputs) == 1:
-                result_bindings = ((child_outputs[0], int(node_id)),)
+                if isinstance(index_value, bool) or not isinstance(
+                    index_value, int
+                ):
+                    return None
+                return int(index_value)
+
+            caller_projection_paths: dict[tuple[int, ...], int] = {}
+
+            def collect_caller_projections(
+                path: tuple[int, ...], value_id: int,
+            ) -> None:
+                for successor in graph.G.successors(int(value_id)):
+                    index = literal_projection_index(int(successor))
+                    if index is None:
+                        continue
+                    projection_path = (*path, index)
+                    caller_projection_paths[projection_path] = int(successor)
+                    collect_caller_projections(projection_path, int(successor))
+
+            collect_caller_projections((), int(node_id))
+            if tuple(child_output_paths) == ((0,),):
+                result_bindings = (
+                    (child_output_paths[(0,)], int(node_id)),
+                )
             else:
                 result_bindings = tuple(
-                    (child_output, unpacked[index])
-                    for index, child_output in enumerate(child_outputs)
-                    if index in unpacked
+                    (child_output_paths[path], caller_projection_paths[path])
+                    for path in child_output_paths
+                    if path in caller_projection_paths
                 )
+            child_outputs = tuple(child_output_paths.values())
             items.append(PlanCall(
                 int(node_id),
                 _build_shell_hierarchy_plan(child),
@@ -2042,6 +2296,7 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         region_nodes = tuple(
             int(value)
             for value in subgraph.G.graph.get("deployment_nodes", ())
+            if int(value) not in call_result_projection_ids
         )
         original_region_node_set = set(region_nodes)
         carried_initial_boundaries = {
@@ -2061,6 +2316,47 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
             if value_id not in carried_initial_boundaries
         )
         region_node_set = set(region_nodes)
+
+        def numerical_region_parents(
+            node_id: int,
+        ) -> tuple[tuple[int, str], ...]:
+            """Expose structural tensor-call leaves at the numerical ABI.
+
+            A Python list/tuple is one source argument, but stack/cat consume
+            each tensor element as a separate numerical operand.  The graph's
+            aggregate leaf ledger is the exact authored correspondence; the
+            container identity itself is coordinator storage and must not
+            replace those producers at a numerical region cut.
+            """
+
+            node_data = graph.G.nodes[int(node_id)]
+            operation = str(
+                node_data.get("op") or node_data.get("type") or ""
+            )
+            expanded: list[tuple[int, str]] = []
+            for parent, role in node_data.get("parents") or ():
+                parent = int(parent)
+                parent_data = graph.G.nodes.get(parent, {})
+                attributes = parent_data.get("attributes") or {}
+                leaves = tuple(map(
+                    int,
+                    attributes.get("aggregate_leaf_value_ids", ()),
+                ))
+                if (
+                    operation in {"stack", "cat", "concat"}
+                    and str(role).startswith("arg")
+                    and attributes.get("producer_kind") == "aggregate"
+                    and attributes.get("aggregate_kind") in {"list", "tuple"}
+                    and leaves
+                ):
+                    expanded.extend(
+                        (leaf, f"{role}:element:{index}")
+                        for index, leaf in enumerate(leaves)
+                    )
+                else:
+                    expanded.append((parent, str(role)))
+            return tuple(expanded)
+
         # Loop-port materialization can rewrite a region's live parents after
         # its dispatch subgraph was first carved. Recompute region captures
         # from the authoritative current graph instead of
@@ -2069,9 +2365,7 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
             *(
                 int(parent)
                 for node_id in region_nodes
-                for parent, _role in (
-                    graph.G.nodes[node_id].get("parents") or ()
-                )
+                for parent, _role in numerical_region_parents(node_id)
                 if int(parent) not in region_node_set
             ),
         )))
@@ -2275,10 +2569,7 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         for value in region_nodes:
             node_data = graph.G.nodes[value]
             expression = node_data.get("expr_obj")
-            parents = tuple(
-                (int(parent), str(role))
-                for parent, role in (node_data.get("parents") or ())
-            )
+            parents = numerical_region_parents(value)
             opcode = str(node_data.get("op") or node_data.get("type"))
             line_attributes = dict(node_data.get("attributes") or {})
             if isinstance(expression, ast.Attribute):
@@ -2479,6 +2770,7 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                 operation = str(
                     attributes.get("tensor")
                     or attributes.get("tensor_operation")
+                    or attributes.get("tensor_candidate")
                     or node.get("op")
                     or node.get("type")
                     or ""
@@ -2564,13 +2856,18 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     "greater", "greater_equal", "equal", "not_equal",
                     "maximum", "minimum", "where", "float", "double",
                     "long", "int", "to", "to_dtype", "astype", "cbrt",
+                    "zeros_like", "empty_like", "ones_like", "full_like",
                 }:
                     shaped = [candidate for candidate in parent_shapes if candidate]
                     if shaped:
-                        logical = max(
-                            shaped,
-                            key=lambda candidate: (len(candidate), candidate),
-                        )
+                        try:
+                            logical = tuple(np.broadcast_shapes(*shaped))
+                        except ValueError:
+                            # Preserve the declared descriptor for an invalid
+                            # expression.  Kernel lowering will report the
+                            # incompatible operands precisely; choosing one
+                            # tuple here would fabricate a region ABI.
+                            pass
                     if parent_dtypes and not tensor.get("dtype"):
                         numeric_dtypes = {
                             "int" if candidate in {"i32", "int32"}
@@ -2608,11 +2905,20 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                 if operation == "matmul" and len(parent_shapes) >= 2:
                     left_shape, right_shape = parent_shapes[:2]
                     if (
-                        len(left_shape) == 2
-                        and len(right_shape) == 2
-                        and left_shape[1] == right_shape[0]
+                        len(left_shape) >= 2
+                        and len(right_shape) >= 2
+                        and left_shape[-1] == right_shape[-2]
                     ):
-                        logical = (left_shape[0], right_shape[1])
+                        try:
+                            batch_shape = tuple(np.broadcast_shapes(
+                                left_shape[:-2], right_shape[:-2]
+                            ))
+                        except ValueError:
+                            pass
+                        else:
+                            logical = (
+                                *batch_shape, left_shape[-2], right_shape[-1]
+                            )
                 _shape_dtype_cache[current] = (logical, dtype)
                 states[current] = 2
             logical, dtype = _shape_dtype_cache.get(
@@ -6674,15 +6980,28 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
     or to mix two branches of the same test with each other.
     """
 
+    # ``ast.Load``/``ast.Store`` and operator/context nodes are locationless
+    # singleton helpers.  They are shared by otherwise unrelated expressions,
+    # so correlating them by object identity (or by their identical dump)
+    # makes one small branch appear to guard every name load in the function.
+    # Branch ownership belongs only to source-positioned syntax.  Real names,
+    # calls, expressions, and statements all carry ``lineno``; helper tokens
+    # do not.
+    def source_positioned(expression: Any) -> bool:
+        return (
+            isinstance(expression, ast.AST)
+            and getattr(expression, "lineno", None) is not None
+        )
+
     expression_nodes = {
         id(data.get("expr_obj")): node_id
         for node_id, data in graph.G.nodes(data=True)
-        if isinstance(data.get("expr_obj"), ast.AST)
+        if source_positioned(data.get("expr_obj"))
     }
     signature_nodes: dict[tuple[Any, ...], set[int]] = {}
     for node_id, data in graph.G.nodes(data=True):
         expression = data.get("expr_obj")
-        if isinstance(expression, ast.AST):
+        if source_positioned(expression):
             signature_nodes.setdefault(
                 _ast_source_signature(expression), set()
             ).add(int(node_id))
@@ -6719,6 +7038,8 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
         for role, statements in branches.items():
             for statement in statements:
                 for member in ast.walk(statement):
+                    if not source_positioned(member):
+                        continue
                     guarded_nodes = (
                         (int(expression_nodes[id(member)]),)
                         if id(member) in expression_nodes
@@ -6829,6 +7150,15 @@ def _ordinary_conditional_control_programs(
             if int(region_index) in retained
             for subgraph in (subgraphs[int(region_index)],)
             if predicate_dependencies.intersection(map(
+                int, subgraph.G.graph.get("deployment_nodes", ())
+            ))
+        )
+        predicate_terminal_regions = tuple(
+            region_index
+            for region_index in retained_regions
+            if int(region_index) in retained
+            for subgraph in (subgraphs[int(region_index)],)
+            if int(predicate_id) in set(map(
                 int, subgraph.G.graph.get("deployment_nodes", ())
             ))
         )
@@ -6946,10 +7276,20 @@ def _ordinary_conditional_control_programs(
         # or owned by an enclosing arm. Leave them in the flat dependency
         # schedule whenever this conditional has real arm regions.
         predicate_owned = not arm_regions
+        # A structural-only arm still needs the region that materializes its
+        # predicate under conditional control, but the predicate's transitive
+        # numerical ancestors are ordinary dataflow predecessors.  Owning all
+        # of them here pulls an enclosing loop (and often the function prefix)
+        # into a post-loop ``if`` merely because its test reads a carried
+        # result.  Leave those predecessor regions in the flat dependency
+        # schedule and claim only the region containing the predicate value.
+        owned_predicate_regions = (
+            predicate_terminal_regions if predicate_owned else ()
+        )
         root = SequenceBlock((
             *(
                 StatementBlock((f"__scheduled_region_{index}__",))
-                for index in predicate_regions if predicate_owned
+                for index in owned_predicate_regions
             ),
             ConditionalBlock(
                 int(predicate_value_id), body, orelse,
@@ -6963,7 +7303,7 @@ def _ordinary_conditional_control_programs(
         programs.append(ControlProgram(
             root=root,
             region_indices=tuple(dict.fromkeys((
-                *(predicate_regions if predicate_owned else ()),
+                *owned_predicate_regions,
                 *arm_regions,
             ))),
         ))
@@ -13807,7 +14147,9 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                 continue
             _receiver, positional, _all = _method_parameter_layout(callee.G)
             bound_parameters: set[str] = set()
-            for parent, role_value in data.get("parents") or ():
+            for parent, role_value in _expanded_callsite_argument_edges(
+                caller, int(_node_id),
+            ):
                 role = str(role_value)
                 position = _positional_argument_index(role)
                 parameter = (
@@ -13882,9 +14224,128 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
     graphs.extend(
         entry.graph for entry in function_table if entry.graph is not None
     )
+
+    def call_result_descriptor(
+        caller: Any,
+        node_id: int,
+        callee: Any,
+    ) -> tuple[dict[str, Any] | None, ...]:
+        """Infer the ordered tensor returns of an exact callsite."""
+
+        _receiver, positional, _all = _method_parameter_layout(callee.G)
+        descriptors: dict[str, dict[str, Any]] = {}
+        aggregate_descriptors: dict[
+            str, tuple[dict[str, Any] | None, ...]
+        ] = {}
+        specializations: dict[str, Any] = {}
+        bound_parameters: set[str] = set()
+        for parent, role_value in _expanded_callsite_argument_edges(
+            caller, int(node_id),
+        ):
+            role = str(role_value)
+            position = _positional_argument_index(role)
+            parameter = (
+                positional[position]
+                if position is not None and position < len(positional)
+                else role[3:] if role.startswith("kw:") else None
+            )
+            if parameter is None:
+                continue
+            parameter = str(parameter)
+            bound_parameters.add(parameter)
+            descriptor = _tensor_descriptor(caller, int(parent))
+            if descriptor is not None:
+                descriptors[parameter] = descriptor
+            static_argument = _source_static_value(caller, int(parent))
+            leaves = _authored_aggregate_leaves(caller, int(parent))
+            if leaves and not static_argument and all(
+                int(leaf) in caller.G for leaf in leaves
+            ):
+                # Same member-identity rule as callsite specialization: the
+                # callee's return descriptors may depend on aggregate members
+                # (``previous_hub, ... = history``), so the propagation copy
+                # must see those members bound, not an opaque formal.
+                aggregate_descriptors[parameter] = tuple(
+                    None if item is None else copy.deepcopy(dict(item))
+                    for item in (
+                        _tensor_descriptor(caller, int(leaf))
+                        for leaf in leaves
+                    )
+                )
+            if static_argument:
+                try:
+                    specializations[parameter] = _source_static_literal(
+                        caller, int(parent)
+                    )
+                except ValueError:
+                    pass
+        for parameter, default in (
+            callee.G.graph.get("parameter_defaults") or {}
+        ).items():
+            if str(parameter) not in bound_parameters:
+                specializations[str(parameter)] = copy.deepcopy(default)
+        if not descriptors and not aggregate_descriptors:
+            return ()
+        specialized = extract_clean_process_subgraph(callee, callee.G)
+        specialized.G.graph["planner_specializations"] = copy.deepcopy(
+            specializations
+        )
+        specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
+            descriptors
+        )
+        _apply_callsite_tensor_descriptors(specialized, descriptors)
+        _apply_callsite_aggregate_descriptors(
+            specialized, aggregate_descriptors,
+        )
+        if not _expand_specialized_unbroadcast_identity(specialized):
+            _fold_callsite_structural_values(specialized)
+        output_descriptors: list[dict[str, Any] | None] = []
+        identities = specialized.G.graph.get("identity_table") or {}
+        for output_name in specialized.G.graph.get("function_outputs") or ():
+            output_ids = tuple(identities.get(str(output_name), ()))
+            value_id = next((
+                int(candidate)
+                for candidate in reversed(output_ids)
+                if int(candidate) in specialized.G
+            ), None)
+            if value_id is None:
+                output_descriptors.append(None)
+                continue
+            nested = (
+                specialized.G.nodes[value_id].get("attributes") or {}
+            ).get("tensor_output_descriptors")
+            if nested:
+                output_descriptors.extend(
+                    copy.deepcopy(tuple(nested))
+                )
+            else:
+                output_descriptors.append(
+                    _structured_output_descriptor(specialized, value_id)
+                )
+
+        def any_descriptor(item: Any) -> bool:
+            if isinstance(item, tuple):
+                return any(any_descriptor(member) for member in item)
+            return item is not None
+
+        return (
+            tuple(copy.deepcopy(output_descriptors))
+            if any(any_descriptor(item) for item in output_descriptors)
+            else ()
+        )
+
     changed = True
     while changed:
         changed = False
+        # The outer catalogue graph owns the function table, but its entry
+        # graphs own the parameter ABI and numerical dependencies.  Settle
+        # each caller locally before reading its call arguments; otherwise a
+        # shaped ``material_state[:, :, 3]`` still looks scalar here and only
+        # a later backend happens to rediscover its extent after the call ABI
+        # has already been frozen.
+        for caller in graphs:
+            if caller.G.graph.get("function_name"):
+                _fold_callsite_structural_values(caller)
         candidates: dict[tuple[int, str], list[dict[str, Any]]] = {}
         for caller in graphs:
             for _node_id, data in caller.G.nodes(data=True):
@@ -13898,8 +14359,29 @@ def _propagate_callsite_tensor_specializations(graph: Any) -> None:
                     continue
                 if callee is None:
                     continue
+                if _tensor_descriptor(caller, int(_node_id)) is None:
+                    result_descriptors = call_result_descriptor(
+                        caller, int(_node_id), callee
+                    )
+                    if len(result_descriptors) == 1 and (
+                        result_descriptors[0] is not None
+                    ):
+                        data["tensor"] = result_descriptors[0]
+                        changed = True
+                    elif result_descriptors:
+                        attributes = dict(data.get("attributes") or {})
+                        if attributes.get(
+                            "tensor_output_descriptors"
+                        ) != result_descriptors:
+                            attributes["tensor_output_descriptors"] = (
+                                result_descriptors
+                            )
+                            data["attributes"] = attributes
+                            changed = True
                 _receiver, positional, _all = _method_parameter_layout(callee.G)
-                for parent, role_value in data.get("parents") or ():
+                for parent, role_value in _expanded_callsite_argument_edges(
+                    caller, int(_node_id),
+                ):
                     role = str(role_value)
                     position = _positional_argument_index(role)
                     parameter = (
@@ -14130,6 +14612,73 @@ class _ProgramABIValueFact:
     token_vocabulary: tuple[str, ...] | None = None
 
 
+def _contains_program_abi_fact(value: Any) -> bool:
+    """Return whether a structural value carries a ProgramABI fact anywhere.
+
+    A fact describes runtime storage/type; it is not a literal.  An authored
+    aggregate whose members are facts (``history = (hub, angle)`` over span
+    parameters) is therefore a dataflow aggregate, never a foldable constant.
+    """
+
+    if isinstance(value, _ProgramABIValueFact):
+        return True
+    if isinstance(value, Mapping):
+        return any(
+            _contains_program_abi_fact(key) or _contains_program_abi_fact(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return any(_contains_program_abi_fact(item) for item in value)
+    return False
+
+
+def _structured_output_descriptor(graph: Any, value_id: int) -> Any:
+    """A tensor descriptor, or a nested tuple of them for an aggregate.
+
+    ``return total, (hub, angle), valid`` publishes ``(hub, angle)`` as one
+    output whose members are two tensors.  The structure is the exact leaf
+    ledger; nothing is inferred from shapes.
+    """
+
+    value_id = int(value_id)
+    if value_id not in graph.G:
+        return None
+    attributes = graph.G.nodes[value_id].get("attributes") or {}
+    leaves = tuple(map(int, attributes.get("aggregate_leaf_value_ids", ())))
+    if attributes.get("producer_kind") == "aggregate" and leaves:
+        return tuple(
+            _structured_output_descriptor(graph, leaf) for leaf in leaves
+        )
+    return _tensor_descriptor(graph, value_id)
+
+
+def _operand_descriptor(graph: Any, value_id: int) -> dict[str, Any] | None:
+    """A tensor descriptor, treating an authored scalar literal as rank 0."""
+
+    descriptor = _tensor_descriptor(graph, int(value_id))
+    if descriptor is not None:
+        return descriptor
+    node = graph.G.nodes.get(int(value_id), {})
+    if str(node.get("type")) not in {"Constant", "Const", "const"}:
+        return None
+    literal = node.get("constant")
+    if literal is None:
+        literal = (node.get("attributes") or {}).get("value")
+    if isinstance(literal, bool):
+        return {"shape": (), "dtype": "bool"}
+    if isinstance(literal, int):
+        return {"shape": (), "dtype": "int64"}
+    if isinstance(literal, float):
+        return {"shape": (), "dtype": "float64"}
+    return None
+
+
+_DTYPE_CAST_OPERATIONS = frozenset({
+    "to_dtype", "astype", "cast", "type_as", "to", "float", "double",
+    "int", "long", "bool_",
+})
+
+
 def _tensor_descriptor(
     graph: Any, node_id: int, _seen: set[int] | None = None,
 ) -> dict[str, Any] | None:
@@ -14141,10 +14690,117 @@ def _tensor_descriptor(
     if int(node_id) in seen:
         return None
     seen.add(int(node_id))
-    tensor = dict(graph.G.nodes[int(node_id)].get("tensor") or {})
+    data = graph.G.nodes[int(node_id)]
+    tensor = dict(data.get("tensor") or {})
     if "shape" not in tensor:
-        data = graph.G.nodes[int(node_id)]
+        # Whole-object lowering propagates exact Program-ABI contracts over
+        # PlanCall argument bindings by SSA value identity. A callee input
+        # need not have a useful local binding-name contract, so consult that
+        # shared value ledger before attempting operation inference. This is
+        # the same declared boundary fact, not backend shape recovery.
+        linked = (
+            graph.G.graph.get("linked_value_abi") or {}
+        ).get(int(data.get("value_id", node_id)))
+        if isinstance(linked, Mapping) and linked.get("shape") is not None:
+            tensor = {
+                "shape": tuple(map(int, linked["shape"])),
+                "dtype": str(linked.get("dtype") or "float64"),
+            }
+    if "shape" not in tensor and str(
+        data.get("op") or data.get("type") or ""
+    ).casefold() == "getattr":
+        # A declared record span is already a tensor boundary even when the
+        # receiver is an opaque Python-shaped record. Resolve that exact
+        # contract here, in the compiler-owned descriptor query used by both
+        # callsite specialization and region shape planning. Waiting until
+        # record-slot SSA materialization is too late: callees have already
+        # partitioned gather/matmul regions by then.
+        field_name = str(
+            (data.get("attributes") or {}).get("attribute") or ""
+        )
+        receiver = next((
+            int(parent)
+            for parent, role in data.get("parents") or ()
+            if str(role) in {"value", "base", "object", "receiver"}
+            and int(parent) in graph.G
+        ), None)
+        receiver_binding = (
+            None
+            if receiver is None
+            else str(
+                (
+                    graph.G.nodes[receiver].get("attributes") or {}
+                ).get("binding_name") or ""
+            )
+        )
+        record = (
+            (graph.G.graph.get("parameter_record_abi") or {}).get(
+                receiver_binding
+            )
+            if receiver_binding else None
+        )
+        field = (
+            (record.get("fields") or {}).get(field_name)
+            if isinstance(record, Mapping) else None
+        )
+        if isinstance(field, Mapping) and field.get("shape") is not None:
+            tensor = {
+                "shape": tuple(map(int, field["shape"])),
+                "dtype": str(field.get("dtype") or "float64"),
+            }
+    if "shape" not in tensor and data.get("type") == "Input":
+        binding_name = (data.get("attributes") or {}).get("binding_name")
+        boundary = (
+            graph.G.graph.get("planner_tensor_descriptors") or {}
+        ).get(str(binding_name))
+        if boundary is None:
+            boundary = (
+                graph.G.graph.get("parameter_value_abi") or {}
+            ).get(str(binding_name))
+        if isinstance(boundary, Mapping) and (
+            boundary.get("shape") is not None
+            or str(boundary.get("storage") or "").casefold() == "scalar"
+        ):
+            # A scalar ProgramABI binding commonly omits ``shape`` because its
+            # storage class already proves rank zero.  Treat it as the empty
+            # tensor descriptor here so that the physical value fact survives
+            # successive callsite specializations.  Requiring an explicit
+            # shape silently lost scalar type/non-None facts at the first call
+            # edge (dt_init -> ref_dt -> ref).
+            tensor = {
+                "shape": tuple(
+                    int(extent) for extent in (boundary.get("shape") or ())
+                ),
+                "dtype": str(boundary.get("dtype") or "float64"),
+            }
+    if "shape" not in tensor:
         operation = str(data.get("op") or data.get("type") or "").casefold()
+        if operation in {
+            "identity", "loopresult", "loopexit", "loopstateport",
+        }:
+            semantic_roles = (
+                {"state", "value"}
+                if operation == "loopstateport" else {"value"}
+            )
+            sources = tuple(
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role).casefold() in semantic_roles
+            )
+            declared_source = (data.get("attributes") or {}).get(
+                "value_source_id"
+            )
+            if declared_source is not None:
+                declared_source = int(declared_source)
+                if sources and sources != (declared_source,):
+                    raise ValueError(
+                        f"{operation} value-source identity conflicts with "
+                        f"its semantic edge: declared={declared_source}, "
+                        f"edges={sources!r}"
+                    )
+                sources = (declared_source,)
+            if len(sources) == 1:
+                return _tensor_descriptor(graph, sources[0], seen)
         # Shape-preserving unary expressions are ordinary dynamic tensor
         # values too.  Callsite specialization used to see ``-g`` as having
         # no descriptor, specialize the callee only for its static shape
@@ -14161,6 +14817,144 @@ def _tensor_descriptor(
             )
             if len(parents) == 1:
                 return _tensor_descriptor(graph, parents[0], seen)
+        if operation in _DTYPE_CAST_OPERATIONS:
+            # ``x.to_dtype("int64")`` preserves the shape exactly and only
+            # changes the element type.  Leaving it descriptor-less made
+            # every subscript on a cast value, and every value after it,
+            # shapeless (``cell_index[:, :, 1]`` in the periodic terrain).
+            parents = tuple(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) not in {"callee", "func", "definition"}
+                and int(parent) in graph.G
+            )
+            tensor_parents = tuple(
+                parent for parent in parents
+                if str(
+                    graph.G.nodes[parent].get("type") or ""
+                ).casefold() not in {"constant", "const"}
+            )
+            if len(tensor_parents) == 1:
+                inherited = _tensor_descriptor(graph, tensor_parents[0], seen)
+                if inherited is not None:
+                    cast_dtype = next((
+                        str(_constant_value(graph.G.nodes[parent]))
+                        for parent in parents
+                        if parent not in tensor_parents
+                        and isinstance(
+                            _constant_value(graph.G.nodes[parent]), str
+                        )
+                    ), None)
+                    result = dict(inherited)
+                    if cast_dtype:
+                        result["dtype"] = cast_dtype
+                    return result
+        if operation in {"indexedstore", "index_set", "setitem"}:
+            base = next((
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role) == "base"
+            ), None)
+            if base is not None:
+                return _tensor_descriptor(graph, base, seen)
+        if operation in {"indexed", "getitem", "subscript"}:
+            base = next((
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role) == "base"
+            ), None)
+            indices = tuple(
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role) == "index"
+            )
+            if base is not None and base in graph.G and len(indices) == 1:
+                base_attributes = (
+                    graph.G.nodes[base].get("attributes") or {}
+                )
+                leaves = tuple(map(
+                    int,
+                    base_attributes.get("aggregate_leaf_value_ids", ()),
+                ))
+                index_attributes = (
+                    graph.G.nodes[indices[0]].get("attributes") or {}
+                )
+                index = index_attributes.get("value")
+                output_descriptors = base_attributes.get(
+                    "tensor_output_descriptors"
+                ) or ()
+                if (
+                    output_descriptors
+                    and isinstance(index, int)
+                    and not isinstance(index, bool)
+                    and -len(output_descriptors) <= index < len(output_descriptors)
+                ):
+                    descriptor = output_descriptors[
+                        index % len(output_descriptors)
+                    ]
+                    if isinstance(descriptor, Mapping):
+                        return copy.deepcopy(dict(descriptor))
+                # ``r[1][0]``: the base is itself a projection of a call
+                # whose output descriptor at that position is a nested tuple.
+                # Follow the exact literal-index path; a structural path is
+                # an identity, not an inference.
+                path = [index] if isinstance(index, int) and not isinstance(
+                    index, bool
+                ) else None
+                top = base
+                while path is not None and top in graph.G:
+                    top_data = graph.G.nodes[top]
+                    top_attributes = top_data.get("attributes") or {}
+                    nested = top_attributes.get("tensor_output_descriptors")
+                    if nested:
+                        structure: Any = tuple(nested)
+                        for step in path:
+                            if not isinstance(structure, tuple) or not (
+                                -len(structure) <= step < len(structure)
+                            ):
+                                structure = None
+                                break
+                            structure = structure[step % len(structure)]
+                        if isinstance(structure, Mapping):
+                            return copy.deepcopy(dict(structure))
+                        break
+                    if str(
+                        top_data.get("op") or top_data.get("type") or ""
+                    ).casefold() not in {"indexed", "getitem", "subscript"}:
+                        break
+                    top_base = next((
+                        int(parent)
+                        for parent, role in top_data.get("parents") or ()
+                        if str(role) == "base"
+                    ), None)
+                    top_indices = tuple(
+                        int(parent)
+                        for parent, role in top_data.get("parents") or ()
+                        if str(role) == "index"
+                    )
+                    if top_base is None or len(top_indices) != 1:
+                        break
+                    top_index = (
+                        graph.G.nodes[top_indices[0]].get("attributes") or {}
+                    ).get("value")
+                    if top_index is None:
+                        top_index = graph.G.nodes[top_indices[0]].get(
+                            "constant"
+                        )
+                    if not isinstance(top_index, int) or isinstance(
+                        top_index, bool
+                    ):
+                        break
+                    path.insert(0, int(top_index))
+                    top = top_base
+                if (
+                    leaves
+                    and isinstance(index, int)
+                    and not isinstance(index, bool)
+                    and -len(leaves) <= index < len(leaves)
+                ):
+                    return _tensor_descriptor(
+                        graph, leaves[index % len(leaves)], seen
+                    )
         return None
     return {
         "shape": tuple(tensor.get("shape") or ()),
@@ -14188,13 +14982,6 @@ def _fold_callsite_structural_values(graph: Any) -> None:
     _retain_source_control_records(graph.G)
     _retain_source_sequence_mutation_records(graph.G)
 
-    import os as _os, sys as _sys
-    if _os.environ.get("TURING_DEBUG_SHAPE_ATTR"):
-        print(
-            f"DEBUGFOLDENTRY fn={graph.G.graph.get('function_name')} "
-            f"nodes={graph.G.number_of_nodes()}",
-            file=_sys.stderr,
-        )
     unresolved = _UNRESOLVED_STRUCTURAL_VALUE
     known: dict[int, Any] = {}
     loop_carried_initial_ids = {
@@ -14221,6 +15008,45 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 indexed.append((position, int(parent)))
         return tuple(parent for _position, parent in sorted(indexed))
 
+    def structural_call_argument(
+        data: Mapping[str, Any],
+        *,
+        roles: set[str],
+        keywords: set[str],
+        default: Any,
+    ) -> Any:
+        """Read authored call metadata without evaluating a Python callable.
+
+        Dynamic arguments are represented by dependency edges and therefore
+        take precedence.  The graph extractor intentionally does not create a
+        value node for a literal keyword such as ``dim=1``; retain that exact
+        source literal as normalized operation metadata instead of silently
+        substituting the operator's default axis.
+        """
+
+        for parent, role_value in data.get("parents") or ():
+            if str(role_value) not in roles:
+                continue
+            value = known.get(int(parent), unresolved)
+            # ProgramABI facts describe runtime storage/type, not the value of
+            # a structural keyword.  Treat them as unresolved here so a
+            # literal ``dim=``/``axis=`` retained in the authored call can be
+            # recovered below instead of being coerced with ``int(fact)``.
+            if value is not unresolved and not isinstance(
+                value, _ProgramABIValueFact
+            ):
+                return value
+        expression = data.get("expr_obj")
+        if isinstance(expression, ast.Call):
+            for keyword in expression.keywords:
+                if keyword.arg not in keywords:
+                    continue
+                try:
+                    return ast.literal_eval(keyword.value)
+                except (TypeError, ValueError):
+                    return unresolved
+        return default
+
     def _record_field_descriptor(node_id: int) -> dict[str, Any] | None:
         """Real shape/dtype for a record-field read, from its bound value.
 
@@ -14238,8 +15064,6 @@ def _fold_callsite_structural_values(graph: Any) -> None:
         resolves to nothing and the per-cell loop it bounds never runs.
         """
 
-        import os as _os, sys as _sys
-        _debug = _os.environ.get("TURING_DEBUG_SHAPE_ATTR")
         node = graph.G.nodes.get(int(node_id), {})
         if str(node.get("type")) not in {"GetAttr", "Attribute"}:
             return None
@@ -14251,13 +15075,6 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             for candidate, role in (node.get("parents") or ())
             if str(role) in {"value", "base", "object"}
         ), None)
-        if _debug and field_name in {"height", "width"}:
-            print(
-                f"DEBUGSHAPEATTR node_id={node_id} field={field_name} "
-                f"receiver_id={receiver_id} "
-                f"receiver_attrs={graph.G.nodes.get(receiver_id, {}).get('attributes') if receiver_id is not None else None}",
-                file=_sys.stderr,
-            )
         if receiver_id is None:
             return None
         receiver_binding = (
@@ -14268,13 +15085,6 @@ def _fold_callsite_structural_values(graph: Any) -> None:
         receiver_value = (
             graph.G.graph.get("planner_specializations") or {}
         ).get(str(receiver_binding))
-        if _debug and field_name in {"height", "width"}:
-            print(
-                f"DEBUGSHAPEATTR2 node_id={node_id} receiver_binding={receiver_binding} "
-                f"receiver_value_is_none={receiver_value is None} "
-                f"specializations_keys={tuple((graph.G.graph.get('planner_specializations') or {}).keys())}",
-                file=_sys.stderr,
-            )
         if receiver_value is None:
             return None
         try:
@@ -14294,6 +15104,43 @@ def _fold_callsite_structural_values(graph: Any) -> None:
         descriptor = _tensor_descriptor(graph, parent)
         if descriptor is None:
             descriptor = _record_field_descriptor(parent)
+        if attribute in {"shape", "ndim", "ndims"}:
+            planner_descriptors = (
+                graph.G.graph.get("planner_tensor_descriptors") or {}
+            )
+            callsite_descriptor_names = set(map(
+                str,
+                graph.G.graph.get("callsite_tensor_descriptor_names") or (),
+            ))
+            input_bindings = tuple(
+                (data.get("attributes") or {}).get("binding_name")
+                for _node_id, data in graph.G.nodes(data=True)
+                if data.get("type") == "Input"
+            )
+            unsettled_tensor_parameter = (
+                bool(input_bindings) and not planner_descriptors
+            ) or any(
+                bool(data.get("tensor"))
+                and str(binding_name) not in callsite_descriptor_names
+                and not tuple((
+                    planner_descriptors.get(str(binding_name)) or {}
+                ).get("shape") or ())
+                for _node_id, data in graph.G.nodes(data=True)
+                if data.get("type") == "Input"
+                for binding_name in (
+                    (data.get("attributes") or {}).get("binding_name"),
+                )
+            )
+            if descriptor is None and unsettled_tensor_parameter:
+                # Shape-derived constants are irreversible graph rewrites.
+                # Before planner/callsite descriptors arrive, input nodes may
+                # still be untyped while their internal consumers acquire
+                # padded scalar domain defaults such as (1,1,1). Never
+                # fold `.shape` from that provisional graph domain. An exact
+                # descriptor for the queried value is sufficient even when an
+                # unrelated parameter remains unsettled; otherwise parametric
+                # functions could never use a declared peer's shape.
+                return unresolved
         if descriptor is None:
             return unresolved
         if attribute == "shape":
@@ -14453,6 +15300,23 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 return _ProgramABIValueFact(
                     str(record_abi["identity"]), "record", None
                 )
+            descriptor = _tensor_descriptor(graph, int(node_id))
+            if descriptor is not None:
+                dtype = str(descriptor.get("dtype") or "unknown")
+                python_type = {
+                    "bool": "builtins.bool",
+                    "int": "builtins.int",
+                    "int32": "builtins.int",
+                    "int64": "builtins.int",
+                    "float": "builtins.float",
+                    "float32": "builtins.float",
+                    "float64": "builtins.float",
+                }.get(dtype, dtype)
+                return _ProgramABIValueFact(
+                    python_type,
+                    "span" if tuple(descriptor.get("shape") or ()) else "scalar",
+                    dtype,
+                )
             return unresolved
         if node_type in {"Tuple", "List", "Set"} or isinstance(
             expression, (ast.Tuple, ast.List, ast.Set),
@@ -14505,6 +15369,25 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 return _ProgramABIValueFact(
                     base_fact.value_python_type, "record", None,
                 )
+            index_facts = tuple(
+                known.get(int(parent), unresolved)
+                for parent, role in (data.get("parents") or ())
+                if str(role) == "index"
+            )
+            if (
+                base_fact is not unresolved
+                and not isinstance(base_fact, _ProgramABIValueFact)
+                and index_facts
+                and all(index is not unresolved for index in index_facts)
+            ):
+                index = (
+                    index_facts[0]
+                    if len(index_facts) == 1 else tuple(index_facts)
+                )
+                try:
+                    return base_fact[index]
+                except (IndexError, KeyError, TypeError):
+                    return unresolved
         if operation in {"numel", "ndim", "ndims"}:
             parent = next((
                 int(parent)
@@ -14783,6 +15666,24 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 if int(child) != node_id
             ]
         graph.G.remove_node(node_id)
+        # The identity table must name only values that exist.  A removed
+        # aggregate formal left in a name's history is later seeded as an
+        # untyped function argument by the SSA builder ("preserve the initial
+        # identity"), bound to the caller's tuple node, and reported as a
+        # missing caller value.
+        identities = graph.G.graph.get("identity_table") or {}
+        if any(
+            int(value_id) == node_id
+            for history in identities.values()
+            for value_id in history
+        ):
+            graph.G.graph["identity_table"] = {
+                str(name): tuple(
+                    int(value_id) for value_id in history
+                    if int(value_id) != node_id
+                )
+                for name, history in identities.items()
+            }
 
     def replace_alias(node_id: int, source_id: int) -> None:
         node_id = int(node_id)
@@ -14801,6 +15702,7 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             if graph.G.has_edge(node_id, int(successor)):
                 graph.G.remove_edge(node_id, int(successor))
             successor_data["parents"] = list(replacement)
+            _follow_declared_value_source(successor_data, node_id, source_id)
             for parent, role in replacement:
                 if not graph.G.has_edge(int(parent), int(successor)):
                     graph.G.add_edge(int(parent), int(successor), role=str(role))
@@ -14834,25 +15736,187 @@ def _fold_callsite_structural_values(graph: Any) -> None:
         except (TypeError, ValueError):
             return False
 
+    def tensor_data_descriptors(
+        data: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        """Return numerical operands, expanding authored tensor aggregates."""
+
+        descriptors = []
+        structural_roles = {"dim", "axis", "keepdim", "kw:dim", "kw:axis",
+                            "kw:keepdim", "kw:out", "kw:dtype"}
+        for parent, role in data.get("parents") or ():
+            role = str(role)
+            if role in {"callee", "func", "definition"} or role in (
+                structural_roles
+            ):
+                continue
+            parent_data = graph.G.nodes.get(int(parent), {})
+            attributes = parent_data.get("attributes") or {}
+            leaves = tuple(map(
+                int, attributes.get("aggregate_leaf_value_ids", ()),
+            ))
+            candidate_ids = (
+                leaves
+                if attributes.get("producer_kind") == "aggregate" and leaves
+                else (int(parent),)
+            )
+            for candidate_id in candidate_ids:
+                descriptor = _tensor_descriptor(graph, candidate_id)
+                if descriptor is None:
+                    candidate = graph.G.nodes.get(candidate_id, {})
+                    literal = candidate.get("constant")
+                    if literal is None:
+                        literal = (candidate.get("attributes") or {}).get(
+                            "value"
+                        )
+                    if str(candidate.get("type")) in {
+                        "Constant", "Const", "const",
+                    } and isinstance(literal, (bool, int, float)):
+                        # A scalar literal operand is an exact rank-0 value.
+                        descriptor = {
+                            "shape": (),
+                            "dtype": (
+                                "bool" if isinstance(literal, bool)
+                                else "int64" if isinstance(literal, int)
+                                else "float64"
+                            ),
+                        }
+                if descriptor is None:
+                    # One undescribed numerical operand makes the result
+                    # undescribed.  Broadcasting only the operands that
+                    # happen to be known silently shrinks a (8, 4, 800, ...)
+                    # result to the mask's (8, 4, 1, ...) and every later
+                    # shape is then wrong while looking specialized.
+                    return ()
+                descriptors.append(descriptor)
+        return tuple(descriptors)
+
+    def basic_index(node: ast.AST) -> Any:
+        """Decode only Python's literal basic-index vocabulary."""
+
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Slice):
+            return slice(
+                None if node.lower is None else basic_index(node.lower),
+                None if node.upper is None else basic_index(node.upper),
+                None if node.step is None else basic_index(node.step),
+            )
+        if isinstance(node, ast.Tuple):
+            return tuple(basic_index(item) for item in node.elts)
+        raise ValueError("index is not a basic literal")
+
     changed = True
     while changed:
         changed = False
         for node_id in _dependency_order(graph):
             node_id = int(node_id)
             data = graph.G.nodes[node_id]
+            previous_tensor = copy.deepcopy(data.get("tensor"))
             operation = str(data.get("op") or data.get("type") or "").casefold()
-            if _tensor_descriptor(graph, node_id) is None and operation in {
-                "add", "sub", "mult", "mul", "div", "truediv",
-                "floordiv", "mod", "pow", "maximum", "minimum",
-            }:
-                parent_descriptors = tuple(
-                    descriptor
+            # ``history[0]`` over an authored aggregate with an exact leaf
+            # ledger IS that leaf.  Keeping the projection as a separate
+            # value leaves a consumer reading an operator whose base is a
+            # structural tuple; region planning then treats it as an
+            # undeclared input of the enclosing function.  The alias is exact
+            # (ledger position by literal index), so it is an identity, not
+            # a shape inference.
+            if operation in {"indexed", "getitem", "subscript"}:
+                base_ids = tuple(
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) in {"base", "value", "object"}
+                )
+                index_ids = tuple(
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) in {"index", "slice", "subscript"}
+                )
+                if (
+                    len(base_ids) == 1 and len(index_ids) == 1
+                    and base_ids[0] in graph.G and index_ids[0] in graph.G
+                ):
+                    base_attributes = (
+                        graph.G.nodes[base_ids[0]].get("attributes") or {}
+                    )
+                    leaves = tuple(map(int, base_attributes.get(
+                        "aggregate_leaf_value_ids", ()
+                    )))
+                    index_value = constant(graph.G.nodes[index_ids[0]])
+                    if (
+                        base_attributes.get("producer_kind") == "aggregate"
+                        and leaves
+                        and all(int(leaf) in graph.G for leaf in leaves)
+                        and isinstance(index_value, int)
+                        and not isinstance(index_value, bool)
+                        and -len(leaves) <= index_value < len(leaves)
+                    ):
+                        replace_alias(
+                            node_id, leaves[index_value % len(leaves)]
+                        )
+                        known.pop(node_id, None)
+                        changed = True
+                        break
+            inherited_descriptor = _tensor_descriptor(graph, node_id)
+            if (
+                inherited_descriptor is not None
+                and "shape" not in (data.get("tensor") or {})
+                and (
+                    operation in {
+                        "neg", "abs", "sin", "cos", "tan", "exp", "log",
+                        "sqrt", "tanh", "clone", "identity", "indexedstore",
+                        "index_set", "setitem", "indexed", "getitem",
+                        "subscript",
+                    }
+                    or operation in _DTYPE_CAST_OPERATIONS
+                )
+            ):
+                # These nodes preserve or alias a tensor descriptor.  Store
+                # the proven fact on the producer as well as returning it
+                # through _tensor_descriptor so later region cuts retain it.
+                data["tensor"] = copy.deepcopy(inherited_descriptor)
+            # The semantic operator name is the authored tensor operation
+            # (``greater_equal`` for ``>=``), not only the AST spelling.
+            semantic_operation = str(
+                (data.get("attributes") or {}).get("tensor_operation")
+                or (data.get("attributes") or {}).get("tensor_candidate")
+                or operation
+            ).casefold()
+            comparison_operations = {
+                "equal", "eq", "not_equal", "ne", "lt", "le", "gt", "ge",
+                "less", "less_equal", "greater", "greater_equal",
+                "lte", "gte",
+            }
+            if (
+                operation in {
+                    "add", "sub", "mult", "mul", "div", "truediv",
+                    "floordiv", "mod", "pow", "maximum", "minimum",
+                    "max", "min",
+                } | comparison_operations
+                or semantic_operation in comparison_operations
+            ) and not (
+                operation in {"max", "min"}
+                and isinstance(data.get("expr_obj"), ast.Call)
+                and isinstance(data["expr_obj"].func, ast.Attribute)
+            ):
+                # Every numerical operand must be described; a scalar
+                # literal is an exact rank-0 operand.  Broadcasting only the
+                # known operands is the partial-shape hazard fixed for
+                # ``where`` above.
+                numerical_parents = tuple(
+                    int(parent)
                     for parent, role in (data.get("parents") or ())
                     if str(role) not in {"callee", "func", "definition"}
-                    and (
-                        descriptor := _tensor_descriptor(graph, int(parent))
+                )
+                parent_descriptors = tuple(
+                    descriptor
+                    for parent in numerical_parents
+                    if (
+                        descriptor := _operand_descriptor(graph, parent)
                     ) is not None
                 )
+                if len(parent_descriptors) != len(numerical_parents):
+                    parent_descriptors = ()
                 if parent_descriptors:
                     try:
                         shape = tuple(np.broadcast_shapes(*(
@@ -14864,18 +15928,296 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                     if shape is not None:
                         data["tensor"] = {
                             "shape": shape,
-                            "dtype": parent_descriptors[0]["dtype"],
+                            "dtype": (
+                                "bool" if (
+                                    operation in comparison_operations
+                                    or semantic_operation
+                                    in comparison_operations
+                                ) else next((
+                                    descriptor["dtype"]
+                                    for descriptor in parent_descriptors
+                                    if tuple(descriptor["shape"])
+                                ), parent_descriptors[0]["dtype"])
+                            ),
                         }
+            if operation in {"indexed", "getitem", "subscript"}:
+                expression = data.get("expr_obj")
+                source_descriptor = None
+                index_values: list[Any] = []
+                for parent, role in data.get("parents") or ():
+                    if str(role) == "base":
+                        source_descriptor = _tensor_descriptor(
+                            graph, int(parent)
+                        )
+                    elif str(role) == "index":
+                        index_values.append(
+                            known.get(int(parent), unresolved)
+                        )
+
+                if source_descriptor is not None and isinstance(
+                    expression, ast.Subscript
+                ):
+                    try:
+                        from ..common.tensors.abstraction_methods.indexing import (
+                            normalize_basic_index,
+                        )
+
+                        # Tensor topology expansion makes an ellipsis explicit
+                        # as a structural tuple dependency (using the source
+                        # rank).  That parent is the canonical index value;
+                        # the surface AST is only a fallback for indexes that
+                        # remained literal through reduction.
+                        if index_values and all(
+                            value is not unresolved for value in index_values
+                        ):
+                            normalized_index = (
+                                index_values[0]
+                                if len(index_values) == 1 else tuple(index_values)
+                            )
+                        else:
+                            normalized_index = basic_index(expression.slice)
+                        _axes, result_shape = normalize_basic_index(
+                            normalized_index,
+                            tuple(source_descriptor["shape"]),
+                        )
+                    except (IndexError, TypeError, ValueError, NotImplementedError):
+                        result_shape = None
+                    if result_shape is not None:
+                        attributes = dict(data.get("attributes") or {})
+                        attributes["basic_index_axes"] = tuple(
+                            (tuple(map(int, indices)), bool(drop_axis))
+                            for indices, drop_axis in _axes
+                        )
+                        attributes["basic_index_source_shape"] = tuple(
+                            source_descriptor["shape"]
+                        )
+                        data["attributes"] = attributes
+                        data["tensor"] = {
+                            "shape": tuple(result_shape),
+                            "dtype": source_descriptor["dtype"],
+                        }
+            if (
+                operation in {"indexedstore", "index_set", "setitem"}
+                and not (data.get("attributes") or {}).get(
+                    "basic_index_axes"
+                )
+            ):
+                expression = data.get("expr_obj")
+                base = next((
+                    int(parent)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) == "base"
+                ), None)
+                source_descriptor = (
+                    None if base is None
+                    else _tensor_descriptor(graph, base)
+                )
+                if (
+                    source_descriptor is not None
+                    and isinstance(expression, ast.Subscript)
+                ):
+                    try:
+                        from ..common.tensors.abstraction_methods.indexing import (
+                            normalize_basic_index,
+                        )
+
+                        axes, _selection_shape = normalize_basic_index(
+                            basic_index(expression.slice),
+                            tuple(source_descriptor["shape"]),
+                        )
+                    except (
+                        IndexError, TypeError, ValueError,
+                        NotImplementedError,
+                    ):
+                        axes = None
+                    if axes is not None:
+                        attributes = dict(data.get("attributes") or {})
+                        attributes["basic_index_axes"] = tuple(
+                            (tuple(map(int, indices)), bool(drop_axis))
+                            for indices, drop_axis in axes
+                        )
+                        attributes["basic_index_source_shape"] = tuple(
+                            source_descriptor["shape"]
+                        )
+                        data["attributes"] = attributes
+                        data["tensor"] = copy.deepcopy(source_descriptor)
             attributes = data.get("attributes") or {}
             tensor_candidate = str(
                 attributes.get("tensor_candidate") or operation
             ).casefold()
+            if tensor_candidate == "arange":
+                positional_values = []
+                for position, parent in enumerate(positional(data)):
+                    value = known.get(int(parent), unresolved)
+                    if value is unresolved:
+                        positional_values = []
+                        break
+                    positional_values.append(value)
+                expression = data.get("expr_obj")
+                if not positional_values and isinstance(expression, ast.Call):
+                    try:
+                        positional_values = [
+                            ast.literal_eval(argument)
+                            for argument in expression.args[:3]
+                        ]
+                    except (TypeError, ValueError):
+                        positional_values = []
+                if positional_values:
+                    if len(positional_values) == 1:
+                        start, stop, step = 0, positional_values[0], 1
+                    else:
+                        start, stop = positional_values[:2]
+                        step = (
+                            positional_values[2]
+                            if len(positional_values) >= 3 else 1
+                        )
+                    if stop is None:
+                        start, stop = 0, start
+                    try:
+                        count = len(range(int(start), int(stop), int(step)))
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        count = 0
+                    if count > 0:
+                        data["tensor"] = {
+                            "shape": (count,), "dtype": "float64",
+                        }
+                        normalized = dict(data.get("attributes") or {})
+                        normalized.update({
+                            "arange_start": float(start),
+                            "arange_step": float(step),
+                            "arange_count": count,
+                        })
+                        data["attributes"] = normalized
+            if tensor_candidate in {
+                "zeros_like", "empty_like", "ones_like", "full_like",
+            }:
+                source_descriptor = next((
+                    _tensor_descriptor(graph, int(parent))
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) not in {
+                        "callee", "func", "function", "definition",
+                    }
+                    and _tensor_descriptor(graph, int(parent)) is not None
+                ), None)
+                if source_descriptor is not None:
+                    data["tensor"] = copy.deepcopy(source_descriptor)
             if (
-                _tensor_descriptor(graph, node_id) is None
-                and tensor_candidate in {
-                    "transpose", "swapaxes", "transpose_last2", "t"
+                tensor_candidate in {
+                    "stack", "cat", "concat", "concatenate", "where",
                 }
             ):
+                operand_descriptors = tensor_data_descriptors(data)
+                if tensor_candidate == "stack" and operand_descriptors:
+                    operand_shape = tuple(operand_descriptors[0]["shape"])
+                    if all(
+                        tuple(descriptor["shape"]) == operand_shape
+                        for descriptor in operand_descriptors
+                    ):
+                        axis = structural_call_argument(
+                            data,
+                            roles={
+                                "dim", "axis", "kw:dim", "kw:axis",
+                                "arg:1",
+                            },
+                            keywords={"dim", "axis"},
+                            default=0,
+                        )
+                        position = int(axis) % (len(operand_shape) + 1)
+                        data["tensor"] = {
+                            "shape": (
+                                *operand_shape[:position],
+                                len(operand_descriptors),
+                                *operand_shape[position:],
+                            ),
+                            "dtype": operand_descriptors[0]["dtype"],
+                        }
+                elif tensor_candidate in {
+                    "cat", "concat", "concatenate",
+                } and operand_descriptors:
+                    shapes = tuple(
+                        tuple(descriptor["shape"])
+                        for descriptor in operand_descriptors
+                    )
+                    rank = len(shapes[0])
+                    axis = structural_call_argument(
+                        data,
+                        roles={
+                            "dim", "axis", "kw:dim", "kw:axis", "arg:1",
+                        },
+                        keywords={"dim", "axis"},
+                        default=0,
+                    )
+                    position = int(axis) % rank if rank else 0
+                    if rank and all(
+                        len(shape) == rank and all(
+                            index == position or extent == shapes[0][index]
+                            for index, extent in enumerate(shape)
+                        )
+                        for shape in shapes
+                    ):
+                        result_shape = list(shapes[0])
+                        result_shape[position] = sum(
+                            shape[position] for shape in shapes
+                        )
+                        data["tensor"] = {
+                            "shape": tuple(result_shape),
+                            "dtype": operand_descriptors[0]["dtype"],
+                        }
+                elif tensor_candidate == "where" and operand_descriptors:
+                    try:
+                        result_shape = tuple(np.broadcast_shapes(*(
+                            descriptor["shape"]
+                            for descriptor in operand_descriptors
+                        )))
+                    except ValueError:
+                        result_shape = None
+                    if result_shape is not None:
+                        data["tensor"] = {
+                            "shape": result_shape,
+                            "dtype": next((
+                                descriptor["dtype"]
+                                for descriptor in operand_descriptors
+                                if descriptor["dtype"] != "bool"
+                            ), operand_descriptors[0]["dtype"]),
+                        }
+            if tensor_candidate in {"gather", "index_select"}:
+                source_descriptor = next((
+                    _tensor_descriptor(graph, int(parent))
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"operand", "value", "base"}
+                    and _tensor_descriptor(graph, int(parent)) is not None
+                ), None)
+                index_descriptor = next((
+                    _tensor_descriptor(graph, int(parent))
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"indices", "index", "arg:0", "arg:1"}
+                    and _tensor_descriptor(graph, int(parent)) is not None
+                ), None)
+                axis = structural_call_argument(
+                    data,
+                    roles={
+                        "dim", "axis", "kw:dim", "kw:axis", "arg:1",
+                    },
+                    keywords={"dim", "axis"},
+                    default=0,
+                )
+                if source_descriptor is not None and index_descriptor is not None:
+                    source_shape = tuple(source_descriptor["shape"])
+                    position = int(axis) % len(source_shape)
+                    attributes = dict(data.get("attributes") or {})
+                    attributes.setdefault("dim", position)
+                    data["attributes"] = attributes
+                    data["tensor"] = {
+                        "shape": (
+                            *source_shape[:position],
+                            *tuple(index_descriptor["shape"]),
+                            *source_shape[position + 1:],
+                        ),
+                        "dtype": source_descriptor["dtype"],
+                    }
+            if tensor_candidate in {
+                    "transpose", "swapaxes", "transpose_last2", "t"
+                }:
                 source_descriptor = next((
                     _tensor_descriptor(graph, int(parent))
                     for parent, role in (data.get("parents") or ())
@@ -14892,10 +16234,7 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                         "shape": result_shape,
                         "dtype": source_descriptor["dtype"],
                     }
-            if (
-                _tensor_descriptor(graph, node_id) is None
-                and tensor_candidate in {"matmul", "mm"}
-            ):
+            if tensor_candidate in {"matmul", "mm"}:
                 operand_descriptors = tuple(
                     descriptor
                     for parent, role in (data.get("parents") or ())
@@ -14930,10 +16269,7 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                             "shape": tuple(result_shape),
                             "dtype": operand_descriptors[0]["dtype"],
                         }
-            if (
-                _tensor_descriptor(graph, node_id) is None
-                and tensor_candidate in {"reshape", "view"}
-            ):
+            if tensor_candidate in {"reshape", "view"}:
                 source_descriptor = next((
                     _tensor_descriptor(graph, int(parent))
                     for parent, role in (data.get("parents") or ())
@@ -14950,13 +16286,34 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 if source_descriptor is not None and shape_parent is not None:
                     result_shape = known[int(shape_parent)]
                     if isinstance(result_shape, (tuple, list)):
-                        data["tensor"] = {
-                            "shape": tuple(int(extent) for extent in result_shape),
-                            "dtype": source_descriptor["dtype"],
-                        }
+                        resolved_shape = [int(extent) for extent in result_shape]
+                        inferred = [
+                            index for index, extent in enumerate(resolved_shape)
+                            if extent == -1
+                        ]
+                        if len(inferred) <= 1 and all(
+                            extent > 0 or extent == -1
+                            for extent in resolved_shape
+                        ):
+                            source_count = int(np.prod(
+                                tuple(source_descriptor["shape"]), dtype=np.int64
+                            ))
+                            known_count = int(np.prod(
+                                tuple(
+                                    extent for extent in resolved_shape
+                                    if extent != -1
+                                ),
+                                dtype=np.int64,
+                            ))
+                            if inferred and known_count and source_count % known_count == 0:
+                                resolved_shape[inferred[0]] = source_count // known_count
+                            if not inferred or -1 not in resolved_shape:
+                                data["tensor"] = {
+                                    "shape": tuple(resolved_shape),
+                                    "dtype": source_descriptor["dtype"],
+                                }
             if (
-                _tensor_descriptor(graph, node_id) is None
-                and tensor_candidate in {
+                tensor_candidate in {
                     "sum", "mean", "prod", "min", "max", "any", "all"
                 }
             ):
@@ -14966,20 +16323,20 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                     if str(role) in {"operand", "arg:0", "value"}
                     and _tensor_descriptor(graph, int(parent)) is not None
                 ), None)
-                structural_arguments = {
-                    str(role): known.get(int(parent), unresolved)
-                    for parent, role in (data.get("parents") or ())
-                }
-                axis = next((
-                    value for role, value in structural_arguments.items()
-                    if role in {"dim", "axis", "kw:dim", "kw:axis", "arg:1"}
-                    and value is not unresolved
-                ), unresolved)
-                keepdim = next((
-                    value for role, value in structural_arguments.items()
-                    if role in {"keepdim", "kw:keepdim", "arg:2"}
-                    and value is not unresolved
-                ), False)
+                axis = structural_call_argument(
+                    data,
+                    roles={
+                        "dim", "axis", "kw:dim", "kw:axis", "arg:1",
+                    },
+                    keywords={"dim", "axis"},
+                    default=unresolved,
+                )
+                keepdim = structural_call_argument(
+                    data,
+                    roles={"keepdim", "kw:keepdim", "arg:2"},
+                    keywords={"keepdim"},
+                    default=False,
+                )
                 if source_descriptor is not None and axis is not unresolved:
                     source_shape = tuple(source_descriptor["shape"])
                     raw_axes = (
@@ -15003,18 +16360,35 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                         "shape": result_shape,
                         "dtype": source_descriptor["dtype"],
                     }
+                    attributes = dict(data.get("attributes") or {})
+                    attributes.setdefault("dim", axis)
+                    attributes.setdefault("keepdim", bool(keepdim))
+                    data["attributes"] = attributes
+            if data.get("tensor") != previous_tensor:
+                # Descriptor propagation and structural folding are one
+                # fixed-point problem: a newly specialized reduction shape
+                # can make a downstream ``value.shape[index]`` constant on
+                # the following pass.  Descriptor-only progress must keep
+                # the loop alive even when no literal was learned this pass.
+                changed = True
             if str(data.get("type")) in {"Constant", "Const", "const"}:
                 value = constant(data)
             else:
                 value = evaluate(node_id, data)
             if value is unresolved:
                 continue
-            if node_id in loop_carried_initial_ids:
+            if (
+                node_id in loop_carried_initial_ids
+                and not isinstance(value, _ProgramABIValueFact)
+            ):
                 # This literal is the entry arm of a Phi, not an invariant
                 # fact for the loop's condition/body.  Keeping it out of the
                 # structural-known table prevents the fixed point from
                 # replacing expressions such as ``iters < max_iters`` with
-                # their iteration-zero value.
+                # their iteration-zero value.  A ProgramABI type/storage fact
+                # is different: the native loop cannot change a physical
+                # scalar/span/record slot into Python None, so that fact stays
+                # invariant even when the value in the slot is loop-carried.
                 continue
             if isinstance(value, _StructuralValueAlias):
                 replace_alias(node_id, value.source_id)
@@ -15032,6 +16406,14 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             # record field remains a normal dataflow value while comparisons
             # such as ``field is not None`` can still be decided here.
             if isinstance(value, _ProgramABIValueFact):
+                continue
+            # The same rule holds for an authored aggregate of facts.  Folding
+            # ``(hub, angle)`` into a Constant severs the Tuple from its leaf
+            # producers, the now-unconsumed span parameters are dropped as
+            # unused, and every later call boundary sees a ledger whose leaf
+            # identities no longer exist.  The tuple stays a known structural
+            # value for projection/isinstance decisions; its producer stays.
+            if _contains_program_abi_fact(value):
                 continue
             if str(data.get("type")) not in {"Constant", "Const", "const"}:
                 replace(node_id, value)
@@ -15068,7 +16450,16 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                     str(role): int(parent)
                     for parent, role in phi_data.get("parents") or ()
                 }
-                if phi_parents.get("test") != predicate_id:
+                source_conditional_id = (
+                    phi_data.get("attributes") or {}
+                ).get("source_conditional_id")
+                if (
+                    phi_parents.get("test") != predicate_id
+                    and (
+                        source_conditional_id is None
+                        or int(source_conditional_id) != int(control_id)
+                    )
+                ):
                     continue
                 selected = phi_parents.get(selected_role)
                 if selected is not None:
@@ -15307,6 +16698,21 @@ def _apply_callsite_tensor_descriptors(
     graph: Any,
     descriptors: Mapping[str, Mapping[str, Any]],
 ) -> None:
+    graph.G.graph["callsite_tensor_descriptor_names"] = tuple(sorted({
+        *map(
+            str,
+            graph.G.graph.get("callsite_tensor_descriptor_names") or (),
+        ),
+        *map(str, descriptors),
+    }))
+    authoritative = dict(
+        graph.G.graph.get("planner_tensor_descriptors") or {}
+    )
+    authoritative.update({
+        str(name): copy.deepcopy(dict(descriptor))
+        for name, descriptor in descriptors.items()
+    })
+    graph.G.graph["planner_tensor_descriptors"] = authoritative
     identities = graph.G.graph.get("identity_table") or {}
     for name, descriptor in descriptors.items():
         candidates = tuple(dict.fromkeys((
@@ -15325,6 +16731,198 @@ def _apply_callsite_tensor_descriptors(
             if data.get("type") != "Input":
                 continue
             data["tensor"] = copy.deepcopy(dict(descriptor))
+
+
+def _follow_declared_value_source(
+    node_data: Any, replaced_id: int, source_id: int,
+) -> None:
+    """Keep a port's declared value source equal to its semantic edge.
+
+    Retained-loop ports record ``value_source_id`` as an explicit identity
+    check against their ``value`` edge.  Aliasing the edge's producer without
+    moving the declaration turns every later descriptor query into an
+    identity-conflict error, so the declaration follows the alias exactly.
+    """
+
+    attributes = node_data.get("attributes") or {}
+    declared = attributes.get("value_source_id")
+    if declared is not None and int(declared) == int(replaced_id):
+        updated = dict(attributes)
+        updated["value_source_id"] = int(source_id)
+        node_data["attributes"] = updated
+
+
+def _alias_projection_to_member(
+    graph: Any, projection: int, leaf_id: int,
+) -> None:
+    """Give one authored ``name[index]`` projection its member's identity."""
+
+    projection = int(projection)
+    leaf_id = int(leaf_id)
+    if projection not in graph.G or leaf_id not in graph.G:
+        return
+    projection_data = graph.G.nodes[projection]
+    for successor in tuple(graph.G.successors(projection)):
+        successor_data = graph.G.nodes[int(successor)]
+        successor_data["parents"] = [
+            (
+                leaf_id if int(parent) == projection else int(parent),
+                str(role),
+            )
+            for parent, role in successor_data.get("parents") or ()
+        ]
+        _follow_declared_value_source(successor_data, projection, leaf_id)
+        for parent, role in successor_data["parents"]:
+            if int(parent) == leaf_id:
+                graph.G.nodes[leaf_id].setdefault("children", []).append(
+                    (int(successor), str(role))
+                )
+        graph.G.remove_edge(projection, int(successor))
+        graph.G.add_edge(leaf_id, int(successor))
+    index_ids = tuple(
+        int(parent)
+        for parent, role in projection_data.get("parents") or ()
+        if str(role) in {"index", "slice", "subscript"}
+    )
+    for parent in tuple(graph.G.predecessors(projection)):
+        graph.G.nodes[int(parent)]["children"] = [
+            (child, role)
+            for child, role in graph.G.nodes[int(parent)].get("children", ())
+            if int(child) != projection
+        ]
+    graph.G.remove_node(projection)
+    for index_id in index_ids:
+        if (
+            index_id in graph.G
+            and graph.G.out_degree(index_id) == 0
+            and graph.G.nodes[index_id].get("type") in {
+                "Constant", "Const", "const",
+            }
+        ):
+            graph.G.remove_node(index_id)
+    identities = graph.G.graph.get("identity_table") or {}
+    graph.G.graph["identity_table"] = {
+        str(key): tuple(
+            leaf_id if int(value_id) == projection else int(value_id)
+            for value_id in history
+        )
+        for key, history in identities.items()
+    }
+
+
+def _apply_callsite_aggregate_descriptors(
+    graph: Any,
+    descriptors: Mapping[str, tuple[Mapping[str, Any] | None, ...]],
+) -> None:
+    """Bind an aggregate formal to its exact authored projection identities."""
+
+    identities = graph.G.graph.get("identity_table") or {}
+    for name, members in descriptors.items():
+        inputs = tuple(dict.fromkeys((
+            *tuple(identities.get(str(name), ())),
+            *(
+                int(node_id)
+                for node_id, data in graph.G.nodes(data=True)
+                if data.get("type") == "Input"
+                and (data.get("attributes") or {}).get("binding_name") == name
+            ),
+        )))
+        inputs = tuple(
+            int(node_id) for node_id in inputs
+            if int(node_id) in graph.G
+            and graph.G.nodes[int(node_id)].get("type") == "Input"
+        )
+        if len(inputs) != 1:
+            raise ValueError(
+                f"aggregate parameter {name!r} does not have one input identity: "
+                f"{inputs!r}"
+            )
+        input_id = inputs[0]
+        projections: dict[int, list[int]] = {}
+        for node_id, data in graph.G.nodes(data=True):
+            if str(data.get("op") or data.get("type") or "").casefold() not in {
+                "indexed", "getitem", "subscript",
+            }:
+                continue
+            base = tuple(
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role) in {"base", "value", "object"}
+            )
+            if base != (input_id,):
+                continue
+            index_ids = tuple(
+                int(parent)
+                for parent, role in data.get("parents") or ()
+                if str(role) in {"index", "slice", "subscript"}
+            )
+            if len(index_ids) != 1 or index_ids[0] not in graph.G:
+                continue
+            index_data = graph.G.nodes[index_ids[0]]
+            index = index_data.get("constant")
+            if index is None:
+                index = (index_data.get("attributes") or {}).get("value")
+            if not isinstance(index, int) or isinstance(index, bool):
+                continue
+            # ``rest = constants[0]`` and a later ``f(constants[0])`` are two
+            # authored projections of one member; both read the same formal.
+            normalized = int(index) % len(members)
+            projections.setdefault(normalized, []).append(int(node_id))
+        leaves = []
+        for index, descriptor in enumerate(members):
+            leaf_id = next_process_value_id(graph)
+            graph.G.add_node(
+                leaf_id,
+                type="Input", op="input",
+                label=f"{name}[{index}]",
+                expr_obj=None, value_id=leaf_id,
+                parents=[], children=[],
+                attributes={
+                    "binding_name": f"{name}[{index}]",
+                    "binding_kind": "parameter",
+                    "aggregate_parent_binding": str(name),
+                    "aggregate_index": int(index),
+                },
+                tensor=(
+                    {} if descriptor is None
+                    else copy.deepcopy(dict(descriptor))
+                ),
+            )
+            leaves.append(leaf_id)
+            # A member input is a formal of this specialization.  Give the
+            # authored projection ``name[index]`` that exact identity: every
+            # consumer of the projection reads the member formal directly,
+            # the same physical ABI a starred positional expansion produces.
+            # An unconsumed member is dropped with the other unused formals.
+            for projection in projections.get(index, ()):
+                _alias_projection_to_member(graph, projection, leaf_id)
+        leaves = tuple(leaves)
+        # The aggregate formal IS the tuple of its member formals.  Make that
+        # structure explicit: the formal becomes an authored-style Tuple whose
+        # elements are the member inputs.  A whole-aggregate consumer such as
+        # ``f(*constants)`` then keeps every member alive through ordinary
+        # dataflow, an unconsumed formal is dropped like any dead tuple, and
+        # ``_authored_aggregate_leaves`` reads one ledger for both.
+        input_attributes = dict(graph.G.nodes[input_id].get("attributes") or {})
+        input_attributes.update({
+            "producer_kind": "aggregate",
+            "aggregate_kind": "tuple",
+            "aggregate_leaf_value_ids": leaves,
+            "tensor_output_descriptors": copy.deepcopy(tuple(members)),
+            "sequence_key_columns": (),
+            "sequence_column_count": 1,
+            "sequence_writable": False,
+        })
+        formal = graph.G.nodes[input_id]
+        formal["attributes"] = input_attributes
+        formal["type"] = "Tuple"
+        formal["op"] = None
+        formal["parents"] = [(int(leaf), "elts") for leaf in leaves]
+        for leaf in leaves:
+            graph.G.add_edge(int(leaf), int(input_id), role="elts")
+            graph.G.nodes[int(leaf)].setdefault("children", []).append(
+                (int(input_id), "elts")
+            )
 
 
 def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
@@ -15442,10 +17040,40 @@ def _callsite_specialized_shell_type(
     _receiver, positional, _all = _method_parameter_layout(original.G)
     specializations = {}
     tensor_descriptors: dict[str, dict[str, Any]] = {}
-    record_descriptors: dict[str, str] = {}
+    aggregate_descriptors: dict[
+        str, tuple[dict[str, Any], ...]
+    ] = {}
+    record_descriptors: dict[str, dict[str, Any]] = {}
     bound_parameters: set[str] = set()
     data = caller.G.nodes[int(node_id)]
-    for parent, role_value in data.get("parents") or ():
+    caller_record_abi = dict(
+        caller.G.graph.get("parameter_record_abi") or {}
+    )
+    caller_identities = caller.G.graph.get("identity_table") or {}
+
+    def caller_record_for_value(value_id: int) -> dict[str, Any] | None:
+        """Resolve a concrete caller record from its exact parameter value."""
+
+        value_id = int(value_id)
+        matches = [
+            dict(record)
+            for parameter_name, record in caller_record_abi.items()
+            if value_id in set(map(
+                int, caller_identities.get(str(parameter_name), ())
+            ))
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        node = caller.G.nodes.get(value_id, {})
+        binding_name = str(
+            (node.get("attributes") or {}).get("binding_name") or ""
+        )
+        record = caller_record_abi.get(binding_name)
+        return None if record is None else dict(record)
+
+    for parent, role_value in _expanded_callsite_argument_edges(
+        caller, int(node_id),
+    ):
         role = str(role_value)
         position = _positional_argument_index(role)
         parameter = (
@@ -15459,19 +17087,48 @@ def _callsite_specialized_shell_type(
             continue
         parameter = str(parameter)
         bound_parameters.add(parameter)
-        record_abi = dict(
+        declared_record_abi = dict(
             original.G.graph.get("parameter_record_abi") or {}
         ).get(parameter)
+        callsite_record_abi = caller_record_for_value(int(parent))
+        record_abi = (
+            callsite_record_abi
+            if callsite_record_abi is not None
+            else declared_record_abi
+        )
         if record_abi is not None and record_abi.get("identity") is not None:
             # A declared record identity is a structural type fact even when
             # the callsite carries no scalar literal or tensor descriptor.
             # Replanning the clean callee lets isinstance(record, Schema)
             # fold from that contract before regions/branches are carved.
-            record_descriptors[parameter] = str(record_abi["identity"])
+            record_descriptors[parameter] = copy.deepcopy(dict(record_abi))
         descriptor = _tensor_descriptor(caller, int(parent))
         if descriptor is not None:
             tensor_descriptors[parameter] = descriptor
-        if _source_static_value(caller, int(parent)):
+        static_argument = _source_static_value(caller, int(parent))
+        leaves = _authored_aggregate_leaves(caller, int(parent))
+        if leaves and not static_argument:
+            # Every authored member is a scoped callee identity whether or
+            # not its tensor contract is already known.  A member without a
+            # descriptor is materialized undescribed and fails loudly where a
+            # shape is needed; it must not erase the whole aggregate contract
+            # and leave the callee formal with zero members.
+            missing = tuple(
+                int(leaf) for leaf in leaves if int(leaf) not in caller.G
+            )
+            if missing:
+                raise ValueError(
+                    f"aggregate argument {parameter!r} names leaf identities "
+                    f"{missing!r} that no longer exist in "
+                    f"{caller.G.graph.get('function_name')!r}"
+                )
+            aggregate_descriptors[parameter] = tuple(
+                None if item is None else copy.deepcopy(dict(item))
+                for item in (
+                    _tensor_descriptor(caller, int(leaf)) for leaf in leaves
+                )
+            )
+        if static_argument:
             try:
                 specializations[parameter] = _source_static_literal(
                     caller, int(parent)
@@ -15496,7 +17153,10 @@ def _callsite_specialized_shell_type(
             )
         ):
             specializations[parameter] = copy.deepcopy(default)
-    if not specializations and not tensor_descriptors and not record_descriptors:
+    if not (
+        specializations or tensor_descriptors
+        or aggregate_descriptors or record_descriptors
+    ):
         return fallback
 
     def stable(value: Any) -> object:
@@ -15524,7 +17184,14 @@ def _callsite_specialized_shell_type(
             (name, stable(value))
             for name, value in tensor_descriptors.items()
         )),
-        tuple(sorted(record_descriptors.items())),
+        tuple(sorted(
+            (name, stable(value))
+            for name, value in aggregate_descriptors.items()
+        )),
+        tuple(sorted(
+            (name, stable(value))
+            for name, value in record_descriptors.items()
+        )),
         int(max_nodes_per_dispatch),
     )
     cached = _CALLSITE_SHELL_TYPE_CACHE.get(key)
@@ -15544,7 +17211,16 @@ def _callsite_specialized_shell_type(
     specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
         tensor_descriptors
     )
+    if record_descriptors:
+        parameter_records = copy.deepcopy(dict(
+            specialized.G.graph.get("parameter_record_abi") or {}
+        ))
+        parameter_records.update(copy.deepcopy(record_descriptors))
+        specialized.G.graph["parameter_record_abi"] = parameter_records
     _apply_callsite_tensor_descriptors(specialized, tensor_descriptors)
+    _apply_callsite_aggregate_descriptors(
+        specialized, aggregate_descriptors,
+    )
     if not _expand_specialized_unbroadcast_identity(specialized):
         _fold_callsite_structural_values(specialized)
     planned = strategize_shell_deployment(
@@ -19079,7 +20755,6 @@ def strategize_shell_deployment(
 
     _resolve_bound_function_references(graph)
     _propagate_callsite_planner_specializations(graph)
-    _propagate_callsite_tensor_specializations(graph)
     # A concrete function graph always has literal structural facts that can
     # remove or alias nodes even when there is no callsite-specific scalar
     # specialization. Perform that fixed point before its dispatch regions are
@@ -19089,6 +20764,12 @@ def strategize_shell_deployment(
     # applied. ``prepare_graph_precompile`` repeats the fold defensively after
     # callsite shells are attached; by then it must be idempotent.
     if graph.G.graph.get("function_name"):
+        _fold_callsite_structural_values(graph)
+    _propagate_callsite_tensor_specializations(graph)
+    if graph.G.graph.get("function_name"):
+        # Tensor descriptors learned across call edges can make another local
+        # shape-only expression decidable.  The structural fixed point is
+        # idempotent and still executes no numerical source code.
         _fold_callsite_structural_values(graph)
     canonical_value_ids = bool(
         graph.G.graph.get("canonical_value_ids")

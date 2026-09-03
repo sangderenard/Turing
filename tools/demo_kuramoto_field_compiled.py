@@ -170,9 +170,9 @@ def loop_source(equation, width: int,
 
 def deploy(backend: str, module, entry: str, directory: Path):
     if backend == "c":
-        from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+        from src.compiler.ssa_c_backend import emit_ssa_to_c
 
-        artifact = emit_ssa_module_to_c(module, entry)
+        artifact = emit_ssa_to_c(module, entry)
         if not artifact.complete:
             raise RuntimeError("; ".join(
                 f"{item.operation}: {item.reason}"

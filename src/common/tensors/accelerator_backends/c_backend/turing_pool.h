@@ -65,6 +65,16 @@ int turing_pool_deploy_span(turing_span_fn fn, void* context, long item_count,
 // may be started again afterwards.
 void turing_pool_stop(void);
 
+// Advisory critical section for ORDER-INSENSITIVE shared effects inside a
+// deployed lane -- the sanctioned case is an append of a lane-invariant
+// value, where every iteration pushes an identical element so only the
+// count is observable and atomicity alone preserves serial semantics.
+// This lock is deliberately separate from the pool's own scheduling lock,
+// so holding it can never interact with claim/park logic.  It must not be
+// used to launder order-DEPENDENT effects; those need an indexed join.
+void turing_pool_effect_lock(void);
+void turing_pool_effect_unlock(void);
+
 #ifdef __cplusplus
 }
 #endif

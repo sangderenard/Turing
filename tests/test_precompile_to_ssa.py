@@ -27,6 +27,7 @@ from src.compiler.precompile_to_ssa import (
     _inject_field_slot_access,
     _install_loop_owned_table_queries,
     _materialize_control_constants,
+    _typed_region_occurrence,
     ResolvedSequenceSchema,
     find_ssa_cycles,
     lower_control_program_to_ssa,
@@ -96,6 +97,67 @@ def test_field_receiver_uses_typed_columns_only_for_heterogeneous_slots():
         if instruction.op == "GetElementPtr"
     ]
     assert [instruction.args[0].id for instruction in geps] == [10, 11]
+
+
+def test_field_write_versions_result_colliding_with_receiver_storage():
+    written = SSAValue(18, dtype="float64")
+    compute = Instr("Compute", [], written)
+    control = Function(
+        "Controller__update_dt_max",
+        [],
+        {"entry": BasicBlock("entry", [compute, Instr("Return", [], None)])},
+    )
+
+    lowered, locations = _inject_field_slot_access(
+        control,
+        self_value_id=18,
+        non_self_param_ids=(),
+        field_ops=(("write", 18, 0),),
+        field_count=1,
+        output_value_ids=(),
+        field_dtypes={0: "float64"},
+    )
+
+    assert locations == {0: (18, 0, "float64")}
+    assert compute.res.id != 18
+    stores = [
+        instruction for instruction in lowered.blocks["entry"].instrs
+        if instruction.op == "Store"
+    ]
+    assert len(stores) == 1
+    assert stores[0].args[0] is compute.res
+    address = stores[0].args[1]
+    gep = next(
+        instruction for instruction in lowered.blocks["entry"].instrs
+        if instruction.res is address
+    )
+    assert gep.args[0].id == 18
+
+
+def test_region_output_versions_declared_inout_formal():
+    control = ControlProgram(
+        StatementBlock(("__scheduled_region_0__",)),
+        region_indices=(0,),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_signatures={0: ((18,), (18,))},
+        region_value_meta={18: Meta((), "float64")},
+        inout_value_ids=(18,),
+    )
+
+    assert shortfalls == ()
+    formal = next(value for value in function.args if value.id == 18)
+    projection = next(
+        instruction for instruction in function.blocks["entry"].instrs
+        if instruction.op == "Load"
+        and instruction.attributes.get("source_output_id") == 18
+    )
+    assert projection.res is not formal
+    assert projection.res.id != formal.id
+    assert projection.res.accounting["source_value_id"] == 18
+    assert projection.res.accounting["ssa_inout_write_version"] is True
 
 
 def test_structural_integral_lowers_resident_mapping_store_not_numeric_slots():
@@ -253,6 +315,42 @@ def test_numerical_tensor_ops_call_real_imported_llvm_algorithms():
         "binary_scalar_double"
     )
     assert function.blocks["entry"].instrs[1].attributes["right_scalar"] == 1.0
+
+
+def test_tensor_normalization_and_cast_like_have_typed_ssa_identities():
+    program = FusedProgram(
+        version=1,
+        feeds={0, 1, 9},
+        steps=[
+            OpStep(0, "tensor", [0], {}, 2),
+            OpStep(
+                1,
+                "cast_like",
+                [9, 2, 1],
+                {
+                    "target_from_operand": 1,
+                    "python_replacement_kind": "operator",
+                    "argument_count": 2,
+                },
+                3,
+            ),
+        ],
+        outputs={"result": 3},
+        meta={
+            value_id: Meta((), "float64", "cpu")
+            for value_id in (0, 1, 2, 3, 9)
+        },
+    )
+
+    function, shortfalls = lower_fused_program_to_ssa(program)
+
+    assert shortfalls == ()
+    assert [item.op for item in function.blocks["entry"].instrs] == [
+        "CastLike", "CastLike", "Ret",
+    ]
+    assert [item.id for item in function.blocks["entry"].instrs[1].args] == [
+        2, 1,
+    ]
 
 
 def test_random_source_lowers_to_repository_ssa_feature_call():
@@ -585,6 +683,36 @@ def test_record_field_getattr_becomes_a_loaded_region_capture():
     assert "Load" in control_operations
 
 
+def test_region_body_free_value_supplements_planner_captures():
+    from src.compiler.hierarchical_plan import PlanClosure, PlanLine
+
+    region = PlanClosure(
+        "region_0",
+        captures=(2,),
+        items=(PlanLine.create("Add", inputs=(1, 2), outputs=(3,)),),
+        value_shapes=tuple(
+            (value_id, (), "float64") for value_id in (1, 2, 3)
+        ),
+    )
+    control = ControlProgram(
+        StatementBlock(("__scheduled_region_0__",)),
+        region_indices=(0,),
+    )
+
+    module, shortfalls, _outputs = lower_control_sections_to_ssa(
+        control,
+        hierarchy_plan=PlanClosure("root", (), (region,)),
+        required_output_value_ids=(3,),
+    )
+
+    assert shortfalls == ()
+    lowered = module.functions["planned_control__planned_region_0"]
+    assert [value.id for value in lowered.args] == [2, 1]
+    assert lowered.metadata["source_region_integral"][
+        "capture_value_ids"
+    ] == (2, 1)
+
+
 def test_verified_source_region_link_replaces_only_an_exact_structural_abi():
     token_chain = (
         "source-region", "planned_control", "closure:1", "region_0",
@@ -784,6 +912,49 @@ def test_whole_object_region_signature_preserves_planner_value_shapes():
     assert outputs[region.name][0].shape == (3, 2)
 
 
+def test_whole_object_regions_preserve_distinct_views_of_one_storage_id():
+    from src.compiler.hierarchical_plan import PlanClosure, PlanLine
+
+    control = ControlProgram(
+        SequenceBlock((
+            StatementBlock(("__scheduled_region_3__",)),
+            StatementBlock(("__scheduled_region_4__",)),
+        )),
+        region_indices=(3, 4),
+    )
+    hierarchy = PlanClosure(
+        "root",
+        (10,),
+        (
+            PlanClosure(
+                "region_3",
+                (10,),
+                (PlanLine.create("sum", inputs=(10,), outputs=(11,)),),
+                value_shapes=((10, (8, 4, 128), "float64"),),
+            ),
+            PlanClosure(
+                "region_4",
+                (10,),
+                (PlanLine.create("equal", inputs=(10, 10), outputs=(12,)),),
+                value_shapes=((10, (8, 4, 128, 1), "float64"),),
+            ),
+        ),
+    )
+
+    module, shortfalls, _outputs = lower_control_sections_to_ssa(
+        control,
+        hierarchy_plan=hierarchy,
+    )
+
+    assert shortfalls == ()
+    assert module.functions[
+        "planned_control__planned_region_3"
+    ].args[0].shape == (8, 4, 128)
+    assert module.functions[
+        "planned_control__planned_region_4"
+    ].args[0].shape == (8, 4, 128, 1)
+
+
 def test_string_tokens_remain_typed_i64_without_numeric_projection():
     from src.compiler.hierarchical_plan import PlanClosure, PlanLine
     from src.compiler.string_table import string_token
@@ -851,6 +1022,51 @@ def test_control_region_call_wires_feeds_and_explicit_output_producers():
     assert call.attributes["output_ids"] == (12, 13)
     loads = [item for item in instructions if item.op == "Load"]
     assert [item.res.id for item in loads] == [12, 13]
+
+
+def test_region_calls_preserve_distinct_ordered_views_of_one_storage_identity():
+    control = ControlProgram(
+        SequenceBlock((
+            StatementBlock(("__scheduled_region_3__",)),
+            StatementBlock(("__scheduled_region_4__",)),
+        )),
+        region_indices=(3, 4),
+    )
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_callees={3: "flat_consumer", 4: "matrix_consumer"},
+        region_signatures={3: ((10,), ()), 4: ((10,), ())},
+        region_feed_meta={
+            3: (Meta((8,), "float64", "cpu"),),
+            4: (Meta((2, 4), "float64", "cpu"),),
+        },
+        region_value_meta={10: Meta((8,), "float64", "cpu")},
+    )
+    calls = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+    ]
+
+    assert shortfalls == ()
+    assert [call.args[0].id for call in calls] == [10, 10]
+    assert [call.args[0].shape for call in calls] == [(8,), (2, 4)]
+    assert [call.attributes["feed_shapes"] for call in calls] == [
+        ((8,),), ((2, 4),),
+    ]
+
+
+def test_region_dtype_reconciliation_does_not_erase_a_reshape_view():
+    canonical = SSAValue(10, "float64", shape=(8, 4, 128, 3))
+    plane_view = SSAValue(10, "float64", shape=(8, 4, 128, 1, 3))
+
+    held = _typed_region_occurrence(
+        plane_view, canonical, Meta(canonical.shape, "float64", "cpu"),
+    )
+
+    assert held.shape == (8, 4, 128, 1, 3)
 
 
 def test_nested_conditionals_overlay_and_lower_each_region_exactly_once():
@@ -968,6 +1184,141 @@ def test_cross_region_live_out_survives_local_consumption():
     assert [value.id for value in calls[1].args] == [10, 11]
 
 
+def test_in_place_store_chain_output_publishes_its_root_arena():
+    """A returned name built by in-place slice stores is one storage.
+
+    ``surface_velocity = point * 0.0`` followed by two slice stores names one
+    arena in three versions.  Every version id aliases the root, so the
+    region must publish the ROOT it produced and the required final version
+    as itself (the identity every later stage keys on), and the function
+    must return that final version.  Dropping every aliased id silently
+    removed the authored output from the region and from the Ret (nine
+    authored outputs, eight returned).
+    """
+
+    from src.compiler.hierarchical_plan import PlanClosure, PlanLine
+
+    control = ControlProgram(
+        SequenceBlock((
+            StatementBlock(("__scheduled_region_0__",)),
+            StatementBlock(("__scheduled_region_1__",)),
+        )),
+        region_indices=(0, 1),
+    )
+    hierarchy = PlanClosure(
+        "root",
+        (10, 20, 21),
+        (
+            PlanClosure(
+                "region_0",
+                (10, 20, 21),
+                (
+                    PlanLine.create("Mul", inputs=(10, 10), outputs=(11,)),
+                    PlanLine.create(
+                        "IndexedStore", inputs=(11, 20, 21), outputs=(12,)
+                    ),
+                    PlanLine.create(
+                        "IndexedStore", inputs=(12, 20, 21), outputs=(13,)
+                    ),
+                ),
+            ),
+            PlanClosure(
+                "region_1",
+                (10,),
+                (PlanLine.create("Add", inputs=(10, 10), outputs=(14,)),),
+            ),
+        ),
+    )
+
+    module, shortfalls, outputs = lower_control_sections_to_ssa(
+        control,
+        hierarchy_plan=hierarchy,
+        identity_table={"out": (11, 12, 13), "other": (14,)},
+        function_outputs=("out", "other"),
+    )
+
+    assert shortfalls == ()
+    region_0 = module.functions["planned_control__planned_region_0"]
+    assert [value.id for value in outputs[region_0.name]] == [11, 13]
+    control_function = module.functions["planned_control"]
+    ret = next(
+        instruction
+        for block in control_function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret"
+    )
+    assert [value.id for value in ret.args] == [13, 14]
+    assert control_function.metadata["value_aliases"] == {12: 11, 13: 12}
+def test_in_place_store_chain_on_a_parameter_publishes_nothing():
+    """A store chain whose root is a CAPTURE is visible through that capture.
+
+    ``material_state[:, :, 0] = ...`` on a parameter writes the caller's
+    storage in place.  The region publishes no version of it (a copied output
+    slot would turn an in/out write into a second value) and the function
+    returns the parameter storage itself.
+    """
+
+    from src.compiler.hierarchical_plan import PlanClosure, PlanLine
+
+    control = ControlProgram(
+        SequenceBlock((
+            StatementBlock(("__scheduled_region_0__",)),
+            StatementBlock(("__scheduled_region_1__",)),
+        )),
+        region_indices=(0, 1),
+    )
+    hierarchy = PlanClosure(
+        "root",
+        (4, 20, 21),
+        (
+            PlanClosure(
+                "region_0",
+                (4, 20, 21),
+                (
+                    PlanLine.create(
+                        "IndexedStore", inputs=(4, 20, 21), outputs=(12,)
+                    ),
+                    PlanLine.create(
+                        "IndexedStore", inputs=(12, 20, 21), outputs=(13,)
+                    ),
+                ),
+            ),
+            PlanClosure(
+                "region_1",
+                (13,),
+                (PlanLine.create("Add", inputs=(13, 13), outputs=(14,)),),
+            ),
+        ),
+    )
+
+    module, shortfalls, outputs = lower_control_sections_to_ssa(
+        control,
+        hierarchy_plan=hierarchy,
+        identity_table={"state": (4, 12, 13), "other": (14,)},
+        function_outputs=("state", "other"),
+        function_parameters=("state",),
+    )
+
+    assert shortfalls == ()
+    region_0 = module.functions["planned_control__planned_region_0"]
+    assert [value.id for value in outputs[region_0.name]] == []
+    control_function = module.functions["planned_control"]
+    ret = next(
+        instruction
+        for block in control_function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret"
+    )
+    assert [value.id for value in ret.args] == [4, 14]
+    calls = [
+        instruction
+        for block in control_function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+    ]
+    assert [value.id for value in calls[1].args] == [4]
+
+
 def test_generator_sequence_plan_call_is_scheduled_before_result_consumer():
     from src.compiler.control_source import (
         ControlProgram, ControlSequenceMutation, LoopBlock, SequenceBlock,
@@ -1009,6 +1360,88 @@ def test_generator_sequence_plan_call_is_scheduled_before_result_consumer():
         producer,
         StatementBlock(("__plan_callsite_206__",)),
         consumer,
+    )
+
+
+def test_ordinary_plan_call_is_ordered_after_argument_producer():
+    from src.compiler.hierarchical_plan import PlanCall, PlanClosure, PlanLine
+    from src.compiler.precompile_to_ssa import _schedule_loop_callsites
+
+    producer = StatementBlock(("__scheduled_region_0__",))
+    consumer = StatementBlock(("__scheduled_region_1__",))
+    hierarchy = PlanClosure("root", (1,), (
+        PlanClosure(
+            "region_0", (1,),
+            (PlanLine.create("Add", inputs=(1, 1), outputs=(2,)),),
+        ),
+        PlanCall(
+            20,
+            PlanClosure("child", (9,), ()),
+            argument_bindings=((2, 9),),
+            result_bindings=((10, 3),),
+        ),
+        PlanClosure(
+            "region_1", (3,),
+            (PlanLine.create("Mul", inputs=(3, 3), outputs=(4,)),),
+        ),
+    ))
+
+    scheduled, bindings = _schedule_loop_callsites(
+        ControlProgram(SequenceBlock((consumer, producer))),
+        hierarchy,
+        {0: ((1,), (2,)), 1: ((3,), (4,))},
+        {0: ((1,), (2,)), 1: ((3,), (4,))},
+    )
+
+    assert bindings[20] == ((2,), (3,))
+    assert scheduled.root.blocks == (
+        producer,
+        StatementBlock(("__plan_callsite_20__",)),
+        consumer,
+    )
+
+
+def test_plan_call_preserves_hierarchy_order_across_mutable_storage_alias():
+    """Resident post-write aliases need not share the store result value id."""
+
+    from src.compiler.hierarchical_plan import PlanCall, PlanClosure, PlanLine
+    from src.compiler.precompile_to_ssa import _schedule_loop_callsites
+
+    store = StatementBlock(("__scheduled_region_0__",))
+    metrics = StatementBlock(("__scheduled_region_2__",))
+    hierarchy = PlanClosure("root", (1,), (
+        PlanClosure(
+            "region_0", (1,),
+            (PlanLine.create("IndexedStore", inputs=(1,), outputs=(11,)),),
+        ),
+        PlanCall(
+            31,
+            PlanClosure("step", (100,), ()),
+            # 18 is the post-write resident-storage view.  Its identity is
+            # intentionally distinct from the store effect/result id 11.
+            argument_bindings=((18, 100),),
+            result_bindings=((101, 32),),
+        ),
+        PlanClosure(
+            "region_2", (11, 32),
+            (PlanLine.create("Sub", inputs=(32, 11), outputs=(40,)),),
+        ),
+    ))
+
+    scheduled, bindings = _schedule_loop_callsites(
+        # The control overlay's stale region discovery order is consumer,
+        # producer; hierarchy composition is the execution authority.
+        ControlProgram(SequenceBlock((metrics, store))),
+        hierarchy,
+        {0: ((1,), (11,)), 2: ((11, 32), (40,))},
+        {0: ((1,), (11,)), 2: ((11, 32), (40,))},
+    )
+
+    assert bindings[31] == ((18,), (32,))
+    assert scheduled.root.blocks == (
+        store,
+        StatementBlock(("__plan_callsite_31__",)),
+        metrics,
     )
 
 
@@ -1197,6 +1630,37 @@ def test_zero_argument_sequence_pop_loads_last_value_and_commits_length():
         str(instruction.op).casefold() == "store"
         for instruction in pop_instructions
     )
+
+
+def test_zero_argument_sequence_clear_commits_zero_length():
+    control = ControlProgram(LoopBlock(
+        "item", "0", "1", "1", SequenceBlock(()),
+        sequence_mutations=(ControlSequenceMutation(
+            20,
+            "clear",
+            (),
+            23,
+            policy="duplicates",
+        ),),
+    ))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        function_name="sequence_clear",
+        first_value_id=1000,
+        sequence_declarations=((20, "duplicates", 1, True),),
+        sequence_column_dtypes={20: ("int64",)},
+    )
+    clear_instructions = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "ssa_sequence_clear"
+    ]
+
+    assert shortfalls == ()
+    assert len(clear_instructions) == 1
+    assert str(clear_instructions[0].op).casefold() == "store"
 
 
 def test_structural_dependency_chain_delays_early_sequence_mutation():
@@ -2208,6 +2672,146 @@ def test_while_break_does_not_capture_a_later_carried_update():
         if instruction.attributes.get("binding") == "loop_result_port"
     )
     assert result_phi.args[1] is carried_phi.res
+
+
+def test_while_latch_condition_cannot_rebind_carried_seed_phi():
+    control = ControlProgram(
+        WhileBlock(
+            predicate_value_id=10,
+            condition=StatementBlock(("__scheduled_region_0__",)),
+            body=SequenceBlock((
+                StatementBlock(("__scheduled_region_0__",)),
+                StatementBlock(("__scheduled_region_1__",)),
+            )),
+            carried_aliases=((2, 1),),
+        ),
+        region_indices=(0, 1),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_signatures={
+            0: ((), (1, 10)),
+            1: ((1,), (2,)),
+        },
+        region_value_meta={
+            1: Meta((), "float64"),
+            2: Meta((), "float64"),
+            10: Meta((), "bool"),
+        },
+    )
+
+    assert shortfalls == ()
+    carried_phi = next(
+        instruction
+        for instruction in function.blocks["while_header"].instrs
+        if instruction.attributes.get("binding") == "loop_carried"
+    )
+    latch_projection = next(
+        instruction
+        for instruction in function.blocks["while_latch"].instrs
+        if instruction.attributes.get("discarded_carried_seed_projection")
+    )
+    assert latch_projection.attributes["source_output_id"] == 1
+    assert latch_projection.res is not carried_phi.res
+    body_projection = next(
+        instruction
+        for instruction in function.blocks["while_body"].instrs
+        if instruction.attributes.get("discarded_carried_seed_projection")
+    )
+    body_update = next(
+        instruction
+        for instruction in function.blocks["while_body"].instrs
+        if instruction.op == "Call"
+        and instruction.attributes.get("callee") == "numerical_region_1"
+    )
+    assert body_projection.res is not carried_phi.res
+    assert body_update.args[0].id == carried_phi.res.id
+    assert body_update.args[0].accounting["ssa_storage_alias"] == (
+        carried_phi.res.id
+    )
+    assert body_update.args[0].accounting["ssa_loop_carried_feed"] == 1
+
+
+def test_while_carried_phi_uses_conditional_merge_as_backedge_definition():
+    """A partial assignment publishes its merge, not a reserved placeholder."""
+
+    control = ControlProgram(
+        WhileBlock(
+            predicate_value_id=10,
+            condition=StatementBlock(("__scheduled_region_0__",)),
+            body=ConditionalBlock(
+                predicate_value_id=11,
+                body=StatementBlock(("__scheduled_region_1__",)),
+                orelse=SequenceBlock(()),
+                predicate_expression=ControlExpression("value", value_id=11),
+                carried_aliases=((2, 1, 1, 2),),
+            ),
+            carried_aliases=((2, 1),),
+        ),
+        region_indices=(0, 1),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_signatures={
+            0: ((1,), (10,)),
+            1: ((1,), (2,)),
+        },
+        region_value_meta={
+            1: Meta((), "float64"),
+            2: Meta((), "float64"),
+            10: Meta((), "bool"),
+            11: Meta((), "bool"),
+        },
+    )
+
+    assert shortfalls == ()
+    carried_phi = next(
+        instruction
+        for instruction in function.blocks["while_header"].instrs
+        if instruction.attributes.get("binding") == "loop_carried"
+    )
+    conditional_phi = next(
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding") == "conditional_carried"
+    )
+    assert carried_phi.args[1] is conditional_phi.res
+    assert any(
+        instruction.res is carried_phi.args[1]
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+
+
+def test_while_identity_assignment_is_a_defined_phi_backedge():
+    control = ControlProgram(WhileBlock(
+        predicate_value_id=10,
+        condition=StatementBlock(("__scheduled_region_0__",)),
+        body=SequenceBlock(()),
+        carried_aliases=((2, 1),),
+    ), region_indices=(0,))
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_signatures={0: ((1,), (10,))},
+        region_value_meta={
+            1: Meta((), "float64"),
+            2: Meta((), "float64"),
+            10: Meta((), "bool"),
+        },
+    )
+
+    assert shortfalls == ()
+    carried_phi = next(
+        instruction
+        for instruction in function.blocks["while_header"].instrs
+        if instruction.attributes.get("binding") == "loop_carried"
+    )
+    assert carried_phi.args[1] is carried_phi.res
+    assert carried_phi.res.accounting["ssa_identity_backedge"] is True
 
 
 def test_terminal_loop_return_runs_after_predicated_sequence_effects():

@@ -1137,6 +1137,24 @@ def _normalize_lexical_values(
     known_class_identities = {
         record.identity for record in navigation_table.classes
     }
+
+    def annotation_aggregate_kind(annotation: ast.AST | None) -> str | None:
+        if isinstance(annotation, ast.Name) and annotation.id in {
+            "list", "set", "dict", "tuple", "bytes", "bytearray",
+        }:
+            return annotation.id
+        if isinstance(annotation, ast.Subscript):
+            return annotation_aggregate_kind(annotation.value)
+        if isinstance(annotation, ast.BinOp) and isinstance(
+            annotation.op, ast.BitOr,
+        ):
+            kinds = tuple(filter(None, (
+                annotation_aggregate_kind(annotation.left),
+                annotation_aggregate_kind(annotation.right),
+            )))
+            return kinds[0] if len(set(kinds)) == 1 else None
+        return None
+
     for argument in (
         *statement.args.posonlyargs,
         *statement.args.args,
@@ -1148,13 +1166,9 @@ def _normalize_lexical_values(
             and annotation.id in known_class_identities
         ):
             parameter_class_names[argument.arg] = annotation.id
-        if (
-            isinstance(annotation, ast.Name)
-            and annotation.id in {
-                "list", "set", "dict", "tuple", "bytes", "bytearray"
-            }
-        ):
-            parameter_aggregate_kinds[argument.arg] = annotation.id
+        aggregate_kind = annotation_aggregate_kind(annotation)
+        if aggregate_kind is not None:
+            parameter_aggregate_kinds[argument.arg] = aggregate_kind
     for parameter_name, record in dict(
         graph.G.graph.get("parameter_sequence_record_abi") or {}
     ).items():
@@ -1271,8 +1285,6 @@ def _normalize_lexical_values(
             for index, expression in enumerate(expressions)
         )
         break
-    temporary_id = max(graph.G.nodes, default=-1) + 1
-
     def new_node(
         node_type: str,
         label: str,
@@ -1280,9 +1292,15 @@ def _normalize_lexical_values(
         attributes: dict[str, Any] | None = None,
         parents: tuple[tuple[int, str], ...] = (),
     ) -> int:
-        nonlocal temporary_id
-        node_id = temporary_id
-        temporary_id += 1
+        # Value ids are identities: never hand out an id freed by an earlier
+        # removal.  The per-graph watermark only moves forward (see
+        # src.compiler.process_graph_value_ids for the shared rule).
+        metadata = graph.G.graph
+        node_id = max(
+            int(metadata.get("value_id_watermark", -1)),
+            max((int(existing) for existing in graph.G.nodes), default=-1),
+        ) + 1
+        metadata["value_id_watermark"] = node_id
         graph.G.add_node(
             node_id,
             label=label,
@@ -3176,6 +3194,25 @@ def _normalize_lexical_values(
                 _remove_node(graph, id(body_statement))
             return result
         if isinstance(body_statement, ast.If):
+            # Python parameters exist from function entry.  A parameter first
+            # read inside one arm is minted there and dropped with that arm's
+            # environment, so the next read mints a SECOND Input for the same
+            # parameter: two formals for one authored argument, and a returned
+            # in/out parameter whose storage the caller can no longer bind.
+            # Mint every parameter this statement reads BEFORE the snapshot,
+            # the rule loops already apply; ``input_value`` is idempotent.
+            for read_name in {
+                member.id
+                for member in source_walk(body_statement)
+                if isinstance(member, ast.Name)
+                and isinstance(member.ctx, ast.Load)
+            }:
+                if (
+                    read_name in parameter_names
+                    and read_name not in environment
+                    and read_name not in static_environment
+                ):
+                    input_value(read_name, binding_kind="parameter")
             test_value = resolve_expression(body_statement.test)
             # Control-flow value merging remains a planner responsibility.
             # Reduce lexical occurrences within each arm without pretending
@@ -3201,9 +3238,19 @@ def _normalize_lexical_values(
                 if not statements:
                     return False
                 terminal = statements[-1]
-                return isinstance(terminal, (ast.Return, ast.Raise)) or (
-                    isinstance(terminal, ast.If)
-                    and id(terminal) in graph.G
+                if isinstance(
+                    terminal,
+                    (ast.Return, ast.Raise, ast.Continue, ast.Break),
+                ):
+                    return True
+                if not isinstance(terminal, ast.If):
+                    return False
+                return (
+                    bool(terminal.orelse)
+                    and terminal_branch(terminal.body)
+                    and terminal_branch(terminal.orelse)
+                ) or (
+                    id(terminal) in graph.G
                     and bool(
                         (graph.G.nodes[id(terminal)].get("attributes") or {}).get(
                             "terminal_return_merge"
@@ -3320,6 +3367,25 @@ def _normalize_lexical_values(
                 })
             return id(body_statement)
         if isinstance(body_statement, ast.Try):
+            # Python parameters exist from function entry.  A parameter first
+            # read inside one arm is minted there and dropped with that arm's
+            # environment, so the next read mints a SECOND Input for the same
+            # parameter: two formals for one authored argument, and a returned
+            # in/out parameter whose storage the caller can no longer bind.
+            # Mint every parameter this statement reads BEFORE the snapshot,
+            # the rule loops already apply; ``input_value`` is idempotent.
+            for read_name in {
+                member.id
+                for member in source_walk(body_statement)
+                if isinstance(member, ast.Name)
+                and isinstance(member.ctx, ast.Load)
+            }:
+                if (
+                    read_name in parameter_names
+                    and read_name not in environment
+                    and read_name not in static_environment
+                ):
+                    input_value(read_name, binding_kind="parameter")
             before = dict(environment)
             for nested in body_statement.body:
                 reduce_statement(nested)
@@ -3713,7 +3779,12 @@ def _normalize_lexical_values(
                     # and its receiver is the explicit ``operand`` input.  It
                     # is not a second, opaque mutation of that receiver.  The
                     # callee's own GetAttr/SetAttr and calls carry its effects.
-                    if call_attributes.get("method_ref") is not None:
+                    if any(
+                        call_attributes.get(key) is not None
+                        for key in (
+                            "method_ref", "callee_ref", "resolved_ast_parent",
+                        )
+                    ):
                         continue
                     argument_ids = tuple(
                         int(parent)
@@ -3743,7 +3814,7 @@ def _normalize_lexical_values(
                     sequence_mutation = (
                         sequence_policy is not None
                         and call.func.attr in {
-                            "add", "append", "extend", "pop"
+                            "add", "append", "clear", "extend", "pop"
                         }
                         and not (
                             aggregate_kind == "dict"
@@ -4042,6 +4113,9 @@ def _normalize_lexical_values(
     ordered_graph = nx.DiGraph()
     ordered_graph.graph.update(relabeled.graph)
     ordered_graph.graph["canonical_value_ids"] = True
+    # Renumbering changes the id space; a watermark from the AST-id
+    # ingestion graph must not leak into canonical allocation.
+    ordered_graph.graph.pop("value_id_watermark", None)
     ordered_graph.graph["ssa_identity_tokens"] = {
         mapping[node_id]: node_token_chains[node_id]
         for node_id in ordered

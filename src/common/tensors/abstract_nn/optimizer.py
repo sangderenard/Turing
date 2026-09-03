@@ -79,23 +79,32 @@ def adam_step(
     beta1: float = 0.9,
     beta2: float = 0.999,
     eps: float = 1e-8,
+    beta1_power: AT | None = None,
+    beta2_power: AT | None = None,
 ) -> Tuple[AT, AT, AT, AT]:
-    """Pure functional, fully-recordable Adam update for a single parameter tensor.
+    """Pure functional AbstractTensor Adam update for one parameter tensor.
 
-    Inputs are AbstractTensors and the update is expressed entirely via
-    AbstractTensor ops so it records on the current tape. Returns
-    (p_new, m_new, v_new, t_new).
+    Hyperparameters may remain runtime scalar/tensor ABI inputs.  No capture
+    or tape mechanism is required: callers may compose this equation with a
+    statically generated inverse graph before selecting a compiler backend.
     """
     # increment step (scalar tensor)
     t_new = t + 1.0
-    b1 = float(beta1)
-    b2 = float(beta2)
+    b1 = beta1
+    b2 = beta2
     m_new = b1 * m + (1.0 - b1) * g
     v_new = b2 * v + (1.0 - b2) * (g * g)
-    m_hat = m_new / (1.0 - (beta1 ** t_new))
-    v_hat = v_new / (1.0 - (beta2 ** t_new))
-    denom = (v_hat ** 0.5) + float(eps)
-    p_new = p - float(lr) * (m_hat / denom)
+    # Supplying the powers makes the bias correction a purely arithmetic
+    # program.  That is the AOT/two-limb route: the host advances these two
+    # scalar states, avoiding a runtime transcendental exponent while keeping
+    # beta and every model parameter live.  Eager callers retain the familiar
+    # beta**step spelling when the powers are omitted.
+    b1_power = (beta1 ** t_new) if beta1_power is None else beta1_power
+    b2_power = (beta2 ** t_new) if beta2_power is None else beta2_power
+    m_hat = m_new / (1.0 - b1_power)
+    v_hat = v_new / (1.0 - b2_power)
+    denom = (v_hat ** 0.5) + eps
+    p_new = p - lr * (m_hat / denom)
     return p_new, m_new, v_new, t_new
 
 

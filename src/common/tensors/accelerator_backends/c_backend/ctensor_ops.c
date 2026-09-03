@@ -171,8 +171,16 @@
         for (int i = 0; i < m; ++i) {
             for (int j = 0; j < p; ++j) {
                 double sum = 0.0;
+                double correction = 0.0;
                 for (int k = 0; k < n; ++k) {
-                    sum += a[i * n + k] * b[k * p + j];
+                    /* Compensated inner products keep cancellation-heavy
+                       operators (for example row-sum-zero Laplacians) from
+                       turning rounding residue into a material force. */
+                    double product = a[i * n + k] * b[k * p + j];
+                    double adjusted = product - correction;
+                    double next = sum + adjusted;
+                    correction = (next - sum) - adjusted;
+                    sum = next;
                 }
                 out[i * p + j] = sum;
             }
@@ -250,6 +258,34 @@
                 m,
                 n,
                 p);
+        }
+    }
+
+    void gather_values_double(
+        const double* input,
+        double* output,
+        const int* shape,
+        int ndim,
+        int dim,
+        const double* indices,
+        int index_count) {
+        int before = 1;
+        int after = 1;
+        for (int axis = 0; axis < dim; ++axis) before *= shape[axis];
+        for (int axis = dim + 1; axis < ndim; ++axis) after *= shape[axis];
+        const int source_count = shape[dim];
+        for (int batch = 0; batch < before; ++batch) {
+            for (int item = 0; item < index_count; ++item) {
+                int source_item = (int)indices[item];
+                if (source_item < 0) source_item += source_count;
+                for (int element = 0; element < after; ++element) {
+                    const int output_index =
+                        ((batch * index_count + item) * after) + element;
+                    const int source_index =
+                        ((batch * source_count + source_item) * after) + element;
+                    output[output_index] = input[source_index];
+                }
+            }
         }
     }
 

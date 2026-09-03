@@ -1352,6 +1352,7 @@ def _expand_unresolved_ast_parents(
     include=None,
     pursuit_roots=None,
     tensor_code_references=None,
+    source_ast_normalizers=(),
     profile_verbose=False,
     progress=None,
 ):
@@ -1936,6 +1937,14 @@ def _expand_unresolved_ast_parents(
                     source_target
                 )
         source_definition = _filter_discovered_definition(source_definition, module)
+        if source_ast_normalizers:
+            discovered_module = ast.Module(
+                body=[source_definition], type_ignores=[]
+            )
+            for normalize in source_ast_normalizers:
+                normalize(discovered_module)
+            ast.fix_missing_locations(discovered_module)
+            source_definition = discovered_module.body[0]
         source_depth = call_depth + 1
         if max_dependency_depth and source_depth > max_dependency_depth:
             raise RuntimeError(
@@ -2994,6 +3003,27 @@ class ProcessGraph:
                     attributes = {}
                     data["attributes"] = attributes
                 attributes["tensor_candidate"] = tensor_op
+                # Literal keyword arguments are part of the authored tensor
+                # operation, not incidental AST children.  Preserve them at
+                # ingestion so structural values such as ``dim``/``axis`` are
+                # present when the operation first acquires its identity.
+                # Planning and SSA lowering must consume this exact source
+                # fact; they must never have to infer it later from a result
+                # shape or silently substitute an operator default.
+                for keyword in getattr(current, "keywords", ()):
+                    if keyword.arg is None:
+                        continue
+                    try:
+                        literal = ast.literal_eval(keyword.value)
+                    except (TypeError, ValueError):
+                        continue
+                    existing = attributes.get(keyword.arg, literal)
+                    if existing != literal:
+                        raise ValueError(
+                            "tensor operation attribute conflicts with its "
+                            f"authored keyword: {tensor_op}.{keyword.arg}"
+                        )
+                    attributes[keyword.arg] = literal
                 if (
                     isinstance(getattr(current, "func", None), ast.Name)
                     or getattr(current, "_tensor_code_reference", None)
@@ -3126,6 +3156,7 @@ class ProcessGraph:
         parent_include=None,
         pursuit_roots=None,
         tensor_code_references=None,
+        source_ast_normalizers=(),
         retain=(),
         profile_verbose=False,
         progress=None,
@@ -3289,6 +3320,7 @@ class ProcessGraph:
                     include=parent_include,
                     pursuit_roots=pursuit_roots,
                     tensor_code_references=tensor_code_references,
+                    source_ast_normalizers=source_ast_normalizers,
                     profile_verbose=profile_verbose,
                     progress=progress,
                 )

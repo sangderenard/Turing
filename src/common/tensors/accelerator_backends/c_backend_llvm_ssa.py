@@ -59,6 +59,7 @@ C_SSA_OUTPUT_ARGUMENTS = {
     "binary_scalar_double": 2,
     "unary_double": 1,
     "matmul_double": 2,
+    "batched_matmul_indexed_double": 2,
     "where_double": 3,
     "broadcast_double": 1,
     "reduce_dim_double": 1,
@@ -69,6 +70,7 @@ C_SSA_OUTPUT_ARGUMENTS = {
     "pad_double_nd": 1,
     "slice_copy_double": 1,
     "index_select_double": 1,
+    "gather_values_double": 1,
     "index_assign_double": 0,
     "index_set_double": 1,
     "unfold2d_double": 1,
@@ -87,9 +89,11 @@ C_SSA_OUTPUT_ARGUMENTS = {
 # ABI still need to distinguish integer metadata vectors from double tensor
 # buffers, so retain that finite part of the authored C signatures here.
 C_SSA_I32_POINTER_ARGUMENTS = {
+    "batched_matmul_indexed_double": (3, 4),
     "pad_double_nd": (2, 3, 4),
     "slice_copy_double": (2,),
     "index_select_double": (2, 5),
+    "gather_values_double": (2,),
     "index_assign_double": (1, 3, 4),
     "index_set_double": (2, 4, 5),
     "cumsum_dim_double": (2,),
@@ -98,6 +102,15 @@ C_SSA_I32_POINTER_ARGUMENTS = {
     "broadcast_double": (2, 4),
     "stack_double": (2,),
     "cat_double": (1, 3),
+}
+
+# Opaque LLVM ``ptr`` does not state whether one address names tensor values
+# or an array of tensor addresses.  The authored C signatures do: stack/cat's
+# first parameter is ``const double **``. Retain that finite pointer depth in
+# repository SSA so generic native emitters do not flatten it to ``double *``.
+C_SSA_POINTER_ARRAY_ARGUMENTS = {
+    "stack_double": (0,),
+    "cat_double": (0,),
 }
 
 
@@ -197,6 +210,7 @@ _C_FUNCTION_ROLES = {
     "repeat_interleave_double": "tensor_kernel",
     "tile_double": "tensor_kernel",
     "index_select_double": "tensor_kernel",
+    "gather_values_double": "tensor_kernel",
     "slice_copy_double": "tensor_kernel",
     "index_assign_double": "tensor_kernel",
     "index_set_double": "tensor_kernel",
@@ -1079,6 +1093,102 @@ exit:
   ret void
 }
 
+define void @gather_values_double(
+    ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
+    ptr %indices, i32 %index.count) {
+entry:
+  br label %before.header
+
+before.header:
+  %before.axis = phi i32 [ 0, %entry ], [ %before.axis.next, %before.body ]
+  %before = phi i32 [ 1, %entry ], [ %before.next, %before.body ]
+  %before.continue = icmp slt i32 %before.axis, %dim
+  br i1 %before.continue, label %before.body, label %after.init
+
+before.body:
+  %before.axis64 = sext i32 %before.axis to i64
+  %before.shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %before.axis64
+  %before.extent = load i32, ptr %before.shape.ptr, align 4
+  %before.next = mul nsw i32 %before, %before.extent
+  %before.axis.next = add nsw i32 %before.axis, 1
+  br label %before.header
+
+after.init:
+  %after.first = add nsw i32 %dim, 1
+  br label %after.header
+
+after.header:
+  %after.axis = phi i32 [ %after.first, %after.init ], [ %after.axis.next, %after.body ]
+  %after = phi i32 [ 1, %after.init ], [ %after.next, %after.body ]
+  %after.continue = icmp slt i32 %after.axis, %ndim
+  br i1 %after.continue, label %after.body, label %copy.init
+
+after.body:
+  %after.axis64 = sext i32 %after.axis to i64
+  %after.shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %after.axis64
+  %after.extent = load i32, ptr %after.shape.ptr, align 4
+  %after.next = mul nsw i32 %after, %after.extent
+  %after.axis.next = add nsw i32 %after.axis, 1
+  br label %after.header
+
+copy.init:
+  %dim64 = sext i32 %dim to i64
+  %source.count.ptr = getelementptr inbounds i32, ptr %shape, i64 %dim64
+  %source.count = load i32, ptr %source.count.ptr, align 4
+  br label %batch.header
+
+batch.header:
+  %batch = phi i32 [ 0, %copy.init ], [ %batch.next, %batch.latch ]
+  %batch.continue = icmp slt i32 %batch, %before
+  br i1 %batch.continue, label %item.header, label %exit
+
+item.header:
+  %item = phi i32 [ 0, %batch.header ], [ %item.next, %item.latch ]
+  %item.continue = icmp slt i32 %item, %index.count
+  br i1 %item.continue, label %item.load, label %batch.latch
+
+item.load:
+  %item64 = sext i32 %item to i64
+  %index.ptr = getelementptr inbounds double, ptr %indices, i64 %item64
+  %source.item.double = load double, ptr %index.ptr, align 8
+  %source.item = fptosi double %source.item.double to i32
+  br label %element.header
+
+element.header:
+  %element = phi i32 [ 0, %item.load ], [ %element.next, %element.body ]
+  %element.continue = icmp slt i32 %element, %after
+  br i1 %element.continue, label %element.body, label %item.latch
+
+element.body:
+  %output.batch.base = mul nsw i32 %batch, %index.count
+  %output.item.base = add nsw i32 %output.batch.base, %item
+  %output.outer = mul nsw i32 %output.item.base, %after
+  %output.index = add nsw i32 %output.outer, %element
+  %source.batch.base = mul nsw i32 %batch, %source.count
+  %source.item.base = add nsw i32 %source.batch.base, %source.item
+  %source.outer = mul nsw i32 %source.item.base, %after
+  %source.index = add nsw i32 %source.outer, %element
+  %source.index64 = sext i32 %source.index to i64
+  %output.index64 = sext i32 %output.index to i64
+  %source.ptr = getelementptr inbounds double, ptr %input, i64 %source.index64
+  %output.ptr = getelementptr inbounds double, ptr %output, i64 %output.index64
+  %value = load double, ptr %source.ptr, align 8
+  store double %value, ptr %output.ptr, align 8
+  %element.next = add nsw i32 %element, 1
+  br label %element.header
+
+item.latch:
+  %item.next = add nsw i32 %item, 1
+  br label %item.header
+
+batch.latch:
+  %batch.next = add nsw i32 %batch, 1
+  br label %batch.header
+
+exit:
+  ret void
+}
+
 define void @index_assign_double(
     ptr %target, ptr %shape, i32 %ndim, ptr %axis.offsets,
     ptr %axis.indices, ptr %values, i32 %value.count) {
@@ -1685,6 +1795,7 @@ j.header:
 k.header:
   %k = phi i32 [ 0, %j.header ], [ %k.next, %k.body ]
   %sum = phi double [ 0.000000e+00, %j.header ], [ %sum.next, %k.body ]
+  %correction = phi double [ 0.000000e+00, %j.header ], [ %correction.next, %k.body ]
   %k.continue = icmp slt i32 %k, %n
   br i1 %k.continue, label %k.body, label %store
 
@@ -1700,7 +1811,10 @@ k.body:
   %a.value = load double, ptr %a.ptr, align 8
   %b.value = load double, ptr %b.ptr, align 8
   %product = fmul double %a.value, %b.value
-  %sum.next = fadd double %sum, %product
+  %adjusted = fsub double %product, %correction
+  %sum.next = fadd double %sum, %adjusted
+  %sum.delta = fsub double %sum.next, %sum
+  %correction.next = fsub double %sum.delta, %adjusted
   %k.next = add nsw i32 %k, 1
   br label %k.header
 
@@ -1719,6 +1833,41 @@ j.latch:
 i.latch:
   %i.next = add nsw i32 %i, 1
   br label %i.header
+
+exit:
+  ret void
+}
+
+define void @batched_matmul_indexed_double(
+    ptr %a, ptr %b, ptr %out, ptr %a_offsets, ptr %b_offsets,
+    i32 %batch_count, i32 %m, i32 %n, i32 %p) {
+entry:
+  %output.stride = mul nsw i32 %m, %p
+  br label %batch.header
+
+batch.header:
+  %batch = phi i32 [ 0, %entry ], [ %batch.next, %batch.body ]
+  %batch.continue = icmp slt i32 %batch, %batch_count
+  br i1 %batch.continue, label %batch.body, label %exit
+
+batch.body:
+  %batch64 = sext i32 %batch to i64
+  %a.offset.ptr = getelementptr inbounds i32, ptr %a_offsets, i64 %batch64
+  %b.offset.ptr = getelementptr inbounds i32, ptr %b_offsets, i64 %batch64
+  %a.offset = load i32, ptr %a.offset.ptr, align 4
+  %b.offset = load i32, ptr %b.offset.ptr, align 4
+  %a.offset64 = sext i32 %a.offset to i64
+  %b.offset64 = sext i32 %b.offset to i64
+  %a.batch = getelementptr inbounds double, ptr %a, i64 %a.offset64
+  %b.batch = getelementptr inbounds double, ptr %b, i64 %b.offset64
+  %out.offset = mul nsw i32 %batch, %output.stride
+  %out.offset64 = sext i32 %out.offset to i64
+  %out.batch = getelementptr inbounds double, ptr %out, i64 %out.offset64
+  call void @matmul_double(
+      ptr %a.batch, ptr %b.batch, ptr %out.batch,
+      i32 %m, i32 %n, i32 %p)
+  %batch.next = add nsw i32 %batch, 1
+  br label %batch.header
 
 exit:
   ret void
@@ -2272,7 +2421,10 @@ TRANSLATIONS = (
     CBackendLLVMSSA(
         "fill_double",
         "fill_double",
-        ("full", "zeros"),
+        (
+            "fill", "full", "full_like", "zeros", "zeros_like",
+            "empty", "empty_like", "ones", "ones_like",
+        ),
         "construction fill loop",
     ),
     CBackendLLVMSSA(
@@ -2453,8 +2605,14 @@ TRANSLATIONS = (
     CBackendLLVMSSA(
         "index_select_double",
         "index_select_double",
-        ("slice", "gather"),
+        ("slice",),
         "single-axis indexed selection",
+    ),
+    CBackendLLVMSSA(
+        "gather_values_double",
+        "gather_values_double",
+        ("gather",),
+        "single-axis selection from numerical index values",
     ),
     CBackendLLVMSSA(
         "index_assign_double",
@@ -2545,6 +2703,12 @@ TRANSLATIONS = (
         "matmul_double",
         ("matmul",),
         "three-loop matrix multiplication",
+    ),
+    CBackendLLVMSSA(
+        "batched_matmul_indexed_double",
+        "batched_matmul_indexed_double",
+        ("matmul",),
+        "broadcast-indexed batched matrix multiplication",
     ),
 )
 
@@ -3398,6 +3562,10 @@ def c_backend_repository_ssa_reference():
         function = imported.module.functions[symbol]
         for argument_index in argument_indices:
             function.args[int(argument_index)].dtype = "int32"
+    for symbol, argument_indices in C_SSA_POINTER_ARRAY_ARGUMENTS.items():
+        function = imported.module.functions[symbol]
+        for argument_index in argument_indices:
+            function.args[int(argument_index)].dtype = "ptrptr_float64"
     entrypoints_by_op: dict[str, list[str]] = {}
     for translation in TRANSLATIONS:
         for operation in translation.abstract_tensor_operations:
@@ -3490,6 +3658,7 @@ __all__ = [
     "C_TENSOR_OPCODE_ORDER",
     "C_SSA_OUTPUT_ARGUMENTS",
     "C_SSA_I32_POINTER_ARGUMENTS",
+    "C_SSA_POINTER_ARRAY_ARGUMENTS",
     "C_SSA_EXTERNAL_PRIMITIVES",
     "LLVM_SSA_MODULE",
     "PRECOMPILE_INTERNAL_OPERATORS",

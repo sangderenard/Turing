@@ -54,12 +54,18 @@ class SuperstepPlan:
     eps:
         Numerical tolerance for deciding when the target window has been
         satisfied.
+    rollback_threshold_multiplier:
+        Numeric errors above their ordinary thresholds still steer ``dt``.
+        State is restored and the substep retried only when an error exceeds
+        this multiple of its threshold. Physical-bound and hard failures are
+        never softened.
     """
     round_max: float | AbstractTensor
     dt_init: float | AbstractTensor
     allow_increase_mid_round: bool = False
     eps: float = 1e-15
     event_boundaries: tuple[float, ...] = ()
+    rollback_threshold_multiplier: float = 1.0
 
 
 @dataclass

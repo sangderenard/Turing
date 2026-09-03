@@ -189,19 +189,16 @@ def backend_operator_inventories() -> Mapping[str, frozenset[str]]:
     vocabularies without importing all of its peers.
     """
 
-    from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
-        c_dispatch_operations,
-        covered_operations,
-    )
     from .fused_program_wasm_backend import supported_tensor_operations as wasm
     from .javascript_numeric_operators import (
         supported_javascript_numeric_operations as javascript,
     )
     from .ssa_fortran_backend import supported_tensor_operations as fortran
+    from .ssa_c_backend import supported_tensor_operations as c
     from .ssa_llvm_backend import supported_tensor_operations as llvm
 
     return MappingProxyType({
-        "c": frozenset(c_dispatch_operations() | covered_operations()),
+        "c": frozenset(c()),
         "llvm": frozenset(llvm()),
         "fortran": frozenset(fortran()),
         "wasm": frozenset(wasm()),

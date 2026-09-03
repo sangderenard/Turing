@@ -415,6 +415,35 @@ def canonicalize_elementwise_steps(program: FusedProgram) -> FusedProgram:
     steps: list[OpStep] = []
     changed = False
     for step in program.steps:
+        # Python builtins and tensor methods share the source spellings
+        # ``max``/``min``.  Their arity is the semantic distinction: one
+        # tensor operand is a reduction, while two operands (including a
+        # captured scalar attribute) are the binary elementwise operation.
+        # Resolve that ambiguity in the common IR canonicalizer so every
+        # backend receives one stable identity.
+        binary_extrema = (
+            step.op_name in {"max", "min"}
+            and (
+                len(step.input_ids) == 2
+                or (
+                    len(step.input_ids) == 1
+                    and any(
+                        key in step.attrs
+                        for key in ("left_scalar", "right_scalar")
+                    )
+                )
+            )
+        )
+        if binary_extrema:
+            normalized = replace(
+                step,
+                op_name=(
+                    "maximum" if step.op_name == "max" else "minimum"
+                ),
+            )
+            steps.append(normalized)
+            changed = changed or normalized != step
+            continue
         try:
             op_name, prefix_reverse = canonical_elementwise_op(step.op_name)
         except KeyError:

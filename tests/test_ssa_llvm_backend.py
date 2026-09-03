@@ -49,6 +49,42 @@ def _native_scalar_buffers(artifact, values):
     return buffers, pointers, extents
 
 
+def test_pointer_array_materializes_repository_pointer_table():
+    left = SSAValue(0, "float64", (2,))
+    right = SSAValue(1, "float64", (2,))
+    table = SSAValue(2, "ptrptr_float64", (2,))
+    callee_table = SSAValue(10, "ptrptr_float64", (2,))
+    index = SSAValue(11, "int32")
+    address = SSAValue(12, "ptr")
+    selected = SSAValue(13, "float64", (2,))
+    callee = Function("consume_table", [callee_table], {
+        "entry": BasicBlock("entry", [
+            Instr("Const", [], index, attributes={"value": 0}),
+            Instr(
+                "GetElementPtr", [callee_table, index], address,
+                attributes={"aggregate_index": 0},
+            ),
+            Instr("Load", [address], selected),
+            Instr("Ret", [], None),
+        ]),
+    })
+    caller = Function("make_table", [left, right], {
+        "entry": BasicBlock("entry", [
+            Instr("PointerArray", [left, right], table),
+            Instr("Call", [table], None, attributes={"callee": callee.name}),
+            Instr("Ret", [], None),
+        ]),
+    })
+
+    artifact = emit_ssa_function_to_llvm(
+        IRModule({caller.name: caller, callee.name: callee}), caller.name,
+    )
+
+    assert artifact.shortfalls == ()
+    assert "%aggregate.pointer_array." in artifact.llvm_ir
+    assert "store ptr" in artifact.llvm_ir
+
+
 def test_multiblock_conditional_phi_executes_natively(tmp_path):
     predicate = SSAValue(0, "bool")
     true_value = SSAValue(1, "int")

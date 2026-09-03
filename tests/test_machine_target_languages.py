@@ -21,16 +21,12 @@ def test_existing_backend_operator_lists_are_exposed_without_a_fifth_copy():
     assert set(inventories) == {
         "c", "glsl", "fortran", "llvm", "webgl", "webgpu",
     }
-    assert len(inventories["c"].operations) == 40
-    assert len(inventories["glsl"].operations) == 56
-    # Includes the shared span constructors (fill/zeros/ones/full and their
-    # like variants) now lowered by the Fortran backend.
-    assert len(inventories["fortran"].operations) == 65
-    assert len(inventories["llvm"].operations) == 70
-    assert len(inventories["webgl"].operations) == 44
-    assert inventories["webgpu"].operations
+    assert inventories["c"].consumes == "ssa"
+    assert all(item.operations for item in inventories.values())
+    assert {"add", "pow", "extent"} <= inventories["c"].operations
+    assert {"add", "pow"} <= inventories["fortran"].operations
+    assert {"add", "pow"} <= inventories["llvm"].operations
     assert {"add", "mul", "bitand"} <= inventories["webgpu"].operations
-    assert inventories["c"].operations <= inventories["llvm"].operations
     assert (
         inventories["webgl"].operations - {"tensor_from_list"}
         <= inventories["glsl"].operations

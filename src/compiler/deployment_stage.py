@@ -43,7 +43,7 @@ from .deployment_lowering import (
 # The backends a bundle build plans for by default: the shells that read
 # the manifest today plus the native tier the pool runtime serves.
 DEFAULT_PLANNED_BACKENDS = (
-    "wasm", "webgpu", "glsl", "c", "llvm", "fortran",
+    "wasm", "webgpu", "glsl", "native_glsl", "c", "llvm", "fortran",
 )
 
 
@@ -284,12 +284,18 @@ def plan_region_deployments(
             lanes=lanes,
             choices=choices,
         ))
+    # ``glsl`` is the historical desktop target name. ``native_glsl`` is the
+    # explicit native-shell dispatcher choice; either one authorizes the same
+    # shader-region cut, while WebGPU remains a separate browser deployment.
     selected_shader_regions = tuple(
         decision.region_index
         for decision in decisions
         if (
-            (choice := decision.choice_for("glsl")) is not None
-            and choice.strategy == "dispatch"
+            any(
+                (choice := decision.choice_for(backend)) is not None
+                and choice.strategy == "dispatch"
+                for backend in ("native_glsl", "glsl")
+            )
             and "glsl" in decision.classification.compute_shader_targets
         )
     )

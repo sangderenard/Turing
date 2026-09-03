@@ -432,6 +432,9 @@ class ShellLanguage(int, Enum):
     C = 1
     LLVM = 2
     GLSL = 3
+    # Explicit dispatcher spelling. ``GLSL`` remains the compatibility name;
+    # this lane is desktop OpenGL compute, not browser WebGL/WGSL.
+    NATIVE_GLSL = 3
     FORTRAN = 4
     PYTHON = 5
 

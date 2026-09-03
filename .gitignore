@@ -49,3 +49,9 @@ standard_graph.jpg
 /site/
 repo-cache/
 tools/_precision_benchmark/
+
+# Browser-automation temp profiles: real cookies, saved passwords, and
+# trust tokens live here, never project content. Committed once by
+# accident on 2026-09-03 (blanket `git add -A`) and removed the same
+# commit; ignored from here on so it can't happen again.
+.tmp-chrome-*/

@@ -43,7 +43,6 @@ def native_voxel_frame(
         targets,
         controller,
         fluid_advance,
-        max_iters=64,
     )
 
     u_out = state.u + 0.0

@@ -421,9 +421,15 @@ class ProgramABIField:
                     raise ExtractionContractError(
                         f"{location}.shape[{position}] must be an integer"
                     )
-                if extent <= 0:
+                # A zero extent is a deterministic shape (an empty span
+                # whose rank and other extents are known); only a negative
+                # extent is malformed.  Refusing empty spans made every
+                # parameter of a profile with no structural edges shapeless
+                # in every callee, instead of folding the authored
+                # ``if edge_nodes.shape[0] == 0`` arm.
+                if extent < 0:
                     raise ExtractionContractError(
-                        f"{location}.shape[{position}] must be positive"
+                        f"{location}.shape[{position}] must not be negative"
                     )
                 extents.append(int(extent))
             shape = tuple(extents)
@@ -769,6 +775,80 @@ class ExtractionContract:
         self._source_origins: set[Path] = set()
         self._source_bytes = 0
 
+    def with_program_abi(
+        self, program_abi: ProgramABIContract | Mapping[str, Any],
+    ) -> "ExtractionContract":
+        """Return the same extraction policy with a declared program ABI.
+
+        Program extents are compilation-input facts, so they may be authored
+        after the repository extraction policy is loaded.  The derived
+        fingerprint includes that exact receipt and its decision ledger starts
+        empty; mutating ``program_abi`` in place would make both claims false.
+        """
+
+        derived = ExtractionContract(self.path)
+        derived.execution = self.execution
+        derived.program_abi = (
+            program_abi
+            if isinstance(program_abi, ProgramABIContract)
+            else ProgramABIContract.from_mapping(program_abi)
+        )
+        receipt = json.dumps(
+            derived.program_abi.receipt(),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        derived.fingerprint = hashlib.sha256(
+            f"{self.fingerprint}:{receipt}".encode("utf-8")
+        ).hexdigest()
+        return derived
+
+    def with_execution(
+        self, execution: ExecutionContract | Mapping[str, Any],
+    ) -> "ExtractionContract":
+        """Return the same extraction rules with a stricter execution model."""
+
+        derived = ExtractionContract(self.path)
+        derived.program_abi = self.program_abi
+        derived.execution = (
+            execution
+            if isinstance(execution, ExecutionContract)
+            else ExecutionContract.from_mapping(execution)
+        )
+        receipt = json.dumps(
+            derived.execution.receipt(),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        derived.fingerprint = hashlib.sha256(
+            f"{self.fingerprint}:{receipt}".encode("utf-8")
+        ).hexdigest()
+        return derived
+
+    def with_execution_file(
+        self, path: str | os.PathLike[str],
+    ) -> "ExtractionContract":
+        """Apply a named, fingerprinted execution overlay contract."""
+
+        overlay_path = Path(path).resolve()
+        raw_text = overlay_path.read_text(encoding="utf-8")
+        raw = yaml.safe_load(raw_text)
+        if not isinstance(raw, Mapping) or int(raw.get("version", 0)) != 1:
+            raise ExtractionContractError(
+                "execution overlay must be a version-1 mapping"
+            )
+        extra = sorted(set(raw) - {"version", "execution"})
+        if extra:
+            raise ExtractionContractError(
+                f"execution overlay has unknown fields {extra}"
+            )
+        derived = self.with_execution(raw.get("execution"))
+        derived.execution_overlay_path = overlay_path
+        derived.fingerprint = hashlib.sha256(
+            f"{derived.fingerprint}:{overlay_path.name}:{raw_text}".encode("utf-8")
+        ).hexdigest()
+        return derived
+
     def _roots(self, values: Any) -> tuple[Path, ...]:
         if not isinstance(values, list):
             raise ExtractionContractError("root groups must be lists")
@@ -946,6 +1026,17 @@ class ExtractionContract:
                 rule_id = candidate_id
                 action, parameters = choice
                 break
+        if (
+            self.execution.python_callbacks == "reject"
+            and action is ExtractionAction.PYTHON_HOST_CALL
+        ):
+            action = ExtractionAction.REJECT
+            parameters = {
+                **dict(parameters),
+                "reason": "execution_contract_rejects_python_callbacks",
+                "rejected_extraction_rule": rule_id,
+            }
+            rule_id = "execution:python_callbacks_reject"
         decision = ExtractionDecision(subject, action, rule_id, parameters)
         with self._lock:
             if action is ExtractionAction.INGEST_PYTHON and subject.origin:

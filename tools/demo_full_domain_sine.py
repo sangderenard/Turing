@@ -41,7 +41,7 @@ from src.common.tensors.signal_symbolic import (
     order_to_degree, structured_coefficients, limb_decomposition,
 )
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
-from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+from src.compiler.ssa_c_backend import emit_ssa_to_c
 
 WIDTH = 2
 DIGITS = 32
@@ -111,9 +111,9 @@ def deploy(backend: str, module, entry: str, directory: Path):
     """One lowered module, realised on one lane, behind one face."""
 
     if backend == "c":
-        from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+        from src.compiler.ssa_c_backend import emit_ssa_to_c
 
-        artifact = emit_ssa_module_to_c(module, entry)
+        artifact = emit_ssa_to_c(module, entry)
         if not artifact.complete:
             raise RuntimeError("; ".join(
                 f"{s.operation}: {s.reason}" for s in artifact.shortfalls[:3]

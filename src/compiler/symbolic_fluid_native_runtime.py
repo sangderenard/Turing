@@ -646,7 +646,6 @@ def load_symbolic_fluid_managed_functions(
             targets,
             controller,
             advance,
-            max_iters=256,
         )
         return (
             state.height,

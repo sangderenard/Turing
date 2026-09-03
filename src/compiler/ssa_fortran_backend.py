@@ -32,7 +32,6 @@ import math
 import hashlib
 import re
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
@@ -752,29 +751,12 @@ def _literal_payload(value: Any) -> str:
 
 def _llvm_literal(value: str) -> Any:
     """Decode the scalar spelling retained by the LLVM-to-SSA importer."""
+    from .ir_literals import decode_llvm_scalar_literal
 
-    dtype, separator, token = str(value).strip().partition(" ")
-    if not separator:
-        raise FortranEmissionError(f"malformed LLVM literal {value!r}")
-    token = token.strip()
-    if dtype.startswith("i"):
-        if token in {"true", "false"}:
-            return token == "true"
-        return int(token, 0)
-    if dtype in {"half", "float", "double"}:
-        if token.casefold().startswith("0x"):
-            bits = token[2:]
-            if len(bits) == 8:
-                return struct.unpack(">f", bytes.fromhex(bits))[0]
-            if len(bits) == 16:
-                return struct.unpack(">d", bytes.fromhex(bits))[0]
-            raise FortranEmissionError(
-                f"unsupported LLVM floating bit pattern {token!r}"
-            )
-        return float(token)
-    raise FortranEmissionError(
-        f"unsupported LLVM literal type {dtype!r} in {value!r}"
-    )
+    try:
+        return decode_llvm_scalar_literal(value)
+    except ValueError as error:
+        raise FortranEmissionError(str(error)) from error
 
 
 class _FunctionEmitter:
@@ -803,6 +785,7 @@ class _FunctionEmitter:
         mutated_base_ids: Sequence[int] = (),
         dynamic_array_ranks: Mapping[int, int] | None = None,
         value_dtypes: Mapping[int, str] | None = None,
+        value_shapes: Mapping[int, Sequence[int]] | None = None,
         tensor_table: SSATensorTable | None = None,
         native_symbol: str | None = None,
         callee_native_symbols: Mapping[str, str] | None = None,
@@ -882,6 +865,30 @@ class _FunctionEmitter:
         }
         self._value_types: dict[int, SSAValue] = {}
         self._infer_control_value_types()
+        self._pointer_value_ids = {
+            int(value.id)
+            for block in self.function.blocks.values()
+            for instruction in block.instrs
+            for value in (*instruction.args, instruction.res)
+            if value is not None
+            and str(value.dtype or "").casefold() in {"ptr", "pointer"}
+        }
+        self._pointer_value_ids.update(
+            int(value.id)
+            for value in self.function.args
+            if str(value.dtype or "").casefold() in {"ptr", "pointer"}
+        )
+        for value_id, value_shape in (value_shapes or {}).items():
+            current = self._value_types.get(int(value_id))
+            if current is None or tuple(current.shape):
+                continue
+            self._value_types[int(value_id)] = SSAValue(
+                current.id,
+                current.dtype,
+                tuple(map(int, value_shape)),
+                current.device,
+                dict(current.accounting or {}),
+            )
         for value_id, value_dtype in (value_dtypes or {}).items():
             current = self._value_types.get(int(value_id))
             if current is None:
@@ -929,10 +936,23 @@ class _FunctionEmitter:
             int(value_id): int(rank)
             for value_id, rank in dict(dynamic_array_ranks or {}).items()
             if int(rank) > 0
+            and int(value_id) in self.array_base_ids
+            and int(value_id) in self._value_types
+            and int(value_id) not in self._pointer_value_ids
+            and str(
+                getattr(self._value_types.get(int(value_id)), "dtype", "")
+            ).casefold() not in {"ssa.aggregate", "ptr", "pointer"}
         }
         for argument in self.function.args:
             argument_id = int(argument.id)
             if argument_id not in self.array_base_ids:
+                continue
+            if argument_id in self._pointer_value_ids:
+                # Raw pointer formals are flat C-interoperable assumed-size
+                # arrays. Their indexed span is governed by the explicit
+                # scalar dimensions already present in the helper signature;
+                # inventing a second extent ABI here makes internal helpers
+                # leak synthetic storage parameters toward the root.
                 continue
             self.dynamic_array_ranks[argument_id] = max(
                 1,
@@ -1020,6 +1040,7 @@ class _FunctionEmitter:
         # slots at a call site: identifier -> Fortran kind.  Named per
         # callsite/position, so they can never collide with ``t{id}`` locals.
         self._discard_declarations: dict[str, str] = {}
+        self._discard_array_declarations: dict[str, SSAValue] = {}
         self._phi_targets: dict[str, list[tuple[str, SSAValue, SSAValue]]] = {}
         self._loop_variables: list[str] = []
         # Values emitted as part of a multi-instruction group (a region call,
@@ -1052,6 +1073,12 @@ class _FunctionEmitter:
                         continue
                     result_id = int(instr.res.id)
                     if result_id in self.dynamic_array_ranks:
+                        continue
+                    if (
+                        result_id in self._pointer_value_ids
+                        or str(self._typed(instr.res).dtype or "").casefold()
+                        == "ssa.aggregate"
+                    ):
                         continue
                     candidates = list(instr.args)
                     candidates.extend(
@@ -2138,6 +2165,60 @@ class _FunctionEmitter:
             conformed.append(broadcast)
         return conformed
 
+    def _callee_extent_arguments(
+        self, callee: str, actual_arguments: Sequence[SSAValue],
+    ) -> tuple[str, ...]:
+        """Resolve a callee's dynamic extents from this call's actual views.
+
+        Dynamic extent names are local to the callee's formal value ids. They
+        are not global storage requirements and must not simply bubble to the
+        program entry. When the linked call preserved an actual tensor view,
+        pass its concrete dimension; when it remains dynamic, pass the
+        caller's corresponding extent. Only genuinely unresolvable/local
+        requirements remain identifiers for transitive propagation.
+        """
+
+        declared = tuple(self.callee_extents.get(str(callee), ()))
+        formals = tuple(self.callee_arguments.get(str(callee), ()))
+        actuals = tuple(actual_arguments)
+        resolved: list[str] = []
+        for extent in declared:
+            extent = str(extent)
+            replacement = None
+            matches = []
+            for position, formal in enumerate(formals[:len(actuals)]):
+                formal_id = int(formal.id)
+                match = re.search(
+                    rf"_{formal_id}(?:_([1-9][0-9]*))?$", extent
+                )
+                if match is not None:
+                    # ``..._212_1`` also superficially ends in formal id 1.
+                    # The longest formal-id suffix is the unambiguous owner.
+                    matches.append((len(str(formal_id)), position, match))
+            for _specificity, position, match in sorted(
+                matches, key=lambda candidate: candidate[0], reverse=True
+            ):
+                actual = actuals[position]
+                axis = int(match.group(1) or 1)
+                shape = tuple(self._typed(actual).shape or ())
+                if axis <= len(shape) and int(shape[axis - 1]) > 0:
+                    replacement = f"{int(shape[axis - 1])}_c_int"
+                    break
+                dimensions = tuple(
+                    self.dynamic_array_leading_extents.get(
+                        int(actual.id), ()
+                    )
+                )
+                if axis <= len(dimensions):
+                    replacement = str(dimensions[axis - 1])
+                    break
+                dynamic_extent = self.dynamic_array_extents.get(int(actual.id))
+                if axis == 1 and dynamic_extent is not None:
+                    replacement = str(dynamic_extent)
+                    break
+            resolved.append(replacement or extent)
+        return tuple(resolved)
+
     def _region_call(
         self, block: BasicBlock, index: int
     ) -> list[str] | None:
@@ -2284,8 +2365,6 @@ class _FunctionEmitter:
                         )
                     continue
                 typed_formal = self._typed(formal)
-                if _is_array(typed_formal):
-                    return None
                 # The callee's DECLARED dtype for this slot, the same
                 # authority the bridge above uses when the slot is consumed.
                 #
@@ -2305,7 +2384,16 @@ class _FunctionEmitter:
                     "real(c_double)",
                 )
                 scratch = f"discard_c{callsite}_p{slot}"
-                self._discard_declarations[scratch] = kind
+                if _is_array(typed_formal):
+                    self._discard_array_declarations[scratch] = SSAValue(
+                        typed_formal.id,
+                        slot_dtype or typed_formal.dtype,
+                        tuple(typed_formal.shape),
+                        typed_formal.device,
+                        dict(typed_formal.accounting or {}),
+                    )
+                else:
+                    self._discard_declarations[scratch] = kind
                 output_binding_values.append(typed_formal)
                 output_binding_names.append(scratch)
         else:
@@ -2326,7 +2414,7 @@ class _FunctionEmitter:
         # arrays whose sizes never appear in its signature.
         declared = self.callee_extents.get(str(callee))
         if declared is not None:
-            extents = list(declared)
+            extents = list(self._callee_extent_arguments(callee, instr.args))
         else:
             call_values = [*instr.args, *output_binding_values]
             extents = sorted(dimension_extents(call_values).values())
@@ -2487,7 +2575,7 @@ class _FunctionEmitter:
                 )
             call_operands.append(operand)
         arguments = [
-            *self.callee_extents.get(callee, ()),
+            *self._callee_extent_arguments(callee, instr.args),
             *call_operands,
         ]
         if output_argument is not None:
@@ -2743,6 +2831,172 @@ class _FunctionEmitter:
         name = f"i_loop{len(self._loop_variables)}"
         self._loop_variables.append(name)
         return name
+
+    def _constant_integer(self, value: SSAValue) -> int | None:
+        for candidate_block in self.function.blocks.values():
+            for candidate in candidate_block.instrs:
+                if (
+                    candidate.res is None
+                    or int(candidate.res.id) != int(value.id)
+                    or candidate.op not in {"Const", "const"}
+                ):
+                    continue
+                held = candidate.attributes.get(
+                    "constant", candidate.attributes.get("value")
+                )
+                if isinstance(held, (bool, int, float)):
+                    return int(held)
+                llvm_literal = candidate.attributes.get("llvm_literal")
+                if isinstance(llvm_literal, str):
+                    match = re.fullmatch(
+                        r"i(?:1|8|16|32|64)\s+([-+]?\d+)",
+                        llvm_literal.strip(),
+                    )
+                    if match is not None:
+                        return int(match.group(1))
+        return None
+
+    def _pointer_array_tensor_kernel(
+        self, block: BasicBlock, index: int,
+    ) -> list[str] | None:
+        """Legalize the complete pointer-table stack/cat group to Fortran."""
+
+        pointer_array = block.instrs[index]
+        if pointer_array.op != "PointerArray" or pointer_array.res is None:
+            return None
+        call = next((
+            candidate
+            for candidate in block.instrs[index + 1:]
+            if candidate.op in {"Call", "call"}
+            and candidate.args
+            and int(candidate.args[0].id) == int(pointer_array.res.id)
+            and str(candidate.attributes.get("callee") or "") in {
+                "stack_double", "cat_double",
+            }
+        ), None)
+        if call is None or call.res is None:
+            return None
+        callee = str(call.attributes.get("callee"))
+        dim_position = 4 if callee == "stack_double" else 5
+        if dim_position >= len(call.args):
+            return None
+        dim = self._constant_integer(call.args[dim_position])
+        if dim is None:
+            return None
+        operation = "stack" if callee == "stack_double" else "concat"
+        semantic = Instr(
+            operation,
+            list(pointer_array.args),
+            call.res,
+            attributes={"dim": int(dim)},
+            source_span=call.source_span,
+        )
+        statements = self._statements(semantic)
+        if statements is None:
+            return None
+        self._locals[int(call.res.id)] = self._typed(call.res)
+        self._consumed.add(int(pointer_array.res.id))
+        self._consumed.add(int(call.res.id))
+        return statements
+
+    def _memcpy_call(self, instr: Instr) -> list[str] | None:
+        """Express a typed LLVM memcpy as a byte-count-bounded slice copy."""
+
+        if not (
+            instr.op in {"Call", "call"}
+            and str(instr.attributes.get("callee") or "").startswith(
+                "llvm.memcpy"
+            )
+            and len(instr.args) >= 3
+        ):
+            return None
+        destination, source, byte_count = instr.args[:3]
+        destination_type = str(self._typed(destination).dtype or self.dtype)
+        source_type = str(self._typed(source).dtype or self.dtype)
+        if destination_type != source_type:
+            return None
+        byte_width = {
+            "bool": 1, "i1": 1,
+            "int32": 4, "i32": 4, "float32": 4,
+            "int64": 8, "i64": 8, "float64": 8, "double": 8,
+        }.get(destination_type.casefold())
+        if byte_width is None:
+            return None
+        destination_rank = max(
+            len(tuple(self._typed(destination).shape or ())),
+            int(self.dynamic_array_ranks.get(int(destination.id), 0)),
+            1 if int(destination.id) in self.array_base_ids else 0,
+        )
+        source_rank = max(
+            len(tuple(self._typed(source).shape or ())),
+            int(self.dynamic_array_ranks.get(int(source.id), 0)),
+            1 if int(source.id) in self.array_base_ids else 0,
+        )
+        if destination_rank == source_rank and destination_rank > 1:
+            # Imported tensor helpers spell a whole-array copy as LLVM memcpy
+            # over ``product(shape) * sizeof(element)``. Fortran already has
+            # the semantic operation: conformable array assignment. Prove
+            # this is that full-copy pattern from SSA dependencies before
+            # discarding the byte-count carrier; a partial memcpy must not be
+            # widened silently.
+            count_value = byte_count
+            producer = self._producers.get(int(count_value.id))
+            while (
+                producer is not None
+                and producer.op in {"SExt", "ZExt", "Trunc", "BitCast"}
+                and len(producer.args) == 1
+            ):
+                count_value = producer.args[0]
+                producer = self._producers.get(int(count_value.id))
+            if producer is not None and producer.op in {"Mul", "mul"}:
+                width_operands = tuple(
+                    value for value in producer.args
+                    if self._constant_integer(value) == byte_width
+                )
+                if len(width_operands) == 1:
+                    element_count = next(
+                        value for value in producer.args
+                        if value is not width_operands[0]
+                    )
+                    argument_names = tuple(
+                        self.function.metadata.get("llvm_argument_names", ())
+                    )
+                    shape_ids = {
+                        int(argument.id)
+                        for position, argument in enumerate(self.function.args)
+                        if position < len(argument_names)
+                        and str(argument_names[position]) == "shape"
+                    }
+                    pending = [element_count]
+                    visited: set[int] = set()
+                    depends_on_shape = False
+                    while pending:
+                        value = pending.pop()
+                        value_id = int(value.id)
+                        if value_id in visited:
+                            continue
+                        visited.add(value_id)
+                        if value_id in shape_ids:
+                            depends_on_shape = True
+                            break
+                        dependency = self._producers.get(value_id)
+                        if dependency is not None:
+                            pending.extend(dependency.args)
+                    if depends_on_shape:
+                        return [
+                            f"    {self._operand(destination)} = "
+                            f"{self._operand(source)}"
+                        ]
+        if destination_rank != 1 or source_rank != 1:
+            return None
+        count = self._operand(byte_count)
+        upper = f"int(({count}) / {byte_width}_c_int64_t, c_int64_t)"
+        destination_name = self._operand(destination)
+        source_name = self._operand(source)
+        return [
+            f"    {destination_name}(1:{upper}) = "
+            f"{source_name}(1:{upper})"
+        ]
 
     def _statements(self, instr: Instr) -> list[str] | None:
         """Ops that are a Fortran *statement* rather than one expression.
@@ -3418,6 +3672,16 @@ class _FunctionEmitter:
                 body.extend(group)
                 continue
 
+            pointer_array = self._pointer_array_tensor_kernel(block, index)
+            if pointer_array is not None:
+                body.extend(pointer_array)
+                continue
+
+            memcpy = self._memcpy_call(instr)
+            if memcpy is not None:
+                body.extend(memcpy)
+                continue
+
             # Before _ssa_call deliberately: even when the kernel body was
             # imported into the module, the ELEMENTAL spelling is one
             # whole-array assignment the compiler can vectorise, where the
@@ -3610,12 +3874,38 @@ class _FunctionEmitter:
             *(self._typed(value) for value in self.function.args),
             *(self._typed(value) for value in self.outputs),
             *self._locals.values(),
+            *self._discard_array_declarations.values(),
         )
         arrays_present = any(_is_array(value) for value in all_values)
         dim_extents = dimension_extents(all_values) if arrays_present else {}
 
-        def dims(value: SSAValue) -> str:
-            return ", ".join(dim_extents[int(size)] for size in value.shape)
+        address_arities: dict[int, set[int]] = {}
+        for collection, positions in self._address_producers.values():
+            address_arities.setdefault(int(collection.id), set()).add(
+                len(positions)
+            )
+        linear_array_ids = {
+            value_id
+            for value_id, arities in address_arities.items()
+            if arities == {1}
+        }
+
+        def dims(value: SSAValue, *, dummy: bool = False) -> str:
+            extents = tuple(dim_extents[int(size)] for size in value.shape)
+            if int(value.id) in linear_array_ids:
+                # Repository helpers frequently express tensor addressing as
+                # one flat GEP even when storage analysis recovers the full
+                # semantic shape.  The declaration must follow the actual SSA
+                # address contract.  An assumed-size rank-one dummy accepts
+                # the caller's contiguous tensor by sequence association;
+                # locals retain the exact compiler-owned element count.
+                return "*" if dummy else " * ".join(extents)
+            return ", ".join(extents)
+
+        def dynamic_dims(value_id: int, extents: Sequence[str], *, dummy: bool) -> str:
+            if int(value_id) in linear_array_ids:
+                return "*" if dummy else " * ".join(extents)
+            return ", ".join(extents)
 
         # A caller must expose every extent its emitted callees require, even
         # when that size exists only in a callee-local temporary.  Whole-field
@@ -3629,9 +3919,10 @@ class _FunctionEmitter:
             for block in self.function.blocks.values()
             for instr in block.instrs
             if instr.op in ("Call", "call")
-            for extent in self.callee_extents.get(
-                str(instr.attributes.get("callee") or ""), ()
+            for extent in self._callee_extent_arguments(
+                str(instr.attributes.get("callee") or ""), instr.args
             )
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(extent))
         }
         extent_names = sorted(
             set(dim_extents.values())
@@ -3706,8 +3997,11 @@ class _FunctionEmitter:
                 leading_extents = self.dynamic_array_leading_extents.get(
                     int(argument.id), ()
                 )
-                dimensions = ", ".join(
-                    leading_extents if leading_extents else ("*",)
+                dimensions = (
+                    dynamic_dims(
+                        int(argument.id), leading_extents, dummy=True
+                    )
+                    if leading_extents else "*"
                 )
                 declarations.append(
                     f"    {kind}, intent({intent}) :: "
@@ -3717,7 +4011,7 @@ class _FunctionEmitter:
             if argument.id in output_ids:
                 if _is_array(argument):
                     declarations.append(
-                        f"    {kind}, intent(inout) :: {_name(argument)}({dims(argument)})"
+                        f"    {kind}, intent(inout) :: {_name(argument)}({dims(argument, dummy=True)})"
                     )
                 else:
                     declarations.append(
@@ -3734,7 +4028,7 @@ class _FunctionEmitter:
                 # the wrapper's final public outputs.
                 if _is_array(argument):
                     declarations.append(
-                        f"    {kind}, intent(inout) :: {_name(argument)}({dims(argument)})"
+                        f"    {kind}, intent(inout) :: {_name(argument)}({dims(argument, dummy=True)})"
                     )
                 else:
                     declarations.append(
@@ -3757,12 +4051,12 @@ class _FunctionEmitter:
                 or int(argument.id) in self.mutated_base_ids
             ) and _is_array(argument):
                 declarations.append(
-                    f"    {kind}, intent(inout) :: {_name(argument)}({dims(argument)})"
+                    f"    {kind}, intent(inout) :: {_name(argument)}({dims(argument, dummy=True)})"
                 )
                 continue
             if _is_array(argument):
                 declarations.append(
-                    f"    {kind}, intent(in) :: {_name(argument)}({dims(argument)})"
+                    f"    {kind}, intent(in) :: {_name(argument)}({dims(argument, dummy=True)})"
                 )
             else:
                 declarations.append(
@@ -3778,11 +4072,11 @@ class _FunctionEmitter:
             if dynamic_extents:
                 declarations.append(
                     f"    {kind}, intent(out) :: {_name(value)}"
-                    f"({', '.join(dynamic_extents)})"
+                    f"({dynamic_dims(int(value.id), dynamic_extents, dummy=True)})"
                 )
             elif _is_array(value):
                 declarations.append(
-                    f"    {kind}, intent(out) :: {_name(value)}({dims(value)})"
+                    f"    {kind}, intent(out) :: {_name(value)}({dims(value, dummy=True)})"
                 )
             else:
                 declarations.append(
@@ -3802,7 +4096,7 @@ class _FunctionEmitter:
             if dynamic_extents:
                 declarations.append(
                     f"    {kind} :: {_name(value)}"
-                    f"({', '.join(dynamic_extents)})"
+                    f"({dynamic_dims(int(value.id), dynamic_extents, dummy=False)})"
                 )
             elif _is_array(value):
                 # An automatic array sized by its own extents: no allocate,
@@ -3816,6 +4110,11 @@ class _FunctionEmitter:
         declarations.extend(
             f"    {kind} :: {identifier}"
             for identifier, kind in self._discard_declarations.items()
+        )
+        declarations.extend(
+            f"    {_DTYPE_KIND.get(value.dtype or self.dtype, 'real(c_double)')}"
+            f" :: {identifier}({dims(value)})"
+            for identifier, value in self._discard_array_declarations.items()
         )
         declarations.extend(
             f"    integer(c_int) :: {index}" for index in self._loop_variables
@@ -3877,6 +4176,7 @@ def emit_function(
     mutated_base_ids: Sequence[int] = (),
     dynamic_array_ranks: Mapping[int, int] | None = None,
     value_dtypes: Mapping[int, str] | None = None,
+    value_shapes: Mapping[int, Sequence[int]] | None = None,
     tensor_table: SSATensorTable | None = None,
     native_symbol: str | None = None,
     callee_native_symbols: Mapping[str, str] | None = None,
@@ -3927,6 +4227,7 @@ def emit_function(
         mutated_base_ids=mutated_base_ids,
         dynamic_array_ranks=dynamic_array_ranks,
         value_dtypes=value_dtypes,
+        value_shapes=value_shapes,
         tensor_table=tensor_table,
         native_symbol=native_symbol,
         callee_native_symbols=callee_native_symbols,
@@ -4272,13 +4573,20 @@ def emit_module(
                             follower.res
                         )
 
+    explicitly_requested_roots = set(map(str, (outputs or {}).keys()))
     named_outputs = dict(outputs or {})
     for function_name, function in functions.items():
-        if function_name in named_outputs:
-            continue
         return_value = function.metadata.get("return_value")
         if isinstance(return_value, SSAValue):
+            # The function owns its return identity.  A caller-side aggregate
+            # projection can carry a different local id for the same slot;
+            # letting that derived catalogue override ``return_value`` makes
+            # the callee assign an undeclared caller id and publishes the
+            # wrong ABI symbol (binary_value and sum_double exposed this in a
+            # whole-program native build).
             named_outputs[function_name] = (return_value,)
+            continue
+        if function_name in named_outputs:
             continue
         declared = tuple(function.metadata.get("named_outputs") or ())
         if not declared:
@@ -4318,16 +4626,21 @@ def emit_module(
         }.values())
         for function_name, values in named_outputs.items()
     }
+    # ``named_outputs`` is also the internal call-signature catalogue, so it
+    # eventually contains every returning helper.  It is not an export list.
+    # Reachability begins at the entries the caller explicitly requested;
+    # otherwise imported tensor helpers whose calls were legalized to native
+    # Fortran expressions become accidental roots (notably the pointer-table
+    # stack implementation, which has no Fortran value-level equivalent).
     roots = {
-        str(name)
-        for name in named_outputs
-        if str(name) in functions
+        name for name in explicitly_requested_roots if name in functions
     }
+    if not roots and outputs is None:
+        roots.update(str(name) for name in named_outputs if str(name) in functions)
     roots.update(
         str(name)
         for name, function in functions.items()
-        if function.metadata.get("named_outputs")
-        or function.metadata.get("control_ir")
+        if function.metadata.get("control_ir")
     )
     roots.update(str(root) for root in extra_roots if str(root) in functions)
     if roots:
@@ -4403,7 +4716,14 @@ def emit_module(
     # SSA value ids are function-local. Determine address bases from each
     # function's own operators and explicit ABI contracts; a same-numbered
     # value in a sibling region is not evidence that this value is an array.
-    method_array_bases: dict[str, set[int]] = {}
+    from .ssa_call_storage import call_array_argument_ids
+
+    method_array_bases: dict[str, set[int]] = {
+        function_name: set(value_ids)
+        for function_name, value_ids in call_array_argument_ids(
+            functions
+        ).items()
+    }
     method_mutated_bases: dict[str, set[int]] = {}
     for function_name, function in functions.items():
         method = str(function_name)
@@ -4941,12 +5261,30 @@ def emit_module(
                 if operation in {
                     "LAnd", "LOr", "logical_and", "logical_or"
                 }:
-                    if instruction.res is not None:
+                    if (
+                        instruction.res is not None
+                        and int(instruction.res.id)
+                        not in array_contract_ids[str(function_name)]
+                    ):
                         logical_ids.add(int(instruction.res.id))
                 elif operation in {"LNot", "Not", "logical_not"}:
-                    if instruction.res is not None:
+                    if (
+                        instruction.res is not None
+                        and int(instruction.res.id)
+                        not in array_contract_ids[str(function_name)]
+                    ):
                         logical_ids.add(int(instruction.res.id))
-                elif operation in _COMPARISON and instruction.res is not None:
+                elif (
+                    operation in _COMPARISON
+                    and instruction.res is not None
+                    and int(instruction.res.id)
+                    not in array_contract_ids[str(function_name)]
+                ):
+                    # Tensor comparison kernels in repository SSA use the
+                    # same double-backed arena ABI as C and LLVM.  Only a
+                    # scalar comparison becomes a Fortran LOGICAL value;
+                    # promoting a tensor result to LOGICAL makes the imported
+                    # numeric helper signature disagree with every caller.
                     logical_ids.add(int(instruction.res.id))
                 # CondBr accepts ordinary scalar truthiness.  Its operand is
                 # logical only when the producer/declared dtype says so; an
@@ -5097,8 +5435,13 @@ def emit_module(
                             callee_dtypes[callee_id] = settled
                             changed_dtypes = True
     for function_name, ranks in function_value_ranks.items():
+        formal_ids = {
+            int(argument.id) for argument in functions[function_name].args
+        }
         method_array_bases.setdefault(function_name, set()).update(
-            value_id for value_id, rank in ranks.items() if rank > 0
+            value_id
+            for value_id, rank in ranks.items()
+            if rank > 0 and value_id in formal_ids
         )
     function_mutated_values = {
         function_name: set(method_mutated_bases.get(function_name, set())) | {
@@ -5185,17 +5528,30 @@ def emit_module(
         )
         for function_name, function in functions.items()
     }
-    # Extents are a finite set-union dataflow problem. Emit each function once
-    # to discover only its local requirements, then close those sets over the
-    # call graph. Re-emitting every function on every iteration is equivalent
-    # but needlessly rebuilds enormous source strings for large programs.
-    local_extents = {
-            function_name: emit_function(
+    from .ssa_storage_requirements import module_storage_requirements
+
+    storage_requirements = module_storage_requirements(module)
+    function_value_shapes = {
+        function_name: {
+            value_id: requirement.shape
+            for value_id, requirement in storage_requirements.get(
+                function_name, {}
+            ).items()
+            if requirement.shape
+        }
+        for function_name in functions
+    }
+    def extent_signature(
+        function_name: str,
+        signatures: Mapping[str, Sequence[str]],
+    ) -> tuple[str, ...]:
+        function = functions[function_name]
+        return emit_function(
                 function,
                 dtype=dtype,
                 trig_solver=trig_solver,
                 outputs=named_outputs.get(function_name, ()),
-                callee_extents={},
+                callee_extents=signatures,
                 callee_arity=callee_arity,
                 callee_output_count=callee_output_count,
                 callee_outputs=named_outputs,
@@ -5221,40 +5577,31 @@ def emit_module(
                     function_name, {}
                 ),
                 value_dtypes=function_value_dtypes.get(function_name, {}),
+                value_shapes=function_value_shapes.get(function_name, {}),
                 tensor_table=module_tensor_tables.get(function_name),
                 native_symbol=native_symbols[function_name],
                 callee_native_symbols=native_symbols,
                 extent_namespace=extent_namespaces[function_name],
             ).extent_names
-            for function_name, function in functions.items()
-    }
-    direct_callees = {
-        function_name: {
-            str(instruction.attributes.get("callee") or "")
-            for block in function.blocks.values()
-            for instruction in block.instrs
-            if (
-                instruction.op in {"Call", "call"}
-                and str(instruction.attributes.get("callee") or "") in functions
-            )
-        }
-        for function_name, function in functions.items()
+
+    # Extents are a finite call-signature dataflow problem, but dynamic names
+    # are callee-local formal dimensions, not global set members. Re-emit only
+    # signatures so each call can substitute its actual tensor view before an
+    # unresolved extent is propagated toward the public entry.
+    local_extents = {
+        function_name: extent_signature(function_name, {})
+        for function_name in functions
     }
     callee_extents: dict[str, tuple[str, ...]] = dict(local_extents)
     for _ in range(max(1, len(functions) + 1)):
         updated_extents = {
-            function_name: tuple(sorted(
-                set(local_extents[function_name]).union(*(
-                    set(callee_extents[callee])
-                    for callee in direct_callees[function_name]
-                ))
-            ))
+            function_name: extent_signature(function_name, callee_extents)
             for function_name in functions
         }
         if updated_extents == callee_extents:
             break
         callee_extents = updated_extents
-    else:  # pragma: no cover - finite extent-name unions must converge.
+    else:  # pragma: no cover - finite call signatures must converge.
         raise RuntimeError("Fortran call ABI extents did not reach a fixed point")
     def emit_subroutines(
         signatures: Mapping[str, Sequence[str]],
@@ -5289,6 +5636,7 @@ def emit_module(
                 mutated_base_ids=method_mutated_bases.get(function_name, set()),
                 dynamic_array_ranks=function_value_ranks.get(function_name, {}),
                 value_dtypes=function_value_dtypes.get(function_name, {}),
+                value_shapes=function_value_shapes.get(function_name, {}),
                 tensor_table=module_tensor_tables.get(function_name),
                 native_symbol=native_symbols[function_name],
                 callee_native_symbols=native_symbols,

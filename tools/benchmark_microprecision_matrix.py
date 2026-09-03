@@ -253,11 +253,11 @@ def _compile_c_core(
     single rounding by specification -- so the same module serves both.
     """
 
-    from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
 
     wrapper = _wrapper_name(name, width, prepared)
     started = time.perf_counter_ns()
-    artifact = emit_ssa_module_to_c(prepared.module, wrapper)
+    artifact = emit_ssa_to_c(prepared.module, wrapper)
     emit_ns = time.perf_counter_ns() - started
     if artifact.shortfalls:
         raise RuntimeError("; ".join(

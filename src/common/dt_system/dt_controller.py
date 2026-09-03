@@ -103,10 +103,14 @@ def step_with_dt_control_used(state,
                              ctrl: STController,
                              advance,
                              retries: int = 0,
-                             max_retries: int = 3,
+                             max_retries: int | None = 3,
                              failures: list[tuple[float, Metrics, tuple[str, ...]]] | None = None,
                              ref=None,
-                             attempt_log: list[dict] | None = None):
+                              attempt_log: list[dict] | None = None,
+                              allow_unresolved: bool = False,
+                              rollback_threshold_multiplier: float = 1.0):
+    if rollback_threshold_multiplier < 1.0:
+        raise ValueError("rollback_threshold_multiplier must be >= 1.0")
     if failures is None:
         failures = []
     if ref is None:
@@ -118,47 +122,90 @@ def step_with_dt_control_used(state,
     saved = state.copy_shallow()
     ok, metrics = advance(state, dt_for_advance)
     metrics = coerce_metrics(metrics)
-    channel_failure = any(
-        float(metrics.error_channels.get(name, 0.0)) > float(limit)
-        for name, limit in targets.error_limits.items()
-    )
-    # Name the term that rejected, not merely that something did. Reporting
-    # only mass/div/vel meant a rejection coming from `ok` or a named error
-    # channel printed four healthy-looking attempts and no cause.
+    rollback_scale = float(rollback_threshold_multiplier)
+    # A value between its ordinary limit and rollback_scale * limit is kept.
+    # It still contributes its full ratio to the PI penalty below, so the next
+    # frame corrects dt without paying for state restoration and recreation.
+    soft_reasons: list[str] = []
+    if metrics.mass_err > targets.mass_max:
+        soft_reasons.append(
+            f"mass_err {float(metrics.mass_err):.3e} > "
+            f"{float(targets.mass_max):.3e}"
+        )
+    div_rollback_limit = float(targets.div_max) * 10.0
+    if metrics.div_inf > div_rollback_limit:
+        soft_reasons.append(
+            f"div_inf {float(metrics.div_inf):.3e} > "
+            f"{div_rollback_limit:.3e}"
+        )
+    for name, limit in targets.error_limits.items():
+        channel_error = float(metrics.error_channels.get(name, 0.0))
+        if channel_error > float(limit):
+            # Numeric values remain in metrics.error_channels.  The resident
+            # reason sequence carries only a stable rule identity so the same
+            # authored controller has a fixed native storage representation.
+            soft_reasons.append(name)
+
+    # Physical invalidity and an engine-declared hard failure never enter the
+    # soft band. Numeric error channels roll back only at N times the same
+    # boundary that used to cause immediate restoration when N == 1.
     reasons: list[str] = []
     if not ok:
         reasons.append("advance reported a physical-bound violation")
     if bool(metrics.hard_failure):
         reasons.append("hard_failure")
-    if metrics.mass_err > targets.mass_max:
+    if metrics.mass_err > targets.mass_max * rollback_scale:
         reasons.append(
-            f"mass_err {float(metrics.mass_err):.3e} > {float(targets.mass_max):.3e}"
+            f"mass_err {float(metrics.mass_err):.3e} > "
+            f"{float(targets.mass_max) * rollback_scale:.3e} rollback limit"
         )
-    if metrics.div_inf > targets.div_max * 10.0:
+    if metrics.div_inf > div_rollback_limit * rollback_scale:
         reasons.append(
             f"div_inf {float(metrics.div_inf):.3e} > "
-            f"{float(targets.div_max) * 10.0:.3e}"
+            f"{div_rollback_limit * rollback_scale:.3e} rollback limit"
         )
-    reasons.extend(
-        f"channel {name} {float(metrics.error_channels.get(name, 0.0)):.3e} "
-        f"> {float(limit):.3e}"
-        for name, limit in targets.error_limits.items()
-        if float(metrics.error_channels.get(name, 0.0)) > float(limit)
-    )
+    for name, limit in targets.error_limits.items():
+        channel_error = float(metrics.error_channels.get(name, 0.0))
+        channel_rollback_limit = float(limit) * rollback_scale
+        if channel_error > channel_rollback_limit:
+            reasons.append("channel rollback limit")
     rejected = bool(reasons)
+    floor_reasons: tuple[str, ...] = ()
+    if rejected and ctrl.dt_min is not None:
+        dt_floor = float(
+            ctrl.dt_min.item()
+            if isinstance(ctrl.dt_min, AbstractTensor)
+            else ctrl.dt_min
+        )
+        if float(dt_for_advance) <= dt_floor * (1.0 + 1.0e-12):
+            # There is no smaller legal proposal. Retain the state and expose
+            # exactly what the floor overruled so the following frame can
+            # continue to adjust without a futile restore/recreate cycle.
+            floor_reasons = tuple(reasons)
+            soft_reasons.append("dt_min retained")
+            reasons.clear()
+            rejected = False
+            ctrl.clamp_events += 1
+            channels = dict(metrics.error_channels or {})
+            channels["dt_min_retained"] = float(dt_for_advance)
+            channels["dt_min_retained_violation_count"] = float(
+                len(floor_reasons))
+            metrics.error_channels = channels
+            metrics.hard_failure = False
     if attempt_log is not None:
         attempt_log.append({
             "dt": float(dt_for_advance),
             "accepted": not rejected,
             "metrics": metrics,
             "reasons": tuple(reasons),
+            "soft_reasons": (() if rejected else tuple(soft_reasons)),
+            "dt_min_retained_reasons": floor_reasons,
         })
-    if rejected and retries >= max_retries:
-        # The search is out of room. Subdivision cannot resolve an
-        # irregularity, and a bisection can run out of bracket the same way, so
-        # refusing to continue would make every such case fatal. Keep the step
-        # that was taken, record exactly what it violated, and carry on: an
-        # unresolved step that is traceable is worth more than a halted run.
+    retries_exhausted = max_retries is not None and retries >= max_retries
+    if rejected and retries_exhausted and allow_unresolved:
+        # Best-effort callers may explicitly choose to retain a proposal after
+        # exhausting refinement. Scientific callers leave this disabled: the
+        # default is rollback, never silent commitment of a violating state.
         ctrl.clamp_events += 1
         metrics.hard_failure = True
         channels = dict(metrics.error_channels or {})
@@ -179,7 +226,7 @@ def step_with_dt_control_used(state,
                 f"  attempt {index}: dt={dt_f:.6g} mass_err={m.mass_err:.3e} "
                 f"div_inf={m.div_inf:.3e} max_vel={m.max_vel:.3e}"
             )
-            lines.extend(f"      rejected by: {reason}" for reason in why)
+            lines.append("      rejected by recorded rule")
         if max_retries == 0:
             lines.append(
                 "  the substep is pinned, so there was no smaller candidate to "
@@ -198,7 +245,7 @@ def step_with_dt_control_used(state,
     if rejected:
         state.restore(saved)
         failures.append((float(dt_for_advance), metrics, tuple(reasons)))
-        if retries >= max_retries:
+        if retries_exhausted:
             ctrl.clamp_events += 1
             lines = [f"timestep controller failed after {len(failures)} attempts:"]
             for i, (dt_f, m, why) in enumerate(failures, 1):
@@ -206,7 +253,7 @@ def step_with_dt_control_used(state,
                     f"  attempt {i}: dt={dt_f:.6g} mass_err={m.mass_err:.3e} "
                     f"div_inf={m.div_inf:.3e} max_vel={m.max_vel:.3e}"
                 )
-                lines.extend(f"      rejected by: {reason}" for reason in why)
+                lines.append("      rejected by recorded rule")
             if max_retries == 0:
                 lines.append(
                     "  the substep is pinned, so there is no smaller candidate "
@@ -219,7 +266,17 @@ def step_with_dt_control_used(state,
                     "dt, so halving could not have resolved it."
                 )
             print("\n".join(lines))
-            raise RuntimeError("adaptive timestep controller failed")
+            metrics.hard_failure = True
+            channels = dict(metrics.error_channels or {})
+            channels["dt_unresolved"] = float(dt_for_advance)
+            channels["dt_unresolved_attempts"] = float(len(failures))
+            metrics.error_channels = channels
+            # A zero used-dt is the native-safe failure status.  The caller can
+            # report a partial window without relying on Python exception
+            # semantics, which repository SSA does not yet represent.
+            return metrics, _restore_type(dt_tensor * 0.5, ref), _restore_type(
+                AbstractTensor.tensor(0.0), ref
+            )
         dt_half = dt_tensor * 0.5
         if (
             ctrl.dt_min is not None
@@ -244,6 +301,8 @@ def step_with_dt_control_used(state,
             failures,
             ref=ref,
             attempt_log=attempt_log,
+            allow_unresolved=allow_unresolved,
+            rollback_threshold_multiplier=rollback_threshold_multiplier,
         )
 
     dt_cfl = targets.cfl * dx / max(metrics.max_vel, 1e-30)
@@ -269,8 +328,12 @@ def step_with_dt_control_used(state,
     return metrics, _restore_type(dt_next, ref), _restore_type(dt_tensor, ref)
 
 
-def step_with_dt_control(state, dt, dx, targets: Targets, ctrl: STController, advance, retries: int = 0):
-    metrics, dt_next, _dt_used = step_with_dt_control_used(state, dt, dx, targets, ctrl, advance, retries, ref=dt)
+def step_with_dt_control(state, dt, dx, targets: Targets, ctrl: STController,
+                         advance, retries: int = 0,
+                         rollback_threshold_multiplier: float = 1.0):
+    metrics, dt_next, _dt_used = step_with_dt_control_used(
+        state, dt, dx, targets, ctrl, advance, retries, ref=dt,
+        rollback_threshold_multiplier=rollback_threshold_multiplier)
     return metrics, dt_next
 
 
@@ -285,10 +348,14 @@ def run_superstep(state,
                   substep: str = "steered",
                   substep_dt: float | None = None,
                   allow_increase_mid_round: bool = False,
-                  max_iters: int = 10000,
                   eps: float = 1e-15,
                   event_boundaries: tuple[float, ...] = (),
-                  attempt_log: list[dict] | None = None):
+                  attempt_log: list[dict] | None = None,
+                  allow_unresolved: bool = False,
+                  max_retries: int | None = 3,
+                  rollback_threshold_multiplier: float = 1.0):
+    if rollback_threshold_multiplier < 1.0:
+        raise ValueError("rollback_threshold_multiplier must be >= 1.0")
     if substep not in {"pinned", "steered"}:
         raise ValueError(
             f"unknown substep interior {substep!r}; expected 'pinned' or "
@@ -319,7 +386,7 @@ def run_superstep(state,
 
     unresolved: list[Metrics] = []
     iters = 0
-    while (round_max_t - total).item() > eps and iters < max_iters:
+    while (round_max_t - total).item() > eps:
         iters += 1
         remainder = round_max_t - total
         dt_try = AbstractTensor.minimum(dt_cap, remainder)
@@ -338,9 +405,11 @@ def run_superstep(state,
             targets,
             ctrl,
             advance,
-            max_retries=0 if substep == "pinned" else 3,
+            max_retries=0 if substep == "pinned" else max_retries,
             ref=ref_dt,
             attempt_log=attempt_log,
+            allow_unresolved=allow_unresolved,
+            rollback_threshold_multiplier=rollback_threshold_multiplier,
         )
         last_metrics = metrics
         if float((metrics.error_channels or {}).get("dt_unresolved", 0.0)) > 0.0:
@@ -374,12 +443,14 @@ def run_superstep(state,
             print(f"  {line.strip()}")
     remaining = float((round_max_t - total).item())
     if remaining > eps:
-        raise RuntimeError(
-            "adaptive superstep did not land on its requested window: "
-            f"advanced={float(total.item()):.17g} "
-            f"round_max={float(round_max_t.item()):.17g} "
-            f"remaining={remaining:.17g} iterations={iters}/{max_iters}"
-        )
+        if last_metrics is None:
+            last_metrics = Metrics(0.0, 0.0, 0.0, 0.0, hard_failure=True)
+        channels = dict(last_metrics.error_channels or {})
+        channels["superstep_window_requested_s"] = float(round_max_t.item())
+        channels["superstep_window_advanced_s"] = float(total.item())
+        channels["superstep_window_remaining_s"] = remaining
+        channels["superstep_iteration_count"] = float(iters)
+        last_metrics.error_channels = channels
 
     total_out = _restore_type(total, ref_dt)
     dt_next_out = _restore_type(last_dt_next, ref_dt)
@@ -405,10 +476,22 @@ def run_superstep_plan(state,
         eps=plan.eps,
         event_boundaries=plan.event_boundaries,
         attempt_log=attempt_log,
+        rollback_threshold_multiplier=plan.rollback_threshold_multiplier,
     )
     total_val = float(total.item() if isinstance(total, AbstractTensor) else total)
     dt_next_val = float(dt_next.item() if isinstance(dt_next, AbstractTensor) else dt_next)
     plan_dt_init_val = float(plan.dt_init.item() if isinstance(plan.dt_init, AbstractTensor) else plan.dt_init)
+    plan_round_max_val = float(
+        plan.round_max.item()
+        if isinstance(plan.round_max, AbstractTensor)
+        else plan.round_max
+    )
+    if plan_round_max_val - total_val > plan.eps:
+        raise RuntimeError(
+            "adaptive timestep controller failed to complete its requested "
+            f"window: advanced={total_val:.17g} "
+            f"round_max={plan_round_max_val:.17g}"
+        )
     ref = plan_dt_init_val
     if ctrl.dt_min is not None:
         ref = max(ref, float(ctrl.dt_min.item() if isinstance(ctrl.dt_min, AbstractTensor) else ctrl.dt_min))

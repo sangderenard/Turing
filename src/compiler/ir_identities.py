@@ -253,7 +253,12 @@ def drop_dead_pure_structural_instructions(functions) -> int:
                         result_id is not None
                         and result_id not in consumed
                         and result_id not in protected
-                        and is_structural
+                        # Const is intrinsically pure.  Frontend-only values
+                        # such as a legalized slice token do not always carry
+                        # a structural_operation tag, but once unconsumed they
+                        # must disappear here rather than reach a numerical
+                        # backend as an impossible literal.
+                        and (is_structural or instruction.op == "Const")
                         and instruction.op in _PURE_REGION_OPS
                     ):
                         removed += 1

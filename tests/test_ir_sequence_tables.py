@@ -672,7 +672,27 @@ def _loop_with_mutation(mutation):
     return ControlProgram(LoopBlock(
         "i", "0", "4", "1", SequenceBlock(()),
         sequence_mutations=(mutation,),
-    ))
+        ))
+
+
+def test_record_table_merges_access_capability_over_exact_storage():
+    table = SSARecordTable()
+    readonly = SSARecordFieldDescriptor(
+        "value", SSARecordFieldStorage.SCALAR,
+        storage_identity="Frame.value", value_ids=(2,), dtype="int64",
+        writable=False,
+    )
+    writable = SSARecordFieldDescriptor(
+        "value", SSARecordFieldStorage.SCALAR,
+        storage_identity="Frame.value", value_ids=(2,), dtype="int64",
+        writable=True,
+    )
+
+    table.register(SSARecordDescriptor(1, "Frame", (readonly,)))
+    merged = table.register(SSARecordDescriptor(1, "Frame", (writable,)))
+
+    assert len(merged.fields) == 1
+    assert merged.fields[0].writable
 
 
 def test_retained_loop_append_becomes_internal_sequence_ssa_call_and_table():

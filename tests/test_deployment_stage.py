@@ -65,7 +65,9 @@ def test_plan_covers_every_region_and_backend():
     for decision in plan.decisions:
         assert decision.classification.execution_class == "thread-workers"
         backends = {choice.backend for choice in decision.choices}
-        assert {"wasm", "webgpu", "glsl", "c", "llvm", "fortran"} <= backends
+        assert {
+            "wasm", "webgpu", "glsl", "native_glsl", "c", "llvm", "fortran",
+        } <= backends
         assert decision.choice_for("wasm").strategy == "pool"
         assert decision.choice_for("fortran").strategy == "serial"
 
@@ -79,6 +81,7 @@ def test_manifest_record_is_json_shaped():
     assert isinstance(strategies["wasm"]["reasons"], list)
     assert "compute" in strategies["webgpu"]
     assert "compute" in strategies["glsl"]
+    assert "compute" in strategies["native_glsl"]
 
 
 def test_presentation_dispatch_does_not_cut_an_untranslatable_numeric_region():
@@ -88,6 +91,7 @@ def test_presentation_dispatch_does_not_cut_an_untranslatable_numeric_region():
 
     assert plan.decisions[0].classification.execution_class == "graphics-output"
     assert plan.decisions[0].choice_for("glsl").strategy == "dispatch"
+    assert plan.decisions[0].choice_for("native_glsl").strategy == "dispatch"
     assert plan.decisions[0].classification.compute_shader_targets == ()
     assert plan.shader_region_cuts == {}
 

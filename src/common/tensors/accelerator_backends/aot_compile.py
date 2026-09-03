@@ -812,7 +812,21 @@ def compile_ast_aot(
     extraction_contract: Any = None,
     linked_process_graphs: Mapping[str, Any] | None = None,
 ) -> AOTCompilation:
-    """Compile ``entrypoint`` in ``source`` ahead-of-time and execute it once.
+    """Compatibility source adapter for the established AOT planning path.
+
+    New application callers use
+    :func:`src.compiler.fortran_c_shell.lower_ast_source_to_ssa`, whose public
+    product is the complete repository-SSA module rather than this adapter's
+    captured ``FusedProgram``/``ControlProgram`` pair.  The deprecation warning
+    below applies to this function as an independently selected *source entry
+    point*.  It does not deprecate the downstream ProcessGraph compiler stages
+    used here.  Bound-feed specialization, linked-call propagation, deployment
+    planning, and hierarchy construction are established compiler contracts;
+    the canonical entry must reuse or match them before this adapter can be
+    retired safely.
+
+    Historically this function compiles ``entrypoint`` in ``source``
+    ahead-of-time and optionally executes it once.
 
     ``backend`` tags the loop-composition capability profile
     (``LoopBackendCapabilities``) used while planning -- a real choice, since

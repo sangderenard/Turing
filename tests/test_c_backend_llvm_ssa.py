@@ -35,6 +35,7 @@ _REAL_TRANSLATED_SYMBOLS = {
     "binary_scalar_double",
     "unary_double",
     "matmul_double",
+    "batched_matmul_indexed_double",
     "where_double",
     "broadcast_double",
     "reduce_dim_double",
@@ -45,6 +46,7 @@ _REAL_TRANSLATED_SYMBOLS = {
     "pad_double_nd",
     "slice_copy_double",
     "index_select_double",
+    "gather_values_double",
     "index_assign_double",
     "index_set_double",
     "unfold2d_double",
@@ -121,7 +123,8 @@ def test_translation_operations_are_real_abstract_tensor_names():
         <= CANONICAL_ABSTRACT_TENSOR_OPERATORS
     )
     assert [entry.c_symbol for entry in translations_for_operation("matmul")] == [
-        "matmul_double"
+        "matmul_double",
+        "batched_matmul_indexed_double",
     ]
 
 
@@ -327,6 +330,33 @@ def test_handwritten_matmul_ssa_matches_real_c_kernel(llvm_engine):
         np.asarray(llvm_output),
         np.asarray([c_output[index] for index in range(4)]),
     )
+
+
+def test_matmul_inner_product_compensates_cancellation(llvm_engine):
+    left = [1.0e16, 1.0, 1.0, -1.0e16]
+    right = [1.0, 1.0, 1.0, 1.0]
+    c_output = _c_array([0.0])
+    C.matmul_double(_c_array(left), _c_array(right), c_output, 1, 4, 1)
+
+    llvm_output = (ctypes.c_double * 1)()
+    function = _llvm_function(
+        llvm_engine,
+        "matmul_double",
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_int32,
+    )
+    function(
+        (ctypes.c_double * len(left))(*left),
+        (ctypes.c_double * len(right))(*right),
+        llvm_output, 1, 4, 1,
+    )
+
+    assert c_output[0] == 2.0
+    assert llvm_output[0] == 2.0
 
 
 def test_handwritten_where_ssa_matches_real_c_kernel(llvm_engine):

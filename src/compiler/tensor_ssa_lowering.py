@@ -22,6 +22,10 @@ from ..transmogrifier.ssa import (
 )
 from ..transmogrifier.ssa_registry import Handler
 from ..transmogrifier.tensor_ssa_reference import SSATensorCodeReference
+from .ssa_aggregate_abi import (
+    legalize_aggregate_adapters,
+    legalize_aggregate_output_views,
+)
 
 
 @dataclass(frozen=True, order=True)
@@ -88,8 +92,49 @@ def wire_repository_ssa_region_products(module: IRModule) -> bool:
                     producer_call, produced_value, cluster = producer
                     if position >= len(consumer.args):
                         continue
+                    previous = consumer.args[position]
+                    # A repeated seed-producing region can occur inside a
+                    # loop body even though the live value for this semantic
+                    # feed is the header Phi.  Control lowering marks that
+                    # exact case.  Do not let whole-module product wiring
+                    # replace the Phi with the repeated seed projection and
+                    # reset the carried value on every iteration.
+                    if (
+                        (previous.accounting or {}).get(
+                            "ssa_loop_carried_feed"
+                        ) == int(feed_id)
+                    ):
+                        continue
                     if int(consumer.args[position].id) != int(produced_value.id):
-                        consumer.args[position] = produced_value
+                        declared_shapes = tuple(
+                            consumer.attributes.get("feed_shapes", ())
+                        )
+                        declared_dtypes = tuple(
+                            consumer.attributes.get("feed_dtypes", ())
+                        )
+                        view_shape = (
+                            tuple(declared_shapes[position])
+                            if position < len(declared_shapes)
+                            else tuple(previous.shape or produced_value.shape)
+                        )
+                        view_dtype = (
+                            str(declared_dtypes[position])
+                            if position < len(declared_dtypes)
+                            and str(declared_dtypes[position])
+                            else previous.dtype or produced_value.dtype
+                        )
+                        consumer.args[position] = SSAValue(
+                            int(produced_value.id),
+                            dtype=view_dtype,
+                            shape=view_shape,
+                            device=previous.device or produced_value.device,
+                            accounting={
+                                **dict(produced_value.accounting or {}),
+                                **dict(previous.accounting or {}),
+                                "ssa_storage_alias": int(produced_value.id),
+                                "ssa_region_feed": (int(feed_id), int(position)),
+                            },
+                        )
                         changed = True
                     producer_index = instructions.index(producer_call)
                     consumer_index = instructions.index(consumer)
@@ -216,6 +261,9 @@ _CAST_OPERATIONS = {
 }
 _REDUCTION_CODES = {"sum": 0, "prod": 1, "min": 2, "max": 3, "any": 4, "all": 5}
 _SHAPED_SSA_OPERATIONS = {
+    "Indexed": "basic_index", "indexed": "basic_index",
+    "IndexedStore": "basic_index_store",
+    "index_set": "basic_index_store",
     "MatMul": "matmul", "matmul": "matmul",
     "Add": "add", "add": "add",
     "Sub": "sub", "sub": "sub",
@@ -224,6 +272,10 @@ _SHAPED_SSA_OPERATIONS = {
     "Pow": "pow", "pow": "pow",
     "sum": "sum", "mean": "mean", "prod": "prod",
     "min": "min", "max": "max", "any": "any", "all": "all",
+    # SymPy's equation graph uses class-style opcodes for elementwise
+    # maximum/minimum.  Tensor methods named ``max``/``min`` remain reductions;
+    # these spellings are the binary symbolic operators.
+    "Max": "maximum", "Min": "minimum",
     "matmul": "matmul", "transpose": "transpose",
     "broadcast_to": "broadcast_to", "expand": "expand",
     "unfold2d": "unfold2d", "fold2d": "fold2d",
@@ -281,6 +333,174 @@ def _attribute(attributes: dict[str, Any], *names: str) -> Any:
         if name in attributes and attributes[name] is not None:
             return attributes[name]
     return None
+
+
+def settle_static_repository_view_shapes(module: IRModule) -> bool:
+    """Resolve literal reshape/view extents before region ABI propagation.
+
+    View lowering aliases storage and therefore normally computes its result
+    descriptor while rewriting the instruction.  A later numerical region may
+    consume that view, however, so the descriptor has to cross the call edge
+    before kernel selection starts.  This pass evaluates only the already-SSA
+    literal shape operand; it does not execute Python or infer data values.
+    """
+
+    changed = False
+    for function in module.functions.values():
+        constants = {
+            int(instruction.res.id): payload
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+            and (payload := _constant_payload(instruction)) is not None
+        }
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.res is None or len(instruction.args) < 2:
+                    continue
+                operation = str(
+                    instruction.attributes.get("tensor_operation")
+                    or instruction.attributes.get("tensor")
+                    or instruction.attributes.get("tensor_candidate")
+                    or instruction.op
+                ).casefold()
+                if operation not in {"reshape", "view"}:
+                    continue
+                requested = _as_sequence(constants.get(
+                    int(instruction.args[1].id)
+                ))
+                if requested is None:
+                    continue
+                resolved = [int(extent) for extent in requested]
+                inferred = [
+                    index for index, extent in enumerate(resolved)
+                    if extent == -1
+                ]
+                if len(inferred) > 1 or any(
+                    extent <= 0 and extent != -1 for extent in resolved
+                ):
+                    continue
+                source_count = _known_count(instruction.args[0])
+                known_count = prod(
+                    extent for extent in resolved if extent != -1
+                )
+                if inferred:
+                    if (
+                        source_count is None or not known_count
+                        or source_count % known_count
+                    ):
+                        continue
+                    resolved[inferred[0]] = source_count // known_count
+                result_shape = tuple(resolved)
+                if tuple(instruction.res.shape) != result_shape:
+                    instruction.res.shape = result_shape
+                    changed = True
+    return changed
+
+
+def settle_canonical_value_metadata(module: IRModule) -> bool:
+    """Fill empty tensor metadata when one canonical value id is unanimous."""
+
+    values: dict[tuple[str, int], list[SSAValue]] = {}
+    for function in module.functions.values():
+        region_receipt = function.metadata.get("source_region_integral") or {}
+        owner = str(region_receipt.get("owner") or function.name)
+        for value in function.args:
+            values.setdefault((owner, int(value.id)), []).append(value)
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                for value in (*instruction.args, instruction.res):
+                    if value is not None:
+                        values.setdefault(
+                            (owner, int(value.id)), []
+                        ).append(value)
+    changed = False
+    excluded = {"ssa.aggregate", "ptr", "pointer", "ptrptr_float64"}
+    for occurrences in values.values():
+        numerical = [
+            value for value in occurrences
+            if str(value.dtype or "") not in excluded
+        ]
+        shapes = {
+            tuple(value.shape) for value in numerical if tuple(value.shape)
+        }
+        if len(shapes) != 1:
+            continue
+        shape = next(iter(shapes))
+        dtype = next((
+            value.dtype for value in numerical
+            if tuple(value.shape) == shape and value.dtype is not None
+        ), None)
+        for value in numerical:
+            if not tuple(value.shape):
+                value.shape = shape
+                if value.dtype is None and dtype is not None:
+                    value.dtype = dtype
+                changed = True
+    return changed
+
+
+def settle_repository_ssa_static_extent_operands(module: IRModule) -> bool:
+    """Restamp explicit kernel extents after whole-module ABI settlement.
+
+    Tensor lowering materializes shape/rank operands as ordinary constants.
+    A producer's exact allocation contract can settle later, when all region
+    descriptors coexist.  Keep those already-lowered operands synchronized so
+    backends never observe an obsolete view shape.
+    """
+
+    changed = False
+    for function_name, function in module.functions.items():
+        table = getattr(module, "tensor_tables", {}).get(function_name)
+        if table is None:
+            continue
+        definitions: dict[int, list[Instr]] = {}
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.op == "Const" and instruction.res is not None:
+                    definitions.setdefault(
+                        int(instruction.res.id), []
+                    ).append(instruction)
+
+        def stamp(value: SSAValue, payload: Any, *, vector: bool) -> None:
+            nonlocal changed
+            for definition in definitions.get(int(value.id), ()):
+                attributes = dict(definition.attributes)
+                if vector:
+                    wanted = tuple(map(int, payload))
+                    if tuple(attributes.get("values") or ()) == wanted:
+                        continue
+                    attributes["values"] = wanted
+                    attributes["constant"] = None
+                else:
+                    wanted = int(payload)
+                    if attributes.get("constant") == wanted:
+                        continue
+                    attributes["constant"] = wanted
+                definition.attributes = attributes
+                changed = True
+
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    instruction.op != "Call"
+                    or instruction.attributes.get("callee")
+                    != "broadcast_double"
+                    or len(instruction.args) < 6
+                ):
+                    continue
+                source_shape = tuple(instruction.args[0].shape or ())
+                output_shape = tuple(instruction.args[1].shape or ())
+                # Exact SSA occurrences, not canonical integer ids, own view
+                # shape.  Consulting the table first would replace legitimate
+                # reshape/broadcast views with their allocation owner's shape.
+                if source_shape:
+                    stamp(instruction.args[2], source_shape, vector=True)
+                    stamp(instruction.args[3], len(source_shape), vector=False)
+                if output_shape:
+                    stamp(instruction.args[4], output_shape, vector=True)
+                    stamp(instruction.args[5], len(output_shape), vector=False)
+    return changed
 
 
 def propagate_repository_ssa_call_metadata(
@@ -425,6 +645,45 @@ def propagate_repository_ssa_call_metadata(
                 changed = True
         return changed
 
+    def settle_specialized_formal_descriptor(
+        callee_name: str, formal: SSAValue, source: SSAValue,
+    ) -> bool:
+        """Keep a region input descriptor aligned with its exact call ABI."""
+
+        shape = tuple(map(int, source.shape or ()))
+        if not shape:
+            return False
+        table = getattr(module, "tensor_tables", {}).get(callee_name)
+        descriptor = (
+            table.by_id(int(formal.id)) if table is not None else None
+        )
+        if (
+            descriptor is None
+            or descriptor.storage != "input"
+            or tuple(descriptor.shape) == shape
+        ):
+            return False
+        stride = 1
+        reversed_strides = []
+        for extent in reversed(shape):
+            reversed_strides.append(stride)
+            stride *= int(extent)
+        dtype_bytes = {
+            "bool": 1, "i1": 1, "int8": 1, "uint8": 1,
+            "int16": 2, "uint16": 2,
+            "float32": 4, "float": 4, "int32": 4, "i32": 4,
+            "float64": 8, "double": 8, "int64": 8, "i64": 8,
+        }.get(str(source.dtype or descriptor.dtype).lower(), 8)
+        table.tensors[int(formal.id)] = dataclasses.replace(
+            descriptor,
+            dtype=str(source.dtype or descriptor.dtype),
+            shape=shape,
+            strides=tuple(reversed(reversed_strides)),
+            byte_size=prod(shape) * dtype_bytes,
+            metadata_state="static",
+        )
+        return True
+
     def returned(function) -> tuple[SSAValue, ...]:
         key = id(function)
         cached = returned_cache.get(key)
@@ -541,18 +800,80 @@ def propagate_repository_ssa_call_metadata(
                     specialized_call = (
                         "__planned_region_" in callee_name
                     )
-                    for actual, formal in zip(instruction.args, callee.args):
+                    feed_ids = tuple(map(
+                        int, instruction.attributes.get("feed_ids", ())
+                    ))
+                    for position, (actual, formal) in enumerate(zip(
+                        instruction.args, callee.args
+                    )):
+                        semantic_actual = actual
+                        if (
+                            position < len(feed_ids)
+                            and not tuple(actual.shape or ())
+                        ):
+                            candidates = values_by_id(function).get(
+                                feed_ids[position], ()
+                            )
+                            numerical_candidates = tuple(
+                                candidate for candidate in candidates
+                                if str(candidate.dtype or "") not in {
+                                    "ssa.aggregate", "ptr", "pointer",
+                                    "ptrptr_float64",
+                                }
+                            )
+                            shaped_candidates = tuple(
+                                candidate for candidate in numerical_candidates
+                                if tuple(candidate.shape or ())
+                            )
+                            shaped_contracts = {
+                                (
+                                    tuple(candidate.shape),
+                                    str(candidate.dtype or ""),
+                                )
+                                for candidate in shaped_candidates
+                            }
+                            # Reshapes are storage aliases and deliberately
+                            # permit one semantic feed id to have several
+                            # shaped views.  An empty materialized operand may
+                            # inherit only a unanimous contract; choosing the
+                            # first view would make source order decide ABI.
+                            if len(shaped_contracts) == 1:
+                                semantic_actual = shaped_candidates[0]
+                            elif not shaped_contracts:
+                                semantic_actual = next(
+                                    iter(numerical_candidates), actual,
+                                )
+                            # The call operand may be a caller-owned storage
+                            # formal while feed_ids names the canonical source
+                            # value.  They are one dependency edge: carry the
+                            # Program-ABI/source descriptor to both endpoints.
+                            if (
+                                tuple(semantic_actual.shape or ())
+                                and not tuple(actual.shape or ())
+                            ):
+                                actual.shape = tuple(semantic_actual.shape)
+                                changed = True
+                            if (
+                                semantic_actual.dtype is not None
+                                and actual.dtype is None
+                            ):
+                                actual.dtype = semantic_actual.dtype
+                                changed = True
                         # The caller's actual value is the concrete contract
                         # for this specialized formal, including the
                         # distinction between a scalar ``()`` and a tensor.
                         # Reverse propagation remains fill-only so a stale
                         # placeholder cannot reshape the actual argument.
                         changed |= enrich(
-                            callee, int(formal.id), actual,
+                            callee, int(formal.id), semantic_actual,
                             authoritative=(
                                 specialized_call and settle_exact_formals
                             ),
                         )
+                        if specialized_call:
+                            changed |= settle_specialized_formal_descriptor(
+                                callee_name, formal, semantic_actual,
+                            )
                         changed |= enrich(function, int(actual.id), formal)
 
                     callee_returns = returned(callee)
@@ -567,16 +888,37 @@ def propagate_repository_ssa_call_metadata(
                         }
                         for position, output_id in enumerate(declared):
                             caller_value = caller_outputs.get(position)
-                            callee_value = callee_values.get(output_id)
-                            if callee_value is None:
-                                tensor_table = getattr(
-                                    module, "tensor_tables", {}
-                                ).get(callee_name)
-                                descriptor = (
-                                    tensor_table.by_id(output_id)
-                                    if tensor_table is not None else None
+                            tensor_table = getattr(
+                                module, "tensor_tables", {}
+                            ).get(callee_name)
+                            descriptor = (
+                                tensor_table.by_id(output_id)
+                                if tensor_table is not None else None
+                            )
+                            material_descriptor = (
+                                descriptor
+                                if descriptor is not None
+                                and bool(tuple(descriptor.shape))
+                                and bool(descriptor.owns_allocation)
+                                and int(descriptor.data_value_id)
+                                == int(output_id)
+                                else None
+                            )
+                            if material_descriptor is not None:
+                                # The tensor table is the allocation contract
+                                # for a lowered region output.  One canonical
+                                # source id can also name earlier singleton
+                                # views; choosing the first SSA occurrence
+                                # stamped those view extents onto a fully
+                                # materialized output at the next call edge.
+                                callee_value = SSAValue(
+                                    int(output_id),
+                                    dtype=str(material_descriptor.dtype),
+                                    shape=tuple(material_descriptor.shape),
                                 )
-                                if descriptor is not None:
+                            else:
+                                callee_value = callee_values.get(output_id)
+                                if callee_value is None and descriptor is not None:
                                     callee_value = callee_values.get(
                                         int(descriptor.data_value_id)
                                     )
@@ -584,7 +926,10 @@ def propagate_repository_ssa_call_metadata(
                                 continue
                             changed |= enrich(
                                 function, int(caller_value.id), callee_value,
-                                authoritative=settle_exact_returns,
+                                authoritative=(
+                                    settle_exact_returns
+                                    or material_descriptor is not None
+                                ),
                             )
                             if not authoritative_returns:
                                 changed |= enrich(
@@ -642,6 +987,24 @@ def lower_tensor_calls_to_repository_ssa(
     as a one-element tensor.
     """
 
+    # Direct source compilation and autograd both consume the same repository
+    # SSA.  Region calls must therefore settle their exact actual/formal and
+    # return metadata here, at the common tensor boundary, rather than relying
+    # on one caller to remember a private prelude.  All three operations are
+    # idempotent; autograd's historical explicit calls remain harmless.
+    settle_shape_only_repository_returns(module)
+    # Resolve facts owned by instructions/identity before the first call-edge
+    # pass.  Specialized-formal settlement is exact on its first round; if it
+    # runs first, an empty downstream placeholder can overwrite a literal
+    # reshape result before that result has stated its extents.
+    settle_static_repository_view_shapes(module)
+    settle_canonical_value_metadata(module)
+    wire_repository_ssa_region_products(module)
+    settle_canonical_value_metadata(module)
+    propagate_repository_ssa_call_metadata(module)
+    if settle_canonical_value_metadata(module):
+        propagate_repository_ssa_call_metadata(module)
+
     next_id = max(_used_value_ids(module), default=-1) + 1
     linked_roots: set[str] = set()
     shortfalls: list[TensorSSALoweringShortfall] = []
@@ -672,6 +1035,21 @@ def lower_tensor_calls_to_repository_ssa(
         *,
         output_argument: int | None = None,
     ) -> Instr:
+        # The imported C/LLVM tensor kernels use double-backed buffers even
+        # when a value's semantic dtype is Boolean (comparisons and masks are
+        # represented as 0.0/1.0). Preserve that physical ABI on every shaped
+        # Boolean occurrence crossing one of these calls. Without it, native C
+        # allocates one byte per element and ``broadcast_double``/``where``
+        # read or write eight, corrupting the activation heap.
+        for value in (*arguments, result):
+            if (
+                tuple(value.shape or ())
+                and str(value.dtype or "").casefold() in {"bool", "i1"}
+            ):
+                value.accounting = {
+                    **dict(value.accounting or {}),
+                    "physical_dtype": "float64",
+                }
         linked_roots.add(callee)
         attributes = {
             key: value for key, value in source.attributes.items()
@@ -701,6 +1079,24 @@ def lower_tensor_calls_to_repository_ssa(
             if value.dtype is None and not tuple(value.shape)
         }
 
+        def shape_unknown(value: SSAValue) -> bool:
+            """True only when a value's shape is genuinely not known.
+
+            An EMPTY shape with a known dtype is a rank-0 scalar, a fully
+            static shape (``alpha = (microstep + 1.0) / microstep_count``).
+            Treating every empty shape as "unknown" routed such scalars
+            through runtime broadcasting with minted extent queries, and the
+            dynamic state then cascaded into every elementwise result after
+            them, none of which had a public extent origin at emission.
+            """
+
+            if tuple(value.shape or ()):
+                return False
+            if value.dtype is None or int(value.id) in unresolved_argument_ids:
+                return True
+            existing = tensor_table.by_id(int(value.id))
+            return existing is not None and existing.metadata_state != "static"
+
         def strides(shape: tuple[int, ...]) -> tuple[int, ...]:
             stride = 1
             result = []
@@ -729,12 +1125,17 @@ def lower_tensor_calls_to_repository_ssa(
                 else "static"
             )
             owner = tensor_table.by_id(alias_of) if alias_of is not None else None
+            physical_dtype = str(
+                (value.accounting or {}).get(
+                    "physical_dtype", value.dtype or "float64"
+                )
+            ).lower()
             dtype_bytes = {
                 "bool": 1, "i1": 1, "int8": 1, "uint8": 1,
                 "int16": 2, "uint16": 2,
                 "float32": 4, "float": 4, "int32": 4, "i32": 4,
                 "float64": 8, "double": 8, "int64": 8, "i64": 8,
-            }.get(str(value.dtype or "float64").lower(), 8)
+            }.get(physical_dtype, 8)
             element_count = prod(shape) if shape else 1
             # A dynamic descriptor requires all three extent values; a result
             # inheriting a dynamic source's state inherits its extents too
@@ -900,6 +1301,68 @@ def lower_tensor_calls_to_repository_ssa(
                     instruction.op in {"Call", "call"}
                     and instruction.attributes.get("callee") is not None
                 ):
+                    raw_axes = instruction.attributes.get(
+                        "basic_index_axes"
+                    )
+                    source_shape = tuple(map(
+                        int,
+                        instruction.attributes.get(
+                            "basic_index_source_shape", ()
+                        ),
+                    ))
+                    axes = (
+                        None if raw_axes is None else tuple(
+                            (tuple(map(int, indices)), bool(drop_axis))
+                            for indices, drop_axis in raw_axes
+                        )
+                    )
+                    if (
+                        instruction.attributes.get("callee")
+                        == "index_select_double"
+                        and instruction.res is not None
+                        and instruction.args
+                        and axes is not None
+                        and len(axes) == len(source_shape)
+                        and all(
+                            drop_axis and len(indices) == 1
+                            for indices, drop_axis in axes
+                        )
+                    ):
+                        # A region may already have selected the repository
+                        # index kernel before whole-module tensor lowering.
+                        # Legalize the same dropped-axis scalar contract here
+                        # rather than preserving a one-element tensor call.
+                        linear_index = 0
+                        for axis, (indices, _drop_axis) in enumerate(axes):
+                            linear_index = (
+                                linear_index * source_shape[axis]
+                                + int(indices[0])
+                            )
+                        index_value, index_definition = constant(
+                            linear_index, "int64"
+                        )
+                        address = fresh(dtype="ptr")
+                        instruction.res.shape = ()
+                        rewritten.extend((
+                            index_definition,
+                            Instr(
+                                "GetElementPtr",
+                                [instruction.args[0], index_value],
+                                address,
+                                attributes={
+                                    "basic_index_linearized": True,
+                                },
+                                source_span=instruction.source_span,
+                            ),
+                            Instr(
+                                "Load", [address], instruction.res,
+                                attributes={
+                                    "basic_index_linearized": True,
+                                },
+                                source_span=instruction.source_span,
+                            ),
+                        ))
+                        continue
                     # AOT numerical-region capture may already have selected
                     # the universal repository fallback before this pass sees
                     # the call.  Keep the AbstractTensor semantic identity on
@@ -979,13 +1442,339 @@ def lower_tensor_calls_to_repository_ssa(
                 operation = str(operation_value)
                 result = instruction.res
                 args = list(instruction.args)
+                raw_basic_axes = instruction.attributes.get(
+                    "basic_index_axes"
+                )
+                basic_source_shape = tuple(map(
+                    int,
+                    instruction.attributes.get(
+                        "basic_index_source_shape", ()
+                    ),
+                ))
+                basic_axes = (
+                    None if raw_basic_axes is None else tuple(
+                        (tuple(map(int, indices)), bool(drop_axis))
+                        for indices, drop_axis in raw_basic_axes
+                    )
+                )
+                if (
+                    args
+                    and basic_axes is not None
+                    and len(basic_axes) == len(basic_source_shape)
+                    and all(
+                        drop_axis and len(indices) == 1
+                        for indices, drop_axis in basic_axes
+                    )
+                ):
+                    # ``slice`` and ``basic_index`` are two planner spellings
+                    # of the same normalized index contract.  Decide scalar
+                    # semantics from the authoritative dropped-axis metadata
+                    # before either spelling selects a tensor kernel.
+                    linear_index = 0
+                    for axis, (indices, _drop_axis) in enumerate(basic_axes):
+                        linear_index = (
+                            linear_index * basic_source_shape[axis]
+                            + int(indices[0])
+                        )
+                    index_value, index_definition = constant(
+                        linear_index, "int64"
+                    )
+                    address = fresh(dtype="ptr")
+                    result.shape = ()
+                    rewritten.extend((
+                        index_definition,
+                        Instr(
+                            "GetElementPtr", [args[0], index_value], address,
+                            attributes={"basic_index_linearized": True},
+                            source_span=instruction.source_span,
+                        ),
+                        Instr(
+                            "Load", [address], result,
+                            attributes={"basic_index_linearized": True},
+                            source_span=instruction.source_span,
+                        ),
+                    ))
+                    continue
+                if (
+                    len(args) == 2
+                    and operation in {"min", "max"}
+                    and all(_known_count(argument) == 1 for argument in args)
+                    and _known_count(result) == 1
+                ):
+                    # The planned graph can retain a count-one tensor shape on
+                    # a scalar reduction result. Python's two-argument
+                    # built-ins still select between two scalar values; they
+                    # do not require a dynamic tensor-extent kernel.
+                    result.shape = ()
+                    rewritten.append(dataclasses.replace(
+                        instruction,
+                        op={"min": "Min", "max": "Max"}[operation],
+                        attributes={
+                            key: value
+                            for key, value in instruction.attributes.items()
+                            if key not in {
+                                "tensor_operation", "tensor",
+                                "tensor_candidate",
+                            }
+                        },
+                    ))
+                    continue
+                # Python's two-argument built-ins are the scalar spelling of
+                # the same elementwise operations exposed by AbstractTensor.
+                # ProcessGraph retains the legal source names ``min``/``max``;
+                # normalize them here, after call arity is known, so they use
+                # the existing broadcast/scalar repository kernels.  Do not
+                # rewrite one-argument iterable reductions.
+                if len(args) == 2 and operation in {"min", "max"}:
+                    operation = {
+                        "min": "minimum",
+                        "max": "maximum",
+                    }[operation]
                 prefix: list[Instr] = []
                 emitted: list[Instr] = []
+
+                if operation in {"basic_index", "basic_index_store"}:
+                    raw_axes = instruction.attributes.get(
+                        "basic_index_axes"
+                    )
+                    if raw_axes is not None and args:
+                        axes = tuple(
+                            (tuple(map(int, indices)), bool(drop_axis))
+                            for indices, drop_axis in raw_axes
+                        )
+                        source = args[0]
+                        source_shape = tuple(map(
+                            int,
+                            instruction.attributes.get(
+                                "basic_index_source_shape",
+                                tuple(source.shape or ()),
+                            ),
+                        ))
+                        if source_shape:
+                            result.shape = tuple(
+                                (
+                                    len(axes[axis][0])
+                                    if axis < len(axes) else source_shape[axis]
+                                )
+                                for axis in range(len(source_shape))
+                                if axis >= len(axes) or not axes[axis][1]
+                            )
+                        source_descriptor = register_tensor(
+                            source,
+                            storage=(
+                                "input"
+                                if int(source.id) in function_argument_ids
+                                else "temporary"
+                            ),
+                        )
+                        if operation == "basic_index_store" and len(args) >= 2:
+                            value = args[-1]
+                            register_tensor(
+                                value,
+                                storage=(
+                                    "input"
+                                    if int(value.id) in function_argument_ids
+                                    else "temporary"
+                                ),
+                            )
+                            offsets = [0]
+                            flattened_indices = []
+                            for indices, _drop_axis in axes:
+                                flattened_indices.extend(indices)
+                                offsets.append(len(flattened_indices))
+                            shape_value, shape_def = int_vector(source_shape)
+                            offsets_value, offsets_def = int_vector(offsets)
+                            indices_value, indices_def = int_vector(
+                                flattened_indices
+                            )
+                            rank_value, rank_def = constant(
+                                len(source_shape), "int32"
+                            )
+                            value_count, value_count_def = constant(
+                                prod(len(indices) for indices, _drop in axes),
+                                "int32",
+                            )
+                            result.shape = source_shape
+                            inplace_store = str(instruction.op) == "IndexedStore"
+                            if inplace_store:
+                                register_tensor(
+                                    result,
+                                    storage="view",
+                                    alias_of=int(source_descriptor.tensor_id),
+                                    data_value_id=int(
+                                        source_descriptor.data_value_id
+                                    ),
+                                )
+                                aliases[int(result.id)] = source
+                            else:
+                                register_tensor(result, storage="temporary")
+                            prefix.extend((
+                                shape_def, rank_def, offsets_def, indices_def,
+                                value_count_def,
+                            ))
+                            emitted.append(call(
+                                (
+                                    "index_assign_double"
+                                    if inplace_store else "index_set_double"
+                                ),
+                                (
+                                    [
+                                        source, shape_value, rank_value,
+                                        offsets_value, indices_value, value,
+                                        value_count,
+                                    ]
+                                    if inplace_store else [
+                                        source, result, shape_value, rank_value,
+                                        offsets_value, indices_value, value,
+                                        value_count,
+                                    ]
+                                ),
+                                result,
+                                instruction,
+                                output_argument=(None if inplace_store else 1),
+                            ))
+                            rewritten.extend((*prefix, *emitted))
+                            continue
+                        if operation == "basic_index":
+                            scalar_selection = (
+                                len(axes) == len(source_shape)
+                                and all(
+                                    bool(drop_axis) and len(indices) == 1
+                                    for indices, drop_axis in axes
+                                )
+                            )
+                            if scalar_selection:
+                                # Every integer-indexed axis is removed by
+                                # Python indexing.  The result is one scalar,
+                                # not a dynamic one-element tensor requiring
+                                # index_select/broadcast extent metadata.
+                                linear_index = 0
+                                for axis, (indices, _drop_axis) in enumerate(
+                                    axes
+                                ):
+                                    linear_index = (
+                                        linear_index * source_shape[axis]
+                                        + int(indices[0])
+                                    )
+                                index_value, index_definition = constant(
+                                    linear_index, "int64"
+                                )
+                                address = fresh(dtype="ptr")
+                                result.shape = ()
+                                rewritten.extend((
+                                    index_definition,
+                                    Instr(
+                                        "GetElementPtr",
+                                        [source, index_value],
+                                        address,
+                                        attributes={
+                                            "basic_index_linearized": True,
+                                        },
+                                        source_span=instruction.source_span,
+                                    ),
+                                    Instr(
+                                        "Load", [address], result,
+                                        attributes={
+                                            "basic_index_linearized": True,
+                                        },
+                                        source_span=instruction.source_span,
+                                    ),
+                                ))
+                                continue
+                            changed_axes = tuple(
+                                (axis, indices)
+                                for axis, (indices, _drop_axis) in enumerate(axes)
+                                if tuple(indices) != tuple(range(source_shape[axis]))
+                            )
+                            if not changed_axes:
+                                register_tensor(
+                                    result,
+                                    storage="view",
+                                    alias_of=source_descriptor.tensor_id,
+                                    data_value_id=source_descriptor.data_value_id,
+                                )
+                                aliases[int(result.id)] = SSAValue(
+                                    source.id,
+                                    dtype=result.dtype or source.dtype,
+                                    shape=tuple(result.shape),
+                                    device=result.device or source.device,
+                                    accounting=dict(source.accounting),
+                                )
+                                continue
+                            current = source
+                            current_shape = list(source_shape)
+                            for selection_index, (axis, indices) in enumerate(
+                                reversed(changed_axes)
+                            ):
+                                last = selection_index == len(changed_axes) - 1
+                                destination_shape = list(current_shape)
+                                destination_shape[axis] = len(indices)
+                                destination = (
+                                    result if last else fresh(
+                                        shape=tuple(destination_shape),
+                                        dtype=result.dtype or source.dtype,
+                                    )
+                                )
+                                register_tensor(destination, storage="temporary")
+                                shape_value, shape_def = int_vector(current_shape)
+                                indices_value, indices_def = int_vector(indices)
+                                rank_value, rank_def = constant(
+                                    len(current_shape), "int32"
+                                )
+                                axis_value, axis_def = constant(axis, "int32")
+                                count_value, count_def = constant(
+                                    len(indices), "int32"
+                                )
+                                prefix.extend((
+                                    shape_def, rank_def, axis_def,
+                                    indices_def, count_def,
+                                ))
+                                emitted.append(call(
+                                    "index_select_double",
+                                    [
+                                        current, destination, shape_value,
+                                        rank_value, axis_value, indices_value,
+                                        count_value,
+                                    ],
+                                    destination, instruction,
+                                    output_argument=1,
+                                ))
+                                current = destination
+                                current_shape = destination_shape
+                            rewritten.extend((*prefix, *emitted))
+                            continue
 
                 # Shape-only operations do not exist at runtime. Preserve the
                 # result's shape/dtype annotation while aliasing its storage.
                 if operation in _VIEW_OPERATIONS and args:
                     source = args[0]
+                    if operation in {"reshape", "view"} and len(args) > 1:
+                        requested = _as_sequence(constants.get(int(args[1].id)))
+                        if requested is not None:
+                            resolved = [int(extent) for extent in requested]
+                            inferred = [
+                                index for index, extent in enumerate(resolved)
+                                if extent == -1
+                            ]
+                            if len(inferred) <= 1 and all(
+                                extent > 0 or extent == -1
+                                for extent in resolved
+                            ):
+                                source_count = _known_count(source)
+                                known_count = prod(
+                                    extent for extent in resolved
+                                    if extent != -1
+                                )
+                                if (
+                                    inferred and source_count is not None
+                                    and known_count
+                                    and source_count % known_count == 0
+                                ):
+                                    resolved[inferred[0]] = (
+                                        source_count // known_count
+                                    )
+                                if -1 not in resolved:
+                                    result.shape = tuple(resolved)
                     source_descriptor = register_tensor(
                         source,
                         storage=(
@@ -1017,16 +1806,40 @@ def lower_tensor_calls_to_repository_ssa(
                 # structure (shape, axis, dtype, keepdim, ...).  Dropping a
                 # constant first operand made calls such as
                 # ``broadcast_to(1.0, (m, n))`` appear to have no source.
+                data_positions = (
+                    frozenset({0, 1, 2})
+                    if operation == "where" else frozenset({0})
+                )
                 data_args = [
                     argument for position, argument in enumerate(args)
-                    if position == 0 or int(argument.id) not in constants
+                    if position in data_positions
+                    or int(argument.id) not in constants
                 ]
                 metadata = [
                     constants[int(argument.id)]
                     for position, argument in enumerate(args)
-                    if position != 0 and int(argument.id) in constants
+                    if position not in data_positions
+                    and int(argument.id) in constants
                 ]
                 source = data_args[0] if data_args else (args[0] if args else None)
+                tensor_opcode = c_tensor_opcode(operation)
+                if (
+                    tensor_opcode is not None
+                    and data_args
+                    and all(
+                        not tuple(argument.shape or ())
+                        and int((argument.accounting or {}).get(
+                            "program_abi_rank", 0
+                        ) or 0) == 0
+                        for argument in data_args
+                    )
+                ):
+                    # Exact scalar operands override provisional count-one
+                    # shapes propagated before dropped-axis indexing was
+                    # legalized.  Otherwise ordinary scalar arithmetic is
+                    # sent through dynamic broadcast kernels solely because
+                    # stale planner metadata still says ``(1,)``.
+                    result.shape = ()
                 if (
                     source is not None
                     and tuple(source.shape or ())
@@ -1112,7 +1925,79 @@ def lower_tensor_calls_to_repository_ssa(
                         output_size = sequence_metadata[0]
                     if output_size is not None and len(output_size) == 4:
                         result.shape = tuple(map(int, output_size))
-                opcode_contract = c_tensor_opcode(operation)
+                elif operation == "arange":
+                    count_value = instruction.attributes.get("arange_count")
+                    start_value = instruction.attributes.get(
+                        "arange_start", 0.0,
+                    )
+                    step_value = instruction.attributes.get(
+                        "arange_step", 1.0,
+                    )
+                    if count_value is not None and int(count_value) > 0:
+                        start, start_def = constant(
+                            float(start_value), "float64",
+                        )
+                        step, step_def = constant(
+                            float(step_value), "float64",
+                        )
+                        count, count_def = constant(
+                            int(count_value), "int32",
+                        )
+                        result.shape = (int(count_value),)
+                        prefix.extend((start_def, step_def, count_def))
+                        emitted.append(call(
+                            "create_arange",
+                            [start, step, count, result],
+                            result,
+                            instruction,
+                            output_argument=3,
+                        ))
+                elif operation == "gather" and len(data_args) >= 2:
+                    indices = data_args[1]
+                    if not tuple(source.shape or ()):
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name,
+                            block_name,
+                            operation,
+                            (
+                                "gather source has no declared rank; "
+                                f"source=%{source.id}, indices=%{indices.id}, "
+                                "argument_shapes="
+                                f"{tuple(tuple(arg.shape or ()) for arg in data_args)!r}"
+                            ),
+                        ))
+                        rewritten.append(instruction)
+                        continue
+                    raw_dim = _attribute(
+                        instruction.attributes, "axis", "dim"
+                    )
+                    if raw_dim is None:
+                        raw_dim = next((
+                            item for item in metadata
+                            if isinstance(item, (int, float))
+                        ), 0)
+                    axis = int(raw_dim) % len(source.shape)
+                    source_shape, source_shape_def = int_vector(source.shape)
+                    rank, rank_def = constant(len(source.shape), "int32")
+                    axis_value, axis_def = constant(axis, "int32")
+                    index_count, index_count_def = constant(
+                        _known_count(indices) or 1, "int32"
+                    )
+                    prefix.extend((
+                        source_shape_def, rank_def, axis_def,
+                        index_count_def,
+                    ))
+                    emitted.append(call(
+                        "gather_values_double",
+                        [
+                            source, result, source_shape, rank, axis_value,
+                            indices, index_count,
+                        ],
+                        result, instruction, output_argument=1,
+                    ))
+                opcode_contract = (
+                    None if emitted else c_tensor_opcode(operation)
+                )
                 if (
                     source is not None
                     and opcode_contract is not None
@@ -1134,9 +2019,23 @@ def lower_tensor_calls_to_repository_ssa(
                         if shaped_operands:
                             import numpy as _np
 
-                            result.shape = tuple(_np.broadcast_shapes(
-                                *shaped_operands
-                            ))
+                            try:
+                                result.shape = tuple(_np.broadcast_shapes(
+                                    *shaped_operands
+                                ))
+                            except ValueError:
+                                shortfalls.append(TensorSSALoweringShortfall(
+                                    function_name,
+                                    block_name,
+                                    operation,
+                                    (
+                                        "tensor operands have incompatible "
+                                        f"shapes {tuple(shaped_operands)!r}; "
+                                        f"result=%{result.id}"
+                                    ),
+                                ))
+                                rewritten.append(instruction)
+                                continue
                         elif len(data_args) == 1:
                             result.shape = tuple(source.shape or ())
                 if (
@@ -1152,6 +2051,48 @@ def lower_tensor_calls_to_repository_ssa(
                     result.shape = tuple(source.shape or ())
                     if source.dtype is not None:
                         result.dtype = source.dtype
+                if operation == "where" and len(data_args) == 3:
+                    # Settle the broadcast contract before registering the
+                    # result descriptor.  Registration owns allocation size;
+                    # changing only SSAValue.shape later would leave a
+                    # one-element arena behind even if the kernel count were
+                    # subsequently corrected.
+                    shaped_operands = tuple(
+                        tuple(operand.shape or ())
+                        for operand in data_args
+                        if tuple(operand.shape or ())
+                    )
+                    if shaped_operands:
+                        import numpy as _np
+
+                        try:
+                            result.shape = tuple(_np.broadcast_shapes(
+                                *shaped_operands
+                            ))
+                        except ValueError:
+                            shortfalls.append(TensorSSALoweringShortfall(
+                                function_name,
+                                block_name,
+                                operation,
+                                "where operands have incompatible shapes "
+                                f"{shaped_operands!r}; result=%{result.id}",
+                            ))
+                            rewritten.append(instruction)
+                            continue
+                # Registration fixes the physical allocation width, so the
+                # repository's double-backed Boolean ABI must be stamped
+                # before any descriptor is created.  Doing this only while
+                # constructing the eventual Call is too late: byte_size has
+                # already been frozen as one byte per semantic bool.
+                for value in (*data_args, result):
+                    if (
+                        tuple(value.shape or ())
+                        and str(value.dtype or "").casefold() in {"bool", "i1"}
+                    ):
+                        value.accounting = {
+                            **dict(value.accounting or {}),
+                            "physical_dtype": "float64",
+                        }
                 source_descriptor = None
                 if source is not None:
                     source_descriptor = register_tensor(
@@ -1200,7 +2141,46 @@ def lower_tensor_calls_to_repository_ssa(
                 # Derived source definition: cbrt(x) = sign(x)*pow(abs(x),1/3).
                 # It is deliberately expressed through the finite primitive
                 # basis instead of becoming a new runtime intrinsic.
-                if operation == "cbrt" and source is not None:
+                if emitted:
+                    pass
+                elif operation in {
+                    "fill", "full", "full_like", "zeros", "zeros_like",
+                    "empty", "empty_like", "ones", "ones_like",
+                }:
+                    like_operation = operation.endswith("_like")
+                    if like_operation and source is not None:
+                        result.shape = tuple(source.shape or ())
+                        if source.dtype is not None:
+                            result.dtype = source.dtype
+                    fill_value: float | None
+                    if operation in {"ones", "ones_like"}:
+                        fill_value = 1.0
+                    elif operation in {
+                        "zeros", "zeros_like", "empty", "empty_like",
+                    }:
+                        fill_value = 0.0
+                    else:
+                        explicit = _attribute(
+                            instruction.attributes, "fill_value", "value"
+                        )
+                        if explicit is None:
+                            explicit = next((
+                                item for item in metadata
+                                if isinstance(item, (int, float))
+                                and not isinstance(item, bool)
+                            ), None)
+                        fill_value = (
+                            None if explicit is None else float(explicit)
+                        )
+                    count = need_count(result, _known_count(result))
+                    if fill_value is not None and count is not None:
+                        scalar, scalar_def = constant(fill_value, "float64")
+                        prefix.append(scalar_def)
+                        emitted.append(call(
+                            "fill_double", [result, scalar, count], result,
+                            instruction, output_argument=0,
+                        ))
+                elif operation == "cbrt" and source is not None:
                     count = need_count(source, source_count)
                     abs_result = fresh(shape=source.shape, dtype=source.dtype or "float64")
                     sign_result = fresh(shape=source.shape, dtype=source.dtype or "float64")
@@ -1338,7 +2318,7 @@ def lower_tensor_calls_to_repository_ssa(
                                 attributes={"lowered_from": "mean"},
                                 source_span=instruction.source_span,
                             ))
-                    elif axis is not None and not source.shape and operation in _REDUCTION_CODES:
+                    elif axis is not None and shape_unknown(source) and operation in _REDUCTION_CODES:
                         # Symbolic source: shape and rank ride as runtime
                         # extents; the kernel already takes them as operands.
                         extents = ensure_dynamic(prefix, source)
@@ -1378,10 +2358,169 @@ def lower_tensor_calls_to_repository_ssa(
                         result, instruction, output_argument=1,
                     ))
 
+                elif operation == "stack" and data_args:
+                    operand_shape = tuple(source.shape or ())
+                    statically_known = (
+                        bool(operand_shape)
+                        or all(
+                            int(operand.id) not in unresolved_argument_ids
+                            for operand in data_args
+                        )
+                    )
+                    if statically_known and all(
+                        tuple(operand.shape or ()) == operand_shape
+                        for operand in data_args
+                    ):
+                        rank = len(operand_shape)
+                        raw_dim = _attribute(instruction.attributes, "axis", "dim")
+                        if raw_dim is None:
+                            raw_dim = next((
+                                item for item in metadata
+                                if isinstance(item, (int, float))
+                            ), 0)
+                        dim_index = int(raw_dim) % (rank + 1)
+                        result.shape = (
+                            *operand_shape[:dim_index], len(data_args),
+                            *operand_shape[dim_index:],
+                        )
+                        pointers = fresh(
+                            shape=(len(data_args),), dtype="ptrptr_float64"
+                        )
+                        shape_value, shape_def = int_vector(operand_shape)
+                        count_value, count_def = constant(
+                            len(data_args), "int32"
+                        )
+                        rank_value, rank_def = constant(rank, "int32")
+                        dim_value, dim_def = constant(dim_index, "int32")
+                        prefix.extend((
+                            Instr("PointerArray", data_args, pointers),
+                            shape_def, count_def, rank_def, dim_def,
+                        ))
+                        emitted.append(call(
+                            "stack_double",
+                            [
+                                pointers, count_value, shape_value,
+                                rank_value, dim_value, result,
+                            ],
+                            result, instruction, output_argument=5,
+                        ))
+
+                elif operation in {"cat", "concat", "concatenate"} and data_args:
+                    rank = len(tuple(source.shape or ()))
+                    raw_dim = _attribute(instruction.attributes, "axis", "dim")
+                    if raw_dim is None:
+                        raw_dim = next((
+                            item for item in metadata
+                            if isinstance(item, (int, float))
+                        ), 0)
+                    dim_index = int(raw_dim) % rank if rank else 0
+                    shapes = tuple(tuple(value.shape or ()) for value in data_args)
+                    compatible = bool(rank) and all(
+                        len(shape) == rank
+                        and all(
+                            axis == dim_index or shape[axis] == source.shape[axis]
+                            for axis in range(rank)
+                        )
+                        for shape in shapes
+                    )
+                    if compatible:
+                        result_shape = list(map(int, source.shape))
+                        result_shape[dim_index] = sum(
+                            int(shape[dim_index]) for shape in shapes
+                        )
+                        result.shape = tuple(result_shape)
+                        pointers = fresh(
+                            shape=(len(data_args),), dtype="ptrptr_float64"
+                        )
+                        sizes, sizes_def = int_vector(
+                            shape[dim_index] for shape in shapes
+                        )
+                        shape_value, shape_def = int_vector(source.shape)
+                        count_value, count_def = constant(
+                            len(data_args), "int32"
+                        )
+                        rank_value, rank_def = constant(rank, "int32")
+                        dim_value, dim_def = constant(dim_index, "int32")
+                        prefix.extend((
+                            Instr("PointerArray", data_args, pointers),
+                            sizes_def, shape_def, count_def, rank_def, dim_def,
+                        ))
+                        emitted.append(call(
+                            "cat_double",
+                            [
+                                pointers, sizes, count_value, shape_value,
+                                rank_value, dim_value, result,
+                            ],
+                            result, instruction, output_argument=6,
+                        ))
+
                 elif operation == "where" and len(data_args) == 3:
                     count = need_count(result, result_count)
+                    conformed = []
+                    for operand in data_args:
+                        if tuple(operand.shape or ()) == tuple(result.shape or ()):
+                            conformed.append(operand)
+                            continue
+                        temporary = fresh(
+                            dtype=result.dtype or "float64",
+                            shape=tuple(result.shape or ()),
+                        )
+                        register_tensor(temporary, storage="temporary")
+                        if not tuple(operand.shape or ()):
+                            scalar = operand
+                            payload = constants.get(int(operand.id))
+                            if (
+                                isinstance(payload, (int, float))
+                                and not isinstance(payload, bool)
+                                and str(operand.dtype or "").casefold()
+                                not in {"double", "float64"}
+                            ):
+                                scalar, scalar_def = constant(
+                                    float(payload), "float64"
+                                )
+                                prefix.append(scalar_def)
+                            emitted.append(call(
+                                "fill_double", [temporary, scalar, count],
+                                temporary, instruction, output_argument=0,
+                            ))
+                        elif operand.shape and result.shape:
+                            source_shape, source_shape_def = int_vector(operand.shape)
+                            source_rank, source_rank_def = constant(
+                                len(operand.shape), "int32"
+                            )
+                            output_shape, output_shape_def = int_vector(result.shape)
+                            output_rank, output_rank_def = constant(
+                                len(result.shape), "int32"
+                            )
+                            prefix.extend((
+                                source_shape_def, source_rank_def,
+                                output_shape_def, output_rank_def,
+                            ))
+                            emitted.append(call(
+                                "broadcast_double",
+                                [
+                                    operand, temporary, source_shape, source_rank,
+                                    output_shape, output_rank,
+                                ],
+                                temporary, instruction, output_argument=1,
+                            ))
+                        else:
+                            shortfalls.append(TensorSSALoweringShortfall(
+                                function_name,
+                                block_name,
+                                operation,
+                                "where operand cannot be conformed without "
+                                f"a result shape; operand=%{operand.id} "
+                                f"result=%{result.id}",
+                            ))
+                            emitted.clear()
+                            break
+                        conformed.append(temporary)
+                    if len(conformed) != 3:
+                        rewritten.append(instruction)
+                        continue
                     emitted.append(call(
-                        "where_double", [*data_args, result, count], result,
+                        "where_double", [*conformed, result, count], result,
                         instruction, output_argument=3,
                     ))
 
@@ -1427,7 +2566,7 @@ def lower_tensor_calls_to_repository_ssa(
                             ],
                             result, instruction, output_argument=1,
                         ))
-                    elif output_shape is not None and not source.shape:
+                    elif output_shape is not None and shape_unknown(source):
                         output_shape = tuple(map(int, output_shape))
                         result.shape = output_shape
                         source_extents = ensure_dynamic(prefix, source)
@@ -1556,7 +2695,93 @@ def lower_tensor_calls_to_repository_ssa(
                             "matmul_double", [left, right, result, *dimensions], result,
                             instruction, output_argument=2,
                         ))
-                    elif not left.shape and not right.shape:
+                    elif (
+                        len(left.shape) >= 2
+                        and len(right.shape) >= 2
+                        and left.shape[-1] == right.shape[-2]
+                    ):
+                        left_batch = tuple(map(int, left.shape[:-2]))
+                        right_batch = tuple(map(int, right.shape[:-2]))
+                        batch_rank = max(len(left_batch), len(right_batch))
+                        left_aligned = (1,) * (batch_rank - len(left_batch)) + left_batch
+                        right_aligned = (1,) * (batch_rank - len(right_batch)) + right_batch
+                        batch_shape: list[int] = []
+                        compatible = True
+                        for left_extent, right_extent in zip(
+                            left_aligned, right_aligned
+                        ):
+                            if left_extent == right_extent or left_extent == 1:
+                                batch_shape.append(right_extent)
+                            elif right_extent == 1:
+                                batch_shape.append(left_extent)
+                            else:
+                                compatible = False
+                                break
+                        if compatible:
+                            m = int(left.shape[-2])
+                            n = int(left.shape[-1])
+                            p = int(right.shape[-1])
+                            result.shape = (*batch_shape, m, p)
+
+                            # The authored C kernel accepts one element offset
+                            # per broadcasted batch. Build that finite routing
+                            # table here from the static tensor descriptors;
+                            # matrix values remain ordinary repository tensors.
+                            left_matrix_size = m * n
+                            right_matrix_size = n * p
+                            left_offsets: list[int] = []
+                            right_offsets: list[int] = []
+                            batch_count = prod(batch_shape)
+                            for flat_index in range(batch_count):
+                                remaining = flat_index
+                                coordinates = [0] * batch_rank
+                                for axis in range(batch_rank - 1, -1, -1):
+                                    extent = batch_shape[axis]
+                                    coordinates[axis] = remaining % extent
+                                    remaining //= extent
+
+                                left_batch_index = 0
+                                right_batch_index = 0
+                                for coordinate, left_extent, right_extent in zip(
+                                    coordinates, left_aligned, right_aligned
+                                ):
+                                    left_batch_index = (
+                                        left_batch_index * left_extent
+                                        + (0 if left_extent == 1 else coordinate)
+                                    )
+                                    right_batch_index = (
+                                        right_batch_index * right_extent
+                                        + (0 if right_extent == 1 else coordinate)
+                                    )
+                                left_offsets.append(
+                                    left_batch_index * left_matrix_size
+                                )
+                                right_offsets.append(
+                                    right_batch_index * right_matrix_size
+                                )
+
+                            left_offsets_value, left_offsets_def = int_vector(
+                                left_offsets
+                            )
+                            right_offsets_value, right_offsets_def = int_vector(
+                                right_offsets
+                            )
+                            prefix.extend((left_offsets_def, right_offsets_def))
+                            dimensions = []
+                            for extent in (batch_count, m, n, p):
+                                value, definition = constant(extent, "int32")
+                                dimensions.append(value)
+                                prefix.append(definition)
+                            emitted.append(call(
+                                "batched_matmul_indexed_double",
+                                [
+                                    left, right, result,
+                                    left_offsets_value, right_offsets_value,
+                                    *dimensions,
+                                ],
+                                result, instruction, output_argument=2,
+                            ))
+                    elif shape_unknown(left) and shape_unknown(right):
                         # Symbolic operands: matmul_double's contract is rank
                         # two, so the three dims become runtime extents.
                         ensure_dynamic(prefix, left)
@@ -1628,7 +2853,7 @@ def lower_tensor_calls_to_repository_ssa(
                                         if tuple(operand.shape) == tuple(result.shape):
                                             conformed_args.append(operand)
                                             continue
-                                        if not operand.shape or not result.shape:
+                                        if shape_unknown(operand) or shape_unknown(result):
                                             # Shapes unknown statically: conforming
                                             # is a runtime decision, so route the
                                             # operand through broadcast_double with
@@ -1734,6 +2959,11 @@ def lower_tensor_calls_to_repository_ssa(
                         if source is not None and _known_count(source) is None
                         else "referenced SSA exists but its concrete call operands cannot be derived from this instruction"
                     )
+                    reason += (
+                        "; argument_shapes="
+                        f"{tuple(tuple(argument.shape or ()) for argument in args)!r}, "
+                        f"result=%{result.id} shape={tuple(result.shape or ())!r}"
+                    )
                     shortfalls.append(TensorSSALoweringShortfall(
                         function_name, block_name, operation, reason,
                     ))
@@ -1772,12 +3002,23 @@ def lower_tensor_calls_to_repository_ssa(
             if existing_table is not None and existing_table != reference_table:
                 raise ValueError(f"repository SSA tensor-table collision for {name!r}")
             module.tensor_tables[name] = reference_table
+    if legalize_aggregate_adapters(module):
+        settle_canonical_value_metadata(module)
+    # Tensor descriptors are created while rewriting functions above.  A
+    # producer's final allocation shape can therefore become authoritative
+    # only after the whole module has been visited, regardless of whether an
+    # aggregate adapter happened to be removed on this invocation.
+    propagate_repository_ssa_call_metadata(module)
+    settle_repository_ssa_static_extent_operands(module)
+    legalize_aggregate_output_views(module)
     return tuple(shortfalls)
 
 
 __all__ = [
     "TensorSSALoweringShortfall",
     "lower_tensor_calls_to_repository_ssa",
+    "legalize_aggregate_adapters",
+    "legalize_aggregate_output_views",
     "propagate_repository_ssa_call_metadata",
     "settle_shape_only_repository_returns",
     "wire_repository_ssa_region_products",

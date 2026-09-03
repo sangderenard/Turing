@@ -644,6 +644,7 @@ from .output_publication import (
     function_output_publications,
     publication_surface_plan,
 )
+from .ssa_aggregate_abi import is_storage_view
 
 
 # Target intrinsics reached by the scalar tables, plus the block-copy the
@@ -959,7 +960,25 @@ def _emit_repository_call_module(
             ):
                 continue
             callee = str(instruction.attributes.get("callee") or "")
-            declared = tuple(map(int, instruction.attributes.get("output_ids", ())))
+            declared = tuple(map(
+                int, instruction.attributes.get("output_ids", ())
+            ))
+            declared_positions = tuple(map(
+                int,
+                instruction.attributes.get(
+                    "output_positions", range(len(declared))
+                ),
+            ))
+            declared_slots = tuple(map(
+                int,
+                instruction.attributes.get(
+                    "output_slots", range(len(declared))
+                ),
+            ))
+            declared_callee_ids = tuple(map(
+                int,
+                instruction.attributes.get("callee_output_ids", declared),
+            ))
             live_positions: list[int] = []
             address_position: dict[int, int] = {}
             projected_values: dict[int, _Any] = {}
@@ -987,7 +1006,7 @@ def _emit_repository_call_module(
                 follower is not instruction
                 and follower.op not in {"GetElementPtr", "getelementptr"}
                 and any(
-                    int(argument.id) == int(instruction.res.id)
+                    is_storage_view(argument, instruction.res)
                     for argument in follower.args
                 )
                 for follower in instructions
@@ -998,7 +1017,7 @@ def _emit_repository_call_module(
             # dead output costs one store to a cell nobody reads, which is
             # nothing.  Removal belongs to the planner's proof, never to an
             # emitter-local count.
-            selected = tuple(range(len(declared)))
+            selected = declared_positions
             if consumed_whole:
                 aggregate_escapes_whole.add(
                     (caller_name, int(instruction.res.id))
@@ -1008,17 +1027,20 @@ def _emit_repository_call_module(
                 existing = aggregate_output_positions.setdefault(callee, [])
                 existing_ids = aggregate_output_ids.setdefault(callee, [])
                 typed = aggregate_output_values.setdefault(callee, {})
-                for position in selected:
-                    if position not in existing:
-                        existing.append(position)
-                        existing_ids.append(declared[position])
+                for selected_index, position in enumerate(selected):
+                    slot = declared_slots[selected_index]
+                    caller_id = declared[selected_index]
+                    callee_id = declared_callee_ids[selected_index]
+                    if slot not in existing:
+                        existing.append(slot)
+                        existing_ids.append(callee_id)
                     value = projected_values.get(position)
                     if value is None:
                         value = values_by_function[caller_name].get(
-                            declared[position]
+                            caller_id
                         )
                     if value is not None:
-                        typed[declared[position]] = value
+                        typed[callee_id] = value
 
     # Which of a callee's OWN formal parameters does its body treat as a
     # pointer TABLE (a `ptr[N]` of other buffers' addresses), rather than a
@@ -2039,6 +2061,32 @@ def _emit_repository_call_module(
                 pointers[result_id] = destination
                 continue
 
+            if operation == "PointerArray" and result is not None:
+                # PointerArray is the SSA-level argument record used by
+                # stack/cat kernels.  Its elements are addresses, not tensor
+                # values: materialize the same pointer table the C backend
+                # emits and retain the compile-time member map for any local
+                # projections.
+                table = f"%aggregate.pointer_array.{tag}"
+                body.append(
+                    f"  {table} = alloca ptr, i64 {len(instruction.args)}, align 8"
+                )
+                members: dict[int, str] = {}
+                for position, argument in enumerate(instruction.args):
+                    argument_pointer = pointer(argument)
+                    slot = f"%pointer.array.slot.{tag}.{position}"
+                    body.append(
+                        f"  {slot} = getelementptr ptr, ptr {table}, "
+                        f"i64 {position}"
+                    )
+                    body.append(
+                        f"  store ptr {argument_pointer}, ptr {slot}, align 8"
+                    )
+                    members[position] = argument_pointer
+                pointers[result_id] = table
+                aggregate_members[result_id] = members
+                continue
+
             if operation in {"GetElementPtr", "getelementptr"} and result is not None:
                 base_id = int(instruction.args[0].id) if instruction.args else -1
                 members = aggregate_members.get(base_id)
@@ -2381,6 +2429,24 @@ def _emit_repository_call_module(
                 except (KeyError, ValueError):
                     returns = ""
                     argument_types = ()
+                if symbol in {
+                    "cast_double_to_int_values",
+                    "cast_double_to_float_values",
+                    "cast_double_to_double_values",
+                    "cast_double_to_bool_values",
+                }:
+                    if len(instruction.args) != 1 or result is None:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, symbol,
+                            "semantic cast call requires one authored operand",
+                        ))
+                        continue
+                    body.append(
+                        f"  call void @{symbol}(ptr {pointer(instruction.args[0])}, "
+                        f"ptr {destination}, i32 {result_count})"
+                    )
+                    kernels_used.add(symbol)
+                    continue
                 if argument_types or returns:
                     kernels_used.add(symbol)
                     arguments = list(instruction.args)
@@ -2416,6 +2482,18 @@ def _emit_repository_call_module(
                     declared_ids = tuple(map(
                         int, instruction.attributes.get("output_ids", ())
                     ))
+                    declared_positions = tuple(map(
+                        int,
+                        instruction.attributes.get(
+                            "output_positions", range(len(declared_ids))
+                        ),
+                    ))
+                    declared_slots = tuple(map(
+                        int,
+                        instruction.attributes.get(
+                            "output_slots", range(len(declared_ids))
+                        ),
+                    ))
                     selected = aggregate_positions.get(
                         (name, result_id), tuple(range(len(callee_outputs)))
                     )
@@ -2447,6 +2525,41 @@ def _emit_repository_call_module(
                                 f"i64 {count}, align 8"
                             )
                             result_ptrs.append(temporary)
+                    elif (
+                        declared_ids
+                        and "output_slots" in instruction.attributes
+                        and len(declared_ids) == len(declared_positions)
+                        == len(declared_slots)
+                        and all(
+                            0 <= slot < len(callee_outputs)
+                            for slot in declared_slots
+                        )
+                    ):
+                        selected_position_by_slot = dict(zip(
+                            declared_slots, declared_positions
+                        ))
+                        result_ptrs = []
+                        for output_index, value in enumerate(callee_outputs):
+                            position = selected_position_by_slot.get(
+                                output_index
+                            )
+                            projected = (
+                                None if position is None
+                                else projections.get(position)
+                            )
+                            if projected is not None:
+                                result_ptrs.append(pointer(projected))
+                            else:
+                                llvm_type = _value_llvm_type(value)
+                                count = _value_element_count(value)
+                                temporary = (
+                                    f"%call.output.{tag}.{output_index}"
+                                )
+                                body.append(
+                                    f"  {temporary} = alloca {llvm_type}, "
+                                    f"i64 {count}, align 8"
+                                )
+                                result_ptrs.append(temporary)
                     elif declared_ids:
                         if len(selected) != len(callee_outputs):
                             shortfalls.append(LLVMEmissionShortfall(
@@ -2605,11 +2718,22 @@ def _emit_repository_call_module(
                         elif len(callee_outputs) == 1 and not declared_ids:
                             pointers[result_id] = result_ptrs[0]
                         else:
-                            aggregate_members[result_id] = {
-                                original_position: result_ptrs[index]
-                                for index, original_position in enumerate(selected)
-                                if index < len(result_ptrs)
-                            }
+                            if "output_slots" in instruction.attributes:
+                                aggregate_members[result_id] = {
+                                    position: result_ptrs[slot]
+                                    for position, slot in zip(
+                                        declared_positions, declared_slots
+                                    )
+                                    if 0 <= slot < len(result_ptrs)
+                                }
+                            else:
+                                aggregate_members[result_id] = {
+                                    original_position: result_ptrs[index]
+                                    for index, original_position in enumerate(
+                                        selected
+                                    )
+                                    if index < len(result_ptrs)
+                                }
                             # An in/out-aliased output has no distinct out
                             # parameter -- the callee writes through the
                             # argument's own storage.  Its aggregate position
@@ -2622,8 +2746,15 @@ def _emit_repository_call_module(
                                     or ()
                                 )
                             )
-                            for original_position, output_id in enumerate(
-                                declared_output_ids
+                            output_positions = tuple(map(
+                                int,
+                                instruction.attributes.get(
+                                    "output_positions",
+                                    range(len(declared_output_ids)),
+                                ),
+                            ))
+                            for original_position, output_id in zip(
+                                output_positions, declared_output_ids
                             ):
                                 known = pointers.get(int(output_id))
                                 if known is not None:
@@ -2638,13 +2769,23 @@ def _emit_repository_call_module(
                             # run.  Materialize the table ONLY when the
                             # aggregate value itself escapes whole.
                             if (name, result_id) in aggregate_escapes_whole:
+                                aggregate_result_ptrs = (
+                                    [result_ptrs[slot] for slot in declared_slots]
+                                    if "output_slots" in instruction.attributes
+                                    and len(declared_slots) == len(declared_ids)
+                                    and all(
+                                        0 <= slot < len(result_ptrs)
+                                        for slot in declared_slots
+                                    )
+                                    else result_ptrs
+                                )
                                 aggregate = f"%aggregate.{tag}"
                                 body.append(
                                     f"  {aggregate} = alloca ptr, i64 "
-                                    f"{len(result_ptrs)}, align 8"
+                                    f"{len(aggregate_result_ptrs)}, align 8"
                                 )
                                 for output_index, result_pointer in enumerate(
-                                    result_ptrs
+                                    aggregate_result_ptrs
                                 ):
                                     slot = (
                                         f"%aggregate.output.slot.{tag}."
@@ -2869,9 +3010,22 @@ def _emit_repository_call_module(
                     integer_lines, result_type = integer
                     body.extend(f"  {line}" for line in integer_lines)
                 else:
-                    for rendered_line in template.format(
-                        *operands, out=register
-                    ).splitlines():
+                    try:
+                        rendered = template.format(*operands, out=register)
+                    except IndexError:
+                        # A flat tensor reduction (max/all/any over one
+                        # operand) reached a scalar template of higher
+                        # arity. The C module lane spells these directly;
+                        # this lane records the missing emission instead of
+                        # dying inside str.format.
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, operation,
+                            f"{len(operands)}-operand {operation} does not "
+                            "fit its scalar template; flat reduction "
+                            "emission is not implemented on this lane",
+                        ))
+                        continue
+                    for rendered_line in rendered.splitlines():
                         body.append(f"  {rendered_line}")
                     # Scalar likeness templates operate in the promoted
                     # operand domain.  Keep that actual register type until
@@ -2978,6 +3132,12 @@ def _emit_repository_call_module(
 
     root = module.functions[function_name]
     root_outputs = function_outputs[function_name]
+    from .ssa_storage_requirements import (
+        function_storage_requirements,
+        is_compiler_owned_storage,
+    )
+
+    storage_requirements = function_storage_requirements(module, function_name)
     # Storage introduced while linking a nested repository call belongs to
     # the root function's native frame, not to the authored program ABI.  It
     # remains an ordinary pointer argument of the internal root function so
@@ -2985,11 +3145,19 @@ def _emit_repository_call_module(
     # allocates it locally.
     root_public_args = tuple(
         value for value in root.args
-        if not (value.accounting or {}).get("linked_call_frame_storage")
+        if not (
+            is_compiler_owned_storage(value)
+            and storage_requirements.get(int(value.id)) is not None
+            and storage_requirements[int(value.id)].element_count is not None
+        )
     )
     root_internal_storage = tuple(
         value for value in root.args
-        if (value.accounting or {}).get("linked_call_frame_storage")
+        if (
+            is_compiler_owned_storage(value)
+            and storage_requirements.get(int(value.id)) is not None
+            and storage_requirements[int(value.id)].element_count is not None
+        )
     )
     public_values = [*root_public_args, *root_outputs]
     buffer_order: list[int] = []
@@ -3003,7 +3171,10 @@ def _emit_repository_call_module(
             continue
         slot = len(buffer_order)
         buffer_order.append(value_id)
-        buffer_shapes.append(tuple(value.shape or ()))
+        requirement = storage_requirements.get(value_id)
+        buffer_shapes.append(tuple(
+            requirement.shape if requirement is not None else value.shape or ()
+        ))
         buffer_dtypes.append(_value_llvm_type(value))
         address = f"%public.addr.{slot}"
         loaded = f"%public.{slot}"
@@ -3012,7 +3183,12 @@ def _emit_repository_call_module(
         public_pointer[value_id] = loaded
     for storage_index, value in enumerate(root_internal_storage):
         llvm_type = _value_llvm_type(value)
-        count = _value_element_count(value)
+        requirement = storage_requirements.get(int(value.id))
+        count = (
+            int(requirement.element_count)
+            if requirement is not None and requirement.element_count is not None
+            else _value_element_count(value)
+        )
         local = f"%root.frame.{storage_index}"
         wrapper.append(
             f"  {local} = alloca {llvm_type}, i64 {count}, align 8"
@@ -4047,6 +4223,32 @@ def emit_ssa_function_to_llvm(
                 continue
             if callee is not None:
                 symbol = str(callee)
+                if (
+                    symbol in {
+                        "acos", "acosh", "asin", "asinh", "atan", "atanh",
+                        "cos", "cosh", "exp", "log", "sin", "sinh", "sqrt",
+                        "tan", "tanh",
+                    }
+                    and instruction.res is not None
+                    and not tuple(getattr(instruction.res, "shape", ()) or ())
+                    and len(instruction.args) == 1
+                ):
+                    argument = as_type(
+                        int(instruction.args[0].id), "double",
+                        f"libm.{result_id}",
+                    )
+                    if argument is None:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            function_name, symbol,
+                            "scalar libm operand cannot render as double",
+                        ))
+                    else:
+                        register = f"%libm.{symbol}.{result_id}"
+                        lines.append(
+                            f"  {register} = call double @{symbol}(double {argument})"
+                        )
+                        scalars[result_id] = (register, "double")
+                    continue
                 semantic_diagnostic = emit_semantic_tensor_call(
                     instruction, symbol,
                 )
@@ -4403,6 +4605,7 @@ def emit_ssa_function_to_llvm(
 
 def compile_artifact(
     artifact: LLVMFunctionArtifact, *, directory: _Path | None = None,
+    optimization: str = "O2",
 ) -> LLVMFunctionArtifact:
     """Build the emitted module with the LLVM compiler, ahead of time."""
 
@@ -4421,16 +4624,21 @@ def compile_artifact(
     # Same LLVM toolchain resolution the C backend uses: the ziglang package
     # bundles clang, invoked through the interpreter, no PATH assumptions.
     import sys as _sys
-    command = [_sys.executable, "-m", "ziglang", "cc", "-shared", "-O2",
+    optimization = str(optimization)
+    if optimization not in {"O0", "O1", "O2", "O3", "Os", "Oz"}:
+        raise ValueError(f"unsupported LLVM optimization level {optimization!r}")
+    optimization_flag = f"-{optimization}"
+    command = [_sys.executable, "-m", "ziglang", "cc", "-shared",
+               optimization_flag,
                "-o", str(library), str(source)]
     if _fma_contract_enabled():
         # The module names no target, so contraction permission alone reaches
         # no FMA unit; name the host. Same switch as the `contract` flag.
-        command.insert(command.index("-O2") + 1, "-march=native")
+        command.insert(command.index(optimization_flag) + 1, "-march=native")
     from .work_contract import active_contract as _active_work_contract
 
     for extra_flag in _active_work_contract().compiler_flags:
-        command.insert(command.index("-O2") + 1, str(extra_flag))
+        command.insert(command.index(optimization_flag) + 1, str(extra_flag))
     if artifact.needs_text_sink:
         command.append(str(
             _Path(__file__).resolve().parents[1]

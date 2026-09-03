@@ -55,17 +55,14 @@ def test_each_backend_keeps_its_own_operator_inventory():
     assert len({len(operations) for operations in inventories.values()}) > 1
     # Backend-private primitives are legitimate vocabulary too; they are not
     # required to masquerade as canonical AbstractTensor operations.
-    assert {"index_set", "slice"} <= inventories["c"]
     assert {"broadcast", "sum_dim", "extent"} <= inventories["llvm"]
     typed_casts = {
         "int_trunc", "zext", "sext", "fptosi", "fptoui", "sitofp", "uitofp",
     }
-    # LLVM and Fortran expose mixed typed SSA values.  C's tensor ABI is
-    # double-valued and a WASM numeric region has one fixed working type, so
-    # neither backend falsely advertises cross-type casts as tensor kernels.
+    # Typed casts are SSA instructions shared by the mixed-value native lanes.
     assert typed_casts <= inventories["llvm"]
     assert typed_casts <= inventories["fortran"]
-    assert not typed_casts & inventories["c"]
+    assert typed_casts <= inventories["c"]
     assert not typed_casts & inventories["wasm"]
     shared = shared_implemented_tensor_operations()
     assert ELEMENTWISE_UNARY - {

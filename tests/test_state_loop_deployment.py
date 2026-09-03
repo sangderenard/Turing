@@ -21,9 +21,16 @@ def test_living_map_separates_fixed_physics_from_presenting_graphics():
     assert "previous[1]-r>=top-.012&&next[1]-r<=top+.006" in source
     assert "WebAssembly.instantiate" in source
     assert "new ArrayBuffer(snapshotCapacity*SNAPSHOT_STRIDE*8)" in source
-    assert "const SNAPSHOT_STRIDE=153" in source
+    assert "const SNAPSHOT_STRIDE=162" in source
     assert "vehicle.radial-probe-penetration[4][15]" in str(model["channels"][0]["record_layout"])
     assert "FIXED_DT=" in source
+    assert "PHYSICS_SUBSTEPS=3" in source
+    assert "body.outriggerWrench={force:totalForce,torque:totalTorque}" in source
+    assert "body.position[axis]+=correction[axis]" not in source
+    assert '"locking-and-leveling"' in source
+    assert "energy.ignitionOn=false;runtime.phase=\"deploying\"" in source
+    assert 'm.type==="vehicle-outrigger-hand-pump"' in source
+    assert "SUBSTEP_DT=FIXED_DT/PHYSICS_SUBSTEPS" in source
     assert 'dt=engineStage==="kinematic-coast"?1/30:FIXED_DT' in source
     assert "snapshot.buffer.mapAsync(GPUMapMode.READ).then" in source
     assert "snapshot.epoch=Number(body.gpuEpoch||0)" in source
@@ -38,9 +45,21 @@ def test_living_map_separates_fixed_physics_from_presenting_graphics():
     assert "parameters=new Float32Array([fields.length,walls.length,...descriptors])" in source
     assert "vehicleGpu?.residentGraph&&vehicleGpu.terrainReady" in source
     assert "function residentVehicleWasmStep(body,dt)" in source
+    assert "function terrainSegmentCrossing(start,finish,body,reach)" in source
+    assert "function solidSegmentCrossing(start,finish,body)" in source
+    assert "function analyticTorusTireContact" in source
+    assert "radialContact=analyticTorusTireContact" in source
+    assert "arcAngle=2*(Math.PI-arcStart)" in source
+    assert "function radialTireContact" not in source
+    assert "terrainSegmentCrossing(ringPoint,nextRing,body,reach)||solidSegmentCrossing(ringPoint,nextRing,body)" in source
+    assert "for(let subdivision=1;subdivision<=8;subdivision++)" in source
+    assert "for(let iteration=0;iteration<8;iteration++)" in source
+    assert "penetrationMax=Math.max(penetrationMax,penetration)" not in source
+    assert "integralCompression=penetrationMax" not in source
+    assert "function tireHalfSpaceOverlap" not in source
     assert "runScalarWasm(contactInstance,contactAbi" in source
     assert "runScalarWasm(vehicleInstance,vehicleAbi" in source
-    assert "else if(vehicleInstance&&contactInstance)residentVehicleWasmStep(body,dt)" in source
+    assert "else if(vehicleInstance&&contactInstance)for(let substep=0;substep<PHYSICS_SUBSTEPS;substep++)" in source
     assert 'type:"vehicle-wasm-fallback"' in source
     assert '"resident-wasm-fallback"' in source
     assert "vehicle-contact-bridge" not in source
@@ -88,21 +107,71 @@ def test_living_map_separates_fixed_physics_from_presenting_graphics():
     assert 'm.type==="vehicle-dyno"' in source
     assert 'type:"vehicle-dyno-result"' in source
     assert "function applyPendingVehicleCommands(body)" in source
-    assert "applyPendingVehicleCommands(body);prepareVehicleControls(body,dt);" in source
+    assert "applyPendingVehicleCommands(body);prepareVehicleEnergy(body,dt);prepareVehicleControls(body,dt);" in source
     assert "function prepareVehicleControls(body,dt)" in source
     assert 'state.reason=command.smoothLaunch?"driver-smooth-launch":"driver-direct-launch"' in source
     assert "body.brakeLocks" in source
     assert "brake_lock_${name}" in source
     assert "function ensureVehicleDamage(body)" in source
+    assert 'body.damage={mode:"parametric-damage"' in source
+    assert "function ensureVehicleEnergy(body)" in source
+    assert 'm.type==="vehicle-fuel-ignition"' in source
+    assert 'm.type==="vehicle-driver-assistance"' in source
+    assert "function ensureVehicleDriverAssistance(body)" in source
+    assert "driver.cruiseTargetSpeedMps-roadSpeed" in source
+    assert "governor_angular_speed:governorOmega" in source
+    assert "tippingAngle=Math.atan2(rearLever,cgHeight)" in source
+    assert "driver.rearDifferentialBrakeCommand" in source
+    assert "body.rearDifferentialBrakeCommand" in source
+    assert "state.requestedIgnitionProfileIdentity" in source
+    assert 'requestedIgnitionProfile.dispatch==="ecu-electronic"' in source
+    assert "state.brakeLightsOn=" in source
+    assert 'm.type==="vehicle-pneumatics"' in source
+    assert 'policy.mode==="manual-wheel"' in source
+    assert "state.pneumaticCompressorPowerW" in source
+    assert "state.hydraulicPumpPowerW" in source
+    assert "tire_reference_volume:2*Math.PI*Math.PI" in source
+    assert "sidewall_deformation_lateral:Number(body.tireDeformation" in source
+    assert "slip_lateral_${name}" in source
+    assert "bump_stop_progressive_stiffness:s.bump_stop_progressive_stiffness_n_per_m2" in source
+    assert "omega>12||starterAllowed" in source
+    assert "engine_angular_speed:body.energy?.ignitionOn===false?0" in source
+    assert "body.frontKnuckleSteerAngle||0" in source
+    assert "const solveCorner=(corner,rackTravel,connected)" in source
+    assert "neutralLength2=" in source
+    assert "body.wheelSteerAngles" in source
+    assert "frontRackTravel:frontTravel" in source
+    assert "ecuAvailable=energy.ecuOnline&&!ecuFeedFailed" in source
+    assert "speedBlend=Math.pow(c2Unit(roadSpeed/referenceSpeed),rateCurve)" in source
+    assert "allowedRate=ecuSteeringActive?ecuRate:servoPowered?assistedRate:manualRate" in source
+    assert '"manual-human-force"' in source
+    assert "humanTorque-resistingTorque" in source
+    assert "steeringServoPowerW" in source
+    assert "steeringCommand=Number(body.appliedSteering" in source
+    assert "ecuVelocityRateControl" in source
+    assert "reversingAgainstMotion" in source
+    assert "directionChangeBrake" in source
+    assert "body.featheredThrottleVelocity=0" in source
+    assert "includeSolidTops=true" in source
+    assert "body.identity,false" in source
     assert "function vehicleDriveFractions(body)" in source
     assert "function updateVehicleDamage(body,dt)" in source
     assert 'damage.mode="parametric-damage"' in source
     assert "requestParametricVehiclePipelines(body,`damage · ${reason}`)" in source
     assert 'm.type==="vehicle-chassis-profile"' in source
     assert 'm.type==="vehicle-chassis-leveling"' in source
+    assert 'm.type==="vehicle-body-wrenches"' in source
+    assert 'm.type==="vehicle-outriggers"' in source
+    assert "function updateVehicleOutriggers(body,dt)" in source
+    assert "terrainSegmentCrossing(previous,foot,body,2.4)" in source
+    assert "runtime.brakeInterlock" in source
+    assert "body.brakeLocks={front_left:true,front_right:true,rear_left:true,rear_right:true}" in source
+    assert "body.linkLengthModifiers[edge.identity]" in source
+    assert "b.bodyAssemblyWrenches.push" in source
     assert 'm.type==="vehicle-steering-system"' in source
     assert 'm.type==="vehicle-parameters"' in source
     assert "function applyVehicleChassisProfile(body,profile)" in source
+    assert "energy.dryMassKg=Math.max(1,Number(geometry.mass)-initialFuel);energy.lastMassKg=-1" in source
     assert "function updateVehicleChassisLeveling(body,dt)" in source
     assert "function updateVehicleSteeringWrench(body,dt)" in source
     assert 'requestParametricVehiclePipelines(body,"shock parameter control")' in source
@@ -111,8 +180,10 @@ def test_living_map_separates_fixed_physics_from_presenting_graphics():
     assert "maximum_sink_depth_m" in source
     assert "if(resolveWorldBottom(body,previousPosition))" in source
     assert "function resetVehicleDrivetrainState(body,reason)" in source
+    assert 'if(body.kind==="vehicle"){body.supportSurfaceLatch=null;body.bottomRejected=false;return false;}' in source
+    assert "No post-step positional rejection" in source
     assert "Object.values(output).every(Number.isFinite)" in source
-    assert "resident Wasm crossed the world-bottom guard" in source
+    assert "vehicle entered the world-bottom guard before integration" in source
     assert "resident GPU crossed the world-bottom guard" in source
     assert "halfshaftHealth" in source
     assert "springPlasticSet" in source

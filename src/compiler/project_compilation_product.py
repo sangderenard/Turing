@@ -34,7 +34,9 @@ LINK_TABLE_SCHEMA = "turing.project-compilation-links.v1"
 SOURCE_REGION_INTEGRAL_SCHEMA = "turing.source-region-integral.v1"
 DEFAULT_WORKER_RESERVATION_BYTES = 4 * 1024 ** 3
 DEFAULT_WORKER_LIMIT_BYTES = 4 * 1024 ** 3
-DEFAULT_UNIT_TIMEOUT_SECONDS = 5 * 60
+# Compilation time is not a correctness boundary. Large, valid authored units
+# may take longer than five minutes; callers may still opt into a deadline.
+DEFAULT_UNIT_TIMEOUT_SECONDS: float | None = None
 DEFAULT_PROJECT_EXTRACTION_CONTRACT = (
     Path(__file__).resolve().parents[2]
     / "extraction_contracts"

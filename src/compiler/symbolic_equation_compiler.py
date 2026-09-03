@@ -7,15 +7,19 @@ it does not evaluate, rewrite, or reimplement their right-hand sides.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import copy
+import sys
 from typing import Any, Mapping, Sequence
 
 import sympy
 
 from .hierarchical_plan import PREDICATE_OPERATIONS
+from .ir_identities import reduce_constant_exponent_pow
 from .ssa_builder import process_graph_to_ssa_instrs
 from .symbolic_process_graph import ingest_sympy_expressions
+from .sympy_dual_ir_cache import SympyDualIRCache
+from ..common.tensors.accelerator_backends.aot_checkpoint import callable_digest
 from ..transmogrifier.graph.graph_express2 import ProcessGraph
 from ..transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
 
@@ -42,6 +46,8 @@ class SymbolicEquationCompilation:
     input_ids: Mapping[str, int]
     output_ids: Mapping[str, int]
     publications: tuple[SymbolicPublication, ...]
+    cache_identity: str | None = None
+    cache_hit: bool = False
 
 
 def _numeric_constant(value: Any) -> Any:
@@ -52,7 +58,7 @@ def _numeric_constant(value: Any) -> Any:
     return value
 
 
-def compile_sympy_equations(
+def _compile_sympy_equations_uncached(
     equations: Sequence[sympy.Equality],
     *,
     name: str = "symbolic_equation_step",
@@ -211,6 +217,28 @@ def compile_sympy_equations(
                 attributes=attributes,
                 source_span=instruction.source_span,
             )
+        # SymPy function nodes arrive through ProcessGraph as direct calls
+        # (for example ``callee='acos'``).  Late native backends intentionally
+        # consume the canonical tensor primitive ABI rather than linking an
+        # arbitrary source-language function name.  Preserve the operation in
+        # metadata and route it through that ABI so symbolic arc/contact math
+        # can lower to C, LLVM, and the other tensor targets uniformly.
+        if instruction.op in {"Call", "call"}:
+            callee = str(instruction.attributes.get("callee") or "")
+            if tuple(getattr(instruction.res, "shape", ()) or ()) and callee in {
+                "acos", "acosh", "asin", "asinh", "atan", "atanh",
+                "cos", "cosh", "exp", "log", "sin", "sinh", "sqrt",
+                "tan", "tanh",
+            }:
+                attributes = dict(instruction.attributes)
+                attributes["callee"] = "unary_double"
+                attributes["tensor_operation"] = callee
+                instruction = Instr(
+                    "Call", list(instruction.args), instruction.res,
+                    arg_roles=list(instruction.arg_roles),
+                    attributes=attributes,
+                    source_span=instruction.source_span,
+                )
         body.append(instruction)
     if dtype == "float32":
         for instruction in body:
@@ -252,8 +280,6 @@ def compile_sympy_equations(
     # finalization; without it the direct scalar lanes would receive raw Pow
     # and each backend's private spelling table would become a second,
     # unaudited policy.
-    from .ir_identities import reduce_constant_exponent_pow
-
     reduce_constant_exponent_pow(module.functions)
     if dtype == "float32":
         for current in module.functions.values():
@@ -271,6 +297,82 @@ def compile_sympy_equations(
         input_ids={row[0]: row[1] for row in input_rows},
         output_ids=dict(zip(output_names, roots)),
         publications=publication_rows,
+    )
+
+
+def _publication_record(publication: SymbolicPublication) -> Mapping[str, Any]:
+    return {
+        "output": publication.output,
+        "semantic": publication.semantic,
+        "presentation": publication.presentation,
+        "unit": publication.unit,
+    }
+
+
+def compile_sympy_equations(
+    equations: Sequence[sympy.Equality],
+    *,
+    name: str = "symbolic_equation_step",
+    schedule: str = "asap",
+    publications: Sequence[SymbolicPublication] = (),
+    dtype: str = "float64",
+) -> SymbolicEquationCompilation:
+    """Lower equations once, then reuse their persistent repository dual IR.
+
+    The cache identity contains the canonical symbolic structure, ordered live
+    parameter ABI (inherent in the equations), publications, dtype, scheduling
+    policy, interpreter/SymPy serialization versions, and the lowering
+    implementation digest.  Runtime parameter values remain outside the key
+    unless a caller intentionally specializes them into the equations.
+    """
+
+    authored = tuple(equations)
+    publication_rows = tuple(publications)
+    implementation = callable_digest(
+        _compile_sympy_equations_uncached,
+        ingest_sympy_expressions,
+        process_graph_to_ssa_instrs,
+        reduce_constant_exponent_pow,
+        ProcessGraph,
+        Function,
+        IRModule,
+    )
+    record = {
+        "name": str(name),
+        "schedule": str(schedule),
+        "dtype": str(dtype),
+        "equations": tuple(sympy.srepr(equation) for equation in authored),
+        "publications": tuple(
+            _publication_record(publication) for publication in publication_rows
+        ),
+        "python_cache_tag": sys.implementation.cache_tag,
+        "sympy_version": sympy.__version__,
+    }
+    cached = SympyDualIRCache(implementation).dual_ir(
+        record,
+        lambda: _compile_sympy_equations_uncached(
+            authored,
+            name=name,
+            schedule=schedule,
+            publications=publication_rows,
+            dtype=dtype,
+        ),
+    )
+    if not isinstance(cached.value, SymbolicEquationCompilation):
+        # A locally corrupted or obsolete payload must never cross the public
+        # compiler boundary. Recompute with caching disabled for this call.
+        value = _compile_sympy_equations_uncached(
+            authored,
+            name=name,
+            schedule=schedule,
+            publications=publication_rows,
+            dtype=dtype,
+        )
+        return replace(value, cache_identity=cached.identity, cache_hit=False)
+    return replace(
+        cached.value,
+        cache_identity=cached.identity,
+        cache_hit=cached.hit,
     )
 
 

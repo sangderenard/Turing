@@ -583,9 +583,9 @@ class KernelBank:
                 )
             return compile_artifact(artifact, directory=directory)
         if name == "c":
-            from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+            from src.compiler.ssa_c_backend import emit_ssa_to_c
 
-            artifact = emit_ssa_module_to_c(module, entrypoint)
+            artifact = emit_ssa_to_c(module, entrypoint)
             if not artifact.complete:
                 raise BankRefusal(
                     f"{entrypoint}: {len(artifact.shortfalls)} C "

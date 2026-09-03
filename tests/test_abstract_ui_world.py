@@ -8,6 +8,7 @@ import subprocess
 import pytest
 
 from src.compiler.abstract_ui_world import (
+    WorldObject,
     compile_world_transform_wasm,
     document_world_objects,
     pluck_placed_object,
@@ -109,6 +110,24 @@ def test_world_graph_publishes_identity_and_semantic_mesh_packet_contract():
         range(1, 7)
     )
     assert all(part["object_runtime_id"] == 1 for part in specialization["semantic_parts"])
+
+
+def test_conceptual_world_object_can_own_separate_geometry_realization():
+    owner = WorldObject(
+        "world/rig", "rig", "world", "Rig", {}, {"kind": "rig"},
+    )
+    geometry = _geometry()
+    geometry["boxes"][0]["parent_identity"] = owner.identity
+    model = world_graph_model(
+        "world",
+        geometry,
+        conceptual_objects=(owner,),
+        properties={"validator_rig": owner.identity},
+    )
+    assert model["properties"] == {"validator_rig": owner.identity}
+    assert model["conceptual_object_order"] == [owner.identity]
+    child = next(item for item in model["objects"] if item["identity"] == "world/courtyard")
+    assert child["parent"] == owner.identity
 
 
 def test_world_transform_plugin_executes_through_published_wasm_abi(tmp_path: Path):

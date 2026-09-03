@@ -257,7 +257,30 @@ rules:
 
   - id: abstract-tensor-vocabulary-is-intrinsic
     match:
-      identity: src.common.tensors.abstraction.AbstractTensor.*
+      identity:
+        - src.common.tensors.abstraction.AbstractTensor.*
+        # AbstractTensor exposes these authored module functions as static
+        # methods.  Python introspection retains the defining identity, so
+        # match the public creation vocabulary as well as the class spelling;
+        # otherwise ``AbstractTensor.ones_like`` is recursively compiled as
+        # its implementation body instead of remaining a tensor operation.
+        - src.common.tensors.abstraction_methods.creation.empty
+        - src.common.tensors.abstraction_methods.creation.eye_like
+        - src.common.tensors.abstraction_methods.creation.full
+        - src.common.tensors.abstraction_methods.creation.full_like
+        - src.common.tensors.abstraction_methods.creation.hanning
+        - src.common.tensors.abstraction_methods.creation.linspace
+        - src.common.tensors.abstraction_methods.creation.meshgrid
+        - src.common.tensors.abstraction_methods.creation.ones
+        - src.common.tensors.abstraction_methods.creation.ones_like
+        - src.common.tensors.abstraction_methods.creation.rand_like
+        - src.common.tensors.abstraction_methods.creation.randint
+        - src.common.tensors.abstraction_methods.creation.randint_like
+        - src.common.tensors.abstraction_methods.creation.randn
+        - src.common.tensors.abstraction_methods.creation.random_tensor
+        - src.common.tensors.abstraction_methods.creation.randoms
+        - src.common.tensors.abstraction_methods.creation.zeros
+        - src.common.tensors.abstraction_methods.creation.zeros_like
     action: intrinsic
     parameters:
       lowering_namespace: abstract_tensor
