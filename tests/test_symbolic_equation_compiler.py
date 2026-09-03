@@ -66,7 +66,10 @@ def test_symbolic_equation_ssa_is_accepted_directly_by_llvm_and_fortran():
     assert llvm.complete, [shortfall.reason for shortfall in llvm.shortfalls]
     assert fortran.complete, [shortfall.format() for shortfall in fortran.shortfalls]
     assert "fadd double" in llvm.llvm_ir
-    assert "t4 = (t0 + (2 * t2))" in fortran.source
+    # The Fortran emitter spells numeric literals with their kind
+    # (``2.0_c_double``), which is the correct typed form; the earlier
+    # untyped ``2`` was the drift.
+    assert "t4 = (t0 + (2.0_c_double * t2))" in fortran.source
     assert llvm.output_publications == ()
     assert fortran.api.metadata["semantic_outputs"] == ()
 
