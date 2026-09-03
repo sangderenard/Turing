@@ -369,20 +369,27 @@ def run_parity(
     evaluators: dict[str, Callable[[np.ndarray], np.ndarray]] = {}
     unavailable: dict[str, str] = {}
     for backend in backends:
-        if backend == "python":
-            evaluators[backend] = python_backend(compilation)
-        elif backend == "c":
-            evaluators[backend] = c_backend(compilation, workdir, optimization)
-        elif backend == "llvm":
-            evaluators[backend] = llvm_backend(compilation, workdir, optimization)
-        elif backend == "fortran":
-            evaluator = fortran_backend(compilation, workdir)
-            if evaluator is None:
-                unavailable[backend] = "no Fortran compiler installed"
+        try:
+            if backend == "python":
+                evaluators[backend] = python_backend(compilation)
+            elif backend == "c":
+                evaluators[backend] = c_backend(compilation, workdir, optimization)
+            elif backend == "llvm":
+                evaluators[backend] = llvm_backend(compilation, workdir, optimization)
+            elif backend == "fortran":
+                evaluator = fortran_backend(compilation, workdir)
+                if evaluator is None:
+                    unavailable[backend] = "no Fortran compiler installed"
+                else:
+                    evaluators[backend] = evaluator
             else:
-                evaluators[backend] = evaluator
-        else:
-            raise ValueError(f"unknown backend {backend!r}")
+                raise ValueError(f"unknown backend {backend!r}")
+        except RuntimeError as error:
+            # A backend that cannot emit or build this program is a finding
+            # (reported), not a reason to lose the other backends' numbers.
+            if backend == "python":
+                raise
+            unavailable[backend] = str(error)
     if "python" not in evaluators:
         raise ValueError("the python authority must be among the backends")
 

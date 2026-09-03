@@ -149,3 +149,22 @@ def test_fluid_state_update_is_unclamped_and_publishes_dt_rejection_metrics():
         "dt.error.height_positivity",
         "dt.error.tracer_bounds",
     }
+
+
+def test_tanh_lowers_to_llvm_as_a_declared_libm_call():
+    """tanh has no LLVM intrinsic; the vehicle body uses it 21 times.
+
+    Before this entry the whole vehicle body failed LLVM emission (21
+    'no likeness-table entry' shortfalls and ~700 operands unavailable
+    downstream) while C and Fortran emitted it.
+    """
+
+    x = sympy.Symbol("tanh_x")
+    compiled = compile_sympy_equations(
+        (sympy.Eq(sympy.Symbol("tanh_y"), sympy.tanh(x) * 2, evaluate=False),),
+        name="tanh_probe",
+    )
+    artifact = emit_ssa_function_to_llvm(compiled.module, compiled.function.name)
+    assert artifact.complete, [s.reason for s in artifact.shortfalls]
+    assert "call double @tanh(double" in artifact.llvm_ir
+    assert "declare double @tanh(double)" in artifact.llvm_ir

@@ -81,6 +81,9 @@ _UNARY: dict[str, str] = {
     "Log": "{out} = call double @llvm.log.f64(double {0})",
     "Sin": "{out} = call double @llvm.sin.f64(double {0})",
     "Cos": "{out} = call double @llvm.cos.f64(double {0})",
+    # No LLVM intrinsic exists for tanh; it is the same libm call the C
+    # backend makes, declared from this template like the intrinsics are.
+    "Tanh": "{out} = call double @tanh(double {0})",
     "Floor": "{out} = call double @llvm.floor.f64(double {0})",
     "Ceil": "{out} = call double @llvm.ceil.f64(double {0})",
     "Trunc": "{out} = call double @llvm.trunc.f64(double {0})",
@@ -101,18 +104,19 @@ _UNARY: dict[str, str] = {
 def _intrinsic_declarations_from_templates(
     *tables: dict[str, str],
 ) -> dict[str, str]:
-    """Derive `declare` lines for the LLVM intrinsics the tables actually call.
+    """Derive `declare` lines for the callees the tables actually call.
 
     A target intrinsic belongs to the LLVM language itself, not to the
     repository's authored kernels, so it has no extractable definition. Its
     signature is nevertheless already stated exactly by the authored call
     template above, so the declaration is read back from that same text rather
-    than restated as a second, drift-prone signature table.
+    than restated as a second, drift-prone signature table.  The same holds
+    for a libm function such as ``tanh`` that LLVM has no intrinsic for.
     """
 
     declarations: dict[str, str] = {}
     call = _re.compile(
-        r"call\s+(?P<ret>[\w.]+)\s+@(?P<symbol>llvm\.[\w.]+)\((?P<args>[^)]*)\)"
+        r"call\s+(?P<ret>[\w.]+)\s+@(?P<symbol>[A-Za-z_][\w.]*)\((?P<args>[^)]*)\)"
     )
     for table in tables:
         for template in table.values():
