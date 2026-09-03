@@ -1451,14 +1451,23 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = gather(x, index, dim)",
         "latex": r"y_i = x_{index_i}",
         "backward": {
-            "x": "gx = zeros_like(x); idx=[slice(None)]*x.ndims(); axis=dim if dim>=0 else x.ndims()+dim; idx[axis]=index; gx[tuple(idx)] = g"
+            "x": "gx = index_adjoint(g, x, idx) with idx=[slice(None)]*x.ndims(), idx[axis]=index: the transpose of the gather, ACCUMULATING every position index names more than once"
         },
         "python": {
             "parameters": ["g", "x", "index", "dim"],
-            "body": "gx=AbstractTensor.zeros_like(x); idx=[slice(None)]*x.ndims(); axis=dim if dim>=0 else x.ndims()+dim; idx[axis]=index; gx[tuple(idx)] = g; return gx"
+            "body": "idx=[slice(None)]*x.ndims(); axis=dim if dim>=0 else x.ndims()+dim; idx[axis]=index; return index_adjoint(g, x, tuple(idx))"
         },
-        "domain": "Any real; index valid.",
-        "notes": "Backward of gather: scatter gradient back to x; no gradient w.r.t index.",
+        "domain": "Any real; index valid; repeated indices accumulate (a many-to-one gather such as face->vertex lookup).",
+        "notes": (
+            "Backward of gather: the adjoint of the same fancy-index read, via "
+            "index_adjoint (sort + prefix-sum), so a source position gathered "
+            "k times receives the SUM of its k output gradients.  The previous "
+            "rule assigned gx[idx] = g, which OVERWRITES on repeated indices and "
+            "kept only the last contribution -- measured 2026-09-03 as a 69% "
+            "wrong directional derivative on a 5-index gather with two repeats, "
+            "and a wholly wrong VJP through the balloon tire's face-vertex "
+            "gathers.  No gradient w.r.t index."
+        ),
         "tags": ["indexing"],
     },
     "index_select": {

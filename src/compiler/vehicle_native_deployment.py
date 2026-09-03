@@ -34,7 +34,7 @@ from .ssa_c_backend import CFunctionArtifact, emit_ssa_function_to_c
 from .ir_identities import apply_precision_pipeline
 from .symbolic_equation_compiler import (
     SymbolicPublication,
-    compile_sympy_equations,
+    compile_symbolic_program,
 )
 from .control_source import ControlProgram, StatementBlock, render_c_shell
 from .vehicle_balloon_tire_native import (
@@ -477,9 +477,50 @@ class WrittenNativeVehicleKernels:
     manifest_path: Path
 
 
+_ROLLER_FIXTURE_CORNER_OUTPUTS = (
+    "carriage_y_{corner}_next", "carriage_velocity_y_{corner}_next",
+    "fixture_actuator_force_{corner}", "fixture_hub_force_{corner}",
+    "fixture_compensation_force_{corner}",
+)
+_ROLLER_FIXTURE_SURFACE_OUTPUTS = (
+    "terrain_phase_x_next", "terrain_phase_z_next", "surface_mode_state",
+    "terrain_period_x_state", "terrain_period_z_state",
+)
+
+
+def _roller_fixture_publications() -> tuple[SymbolicPublication, ...]:
+    """Publication rows in the exact order the authored equations emit them.
+
+    Computed from names alone so the persistent symbolic cache can be keyed
+    without constructing the fixture equations.
+    """
+
+    rows = []
+    for corner in FIXTURE_CORNERS:
+        for stem in _ROLLER_FIXTURE_CORNER_OUTPUTS:
+            name = stem.format(corner=corner)
+            rows.append(SymbolicPublication(name, f"rig.fixture.{name}"))
+    for name in _ROLLER_FIXTURE_SURFACE_OUTPUTS:
+        rows.append(SymbolicPublication(name, f"rig.fixture.surface.{name}"))
+    return tuple(rows)
+
+
 @lru_cache(maxsize=1)
 def compile_vehicle_roller_fixture_ssa():
     """Compile the external roller/carriage dynamics used by the native rig.
+
+    Built once per revision of this file through the persistent symbolic
+    cache; :func:`symbolic_roller_fixture_equations` is the authority.
+    """
+
+    return compile_symbolic_program(
+        symbolic_roller_fixture_equations, name="vehicle_roller_fixture_step",
+        publications=_roller_fixture_publications(), dtype="float64",
+    )
+
+
+def symbolic_roller_fixture_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, sympy.Symbol]]:
+    """Author the external roller/carriage dynamics used by the native rig.
 
     This is laboratory equipment, not an alternate vehicle/contact model.
     Each corner mode is 0 for a passive unilateral hydraulic follower and 1
@@ -508,7 +549,6 @@ def compile_vehicle_roller_fixture_ssa():
             )
     s = symbols
     equations = []
-    publications = []
     for corner in FIXTURE_CORNERS:
         mode = sympy.Min(sympy.Max(sympy.Max(s["mode"], s[f"mode_{corner}"]), 0), 1)
         hub_v = s[f"hub_velocity_y_{corner}"]
@@ -549,9 +589,10 @@ def compile_vehicle_roller_fixture_ssa():
             f"fixture_hub_force_{corner}": (1 - mode) * passive_force,
             f"fixture_compensation_force_{corner}": compensation_force,
         }
+        assert tuple(values) == tuple(
+            stem.format(corner=corner) for stem in _ROLLER_FIXTURE_CORNER_OUTPUTS)
         for output_name, expression in values.items():
             equations.append(sympy.Eq(sympy.Symbol(output_name, real=True), expression, evaluate=False))
-            publications.append(SymbolicPublication(output_name, f"rig.fixture.{output_name}"))
     patch_values = {
         "terrain_phase_x_next": s["terrain_phase_x"] + s["dt"] * s["terrain_velocity_x"],
         "terrain_phase_z_next": s["terrain_phase_z"] + s["dt"] * s["terrain_velocity_z"],
@@ -559,18 +600,12 @@ def compile_vehicle_roller_fixture_ssa():
         "terrain_period_x_state": sympy.Max(s["terrain_period_x"], sympy.Float("0.01")),
         "terrain_period_z_state": sympy.Max(s["terrain_period_z"], sympy.Float("0.01")),
     }
+    assert tuple(patch_values) == _ROLLER_FIXTURE_SURFACE_OUTPUTS
     for output_name, expression in patch_values.items():
         equations.append(sympy.Eq(
             sympy.Symbol(output_name, real=True), expression, evaluate=False,
         ))
-        publications.append(SymbolicPublication(
-            output_name, f"rig.fixture.surface.{output_name}",
-        ))
-    compiled = compile_sympy_equations(
-        tuple(equations), name="vehicle_roller_fixture_step",
-        publications=tuple(publications), dtype="float64",
-    )
-    return compiled
+    return tuple(equations), symbols
 
 
 def compile_vehicle_roller_fixture_c(*, double_double: bool = False) -> CFunctionArtifact:

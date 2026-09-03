@@ -515,3 +515,29 @@ def test_one_vehicle_program_materializes_semantic_eager_feed_dtypes():
     assert feeds["tire_bead_mask"].dtype.kind == "b"
     assert feeds["tire_initialized"].dtype.kind == "b"
     assert program.source is vehicle_python_compilation_inputs(1).source
+
+
+def test_energy_diagnostics_stack_one_scalar_per_batch_lane():
+    """Kinetic energy must be a (batch,) vector like the other three columns.
+
+    The velocity norm is summed over vertex, xyz and wheel before the mass
+    multiplies it, so the per-lane vertex mass is a (batch,) factor; a
+    (batch, 1, 1) reshape broadcast it into rank 3 and the final stack
+    rejected the mismatched shapes at runtime.
+    """
+
+    from src.common.tensors import AbstractTensor
+
+    namespace = {"AbstractTensor": AbstractTensor}
+    exec(VEHICLE_NATIVE_GRAPH_VECTOR_SOURCE, namespace)
+    energy = namespace["vehicle_energy_diagnostics_vector"]
+    with AbstractTensor.use_backend("numpy"):
+        tire_input = AbstractTensor.tensor(
+            np.arange(1, 41, dtype=np.float64).reshape(1, 40))
+        tire_state = AbstractTensor.tensor(np.ones((1, 4, 7, 6)))
+        tire_output = AbstractTensor.tensor(np.ones((1, 4, 14)))
+        values = np.asarray(energy(tire_input, tire_state, tire_output).data)
+    # vertex mass is input column 2 (== 3.0); 4 wheels * 7 vertices * 3
+    # velocity components of 1.0 give 84; 0.5 * 3 * 84 == 126.
+    assert values.shape == (1, 4)
+    assert values.tolist() == [[126.0, 8.0, 4.0, 4.0]]

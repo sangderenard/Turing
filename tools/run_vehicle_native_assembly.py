@@ -20,7 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.compiler.abstract_ui_vehicles import _vehicle_mechanical_graph, load_default_car_configuration
+from src.compiler.abstract_ui_vehicles import (
+    _vehicle_mechanical_graph, compile_symbolic_vehicle_physics,
+    compile_wheel_contact_ssa, load_default_car_configuration,
+)
 from src.common.tensors import AbstractTensor
 from src.common.dt_system.dt_controller import STController, Targets, run_superstep
 from src.common.dt_system.dt_scaler import Metrics
@@ -33,7 +36,9 @@ from src.compiler.vehicle_native_assembly import (
     load_vehicle_qualification_spec, native_vehicle_assembly_stages,
     qualification_stage_policy, stage_components,
 )
-from src.compiler.vehicle_native_deployment import derive_vehicle_rig_rate_hz
+from src.compiler.vehicle_native_deployment import (
+    compile_vehicle_roller_fixture_ssa, derive_vehicle_rig_rate_hz,
+)
 from src.compiler.vehicle_balloon_tire import balloon_tire_graph_abi
 from src.compiler.vehicle_balloon_tire_program import balloon_tire_python_program
 from src.compiler.vehicle_balloon_tire_diagnostics import balloon_tire_state_diagnostics
@@ -518,22 +523,24 @@ class _DuallyDTState:
             self.material._pending_visual_snapshot = pending
 
 
-def _run_dually_python_profile(args, bundle: Path, manifest: dict) -> int:
+def _run_dually_python_profile(args, bundle: Path) -> int:
     """Run one data profile through the existing Python-authored validator."""
 
     if not args.python_material:
         raise ValueError("the dually profile currently requires --python-material")
     profile = dually_validator_profile()
-    hz = int(manifest.get("time_integration", {}).get("outer_rate_hz", 120))
+    hz = _outer_rate_hz(args, load_default_car_configuration())
     frame_dt = 1.0 / hz
     rollback_threshold_multiplier = float(
         args.dt_rollback_threshold_multiplier)
     if rollback_threshold_multiplier < 1.0:
         raise ValueError("--dt-rollback-threshold-multiplier must be >= 1")
-    vehicle_names = tuple(manifest["vehicle"]["input_names"])
-    output_names = tuple(manifest["vehicle"]["output_names"])
-    contact_names = tuple(manifest["contact"]["input_names"])
-    fixture_names = tuple(manifest["fixture"]["input_names"])
+    # The same plain metadata lookups the native manifest was written from;
+    # no build artifact is opened on the Python path.
+    vehicle_names = tuple(compile_symbolic_vehicle_physics().function.metadata["argument_names"])
+    output_names = tuple(compile_symbolic_vehicle_physics().function.metadata["output_names"])
+    contact_names = tuple(compile_wheel_contact_ssa().function.metadata["argument_names"])
+    fixture_names = tuple(compile_vehicle_roller_fixture_ssa().function.metadata["argument_names"])
     vi = {name: index for index, name in enumerate(vehicle_names)}
     fi = {name: index for index, name in enumerate(fixture_names)}
 
@@ -917,9 +924,27 @@ def _run_dually_python_profile(args, bundle: Path, manifest: dict) -> int:
     return 0
 
 
+def _outer_rate_hz(args, config) -> int:
+    """Outer tick rate: an explicit --rate-hz, else the model's derived rate.
+
+    This is the same rule as ``build_vehicle_validator_native.py``'s
+    ``--rate-hz`` default, so the Python path and a native build run the
+    same schedule unless one is told otherwise.
+    """
+
+    if args.rate_hz is not None:
+        if int(args.rate_hz) <= 0:
+            raise ValueError("--rate-hz must be a positive integer")
+        return int(args.rate_hz)
+    return int(derive_vehicle_rig_rate_hz(config))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("bundle", type=Path)
+    parser.add_argument("bundle", type=Path,
+                        help=("directory for this run's checkpoints and reports; "
+                              "the native DLL, and the shader viewer under --viewer, "
+                              "are loaded from it only when --python-material is not set"))
     parser.add_argument("--assembly-profile", choices=("car", "dually-axle"),
                         default="car",
                         help="loaded artifact profile consumed by this validator")
@@ -963,6 +988,10 @@ def main() -> int:
     parser.add_argument("--dually-stage-seconds", type=float, default=0.25,
                         help="simulated duration assigned to each dually assembly stage")
     parser.add_argument(
+        "--rate-hz", type=int, default=None,
+        help=("outer tick rate; default derives the model's physical rate, the "
+              "same rule as build_vehicle_validator_native.py's default"))
+    parser.add_argument(
         "--dt-rollback-threshold-multiplier", type=float, default=2.0,
         help=("retain a numerically over-threshold proposal for next-frame dt "
               "correction unless its error exceeds this multiple; physical "
@@ -975,13 +1004,12 @@ def main() -> int:
     if args.release_new_car and resume_requested:
         parser.error("--release-new-car cannot be combined with checkpoint resume")
     bundle = args.bundle.resolve()
-    manifest = json.loads((bundle / "vehicle_native.manifest.json").read_text(encoding="utf-8"))
     if args.assembly_profile == "dually-axle":
         args.python_viewer = bool(args.python_viewer or args.viewer)
         if not args.python_viewer and args.headless_frame is None:
             parser.error(
                 "dually-axle currently requires --python-viewer or --headless-frame")
-        return _run_dually_python_profile(args, bundle, manifest)
+        return _run_dually_python_profile(args, bundle)
     config = load_default_car_configuration()
     source = config.source
     qualification_spec = load_vehicle_qualification_spec(args.qualification_spec)
@@ -996,19 +1024,35 @@ def main() -> int:
     graph_nodes = {node["identity"]: node for node in mechanical_graph["nodes"]}
     accessory_presets = mechanical_graph["rotating_accessory_presets"]
     static_accessory_presets = mechanical_graph["static_accessory_presets"]
-    hz = int(manifest.get("time_integration", {}).get(
-        "outer_rate_hz", derive_vehicle_rig_rate_hz(config)))
+    hz = _outer_rate_hz(args, config)
     dt = 1.0 / hz
-    vehicle_names = list(manifest["vehicle"]["input_names"])
-    output_names = list(manifest["vehicle"]["output_names"])
-    contact_names = list(manifest["contact"]["input_names"])
-    fixture_names = list(manifest["fixture"]["input_names"])
-    tire_names = list(manifest["tire_appendage"]["output_names"])
+    # Every name/count below used to come from vehicle_native.manifest.json,
+    # a native-build artifact.  Each one is the exact same plain lookup on
+    # the Python-authored/compiled objects that manifest was written from in
+    # the first place; reading it here removes the round trip through a
+    # prior native build entirely, so the Python-material path never opens
+    # the build directory.
+    vehicle_compilation = compile_symbolic_vehicle_physics()
+    contact_compilation = compile_wheel_contact_ssa()
+    fixture_compilation = compile_vehicle_roller_fixture_ssa()
+    vehicle_names = list(vehicle_compilation.function.metadata["argument_names"])
+    output_names = list(vehicle_compilation.function.metadata["output_names"])
+    contact_names = list(contact_compilation.function.metadata["argument_names"])
+    fixture_names = list(fixture_compilation.function.metadata["argument_names"])
+    tire_program_for_counts = balloon_tire_python_program(CORNERS)
+    tire_names = list(tire_program_for_counts.output_names)
     tire_stride = len(tire_names) // len(CORNERS)
-    tire_state_count = int(manifest["tire_appendage"]["state_scalar_count"])
-    material_state_count = int(manifest["mechanical_material"]["state_scalar_count"])
-    material_diagnostic_count = int(
-        manifest["mechanical_material"]["diagnostic_scalar_count"])
+    tire_state_count = int(tire_program_for_counts.state_scalar_count)
+    # Exact same damage-bearing-edge filter _render_native_material_bank
+    # uses to size the material state/diagnostic arrays it writes into the
+    # manifest; mechanical_graph is already built above from `config`.
+    material_edges = tuple(
+        edge for edge in mechanical_graph["edges"]
+        if edge.get("damage", {}).get("model")
+        == "elastic-plastic-member-with-shear-fracture"
+    )
+    material_state_count = len(material_edges) * 9
+    material_diagnostic_count = len(material_edges) * 8
     vi = {name: i for i, name in enumerate(vehicle_names)}
     vo = {name: i for i, name in enumerate(output_names)}
     fi = {name: i for i, name in enumerate(fixture_names)}

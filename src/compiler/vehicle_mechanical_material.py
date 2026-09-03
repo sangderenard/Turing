@@ -18,12 +18,47 @@ from .ssa_wasm_backend import SSAWasmArtifact, emit_ssa_function_to_wasm
 from .symbolic_equation_compiler import (
     SymbolicEquationCompilation,
     SymbolicPublication,
-    compile_sympy_equations,
+    compile_symbolic_program,
+)
+
+
+# Output names in the exact order the authored return map emits them, so the
+# persistent symbolic cache can be keyed without constructing the equations.
+MEMBER_MATERIAL_OUTPUTS = (
+    "plastic_axial_next",
+    "plastic_bending_next",
+    "plastic_shear_next",
+    "accumulated_plastic_strain_next",
+    "work_hardening_next",
+    "remaining_ductility_next",
+    "failed_next",
+    "axial_stress_pa",
+    "bending_stress_pa",
+    "shear_stress_pa",
+    "equivalent_trial_stress_pa",
+    "current_yield_stress_pa",
+    "fracture_demand",
+    "elastic_energy_j",
+    "damping_power_w",
+    "plastic_work_increment_j",
+    "dissipated_energy_next",
 )
 
 
 def _positive(value: sympy.Basic) -> sympy.Basic:
-    return (value + sympy.Abs(value)) / 2
+    """``max(value, 0)`` spelled so every backend evaluates it exactly.
+
+    ``(value + Abs(value)) / 2`` is the same function in real arithmetic, but
+    it relies on ``value`` and ``Abs(value)`` cancelling to exactly zero.
+    SymPy's automatic evaluation distributes the halving and re-spells the
+    operands, so the compiled schedule adds two differently rounded copies
+    of ``value`` and keeps a residue of a few ULP; the 1e12 fracture gate
+    below then turns that residue into a phantom failure fraction (measured:
+    exactly 2**-14, scaling every stress by 2**-13).  ``Max`` is a single
+    exact relational select in every backend.
+    """
+
+    return sympy.Max(value, 0)
 
 
 def _clamp(value: sympy.Basic, lower: sympy.Basic, upper: sympy.Basic) -> sympy.Basic:
@@ -126,6 +161,7 @@ def symbolic_vehicle_member_material_equations(
         "plastic_work_increment_j": plastic_work,
         "dissipated_energy_next": dissipated_energy,
     }
+    assert tuple(values) == MEMBER_MATERIAL_OUTPUTS
     equations = tuple(sympy.Eq(sympy.Symbol(name, real=True), expression, evaluate=False)
                       for name, expression in values.items())
     return equations, s
@@ -133,13 +169,12 @@ def symbolic_vehicle_member_material_equations(
 
 @lru_cache(maxsize=1)
 def compile_vehicle_member_material_ssa() -> SymbolicEquationCompilation:
-    equations, _ = symbolic_vehicle_member_material_equations()
-    return compile_sympy_equations(
-        equations,
+    return compile_symbolic_program(
+        symbolic_vehicle_member_material_equations,
         name="vehicle_member_material_step",
         publications=tuple(
-            SymbolicPublication(str(equation.lhs), f"world.vehicle.member.{equation.lhs}")
-            for equation in equations
+            SymbolicPublication(name, f"world.vehicle.member.{name}")
+            for name in MEMBER_MATERIAL_OUTPUTS
         ),
         dtype="float64",
     )

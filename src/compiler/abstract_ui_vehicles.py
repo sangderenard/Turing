@@ -23,6 +23,8 @@ from .symbolic_equation_compiler import (
     SymbolicEquationCompilation,
     SymbolicPublication,
     compile_sympy_equations,
+    compile_symbolic_program,
+    symbolic_equations_cached,
 )
 from .vehicle_balloon_tire import balloon_tire_graph_abi
 
@@ -1951,7 +1953,26 @@ def _hard_clamp(value: sympy.Basic, lower: sympy.Basic | float,
 
 
 @lru_cache(maxsize=1)
+@lru_cache(maxsize=1)
+def _symbolic_vehicle_equations_loaded() -> tuple[tuple[sympy.Equality, ...], dict[str, sympy.Symbol]]:
+    return symbolic_equations_cached(_symbolic_vehicle_equations_authored)
+
+
 def symbolic_vehicle_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, sympy.Symbol]]:
+    """The authored vehicle transition, built once per revision of this file.
+
+    ``_symbolic_vehicle_equations_authored`` is the numerical authority.  Its
+    sympy construction alone takes minutes of automatic evaluation, which
+    every process used to pay before any cache could even be consulted; the
+    persistent symbolic cache keys on this file's digest instead, so the
+    expressions are built once and any edit here rebuilds them.
+    """
+
+    equations, symbols = _symbolic_vehicle_equations_loaded()
+    return tuple(equations), dict(symbols)
+
+
+def _symbolic_vehicle_equations_authored() -> tuple[tuple[sympy.Equality, ...], dict[str, sympy.Symbol]]:
     """One transition with four independent spring lanes and one body reduction."""
 
     s = _symbols()
@@ -2848,10 +2869,12 @@ def symbolic_vehicle_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, 
 
 @lru_cache(maxsize=1)
 def compile_symbolic_vehicle_physics() -> SymbolicEquationCompilation:
-    equations, _ = symbolic_vehicle_equations()
     publications = tuple(SymbolicPublication(name, f"world.vehicle.{name}")
                          for name in VEHICLE_STATE_OUTPUTS)
-    return compile_sympy_equations(equations, name="abstract_ui_vehicle_step", publications=publications)
+    return compile_symbolic_program(
+        _symbolic_vehicle_equations_authored, name="abstract_ui_vehicle_step",
+        publications=publications,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -2871,11 +2894,10 @@ def compile_symbolic_vehicle_physics_wasm() -> SSAWasmArtifact:
 
 @lru_cache(maxsize=1)
 def compile_symbolic_vehicle_physics_gpu_ssa() -> SymbolicEquationCompilation:
-    equations, _ = symbolic_vehicle_equations()
     publications = tuple(SymbolicPublication(name, f"world.vehicle.{name}")
                          for name in VEHICLE_STATE_OUTPUTS)
-    return compile_sympy_equations(
-        equations, name="abstract_ui_vehicle_step_gpu",
+    return compile_symbolic_program(
+        _symbolic_vehicle_equations_authored, name="abstract_ui_vehicle_step_gpu",
         publications=publications, dtype="float32",
     )
 
@@ -3675,7 +3697,19 @@ def compile_torus_plane_contact_arc_llvm():
 
 
 @lru_cache(maxsize=1)
+@lru_cache(maxsize=1)
+def _symbolic_wheel_contact_equations_loaded() -> tuple[tuple[sympy.Equality, ...], dict[str, sympy.Symbol]]:
+    return symbolic_equations_cached(_symbolic_wheel_contact_equations_authored)
+
+
 def symbolic_wheel_contact_equations() -> tuple[tuple[sympy.Equality, ...], dict[str, sympy.Symbol]]:
+    """The authored contact law, built once per revision of this file."""
+
+    equations, symbols = _symbolic_wheel_contact_equations_loaded()
+    return tuple(equations), dict(symbols)
+
+
+def _symbolic_wheel_contact_equations_authored() -> tuple[tuple[sympy.Equality, ...], dict[str, sympy.Symbol]]:
     """Per-wheel mesh-contact, pneumatic patch, and Coulomb friction law."""
 
     names = (
@@ -3828,12 +3862,13 @@ def symbolic_wheel_contact_equations() -> tuple[tuple[sympy.Equality, ...], dict
 
 
 @lru_cache(maxsize=1)
+@lru_cache(maxsize=1)
 def compile_wheel_contact_ssa() -> SymbolicEquationCompilation:
-    equations, _ = symbolic_wheel_contact_equations()
     publications = tuple(SymbolicPublication(name, f"world.vehicle.contact.{name}")
                          for name in CONTACT_PATCH_OUTPUTS)
-    return compile_sympy_equations(
-        equations, name="abstract_ui_wheel_contact", publications=publications, dtype="float32",
+    return compile_symbolic_program(
+        _symbolic_wheel_contact_equations_authored, name="abstract_ui_wheel_contact",
+        publications=publications, dtype="float32",
     )
 
 

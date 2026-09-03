@@ -325,6 +325,14 @@ class BalloonTireManagedState:
     displacement_criticality_m: float
     last_maximum_displacement_m: float = 0.0
     last_maximum_velocity_m_s: float = 0.0
+    # The tire program's own authored integration step (the ``dt`` of its
+    # default input row), captured before the dt system starts overwriting
+    # ``inputs[:, 0]``.  Published to the controller as the pre-trial bound
+    # on a round's first attempt: the core's declared safe step.
+    declared_dt_s: float = 0.0
+
+    def dt_limit_hint(self):
+        return float(self.declared_dt_s) if float(self.declared_dt_s) > 0.0 else None
 
     def copy_shallow(self):
         return (
@@ -351,6 +359,11 @@ def balloon_tire_managed_advance(material, dt):
     material.telemetry[6] = max(material.telemetry[6], dt)
     material.telemetry[7] = dt
     previous_position = material.state[:, :, :, 0:3] + 0.0
+    previous_velocity = material.state[:, :, :, 3:6] + 0.0
+    vertex_mass = material.inputs[:, 2].reshape((-1, 1, 1))
+    kinetic_before = (
+        0.5 * vertex_mass * (previous_velocity * previous_velocity).sum(dim=3)
+    ).sum(dim=2).sum(dim=1)
     material.inputs[:, 0] = dt
     material.state, material.output = balloon_tire_vector_step(
         material.inputs, material.state, material.output,
@@ -367,6 +380,22 @@ def balloon_tire_managed_advance(material, dt):
     maximum_velocity = (
         (velocity * velocity).sum(dim=3) + 1.0e-30
     ).sqrt().max()
+    # Energy/power time scale for the controller: stored energy is kinetic
+    # plus membrane strain and bending energy; power is the magnitude of the
+    # kinetic exchange this step plus the dissipation the tire reports.
+    kinetic_after = (
+        0.5 * vertex_mass * (velocity * velocity).sum(dim=3)
+    ).sum(dim=2).sum(dim=1)
+    stored_energy = kinetic_after + (
+        material.output[:, :, 11] + material.output[:, :, 13]
+    ).sum(dim=1)
+    # Magnitudes: the tire reports dissipation with a sign (power leaving
+    # the membrane is negative); the controller's time scale wants the rate
+    # at which energy is moving, whichever way.
+    exchange_power = (
+        (kinetic_after - kinetic_before).abs() / dt
+        + material.output[:, :, 12].sum(dim=1).abs()
+    )
     finite = material.state.isfinite().all() and material.output.isfinite().all()
     if finite:
         material.telemetry[11] = max(
@@ -392,6 +421,8 @@ def balloon_tire_managed_advance(material, dt):
         mass_err=0.0,
         error_channels={
             "maximum_substep_displacement_m": maximum_displacement,
+            "energy_j": stored_energy.max(),
+            "power_w": exchange_power.max(),
         },
     )
 
@@ -729,6 +760,7 @@ def balloon_tire_managed_python_compilation_inputs(
         face_material=arrays["face_material"],
         telemetry=np.zeros((20,), dtype=np.float64),
         displacement_criticality_m=float(arrays["inputs"][0, 21]),
+        declared_dt_s=float(arrays["inputs"][0, 0]),
     )
     if material.displacement_criticality_m <= 0.0:
         raise ValueError("balloon tire displacement criticality must be positive")
@@ -746,6 +778,9 @@ def balloon_tire_managed_python_compilation_inputs(
                         material.displacement_criticality_m
                     ),
                 },
+                # One step may exchange at most a tenth of the tire's stored
+                # energy; measured from the tire's own energy/power channels.
+                energy_exchange_fraction=0.1,
             ),
             # The managed system may shrink and regrow without an imposed cap.
             "controller": STController(dt_min=None, dt_max=None),

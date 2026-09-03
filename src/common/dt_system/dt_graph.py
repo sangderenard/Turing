@@ -462,6 +462,8 @@ class MetaLoopRunner:
                 rollback_threshold_multiplier=(
                     round_node.plan.rollback_threshold_multiplier
                 ),
+                rollback=round_node.plan.rollback,
+                distribution=round_node.distribution,
             )
             if (
                 float(total) < float(window) - round_node.plan.eps

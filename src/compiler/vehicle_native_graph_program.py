@@ -492,7 +492,11 @@ def vehicle_graph_tick_vector(vehicle_input, contact_input,
 
 def vehicle_energy_diagnostics_vector(tire_input, tire_state, tire_output):
     velocity = tire_state[:, :, :, 3:6]
-    kinetic = 0.5 * tire_input[:, 2].reshape((-1, 1, 1)) * (velocity * velocity).sum(dim=3).sum(dim=2).sum(dim=1)
+    # The velocity norm is summed over vertex, xyz and wheel first, leaving
+    # one scalar per batch lane; the per-lane mass multiplies that (batch,)
+    # vector directly.  A (batch, 1, 1) reshape here broadcast against the
+    # summed vector into a rank-3 tensor, and the stack below rejected it.
+    kinetic = 0.5 * tire_input[:, 2] * (velocity * velocity).sum(dim=3).sum(dim=2).sum(dim=1)
     potential = (tire_output[:, :, 11] + tire_output[:, :, 13]).sum(dim=1)
     dissipation = tire_output[:, :, 12].sum(dim=1)
     contacts = tire_output[:, :, 9].sum(dim=1)

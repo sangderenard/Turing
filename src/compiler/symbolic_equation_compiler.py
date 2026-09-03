@@ -9,8 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import copy
+import inspect
+from pathlib import Path
 import sys
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import sympy
 
@@ -20,6 +22,7 @@ from .ssa_builder import process_graph_to_ssa_instrs
 from .symbolic_process_graph import ingest_sympy_expressions
 from .sympy_dual_ir_cache import SympyDualIRCache
 from ..common.tensors.accelerator_backends.aot_checkpoint import callable_digest
+from ..common.tensors.accelerator_backends.artifact_cache import implementation_digest
 from ..transmogrifier.graph.graph_express2 import ProcessGraph
 from ..transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
 
@@ -328,15 +331,7 @@ def compile_sympy_equations(
 
     authored = tuple(equations)
     publication_rows = tuple(publications)
-    implementation = callable_digest(
-        _compile_sympy_equations_uncached,
-        ingest_sympy_expressions,
-        process_graph_to_ssa_instrs,
-        reduce_constant_exponent_pow,
-        ProcessGraph,
-        Function,
-        IRModule,
-    )
+    implementation = _pipeline_implementation()
     record = {
         "name": str(name),
         "schedule": str(schedule),
@@ -376,8 +371,132 @@ def compile_sympy_equations(
     )
 
 
+def _pipeline_implementation() -> str:
+    """Digest of the lowering implementation every cached layer depends on."""
+
+    return callable_digest(
+        _compile_sympy_equations_uncached,
+        ingest_sympy_expressions,
+        process_graph_to_ssa_instrs,
+        reduce_constant_exponent_pow,
+        ProcessGraph,
+        Function,
+        IRModule,
+    )
+
+
+def _source_files(*values: Any) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for value in values:
+        try:
+            path = inspect.getsourcefile(value)
+        except TypeError:
+            path = None
+        if not path:
+            raise TypeError(
+                f"{value!r} has no source file; a symbolic producer must be "
+                "authored in a module so its revision can be digested"
+            )
+        paths.append(Path(path))
+    return tuple(paths)
+
+
+def _producer_record(
+    producer: Callable[[], Any], key_sources: Sequence[Any],
+) -> tuple[Mapping[str, Any], str]:
+    """Cheap, construction-free identity of an authored symbolic program.
+
+    The producer builds sympy expressions whose automatic evaluation can take
+    minutes for a large model; that cost must not be paid to discover whether
+    the result is already on disk.  A symbolic program with no runtime
+    parameters is a pure function of its source, so the key is the digest of
+    the source FILE of the producer (and of any ``key_sources`` it draws
+    helpers or constants from), plus the interpreter and SymPy versions.
+    Any edit to those files changes the key, so a stale program can never
+    survive an edit silently.
+    """
+
+    files = _source_files(producer, *key_sources)
+    source_digest = implementation_digest(files)
+    record = {
+        "producer": f"{producer.__module__}.{producer.__qualname__}",
+        "producer_sources": source_digest,
+        "python_cache_tag": sys.implementation.cache_tag,
+        "sympy_version": sympy.__version__,
+    }
+    return record, source_digest
+
+
+def symbolic_equations_cached(
+    producer: Callable[[], Any], *, key_sources: Sequence[Any] = (),
+) -> Any:
+    """Run a zero-argument authored equation producer once per source revision.
+
+    Returns exactly what ``producer`` returns (typically
+    ``(equations, symbols)``), loaded from the persistent ``solved-equations``
+    layer when the producer's source files are unchanged.
+    """
+
+    record, source_digest = _producer_record(producer, key_sources)
+    cached = SympyDualIRCache(source_digest).solved_equations(record, producer)
+    return cached.value
+
+
+def compile_symbolic_program(
+    producer: Callable[[], Any],
+    *,
+    name: str,
+    schedule: str = "asap",
+    publications: Sequence[SymbolicPublication] = (),
+    dtype: str = "float64",
+    key_sources: Sequence[Any] = (),
+) -> SymbolicEquationCompilation:
+    """Compile an authored symbolic program once per source revision.
+
+    This is the entry point every ``compile_*_ssa`` should use.  On a hit the
+    finished :class:`SymbolicEquationCompilation` is loaded without
+    constructing a single sympy expression; on a miss the producer runs
+    (through :func:`symbolic_equations_cached`, so a sibling that needs only
+    the equations shares the work) and :func:`compile_sympy_equations`
+    lowers it, populating the ``dual-ir`` layer as before.
+    """
+
+    publication_rows = tuple(publications)
+    producer_record, source_digest = _producer_record(producer, key_sources)
+    record = {
+        **producer_record,
+        "name": str(name),
+        "schedule": str(schedule),
+        "dtype": str(dtype),
+        "publications": tuple(
+            _publication_record(publication) for publication in publication_rows
+        ),
+    }
+    implementation = f"{source_digest}:{_pipeline_implementation()}"
+
+    def lower() -> SymbolicEquationCompilation:
+        equations, _symbols = symbolic_equations_cached(
+            producer, key_sources=key_sources,
+        )
+        return compile_sympy_equations(
+            equations, name=name, schedule=schedule,
+            publications=publication_rows, dtype=dtype,
+        )
+
+    cached = SympyDualIRCache(implementation).get_or_compute(
+        "symbolic-program", record, lower,
+    )
+    value = cached.value
+    if not isinstance(value, SymbolicEquationCompilation):
+        value = lower()
+        return replace(value, cache_identity=cached.identity, cache_hit=False)
+    return replace(value, cache_identity=cached.identity, cache_hit=cached.hit)
+
+
 __all__ = [
     "SymbolicEquationCompilation",
     "SymbolicPublication",
     "compile_sympy_equations",
+    "compile_symbolic_program",
+    "symbolic_equations_cached",
 ]
