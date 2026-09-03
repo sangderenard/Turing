@@ -201,6 +201,10 @@ _UNARY: dict[str, str] = {
     "Exp": "exp({0})",
     "log": "log({0})",
     "Log": "log({0})",
+    # The vehicle body uses tanh 21 times; the SSA spells it "Tanh" (the
+    # lowercase "tanh" below is the recorded-tape vocabulary, a different
+    # table), so without this entry the whole body was unemittable.
+    "Tanh": "tanh({0})",
     "sin": "sin({0})",
     "cos": "cos({0})",
     "tan": "tan({0})",

@@ -168,3 +168,12 @@ def test_tanh_lowers_to_llvm_as_a_declared_libm_call():
     assert artifact.complete, [s.reason for s in artifact.shortfalls]
     assert "call double @tanh(double" in artifact.llvm_ir
     assert "declare double @tanh(double)" in artifact.llvm_ir
+    # Fortran had the same gap: its SSA-op table lacked "Tanh" (only the
+    # recorded-tape "tanh" key existed).
+    ret = next(i for b in compiled.function.blocks.values() for i in b.instrs if i.op == "Ret")
+    fortran = emit_fortran(
+        compiled.module, name="tanh_probe_fortran",
+        outputs={compiled.function.name: tuple(ret.args)}, progress=lambda _m: None,
+    )
+    assert fortran.complete, [s.format() for s in fortran.shortfalls]
+    assert "tanh(" in fortran.source
