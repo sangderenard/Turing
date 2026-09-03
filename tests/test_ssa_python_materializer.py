@@ -125,6 +125,33 @@ def test_a_constant_authored_inside_a_body_survives_materialization():
     assert "x + t1" in source
 
 
+def test_a_constant_spelled_constant_survives_materialization():
+    """The compiler's own SSA builder spells a Const's payload ``constant``,
+    not ``value`` -- confirmed by reading ``ssa_reference_evaluator`` and
+    ``ssa_c_backend``, which both check ``constant`` first. This materializer
+    checked only ``value``, so it silently could not run any Const the
+    compiler itself produces (this exact shape reached
+    ``compile_vehicle_member_material_ssa``'s output during the 2026-09-03
+    Route C fixes and raised "no 'value' attribute")."""
+
+    literal = SSAValue(1, dtype="float64")
+    scaled = SSAValue(2, dtype="float64")
+    argument = SSAValue(0, dtype="float64")
+    function = _one_block(
+        Instr("Const", [], literal, attributes={"constant": 2.5}),
+        Instr("Mul", [argument, literal], scaled),
+        Instr("Ret", [scaled], SSAValue(3)),
+        name="with_constant_key",
+        args=[argument],
+    )
+
+    body, _ = materialize_function_body(function, parameter_names=("x",))
+    source = to_source(ast.Module(body=body, type_ignores=[]))
+
+    assert "2.5" in source
+    assert "x * t1" in source
+
+
 def test_none_value_materializes_as_python_none_not_zero():
     absent = SSAValue(1, dtype="none")
     function = _one_block(
@@ -138,6 +165,138 @@ def test_none_value_materializes_as_python_none_not_zero():
 
     assert "t1 = None" in source
     assert "return t1" in source
+
+
+# -- tensor-vocabulary redirects for opcodes this file previously missed ----
+#
+# ``Tanh`` was absent from ``_UNARY_SPELLING`` entirely (declared
+# unimplemented by default rather than wired to the catalogued ``tanh``
+# method every backend already has); ``Max``/``Min`` were hardwired to the
+# Python builtins regardless of ``tensor_vocabulary``, which raises the
+# moment a real multi-element tensor reaches one (builtin ``max``/``min``
+# call ``bool()`` on a comparison, and a tensor's comparison is itself a
+# tensor). Found and fixed during the 2026-09-03 SymPy-route inventory.
+
+
+def test_tanh_is_wired_to_the_tensor_method_under_tensor_vocabulary():
+    from src.common.tensors import AbstractTensor
+    import numpy as np
+
+    argument = SSAValue(0, dtype="float64")
+    result = SSAValue(1, dtype="float64")
+    function = _one_block(
+        Instr("Tanh", [argument], result),
+        Instr("Ret", [result], SSAValue(2)),
+        name="tanh_law",
+        args=[argument],
+    )
+
+    body, uses_math = materialize_function_body(
+        function, parameter_names=("x",), tensor_vocabulary=True,
+    )
+    source = to_source(ast.Module(body=body, type_ignores=[]))
+    assert "x.tanh()" in source
+    assert not uses_math
+
+    namespace = {"AbstractTensor": AbstractTensor}
+    exec(compile(f"def tanh_law(x):\n" + "\n".join(f"    {line}" for line in source.splitlines()), "<t>", "exec"), namespace)
+    values = np.array([-2.0, -1.0, 0.5, 3.0])
+    got = namespace["tanh_law"](AbstractTensor.get_tensor(values))
+    assert np.allclose(np.asarray(got.data), np.tanh(values))
+
+
+def test_tanh_without_tensor_vocabulary_still_spells_math_tanh():
+    argument = SSAValue(0, dtype="float64")
+    result = SSAValue(1, dtype="float64")
+    function = _one_block(
+        Instr("Tanh", [argument], result),
+        Instr("Ret", [result], SSAValue(2)),
+        name="tanh_scalar",
+        args=[argument],
+    )
+
+    body, uses_math = materialize_function_body(function, parameter_names=("x",))
+    source = to_source(ast.Module(body=body, type_ignores=[]))
+    assert "math.tanh(x)" in source
+    assert uses_math
+
+
+def test_max_picks_the_non_constant_operand_as_the_tensor_receiver():
+    """The synthesized zero bound in ``Max(0, x)`` must not become the receiver.
+
+    A plain Python ``int``/``float`` has no ``.maximum`` method, so putting
+    the constant operand first (the SSA's authored argument order) and
+    calling ``.maximum`` on it the way the unary redirect calls a method on
+    its single operand would repeat Route A's exact "numeric receiver" bug
+    this file exists to avoid.
+    """
+
+    from src.common.tensors import AbstractTensor
+    import numpy as np
+
+    argument = SSAValue(0, dtype="float64")
+    zero = SSAValue(1, dtype="float64")
+    result = SSAValue(2, dtype="float64")
+    function = _one_block(
+        Instr("Const", [], zero, attributes={"value": 0.0}),
+        Instr("Max", [zero, argument], result),
+        Instr("Ret", [result], SSAValue(3)),
+        name="max_law",
+        args=[argument],
+    )
+
+    body, _ = materialize_function_body(
+        function, parameter_names=("x",), tensor_vocabulary=True,
+    )
+    source = to_source(ast.Module(body=body, type_ignores=[]))
+    assert ".maximum(" in source
+    assert "max(" not in source
+
+    namespace = {"AbstractTensor": AbstractTensor}
+    exec(compile(f"def max_law(x):\n" + "\n".join(f"    {line}" for line in source.splitlines()), "<t>", "exec"), namespace)
+    values = np.array([-2.0, -1.0, 0.5, 3.0])
+    got = namespace["max_law"](AbstractTensor.get_tensor(values))
+    assert np.allclose(np.asarray(got.data), np.maximum(0.0, values))
+
+
+def test_max_of_two_constants_stays_the_scalar_builtin():
+    """Both operands provably constant: no tensor is involved, so builtin
+    ``max`` is correct and no ``.maximum`` receiver needs to be found."""
+
+    left = SSAValue(0, dtype="float64")
+    right = SSAValue(1, dtype="float64")
+    result = SSAValue(2, dtype="float64")
+    function = _one_block(
+        Instr("Const", [], left, attributes={"value": 1.0}),
+        Instr("Const", [], right, attributes={"value": 2.0}),
+        Instr("Max", [left, right], result),
+        Instr("Ret", [result], SSAValue(3)),
+        name="max_constants",
+    )
+
+    body, _ = materialize_function_body(function, tensor_vocabulary=True)
+    source = to_source(ast.Module(body=body, type_ignores=[]))
+    assert "max(" in source
+    assert ".maximum(" not in source
+
+
+def test_pi_reads_the_one_shared_bounded_constant_home():
+    """``Pi`` is a semantic operation until lowering, same as every native
+    backend (``ssa_c_backend``, ``ssa_llvm_backend``, ...) reads it -- not a
+    restated ``math.pi`` literal that could drift from theirs."""
+
+    import math
+
+    result = SSAValue(0, dtype="float64")
+    function = _one_block(
+        Instr("Pi", [], result),
+        Instr("Ret", [result], SSAValue(1)),
+        name="pi_law",
+    )
+
+    body, _ = materialize_function_body(function)
+    source = to_source(ast.Module(body=body, type_ignores=[]))
+    assert repr(math.pi) in source
 
 
 # -- classes ---------------------------------------------------------------

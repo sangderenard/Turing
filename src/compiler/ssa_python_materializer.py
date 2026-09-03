@@ -109,6 +109,18 @@ _BINARY_SPELLING: dict[str, str] = {
     "Pow": "({0} ** {1})",
 }
 
+# ``max``/``min`` are Python builtins that compare their two operands with
+# ``>``/``<`` and return one of them whole -- fine for a scalar, but a
+# tensor's comparison result is itself a tensor, so ``bool()`` of it (what
+# ``max``/``min`` do internally) raises for anything but a single element.
+# Elementwise selection needs the catalogued ``maximum``/``minimum`` methods
+# instead; this maps the scalar opcode to that catalog name so the same
+# ``tensor_vocabulary`` redirect the unary table already has applies here too.
+_BINARY_TENSOR_NAME: dict[str, str] = {
+    "Max": "maximum",
+    "Min": "minimum",
+}
+
 _UNARY_SPELLING: dict[str, str] = {
     "Neg": "(-{0})",
     "Abs": "abs({0})",
@@ -121,6 +133,7 @@ _UNARY_SPELLING: dict[str, str] = {
     "Ceil": "math.ceil({0})",
     "Trunc": "math.trunc({0})",
     "Round": "round({0})",
+    "Tanh": "math.tanh({0})",
     "Not": "(not {0})",
     "LNot": "(not {0})",
     "Invert": "(~int({0}))",
@@ -247,6 +260,26 @@ class _BodyMaterializer:
         # vocabulary, exactly as this module asks callers to add spellings
         # deliberately rather than let it invent one.
         self.tensor_vocabulary = bool(tensor_vocabulary)
+        # SSA carries no type tag distinguishing "genuinely a tensor" from
+        # "a plain Python number that happens to flow through the same
+        # opcodes" (a numeric literal such as Max/Min's synthesized zero
+        # bound, or a fully constant-folded subexpression like sqrt(3)).
+        # Values produced only from ``Const`` and constant-only arithmetic
+        # are tracked here so a tensor-method redirect never picks a plain
+        # number as its receiver -- exactly the mistake the hand-written
+        # SymPy printer this module replaces used to make.
+        self.constant_ids: set[int] = set()
+
+    def _is_constant(self, value: Any) -> bool:
+        return int(value.id) in self.constant_ids
+
+    def _mark_constant(self, result: Any, *, constant: bool) -> None:
+        if result is None:
+            return
+        if constant:
+            self.constant_ids.add(int(result.id))
+        else:
+            self.constant_ids.discard(int(result.id))
 
     def operand(self, value: Any) -> str:
         value_id = int(value.id)
@@ -279,17 +312,39 @@ class _BodyMaterializer:
         result = instruction.res
 
         if operation in {"Const", "const"}:
-            if "value" not in attributes:
-                raise MaterializationError(
-                    f"{self.function.name}: Const %t{int(result.id)} carries "
-                    "no 'value' attribute, so there is no literal to emit"
-                )
-            if attributes["value"] is None:
+            # Mirror ``ssa_reference_evaluator``'s own precedence exactly: a
+            # constant's payload lives under whichever of these keys the
+            # producer used (``constant`` is what the compiler's own SSA
+            # builder emits; ``value``/``values``/``llvm_literal`` are the
+            # other spellings every real backend already tolerates). Reading
+            # only ``value`` here made this materializer silently unusable
+            # on real compiled laws, whose constants are spelled ``constant``.
+            if (
+                ("constant" in attributes and attributes["constant"] is None
+                 and "values" not in attributes)
+                or ("value" in attributes and attributes["value"] is None)
+            ):
                 raise MaterializationError(
                     f"{self.function.name}: None must use the explicit "
                     "NoneValue operation"
                 )
-            self.assign(result, _constant(attributes["value"]))
+            payload = attributes.get("constant")
+            if payload is None:
+                payload = attributes.get("value")
+            if payload is None and "values" in attributes:
+                payload = attributes.get("values")
+            if payload is None and "llvm_literal" in attributes:
+                from .ir_literals import decode_llvm_scalar_literal
+
+                payload = decode_llvm_scalar_literal(str(attributes["llvm_literal"]))
+            if payload is None:
+                raise MaterializationError(
+                    f"{self.function.name}: Const %t{int(result.id)} carries "
+                    "no 'constant'/'value'/'values'/'llvm_literal' attribute, "
+                    "so there is no literal to emit"
+                )
+            self.assign(result, _constant(payload))
+            self._mark_constant(result, constant=True)
             return
 
         if operation in {"NoneValue", "nonevalue"}:
@@ -303,6 +358,33 @@ class _BodyMaterializer:
                     "or attributes"
                 )
             self.assign(result, "None")
+            return
+
+        if operation == "Pi":
+            # ``Pi`` stays a semantic operation until backend lowering (see
+            # ``symbolic_process_graph``) precisely so every backend reads the
+            # same bounded-constant home instead of restating a literal that
+            # could drift from it (``ssa_c_backend``, ``ssa_llvm_backend``,
+            # ``ssa_fortran_backend``, ``ssa_wasm_backend`` all do this). This
+            # is that same read, not a second definition.
+            from .bounded_constants import materialize_pi
+
+            if result is None:
+                raise MaterializationError(
+                    f"{self.function.name}: Pi has no SSA result"
+                )
+            materialization = materialize_pi(
+                attributes.get("constant_solver") or "literal",
+                attributes.get("requested_epsilon"),
+            )
+            if materialization.value is None:
+                raise MaterializationError(
+                    f"{self.function.name}: Pi's solver "
+                    f"{materialization.solver.value!r} declines to produce a "
+                    "value; there is no Python literal to emit"
+                )
+            self.assign(result, _constant(materialization.value))
+            self._mark_constant(result, constant=True)
             return
 
         if operation in {"GetAttr", "getattr"}:
@@ -343,7 +425,9 @@ class _BodyMaterializer:
             # the loop-carried slot seed is emitted as exactly this shape.
             # Spelled as an assignment rather than elided so the emitted
             # Python stays step-for-step with the SSA.
-            self.assign(result, self.operand(instruction.args[0]))
+            source_value = instruction.args[0]
+            self.assign(result, self.operand(source_value))
+            self._mark_constant(result, constant=self._is_constant(source_value))
             return
 
         if operation in {"Select", "select"} and len(instruction.args) == 3:
@@ -429,29 +513,58 @@ class _BodyMaterializer:
             return
 
         if operation in _BINARY_SPELLING:
-            left = self.operand(instruction.args[0])
-            right = self.operand(instruction.args[1])
+            left_value, right_value = instruction.args[0], instruction.args[1]
+            left = self.operand(left_value)
+            right = self.operand(right_value)
+            both_constant = self._is_constant(left_value) and self._is_constant(right_value)
+            tensor_name = _BINARY_TENSOR_NAME.get(operation)
+            if (
+                self.tensor_vocabulary
+                and tensor_name is not None
+                and TENSOR_CALL_FORMS.get(tensor_name) is False
+                and not both_constant
+            ):
+                # A plain Python number has no ``.maximum``/``.minimum``
+                # method, so the receiver must be whichever operand is not
+                # provably a constant -- Max/Min are commutative, so operand
+                # order here carries no meaning the SSA depends on.
+                if self._is_constant(left_value):
+                    receiver, argument = right, left
+                else:
+                    receiver, argument = left, right
+                self.assign(result, f"{receiver}.{tensor_name}({argument})")
+                self._mark_constant(result, constant=False)
+                return
             self.assign(result, _BINARY_SPELLING[operation].format(left, right))
+            self._mark_constant(result, constant=both_constant)
             return
 
         if operation in _UNARY_SPELLING:
-            operand = self.operand(instruction.args[0])
+            operand_value = instruction.args[0]
+            operand = self.operand(operand_value)
+            operand_constant = self._is_constant(operand_value)
             tensor_name = operation.lower()
             if (
                 self.tensor_vocabulary
                 and operation in _NEEDS_MATH
                 and TENSOR_CALL_FORMS.get(tensor_name) is False
+                and not operand_constant
             ):
                 # Only the ``math.*`` spellings need redirecting: they are the
                 # ones that genuinely fail on a tensor. The operator and
                 # builtin forms (``-x``, ``abs(x)``) already mean the right
                 # thing for both, so they are left exactly as they are rather
-                # than rewritten for the sake of uniformity.
+                # than rewritten for the sake of uniformity. A provably
+                # constant operand (a numeric literal, or a chain folded from
+                # nothing but literals) skips the redirect: it stays a plain
+                # Python number, and a plain number has no tensor method.
                 self.assign(result, f"{operand}.{tensor_name}()")
+                self._mark_constant(result, constant=False)
                 return
             if operation in _NEEDS_MATH:
                 self.uses_math = True
             self.assign(result, _UNARY_SPELLING[operation].format(operand))
+            self._mark_constant(result, constant=operand_constant)
             return
 
         tensor_operation = str(
