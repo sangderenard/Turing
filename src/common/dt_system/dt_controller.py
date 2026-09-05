@@ -581,7 +581,17 @@ def run_superstep(state,
         if declared is not None and math.isfinite(float(declared)) and float(declared) > 0.0:
             dt_cap = AbstractTensor.minimum(dt_cap, AbstractTensor.tensor(float(declared)))
     last_dt_next = dt_cap
-    last_metrics = None
+    # Never None: a value that is a real Metrics object on one control-flow
+    # path and None on another is two different aggregate shapes merged by
+    # the SAME variable, and a compiled build cannot unify that (confirmed
+    # with tools/repro_keyed_construct.py -- constructing one aggregate
+    # object once and only conditionally overwriting its fields compiles
+    # cleanly; conditionally rebinding the variable to a freshly-built
+    # object does not, even when both objects have identical field names).
+    # This is that same "quiet, non-throwing incomplete window" record used
+    # below when the loop truly never advances, just built up front instead
+    # of only on demand.
+    last_metrics = Metrics(0.0, 0.0, 0.0, 0.0, hard_failure=True)
     boundary_values = tuple(sorted({
         float(value)
         for value in event_boundaries
@@ -661,8 +671,8 @@ def run_superstep(state,
             print(f"  {line.strip()}")
     remaining = float((round_max_t - total).item())
     if remaining > eps:
-        if last_metrics is None:
-            last_metrics = Metrics(0.0, 0.0, 0.0, 0.0, hard_failure=True)
+        # last_metrics is never None now (see its initialization above), so
+        # there is no fallback construction left to bind here.
         channels = dict(last_metrics.error_channels or {})
         channels["superstep_window_requested_s"] = float(round_max_t.item())
         channels["superstep_window_advanced_s"] = float(total.item())

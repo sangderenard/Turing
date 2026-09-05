@@ -152,11 +152,109 @@ def _vehicle_body() -> tuple[SymbolicEquationCompilation, dict[str, float], Driv
     return compilation, feeds, drive
 
 
-PROGRAMS: dict[str, Callable[[], tuple[SymbolicEquationCompilation, dict[str, float], Driver]]] = {
+def _tire_gas():
+    from src.compiler.vehicle_balloon_tire import compile_balloon_gas_ssa
+
+    compilation = compile_balloon_gas_ssa()
+    feeds = {"current_volume_m3": 0.05, "gas_polytropic_exponent": 1.4,
+             "minimum_volume_fraction": 0.2, "reference_pressure_pa": 135_000.0,
+             "reference_temperature_k": 293.0, "reference_volume_m3": 0.05}
+
+    def drive(frame: int, inputs: dict[str, float]) -> None:
+        inputs["current_volume_m3"] = 0.05 * (1.0 + 0.1 * math.sin(2.0 * math.pi * frame / 40.0))
+
+    return compilation, feeds, drive
+
+
+def _tire_bead_implicit_step():
+    from src.compiler.vehicle_balloon_tire import compile_balloon_bead_implicit_step_ssa
+
+    compilation = compile_balloon_bead_implicit_step_ssa()
+    feeds = {"bead_damping_n_s_per_m": 9_200.0, "bead_stiffness_n_per_m": 2.4e6,
+             "dt": 2.44140625e-4, "vertex_mass_kg": 0.0972222,
+             "free_velocity_x": 0.1, "free_velocity_y": 0.0, "free_velocity_z": 0.0,
+             "rim_center_x": 0.0, "rim_center_y": 0.0, "rim_center_z": 0.0,
+             "target_x": 0.30, "target_y": 0.0, "target_z": 0.0,
+             "target_velocity_x": 0.0, "target_velocity_y": 0.0, "target_velocity_z": 0.0,
+             "vertex_x": 0.31, "vertex_y": 0.0, "vertex_z": 0.0}
+
+    def drive(frame: int, inputs: dict[str, float]) -> None:
+        inputs["target_y"] = 0.002 * math.sin(2.0 * math.pi * frame / 30.0)
+
+    # A bead vertex integrates in place: its next position/velocity are its
+    # own next inputs (names the generic ``_next -> base`` rule cannot see).
+    feedback = {f"position_{axis}_next": f"vertex_{axis}" for axis in "xyz"}
+    feedback.update({f"velocity_{axis}_next": f"free_velocity_{axis}" for axis in "xyz"})
+    return compilation, feeds, drive, feedback
+
+
+def _tire_contact_impulse():
+    from src.compiler.vehicle_balloon_tire import compile_balloon_contact_impulse_ssa
+
+    compilation = compile_balloon_contact_impulse_ssa()
+    feeds = {"contact_active": 1.0, "friction_coefficient": 0.9,
+             "inverse_effective_mass_per_kg": 1.0 / 0.0972222,
+             "normal_x": 0.0, "normal_y": 1.0, "normal_z": 0.0, "restitution": 0.1,
+             "velocity_x": 0.5, "velocity_y": -0.3, "velocity_z": 0.1}
+
+    def drive(frame: int, inputs: dict[str, float]) -> None:
+        phase = 2.0 * math.pi * frame / 50.0
+        inputs["velocity_x"] = 0.5 * math.cos(phase)
+        inputs["velocity_y"] = -0.3 - 0.2 * math.sin(phase)
+        inputs["velocity_z"] = 0.1 * math.sin(2.0 * phase)
+
+    return compilation, feeds, drive
+
+
+def _tire_membrane_face():
+    from src.compiler.vehicle_balloon_tire import compile_balloon_membrane_face_ssa
+
+    compilation = compile_balloon_membrane_face_ssa()
+    # One rest triangle of the authored tire's scale (edges ~0.19 m), with its
+    # metric, inverse and area derived consistently from those rest points.
+    r0 = np.array([0.0, 0.0, 0.0]); r1 = np.array([0.19, 0.0, 0.0]); r2 = np.array([0.08, 0.17, 0.0])
+    e1, e2 = r1 - r0, r2 - r0
+    metric = np.array([[e1 @ e1, e1 @ e2], [e2 @ e1, e2 @ e2]])
+    inverse = np.linalg.inv(metric)
+    lam, mu = 6.2e6, 4.1e6
+    feeds = {
+        "gas_pressure_pa": 135_000.0, "reference_pressure_pa": 135_000.0,
+        "lame_lambda_pa": lam, "lame_mu_pa": mu,
+        "membrane_damping_lambda_pa_s": 5_400.0, "membrane_damping_mu_pa_s": 3_600.0,
+        "natural_metric_00": metric[0, 0], "natural_metric_01": metric[0, 1], "natural_metric_11": metric[1, 1],
+        "rest_inverse_00": inverse[0, 0], "rest_inverse_01": inverse[0, 1],
+        "rest_inverse_10": inverse[1, 0], "rest_inverse_11": inverse[1, 1],
+        "rest_area_m2": 0.5 * float(np.linalg.norm(np.cross(e1, e2))),
+        "orthotropic_q11_pa": lam + 2 * mu, "orthotropic_q22_pa": lam + 2 * mu,
+        "orthotropic_q12_pa": lam, "orthotropic_q16_pa": 0.0, "orthotropic_q26_pa": 0.0,
+        "orthotropic_q66_pa": mu, "skin_thickness_m": 0.012,
+    }
+    for index, point in enumerate((r0, r1, r2)):
+        for axis, value in zip("xyz", point):
+            feeds[f"r{index}_{axis}"] = float(value)
+            feeds[f"x{index}_{axis}"] = float(value)
+            feeds[f"v{index}_{axis}"] = 0.0
+
+    def drive(frame: int, inputs: dict[str, float]) -> None:
+        phase = 2.0 * math.pi * frame / 60.0
+        # Stretch vertex 1 along x and lift vertex 2 out of plane, slowly.
+        inputs["x1_x"] = 0.19 * (1.0 + 0.01 * math.sin(phase))
+        inputs["x2_z"] = 0.004 * math.sin(0.5 * phase)
+        inputs["v1_x"] = 0.19 * 0.01 * math.cos(phase) * 2.0 * math.pi / 60.0 * 4096.0
+        inputs["v2_z"] = 0.004 * 0.5 * math.cos(0.5 * phase) * 2.0 * math.pi / 60.0 * 4096.0
+
+    return compilation, feeds, drive
+
+
+PROGRAMS: dict[str, Callable[[], tuple]] = {
     "roller_fixture": _roller_fixture,
     "member_material": _member_material,
     "wheel_contact": _wheel_contact,
     "vehicle_body": _vehicle_body,
+    "tire_gas": _tire_gas,
+    "tire_bead_implicit_step": _tire_bead_implicit_step,
+    "tire_contact_impulse": _tire_contact_impulse,
+    "tire_membrane_face": _tire_membrane_face,
 }
 
 
@@ -359,11 +457,13 @@ def run_parity(
     program: str, *, frames: int, backends: Sequence[str], optimization: str = "O2",
     open_loop: bool = False, directory: Path | None = None,
 ) -> dict[str, Any]:
-    compilation, feeds, drive = PROGRAMS[program]()
+    program_parts = PROGRAMS[program]()
+    compilation, feeds, drive = program_parts[:3]
+    explicit_feedback = dict(program_parts[3]) if len(program_parts) > 3 else {}
     metadata = compilation.function.metadata
     arguments = tuple(metadata["argument_names"])
     outputs = tuple(metadata["output_names"])
-    feedback = feedback_map(arguments, outputs)
+    feedback = {**feedback_map(arguments, outputs), **explicit_feedback}
     workdir = Path(directory or tempfile.mkdtemp(prefix=f"frame_parity_{program}_"))
 
     evaluators: dict[str, Callable[[np.ndarray], np.ndarray]] = {}
@@ -400,6 +500,9 @@ def run_parity(
             base[index_of[name]] = float(value)
     state = {backend: base.copy() for backend in evaluators}
     trajectories = {backend: np.zeros((frames, len(outputs))) for backend in evaluators}
+    seconds = {backend: 0.0 for backend in evaluators}
+
+    import time as _time
 
     for frame in range(frames):
         exogenous: dict[str, float] = {}
@@ -409,7 +512,9 @@ def run_parity(
             for name, value in exogenous.items():
                 if name in index_of:
                     vector[index_of[name]] = float(value)
+            started = _time.perf_counter()
             trajectories[backend][frame] = evaluator(vector)
+            seconds[backend] += _time.perf_counter() - started
         for backend in evaluators:
             source = "python" if open_loop else backend
             produced = trajectories[source][frame]
@@ -455,6 +560,12 @@ def run_parity(
         "inputs": len(arguments), "outputs": len(outputs),
         "feedback": feedback, "unavailable": unavailable, "backends": {},
         "python_one_ulp_sensitivity": one_ulp_sensitivity,
+        # Mean wall time of one evaluation per backend, microseconds.  The
+        # Python figure is the sympy-lambdified authority (interpreter cost,
+        # not a kernel); the native figures are the kernels themselves.
+        "microseconds_per_call": {
+            backend: 1.0e6 * seconds[backend] / max(frames, 1) for backend in evaluators
+        },
     }
     for backend, values in trajectories.items():
         if backend == "python":
@@ -519,6 +630,8 @@ def main() -> int:
                   f"first>1e-9 at frame {row['first_frame_over_1e-9_abs']} non_finite={row['non_finite']}")
         for pair, value in report["backend_vs_backend_max_abs"].items():
             print(f"  {pair:14s} max_abs={value:.3e}")
+        print("  time/call: " + "  ".join(
+            f"{backend}={value:.1f}us" for backend, value in report["microseconds_per_call"].items()))
         for backend, reason in report["unavailable"].items():
             print(f"  {backend}: unavailable ({reason})")
     if args.json is not None:

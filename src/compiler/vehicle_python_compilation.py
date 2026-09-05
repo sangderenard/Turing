@@ -128,10 +128,17 @@ def _vehicle_python_runtime_bindings_cached(
     receive the retained process graphs and never receives these callables.
     """
 
+    from .vehicle_balloon_tire import balloon_tire_symbolic_compilations
+    from .native_law_kernels import bind_native_stand_ins
+
     bindings = balloon_tire_python_bindings()
+    compilations = dict(balloon_tire_symbolic_compilations())
     for name, compilation in symbolic_law_compilations(include_configured_vehicle).items():
         bindings[name] = _abstract_tensor_stage_callable(compilation, name)
-    return bindings
+        compilations[name] = compilation
+    # Opt-in native stand-ins (TURING_LAW_NATIVE=llvm): the same stage lowered
+    # by batch contract to a kernel; the eager stage stays as the fallback.
+    return bind_native_stand_ins(bindings, compilations)
 
 
 def vehicle_python_runtime_bindings(

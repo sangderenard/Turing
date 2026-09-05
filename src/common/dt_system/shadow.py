@@ -31,6 +31,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from ..tensors import AbstractTensor
 from .dt_scaler import Metrics, coerce_metrics
 
 
@@ -156,7 +157,15 @@ def shadow_dt_limit(dt: float, growth: float, growth_max: float) -> float | None
         return 0.0 if growth == math.inf else None
     if growth <= 1.0 or growth_max <= 1.0:
         return None
-    return float(dt) * math.log(growth_max) / math.log(growth)
+    # AbstractTensor.log(), not math.log(): the compiled path only lowers
+    # scalar transcendentals through the tensor-op surface (the same one
+    # .sqrt() etc. already use everywhere else in this codebase); a raw
+    # math.log() call has no native-materialization path there at all (see
+    # docs -- diagnosed against the real managed-tire compile, math.log was
+    # the one call left on the old float path when everything else near it
+    # was already migrated).
+    return float(dt) * float(AbstractTensor.tensor(growth_max).log().item()) / float(
+        AbstractTensor.tensor(growth).log().item())
 
 
 __all__ = ["ShadowedState", "shadow_advance", "shadow_dt_limit"]

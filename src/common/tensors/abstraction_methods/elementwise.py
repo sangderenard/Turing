@@ -274,6 +274,27 @@ def _v3_valuewise(
                 tape.annotate(out, **({"forced": True} | annotate))
             return out
 
+    # ``where`` is a translated operation: every backend that can, carries it
+    # as one kernel (numpy ``where_``, the C backend's ``where_double``, the
+    # LLVM SSA translation of the same symbol), and the tape records the same
+    # ``where`` op either way.  Selecting through the backend keeps those
+    # translations and the per-element rule (``a if c else b``, a pure
+    # selection) exactly, while the per-element Python path below stays the
+    # definition for backends without the kernel.  Measured on the eager
+    # dually tyre: that Python path was 85% of a substep.
+    backend_where = getattr(type(self), "where_", None)
+    if (
+        backend_where is not None
+        and isinstance(a_t, type(self))
+        and isinstance(b_t, type(self))
+    ):
+        out = self.ensure_tensor(backend_where(self, a_t, b_t))
+        out = finalize(out)
+        tape = getattr(out, "_tape", None)
+        if tape and annotate:
+            tape.annotate(out, **({"eval_mode": "backend", "v": "v3"} | annotate))
+        return out
+
     c = self.reshape(-1).tolist()
     A = a_t.reshape(-1).tolist()
     B = b_t.reshape(-1).tolist()

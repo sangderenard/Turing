@@ -320,8 +320,21 @@ def vehicle_tire_recurrence(tire_inputs, tire_state, tire_output, tire_history,
         packed_plane[:, :, :, 2, :] = surface_velocity + geometric_velocity
         wheel_input[:, :, 23:41] = packed_plane.reshape((batch_count, wheel_count, 18))
         tire_inputs[:, wheel_input_indices.reshape((-1,))] = wheel_input.reshape((-1, 164))
-        tire_state, tire_output = balloon_tire_vector_step(
-            tire_inputs, tire_state, tire_output, *tire_constants)
+        # tire_fidelity_mode selects fine (0, the full deformable mesh -- the
+        # only mode with real spatial detail, so training-data generation
+        # always uses it) or one of the reduced/wrench modes (1-3, no
+        # membrane/bending/bead-implicit solve at all -- see
+        # docs/PLAN_TIRE_FIDELITY_LADDER.md).  A real branch, not a
+        # AbstractTensor.where() blend: the compiler's control-flow lowering
+        # executes only the selected side, so the reduced modes actually
+        # skip the expensive mesh work instead of computing and discarding
+        # it.  One mode for the whole batch (uniform, not per-lane).
+        if tire_inputs[:, 24].max() >= 0.5:
+            tire_state, tire_output = balloon_tire_reduced_vector_step(
+                tire_inputs, tire_state, tire_output, *tire_constants)
+        else:
+            tire_state, tire_output = balloon_tire_vector_step(
+                tire_inputs, tire_state, tire_output, *tire_constants)
         wrench_sum = wrench_sum + tire_output[:, :, 0:6]
         contact_peak = contact_peak.maximum(tire_output[:, :, 9])
         minimum_skin = minimum_skin.minimum(tire_output[:, :, 10])

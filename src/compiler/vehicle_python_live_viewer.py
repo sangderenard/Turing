@@ -328,32 +328,42 @@ class PythonValidatorViewer:
         title = self.font.render("LIVE PYTHON VALIDATOR — COMMERCIAL DUALLY AXLE",
                                  True, (233, 238, 242))
         self.screen.blit(title, (24, 20))
+        fidelity_names = {0.0: "FINE (full deformable mesh)",
+                          1.0: "REDUCED (contact-patch integral)",
+                          2.0: "WRENCH (hub spring-damper)",
+                          3.0: "WRENCH-PER-VERTEX (bead spring-damper)"}
+        fidelity_mode = float(snapshot.get("tire_fidelity_mode", 0.0)) if snapshot else 0.0
+        fidelity_label = fidelity_names.get(fidelity_mode, f"UNKNOWN ({fidelity_mode})")
+        fidelity_line = self.small.render(
+            f"tire fidelity: {fidelity_label}", True,
+            (255, 214, 92) if fidelity_mode != 0.0 else (156, 177, 190))
+        self.screen.blit(fidelity_line, (24, 42))
         stage_line = self.small.render(
             f"{stage}  {progress * 100:5.1f}%   try t={sim_time:10.6f}s   "
             f"dt={substep_dt:.3e}s   attempt={substep_index}   {status}",
             True, ((255, 124, 112) if status == "rejected-substep"
                    else (173, 193, 207)))
-        self.screen.blit(stage_line, (24, 50))
+        self.screen.blit(stage_line, (24, 62))
         subdivision_line = self.small.render(
             f"accepted t={accepted_time:10.6f}s   "
             f"accepted={accepted_substeps}   rejected={rejected_substeps}",
             True, (156, 177, 190))
-        self.screen.blit(subdivision_line, (24, 70))
+        self.screen.blit(subdivision_line, (24, 82))
         error_line = self.small.render(
             f"error matrix: max={error_max:.3e} m @ {error_location}   "
             f"rms={error_rms:.3e} m   p95={error_p95:.3e} m",
             True, (235, 175, 112))
-        self.screen.blit(error_line, (24, 90))
+        self.screen.blit(error_line, (24, 102))
         wheel_error_line = self.small.render(
             "wheel maxima m: " + "  ".join(
                 f"{value:.3e}" for value in error_per_wheel),
             True, (192, 163, 128))
-        self.screen.blit(wheel_error_line, (24, 110))
+        self.screen.blit(wheel_error_line, (24, 122))
         rule_line = self.small.render(
             f"violated rule: {rule_violation}",
             True, ((255, 112, 104) if rule_violation != "none"
                    else (130, 195, 145)))
-        self.screen.blit(rule_line, (24, 130))
+        self.screen.blit(rule_line, (24, 142))
         legend = self.small.render(
             "casing center-surface triangles: exterior tread/sidewall/bead "
             "gray/black/brown | interior liner teal | rim closure steel | drag/orbit, wheel/zoom",
@@ -369,7 +379,7 @@ class PythonValidatorViewer:
             "pressure kPa: " + "  ".join(
                 f"{value / 1000.0:8.1f}" for value in pressure),
             True, (178, 210, 177))
-        self.screen.blit(pressure_text, (24, 150))
+        self.screen.blit(pressure_text, (24, 162))
         pygame.display.flip()
         self.clock.tick(60)
 

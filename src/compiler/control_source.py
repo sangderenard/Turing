@@ -91,6 +91,14 @@ class ConditionalBlock:
     entry_record_projections: tuple[
         tuple[int, int, int, int, str], ...
     ] = ()
+    # Source call nodes lexically inside each arm. A planned call (a
+    # ``__plan_callsite_N__`` statement) is otherwise scheduled relative to
+    # numerical regions and loops only; an arm whose entire content is a
+    # call (``if d is not None: return d(...)``) has no region for the
+    # scheduler to anchor on, so the callsite scheduler places these inside
+    # the arm that owns them.
+    body_callsite_ids: tuple[int, ...] = ()
+    orelse_callsite_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -155,6 +163,11 @@ class LoopBlock:
     # this survives scheduling so verification can prove that source loops
     # became CFG loops rather than merely observing generic Phi/Lt blocks.
     source_loop_node_id: int | None = None
+    # Graph nodes of every source break/continue in this loop's body.  The
+    # lowering checks each one was emitted (in an arm or at its lexical
+    # position); a site nothing placed is a loud shortfall, never a loop
+    # that silently runs to completion.
+    control_site_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         preference = str(self.schedule_preference).lower()
@@ -194,6 +207,11 @@ class WhileBlock:
     # body instead of guessing from a later result consumer.
     source_loop_node_id: int | None = None
     terminal_controls: tuple["LoopControlBlock", ...] = ()
+    # Graph nodes of every source break/continue in this loop's body.  The
+    # lowering checks each one was emitted (in an arm or at its lexical
+    # position); a site nothing placed is a loud shortfall, never a loop
+    # that silently runs to completion.
+    control_site_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -209,11 +227,29 @@ class LoopControlBlock:
     expect_true: bool = True
     predicate_expression: ControlExpression | None = None
     source_action: str | None = None
+    # ``action == "return"``: a source ``return`` inside a loop or
+    # conditional. Lowering captures these slot values (function-output
+    # order) on the edge and branches to the function's exit block, where
+    # every return edge is merged per slot (control-aware result merging;
+    # docs/PLAN_CONTROL_AWARE_RESULT_MERGING.md). A ``None`` slot is one the
+    # reducer could not resolve at that return.
+    return_value_ids: tuple[int | None, ...] = ()
+    # ``break``/``continue``: the graph node of the source statement, and
+    # the bindings live at that site as (pre-loop identity, value-at-site)
+    # pairs -- the values the exit edge carries for every name the arm
+    # rebound (reducer ``loop_break_sites``).  A missing pair means the
+    # site did not rebind that name.
+    site_node_id: int | None = None
+    site_values: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
-        if self.action not in {"break", "continue"}:
-            raise ValueError("loop control action must be break or continue")
-        if self.source_action not in {None, "break", "continue", "loop-return"}:
+        if self.action not in {"break", "continue", "return"}:
+            raise ValueError(
+                "loop control action must be break, continue or return"
+            )
+        if self.source_action not in {
+            None, "break", "continue", "loop-return", "return",
+        }:
             raise ValueError("unknown source loop-control action")
 
 
@@ -461,6 +497,14 @@ class ControlProgram:
     # plus a loop-return edge), rather than by a ConditionalBlock.  These are
     # semantic-accounting identities, not permission to omit either arm.
     specialized_conditional_node_ids: tuple[int, ...] = ()
+    # A control that owns NO numerical region (a guard clause whose arm is
+    # only a ``return``, or a call) has no marker to replace in the
+    # schedule.  ``anchor_region`` names the first scheduled region that
+    # lexically follows it; the overlay inserts the control immediately
+    # before that region (or at the end of its scope when None) instead of
+    # dropping it.  Declared last: ControlProgram is built positionally in
+    # places, so a new field must never shift the existing ones.
+    anchor_region: int | None = None
 
 
 def control_dependency_value_ids(control: ControlProgram | None) -> frozenset[int]:
@@ -952,6 +996,65 @@ def _region_marker(block: StatementBlock) -> int | None:
     return int(marker[len(prefix):-2])
 
 
+def _anchored_control(control: "ControlProgram") -> bool:
+    """A region-less control the overlay must place by anchor, not drop.
+
+    Only source conditionals qualify: a region-less loop is handled by the
+    existing sequence-mutation / call-only-induction rule below.
+    """
+
+    if control.region_indices:
+        return False
+    root = control.root
+    blocks = root.blocks if isinstance(root, SequenceBlock) else (root,)
+    return any(isinstance(block, ConditionalBlock) for block in blocks)
+
+
+def _insert_before_marker(
+    block: "ControlBlock", anchor: int | None, inserted: "ControlBlock",
+) -> tuple["ControlBlock", bool]:
+    """Insert ``inserted`` immediately before the ``anchor`` region marker.
+
+    Walks sequences and the bodies of conditionals/loops; returns the
+    rewritten block and whether the anchor was found.  ``anchor=None``
+    never matches, so the caller appends at the end of the scope instead.
+    """
+
+    if anchor is None:
+        return block, False
+    if isinstance(block, SequenceBlock):
+        children = []
+        found = False
+        for child in block.blocks:
+            if (
+                not found
+                and isinstance(child, StatementBlock)
+                and _region_marker(child) == anchor
+            ):
+                children.append(inserted)
+                found = True
+                children.append(child)
+                continue
+            if not found:
+                child, found = _insert_before_marker(child, anchor, inserted)
+            children.append(child)
+        return SequenceBlock(tuple(children)), found
+    if isinstance(block, StatementBlock):
+        if _region_marker(block) == anchor:
+            return SequenceBlock((inserted, block)), True
+        return block, False
+    if isinstance(block, ConditionalBlock):
+        body, found = _insert_before_marker(block.body, anchor, inserted)
+        orelse = block.orelse
+        if not found and orelse is not None:
+            orelse, found = _insert_before_marker(orelse, anchor, inserted)
+        return replace(block, body=body, orelse=orelse), found
+    if isinstance(block, (LoopBlock, WhileBlock)):
+        body, found = _insert_before_marker(block.body, anchor, inserted)
+        return replace(block, body=body), found
+    return block, False
+
+
 def _marker_scope_paths(
     block: "ControlBlock",
     nested_regions: frozenset[int],
@@ -1118,6 +1221,7 @@ def compose_region_code(
                 substitute(block.body),
                 carried_aliases=block.carried_aliases,
                 result_ports=block.result_ports,
+                control_site_ids=block.control_site_ids,
                 carried_seeds=block.carried_seeds,
                 parallel_iterations=block.parallel_iterations,
                 dispatch_shell=block.dispatch_shell,
@@ -1135,6 +1239,7 @@ def compose_region_code(
                 substitute(block.body),
                 carried_aliases=block.carried_aliases,
                 result_ports=block.result_ports,
+                control_site_ids=block.control_site_ids,
                 carried_seeds=block.carried_seeds,
                 recursion_region_id=block.recursion_region_id,
                 predicate_expression=block.predicate_expression,
@@ -1306,6 +1411,7 @@ def project_control_regions(
                 ),
                 carried_seeds=block.carried_seeds,
                 result_ports=block.result_ports,
+                control_site_ids=block.control_site_ids,
                 parallel_iterations=block.parallel_iterations,
                 dispatch_shell=block.dispatch_shell,
                 recursion_region_id=block.recursion_region_id,
@@ -1348,6 +1454,7 @@ def project_control_regions(
                 ),
                 carried_seeds=block.carried_seeds,
                 result_ports=block.result_ports,
+                control_site_ids=block.control_site_ids,
                 recursion_region_id=block.recursion_region_id,
                 predicate_expression=block.predicate_expression,
                 sequence_mutations=block.sequence_mutations,
@@ -1708,16 +1815,14 @@ def overlay_scheduled_control(
                 orelse, else_consumed = embed(
                     block.orelse, nested_root, nested_regions
                 )
+            # Rebuild by `replace` so every field survives embedding --
+            # positional reconstruction silently dropped
+            # `entry_record_projections` and the arm callsite ownership.
             return (
-                ConditionalBlock(
-                    block.predicate_value_id,
-                    body or SequenceBlock(()),
-                    orelse,
-                    block.expect_true,
-                    block.predicate_expression,
-                    block.carried_aliases,
-                    block.source_node_id,
-                    block.carried_sequence_aliases,
+                replace(
+                    block,
+                    body=body or SequenceBlock(()),
+                    orelse=orelse,
                 ),
                 body_consumed or else_consumed,
             )
@@ -1736,6 +1841,7 @@ def overlay_scheduled_control(
                     body,
                     carried_aliases=block.carried_aliases,
                     result_ports=block.result_ports,
+                    control_site_ids=block.control_site_ids,
                     carried_seeds=block.carried_seeds,
                     parallel_iterations=block.parallel_iterations,
                     dispatch_shell=block.dispatch_shell,
@@ -1768,6 +1874,7 @@ def overlay_scheduled_control(
                     body,
                     carried_aliases=block.carried_aliases,
                     result_ports=block.result_ports,
+                    control_site_ids=block.control_site_ids,
                     carried_seeds=block.carried_seeds,
                     recursion_region_id=block.recursion_region_id,
                     predicate_expression=block.predicate_expression,
@@ -1898,6 +2005,22 @@ def overlay_scheduled_control(
                     f"parent={tuple(controls[index].region_indices)!r}, "
                     f"child={tuple(controls[child].region_indices)!r}"
                 )
+        # Region-less children declared nested in this control (a guard
+        # clause inside an arm or a loop body) are placed before their
+        # anchor region within this root, or appended to it.
+        for child in sorted(direct_children.get(index, ())):
+            control = controls[child]
+            if not _anchored_control(control):
+                continue
+            child_root = nested_root(child, visiting | {index})
+            root, found = _insert_before_marker(
+                root, control.anchor_region, child_root
+            )
+            if not found:
+                root = SequenceBlock((
+                    *(root.blocks if isinstance(root, SequenceBlock) else (root,)),
+                    child_root,
+                ))
         nested_roots[index] = root
         return root
 
@@ -1993,7 +2116,21 @@ def overlay_scheduled_control(
             and bool(control.root.sequence_mutations)
         )
     ]
+    # Region-less controls that declare an anchor (a guard clause whose arm
+    # is only a return/call): those nested under another control were
+    # inserted by `nested_root`; the maximal ones are inserted here, just
+    # before their anchor region in the flat schedule, or at the end when
+    # nothing follows them.
+    anchored_top_level: dict[int | None, list[ControlBlock]] = {}
+    for index, control in enumerate(controls):
+        if index in nested_children_overall or not _anchored_control(control):
+            continue
+        anchored_top_level.setdefault(
+            control.anchor_region, []
+        ).append(control.root)
     for region_index in order:
+        for anchored in anchored_top_level.pop(region_index, ()):
+            blocks.append(anchored)
         replacement = replacements.get(region_index)
         if replacement is not None:
             blocks.append(replacement)
@@ -2001,6 +2138,8 @@ def overlay_scheduled_control(
             blocks.append(StatementBlock((
                 f"__scheduled_region_{region_index}__",
             )))
+    for anchored_blocks in anchored_top_level.values():
+        blocks.extend(anchored_blocks)
 
     def stable_key(value):
         if isinstance(value, slice):

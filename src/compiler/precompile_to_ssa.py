@@ -5,7 +5,9 @@ from __future__ import annotations
 import ast
 import copy
 import logging
+import os
 import re
+import sys
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Mapping
 
@@ -37,7 +39,8 @@ from .hierarchical_plan import (
     PlanCall,
     PlanClosure,
     PlanLine,
-    plan_region_to_ssa_instrs,
+    copy_region_instructions,
+    expand_plan_regions,
 )
 from .precompile_ssa_validator import (
     PrecompileSSAValidationResult,
@@ -859,6 +862,7 @@ class _ControlSSABuilder:
         ] | None = None,
         value_aliases: Mapping[int, int] | None = None,
         inout_value_ids: tuple[int, ...] = (),
+        constant_value_ids: tuple[int, ...] = (),
         output_value_ids: tuple[int, ...] = (),
         named_output_histories: Mapping[str, tuple[int, ...]] | None = None,
         value_name_histories: Mapping[str, tuple[int, ...]] | None = None,
@@ -914,7 +918,18 @@ class _ControlSSABuilder:
             for alias, source in (value_aliases or {}).items()
         }
         self.inout_value_ids = set(map(int, inout_value_ids))
+        # Authored literals the control function owns; a use before any
+        # region published them is materialized by
+        # ``_materialize_control_constants`` from the provisional argument
+        # ``external_value`` mints, never invented as an ABI input.
+        self.constant_value_ids = set(map(int, constant_value_ids))
         self.output_value_ids = tuple(map(int, output_value_ids))
+        # (block, per-slot values) for every source ``return`` lowered below
+        # the top level; merged per slot in `function_exit_block` by `finish`.
+        self.function_return_edges: list[
+            tuple[BasicBlock, tuple[SSAValue | None, ...]]
+        ] = []
+        self._function_exit: BasicBlock | None = None
         self.named_output_histories = {
             str(name): tuple(map(int, history))
             for name, history in (named_output_histories or {}).items()
@@ -965,6 +980,24 @@ class _ControlSSABuilder:
         self.preserved_region_output_ids: set[int] = set()
         self.arguments: list[SSAValue] = []
         self.external_values: dict[int, SSAValue] = {}
+        _alias_debug = os.environ.get("TURING_DEBUG_ALIAS_BINDING")
+        if _alias_debug and _alias_debug in str(function_name):
+            import traceback as _traceback
+
+            class _TracedExternals(dict):
+                def __setitem__(_self, key, value):
+                    if value is not None and int(value.id) != int(key):
+                        frames = _traceback.extract_stack(limit=6)[:-1]
+                        print(
+                            f"DEBUG-ALIAS-BINDING {function_name}: "
+                            f"external_values[{key}] = value {int(value.id)} "
+                            f"accounting={dict(value.accounting or {})} at "
+                            + " <- ".join(f"{f.name}:{f.lineno}" for f in reversed(frames)),
+                            file=sys.stderr, flush=True,
+                        )
+                    super().__setitem__(key, value)
+
+            self.external_values = _TracedExternals()
         self.declared_parameter_only_ids: set[int] = set()
         self.validation_contracts: list[dict[str, object]] = []
         self.table_lookup_defaults = dict(table_lookup_defaults or {})
@@ -1182,6 +1215,12 @@ class _ControlSSABuilder:
             self.next_value_id = max(
                 self.next_value_id, max(reserved_control_ids) + 1
             )
+        if os.environ.get("TURING_DEBUG_REGION_OUTPUTS"):
+            print(f"DEBUG-BUILDER-WATERMARK {self.function_name}: next={self.next_value_id} "
+                  f"externals_max={max(self.external_values, default=-1)} "
+                  f"signature_max={max(signature_ids, default=-1)} "
+                  f"reserved_max={max(reserved_control_ids, default=-1)}",
+                  file=sys.stderr, flush=True)
         # A specialized callee may receive a heterogeneous payload directly,
         # after its owning loop has already been split into the caller.  Such
         # a value still has two ABI columns: its authored scalar identity and
@@ -2885,6 +2924,17 @@ class _ControlSSABuilder:
         self.blocks[name] = block
         return block
 
+    def function_exit_block(self) -> BasicBlock:
+        """The one block every source ``return`` branches to (created lazily).
+
+        It is registered when first needed but only ever filled by `finish`,
+        which merges the return edges per output slot and emits the Ret.
+        """
+
+        if self._function_exit is None:
+            self._function_exit = self.new_block("function_exit")
+        return self._function_exit
+
     def _value_dominates_current_edge(self, value: SSAValue) -> bool:
         """Whether this exact SSA object is resident on the current edge."""
 
@@ -2907,6 +2957,20 @@ class _ControlSSABuilder:
             for successor in block.successors:
                 if successor in predecessors:
                     predecessors[successor].add(name)
+        # Only blocks reachable from the entry take part.  An unreachable
+        # block (the continuation minted after an unconditional break/return
+        # inside an arm) has no predecessors; letting it into the fixpoint
+        # collapsed every dominator set downstream of the merge it feeds to
+        # the block itself, so a value defined before an inner loop was
+        # judged non-dominating at that loop's exit.
+        reachable = {entry_name}
+        frontier = [entry_name]
+        while frontier:
+            name = frontier.pop()
+            for successor in self.blocks[name].successors:
+                if successor in predecessors and successor not in reachable:
+                    reachable.add(successor)
+                    frontier.append(successor)
         dominators = {
             name: ({name} if name == entry_name else set(block_names))
             for name in block_names
@@ -2915,9 +2979,12 @@ class _ControlSSABuilder:
         while changed:
             changed = False
             for name in block_names:
-                if name == entry_name:
+                if name == entry_name or name not in reachable:
                     continue
-                incoming = predecessors[name]
+                incoming = {
+                    parent for parent in predecessors[name]
+                    if parent in reachable
+                }
                 common = (
                     set.intersection(*(
                         dominators[parent] for parent in incoming
@@ -2928,9 +2995,18 @@ class _ControlSSABuilder:
                 if updated != dominators[name]:
                     dominators[name] = updated
                     changed = True
-        return len(producer_blocks) == 1 and next(iter(
-            producer_blocks
-        )) in dominators[current_name]
+        # A carried "updated" slot is one SSAValue object written twice by
+        # design: seeded in the preheader, rewritten in the body (see
+        # ``lower_loop``).  Whichever of those writes dominates the current
+        # block is the write the edge observes, so the slot is resident here
+        # when ANY producer block dominates.  Requiring exactly one producer
+        # rejected every carried slot at a break site, and the exit edge
+        # silently carried the header Phi (the value from BEFORE this
+        # iteration's update) instead.
+        return any(
+            producer in dominators[current_name]
+            for producer in producer_blocks
+        )
 
     def emit(
         self,
@@ -3383,6 +3459,21 @@ class _ControlSSABuilder:
         return result
 
     def lower(self, block: ControlBlock, *, path: str = "root") -> None:
+        if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
+            print(
+                f"DEBUG-LOWER fn={self.function_name} path={path} "
+                f"block={type(block).__name__}"
+                + (
+                    f" action={block.action} source_action={block.source_action}"
+                    f" return_value_ids={block.return_value_ids!r}"
+                    if isinstance(block, LoopControlBlock) else ""
+                )
+                + (
+                    f" lines={block.lines!r}"
+                    if isinstance(block, StatementBlock) else ""
+                ),
+                file=sys.stderr,
+            )
         previous = self._evolution_source
         if self.evolution is not None:
             self._evolution_source = self.evolution.component_for_artifact(block)
@@ -3552,15 +3643,133 @@ class _ControlSSABuilder:
         if isinstance(block, WhileBlock):
             self.lower_while(block, path=path)
             return
+        if isinstance(block, LoopControlBlock) and block.action == "return":
+            # A source ``return`` below the function's top level: capture
+            # this return's own slot values on the edge and branch to the
+            # function exit, where every return edge is merged per slot
+            # (`finish`). Loop-carried Phis at any enclosing loop exit do
+            # not receive this edge -- the post-loop code does not run on
+            # a return path -- which is exactly the semantics of ``return``.
+            if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
+                for slot in block.return_value_ids:
+                    if slot is None:
+                        continue
+                    chain = []
+                    current = int(slot)
+                    while current in self.value_aliases and len(chain) < 8:
+                        current = int(self.value_aliases[current])
+                        chain.append(current)
+                    resident = self.external_values.get(int(slot))
+                    print(
+                        f"DEBUG-RETURN-SLOT fn={self.function_name} slot={slot} "
+                        f"alias_chain={chain!r} "
+                        f"external_values[slot]={None if resident is None else int(resident.id)} "
+                        f"external_values[chain_end]={None if self.external_values.get(current) is None else int(self.external_values[current].id)}",
+                        file=sys.stderr,
+                    )
+            edge_values = tuple(
+                None if slot is None else self.external_value(int(slot))
+                for slot in block.return_value_ids
+            )
+            exit_block = self.function_exit_block()
+            if block.predicate_value_id is None and (
+                block.predicate_expression is None
+            ):
+                self.function_return_edges.append((self.current, edge_values))
+                self.branch(exit_block)
+                self.current.instrs[-1].attributes["source_control"] = "return"
+                self.current = self.new_block("unreachable_return_control")
+            else:
+                fallthrough = self.new_block("return_control_next")
+                predicate = (
+                    self.lower_control_expression(block.predicate_expression)
+                    if block.predicate_expression is not None
+                    else self.external_value(
+                        block.predicate_value_id, dtype="bool"
+                    )
+                )
+                # The predicated edge leaves from a block of its own so the
+                # exit Phi's incoming block names exactly one return site.
+                returning = self.new_block("return_edge")
+                self.conditional_branch(
+                    predicate,
+                    returning if block.expect_true else fallthrough,
+                    fallthrough if block.expect_true else returning,
+                )
+                self.current.instrs[-1].attributes["source_control"] = "return"
+                self.current = returning
+                self.function_return_edges.append((self.current, edge_values))
+                self.branch(exit_block)
+                self.current = fallthrough
+            return
         if isinstance(block, LoopControlBlock):
             if not self.loop_targets:
-                raise ValueError(f"{block.action} appears outside a loop")
+                raise ValueError(
+                    f"{block.action} appears outside a loop "
+                    f"(site {block.site_node_id}, {self.function_name}, {path})"
+                )
             latch, exit_block = self.loop_targets[-1]
             target = exit_block if block.action == "break" else latch
+            if self.loop_exit_contexts and block.site_node_id is not None:
+                self.loop_exit_contexts[-1]["sites_seen"].add(
+                    int(block.site_node_id)
+                )
             if block.action == "break" and self.loop_exit_contexts:
                 context = self.loop_exit_contexts[-1]
+                # The reducer recorded, per site, the value every rebound
+                # name holds THERE (keyed by its pre-loop identity).  That is
+                # the value the exit edge carries; the older
+                # "updated-if-it-dominates-else-current" rule remains only
+                # for names the site table does not mention.
+                site_values = {
+                    int(initial_id): int(value_id)
+                    for initial_id, value_id in block.site_values
+                }
+
+                def site_value(initial_id: int) -> SSAValue | None:
+                    value_id = site_values.get(int(initial_id))
+                    if value_id is None:
+                        return None
+                    value = self.external_values.get(int(value_id))
+                    if value is None and int(value_id) in self.constant_value_ids:
+                        # A folded literal (``flag = True; break``): the
+                        # control function materializes it in its entry.
+                        value = self.external_value(int(value_id))
+                    if value is None or not self._value_dominates_current_edge(
+                        value
+                    ):
+                        if os.environ.get("TURING_DEBUG_BREAK_EDGE"):
+                            print(
+                                f"DEBUG-BREAK-EDGE {self.function_name} site="
+                                f"{block.site_node_id} initial={initial_id} "
+                                f"value_id={value_id} object={value!r} "
+                                f"current={self.current.name}",
+                                file=sys.stderr, flush=True,
+                            )
+                            for name, emitted in self.blocks.items():
+                                for instruction in emitted.instrs:
+                                    print(
+                                        f"    {name}: {instruction.op} "
+                                        f"{[int(a.id) for a in instruction.args]} -> "
+                                        f"{None if instruction.res is None else int(instruction.res.id)}"
+                                        f"{' <== SITE VALUE OBJECT' if value is not None and instruction.res is value else ''}",
+                                        file=sys.stderr, flush=True,
+                                    )
+                        self.shortfalls.append(SSALoweringShortfall(
+                            "control", "break-edge-value", path,
+                            f"break site {block.site_node_id} carries value "
+                            f"{value_id} for pre-loop identity {initial_id} "
+                            "but that value does not dominate the exit edge",
+                        ))
+                        return None
+                    return value
+
                 carried_values = []
                 for updated_id, initial_id, current in context["carried"]:
+                    at_site = site_value(int(initial_id))
+                    if at_site is not None:
+                        carried_values.append(at_site)
+                        continue
                     candidate = self.external_values.get(
                         int(updated_id),
                         self.external_values.get(int(initial_id), current),
@@ -3570,8 +3779,15 @@ class _ControlSSABuilder:
                         if self._value_dominates_current_edge(candidate)
                         else current
                     )
+                bound_values = []
+                for _port_id, initial_id in context["break_bound"]:
+                    at_site = site_value(int(initial_id))
+                    bound_values.append(
+                        at_site if at_site is not None
+                        else self.external_value(int(initial_id))
+                    )
                 context["break_edges"].append((
-                    self.current, tuple(carried_values)
+                    self.current, tuple(carried_values), tuple(bound_values)
                 ))
             if block.predicate_value_id is None:
                 self.branch(target)
@@ -5073,7 +5289,10 @@ class _ControlSSABuilder:
         header: BasicBlock,
         exit_block: BasicBlock,
         carried: list[tuple[int, int, SSAValue, SSAValue, SSAValue]],
-        break_edges: tuple[tuple[BasicBlock, tuple[SSAValue, ...]], ...],
+        break_edges: tuple[
+            tuple[BasicBlock, tuple[SSAValue, ...], tuple[SSAValue, ...]], ...
+        ],
+        break_bound: tuple[tuple[int, int], ...] = (),
     ) -> None:
         """Define authored LoopResult ids with edge-correct exit Phis."""
 
@@ -5101,7 +5320,7 @@ class _ControlSSABuilder:
             carried_index, normal_value = carried_entry
             incoming_blocks = [header.name]
             incoming_values = [normal_value]
-            for predecessor, edge_values in break_edges:
+            for predecessor, edge_values, _bound_values in break_edges:
                 incoming_blocks.append(predecessor.name)
                 incoming_values.append(edge_values[carried_index])
 
@@ -5143,6 +5362,34 @@ class _ControlSSABuilder:
             for equivalent_port_id in group:
                 self.external_values[int(equivalent_port_id)] = port
                 port_values[int(equivalent_port_id)] = port
+        # A break-bound name: zero-trip / fall-through exits keep the
+        # pre-loop value; each break edge carries the value its site bound.
+        for bound_index, (port_id, initial_id) in enumerate(break_bound):
+            normal_value = self.external_value(int(initial_id))
+            incoming_blocks = [header.name]
+            incoming_values = [normal_value]
+            for predecessor, _edge_values, bound_values in break_edges:
+                incoming_blocks.append(predecessor.name)
+                incoming_values.append(bound_values[bound_index])
+            port = self.produced_value(
+                int(port_id),
+                dtype=str(normal_value.dtype or "unknown"),
+                claim_provisional_definition=True,
+            )
+            self.emit(
+                Handler.Phi,
+                incoming_values,
+                port,
+                attributes={
+                    "incoming_blocks": tuple(incoming_blocks),
+                    "binding": "loop_result_port",
+                    "result_kind": "break_bound",
+                    "initial_value_id": int(initial_id),
+                    "updated_value_id": int(initial_id),
+                },
+            )
+            self.external_values[int(port_id)] = port
+            port_values[int(port_id)] = port
 
     def lower_loop(self, loop: LoopBlock, *, path: str) -> None:
         recursion_region_id = loop.recursion_region_id
@@ -5306,7 +5553,19 @@ class _ControlSSABuilder:
                 for updated_id, initial_id, _initial, _updated, current
                 in carried
             ),
+            # A port whose "updated" identity IS its initial identity has no
+            # backedge version: the name is bound only on break paths.
+            "break_bound": tuple(
+                (int(port_id), int(initial_id))
+                for port_id, initial_id, updated_id
+                in getattr(loop, "result_ports", ())
+                if int(updated_id) == int(initial_id)
+            ),
             "break_edges": [],
+            "sites_seen": set(),
+            "expected_sites": tuple(
+                int(site) for site in getattr(loop, "control_site_ids", ())
+            ),
         }
         self.loop_exit_contexts.append(exit_context)
         if deployment_id is not None:
@@ -5762,12 +6021,24 @@ class _ControlSSABuilder:
         for updated_id, initial_id, _initial, _updated, current in carried:
             self.external_values[initial_id] = current
             self.external_values[updated_id] = current
+        for missing_site in sorted(
+            set(exit_context["expected_sites"]) - exit_context["sites_seen"]
+        ):
+            # A source break/continue nothing placed (neither an arm nor the
+            # lexical schedule) would silently turn into a loop that runs to
+            # completion.
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "loop-control-site", path,
+                f"source break/continue at graph node {missing_site} was "
+                "never placed in the loop body",
+            ))
         self._publish_loop_result_ports(
             loop,
             header=header,
             exit_block=exit_block,
             carried=carried,
             break_edges=tuple(exit_context["break_edges"]),
+            break_bound=tuple(exit_context["break_bound"]),
         )
         if deployment_id is not None:
             self.emit_deployment_boundary(Handler.Join, record)
@@ -5864,7 +6135,19 @@ class _ControlSSABuilder:
                 for updated_id, initial_id, _initial, _updated, current
                 in carried
             ),
+            # A port whose "updated" identity IS its initial identity has no
+            # backedge version: the name is bound only on break paths.
+            "break_bound": tuple(
+                (int(port_id), int(initial_id))
+                for port_id, initial_id, updated_id
+                in getattr(loop, "result_ports", ())
+                if int(updated_id) == int(initial_id)
+            ),
             "break_edges": [],
+            "sites_seen": set(),
+            "expected_sites": tuple(
+                int(site) for site in getattr(loop, "control_site_ids", ())
+            ),
         }
         self.loop_exit_contexts.append(exit_context)
         preserved_before_body = set(self.preserved_region_output_ids)
@@ -6003,12 +6286,24 @@ class _ControlSSABuilder:
             self.external_values[initial_id] = current
             self.external_values[updated_id] = current
         self.external_values[int(loop.predicate_value_id)] = current_predicate
+        for missing_site in sorted(
+            set(exit_context["expected_sites"]) - exit_context["sites_seen"]
+        ):
+            # A source break/continue nothing placed (neither an arm nor the
+            # lexical schedule) would silently turn into a loop that runs to
+            # completion.
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "loop-control-site", path,
+                f"source break/continue at graph node {missing_site} was "
+                "never placed in the loop body",
+            ))
         self._publish_loop_result_ports(
             loop,
             header=header,
             exit_block=exit_block,
             carried=carried,
             break_edges=tuple(exit_context["break_edges"]),
+            break_bound=tuple(exit_context["break_bound"]),
         )
 
     def lower_state_machine(
@@ -6225,11 +6520,97 @@ class _ControlSSABuilder:
                 deploy_site=record.get("deploy_site"),
                 join_site=record.get("join_site"),
             ))
-        if not self.current.successors and (
+        fallthrough_open = not self.current.successors and (
             not self.current.instrs
             or self.current.instrs[-1].op
             not in {Handler.Br.value, Handler.CondBr.value, Handler.Ret.value}
-        ):
+        )
+        if self.function_return_edges:
+            # Control-aware result merging: every source ``return`` below the
+            # top level branched to `function_exit` carrying its own slot
+            # values; the lexical fall-through epilogue (if still open) is
+            # one more edge carrying the values computed above. One Phi per
+            # output slot, one Ret -- never "the last return's values on
+            # every path".
+            if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
+                for block, values in self.function_return_edges:
+                    print(
+                        f"DEBUG-RETURN-EDGE fn={self.function_name} "
+                        f"block={block.name} "
+                        f"values={[None if v is None else (int(v.id), str(v.dtype), sorted((v.accounting or {}).keys())) for v in values]!r}",
+                        file=sys.stderr,
+                    )
+            slot_count = max(
+                len(named_returns),
+                *(len(values) for _block, values in self.function_return_edges),
+            )
+            edges = list(self.function_return_edges)
+            if fallthrough_open:
+                fallthrough_values = tuple(
+                    returned[index] if index < len(returned) else None
+                    for index in range(slot_count)
+                )
+                edges.append((self.current, fallthrough_values))
+                self.branch(self.function_exit_block())
+            exit_block = self.function_exit_block()
+            self.current = exit_block
+            merged_values: list[SSAValue] = []
+            slot_names = [name for name, _value_id in named_returns]
+            for slot in range(slot_count):
+                incoming_blocks = []
+                incoming_values = []
+                for block, values in edges:
+                    value = values[slot] if slot < len(values) else None
+                    if value is None:
+                        # An unresolved slot on this return: keep the Phi
+                        # arity honest with an explicit absence and record
+                        # the shortfall rather than silently dropping the edge.
+                        value = self.fresh_value(dtype="none")
+                        self.current = block
+                        # Insert before the block's terminator.
+                        terminator = block.instrs.pop()
+                        self.emit(Handler.NoneValue, [], value)
+                        block.instrs.append(terminator)
+                        self.current = exit_block
+                        self.shortfalls.append(SSALoweringShortfall(
+                            "control", "return",
+                            f"{self.function_name}.return_slot[{slot}]",
+                            "a return statement's slot value could not be "
+                            f"resolved on edge {block.name!r}",
+                        ))
+                    incoming_blocks.append(block.name)
+                    incoming_values.append(value)
+                dtype = next(
+                    (str(value.dtype) for value in incoming_values
+                     if value.dtype not in {None, "unknown", "none"}),
+                    str(incoming_values[0].dtype or "unknown"),
+                )
+                if len(edges) == 1:
+                    merged = incoming_values[0]
+                else:
+                    merged = self.fresh_value(dtype=dtype)
+                    self.emit(
+                        Handler.Phi,
+                        incoming_values,
+                        merged,
+                        attributes={
+                            "incoming_blocks": tuple(incoming_blocks),
+                            "binding": "return_merge",
+                            **(
+                                {"output_name": slot_names[slot]}
+                                if slot < len(slot_names) else {}
+                            ),
+                        },
+                    )
+                merged_values.append(merged)
+            returned = merged_values
+            named_returns = [
+                (name, int(merged_values[index].id))
+                for index, (name, _value_id) in enumerate(named_returns)
+                if index < len(merged_values)
+            ]
+            self.emit(Handler.Ret, returned)
+        elif fallthrough_open:
             self.emit(Handler.Ret, returned)
         function = Function(
                 self.function_name,
@@ -6492,6 +6873,7 @@ def lower_control_program_to_ssa(
     ] | None = None,
     value_aliases: Mapping[int, int] | None = None,
     inout_value_ids: tuple[int, ...] = (),
+    constant_value_ids: tuple[int, ...] = (),
     output_value_ids: tuple[int, ...] = (),
     named_output_histories: Mapping[str, tuple[int, ...]] | None = None,
     value_name_histories: Mapping[str, tuple[int, ...]] | None = None,
@@ -6537,6 +6919,7 @@ def lower_control_program_to_ssa(
         plan_callsite_bindings=plan_callsite_bindings,
         value_aliases=value_aliases,
         inout_value_ids=inout_value_ids,
+        constant_value_ids=constant_value_ids,
         output_value_ids=output_value_ids,
         named_output_histories=named_output_histories,
         value_name_histories=value_name_histories,
@@ -7394,6 +7777,28 @@ def _schedule_loop_callsites(
             discover_control(block.callee)
 
     discover_control(control.root)
+    # Callsites lexically owned by a conditional arm (see
+    # ConditionalBlock.body_callsite_ids): scheduled inside that arm by
+    # `rebuild`, never anchored on a later region or left trailing.
+    arm_callsite_candidates: set[int] = set()
+
+    def discover_arm_callsites(block: Any) -> None:
+        if isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                discover_arm_callsites(child)
+        elif isinstance(block, ConditionalBlock):
+            arm_callsite_candidates.update(map(int, block.body_callsite_ids))
+            arm_callsite_candidates.update(map(int, block.orelse_callsite_ids))
+            discover_arm_callsites(block.body)
+            if block.orelse is not None:
+                discover_arm_callsites(block.orelse)
+        elif isinstance(block, (LoopBlock, WhileBlock)):
+            discover_arm_callsites(block.body)
+        elif isinstance(block, CallBlock):
+            discover_arm_callsites(block.callee)
+
+    discover_arm_callsites(control.root)
+    arm_owned_callsites: set[int] = set()
     calls_before: dict[int, list[int]] = {}
     replaced_projection_regions: set[int] = set()
     pending: list[int] = []
@@ -7426,6 +7831,10 @@ def _schedule_loop_callsites(
 
     for item in hierarchy_plan.items:
         if isinstance(item, PlanCall):
+            if int(item.callsite_id) in arm_callsite_candidates:
+                # Owned by a conditional arm: placed there by `rebuild`.
+                arm_owned_callsites.add(int(item.callsite_id))
+                continue
             pending.append(int(item.callsite_id))
             continue
         if not (
@@ -7504,14 +7913,30 @@ def _schedule_loop_callsites(
                 block, condition=rebuilt_condition, body=rebuilt_body
             )
         if isinstance(block, ConditionalBlock):
-            return replace(
-                block,
-                body=rebuild(block.body),
-                orelse=(
-                    rebuild(block.orelse)
-                    if block.orelse is not None else None
-                ),
+            # Planned calls whose only lexical home is this arm (no region
+            # of their own to anchor on) are scheduled at the head of the
+            # arm, ahead of its regions and its return control.
+            owned_body = tuple(
+                callsite_id for callsite_id in block.body_callsite_ids
+                if callsite_id in arm_owned_callsites
             )
+            owned_else = tuple(
+                callsite_id for callsite_id in block.orelse_callsite_ids
+                if callsite_id in arm_owned_callsites
+            )
+            rebuilt_body = rebuild(block.body)
+            if owned_body:
+                rebuilt_body = sequence(marker(owned_body), rebuilt_body)
+            rebuilt_else = (
+                rebuild(block.orelse) if block.orelse is not None else None
+            )
+            if owned_else:
+                rebuilt_else = sequence(
+                    marker(owned_else),
+                    rebuilt_else if rebuilt_else is not None
+                    else SequenceBlock(()),
+                )
+            return replace(block, body=rebuilt_body, orelse=rebuilt_else)
         return block
 
     rebuilt_root = rebuild(control.root)
@@ -7787,6 +8212,80 @@ def _schedule_loop_callsites(
         rebuilt_control,
         root=dependency_order(rebuilt_control.root),
     ), bindings
+
+
+def debug_region_output_loads(function: Function, tag: str) -> None:
+    """Env-gated probe: report region-output loads whose result id drifted.
+
+    ``TURING_DEBUG_OUTPUT_LOADS=<function-name-substring>`` prints, at each
+    call site that invokes this, every ``Load`` stamped with a
+    ``source_output_id`` whose result id no longer equals that stamp.
+    """
+
+    wanted = os.environ.get("TURING_DEBUG_OUTPUT_LOADS")
+    if not wanted or wanted not in str(function.name):
+        return
+    drifted = [
+        (block_name, int(instruction.attributes.get("source_output_id")),
+         int(instruction.res.id))
+        for block_name, block in function.blocks.items()
+        for instruction in block.instrs
+        if instruction.res is not None
+        and instruction.attributes
+        and instruction.attributes.get("source_output_id") is not None
+        and int(instruction.attributes.get("source_output_id"))
+        != int(instruction.res.id)
+    ]
+    print(
+        f"DEBUG-OUTPUT-LOADS [{tag}] {function.name}: drifted={drifted}",
+        file=sys.stderr, flush=True,
+    )
+    if tag != os.environ.get("TURING_DEBUG_OUTPUT_LOADS_TRACE_AT", "shell-after-sections"):
+        return
+    import traceback as _traceback
+
+    def _where() -> str:
+        frames = _traceback.extract_stack(limit=9)[:-2]
+        return " <- ".join(f"{f.name}:{f.lineno}" for f in reversed(frames))
+
+    class _TracedValue(SSAValue):
+        @property
+        def id(self):  # type: ignore[override]
+            return self.__dict__["id"]
+
+        @id.setter
+        def id(self, new_id):
+            old_id = self.__dict__.get("id")
+            if old_id is not None and int(old_id) != int(new_id):
+                print(f"DEBUG-OUTPUT-LOADS-TRACE {function.name}: value id "
+                      f"{old_id} -> {new_id} at {_where()}", file=sys.stderr, flush=True)
+            self.__dict__["id"] = new_id
+
+    class _TracedInstr(Instr):
+        @property
+        def res(self):  # type: ignore[override]
+            return self.__dict__["res"]
+
+        @res.setter
+        def res(self, value):
+            old = self.__dict__.get("res")
+            if old is not None and value is not None and int(old.id) != int(value.id):
+                print(f"DEBUG-OUTPUT-LOADS-TRACE {function.name}: res object "
+                      f"{int(old.id)} -> {int(value.id)} (source_output_id="
+                      f"{(self.attributes or {}).get('source_output_id')}) at {_where()}",
+                      file=sys.stderr, flush=True)
+            self.__dict__["res"] = value
+
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            if (
+                instruction.res is not None
+                and str(instruction.op) == "Load"
+                and instruction.attributes
+                and instruction.attributes.get("source_output_id") is not None
+            ):
+                instruction.res.__class__ = _TracedValue
+                instruction.__class__ = _TracedInstr
 
 
 def _materialize_control_constants(
@@ -8134,32 +8633,65 @@ def lower_control_sections_to_ssa(
     variant_projected_target_ids: set[int] = set()
     region_array_feed_ids: dict[int, set[int]] = {}
     section_outputs: dict[str, tuple[SSAValue, ...]] = {}
-    plan_value_watermark = 0
+    # One expansion per planned region, shared by every stage below, so all
+    # stages agree on the ids a region defines (including the temporaries
+    # its lowering coins, which are allocated plan-wide and never collide
+    # with an authored id or with another region's temporaries).
+    # Every value id this function already has in play, whether or not the
+    # hierarchy plan mentions it (control-only graph values never do).
+    known_value_ids: set[int] = {0}
+    for history in (identity_table or {}).values():
+        known_value_ids.update(int(value_id) for value_id in history)
+    known_value_ids.update(map(int, control_dependency_value_ids(control)))
+    known_value_ids.update(int(value_id) for _kind, value_id, _slot in field_ops)
+    if self_value_id is not None:
+        known_value_ids.add(int(self_value_id))
+    known_value_ids.update(map(int, required_output_value_ids))
+    known_value_ids.update(map(int, record_field_write_value_ids))
+    for region_outputs in (region_output_value_ids or {}).values():
+        known_value_ids.update(map(int, region_outputs))
+    for mapping in (value_dtypes, value_shapes, constant_values,
+                    preloaded_value_aliases, sequence_length_values,
+                    joined_singleton_values, field_const_sources):
+        known_value_ids.update(int(value_id) for value_id in (mapping or {}))
+    known_value_ids.update(
+        int(value_id) for value_id in (preloaded_value_aliases or {}).values()
+    )
+    known_value_ids.update(
+        int(sequence_id)
+        for sequence_id, _policy, _columns, _writable in sequence_declarations
+    )
+    known_value_ids.update(
+        int(sequence_id) for sequence_id, _policy, _columns in sequence_initializations
+    )
+    for group in (table_lookups, table_stores, table_deletions, field_aliases,
+                  sequence_memberships, nested_record_fields, sequence_augassigns):
+        for entry in group:
+            for leaf in entry:
+                if isinstance(leaf, bool) or not isinstance(leaf, int):
+                    continue
+                known_value_ids.add(int(leaf))
+    known_value_ids.update(map(int, (*retained_sequence_ids, *nested_sequence_ids,
+                                     *joined_sequence_ids, *source_sequence_ids)))
+    if os.environ.get("TURING_DEBUG_REGION_OUTPUTS"):
+        print(f"DEBUG-REGION-WATERMARK {control_name}: known_max={max(known_value_ids)}",
+              file=sys.stderr, flush=True)
+    expanded_plan_regions = (
+        expand_plan_regions(
+            hierarchy_plan, first_free_value_id=max(known_value_ids) + 1,
+        )
+        if hierarchy_plan is not None else {}
+    )
 
-    def _watermark(closure: "PlanClosure") -> None:
-        nonlocal plan_value_watermark
-        for _vid, _shape, _dtype in closure.value_shapes:
-            plan_value_watermark = max(plan_value_watermark, int(_vid) + 1)
-        for item in closure.items:
-            if isinstance(item, PlanLine):
-                for value_id in (*item.inputs, *item.outputs):
-                    plan_value_watermark = max(
-                        plan_value_watermark, int(value_id) + 1
-                    )
-            elif isinstance(item, PlanClosure):
-                _watermark(item)
-            elif isinstance(item, PlanCall):
-                for value_id in (
-                    *item.argument_value_ids, *item.result_value_ids,
-                    *(caller for caller, _callee in item.argument_bindings),
-                    *(caller for _callee, caller in item.result_bindings),
-                ):
-                    plan_value_watermark = max(
-                        plan_value_watermark, int(value_id) + 1
-                    )
-
-    if hierarchy_plan is not None:
-        _watermark(hierarchy_plan)
+    def region_instructions(closure: "PlanClosure") -> list[Instr]:
+        key = (str(closure.name), int(closure.closure_id))
+        if key not in expanded_plan_regions:
+            raise RuntimeError(
+                f"planned region {closure.name} (closure {closure.closure_id}) "
+                "is not a top-level region of the hierarchy plan; its "
+                "instructions have no plan-wide expansion to share"
+            )
+        return copy_region_instructions(expanded_plan_regions[key])
 
     shortfalls: list[SSALoweringShortfall] = []
     table_sequence_ids = {
@@ -8369,7 +8901,7 @@ def lower_control_sections_to_ssa(
                 and planned.name.startswith("region_")
             ):
                 continue
-            planned_instructions = plan_region_to_ssa_instrs(planned, first_free_value_id=plan_value_watermark)
+            planned_instructions = region_instructions(planned)
             semantic_instructions.extend(planned_instructions)
             for instruction in planned_instructions:
                 for value in (
@@ -8452,7 +8984,7 @@ def lower_control_sections_to_ssa(
             ):
                 continue
             region_index = int(planned.name.rsplit("_", 1)[1])
-            instructions = plan_region_to_ssa_instrs(planned, first_free_value_id=plan_value_watermark)
+            instructions = region_instructions(planned)
             region_array_feed_ids[region_index] = {
                 int(instruction.args[0].id)
                 for instruction in instructions
@@ -8597,7 +9129,7 @@ def lower_control_sections_to_ssa(
             for item in planned_items
             if isinstance(item, PlanClosure)
             and item.name.startswith("region_")
-            for instruction in plan_region_to_ssa_instrs(item, first_free_value_id=plan_value_watermark)
+            for instruction in region_instructions(item)
             for argument in instruction.args
         }
         call_item_positions = {
@@ -8737,7 +9269,7 @@ def lower_control_sections_to_ssa(
             ):
                 continue
             planned_index = int(planned.name.rsplit("_", 1)[1])
-            planned_instructions = plan_region_to_ssa_instrs(planned, first_free_value_id=plan_value_watermark)
+            planned_instructions = region_instructions(planned)
             planned_region_instructions[planned_index] = planned_instructions
 
     if hierarchy_plan is not None:
@@ -8760,7 +9292,7 @@ def lower_control_sections_to_ssa(
             # carve a ``region_0`` do not collide in one shared library, and so
             # the control call the lowering emits already targets this symbol.
             region_name = f"{control_name}__planned_region_{region_index}"
-            instructions = list(plan_region_to_ssa_instrs(region))
+            instructions = region_instructions(region)
             # A resident generator query (currently ``sum(1 for ...)`` or
             # ``next(..., default)``) is emitted in lexical control beside its
             # producer loop. Remove only that replaced operator from the
@@ -9540,18 +10072,35 @@ def lower_control_sections_to_ssa(
             required_roots = {
                 resident_root(value_id) for value_id in required_outputs
             }
+            # A canonical literal (one graph node, a known value) is owned
+            # by the control function, which materializes it itself
+            # (``_materialize_control_constants``).  The planner
+            # rematerializes such a literal privately inside every region
+            # that uses it; those copies are never that region's outputs.
+            # Publishing them made four regions each define the one id
+            # (``step_with_dt_control_used`` 342 x4).
+            control_owned_literals = {
+                int(instr.res.id)
+                for instr in instructions
+                if instr.res is not None
+                and str(instr.op).casefold() in {"const", "constant"}
+                and int(instr.res.id) in (constant_values or {})
+            }
             outputs = tuple(sorted(
                 value_id for value_id in produced
-                if (
-                    value_id in required_outputs
-                    and (
-                        value_id not in region_value_aliases
-                        or resident_root(value_id) in produced
+                if value_id not in control_owned_literals
+                and (
+                    (
+                        value_id in required_outputs
+                        and (
+                            value_id not in region_value_aliases
+                            or resident_root(value_id) in produced
+                        )
                     )
-                )
-                or (
-                    value_id in required_roots
-                    and value_id not in region_value_aliases
+                    or (
+                        value_id in required_roots
+                        and value_id not in region_value_aliases
+                    )
                 )
             ))
             # The region's formal parameters are its captures only. Its outputs
@@ -9617,6 +10166,16 @@ def lower_control_sections_to_ssa(
                     )
                 )
             )
+            if os.environ.get("TURING_DEBUG_REGION_OUTPUTS"):
+                print(
+                    f"DEBUG-REGION-OUTPUTS {control_name} {region_name}: "
+                    f"produced={sorted(produced)} outputs={outputs} "
+                    f"required={sorted(required_outputs & produced)} "
+                    f"req-sets={ {name: sorted(set(map(int, group)) & produced) for name, group in (('plan_live', resolved_plan_live_value_ids), ('control_dep', control_dependency_value_ids(control)), ('authored_out', authored_output_value_ids), ('required_out', required_output_value_ids), ('region_out', (region_output_value_ids or {}).get(region_index, ())), ('record_write', record_field_write_value_ids))} } "
+                    f"aliases={ {k: v for k, v in region_value_aliases.items() if k in produced or v in produced} } "
+                    f"instrs={[(str(i.op), [int(a.id) for a in i.args], None if i.res is None else int(i.res.id)) for i in instructions]}",
+                    file=sys.stderr, flush=True,
+                )
             functions[region_name] = region_function
             region_callees[region_index] = region_name
             region_signatures[region_index] = (
@@ -9677,9 +10236,18 @@ def lower_control_sections_to_ssa(
     # constants) for the region-call convention. They must not reuse a graph
     # value id, or a synthetic const collides with a field value the injection
     # below references by that same id. Start them above every graph id in play.
-    graph_value_ids = [0]
+    graph_value_ids = [0, *known_value_ids]
     for history in (identity_table or {}).values():
         graph_value_ids.extend(int(value_id) for value_id in history)
+    for expanded in expanded_plan_regions.values():
+        for instruction in expanded:
+            graph_value_ids.extend(int(value.id) for value in instruction.args)
+            if instruction.res is not None:
+                graph_value_ids.append(int(instruction.res.id))
+    if os.environ.get("TURING_DEBUG_REGION_OUTPUTS"):
+        print(f"DEBUG-REGION-WATERMARK {control_name}: graph_max={max(graph_value_ids)} "
+              f"control_dep_max={max(map(int, control_dependency_value_ids(control)), default=-1)}",
+              file=sys.stderr, flush=True)
     for feeds, outputs in region_signatures.values():
         graph_value_ids.extend(int(value_id) for value_id in feeds)
         graph_value_ids.extend(int(value_id) for value_id in outputs)
@@ -9767,6 +10335,7 @@ def lower_control_sections_to_ssa(
         plan_callsite_bindings=plan_callsite_bindings,
         value_aliases=region_value_aliases,
         inout_value_ids=tuple(map(int, record_field_write_value_ids)),
+        constant_value_ids=tuple(map(int, constant_values or {})),
         output_value_ids=tuple(map(int, required_output_value_ids)),
         named_output_histories={
             str(name): tuple(map(int, (identity_table or {}).get(name, ())))
@@ -9816,11 +10385,13 @@ def lower_control_sections_to_ssa(
         },
         table_epilogue_operations=tuple(table_epilogue_operations),
     )
+    debug_region_output_loads(control_function, "after-control-lowering")
     control_function = _materialize_control_constants(
         control_function,
         constant_values or {},
         value_dtypes=value_dtypes or {},
     )
+    debug_region_output_loads(control_function, "after-constants")
     sequence_helpers, sequence_tables = _sequence_artifacts_from_control(
         control_function
     )
@@ -10313,6 +10884,14 @@ def lower_precompile_and_control_to_ssa(
             region_value_meta.setdefault(int(value_id), meta)
         region_shortfalls.extend(shortfalls)
     if hierarchy_plan is not None:
+        expanded_plan_regions = expand_plan_regions(
+            hierarchy_plan, first_free_value_id=max(used_ids, default=-1) + 1,
+        )
+        for expanded in expanded_plan_regions.values():
+            for instruction in expanded:
+                used_ids.update(int(value.id) for value in instruction.args)
+                if instruction.res is not None:
+                    used_ids.add(int(instruction.res.id))
         for region in hierarchy_plan.items:
             if not (
                 isinstance(region, PlanClosure)
@@ -10323,7 +10902,9 @@ def lower_precompile_and_control_to_ssa(
             if region_index in region_callees:
                 continue
             region_name = f"planned_region_{region_index}"
-            instructions = list(plan_region_to_ssa_instrs(region))
+            instructions = copy_region_instructions(expanded_plan_regions[
+                (str(region.name), int(region.closure_id))
+            ])
             produced = {
                 int(instruction.res.id)
                 for instruction in instructions

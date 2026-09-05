@@ -87,6 +87,7 @@ from .loop_composer import (
     LoopComposer,
     LoopStrategy,
     _destructure_loop_target,
+    _retarget_cached_value_ids,
     analyze_shader_loop_reductions,
     bind_control_deployments_to_regions,
     evaporate_unrolled_loops,
@@ -326,13 +327,43 @@ def _topological_region_order(shell: Any, candidate_regions: Any) -> tuple[int, 
         for region, nodes in nodes_by_region.items()
         for node_id in nodes
     }
+    # A retained loop's own internal state-effect chain (for example two
+    # mutually exclusive branches each doing ``ctrl.clamp_events += 1``)
+    # legitimately closes a cycle in raw ProcessGraph ancestry: one
+    # branch's result feeds the next iteration's read of the other. That
+    # is exactly what ``recursion_table``/``control_members`` -- already
+    # published for ``reduce_scheduled_shader_regions``, which drops edges
+    # incident to those nodes before checking its own scheduling graph is
+    # acyclic -- exists to name. This function walked raw, un-filtered
+    # ancestry instead, so the very cycle the scheduler had already
+    # discounted came back as an unresolvable region dependency cycle
+    # (diagnosed via tools/repro_step_with_dt_control_used.py: regions
+    # holding two branch-exclusive ``ctrl.clamp_events += 1`` computations
+    # inside ``step_with_dt_control_used``'s retry loop). Apply the same
+    # discount here instead of inventing a second rule for one graph.
+    recursion_control_nodes = frozenset(
+        int(node_id)
+        for record in (graph.G.graph.get("recursion_table") or {}).values()
+        if record.get("control_ir", True)
+        for node_id in record.get("control_members", ())
+        if int(node_id) in graph.G
+    )
+    ancestry_graph = (
+        graph.G if not recursion_control_nodes
+        else graph.G.copy()
+    )
+    if recursion_control_nodes:
+        ancestry_graph.remove_edges_from(tuple(
+            (left, right) for left, right in ancestry_graph.edges
+            if left in recursion_control_nodes or right in recursion_control_nodes
+        ))
     dependency_graph = nx.DiGraph()
     dependency_graph.add_nodes_from(candidates)
     for consumer, nodes in nodes_by_region.items():
         for node_id in nodes:
-            if node_id not in graph.G:
+            if node_id not in ancestry_graph:
                 continue
-            for ancestor in nx.ancestors(graph.G, node_id):
+            for ancestor in nx.ancestors(ancestry_graph, node_id):
                 producer = region_by_node.get(int(ancestor))
                 if producer is not None and producer != consumer:
                     dependency_graph.add_edge(producer, consumer)
@@ -1803,6 +1834,94 @@ def _control_dependency_value_ids(control: Any) -> frozenset[int]:
 
     return control_dependency_value_ids(control)
 
+def _atomic_region_node_order(
+    graph: Any,
+    topological_nodes: tuple[int, ...],
+    region_by_node: Mapping[int, int],
+) -> tuple[int, ...]:
+    """Node walk order in which every dispatch region is one atomic unit.
+
+    ``_dependency_order`` orders NODES.  The hierarchy plan emits a region
+    closure when the walk meets the region's FIRST member, so a region whose
+    members straddle another region's output was emitted before its
+    producer: ``pi_update``'s region_1 holds the line-5 ``dt_prev``/``dt_pen``
+    casts AND the line-13 ``self.acc`` update, which reads the field written
+    from region_0's line-7 cast (``GetAttr`` ``after_write`` edge).  The
+    plan listed region_1 first, the control lowering called it first, and
+    the accumulator update ran on the stale field.  Contract each region to
+    one unit, order the units topologically over the forward semantic
+    parent edges between different units (with the same retained-loop
+    control-member discount ``_topological_region_order`` applies), break
+    ties by the first member's node position so every already-valid order
+    is unchanged, and expand each unit back to its members in node order.
+    """
+
+    G = graph.G
+    order_index = {
+        int(node_id): index for index, node_id in enumerate(topological_nodes)
+    }
+
+    def unit_of(node_id: int) -> tuple[str, int]:
+        region_index = region_by_node.get(int(node_id))
+        if region_index is None:
+            return ("node", int(node_id))
+        return ("region", int(region_index))
+
+    members: dict[tuple[str, int], list[int]] = {}
+    for node_id in topological_nodes:
+        members.setdefault(unit_of(int(node_id)), []).append(int(node_id))
+    if not any(unit[0] == "region" for unit in members):
+        return tuple(topological_nodes)
+    recursion_control_nodes = frozenset(
+        int(node_id)
+        for record in (G.graph.get("recursion_table") or {}).values()
+        if record.get("control_ir", True)
+        for node_id in record.get("control_members", ())
+        if int(node_id) in G
+    )
+    unit_graph = nx.DiGraph()
+    unit_graph.add_nodes_from(members)
+    for node_id in topological_nodes:
+        node_id = int(node_id)
+        if node_id in recursion_control_nodes:
+            continue
+        consumer = unit_of(node_id)
+        for parent, _role in (G.nodes[node_id].get("parents") or ()):
+            parent = int(parent)
+            if (
+                parent not in order_index
+                or parent in recursion_control_nodes
+                or order_index[parent] >= order_index[node_id]
+            ):
+                continue
+            producer = unit_of(parent)
+            if producer != consumer:
+                unit_graph.add_edge(producer, consumer)
+    first_position = {
+        unit: order_index[unit_members[0]]
+        for unit, unit_members in members.items()
+    }
+    try:
+        ordered_units = tuple(nx.lexicographical_topological_sort(
+            unit_graph, key=lambda unit: first_position[unit],
+        ))
+    except nx.NetworkXUnfeasible as error:
+        cycles = tuple(
+            tuple(unit for unit in cycle if unit[0] == "region")
+            for cycle in nx.simple_cycles(unit_graph)
+        )
+        raise ValueError(
+            "dispatch regions are not atomic compilation units: canonical "
+            "data dependencies cross region boundaries cyclically: "
+            f"{cycles!r}"
+        ) from error
+    return tuple(
+        node_id
+        for unit in ordered_units
+        for node_id in members[unit]
+    )
+
+
 def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
     """Freeze call/region ownership before backend source composition."""
 
@@ -1880,6 +1999,11 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         return int(line), int(column or 0)
 
     caller_identities = graph.G.graph.get("identity_table") or {}
+    # Regions are emitted atomically at the position of their first member,
+    # so the walk must already respect region-level dependencies.
+    walk_order = _atomic_region_node_order(
+        graph, topological_nodes, region_by_node,
+    )
 
     def direct_return_value_ids(child_graph: Any) -> tuple[int, ...]:
         """Resolve one direct return by deterministic source coordinates.
@@ -1940,7 +2064,7 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         # guess that they are a tuple-valued return surface.
         return unique if len(unique) == 1 else ()
 
-    for node_id in topological_nodes:
+    for node_id in walk_order:
         child = shell.callsite_function_shells.get(node_id)
         if child is not None:
             call_attributes = graph.G.nodes[node_id].get("attributes") or {}
@@ -5179,6 +5303,8 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     sequence_mutations=block.sequence_mutations,
                     comparison=block.comparison,
                     terminal_controls=block.terminal_controls,
+                    source_loop_node_id=block.source_loop_node_id,
+                    control_site_ids=block.control_site_ids,
                 )
             if isinstance(block, WhileBlock):
                 return WhileBlock(
@@ -5193,6 +5319,7 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     sequence_mutations=block.sequence_mutations,
                     source_loop_node_id=block.source_loop_node_id,
                     terminal_controls=block.terminal_controls,
+                    control_site_ids=block.control_site_ids,
                 )
             if isinstance(block, LoopControlBlock):
                 return block
@@ -7080,7 +7207,7 @@ def _ordinary_conditional_control_programs(
 ) -> tuple[ControlProgram, ...]:
     """Preserve ordinary source ``if`` arms and their lexical SSA merges."""
 
-    from .control_source import ConditionalBlock
+    from .control_source import ConditionalBlock, LoopControlBlock
 
     retained = frozenset(map(int, retained_regions))
     subgraphs = tuple(dispatch_subgraphs)
@@ -7162,19 +7289,198 @@ def _ordinary_conditional_control_programs(
                 int, subgraph.G.graph.get("deployment_nodes", ())
             ))
         )
-        has_structural_branch_effect = any(
-            isinstance(member, (ast.Assign, ast.AnnAssign, ast.AugAssign))
-            or (
-                isinstance(member, ast.Call)
-                and isinstance(member.func, ast.Attribute)
-                and member.func.attr in {"append", "add", "extend"}
+        # A ``return`` ending an arm is a control effect of that arm: it
+        # leaves the function carrying the arm's values. Handled here only
+        # for conditionals outside every loop; inside a loop body the loop
+        # planner already places the return control at its lexical position
+        # (`LoopDescriptor.return_controls`), and placing it twice would
+        # emit two return edges for one source return.
+        return_slot_values = dict(graph.G.graph.get("return_slot_values") or {})
+        enclosing_loop_spans = tuple(
+            (int(loop_expression.lineno), int(getattr(
+                loop_expression, "end_lineno", loop_expression.lineno
+            )))
+            for _loop_id, loop_data in graph.G.nodes(data=True)
+            for loop_expression in (loop_data.get("expr_obj"),)
+            if isinstance(loop_expression, (ast.For, ast.While))
+        )
+        inside_loop = any(
+            start <= int(expression.lineno) <= end
+            for start, end in enclosing_loop_spans
+        )
+        # A ``break``/``continue`` ending an arm is that arm's exit edge: it
+        # leaves the loop carrying the arm's OWN bindings, which dominate
+        # the edge only inside the arm.  Place it there (the loop schedule
+        # skips arm-owned sites, `LoopDescriptor.control_sites`), with the
+        # site's live bindings from the owning loop's ``loop_break_sites``.
+        enclosing_loops = tuple(
+            (
+                int(loop_expression.lineno),
+                int(getattr(
+                    loop_expression, "end_lineno", loop_expression.lineno
+                )),
+                dict((loop_data.get("attributes") or {}).get(
+                    "loop_break_sites"
+                ) or {}),
             )
-            for statement in (*expression.body, *expression.orelse)
-            for member in ast.walk(statement)
+            for _loop_id, loop_data in graph.G.nodes(data=True)
+            for loop_expression in (loop_data.get("expr_obj"),)
+            if isinstance(loop_expression, (ast.For, ast.While))
+        )
+        retained_region_nodes = {
+            int(member)
+            for region_index in sorted(retained)
+            for member in subgraphs[int(region_index)].G.graph.get(
+                "deployment_nodes", ()
+            )
+        }
+        control_node_by_statement = {
+            id(node_data.get("expr_obj")): int(node_id)
+            for node_id, node_data in graph.G.nodes(data=True)
+            if isinstance(
+                node_data.get("expr_obj"), (ast.Break, ast.Continue)
+            )
+        }
+
+        def arm_loop_control(statements, arm_name):
+            if not inside_loop or not statements:
+                return None
+            terminal = statements[-1]
+            if not isinstance(terminal, (ast.Break, ast.Continue)):
+                return None
+            action = "break" if isinstance(terminal, ast.Break) else "continue"
+            line = int(getattr(terminal, "lineno", -1))
+            span = (
+                line,
+                int(getattr(terminal, "col_offset", -1)),
+                int(getattr(terminal, "end_lineno", -1)),
+                int(getattr(terminal, "end_col_offset", -1)),
+            )
+            # Innermost loop whose source range holds the site owns it.
+            owner = min(
+                (
+                    (end - start, break_sites)
+                    for start, end, break_sites in enclosing_loops
+                    if start <= line <= end
+                ),
+                key=lambda item: item[0],
+                default=None,
+            )
+            declared_identity_ids = {
+                int(value_id)
+                for history in (graph.G.graph.get("identity_table") or {}).values()
+                for value_id in history
+            }
+            site_values = {
+                int(initial): int(value)
+                for initial, value in (
+                    (owner[1].get(span) or {}) if owner else {}
+                ).items()
+                if int(value) in graph.G
+                and (int(initial) in graph.G or int(initial) in declared_identity_ids)
+            }
+            # Same rule as the loop schedule (``arm_owned_site`` in
+            # loop_composer): the arm owns the site only when a value it
+            # carries is produced by a retained region INSIDE this arm.
+            owned = any(
+                int(value) in retained_region_nodes
+                and int(value) in node_by_value
+                and (int(control_id), arm_name) in memberships.get(
+                    node_by_value[int(value)], ()
+                )
+                for value in site_values.values()
+            )
+            if os.environ.get("TURING_DEBUG_BREAK_EDGE"):
+                print(
+                    "DEBUG-ARM-OWNED builder "
+                    f"fn={graph.G.graph.get('function_name')} "
+                    f"control={int(control_id)} arm={arm_name} "
+                    f"site={control_node_by_statement.get(id(terminal))} "
+                    f"site_values={site_values} owned={owned}",
+                    file=sys.stderr, flush=True,
+                )
+            if not owned:
+                return None
+            return LoopControlBlock(
+                action, None, True, None,
+                source_action=action,
+                site_node_id=control_node_by_statement.get(id(terminal)),
+                site_values=tuple(sorted(
+                    (int(initial), int(value))
+                    for initial, value in site_values.items()
+                )),
+            )
+
+        def arm_return_control(statements):
+            if inside_loop or not statements:
+                return None
+            terminal = statements[-1]
+            if not isinstance(terminal, ast.Return) or terminal.value is None:
+                return None
+            returned = terminal.value
+            slots = return_slot_values.get((
+                int(getattr(returned, "lineno", -1)),
+                int(getattr(returned, "col_offset", -1)),
+                int(getattr(returned, "end_lineno", -1)),
+                int(getattr(returned, "end_col_offset", -1)),
+            ))
+            if slots is None:
+                return None
+            return LoopControlBlock(
+                "return", None, True, None,
+                source_action="return",
+                return_value_ids=tuple(slots),
+            )
+
+        body_return_control = (
+            arm_return_control(expression.body)
+            or arm_loop_control(expression.body, "body")
+        )
+        else_return_control = (
+            arm_return_control(expression.orelse)
+            or arm_loop_control(expression.orelse, "orelse")
+        )
+        if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
+            terminal_spans = [
+                (
+                    int(getattr(arm[-1].value, "lineno", -1)),
+                    int(getattr(arm[-1].value, "col_offset", -1)),
+                    int(getattr(arm[-1].value, "end_lineno", -1)),
+                    int(getattr(arm[-1].value, "end_col_offset", -1)),
+                )
+                for arm in (expression.body, expression.orelse)
+                if arm and isinstance(arm[-1], ast.Return)
+                and arm[-1].value is not None
+            ]
+            print(
+                "DEBUG-RETURN-ARM "
+                f"fn={graph.G.graph.get('function_name')} "
+                f"control={int(control_id)} inside_loop={inside_loop} "
+                f"terminal_return_spans={terminal_spans!r} "
+                f"table_keys={sorted(return_slot_values)!r} "
+                f"body={body_return_control is not None} "
+                f"else={else_return_control is not None}",
+                file=sys.stderr,
+            )
+        has_structural_branch_effect = (
+            body_return_control is not None
+            or else_return_control is not None
+            or any(
+                isinstance(member, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                or (
+                    isinstance(member, ast.Call)
+                    and isinstance(member.func, ast.Attribute)
+                    and member.func.attr in {"append", "add", "extend"}
+                )
+                for statement in (*expression.body, *expression.orelse)
+                for member in ast.walk(statement)
+            )
         )
         if (
             not body_regions
             and not else_regions
+            and body_return_control is None
+            and else_return_control is None
             and not (predicate_regions and has_structural_branch_effect)
         ):
             if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
@@ -7190,22 +7496,43 @@ def _ordinary_conditional_control_programs(
             continue
 
         carried = []
-        for history in (graph.G.graph.get("identity_table") or {}).values():
+        positional_output_names = set(
+            graph.G.graph.get("positional_output_names") or ()
+        )
+        for name, history in (
+            graph.G.graph.get("identity_table") or {}
+        ).items():
+            if str(name) in positional_output_names:
+                # A positional output slot's history lists one value PER
+                # RETURN SITE; it is not a variable rebound in these arms.
+                # Merging it here manufactured degenerate `Phi [v, v]`
+                # aliases between return sites and rebound each earlier
+                # return's value onto the next one ("last return wins").
+                # Return sites merge at the function exit instead
+                # (control-aware result merging).
+                continue
             ordered = tuple(
                 int(value_id) for value_id in history
                 if int(value_id) in node_by_value
             )
             if not ordered:
                 continue
+            # An arm that ends in return/break/continue never reaches the
+            # merge point: the values it binds leave through its own edge
+            # (return merge, break edge) and are not this conditional's
+            # carried aliases.  Merging them here manufactured a Phi with an
+            # unreachable incoming edge and rebound the fall-through value.
             body_values = tuple(
                 value_id for value_id in ordered
-                if (int(control_id), "body") in memberships.get(
+                if body_return_control is None
+                and (int(control_id), "body") in memberships.get(
                     node_by_value[value_id], ()
                 )
             )
             else_values = tuple(
                 value_id for value_id in ordered
-                if (int(control_id), "orelse") in memberships.get(
+                if else_return_control is None
+                and (int(control_id), "orelse") in memberships.get(
                     node_by_value[value_id], ()
                 )
             )
@@ -7230,10 +7557,15 @@ def _ordinary_conditional_control_programs(
             # values is its merge by SSA construction.  Retain the annotation
             # only as a compatibility fallback for graphs without complete
             # ordered histories.
+            # A loop port (LoopResult/LoopExit) is the value AFTER an
+            # enclosing loop, never a conditional's own merge.
             merged = next((
                 ordered[position]
                 for position in range(last_branch + 1, len(ordered))
                 if ordered[position] not in {*body_values, *else_values}
+                and str(graph.G.nodes[node_by_value[ordered[position]]].get(
+                    "type"
+                ) or "") not in {"LoopResult", "LoopExit"}
             ), None)
             if merged is None:
                 merged = next((
@@ -7251,16 +7583,25 @@ def _ordinary_conditional_control_programs(
                 initial,
                 merged,
             ))
-        body = SequenceBlock(tuple(
-            StatementBlock((f"__scheduled_region_{index}__",))
-            for index in body_regions
+        body = SequenceBlock((
+            *(
+                StatementBlock((f"__scheduled_region_{index}__",))
+                for index in body_regions
+            ),
+            *((body_return_control,) if body_return_control is not None else ()),
         ))
         orelse = (
-            SequenceBlock(tuple(
-                StatementBlock((f"__scheduled_region_{index}__",))
-                for index in else_regions
+            SequenceBlock((
+                *(
+                    StatementBlock((f"__scheduled_region_{index}__",))
+                    for index in else_regions
+                ),
+                *(
+                    (else_return_control,)
+                    if else_return_control is not None else ()
+                ),
             ))
-            if else_regions else None
+            if else_regions or else_return_control is not None else None
         )
         arm_regions = tuple(dict.fromkeys((*body_regions, *else_regions)))
         split_regions = set(predicate_regions).intersection(arm_regions)
@@ -7298,6 +7639,29 @@ def _ordinary_conditional_control_programs(
                 ),
                 carried_aliases=tuple(carried),
                 source_node_id=int(control_id),
+                # Call nodes lexically inside each arm: the callsite
+                # scheduler anchors a planned call on numerical regions,
+                # which an arm consisting only of a call does not have.
+                body_callsite_ids=tuple(sorted(
+                    int(node_id)
+                    for node_id, roles in memberships.items()
+                    if (int(control_id), "body") in roles
+                    and int(node_id) in graph.G
+                    and str(
+                        graph.G.nodes[int(node_id)].get("op")
+                        or graph.G.nodes[int(node_id)].get("type") or ""
+                    ).casefold() == "call"
+                )),
+                orelse_callsite_ids=tuple(sorted(
+                    int(node_id)
+                    for node_id, roles in memberships.items()
+                    if (int(control_id), "orelse") in roles
+                    and int(node_id) in graph.G
+                    and str(
+                        graph.G.nodes[int(node_id)].get("op")
+                        or graph.G.nodes[int(node_id)].get("type") or ""
+                    ).casefold() == "call"
+                )),
             ),
         ))
         programs.append(ControlProgram(
@@ -15546,6 +15910,22 @@ def _fold_callsite_structural_values(graph: Any) -> None:
                 fixed = descriptor_attribute(arguments[0], attribute)
                 if fixed is not unresolved:
                     return fixed
+                # `getattr(record, "field", default)` is the same read as
+                # `record.field` (and `record.get("field")` just above): a
+                # field the program ABI declares on the receiver is present,
+                # so the default never applies. Returning the default
+                # unconditionally folded `getattr(targets,
+                # "energy_exchange_fraction", None)` to None -- and every
+                # `x is not None` guard on it to a constant False -- even
+                # when the receiver's record declared the field (verified
+                # with tools/audit_structural_boolop_shapes.py
+                # --declare-optional-targets); it was only correct while the
+                # field happened to be undeclared.
+                field_fact = declared_record_field(
+                    known.get(arguments[0], unresolved), attribute,
+                )
+                if field_fact is not unresolved:
+                    return field_fact
             if len(values) >= 3 and values[2] is not unresolved:
                 return values[2]
         if name == "isinstance" and values:
@@ -15721,6 +16101,10 @@ def _fold_callsite_structural_values(graph: Any) -> None:
             source_id if int(root) == node_id else int(root)
             for root in graph.roots
         ]
+        # Cached copies of the aliased id live on nodes that are not its
+        # successors too (a loop node's carried initial, a tuple's leaf
+        # ledger); move every one before the id disappears.
+        _retarget_all_cached_value_ids(graph, node_id, source_id)
         remove_node(node_id)
 
     def same_structural_value(left: Any, right: Any) -> bool:
@@ -16744,12 +17128,46 @@ def _follow_declared_value_source(
     identity-conflict error, so the declaration follows the alias exactly.
     """
 
-    attributes = node_data.get("attributes") or {}
-    declared = attributes.get("value_source_id")
-    if declared is not None and int(declared) == int(replaced_id):
-        updated = dict(attributes)
-        updated["value_source_id"] = int(source_id)
-        node_data["attributes"] = updated
+    # `value_source_id` is one of several cached copies of an id that must
+    # follow an alias: the leaf ledgers (`aggregate_leaf_value_ids`,
+    # `materialized_source_value_ids`, `materialized_value_ids`) and a loop
+    # node's own carried/initial/state-effect records are the same kind of
+    # copy, read in preference to the edge by region capture expansion,
+    # iterable trip counts and the retained-loop port builder. One helper,
+    # shared with loop_composer's edge rewriters, moves all of them.
+    attributes = node_data.get("attributes")
+    if isinstance(attributes, dict):
+        node_data["attributes"] = dict(attributes)
+    _retarget_cached_value_ids(node_data, int(replaced_id), (int(source_id),))
+
+
+def _retarget_all_cached_value_ids(
+    graph: Any, replaced_id: int, source_id: int,
+) -> None:
+    """Move every cached copy of ``replaced_id`` graph-wide, not just successors.
+
+    A loop node caches a carried binding's initial value (a tuple-unpacking
+    projection, say) without being that projection's successor, so an alias
+    that only visits successors leaves the loop attribute naming a node the
+    alias just removed; the evaporator then seeds clones from a dead id.
+    """
+
+    for _node_id, data in graph.G.nodes(data=True):
+        attributes = data.get("attributes")
+        if not isinstance(attributes, dict):
+            continue
+        if not any(
+            key in attributes
+            for key in (
+                "value_source_id", "aggregate_leaf_value_ids",
+                "materialized_source_value_ids", "materialized_value_ids",
+                "loop_carried_bindings", "loop_target_initials",
+                "loop_state_effects", "loop_iteration_outputs",
+            )
+        ):
+            continue
+        data["attributes"] = dict(attributes)
+        _retarget_cached_value_ids(data, int(replaced_id), (int(source_id),))
 
 
 def _alias_projection_to_member(
@@ -16790,6 +17208,10 @@ def _alias_projection_to_member(
             for child, role in graph.G.nodes[int(parent)].get("children", ())
             if int(child) != projection
         ]
+    # A loop that carries this projection (``a, b = history`` bound as its
+    # initial) caches the projection id without being its successor; move
+    # every cached copy before the node is gone.
+    _retarget_all_cached_value_ids(graph, projection, leaf_id)
     graph.G.remove_node(projection)
     for index_id in index_ids:
         if (

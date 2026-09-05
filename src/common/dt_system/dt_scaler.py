@@ -91,9 +91,17 @@ def coerce_metrics(value) -> Metrics:
     if isinstance(value, Metrics):
         # Keep the caller's object identity (diagnostics such as
         # ``unresolved_report`` are attached to it later) but with exact
-        # scalar fields.
-        for name in ("max_vel", "max_flux", "div_inf", "mass_err", "proc_ms",
-                     "dt_limit", "error_channels", "advanced_dt"):
+        # scalar fields -- ALL twelve, not a subset.  Leaving any field
+        # untouched here means this branch and the ``normalized`` return
+        # below hand back the same field under two different concrete
+        # types depending on which branch ran (whatever type the caller's
+        # object already had here, vs the cast type below), which is
+        # exactly the aggregate-identity ambiguity a compiled build cannot
+        # unify (see run_superstep's ``last_metrics`` fix, same family).
+        for name in ("max_vel", "max_flux", "div_inf", "mass_err",
+                     "osc_flag", "stiff_flag", "sim_frame", "proc_ms",
+                     "dt_limit", "error_channels", "hard_failure",
+                     "advanced_dt"):
             setattr(value, name, getattr(normalized, name))
         return value
     return normalized

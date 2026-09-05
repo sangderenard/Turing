@@ -75,6 +75,17 @@ def call_array_argument_ids(
                         continue
                     callee = functions[callee_name]
                     callee_arrays = arrays[callee_name]
+                    if len(instruction.args) != len(callee.args):
+                        # The call-argument harmonizer in fortran_c_shell
+                        # deliberately leaves a call unrealigned when its
+                        # identified actual/formal sets do not match exactly;
+                        # zip() would then pair by raw index. This is a
+                        # transitive fixed point: one mispaired array mark
+                        # propagates to every other caller of the callee and
+                        # ends as scalars emitted as spans (or the reverse)
+                        # with no error until the native ABI disagrees. A
+                        # pairing nobody claimed carries no storage fact.
+                        continue
                     for actual, formal in zip(instruction.args, callee.args):
                         actual_id = int(actual.id)
                         formal_id = int(formal.id)

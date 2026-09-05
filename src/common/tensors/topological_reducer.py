@@ -1269,28 +1269,84 @@ def _normalize_lexical_values(
                     for name in target_name_nodes(loop.target.elts[0])
                 )
     scalar_loop_binding_ids: set[int] = set()
-    for body_statement in source_body_statements(statement):
-        if not isinstance(body_statement, ast.Return):
-            continue
-        returned = body_statement.value
-        expressions = (
+    # Every ``return`` of THIS function names its output slots -- not only a
+    # return that happens to sit at the top level of the body. Scanning
+    # ``source_body_statements`` alone left a function whose returns are all
+    # inside a loop or conditional (``while True: ... return a, b, c``)
+    # with no ``function_outputs`` at all, so the per-Return identity
+    # recording below never ran, the hierarchy plan built its PlanCall with
+    # ``result_bindings=()``, and every caller bound zero of the callee's
+    # outputs ("unmaterialized_result", 15 real outputs unbound -- diagnosed
+    # against the real managed-tire compile, ``step_with_dt_control_used``).
+    # Nested definitions own their own returns and are not walked into.
+    def function_return_statements(definition: Any) -> tuple[Any, ...]:
+        returns: list[Any] = []
+        stack = list(reversed(source_body_statements(definition)))
+        while stack:
+            current = stack.pop()
+            if isinstance(current, (
+                ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef,
+            )):
+                continue
+            if isinstance(current, ast.Return):
+                returns.append(current)
+                continue
+            stack.extend(reversed(source_child_nodes(current)))
+        return tuple(returns)
+
+    return_expression_lists = tuple(
+        (
             tuple(returned.elts)
             if isinstance(returned, (ast.Tuple, ast.List))
             else (returned,)
         )
-        graph.G.graph["function_outputs"] = tuple(
-            expression.id
-            if isinstance(expression, ast.Name)
-            else f"result_{index}"
-            for index, expression in enumerate(expressions)
-        )
-        break
+        for return_statement in function_return_statements(statement)
+        for returned in (return_statement.value,)
+        if returned is not None
+    )
+    if return_expression_lists:
+        arities = {len(expressions) for expressions in return_expression_lists}
+        if len(arities) != 1:
+            # Returns that disagree on arity have no single output surface;
+            # that is a real shortfall to report, never a silent ``()``.
+            graph.G.graph["function_output_shortfall"] = (
+                "return arity disagrees across return statements: "
+                f"{sorted(arities)!r}"
+            )
+        else:
+            arity = next(iter(arities))
+            # A slot keeps its authored name only when EVERY return spells
+            # that slot as the same name; otherwise it is positional.
+            slot_names = []
+            positional_names = []
+            for index in range(arity):
+                names = {
+                    expressions[index].id
+                    if isinstance(expressions[index], ast.Name)
+                    else None
+                    for expressions in return_expression_lists
+                }
+                if len(names) == 1 and None not in names:
+                    slot_names.append(names.pop())
+                else:
+                    slot_names.append(f"result_{index}")
+                    positional_names.append(slot_names[-1])
+            graph.G.graph["function_outputs"] = tuple(slot_names)
+            # A positional slot's identity history is a list of ALTERNATIVE
+            # return values (one per return site), not the version chain of
+            # a rebound variable. Consumers that merge variable versions
+            # across conditionals (`_ordinary_conditional_control_programs`)
+            # must not treat it as one, or every earlier return's value is
+            # aliased onto the next return's (measured as degenerate
+            # `Phi [329, 329]` merges and "last return wins" outputs).
+            graph.G.graph["positional_output_names"] = tuple(positional_names)
     def new_node(
         node_type: str,
         label: str,
         *,
         attributes: dict[str, Any] | None = None,
         parents: tuple[tuple[int, str], ...] = (),
+        source: Any = None,
     ) -> int:
         # Value ids are identities: never hand out an id freed by an earlier
         # removal.  The per-graph watermark only moves forward (see
@@ -1301,6 +1357,23 @@ def _normalize_lexical_values(
             max((int(existing) for existing in graph.G.nodes), default=-1),
         ) + 1
         metadata["value_id_watermark"] = node_id
+        # A synthesized node has no `expr_obj`, so nothing downstream can
+        # place it lexically unless the authored statement it stands for is
+        # recorded here. `source` is that statement/expression: its span is
+        # stamped as the node-level `source_span` every lexical-ownership
+        # test reads first (e.g. loop_composer's `is_lexical_body_node`),
+        # while `expr_obj` stays None so the node is never mistaken for the
+        # authored expression itself.
+        node_source_span = (
+            {
+                "line": getattr(source, "lineno", None),
+                "column": getattr(source, "col_offset", None),
+                "end_line": getattr(source, "end_lineno", None),
+                "end_column": getattr(source, "end_col_offset", None),
+            }
+            if source is not None and getattr(source, "lineno", None) is not None
+            else None
+        )
         graph.G.add_node(
             node_id,
             label=label,
@@ -1313,6 +1386,7 @@ def _normalize_lexical_values(
             parents=list(parents),
             children=[],
             attributes=dict(attributes or {}),
+            **({"source_span": node_source_span} if node_source_span else {}),
         )
         if node_type in {"Const", "Constant"}:
             graph.G.nodes[node_id]["constant"] = (
@@ -2711,6 +2785,12 @@ def _normalize_lexical_values(
                     "SetAttr",
                     f"setattr[{target.attr}]",
                     attributes={"attribute": target.attr},
+                    # The write's own statement anchors it lexically: an
+                    # unanchored SetAttr inside a loop body was not owned by
+                    # the loop (`is_lexical_body_node`), so port
+                    # materialization rewired the loop's own effect chain
+                    # onto its own result port and closed a cycle.
+                    source=target,
                 )
             # In ``object.field += value`` the Attribute node is the read
             # feeding the AugAssign result.  Reusing that same node as the
@@ -2722,6 +2802,12 @@ def _normalize_lexical_values(
                     "SetAttr",
                     f"setattr[{target.attr}]",
                     attributes={"attribute": target.attr},
+                    # The write's own statement anchors it lexically: an
+                    # unanchored SetAttr inside a loop body was not owned by
+                    # the loop (`is_lexical_body_node`), so port
+                    # materialization rewired the loop's own effect chain
+                    # onto its own result port and closed a cycle.
+                    source=target,
                 )
             node_data = graph.G.nodes[node_id]
             node_data["type"] = "SetAttr"
@@ -3124,16 +3210,45 @@ def _normalize_lexical_values(
             output_names = tuple(
                 graph.G.graph.get("function_outputs", ())
             )
+            positional_names = set(
+                graph.G.graph.get("positional_output_names", ())
+            )
             resolved = []
+            slot_values: list[int | None] = []
             for index, expression in enumerate(expressions):
                 value = resolve_expression(expression)
+                slot_values.append(value if isinstance(value, int) else None)
                 if value is None:
                     continue
                 resolved.append(value)
-                if index < len(output_names):
+                if index < len(output_names) and (
+                    str(output_names[index]) in positional_names
+                ):
+                    # A positional slot has no binding of its own; its
+                    # history is the list of return-site values (each site
+                    # is also recorded exactly in `return_slot_values`). A
+                    # name-spelled slot IS a variable whose own binding
+                    # already holds this value -- appending it again would
+                    # only duplicate the entry and make the return site look
+                    # like a rebinding to every history consumer.
                     identity_bindings.setdefault(
                         str(output_names[index]), []
                     ).append(value)
+            # Every return statement names its OWN value per output slot.
+            # The identity history above is a single chain per slot, so any
+            # consumer reading ``history[-1]`` sees only the last return;
+            # a return nested in a loop or conditional must instead branch to
+            # the function exit carrying these exact values, where they are
+            # merged per slot (control-aware result merging, see
+            # docs/PLAN_CONTROL_AWARE_RESULT_MERGING.md). Key by source span:
+            # AST object ids do not survive reduction, spans do.
+            if returned is not None and getattr(returned, "lineno", None) is not None:
+                graph.G.graph.setdefault("return_slot_values", {})[(
+                    int(returned.lineno),
+                    int(getattr(returned, "col_offset", -1)),
+                    int(getattr(returned, "end_lineno", -1)),
+                    int(getattr(returned, "end_col_offset", -1)),
+                )] = tuple(slot_values)
             if len(expressions) == 1:
                 value = resolved[0] if resolved else None
                 if value is not None:
@@ -3717,6 +3832,78 @@ def _normalize_lexical_values(
                 loop_attributes["loop_carried_bindings"] = (
                     loop_carried_bindings
                 )
+                # Claim this loop's break/continue sites (a nested loop has
+                # already claimed its own).  For each ``break`` site, every
+                # name whose value at the site differs from its pre-loop
+                # value reaches the loop exit through that edge, keyed by the
+                # pre-loop identity so the exit merge can pair it with the
+                # carried (or zero-trip) value.  A name bound ONLY on break
+                # paths is not loop-carried (the fall-through path never
+                # rebinds it) yet still needs a post-loop identity: its
+                # continuation is the last break site's value, which the loop
+                # port materialization rewires onto a LoopResult port.
+                loop_start = int(getattr(body_statement, "lineno", -1))
+                loop_break_sites: dict[tuple[int, int, int, int], dict[int, int]] = {}
+                loop_break_bindings: dict[str, tuple[int, int]] = {}
+                for site_span, site in (
+                    graph.G.graph.get("loop_control_site_bindings") or {}
+                ).items():
+                    if (
+                        site.get("loop_id") is not None
+                        or not (loop_start <= int(site_span[0]) <= loop_end)
+                    ):
+                        continue
+                    site["loop_id"] = loop_id
+                    if site["action"] != "break":
+                        continue
+                    site_values: dict[int, int] = {}
+                    for name, value in site["bindings"].items():
+                        if name in loop_target_bindings:
+                            continue
+                        initial = before_loop.get(name)
+                        if (
+                            initial is None
+                            and name in parameter_names
+                            and name not in static_environment
+                        ):
+                            initial = input_value(name, binding_kind="parameter")
+                        if (
+                            initial is None
+                            or int(initial) == int(value)
+                            or int(initial) not in graph.G
+                            or int(value) not in graph.G
+                        ):
+                            continue
+                        site_values[int(initial)] = int(value)
+                        if name not in loop_carried_bindings:
+                            loop_break_bindings[name] = (int(initial), int(value))
+                    loop_break_sites[site_span] = site_values
+                    # The break edge CONSUMES these values (the loop-exit
+                    # merge reads them), so the Break node records them as
+                    # its inputs.  Without that edge a pre-loop parameter
+                    # whose only later reader is the exit merge has no
+                    # consumer yet and the planner prunes it as an unused
+                    # parameter before the merge exists.
+                    site_node_id = site.get("node_id")
+                    if site_values and site_node_id in graph.G:
+                        _replace_inputs(
+                            graph,
+                            site_node_id,
+                            (
+                                *(
+                                    (int(initial), "site_initial")
+                                    for initial in site_values
+                                ),
+                                *(
+                                    (int(value), "site_value")
+                                    for value in site_values.values()
+                                ),
+                            ),
+                        )
+                loop_attributes["loop_break_sites"] = loop_break_sites
+                loop_attributes["loop_break_bindings"] = loop_break_bindings
+                for name, (_initial, continuation) in loop_break_bindings.items():
+                    environment[name] = continuation
                 loop_attributes["loop_target_bindings"] = (
                     loop_target_bindings
                 )
@@ -3869,6 +4056,33 @@ def _normalize_lexical_values(
                         state_effects
                     )
             return id(body_statement)
+        if isinstance(body_statement, (ast.Break, ast.Continue)):
+            # A loop-control site leaves its arm with the arm's OWN bindings
+            # (``if c: dt_try = ...; break`` reaches the loop exit with that
+            # dt_try).  The ``if`` merge below deliberately drops a terminal
+            # arm's bindings from the fall-through environment, so the exit
+            # edge must carry them explicitly.  Record the environment at the
+            # site, keyed by source span (AST ids do not survive reduction);
+            # the enclosing loop claims the site when it finishes reducing.
+            graph.G.graph.setdefault("loop_control_site_bindings", {})[(
+                int(getattr(body_statement, "lineno", -1)),
+                int(getattr(body_statement, "col_offset", -1)),
+                int(getattr(body_statement, "end_lineno", -1)),
+                int(getattr(body_statement, "end_col_offset", -1)),
+            )] = {
+                "action": (
+                    "break" if isinstance(body_statement, ast.Break)
+                    else "continue"
+                ),
+                "bindings": {
+                    str(name): int(value)
+                    for name, value in environment.items()
+                    if isinstance(value, int) and not isinstance(value, bool)
+                },
+                "loop_id": None,
+                "node_id": id(body_statement),
+            }
+            return id(body_statement) if id(body_statement) in graph.G else None
         if isinstance(body_statement, ast.Expr):
             return resolve_expression(body_statement.value)
         for child in source_child_nodes(body_statement):
@@ -4152,6 +4366,17 @@ def _normalize_lexical_values(
         )
         for name, value_ids in identity_bindings.items()
     }
+    # Per-return slot values are ids in the pre-canonical space too.
+    graph.G.graph["return_slot_values"] = {
+        span: tuple(
+            None if value_id is None or value_id not in mapping
+            else mapping[value_id]
+            for value_id in slot_ids
+        )
+        for span, slot_ids in (
+            graph.G.graph.get("return_slot_values") or {}
+        ).items()
+    }
     # Ingestion spelling and SSA definition numbering are separate domains.
     # ``identity_table`` remains the compact compatibility map used by older
     # lowering code.  This ledger preserves the original common spelling and
@@ -4189,6 +4414,23 @@ def _normalize_lexical_values(
                     "loop_carried_bindings"
                 ].items()
                 if initial in mapping and updated in mapping
+            }
+        if "loop_break_bindings" in attributes:
+            attributes["loop_break_bindings"] = {
+                name: (mapping[initial], mapping[continuation])
+                for name, (initial, continuation) in attributes[
+                    "loop_break_bindings"
+                ].items()
+                if initial in mapping and continuation in mapping
+            }
+        if "loop_break_sites" in attributes:
+            attributes["loop_break_sites"] = {
+                span: {
+                    mapping[initial]: mapping[value]
+                    for initial, value in site_values.items()
+                    if initial in mapping and value in mapping
+                }
+                for span, site_values in attributes["loop_break_sites"].items()
             }
         if "loop_target_bindings" in attributes:
             attributes["loop_target_bindings"] = {

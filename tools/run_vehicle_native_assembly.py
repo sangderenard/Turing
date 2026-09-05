@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import numpy as np
 
@@ -177,21 +178,64 @@ class _PythonVehicleMaterial:
         self.vi = {name: index for index, name in enumerate(self.vehicle_names)}
         self.ci = {name: index for index, name in enumerate(self.contact_names)}
         self.fi = {name: index for index, name in enumerate(self.fixture_names)}
-        tire_program = (balloon_tire_python_program(
-                            self.wheel_names,
-                            pneumatic_mode=tire_pneumatic_mode,
-                            material_profile=tire_material_profile)
-                        if tire_dimensions is None else
-                        balloon_tire_python_program(
-                            self.wheel_names,
-                            tire_radius_m=tire_dimensions[0],
-                            tire_section_radius_m=tire_dimensions[1],
-                            tire_width_m=tire_dimensions[2],
-                            tire_mass_kg=tire_dimensions[3],
-                            reference_pressure_pa=tire_dimensions[4],
-                            rim_radius_m=tire_dimensions[5],
-                            pneumatic_mode=tire_pneumatic_mode,
-                            material_profile=tire_material_profile))
+        tire_kwargs = dict(pneumatic_mode=tire_pneumatic_mode,
+                           material_profile=tire_material_profile)
+        if tire_dimensions is not None:
+            tire_kwargs.update(
+                tire_radius_m=tire_dimensions[0],
+                tire_section_radius_m=tire_dimensions[1],
+                tire_width_m=tire_dimensions[2],
+                tire_mass_kg=tire_dimensions[3],
+                reference_pressure_pa=tire_dimensions[4],
+                rim_radius_m=tire_dimensions[5])
+        tire_program = balloon_tire_python_program(
+            self.wheel_names, **tire_kwargs)
+        # The tyre's critical explicit step, measured by power iteration on a
+        # one-wheel twin of the same skin (every wheel has the same stiffest
+        # mode).  The outer dt controller keeps steering the physical step;
+        # each outer step is divided into tyre microsteps that stay a fixed
+        # fraction under this limit (see vehicle_balloon_tire_stability).
+        from src.compiler.vehicle_balloon_tire_stability import (
+            estimate_tire_critical_dt)
+        stability = estimate_tire_critical_dt(
+            balloon_tire_python_program(("w",), **tire_kwargs))
+        self.tire_critical_dt_s = float(stability["dt_critical_s"])
+        print(json.dumps({
+            "tire_critical_dt_s": self.tire_critical_dt_s,
+            "tire_omega_max_rad_s": stability["omega_max_rad_s"],
+            "mode_tread_fraction": stability["mode_tread_fraction"],
+            "mode_sidewall_fraction": stability["mode_sidewall_fraction"],
+        }), flush=True)
+        # Live diagnostic only: the coarse four-station ring volume computed
+        # from the tire's own current u=0 column, alongside the mesh's real
+        # per-face volume, so the reduced law's accuracy and speed are
+        # visible while the validator runs -- it feeds nothing back into the
+        # simulation.  Native when TURING_LAW_NATIVE is set, eager otherwise.
+        from src.compiler.vehicle_tire_ring_model import compile_ring_volume_ssa
+        from src.compiler.vehicle_python_compilation import (
+            _abstract_tensor_stage_callable)
+        from src.compiler.native_law_kernels import NativeLawStage, native_backend
+
+        ring_compilation = compile_ring_volume_ssa()
+        ring_eager = _abstract_tensor_stage_callable(
+            ring_compilation, "tire_ring_volume")
+        ring_backend = native_backend()
+        self.ring_volume_stage = (
+            NativeLawStage(
+                "tire_ring_volume", ring_compilation, ring_eager, ring_backend)
+            if ring_backend else ring_eager)
+        bead_rows = np.nonzero(np.asarray(
+            tire_program.constants["bead_mask"], dtype=bool))[0]
+        ring_rows = (int(bead_rows[1] - bead_rows[0])
+                     if bead_rows[1] - bead_rows[0] > 1
+                     else int(np.nonzero(np.asarray(
+                         tire_program.constants["bead_mask"], dtype=bool
+                     )[1:])[0][0] + 1))
+        self.ring_station_rows = (0, ring_rows // 4, 3 * ring_rows // 4, ring_rows - 1)
+        self.ring_argument_names = tuple(
+            ring_compilation.function.metadata["argument_names"])
+        self.ring_station_names = ("bead_inboard", "shoulder_inboard",
+                                   "shoulder_outboard", "bead_outboard")
         self.tire_faces = np.asarray(
             tire_program.constants["face_vertices"], dtype=np.int64)
         self.tire_face_zones = tuple(tire_program.face_zones)
@@ -208,6 +252,16 @@ class _PythonVehicleMaterial:
         self.tire_shell_surface = "single-invariant-center-surface"
         self.tire_input_index = {
             name: index for index, name in enumerate(tire_program.input_names)}
+        # The tire program's own authored integration step (the dt of its
+        # default input row): the pre-trial bound on a round's first attempt.
+        self.declared_tire_dt_s = float(
+            np.asarray(tire_program.constants["default_input"])[
+                self.tire_input_index["dt"]])
+        # Every feed carries a batch axis; the validator drives lane 0 and the
+        # same inputs are broadcast to every other lane each tick, so the
+        # whole batch is one physical situation unless a per-lane spread is
+        # applied below.  Reads for the harness/viewer stay on lane 0.
+        self.lanes = int(self.feeds["vehicle_input"].shape[0])
         self.last = None
         self._visual_lock = threading.Lock()
         self._visual_snapshot = None
@@ -280,6 +334,16 @@ class _PythonVehicleMaterial:
         self.feeds["tire_input"].data[:, self.tire_input_index[
             "gas_charge_fraction"]] = float(charge)
 
+    def set_tire_fidelity_mode(self, mode):
+        """0.0 = fine (today's full deformable mesh contact), 1.0 = reduced
+        (lumped fallback-spring force from the real ring geometry). See
+        docs/PLAN_TIRE_FIDELITY_LADDER.md. No time-of-impact ramp yet on the
+        reduced path -- pair with a small --tire-dt-fraction to avoid an
+        impulsive first-contact step until that lands.
+        """
+        self.feeds["tire_input"].data[:, self.tire_input_index[
+            "tire_fidelity_mode"]] = float(mode)
+
     def set_pillar_pose(self, wheel, alpha, pose):
         index = int(wheel)
         self.feeds["pillar_alpha"].data[0, index] = float(alpha)
@@ -302,31 +366,31 @@ class _PythonVehicleMaterial:
 
     def tick(self, vehicle_in, contact_in, fixture_in, vehicle_out,
              publish_visual=True):
-        self.feeds["vehicle_input"].data[0, :] = tuple(vehicle_in)
+        self.feeds["vehicle_input"].data[:, :] = tuple(vehicle_in)
         validator_contact = np.asarray(tuple(contact_in)).reshape(
             (4, len(self.contact_names)))
-        graph_contact = self.feeds["contact_input"].data[0]
-        graph_contact[:, :] = 0.0
-        graph_contact[:, 3:6] = validator_contact[:, [
+        graph_contact = self.feeds["contact_input"].data
+        graph_contact[:, :, :] = 0.0
+        graph_contact[:, :, 3:6] = validator_contact[:, [
             self.ci["attachment_x"], self.ci["attachment_y"],
             self.ci["attachment_z"],
         ]]
         fixture_values = np.asarray(tuple(fixture_in))
-        self.feeds["fixture_global"].data[0, :] = tuple(
+        self.feeds["fixture_global"].data[:, :] = tuple(
             fixture_values[self.fi[name]] for name in (
                 "dt", "mode", "gravity", "floor_y", "carriage_mass",
                 "neutral_buoyancy", "passive_damping", "lock_stiffness",
                 "lock_damping", "maximum_actuator_force",
             ))
         for wheel, corner in enumerate(CORNERS[:len(self.wheel_names)]):
-            self.feeds["fixture_wheel"].data[0, wheel, :] = tuple(
+            self.feeds["fixture_wheel"].data[:, wheel, :] = tuple(
                 (fixture_values[self.fi[f"{stem}_{corner}"]]
                  if f"{stem}_{corner}" in self.fi else 0.0) for stem in (
                     "hub_y", "hub_velocity_y", "carriage_y",
                     "carriage_velocity_y", "command_y", "command_velocity_y",
                     "roller_reaction", "mode",
                 ))
-        self.feeds["fixture_surface"].data[0, :] = tuple(
+        self.feeds["fixture_surface"].data[:, :] = tuple(
             fixture_values[self.fi[name]] for name in (
                 "surface_mode", "terrain_phase_x", "terrain_phase_z",
                 "terrain_velocity_x", "terrain_velocity_z",
@@ -334,7 +398,7 @@ class _PythonVehicleMaterial:
             ))
         vin = self.feeds["vehicle_input"].data
         for wheel, corner in enumerate(CORNERS):
-            self.feeds["wheel_assembly_alpha"].data[0, wheel] = vin[
+            self.feeds["wheel_assembly_alpha"].data[:, wheel] = vin[
                 0, self.vi[f"assembly_alpha_{corner}"]]
             for feed_name, field in (
                 ("compression", "compression"),
@@ -342,12 +406,25 @@ class _PythonVehicleMaterial:
                 ("wheel_angle", "wheel_angle"),
                 ("wheel_omega", "wheel_omega"),
             ):
-                self.feeds[feed_name].data[0, wheel] = vin[
+                self.feeds[feed_name].data[:, wheel] = vin[
                     0, self.vi[f"{field}_{corner}"]]
-        self.feeds["outer_dt"].data[0] = vin[0, self.vi["dt"]]
+        self.feeds["outer_dt"].data[:] = vin[0, self.vi["dt"]]
         arguments = [self.feeds[name] for name in self.feed_order]
+        _diagnose_fidelity = getattr(self, "_fidelity_diagnostic_ticks", 0) < 5
+        if _diagnose_fidelity:
+            before = float(np.asarray(self.feeds["tire_input"].data)[
+                0, self.tire_input_index["tire_fidelity_mode"]])
+            print(f"[fidelity-diagnostic] tick {getattr(self, '_fidelity_diagnostic_ticks', 0)} "
+                 f"tire_fidelity_mode BEFORE entrypoint call: {before}", flush=True)
         with AbstractTensor.use_backend("numpy"):
             result = self.entrypoint(*arguments)
+        if _diagnose_fidelity:
+            after = float(np.asarray(self._data(result[4]))[
+                0, self.tire_input_index["tire_fidelity_mode"]])
+            print(f"[fidelity-diagnostic] tick {getattr(self, '_fidelity_diagnostic_ticks', 0)} "
+                 f"tire_fidelity_mode AFTER entrypoint call (result[4], what "
+                 f"becomes tire_input next tick): {after}", flush=True)
+            self._fidelity_diagnostic_ticks = getattr(self, "_fidelity_diagnostic_ticks", 0) + 1
         self.last = result
         self._copy_flat(vehicle_out, self._data(result[0]))
         graph_contact_result = self._data(result[1])[0]
@@ -381,6 +458,8 @@ class _PythonVehicleMaterial:
                 self.feeds["node_reference"],
                 self.feeds["node_structural_support_binding"])
         snapshot = {
+            "tire_fidelity_mode": float(np.asarray(self._data(result[4]))[
+                0, self.tire_input_index["tire_fidelity_mode"]]),
             "tire_position": self._data(result[5])[0, :, :, 0:3].copy(),
             "tire_faces": self.tire_faces.copy(),
             "tire_face_zones": self.tire_face_zones,
@@ -407,6 +486,33 @@ class _PythonVehicleMaterial:
     def tire_diagnostics(self, output):
         if self.last is not None:
             self._copy_flat(output, self._data(self.last[6]))
+
+    def spread_tire_input(self, name: str, spread: float) -> np.ndarray:
+        """Scale one tire input across lanes by (1 - spread) .. (1 + spread).
+
+        Lane 0 keeps the authored value (it is what the validator observes);
+        the other lanes fan out around it so the batch exercises a family of
+        tires in one tensor program.  Returns the per-lane factors.
+        """
+
+        column = self.tire_input_index[name]
+        factors = np.ones(self.lanes, dtype=np.float64)
+        if self.lanes > 1 and spread > 0.0:
+            factors[1:] = np.linspace(1.0 - spread, 1.0 + spread, self.lanes - 1)
+        data = self.feeds["tire_input"].data
+        data[:, column] = data[0, column] * factors
+        return factors
+
+    def lane_summary(self) -> str:
+        """One line per lane: peak tire speed and mean gas pressure."""
+
+        state = self._data(self.feeds["tire_state"])
+        output = self._data(self.feeds["tire_output"])
+        speed = np.sqrt((state[..., 3:6] ** 2).sum(-1)).reshape(self.lanes, -1).max(1)
+        pressure = output[..., 6].reshape(self.lanes, -1).mean(1)
+        return " | ".join(
+            f"lane{lane}: v={speed[lane]:.3g} m/s p={pressure[lane]:.4g} Pa"
+            for lane in range(self.lanes))
 
     def tire_state(self, output):
         self._copy_flat(output, self._data(self.feeds["tire_state"]))
@@ -489,6 +595,9 @@ class _DuallyDTState:
         self.contact_in = contact_in
         self.fixture_in = fixture_in
         self.vehicle_out = vehicle_out
+
+    def dt_limit_hint(self):
+        return float(self.material.declared_tire_dt_s)
 
     def copy_shallow(self):
         feeds = {
@@ -594,7 +703,8 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
         fixture_defaults[f"command_y_{corner}"] = carriage_y
         fixture_defaults[f"mode_{corner}"] = 1.0
 
-    prepared = dually_vehicle_python_compilation_inputs()
+    prepared = dually_vehicle_python_compilation_inputs(
+        batch_size=max(1, int(args.lanes)))
     material = _PythonVehicleMaterial(
         vehicle_names, output_names, contact_names, fixture_names,
         profile.wheel_names, profile.fixture_plan.wheel_to_structural_support,
@@ -616,15 +726,26 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
         material.set_roller_anchor(wheel, attachment[0], attachment[2])
     ambient_charge = min(1.0, 101_325.0 / rated_pressure)
     material.set_tire_gas_charge(ambient_charge)
+    material.set_tire_fidelity_mode(1.0 if args.tire_fidelity_mode == "reduced" else 0.0)
 
     state = _DuallyDTState(
         material, vehicle_in, contact_in, fixture_in, vehicle_out)
     # No live-mode floor: the repository controller may subdivide as far as
     # the authored membrane's actual error requires before retaining a step.
     controller = STController(dt_min=None, dt_max=frame_dt)
+    rollback_enabled = str(args.dt_lane) == "rollback"
+    tire_dt_fraction = float(args.tire_dt_fraction)
+    _trace_budget = [int(os.environ.get("TURING_TRACE_SUBSTEPS", "0") or 0)]
+    from src.compiler.vehicle_balloon_tire_stability import tire_microstep_count
+    run_started = time.time()
+    tick_seconds = [0.0]
+    wait_seconds = [0.0]
     targets = Targets(
         cfl=0.22, div_max=1.0, mass_max=1.0,
-        error_limits={"maximum_substep_displacement_m": 0.006})
+        error_limits={"maximum_substep_displacement_m": 0.006},
+        energy_exchange_fraction=(
+            None if args.dt_energy_fraction <= 0.0 else float(args.dt_energy_fraction)),
+    )
     stop = threading.Event()
     status_lock = threading.Condition()
     live = {
@@ -715,15 +836,45 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
                     800.0, 1_200.0, 800.0, 60_000.0))
             grasp_configured = True
 
+    _tick_profile_budget = [int(os.environ.get("TURING_PROFILE_TICKS", "0") or 0)]
+    _tick_profiler = None
+    if _tick_profile_budget[0] > 0:
+        import cProfile
+        _tick_profiler = cProfile.Profile()
+
     def advance(_state, dt_value):
         dt_value = float(dt_value)
         attempted_time = accepted_clock[0] + dt_value
         previous = material._data(
             material.feeds["tire_state"])[0, ..., 0:3].copy()
+        previous_velocity = material._data(
+            material.feeds["tire_state"])[0, ..., 3:6].copy()
         vehicle_in[vi["dt"]] = dt_value
         fixture_in[fi["dt"]] = dt_value
-        material.tick(vehicle_in, contact_in, fixture_in, vehicle_out,
-                      publish_visual=False)
+        microstep_count_used = tire_microstep_count(
+            dt_value, material.tire_critical_dt_s, tire_dt_fraction)
+        material.feeds["microstep_count"] = microstep_count_used
+        tick_started = time.perf_counter()
+        if _tick_profiler is not None and _tick_profile_budget[0] > 0:
+            # TURING_PROFILE_TICKS=N: profile the first N substep ticks and
+            # print where the time goes, once, so a slow frame is attributed
+            # to a line rather than guessed at.
+            _tick_profiler.enable()
+            material.tick(vehicle_in, contact_in, fixture_in, vehicle_out,
+                          publish_visual=False)
+            _tick_profiler.disable()
+            _tick_profile_budget[0] -= 1
+            if _tick_profile_budget[0] == 0:
+                import pstats, io as _io
+                for key in ("tottime", "cumulative"):
+                    sink = _io.StringIO()
+                    pstats.Stats(_tick_profiler, stream=sink).sort_stats(key).print_stats(28)
+                    print(f"PROFILE ({key})" + chr(10) + sink.getvalue(), flush=True)
+                print("PROFILE DONE", flush=True)
+        else:
+            material.tick(vehicle_in, contact_in, fixture_in, vehicle_out,
+                          publish_visual=False)
+        tick_seconds[0] += time.perf_counter() - tick_started
         tire_state = material._data(material.feeds["tire_state"])[0]
         position = tire_state[..., 0:3]
         velocity = tire_state[..., 3:6]
@@ -737,7 +888,48 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
                                     error_matrix.shape)
         error_location = f"{profile.wheel_names[offender[0]]}:vertex-{offender[1]}"
         maximum_velocity = float(np.max(np.linalg.norm(velocity, axis=-1)))
+        # Live diagnostic: the coarse ring law's volume from the tire's
+        # current u=0 column, next to the mesh's real per-face volume, so
+        # the reduced law's accuracy and speed are visible while this runs.
+        # Feeds nothing back -- lane 0 only, one column, purely reported.
+        ring_points = position[:, material.ring_station_rows, :]
+        ring_r = np.hypot(ring_points[..., 0], ring_points[..., 1])
+        ring_z = ring_points[..., 2]
+        station_values = {}
+        for index, name in enumerate(material.ring_station_names):
+            station_values[f"{name}_r"] = ring_r[:, index]
+            station_values[f"{name}_z"] = ring_z[:, index]
+        ring_call_started = time.perf_counter()
+        ring_volume_out, ring_area_out = material.ring_volume_stage(*(
+            AbstractTensor.tensor(station_values[name])
+            for name in material.ring_argument_names))
+        ring_call_seconds = time.perf_counter() - ring_call_started
+        ring_volume_m3 = np.asarray(getattr(
+            ring_volume_out, "data", ring_volume_out)).reshape(-1)
+        face_position = position[:, material.tire_faces, :]
+        mesh_volume_m3 = np.sum(
+            face_position[:, :, 0, 0] * (face_position[:, :, 1, 1] * face_position[:, :, 2, 2]
+                                         - face_position[:, :, 1, 2] * face_position[:, :, 2, 1])
+            + face_position[:, :, 0, 1] * (face_position[:, :, 1, 2] * face_position[:, :, 2, 0]
+                                           - face_position[:, :, 1, 0] * face_position[:, :, 2, 2])
+            + face_position[:, :, 0, 2] * (face_position[:, :, 1, 0] * face_position[:, :, 2, 1]
+                                           - face_position[:, :, 1, 1] * face_position[:, :, 2, 0]),
+            axis=1) / 6.0
         pressure = material._data(material.feeds["tire_output"])[..., 6]
+        # Energy/power time scale for the controller (lane 0): stored energy
+        # is kinetic plus membrane strain and bending energy; power is the
+        # kinetic exchange this step plus the reported dissipation, as
+        # magnitudes.  Same channels the managed tire publishes.
+        vertex_mass = float(material._data(material.feeds["tire_input"])[
+            0, material.tire_input_index["vertex_mass_kg"]])
+        kinetic_after = 0.5 * vertex_mass * float((velocity * velocity).sum())
+        kinetic_before = 0.5 * vertex_mass * float(
+            (previous_velocity * previous_velocity).sum())
+        tire_output_lane = material._data(material.feeds["tire_output"])[0]
+        stored_energy = kinetic_after + float(
+            tire_output_lane[:, 11].sum() + tire_output_lane[:, 13].sum())
+        exchange_power = (abs(kinetic_after - kinetic_before) / max(dt_value, 1e-30)
+                          + abs(float(tire_output_lane[:, 12].sum())))
         finite = bool(np.isfinite(tire_state).all() and np.isfinite(pressure).all())
         position_in_bounds = bool(np.max(np.abs(position)) < 100.0)
         pressure_below_limit = bool(np.max(pressure) < rated_pressure * 3.0)
@@ -765,7 +957,10 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
         accepted = floor_accepted or (
             physical and displacement <= rollback_limit)
         soft_accepted = accepted and displacement > 0.006
-        if accepted:
+        # Under the no-restore lane every attempt IS the state: nothing is
+        # ever restored, so the clock and the picture advance with it and
+        # the controller steers dt from the published metrics instead.
+        if accepted or not rollback_enabled:
             material.commit_pending_visual_snapshot()
             accepted_clock[0] += dt_value
         with status_lock:
@@ -794,8 +989,48 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
             status_lock.notify_all()
             # Do not let a fast retry overwrite this dt before the live
             # viewer has actually presented it.
+            wait_started = time.perf_counter()
             while displayed_attempt[0] < attempt_index and not stop.is_set():
                 status_lock.wait(timeout=0.1)
+            wait_seconds[0] += time.perf_counter() - wait_started
+        accepted_count = int(live["accepted_substeps"])
+        if _trace_budget[0] > 0:
+            # TURING_TRACE_SUBSTEPS=N: one line per attempted substep for the
+            # first N, to see a startup impulse as it happens.
+            _trace_budget[0] -= 1
+            tire_state_now = material._data(material.feeds["tire_state"])[0]
+            speed = np.linalg.norm(tire_state_now[..., 3:6], axis=-1)
+            fastest = np.unravel_index(int(np.argmax(speed)), speed.shape)
+            print(json.dumps({
+                "trace_substep": accepted_count, "sim_time_s": accepted_clock[0],
+                "dt_s": dt_value, "tire_microsteps": microstep_count_used,
+                "accepted": bool(accepted), "vmax_m_s": float(speed.max()),
+                "vmax_wheel": int(fastest[0]), "vmax_vertex": int(fastest[1]),
+                "v_p95_m_s": float(np.percentile(speed, 95.0)),
+                "energy_j": stored_energy, "displacement_m": displacement,
+            }), flush=True)
+        if accepted and accepted_count % 20 == 0:
+            # A heartbeat: the run prints only rejections otherwise, so a
+            # healthy run would be indistinguishable from a stalled one.
+            print(json.dumps({
+                "heartbeat": accepted_count,
+                "sim_time_s": accepted_clock[0],
+                "dt_s": dt_value,
+                "maximum_velocity_m_s": maximum_velocity,
+                "energy_j": stored_energy,
+                "power_w": exchange_power,
+                "maximum_displacement_m": displacement,
+                "wall_s": time.time() - run_started,
+                "tire_microsteps": microstep_count_used,
+                "tire_dt_s": dt_value / microstep_count_used,
+                "tire_critical_dt_s": material.tire_critical_dt_s,
+                "native_laws": _native_law_report(),
+                "ring_volume_m3": ring_volume_m3.round(6).tolist(),
+                "mesh_volume_m3": mesh_volume_m3.round(6).tolist(),
+                "ring_call_us": round(ring_call_seconds * 1e6, 1),
+                "tick_s_per_substep": tick_seconds[0] / max(accepted_count, 1),
+                "viewer_wait_s_per_substep": wait_seconds[0] / max(accepted_count, 1),
+            }), flush=True)
         if not accepted:
             print(json.dumps({
                 "dt_attempt_s": dt_value,
@@ -814,7 +1049,11 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
         return physical, Metrics(
             max_vel=maximum_velocity, max_flux=maximum_velocity,
             div_inf=0.0, mass_err=0.0,
-            error_channels={"maximum_substep_displacement_m": displacement},
+            error_channels={
+                "maximum_substep_displacement_m": displacement,
+                "energy_j": stored_energy,
+                "power_w": exchange_power,
+            },
             advanced_dt=dt_value)
 
     def worker() -> None:
@@ -844,7 +1083,8 @@ def _run_dually_python_profile(args, bundle: Path) -> int:
                         advance, allow_increase_mid_round=True,
                         max_retries=None,
                         rollback_threshold_multiplier=(
-                            rollback_threshold_multiplier))
+                            rollback_threshold_multiplier),
+                        rollback=rollback_enabled)
                     advanced = float(advanced)
                     if advanced <= 0.0 or metrics.hard_failure:
                         raise RuntimeError(
@@ -939,6 +1179,17 @@ def _outer_rate_hz(args, config) -> int:
     return int(derive_vehicle_rig_rate_hz(config))
 
 
+
+def _native_law_report():
+    """Per-law native kernel calls/seconds when TURING_LAW_NATIVE is set."""
+
+    try:
+        from src.compiler.native_law_kernels import native_law_report
+    except Exception:
+        return {}
+    return {key: {"calls": int(v["calls"]), "s": round(float(v["seconds"]), 3), "native": int(v["native"])}
+            for key, v in native_law_report().items()}
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("bundle", type=Path,
@@ -988,6 +1239,30 @@ def main() -> int:
     parser.add_argument("--dually-stage-seconds", type=float, default=0.25,
                         help="simulated duration assigned to each dually assembly stage")
     parser.add_argument(
+        "--dt-lane", choices=("no-restore", "rollback"), default="no-restore",
+        help=("dt-system lane for the Python-material dually run: 'no-restore' "
+              "never copies or restores the state (dt is steered by the "
+              "published energy/power and displacement metrics); 'rollback' "
+              "is the copy-and-retry lane"))
+    parser.add_argument(
+        "--tire-dt-fraction", type=float, default=0.3,
+        help=("the tyre's microstep as a fraction of its measured critical "
+              "explicit step (2/omega_max); each outer dt-controller step is "
+              "divided into enough tyre microsteps to stay under it"))
+    parser.add_argument(
+        "--dt-energy-fraction", type=float, default=0.1,
+        help=("fraction of the tire's stored energy one substep may exchange "
+              "(Targets.energy_exchange_fraction); 0 disables the pin"))
+    parser.add_argument(
+        "--lanes", type=int, default=8,
+        help=("batch lanes the Python-material dually run simulates in one "
+              "tensor program (the viewer shows lane 0)"))
+    parser.add_argument(
+        "--lane-pressure-spread", type=float, default=0.10,
+        help=("fan the tire reference pressure of lanes 1..N-1 across "
+              "(1-spread)..(1+spread) of lane 0's value so the batch is a "
+              "family of tires, not eight copies"))
+    parser.add_argument(
         "--rate-hz", type=int, default=None,
         help=("outer tick rate; default derives the model's physical rate, the "
               "same rule as build_vehicle_validator_native.py's default"))
@@ -996,6 +1271,14 @@ def main() -> int:
         help=("retain a numerically over-threshold proposal for next-frame dt "
               "correction unless its error exceeds this multiple; physical "
               "and hard failures always roll back"))
+    parser.add_argument(
+        "--tire-fidelity-mode", choices=("fine", "reduced"), default="fine",
+        help=("fine (default): today's full deformable-mesh tire contact. "
+              "reduced: the lumped fallback-spring force from the real ring "
+              "geometry (docs/PLAN_TIRE_FIDELITY_LADDER.md), applied at the "
+              "bead ring. No ramp-in yet on first contact -- pair with a "
+              "small --tire-dt-fraction (e.g. 0.01) to avoid an impulsive "
+              "first-contact step."))
     args = parser.parse_args()
     resume_requested = any((args.resume_report, args.resume_telemetry, args.start_stage))
     if resume_requested and not all((args.resume_report, args.resume_telemetry,

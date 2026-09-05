@@ -22,6 +22,11 @@ from .vehicle_balloon_tire import balloon_tire_graph_abi
 
 MAX_PLANES_PER_WHEEL = 2
 
+#: Same four ring stations as vehicle_tire_ring_model.py's Pappus volume law
+#: and vehicle_tire_reduced_contact_law.py's fallback-spring law -- one
+#: shared geometry, not independently tuned per law.
+_STATIONS = ("bead_inboard", "shoulder_inboard", "shoulder_outboard", "bead_outboard")
+
 
 BALLOON_TIRE_VECTOR_SOURCE = '''
 def vector_cross(left, right):
@@ -57,6 +62,177 @@ def balloon_tire_vector_initialize(inputs, state, wheel_input_indices, rest):
     state[:, :, :, 0:3] = hub.reshape((batch_count, wheel_count, 1, 3)) + radius
     state[:, :, :, 3:6] = hub_velocity.reshape((batch_count, wheel_count, 1, 3)) + vector_cross(omega.reshape((batch_count, wheel_count, 1, 3)), radius)
     return state
+
+
+def balloon_tire_reduced_vector_step(inputs, state, output, wheel_input_indices, rest,
+                                     face_vertices, face_rest, face_scatter,
+                                     bending_incidence, bending_scatter,
+                                     bending_weight, vertex_area, bead_mask,
+                                     face_material):
+    """The reduced/wrench/wrench-per-vertex tire fidelity modes (1/2/3),
+    called by the host INSTEAD OF balloon_tire_vector_step -- not a branch
+    inside it.  fine (mode 0) is training-data-only; deployed/live rig work
+    uses one of these.  Never runs the membrane, bending, or bead-implicit
+    solve (the actually expensive part per step) -- the tire mesh is purely
+    kinematic (rigidly follows the hub, exactly like balloon_tire_vector_
+    initialize), and rim_force/rim_moment come directly from whichever
+    reduced contact law tire_fidelity_mode selects.  Same signature as
+    balloon_tire_vector_step (drop-in host dispatch) even though the mesh
+    geometry/material arguments are unused here -- extend never shrink.
+    A trimmed-signature variant was tried and reverted: it did not fix the
+    (4,4,144,144)x(4,1,144,3) shape-mismatch this hits during standalone
+    native-shim lowering (docs/PLAN_TIRE_FIDELITY_LADDER.md) -- the same
+    error appeared one stage earlier instead, so unused arguments were not
+    the actual cause. Root cause still open.
+    """
+
+    batch_count = inputs.shape[0]
+    wheel_count = wheel_input_indices.shape[0]
+    wheel_input = inputs.gather(wheel_input_indices.reshape((-1,)), dim=1).reshape((batch_count, wheel_count, 41))
+    hub = wheel_input[:, :, 0:3]
+    hub_velocity = wheel_input[:, :, 3:6]
+    basis = wheel_input[:, :, 6:15].reshape((batch_count, wheel_count, 3, 3))
+    angle = wheel_input[:, :, 18]
+    cosine = angle.cos().reshape((batch_count, wheel_count, 1))
+    sine = angle.sin().reshape((batch_count, wheel_count, 1))
+    local = rest.reshape((1, 1, -1, 3))
+    rotated_local = AbstractTensor.stack([
+        cosine * local[:, :, :, 0] - sine * local[:, :, :, 1],
+        sine * local[:, :, :, 0] + cosine * local[:, :, :, 1],
+        local[:, :, :, 2] * AbstractTensor.ones_like(cosine),
+    ], dim=-1)
+    reference = hub.reshape((batch_count, wheel_count, 1, 3)) + AbstractTensor.matmul(rotated_local, basis)
+    total_omega = wheel_input[:, :, 15:18] + wheel_input[:, :, 19].reshape((batch_count, wheel_count, 1)) * basis[:, :, 2, :]
+    velocity = hub_velocity.reshape((batch_count, wheel_count, 1, 3)) + vector_cross(
+        total_omega.reshape((batch_count, wheel_count, 1, 3)), reference - hub.reshape((batch_count, wheel_count, 1, 3)))
+    position = reference
+    state[:, :, :, 0:3] = position
+    state[:, :, :, 3:6] = velocity
+
+    batch_offset = AbstractTensor.arange(position.shape[0]).reshape((-1, 1, 1, 1)) * (wheel_count * position.shape[2])
+    wheel_vertex_offset = AbstractTensor.arange(wheel_count).reshape((1, wheel_count, 1, 1)) * position.shape[2]
+    face_index = batch_offset + wheel_vertex_offset + face_vertices.reshape((1, 1, -1, 3))
+    face_position = position.reshape((-1, 3)).gather(face_index.reshape((-1,)), dim=0).reshape((batch_count, wheel_count, face_vertices.shape[0], 3, 3))
+    volume = (face_position[:, :, :, 0, :] * vector_cross(
+        face_position[:, :, :, 1, :], face_position[:, :, :, 2, :])).sum(dim=-1).sum(dim=2) / 6.0
+    gas_result = balloon_tire_gas(
+        volume, inputs[:, 7].reshape((-1, 1)), inputs[:, 12].reshape((-1, 1)),
+        (inputs[:, 3] * inputs[:, 4].maximum(0.0)).reshape((-1, 1)),
+        inputs[:, 6].reshape((-1, 1)), inputs[:, 5].reshape((-1, 1)))
+    gas_pressure = gas_result[0]
+    volume_ratio = gas_result[1]
+    gas_temperature = gas_result[2]
+
+    fidelity_mode = inputs[:, 24].reshape((-1, 1))
+    station_r = [inputs[:, 25].reshape((-1, 1)), inputs[:, 26].reshape((-1, 1)),
+                inputs[:, 27].reshape((-1, 1)), inputs[:, 28].reshape((-1, 1))]
+    station_z = [inputs[:, 29].reshape((-1, 1)), inputs[:, 30].reshape((-1, 1)),
+                inputs[:, 31].reshape((-1, 1)), inputs[:, 32].reshape((-1, 1))]
+    ground_y = wheel_input[:, :, 24]
+    roller_engaged = (wheel_input[:, :, 22] > 0.5).to_dtype("float64")
+    depth = (hub[:, :, 1] - ground_y).reshape((batch_count, wheel_count))
+    _gauss5_nodes = (0.0, 0.5384693101056831, -0.5384693101056831,
+                     0.9061798459386640, -0.9061798459386640)
+    _gauss5_weights = (0.5688888888888889, 0.4786286704993665, 0.4786286704993665,
+                       0.2369268850561891, 0.2369268850561891)
+    contact_patch_area = depth * 0.0
+    for _segment in range(3):
+        r0, r1 = station_r[_segment], station_r[_segment + 1]
+        z0, z1 = station_z[_segment], station_z[_segment + 1]
+        half_length = ((z1 - z0) / 2.0).reshape((batch_count, 1))
+        segment_area = depth * 0.0
+        for _node, _weight in zip(_gauss5_nodes, _gauss5_weights):
+            _t = (_node + 1.0) / 2.0
+            radius_here = (r0 + _t * (r1 - r0)).reshape((batch_count, 1))
+            chord_width = 2.0 * (radius_here * radius_here - depth * depth).maximum(0.0).sqrt()
+            segment_area = segment_area + _weight * chord_width
+        contact_patch_area = contact_patch_area + segment_area * half_length.abs()
+    bead_selector = bead_mask.reshape((1, 1, -1, 1)).to_dtype("float64")
+    bead_vertex_count = bead_mask.reshape((1, -1)).to_dtype("float64").sum(dim=1).maximum(1.0)
+    bead_mean_velocity_y = (velocity[:, :, :, 1] * bead_selector[:, :, :, 0]).sum(dim=2) / bead_vertex_count
+    reduced_damping_force_y = inputs[:, 20].reshape((-1, 1)) * bead_mean_velocity_y
+    reduced_force_y_raw = ((gas_pressure * contact_patch_area - reduced_damping_force_y)
+                           * roller_engaged).maximum(0.0)
+    mode1_gate = ((fidelity_mode - 1.0).abs() < 0.5).to_dtype("float64")
+    mode2_gate = ((fidelity_mode - 2.0).abs() < 0.5).to_dtype("float64")
+    mode3_gate = ((fidelity_mode - 3.0).abs() < 0.5).to_dtype("float64")
+    reduced_force_y = reduced_force_y_raw * mode1_gate.reshape((batch_count, 1))
+    rim_force = AbstractTensor.stack([
+        reduced_force_y * 0.0, reduced_force_y, reduced_force_y * 0.0], dim=-1)
+    rim_moment = rim_force * 0.0
+
+    shoulder_r = (0.5 * (station_r[1] + station_r[2])).reshape((batch_count, 1, 1))
+    surface_kind_q = wheel_input[:, :, 20].reshape((batch_count, wheel_count, 1))
+    cylinder_radius_q = wheel_input[:, :, 21].reshape((batch_count, wheel_count, 1))
+    plane_point_q = wheel_input[:, :, 23:26].reshape((batch_count, wheel_count, 1, 3))
+    plane_normal_q = wheel_input[:, :, 26:29].reshape((batch_count, wheel_count, 1, 3))
+    wrench_k = inputs[:, 33].reshape((batch_count, 1, 1))
+    wrench_c = inputs[:, 34].reshape((batch_count, 1, 1))
+
+    def _wrench_force(query_position, query_velocity):
+        to_plane = ((query_position - plane_point_q) * plane_normal_q).sum(dim=-1)
+        radial = query_position[:, :, :, 0:2] - plane_point_q[:, :, :, 0:2]
+        radial_length = ((radial * radial).sum(dim=-1) + 1.0e-24).sqrt()
+        to_cylinder = radial_length - cylinder_radius_q
+        cylinder_direction = AbstractTensor.stack([
+            radial[:, :, :, 0] / radial_length, radial[:, :, :, 1] / radial_length,
+            radial_length * 0.0], dim=-1)
+        is_cylinder = (surface_kind_q >= 0.5).reshape(surface_kind_q.shape[:3] + (1,))
+        surface_distance = AbstractTensor.where(surface_kind_q >= 0.5, to_cylinder, to_plane)
+        direction = AbstractTensor.where(is_cylinder, cylinder_direction,
+                                         plane_normal_q * AbstractTensor.ones_like(cylinder_direction))
+        penetration = (shoulder_r - surface_distance).maximum(0.0)
+        closing_velocity = (query_velocity * direction).sum(dim=-1)
+        magnitude = (wrench_k.reshape(wrench_k.shape[:2] + (1,)) * penetration
+                    - wrench_c.reshape(wrench_c.shape[:2] + (1,)) * closing_velocity).maximum(0.0)
+        engaged = roller_engaged.reshape(roller_engaged.shape + (1,)) * (penetration > 0.0).to_dtype("float64")
+        return magnitude.reshape(magnitude.shape + (1,)) * engaged.reshape(engaged.shape + (1,)) * direction
+
+    hub_query_position = hub.reshape((batch_count, wheel_count, 1, 3))
+    hub_query_velocity = hub_velocity.reshape((batch_count, wheel_count, 1, 3))
+    wrench_force_hub = _wrench_force(hub_query_position, hub_query_velocity)[:, :, 0, :]
+    rim_force = rim_force + wrench_force_hub * mode2_gate.reshape((batch_count, 1, 1))
+
+    wrench_force_per_vertex = _wrench_force(position, velocity) * bead_selector
+    arm = position - hub.reshape((batch_count, wheel_count, 1, 3))
+    moment_per_vertex = AbstractTensor.stack([
+        arm[..., 1] * wrench_force_per_vertex[..., 2] - arm[..., 2] * wrench_force_per_vertex[..., 1],
+        arm[..., 2] * wrench_force_per_vertex[..., 0] - arm[..., 0] * wrench_force_per_vertex[..., 2],
+        arm[..., 0] * wrench_force_per_vertex[..., 1] - arm[..., 1] * wrench_force_per_vertex[..., 0],
+    ], dim=-1)
+    rim_force = rim_force + wrench_force_per_vertex.sum(dim=2) * mode3_gate.reshape((batch_count, 1, 1))
+    rim_moment = rim_moment + moment_per_vertex.sum(dim=2) * mode3_gate.reshape((batch_count, 1, 1))
+
+    output[:, :, 0:3], output[:, :, 3:6] = rim_force, rim_moment
+    output[:, :, 6], output[:, :, 7], output[:, :, 8] = gas_pressure, volume_ratio, gas_temperature
+    output[:, :, 9] = roller_engaged * (mode1_gate + mode2_gate + mode3_gate).reshape((batch_count, 1))
+    output[:, :, 10] = position[:, :, :, 1].min(dim=2)
+    output[:, :, 11], output[:, :, 12], output[:, :, 13] = (
+        output[:, :, 11] * 0.0, output[:, :, 12] * 0.0, output[:, :, 13] * 0.0)
+    return state, output
+
+
+def balloon_tire_reduced_microstep_loop(inputs, state, output, wheel_input_indices, rest,
+                                        face_vertices, face_rest, face_scatter,
+                                        bending_incidence, bending_scatter,
+                                        bending_weight, vertex_area, bead_mask,
+                                        face_material, repeat_count):
+    """The native-shim entry point: one Python/eager dispatch runs
+    ``repeat_count`` reduced-mode microsteps internally, instead of the host
+    paying full eager AbstractTensor call overhead once per microstep (see
+    docs/PLAN_TIRE_FIDELITY_LADDER.md's native-shim-microstepping section).
+    ``repeat_count`` is a genuine Python int (like ``vehicle_tire_recurrence``'s
+    ``microstep_count``), not a tensor -- the loop trip count is fixed at
+    lowering/specialization time, exactly the existing precedent.
+    """
+
+    for _ in range(repeat_count):
+        state, output = balloon_tire_reduced_vector_step(
+            inputs, state, output, wheel_input_indices, rest,
+            face_vertices, face_rest, face_scatter,
+            bending_incidence, bending_scatter,
+            bending_weight, vertex_area, bead_mask, face_material)
+    return state, output
 
 
 def balloon_tire_vector_step(inputs, state, output, wheel_input_indices, rest,
@@ -124,7 +300,17 @@ def balloon_tire_vector_step(inputs, state, output, wheel_input_indices, rest,
         face_reference[:, :, :, 0, 0], face_reference[:, :, :, 0, 1], face_reference[:, :, :, 0, 2],
         face_reference[:, :, :, 1, 0], face_reference[:, :, :, 1, 1], face_reference[:, :, :, 1, 2],
         face_reference[:, :, :, 2, 0], face_reference[:, :, :, 2, 1], face_reference[:, :, :, 2, 2],
-        inputs[:, 3].reshape((-1, 1, 1)), face_rest[:, 4], face_rest[:, 0], face_rest[:, 1], face_rest[:, 2], face_rest[:, 3], face_material[:, 0].reshape((1, 1, -1)),
+        # Construction prestress at the CURRENT gas charge, the same reference
+        # the gas law is given.  The authored topology is the molded shape;
+        # the carcass tension that holds it is whatever balances the gas that
+        # is actually in it, so pressure and construction cancel face-for-face
+        # at that shape at any charge.  With the prestress pinned to the rated
+        # pressure, a tyre started at ambient charge (0.75 of rated) received
+        # a 34 kPa net inward load on every face in one step at t=0: the whole
+        # skin reached 7.8 m/s in the first 244 us, the sidewalls caved, the
+        # volume collapsed and the gas law read 500 kPa.  Inflating now raises
+        # pressure and stiffness without a shape jump.
+        (inputs[:, 3] * inputs[:, 4].maximum(0.0)).reshape((-1, 1, 1)), face_rest[:, 4], face_rest[:, 0], face_rest[:, 1], face_rest[:, 2], face_rest[:, 3], face_material[:, 0].reshape((1, 1, -1)),
         face_velocity[:, :, :, 0, 0], face_velocity[:, :, :, 0, 1], face_velocity[:, :, :, 0, 2],
         face_velocity[:, :, :, 1, 0], face_velocity[:, :, :, 1, 1], face_velocity[:, :, :, 1, 2],
         face_velocity[:, :, :, 2, 0], face_velocity[:, :, :, 2, 1], face_velocity[:, :, :, 2, 2],
@@ -499,7 +685,28 @@ def balloon_tire_python_program(
         "gas_permeability_activation_energy_j_per_mol", "minimum_volume_fraction", "skin_thickness_m",
         "lame_lambda_pa", "lame_mu_pa", "membrane_damping_lambda_pa_s",
         "membrane_damping_mu_pa_s", "bead_stiffness_n_per_m", "bending_stiffness_nm",
-        "bead_damping_n_s_per_m", "contact_skin_offset_m", "contact_restitution", "friction_coefficient")
+        "bead_damping_n_s_per_m", "contact_skin_offset_m", "contact_restitution", "friction_coefficient",
+        "tire_fidelity_mode",
+        *(f"ring_{name}_r_m" for name in _STATIONS), *(f"ring_{name}_z_m" for name in _STATIONS),
+        "wrench_spring_n_per_m", "wrench_damping_n_s_per_m")
+    #: tire_fidelity_mode selects which contact force law augments the
+    #: mesh's own dynamics; inert (multiplies to zero) unless selected:
+    #:   0.0 = fine (today's full deformable-mesh contact only; default,
+    #:         unchanged behavior)
+    #:   1.0 = reduced -- lumped fallback-spring force from the real
+    #:         ring-geometry contact-patch integral (see
+    #:         vehicle_tire_reduced_contact_law.py), applied at the bead ring
+    #:   2.0 = wrench -- bare-bones spring-damper from the hub to the
+    #:         nearest ground/roller surface, one-sided (engages only on
+    #:         boundary penetration); no moment arm (single query point)
+    #:   3.0 = wrench-per-vertex -- the same spring-damper evaluated at each
+    #:         bead vertex independently, giving a real moment for off-center
+    #:         contact, still far cheaper than the full membrane
+    #: All kept selectable (not removed as others are added) so they can be
+    #: compared/tuned against each other and against the fine mesh.  The
+    #: ring_*_r_m/ring_*_z_m/wrench_*_n_per_m fields are ordinary scalar
+    #: parameters (not new function arguments) so every existing call site
+    #: keeps working unchanged.  See docs/PLAN_TIRE_FIDELITY_LADDER.md.
     wheel_fields = [
         *(f"hub_position_{axis}" for axis in "xyz"), *(f"hub_velocity_{axis}" for axis in "xyz"),
         *(f"hub_basis_{local}_{world}" for local in "xyz" for world in "xyz"),
@@ -519,11 +726,50 @@ def balloon_tire_python_program(
     default_input[input_index["dt"]] = 1.0 / 4096.0
     default_input[input_index["gravity_y"]] = -9.81
     for name in parameter_names:
+        if name == "tire_fidelity_mode" or name.startswith("ring_") or name.startswith("wrench_"):
+            continue  # tire_fidelity_mode defaults to 0.0 (already zero-filled);
+            # ring_* stations are set below from the real rest mesh;
+            # wrench_* defaults are set below (not part of abi["parameters"]).
         default_input[input_index[name]] = (
             1.0 if name == "gas_charge_fraction" else float(abi["parameters"][name]))
     for wheel in wheel_names:
         for axis in "xyz":
             default_input[input_index[f"{wheel}.hub_basis_{axis}_{axis}"]] = 1.0
+
+    # Real ring-station geometry, derived from the actual rest mesh (not
+    # hand-picked): vertex layout is iu*section_rows+iv (confirmed against
+    # topology.bead_rings' (0, section_segments)-style rows), bead stations
+    # are rows 0/last, shoulder stations are the max-radius row in each half.
+    circumferential_segments = topology.circumferential_segments
+    section_rows = vertex_count // circumferential_segments
+    _radius = np.linalg.norm(rest[:, :2], axis=-1)
+
+    def _row_indices(iv: int) -> np.ndarray:
+        return np.array([iu * section_rows + iv for iu in range(circumferential_segments)])
+
+    def _station(iv: int) -> tuple[float, float]:
+        row = _row_indices(iv)
+        return float(np.mean(_radius[row])), float(np.mean(rest[row, 2]))
+
+    _half = section_rows // 2
+    _inboard_iv = int(np.argmax([np.mean(_radius[_row_indices(iv)]) for iv in range(0, _half)]))
+    _outboard_iv = _half + int(np.argmax(
+        [np.mean(_radius[_row_indices(iv)]) for iv in range(_half, section_rows)]))
+    _station_rz = dict(zip(_STATIONS, (
+        _station(0), _station(_inboard_iv), _station(_outboard_iv), _station(section_rows - 1))))
+    for name, (station_r, station_z) in _station_rz.items():
+        default_input[input_index[f"ring_{name}_r_m"]] = station_r
+        default_input[input_index[f"ring_{name}_z_m"]] = station_z
+
+    # Seeded from the already-tuned bead spring/damper, not invented values;
+    # real tuning (by hand or, once wanted, ADAM against a fine-mesh
+    # reference) is expected to move these -- they are deliberately
+    # parameterized, not baked in.  See docs/PLAN_TIRE_FIDELITY_LADDER.md.
+    default_input[input_index["wrench_spring_n_per_m"]] = (
+        float(abi["parameters"]["bead_stiffness_n_per_m"]))
+    default_input[input_index["wrench_damping_n_s_per_m"]] = (
+        float(abi["parameters"]["bead_damping_n_s_per_m"]))
+
     face_material = np.concatenate((np.asarray([
         ([0.0, 0.0, 0.0, 0.0, 0.0]
          if zone == "rim-closure" else [
@@ -537,7 +783,8 @@ def balloon_tire_python_program(
     ], dtype=np.float64), oriented_stiffness), axis=1)
     constants = {
         "wheel_input_indices": np.arange(
-            24, len(input_names), dtype=np.int64).reshape((len(wheel_names), 41)),
+            2 + len(parameter_names), len(input_names), dtype=np.int64
+        ).reshape((len(wheel_names), 41)),
         "rest": rest, "face_vertices": faces,
         "face_rest": np.asarray(topology.face_rest_data, dtype=np.float64),
         "face_scatter": face_scatter, "laplacian": laplacian,

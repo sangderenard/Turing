@@ -340,6 +340,104 @@ def _drop_unused_root_private_formals(function: Any) -> int:
     return len(removable)
 
 
+def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
+    """Complete every call whose callee's signature grew a frame-storage tail.
+
+    Linking a callee to ITS callees can append propagated frame-storage
+    formals to its signature after a call into it was already built.
+    Such a call is not malformed; it is incomplete by exactly the
+    appended tail.  Complete it the way the linker propagates every
+    unbound callee formal: the caller receives one storage slot per
+    appended formal (stamped ``propagated_formal_id``, the identity
+    `_call_argument_identity` reads for it) and passes it through.
+    Completing a call appends the same tail to the CALLER's own signature,
+    so its callers are now short by that tail too: iterate to a fixed
+    point, never a single pass in dictionary order (tick ->
+    tire_recurrence -> balloon_tire was left two arguments short exactly
+    that way).
+
+    This ran only inside `_prune_unused_callee_formals`, at the very end
+    of lowering -- after `_harmonize_call_argument_shapes` had already
+    seen the grown callee and reported the tail as an "unidentified
+    remainder" that "must already agree in count" (diagnosed against the
+    real managed-tire compile: `_no_exchange_observed` gained one
+    `linked_call_frame_storage` formal for its own `_scalar` call the
+    moment its result became live, and `_apply_energy_sidechain`'s call
+    into it was one operand short).  It is the same technique
+    `_propagate_record_field_demand` already runs early for record
+    fields; run it early for frame storage too.  Returns the number of
+    slots appended.
+    """
+
+    from ..transmogrifier.ssa import SSAValue
+
+    next_fresh_id = max(
+        (
+            int(value.id)
+            for function in functions.values()
+            for value in (
+                *function.args,
+                *(
+                    instruction.res
+                    for block in function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.res is not None
+                ),
+            )
+        ),
+        default=-1,
+    ) + 1
+
+    def calls_into(callee_name: str) -> list[tuple[Any, Any]]:
+        return [
+            (caller, instruction)
+            for caller in functions.values()
+            for block in caller.blocks.values()
+            for instruction in block.instrs
+            if (
+                instruction.op in {"Call", "call"}
+                and str(instruction.attributes.get("callee") or "")
+                == str(callee_name)
+            )
+        ]
+
+    appended = 0
+    completed_any = True
+    while completed_any:
+        completed_any = False
+        for callee_name, callee in functions.items():
+            for owner, call in calls_into(callee_name):
+                if len(call.args) >= len(callee.args):
+                    continue
+                tail = callee.args[len(call.args):]
+                if not all(
+                    (formal.accounting or {}).get("linked_call_frame_storage")
+                    or (formal.accounting or {}).get("compiler_frame_storage")
+                    for formal in tail
+                ):
+                    continue
+                for formal in tail:
+                    slot = SSAValue(
+                        next_fresh_id,
+                        dtype=formal.dtype,
+                        shape=tuple(formal.shape or ()),
+                        device=formal.device,
+                        accounting={
+                            "linked_call_frame_storage": str(callee_name),
+                            "callsite_id": call.attributes.get(
+                                "plan_callsite_id"
+                            ),
+                            "propagated_formal_id": int(formal.id),
+                        },
+                    )
+                    next_fresh_id += 1
+                    owner.args.append(slot)
+                    call.args.append(slot)
+                    completed_any = True
+                    appended += 1
+    return appended
+
+
 def _prune_unused_callee_formals(
     functions: Mapping[str, Any],
     call_records: Mapping[str, list[Any]] | None = None,
@@ -387,49 +485,7 @@ def _prune_unused_callee_formals(
             )
         ]
 
-    # Linking a callee to ITS callees can append propagated frame-storage
-    # formals to its signature after a call into it was already built.
-    # Such a call is not malformed; it is incomplete by exactly the
-    # appended tail.  Complete it the way the linker propagates every
-    # unbound callee formal: the caller receives one storage slot per
-    # appended formal and passes it through.  Completing a call appends
-    # the same tail to the CALLER's own signature, so its callers are now
-    # short by that tail too: iterate to a fixed point, never a single
-    # pass in dictionary order (tick -> tire_recurrence -> balloon_tire
-    # was left two arguments short exactly that way).  Only then is the
-    # arity check below a real consistency check.
-    completed_any = True
-    while completed_any:
-        completed_any = False
-        for callee_name, callee in functions.items():
-            for owner, call in calls_into(callee_name):
-                if len(call.args) >= len(callee.args):
-                    continue
-                tail = callee.args[len(call.args):]
-                if not all(
-                    (formal.accounting or {}).get("linked_call_frame_storage")
-                    or (formal.accounting or {}).get("compiler_frame_storage")
-                    for formal in tail
-                ):
-                    continue
-                for formal in tail:
-                    slot = SSAValue(
-                        next_fresh_id,
-                        dtype=formal.dtype,
-                        shape=tuple(formal.shape or ()),
-                        device=formal.device,
-                        accounting={
-                            "linked_call_frame_storage": str(callee_name),
-                            "callsite_id": call.attributes.get(
-                                "plan_callsite_id"
-                            ),
-                            "propagated_formal_id": int(formal.id),
-                        },
-                    )
-                    next_fresh_id += 1
-                    owner.args.append(slot)
-                    call.args.append(slot)
-                    completed_any = True
+    _complete_propagated_frame_tails(functions)
     for callee_name, callee in functions.items():
         caller_calls = calls_into(callee_name)
         callers = [instruction for _caller, instruction in caller_calls]
@@ -3774,6 +3830,33 @@ def _field_slot_ops(
         if query_id is None or field_id is None or field_id not in graph_obj:
             continue
         field_data = graph_obj.nodes[field_id]
+        # ``x in (obj.field or {})`` (or a local alias of that expression,
+        # e.g. ``channels = metrics.error_channels or {}; ... "k" in
+        # channels``) is a real, common defensive idiom, not a different
+        # shape of membership test: the ``or`` only ever supplies a fallback
+        # when the field itself is falsy, so the field identity for
+        # membership purposes is its LEFT operand. Without this, the field
+        # lookup below sees a BoolOp node with no ``attribute``/
+        # ``aggregate_kind`` of its own and silently fails to recognize the
+        # membership test at all (diagnosed against the real managed-tire
+        # compile: `_no_exchange_observed`'s `"power_w" in channels` never
+        # materialized a value because of exactly this).
+        for _ in range(4):
+            boolop_expression = field_data.get("expr_obj")
+            if not (
+                isinstance(boolop_expression, ast.BoolOp)
+                and isinstance(boolop_expression.op, ast.Or)
+            ):
+                break
+            left_id = next((
+                int(parent)
+                for parent, role in (field_data.get("parents") or ())
+                if str(role) == "value:0"
+            ), None)
+            if left_id is None or left_id not in graph_obj:
+                break
+            field_id = left_id
+            field_data = graph_obj.nodes[field_id]
         field_attributes = field_data.get("attributes") or {}
         field_name = field_attributes.get("attribute")
         sequence_id = None
@@ -7873,6 +7956,329 @@ def _sequence_length_values(
     return values
 
 
+def _call_argument_identity(
+    owner_function: Any, value: Any, parameter_names_by_id: Mapping[int, str],
+) -> tuple[str, Any] | None:
+    """The one stable identity a call argument or formal carries, if any.
+
+    Three sources, checked in order, all already computed elsewhere in this
+    module for other reasons -- this does not invent new facts, it is the
+    first place that reads them uniformly regardless of what KIND of value
+    is being asked about:
+
+    - a materialized record field carries its own name (``program_abi_field``,
+      e.g. ``"error_channels.keys"``, ``"hard_failure"``);
+    - a frame-storage slot appended to complete a callee's grown signature
+      carries the id of the formal it was propagated for
+      (``propagated_formal_id``);
+    - an ordinary value that IS one of its own function's declared
+      parameters (state, dt, a plain scalar -- forwarded straight through,
+      not derived from a record at all) carries that parameter's own
+      source-level name, via the function's ``parameter_names`` metadata.
+
+    Anything reaching none of these three is a genuinely anonymous
+    intermediate value used directly as an argument; there is no fact
+    anywhere recording what it is, and this function says so honestly
+    (``None``) rather than falling back to guessing from position.
+    """
+
+    accounting = dict(value.accounting or {})
+    field = accounting.get("program_abi_field")
+    if field is not None:
+        return ("field", str(field))
+    propagated = accounting.get("propagated_formal_id")
+    if propagated is not None:
+        return ("propagated", int(propagated))
+    name = parameter_names_by_id.get(int(value.id))
+    if name is not None:
+        return ("parameter", str(name))
+    return None
+
+
+def _propagate_record_field_demand(all_functions: Mapping[str, Any]) -> None:
+    """Grow a caller's formals to include every record field a callee it
+    calls needs, transitively, before anything tries to align call shapes.
+
+    A field is materialized into a function's OWN formal list only for
+    fields that function's OWN body directly references (the ``if not
+    candidates: continue`` skip in the nested-record materializer).  That
+    is correct in isolation and wrong across a call: a function that only
+    FORWARDS a whole record (``_propose_dt_pen(metrics, targets, dx,
+    distribution)`` from inside ``step_with_dt_control_used``, never
+    touching ``targets.cfl`` itself) never gets that field materialized,
+    even though its callee needs it expanded.  There is no "whole record
+    pointer" to extract the field from at this level once fields ARE
+    materialized -- each becomes its own independent physical value, the
+    same way :func:`_prune_unused_callee_formals`'s frame-storage
+    completion (``linked_call_frame_storage``) grows a caller for a
+    propagated storage slot it does not itself use, just for a different
+    kind of need: a record field instead of frame storage.  That existing
+    completion runs too late to help here -- at the very end of this
+    module's lowering, well after the call-shape unification this feeds
+    already has to have run -- so this is the same technique, run early.
+
+    Growing is the only thing this does: it only ever APPENDS a new
+    formal, copying the callee's own field metadata verbatim (with
+    ``program_abi_field_written`` reset to ``False`` -- the caller is
+    forwarding, never writing, whatever it does not already write itself),
+    to both the caller's formal list and this one call's argument list.
+    Nothing is removed, reordered, or guessed at; the CORRESPONDING
+    reorder, once every needed field genuinely exists somewhere in the
+    caller, is :func:`_harmonize_call_argument_shapes`'s job, called right
+    after this.  Iterated to a fixed point exactly like frame-storage
+    completion, so demand reaches as far up the call graph as it needs to.
+    """
+
+    from ..transmogrifier.ssa import SSAValue
+
+    next_fresh_id = 1 + max(
+        (
+            int(value.id)
+            for function in all_functions.values()
+            for value in (
+                *function.args,
+                *(
+                    instruction.res
+                    for block in function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.res is not None
+                ),
+            )
+        ),
+        default=0,
+    )
+    grew = True
+    while grew:
+        grew = False
+        for caller in all_functions.values():
+            caller_fields = {
+                ((formal.accounting or {}).get("program_abi_record"),
+                 (formal.accounting or {}).get("program_abi_field")): formal
+                for formal in caller.args
+                if (formal.accounting or {}).get("program_abi_field") is not None
+            }
+            for block in caller.blocks.values():
+                for instruction in block.instrs:
+                    if (
+                        instruction.op not in {"Call", "call"}
+                        or instruction.attributes.get("tensor_operation")
+                    ):
+                        continue
+                    callee = all_functions.get(str(
+                        instruction.attributes.get("callee") or ""
+                    ))
+                    if callee is None:
+                        continue
+                    supplied = {
+                        ((argument.accounting or {}).get("program_abi_record"),
+                         (argument.accounting or {}).get("program_abi_field"))
+                        for argument in instruction.args
+                        if (argument.accounting or {}).get(
+                            "program_abi_field"
+                        ) is not None
+                    }
+                    for formal in callee.args:
+                        formal_accounting = dict(formal.accounting or {})
+                        field = formal_accounting.get("program_abi_field")
+                        if field is None:
+                            continue
+                        key = (formal_accounting.get("program_abi_record"), field)
+                        if key in supplied:
+                            continue
+                        existing = caller_fields.get(key)
+                        if existing is not None:
+                            # Already materialized somewhere in the caller
+                            # (a different call, or its own body) -- this
+                            # call just needs to carry the SAME value, not
+                            # a new one.
+                            instruction.args.append(existing)
+                        else:
+                            propagated = SSAValue(
+                                next_fresh_id,
+                                dtype=formal.dtype,
+                                shape=tuple(formal.shape or ()),
+                                device=formal.device,
+                                accounting={
+                                    **formal_accounting,
+                                    "program_abi_field_written": False,
+                                },
+                            )
+                            next_fresh_id += 1
+                            caller.args.append(propagated)
+                            caller_fields[key] = propagated
+                            instruction.args.append(propagated)
+                        supplied.add(key)
+                        grew = True
+
+
+def _harmonize_call_argument_shapes(all_functions: Mapping[str, Any]) -> None:
+    """Make every call site into one specialized callee agree on argument
+    shape, before any dtype/rank fact is unified over them.
+
+    Two callees sharing a record-typed value (or a caller's own forwarded
+    parameter) each materialize their OWN formal list independently, from
+    their OWN body's references -- one skips a field the other keeps, and
+    the same logical value ends up at different positions.  The call-type
+    unification loop that runs after this one trusts plain position; a
+    mispaired (actual, formal) can never converge there, because the pair
+    names two different things to begin with (this is the exact defect
+    diagnosed on the managed tire build across 2026-09-03/04, down to the
+    specific value: an ``error_channels.keys`` array bound against a
+    ``hard_failure`` scalar formal, purely from an unrelated argument-count
+    drift earlier in the same call's argument list).
+
+    This realigns each call's argument list to its callee's formal order by
+    IDENTITY (:func:`_call_argument_identity`), not position -- the callee's
+    own formal list is never touched, so nothing a DIFFERENT caller depends
+    on can be removed.  A call is only ever changed when every one of its
+    identified arguments has an exact, unambiguous counterpart among the
+    callee's identified formals; anything left unidentified on either side
+    must already agree in count, in its own existing relative order, or the
+    call is named precisely and left for the caller (a human) to resolve --
+    never silently paired by leftover position, which is how this defect
+    was produced in the first place.
+    """
+
+    calls_by_callee: dict[str, list[tuple[Any, Any]]] = {}
+    for caller in all_functions.values():
+        for block in caller.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    instruction.op not in {"Call", "call"}
+                    or instruction.attributes.get("tensor_operation")
+                ):
+                    continue
+                callee_name = str(instruction.attributes.get("callee") or "")
+                if callee_name not in all_functions:
+                    continue
+                calls_by_callee.setdefault(callee_name, []).append(
+                    (caller, instruction)
+                )
+
+    parameter_names_cache: dict[str, dict[int, str]] = {}
+
+    def parameter_names_of(function: Any) -> dict[int, str]:
+        cached = parameter_names_cache.get(function.name)
+        if cached is not None:
+            return cached
+        names = {
+            int(value_id): str(name)
+            for name, value_id in (
+                (function.metadata or {}).get("parameter_names", ())
+            )
+        }
+        parameter_names_cache[function.name] = names
+        return names
+
+    for callee_name, sites in calls_by_callee.items():
+        callee = all_functions[callee_name]
+        callee_names = parameter_names_of(callee)
+        formal_identities = [
+            _call_argument_identity(callee, formal, callee_names)
+            for formal in callee.args
+        ]
+        formal_positions: dict[tuple[str, Any], int] = {}
+        ambiguous_formal = False
+        for position, identity in enumerate(formal_identities):
+            if identity is None:
+                continue
+            if identity in formal_positions:
+                ambiguous_formal = True
+                break
+            formal_positions[identity] = position
+        if ambiguous_formal:
+            # Two of the callee's OWN formals share one identity -- not a
+            # call-site problem, and not this pass's to resolve.
+            continue
+        unnamed_formal_count = sum(
+            1 for identity in formal_identities if identity is None
+        )
+        if unnamed_formal_count == len(formal_identities):
+            # No formal on this callee carries any identity at all -- not a
+            # record consumer, not one of an authored function's own named
+            # parameters.  This is a compiler-synthesized positional
+            # primitive (a generated sequence-insert helper, for example),
+            # for which position IS the whole and correct contract; there is
+            # nothing here for identity to improve on, so leave it exactly
+            # as it already works.
+            continue
+        for caller, instruction in sites:
+            caller_names = parameter_names_of(caller)
+            actual_identities = [
+                _call_argument_identity(caller, actual, caller_names)
+                for actual in instruction.args
+            ]
+            if actual_identities == formal_identities:
+                continue
+            actual_positions: dict[tuple[str, Any], int] = {}
+            ambiguous_actual = False
+            for position, identity in enumerate(actual_identities):
+                if identity is None:
+                    continue
+                if identity in actual_positions:
+                    ambiguous_actual = True
+                    break
+                actual_positions[identity] = position
+            if ambiguous_actual:
+                continue
+            if set(actual_positions) != set(formal_positions):
+                # An identified field/parameter appears on one side and
+                # not the other: this call cannot supply what the callee
+                # needs, or supplies something it has no formal for.  Not
+                # a position problem this pass can fix by realigning.
+                continue
+            unnamed_actual_positions = [
+                position for position, identity in enumerate(actual_identities)
+                if identity is None
+            ]
+            if len(unnamed_actual_positions) != unnamed_formal_count:
+                # The identified portion matches perfectly; the remainder
+                # on each side has no identity at all to align by, and
+                # there are different numbers of them.  Naming this
+                # precisely, instead of leaving it to surface later as an
+                # unrelated dtype conflict between two named fields three
+                # positions further down the list.
+                raise ValueError(
+                    "call argument shapes cannot be harmonized: "
+                    f"{caller.name!r} -> {callee_name!r} supplies "
+                    f"{len(unnamed_actual_positions)} argument(s) with no "
+                    "identity (not a record field, not a propagated frame "
+                    "slot, not one of the caller's own named parameters), "
+                    f"the callee has {unnamed_formal_count} such formal "
+                    "position(s); an unidentified remainder must already "
+                    "agree in count to be aligned safely; unidentified "
+                    "actuals="
+                    f"{[(int(instruction.args[p].id), str(instruction.args[p].dtype), sorted((instruction.args[p].accounting or {}).keys())) for p in unnamed_actual_positions]!r} "
+                    "unidentified formals="
+                    f"{[(int(formal.id), str(formal.dtype), sorted((formal.accounting or {}).keys())) for formal, identity in zip(callee.args, formal_identities) if identity is None]!r} "
+                    "formal consumers="
+                    f"{[(int(formal.id), [(str(block_name), str(consumer.op), str(consumer.attributes.get('callee') or consumer.attributes.get('binding') or '')) for block_name, block in callee.blocks.items() for consumer in block.instrs if any(int(argument.id) == int(formal.id) for argument in consumer.args)]) for formal, identity in zip(callee.args, formal_identities) if identity is None]!r} "
+                    "call actuals="
+                    f"{[(int(a.id), str(a.dtype), identity) for a, identity in zip(instruction.args, actual_identities)]!r} "
+                    "callee formals="
+                    f"{[(int(f.id), str(f.dtype), identity) for f, identity in zip(callee.args, formal_identities)]!r} "
+                    "call attributes="
+                    f"{sorted(instruction.attributes.keys())!r}"
+                )
+            realigned = [None] * len(callee.args)
+            for identity, formal_position in formal_positions.items():
+                realigned[formal_position] = instruction.args[
+                    actual_positions[identity]
+                ]
+            for unnamed_formal_position, unnamed_actual_position in zip(
+                (
+                    position for position, identity in enumerate(formal_identities)
+                    if identity is None
+                ),
+                unnamed_actual_positions,
+            ):
+                realigned[unnamed_formal_position] = instruction.args[
+                    unnamed_actual_position
+                ]
+            assert all(value is not None for value in realigned)
+            instruction.args = realigned
+
+
 def _class_surface_ssa_program(
     compilation: Any,
     artifact_name: str,
@@ -8776,6 +9182,61 @@ def _class_surface_ssa_program(
                 direct_children.setdefault(
                     parent_by_child.get(child_index, 0), []
                 ).append(child_index)
+            # A conditional that owns no numerical region (a guard clause
+            # whose arm is only a return or a call) has no schedule marker
+            # to replace.  Anchor it before the first scheduled region that
+            # lexically follows it, so the overlay places it instead of
+            # dropping it (which silently ran the function as if the guard
+            # were false).
+            def earliest_region_line(region_index: int) -> int | None:
+                subgraph = (
+                    getattr(shell, "dispatch_subgraphs", ())
+                    [int(region_index)]
+                    if int(region_index) < len(
+                        getattr(shell, "dispatch_subgraphs", ())
+                    ) else None
+                )
+                if subgraph is None:
+                    return None
+                lines = []
+                for node_id in subgraph.G.graph.get("deployment_nodes", ()):
+                    node = graph_obj.nodes.get(int(node_id)) or {}
+                    line = (node.get("source_span") or {}).get("line")
+                    if line is None:
+                        line = getattr(node.get("expr_obj"), "lineno", None)
+                    if line is not None and int(line) >= 0:
+                        lines.append(int(line))
+                return min(lines) if lines else None
+
+            region_lines = {
+                int(region_index): earliest_region_line(int(region_index))
+                for region_index in control.region_indices
+            }
+            anchored_controls = []
+            for conditional_control, block in zip(
+                conditional_controls, conditional_blocks
+            ):
+                if (
+                    conditional_control.region_indices
+                    or block is None
+                    or block.source_node_id is None
+                ):
+                    anchored_controls.append(conditional_control)
+                    continue
+                expression = source_expressions.get(int(block.source_node_id))
+                conditional_line = getattr(expression, "lineno", None)
+                anchor = None
+                if conditional_line is not None:
+                    anchor = next((
+                        int(region_index)
+                        for region_index in control.region_indices
+                        if region_lines.get(int(region_index)) is not None
+                        and region_lines[int(region_index)] > int(conditional_line)
+                    ), None)
+                anchored_controls.append(
+                    replace(conditional_control, anchor_region=anchor)
+                )
+            conditional_controls = tuple(anchored_controls)
             control = overlay_scheduled_control(
                 control.region_indices,
                 (control, *conditional_controls),
@@ -9831,6 +10292,21 @@ def _class_surface_ssa_program(
             graph,
             getattr(shell, "dispatch_subgraphs", ()),
         )
+        _node_probe = os.environ.get("TURING_DEBUG_GRAPH_NODES")
+        if _node_probe and _node_probe.split(":", 1)[0] in str(
+            graph_obj.graph.get("function_name")
+        ):
+            for _probe_id in _node_probe.split(":", 1)[1].split(","):
+                _probe_data = graph_obj.nodes.get(int(_probe_id)) or {}
+                print(
+                    f"DEBUG-GRAPH-NODE {graph_obj.graph.get('function_name')} "
+                    f"{_probe_id}: type={_probe_data.get('type')} op={_probe_data.get('op')} "
+                    f"attributes={_probe_data.get('attributes')} "
+                    f"parents={_probe_data.get('parents')} constant={_probe_data.get('constant')!r} "
+                    f"in_constant_values={int(_probe_id) in constant_values} "
+                    f"span={_probe_data.get('source_span')}",
+                    file=sys.stderr, flush=True,
+                )
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
@@ -9953,6 +10429,10 @@ def _class_surface_ssa_program(
                 ),
             )
         )
+        if os.environ.get("TURING_DEBUG_OUTPUT_LOADS"):
+            from .precompile_to_ssa import debug_region_output_loads as _probe_loads
+            for _probe_function in module_ir.functions.values():
+                _probe_loads(_probe_function, "shell-after-sections")
         if external_reference_callsites:
             module_ir.metadata["external_reference_callsites"] = tuple(
                 external_reference_callsites
@@ -10778,6 +11258,33 @@ def _class_surface_ssa_program(
             if not any(destroys_value(operand) for operand in operands):
                 return None
 
+            if canonical == "logical_or" and len(ordered) == 2:
+                # ``field or {}`` on a program-ABI keyed field is the defensive
+                # idiom the AOT membership-recognition pass already unwraps
+                # to its left operand: a keyed field is always a mapping, it
+                # is falsy exactly when empty, and an empty literal reads the
+                # same as an empty field -- so the expression IS the field
+                # for every read. A Select between the field's part slots
+                # and the literal's own resident table is not a value any
+                # backend can honor, and it keeps the literal's otherwise
+                # dead arenas alive as formals, changing the callee's
+                # anonymous-argument count under every caller.
+                right_data = graph.nodes.get(int(ordered[1][1]), {})
+                right_type = str(
+                    right_data.get("type") or right_data.get("op") or ""
+                ).casefold()
+                left_storage = str(
+                    (operands[0].accounting or {}).get("program_abi_storage")
+                    or ""
+                )
+                if (
+                    right_type == "dict"
+                    and not (right_data.get("parents") or ())
+                    and left_storage == "keyed"
+                ):
+                    values[int(value_id)] = operands[0]
+                    return operands[0]
+
             nonlocal next_structural_id
             current = operands[0]
             for position, operand in enumerate(operands[1:], start=1):
@@ -10808,6 +11315,343 @@ def _class_surface_ssa_program(
                 current = result
             return current
 
+        def structural_membership_value(value_id: int, data, *, negate: bool):
+            """Lower ``key in field`` / ``key not in field`` structurally.
+
+            A short-circuited boolop operand of this shape (see
+            ``ensure_structural_value``'s "call"-disguise case) names no
+            callee at all -- it is a plain ``Compare`` whose ``lhs``/``rhs``
+            are the query and the keyed field. The field's resident table is
+            already known: whatever earlier pass gave the field's owning
+            record a ``SSARecordFieldDescriptor`` with a ``sequence_id``
+            already registered a real :class:`SSASequenceDescriptor` for it
+            in ``all_sequence_tables[symbol]`` (a AOT region never had to run
+            for that to happen -- the descriptor is built the moment the
+            record's keyed field is bound, independent of whether this
+            function's body ever got numeric regions of its own). Reuse that
+            descriptor with the SAME native contains-scan
+            (``lower_sequence_contains``) every region-lowered caller already
+            uses, instead of inventing a second membership-test lowering
+            (diagnosed against the real managed-tire compile:
+            `_no_exchange_observed`'s `"power_w" in channels` was the exact
+            case with a real sequence_id=5 descriptor sitting unused).
+            """
+
+            parents = tuple(data.get("parents") or ())
+            query_id = next((
+                int(parent) for parent, role in parents if str(role) == "lhs"
+            ), None)
+            field_id = next((
+                int(parent) for parent, role in parents if str(role) == "rhs"
+            ), None)
+            if query_id is None or field_id is None or field_id not in graph:
+                structural_shortfalls.append((
+                    value_id, "call", "membership-operands"
+                ))
+                return None
+            field_data = graph.nodes[field_id]
+            # ``x in (obj.field or {})`` is a common defensive idiom -- the
+            # ``or`` only ever supplies a fallback when the field itself is
+            # falsy, so the real membership target is its left operand
+            # (mirrors the exact same unwrap already used by the AOT
+            # membership-recognition pass for this identical shape).
+            for _ in range(4):
+                boolop_expr = field_data.get("expr_obj")
+                if not (
+                    isinstance(boolop_expr, ast.BoolOp)
+                    and isinstance(boolop_expr.op, ast.Or)
+                ):
+                    break
+                left_id = next((
+                    int(parent)
+                    for parent, role in (field_data.get("parents") or ())
+                    if str(role) == "value:0"
+                ), None)
+                if left_id is None or left_id not in graph:
+                    break
+                field_id = left_id
+                field_data = graph.nodes[field_id]
+            field_attributes = field_data.get("attributes") or {}
+            field_name = field_attributes.get("attribute")
+            base_id = next((
+                int(parent)
+                for parent, role in (field_data.get("parents") or ())
+                if str(role) == "value"
+            ), None)
+            if field_name is None or base_id is None or record_table is None:
+                structural_shortfalls.append((
+                    value_id, "call", "membership-field"
+                ))
+                return None
+            sequence_table = all_sequence_tables.get(symbol)
+            if sequence_table is None:
+                structural_shortfalls.append((
+                    value_id, "call", "membership-sequence-table"
+                ))
+                return None
+            sequence_id = None
+            parts_descriptor = None
+            base_record = record_table.records.get(base_id)
+            field_descriptor = next((
+                field for field in (base_record.fields if base_record else ())
+                if field.name == str(field_name)
+            ), None)
+            if (
+                field_descriptor is not None
+                and field_descriptor.sequence_id is not None
+            ):
+                # A record field lowered as one SEQUENCE descriptor names
+                # its table directly.
+                sequence_id = int(field_descriptor.sequence_id)
+            else:
+                # A program-ABI ``keyed`` field is not one SEQUENCE field:
+                # `materialize_parameter_record_abi` expands it into
+                # `<field>.length` / `<field>.keys` / `<field>.values` part
+                # slots on the function's own arguments, each stamped
+                # `program_abi_keyed_owner`/`program_abi_keyed_part`, plus
+                # the mapping identity itself stamped
+                # `program_abi_storage="keyed"` + `program_abi_field`. The
+                # table registered for that mapping is keyed by the mapping
+                # identity's id -- the exact correlation
+                # `resolve_keyed_mapping_iterables` uses (`owner_by_mapping`,
+                # with the GetAttr `attribute` spelling as its fallback).
+                # Mirror it, then cross-check the parts against the
+                # descriptor's arenas: both must agree or nothing is bound.
+                owner_by_mapping = {
+                    int(argument.id): str(
+                        (argument.accounting or {})["program_abi_field"]
+                    )
+                    for argument in function.args
+                    if (argument.accounting or {}).get("program_abi_storage")
+                    == "keyed"
+                    and (argument.accounting or {}).get("program_abi_field")
+                    is not None
+                }
+                candidates = [
+                    mapping_id
+                    for mapping_id, owner in owner_by_mapping.items()
+                    if owner == str(field_name)
+                    and mapping_id in sequence_table.sequences
+                ]
+                if not candidates:
+                    candidates = [
+                        int(node_data.get("value_id", node_id))
+                        for node_id, node_data in graph.nodes(data=True)
+                        if (node_data.get("attributes") or {}).get("attribute")
+                        == str(field_name)
+                        and int(node_data.get("value_id", node_id))
+                        in sequence_table.sequences
+                    ]
+                parts_by_owner: dict[str, dict[str, int]] = {}
+                for argument in function.args:
+                    accounting = argument.accounting or {}
+                    owner = accounting.get("program_abi_keyed_owner")
+                    part = accounting.get("program_abi_keyed_part")
+                    if owner is None or part is None:
+                        continue
+                    parts_by_owner.setdefault(str(owner), {})[str(part)] = int(
+                        argument.id
+                    )
+                # The descriptor's arenas are fresh anonymous arguments
+                # ("built during lowering from anonymous storage", see
+                # resolve_keyed_mapping_iterables) that call-frame linking
+                # binds to the `<field>.keys/.values/.length` part slots
+                # later; their ids never equal the parts'. So the parts can
+                # only CONFIRM a candidate (when a descriptor already names
+                # them), never veto the unique one the owner rule found.
+                parts = parts_by_owner.get(str(field_name), {})
+                unique_candidates = list(dict.fromkeys(candidates))
+                confirmed = [
+                    candidate for candidate in unique_candidates
+                    if parts and (
+                        set(map(int, parts.values())) & {
+                            *map(int, sequence_table.sequences[candidate]
+                                 .column_value_ids),
+                            int(sequence_table.sequences[candidate]
+                                .length_address_id),
+                        }
+                    )
+                ]
+                if len(confirmed) == 1:
+                    sequence_id = confirmed[0]
+                elif len(unique_candidates) == 1:
+                    sequence_id = unique_candidates[0]
+                if (
+                    sequence_id is None
+                    and all(part in parts for part in ("length", "keys", "values"))
+                    and all(int(parts[part]) in values for part in parts)
+                ):
+                    # A caller-supplied keyed field has NO table of its own:
+                    # its resident storage IS the three ABI part slots, and a
+                    # keyed helper only ever reaches them because the
+                    # keyed-owner binder swaps the helper's anonymous arenas
+                    # for exactly these parts after linking (keys, values,
+                    # length, and length again as capacity -- "a
+                    # caller-supplied mapping is always exactly full"). Build
+                    # the same shape from the parts directly: one descriptor
+                    # over the slots themselves, so no anonymous arena and no
+                    # later rebinding is needed. (The table entry that IS
+                    # present here belongs to the `{}` fallback literal of
+                    # `field or {}`, whose membership the unwrapped field
+                    # already answers.)
+                    keys_value = values[int(parts["keys"])]
+                    values_value = values[int(parts["values"])]
+                    length_value = values[int(parts["length"])]
+                    descriptor = SSASequenceDescriptor(
+                        sequence_id=int(keys_value.id),
+                        column_value_ids=(
+                            int(keys_value.id), int(values_value.id),
+                        ),
+                        length_address_id=int(length_value.id),
+                        capacity_value_id=int(length_value.id),
+                        status_address_id=None,
+                        column_dtypes=(
+                            str(keys_value.dtype or "int64"),
+                            str(values_value.dtype or "float64"),
+                        ),
+                        key_columns=(0,),
+                        writable=False,
+                    )
+                    parts_descriptor = descriptor
+                if sequence_id is None and parts_descriptor is None and os.environ.get(
+                    "TURING_DEBUG_STRUCTURAL_OUTPUTS"
+                ):
+                    print(
+                        "DEBUG-STRUCTURAL-MEMBERSHIP "
+                        f"function={symbol!r} field={field_name!r} "
+                        f"base_id={base_id} base_record={base_record!r} "
+                        f"sequence_ids={sorted(sequence_table.sequences)!r} "
+                        f"owner_by_mapping={owner_by_mapping!r} "
+                        f"parts_by_owner={parts_by_owner!r} "
+                        f"candidates={unique_candidates!r} "
+                        f"sequence_calls={[(str(i.op), [int(a.id) for a in i.args], dict(i.attributes or {})) for b in function.blocks.values() for i in b.instrs if i.attributes.get('ssa_sequence_operation') or i.attributes.get('keyed_lookup_owner')]!r} "
+                        f"args={[(int(a.id), dict(a.accounting or {})) for a in function.args]!r}",
+                        file=sys.stderr,
+                    )
+            if parts_descriptor is not None:
+                descriptor = parts_descriptor
+            else:
+                if sequence_id is None:
+                    structural_shortfalls.append((
+                        value_id, "call", "membership-sequence"
+                    ))
+                    return None
+                descriptor = sequence_table.sequences.get(int(sequence_id))
+                if descriptor is None:
+                    structural_shortfalls.append((
+                        value_id, "call", "membership-descriptor"
+                    ))
+                    return None
+            query_value = ensure_structural_value(query_id)
+            if query_value is None:
+                structural_shortfalls.append((
+                    value_id, "call", f"membership-query:{query_id}"
+                ))
+                return None
+            storage_ids = (
+                *descriptor.column_value_ids,
+                descriptor.length_address_id,
+                descriptor.capacity_value_id,
+                *(
+                    (descriptor.live_flags_value_id,)
+                    if descriptor.live_flags_value_id is not None else ()
+                ),
+            )
+            storage_args = []
+            # `lower_sequence_contains` builds the helper's formals from
+            # `_storage_values(descriptor)`, which names each arena once even
+            # when a descriptor aliases the same arena twice (capacity ==
+            # length for a caller-supplied mapping); the call must pass the
+            # same de-duplicated sequence.
+            for storage_id in dict.fromkeys(int(item) for item in storage_ids):
+                storage_value = values.get(int(storage_id))
+                if storage_value is None:
+                    structural_shortfalls.append((
+                        value_id, "call", f"membership-storage:{storage_id}"
+                    ))
+                    return None
+                storage_args.append(storage_value)
+            nonlocal next_structural_id
+            from .ir_sequence_tables import lower_sequence_contains
+
+            helper_name = (
+                f"ssa_sequence_{int(descriptor.sequence_id)}"
+                f"_contains_structural_{value_id}"
+            )
+            lowering = lower_sequence_contains(
+                descriptor, function_name=helper_name,
+                first_value_id=next_structural_id,
+            )
+            for helper_function in lowering.functions:
+                all_functions[helper_function.name] = helper_function
+                helper_ids = [
+                    int(argument.id) for argument in helper_function.args
+                ] + [
+                    int(instruction.res.id)
+                    for block in helper_function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.res is not None
+                ]
+                if helper_ids:
+                    next_structural_id = max(
+                        next_structural_id, 1 + max(helper_ids)
+                    )
+            call_result_id = next_structural_id if negate else value_id
+            if negate:
+                next_structural_id += 1
+            call_result = SSAValue(int(call_result_id), dtype="bool")
+            insertions.append(Instr(
+                "Call", [*storage_args, query_value], call_result,
+                attributes={
+                    "callee": helper_name,
+                    "source_linked": True,
+                    "ssa_sequence_operation": "contains",
+                    "sequence_id": int(descriptor.sequence_id),
+                    # A helper built over an anonymous table's arenas is
+                    # rebound to the owner's `<field>.keys/.values/.length`
+                    # part slots by the keyed-owner binder after call-frame
+                    # linking, exactly as `lookup` calls are -- provided the
+                    # call names its owner (resolve_keyed_mapping_iterables
+                    # stamps lookups before this recovery runs, so it cannot
+                    # stamp here). A helper built directly over the parts is
+                    # already bound and must NOT be rebound: its arguments
+                    # are de-duplicated (capacity is length), so the binder's
+                    # fixed four-slot layout would overwrite the query.
+                    **(
+                        {} if parts_descriptor is not None
+                        else {"keyed_lookup_owner": str(field_name)}
+                    ),
+                },
+            ))
+            values[int(call_result_id)] = call_result
+            if not negate:
+                return call_result
+            from .ssa_numeric_operators import TENSOR_SSA_OPERATOR_BY_NAME
+
+            row = TENSOR_SSA_OPERATOR_BY_NAME.get("not_equal")
+            if row is None or not row.is_direct:
+                structural_shortfalls.append((
+                    value_id, "call", "membership-negate"
+                ))
+                return None
+            false_id = next_structural_id
+            next_structural_id += 1
+            false_value = SSAValue(int(false_id), dtype="bool")
+            insertions.append(Instr(
+                "Const", [], false_value, attributes={"value": False},
+            ))
+            values[int(false_id)] = false_value
+            negated = SSAValue(int(value_id), dtype="bool")
+            insertions.append(Instr(
+                row.handler.value, [call_result, false_value], negated,
+                attributes={
+                    "structural_operation": "compare",
+                    "semantic_family": "not_equal",
+                },
+            ))
+            values[int(value_id)] = negated
+            return negated
+
         def ensure_structural_value(value_id: int):
             """Lower a missing direct expression from its exact graph edges."""
 
@@ -10819,6 +11663,54 @@ def _class_surface_ssa_program(
                 data.get("op") or data.get("type") or ""
             ).casefold()
             attributes = dict(data.get("attributes") or {})
+            compare_op_canonical = None
+            if (
+                operation in {"call", "plancall"}
+                and str(attributes.get("source_type") or "") == "Compare"
+                and not any(
+                    str(role) == "callee"
+                    for _parent, role in (data.get("parents") or ())
+                )
+            ):
+                # A short-circuited boolop operand is coordinator work (its
+                # evaluation may be skipped entirely), so it is classified
+                # generically as a deferred "call" regardless of its real
+                # AST shape -- `source_type` keeps the original class for
+                # exactly this case. A plain `Compare` with one operator
+                # carries no callee at all, only its `lhs`/`rhs` operands;
+                # it was never a function call to look up or rebuild as
+                # one. Recover the real comparator from `expr_obj` and let
+                # it fall through to the ordinary canonical-operator
+                # construction below (diagnosed against the real
+                # managed-tire compile: `_no_exchange_observed`'s
+                # `_scalar(...) <= 0.0` comparison, disguised as a "call"
+                # node by short-circuit coordination, was the operand whose
+                # missing case broke the enclosing boolop's return value).
+                compare_expr = data.get("expr_obj")
+                if (
+                    isinstance(compare_expr, ast.Compare)
+                    and len(compare_expr.ops) == 1
+                ):
+                    compare_op_canonical = {
+                        ast.Lt: "less", ast.LtE: "less_equal",
+                        ast.Gt: "greater", ast.GtE: "greater_equal",
+                        ast.Eq: "equal", ast.NotEq: "not_equal",
+                    }.get(type(compare_expr.ops[0]))
+                    if compare_op_canonical is None and isinstance(
+                        compare_expr.ops[0], (ast.In, ast.NotIn)
+                    ):
+                        membership = structural_membership_value(
+                            value_id, data, negate=isinstance(
+                                compare_expr.ops[0], ast.NotIn
+                            ),
+                        )
+                        if membership is not None:
+                            return membership
+            if compare_op_canonical is None and operation in {"call", "plancall"}:
+                structural_shortfalls.append((
+                    value_id, operation, "call-result-unavailable"
+                ))
+                return None
             if operation == "input":
                 # A planned numerical region can consume only shaped views of
                 # an authored tensor parameter.  In that case the region
@@ -10894,6 +11786,17 @@ def _class_surface_ssa_program(
                         if isinstance(expression, ast.Constant) else None,
                     ),
                 )
+                if literal is None:
+                    # Every backend rejects `Const(value=None)` ("None must
+                    # use the explicit NoneValue operation"); the authored
+                    # constant materializer in precompile_to_ssa already
+                    # spells the absence literal as `NoneValue` with dtype
+                    # "none". A structural `x is None` / `x is not None`
+                    # operand recovered here must publish the same.
+                    result = SSAValue(value_id, dtype="none")
+                    insertions.append(Instr("NoneValue", [], result))
+                    values[value_id] = result
+                    return result
                 dtype = (
                     "bool" if isinstance(literal, bool)
                     else "int64" if isinstance(literal, int)
@@ -10952,7 +11855,7 @@ def _class_surface_ssa_program(
                 ))
                 values[value_id] = result
                 return result
-            canonical = {
+            canonical = compare_op_canonical or {
                 "add": "add", "sub": "sub", "mul": "mul",
                 "div": "truediv", "truediv": "truediv",
                 "greater": "greater", "gt": "greater",
@@ -10962,6 +11865,11 @@ def _class_surface_ssa_program(
                 "lessequal": "less_equal", "less_equal": "less_equal",
                 "equal": "equal", "eq": "equal",
                 "notequal": "not_equal", "not_equal": "not_equal",
+                # `not x` arrives as the reducer's `logical_not` (UnaryOp
+                # Not -> Handler.LNot); TENSOR_SSA_OPERATOR_BY_NAME carries
+                # it as a direct one-operand operator, so the generic
+                # construction below already lowers it once it is named.
+                "logical_not": "logical_not", "lnot": "logical_not",
             }.get(operation)
             expression = data.get("expr_obj")
             if operation == "boolop":
@@ -11003,7 +11911,8 @@ def _class_surface_ssa_program(
                 return None
             dtype = (
                 "bool" if canonical in {
-                    "logical_and", "logical_or", "equal", "not_equal",
+                    "logical_and", "logical_or", "logical_not",
+                    "equal", "not_equal",
                     "less", "less_equal", "greater", "greater_equal",
                 } else arguments[0].dtype
             )
@@ -11673,7 +12582,12 @@ def _class_surface_ssa_program(
                 f"function={symbol!r} graph_outputs={output_names!r} "
                 f"named_outputs={tuple(named_output_ids.items())!r} "
                 f"ret_ids={tuple(int(value.id) for value in terminator.args)!r} "
-                f"record_layouts={tuple(returned_record_layouts)!r}",
+                f"record_layouts={tuple(returned_record_layouts)!r} "
+                f"shortfalls={tuple(dict.fromkeys(structural_shortfalls))!r} "
+                f"all_rets={tuple((str(block_name), tuple(int(value.id) for value in instruction.args)) for block_name, block in function.blocks.items() for instruction in block.instrs if instruction.op in {'Ret', 'ret', 'Return', 'return'})!r} "
+                f"args={[(int(value.id), str(value.dtype), sorted((value.accounting or {}).keys())) for value in function.args]!r} "
+                f"insertions={[(str(instruction.op), [int(a.id) for a in instruction.args], None if instruction.res is None else int(instruction.res.id)) for instruction in insertions]!r} "
+                f"return_slot_values={[(span, [(slot, None if slot is None else str((graph.nodes.get(int(slot)) or {}).get('op') or (graph.nodes.get(int(slot)) or {}).get('type'))) for slot in slots]) for span, slots in sorted((graph.graph.get('return_slot_values') or {}).items())]!r}",
                 file=sys.stderr,
             )
         if structural_shortfalls:
@@ -13583,45 +14497,74 @@ def _class_surface_ssa_program(
                         rebuilt.append(instruction)
                         continue
                     first = incoming[0]
-                    signatures = tuple(
-                        (
-                            field.name, field.storage, field.storage_identity,
-                            len(field.value_ids), field.dtype,
-                        )
-                        for field in first.fields
-                    )
-                    if any(
-                        record.identity != first.identity
-                        or tuple(
-                            (
-                                field.name, field.storage,
-                                field.storage_identity,
-                                len(field.value_ids), field.dtype,
-                            )
-                            for field in record.fields
-                        ) != signatures
-                        for record in incoming[1:]
-                    ):
+                    if any(record.identity != first.identity for record in incoming):
                         rebuilt.append(instruction)
                         continue
-                    if any(
-                        int(value_id) not in values
+                    # A field materializes into a branch's own local record
+                    # view only when that branch's body actually references
+                    # it (the same lazy-materialization rule
+                    # _propagate_record_field_demand documents elsewhere in
+                    # this module) -- so branches that take genuinely
+                    # different paths (one reports an extra diagnostic field
+                    # the others never touch, say) can disagree on which
+                    # fields are even PRESENT, without disagreeing on any
+                    # field they actually share. Requiring every incoming
+                    # record's field set to match EXACTLY made that
+                    # divergence bail out this whole per-field phi and fall
+                    # through to a cruder merge that conflated two unrelated
+                    # fields onto one shared value (diagnosed against the
+                    # real managed-tire compile: 'hard_failure' and
+                    # 'error_channels.keys', two fields every branch DOES
+                    # share, wrongly sharing one identity because a THIRD,
+                    # branch-exclusive field broke the all-or-nothing check).
+                    # Only the fields every incoming branch actually has, with
+                    # an identical shape, get a phi here; a field present in
+                    # just one branch is left for that field's own real
+                    # materialization to handle later, unaffected.
+                    fields_by_name = tuple(
+                        {field.name: field for field in record.fields}
                         for record in incoming
-                        for field in record.fields
-                        for value_id in field.value_ids
-                    ):
+                    )
+                    common_names = [
+                        field.name for field in first.fields
+                        if all(field.name in mapping for mapping in fields_by_name[1:])
+                    ]
+                    common_fields = []
+                    for name in common_names:
+                        candidates = tuple(
+                            mapping[name] for mapping in fields_by_name
+                        )
+                        signature = (
+                            candidates[0].storage, candidates[0].storage_identity,
+                            len(candidates[0].value_ids), candidates[0].dtype,
+                        )
+                        if any(
+                            (
+                                candidate.storage, candidate.storage_identity,
+                                len(candidate.value_ids), candidate.dtype,
+                            ) != signature
+                            for candidate in candidates[1:]
+                        ):
+                            continue
+                        if any(
+                            int(value_id) not in values
+                            for candidate in candidates
+                            for value_id in candidate.value_ids
+                        ):
+                            continue
+                        common_fields.append(candidates)
+                    if not common_fields:
                         rebuilt.append(instruction)
                         continue
                     merged_fields = []
                     merged_layout = []
-                    for field_index, source_field in enumerate(first.fields):
+                    for candidates in common_fields:
+                        source_field = candidates[0]
                         merged_ids = []
                         for slot_index in range(len(source_field.value_ids)):
                             arguments = [
-                                values[int(record.fields[field_index].value_ids[
-                                    slot_index
-                                ])]
-                                for record in incoming
+                                values[int(candidate.value_ids[slot_index])]
+                                for candidate in candidates
                             ]
                             result = SSAValue(
                                 next_value_id,
@@ -17294,6 +18237,21 @@ def _class_surface_ssa_program(
                 ] = sequence
                 return True
 
+            # Scoped to this CALLER, not to one record/call: two different
+            # calls from the same caller (e.g. one into coerce_metrics, one
+            # into _propose_dt_pen) can each independently decide they need
+            # a caller-side storage slot, and without a shared ledger here
+            # they can both walk away thinking they own the SAME existing
+            # slot for two unrelated fields (diagnosed against the real
+            # managed-tire compile: one caller value bound as both
+            # 'error_channels.keys' and 'hard_failure', a genuine dtype
+            # conflict `_class_surface_ssa_program`'s dtype-unification loop
+            # then correctly refused). The per-record split-detection below
+            # already existed and is correct in isolation; it just needs to
+            # see every claim this caller's calls make, not just one
+            # record's.
+            owner_by_slot: dict[int, tuple[str, Any]] = {}
+            slot_by_owner: dict[tuple[int, tuple[str, Any]], int] = {}
             for record in records:
                 result_storage_bindings = (
                     result_storage_bindings_by_call.setdefault(
@@ -17782,8 +18740,6 @@ def _class_surface_ssa_program(
                                     storage_identity_by_value[int(value_id)] = (
                                         str(field.storage_identity)
                                     )
-                    owner_by_slot = {}
-                    slot_by_owner = {}
                     distinct_bindings = []
                     for callee_id, kind, source in record.frame_bindings:
                         if str(kind) != "caller_storage":
@@ -17796,7 +18752,13 @@ def _class_surface_ssa_program(
                         owner = (
                             ("record", storage_identity)
                             if storage_identity is not None
-                            else ("value", int(callee_id))
+                            # Now shared across every call this caller makes
+                            # (not reset per record, see above), so the
+                            # fallback owner must include which CALLEE this
+                            # callee_id belongs to -- two different callees
+                            # can otherwise coincidentally reuse the same
+                            # small integer id and look like the same owner.
+                            else ("value", str(record.callee_symbol), int(callee_id))
                         )
                         first_owner = owner_by_slot.setdefault(source_id, owner)
                         if first_owner == owner:
@@ -20245,6 +21207,26 @@ def _class_surface_ssa_program(
                         "program_abi_keyed_values",
                     ):
                         accounting.pop(frame_local, None)
+                    # This loop's job is ownership/storage identity reaching
+                    # the formal, not field IDENTITY: a callee whose formal
+                    # carries no field demand of its own (a generic scalar
+                    # helper like the tire dt system's ``_scalar``, called
+                    # with a value that only HAPPENS to be storage-backed)
+                    # must not be made to look like a record-field consumer
+                    # merely because this actual is one. That mislabel
+                    # confused _propagate_record_field_demand into force-
+                    # feeding the "field" into every OTHER caller of the
+                    # same specialized callee, producing an arity mismatch
+                    # _harmonize_call_argument_shapes then correctly refused
+                    # (diagnosed via the real managed-tire compile, the
+                    # exact same defect class as the identity rules those
+                    # two passes already enforce). Only keep the field
+                    # identity here when the formal already declared
+                    # wanting one -- this loop settles ownership for an
+                    # already-known field, it does not get to invent one.
+                    if not (formal.accounting or {}).get("program_abi_field"):
+                        accounting.pop("program_abi_field", None)
+                        accounting.pop("program_abi_field_written", None)
                     formal.accounting = {
                         **dict(formal.accounting or {}), **accounting,
                     }
@@ -20327,6 +21309,9 @@ def _class_surface_ssa_program(
         canonical: dict[int, Any] = {}
         for argument in function.args:
             canonical.setdefault(int(argument.id), argument)
+        if os.environ.get("TURING_DEBUG_OUTPUT_LOADS"):
+            from .precompile_to_ssa import debug_region_output_loads as _probe_loads
+            _probe_loads(function, "shell-before-freshener")
         outputs = tuple(emit_outputs(function_name, function))
         # Control lowering may publish a source output as a fresh SSAValue
         # carrying only its integer id, while a later structural/object pass
@@ -20401,6 +21386,13 @@ def _class_surface_ssa_program(
                 sorted(freshened.items())
             )
 
+    # A callee whose own linking grew its frame leaves every call into it
+    # short by that tail; complete those calls (stamping the propagated
+    # identity the harmonizer reads) before anything judges call shapes.
+    _complete_propagated_frame_tails(all_functions)
+    _propagate_record_field_demand(all_functions)
+    _harmonize_call_argument_shapes(all_functions)
+
     # A native Call is an equality constraint between each caller operand and
     # its callee parameter.  Settle that constraint in repository SSA so every
     # backend receives the same dtype and dynamic-rank facts.  An explicit
@@ -20414,7 +21406,7 @@ def _class_surface_ssa_program(
     # with the cycling values named instead of spinning (the managed tire's
     # lowering sat 3.5 h in this loop on 2026-09-03).
     call_type_passes = 0
-    call_type_pass_bound = 64 + 4 * sum(
+    call_type_pass_bound = 64 + sum(
         len(instruction.args)
         for caller in all_functions.values()
         for block in caller.blocks.values()
@@ -20422,9 +21414,25 @@ def _class_surface_ssa_program(
         if instruction.op in {"Call", "call"}
     )
     call_type_pass_changes: list[str] = []
+    # A pass whose change set repeats an earlier pass's is a cycle already:
+    # refuse at once with the period and the values, instead of spinning to
+    # the bound (the dually build spent hours flipping the same twelve
+    # metrics-record members between two dtypes on 2026-09-03).
+    call_type_change_signatures: dict[tuple[str, ...], int] = {}
     while changed_call_types:
         changed_call_types = False
         call_type_passes += 1
+        if call_type_pass_changes:
+            signature = tuple(sorted(call_type_pass_changes))
+            earlier = call_type_change_signatures.get(signature)
+            if earlier is not None:
+                raise ValueError(
+                    "call rank/dtype unification cycles with period "
+                    f"{call_type_passes - 1 - earlier}: pass {call_type_passes - 1} "
+                    f"repeated pass {earlier}'s changes: "
+                    + "; ".join(call_type_pass_changes[:12])
+                )
+            call_type_change_signatures[signature] = call_type_passes - 1
         if call_type_passes > call_type_pass_bound:
             raise ValueError(
                 "call rank/dtype unification did not converge after "
@@ -20432,7 +21440,16 @@ def _class_surface_ssa_program(
                 "the last pass still changed: "
                 + "; ".join(call_type_pass_changes[-12:])
             )
+        previous_pass_changes = call_type_pass_changes
         call_type_pass_changes = []
+        if call_type_passes % 25 == 0:
+            import sys as _sys
+            print(
+                "[call-types] pass " + str(call_type_passes) + "/" + str(call_type_pass_bound)
+                + ": " + str(len(previous_pass_changes)) + " change(s) in the last pass; sample: "
+                + "; ".join(previous_pass_changes[:4]),
+                file=_sys.stderr, flush=True,
+            )
         for caller in all_functions.values():
             for block in caller.blocks.values():
                 for instruction in block.instrs:
@@ -20445,6 +21462,28 @@ def _class_surface_ssa_program(
                         instruction.attributes.get("callee") or ""
                     ))
                     if callee is None:
+                        continue
+                    if len(instruction.args) != len(callee.args):
+                        # zip() truncates silently: with a real arity
+                        # mismatch (this caller supplies an identified
+                        # argument -- e.g. its own 'targets' parameter --
+                        # that _harmonize_call_argument_shapes correctly
+                        # and safely declined to insert into the callee's
+                        # formal list, exactly its designed behavior when
+                        # identities don't line up) positional zip pairs
+                        # each actual against whatever formal happens to
+                        # share its raw index, not its real counterpart.
+                        # Diagnosed against the real managed-tire compile:
+                        # a 33-actual/31-formal call zipped 'error_channels.
+                        # keys' against a 'hard_failure' formal purely by
+                        # coincidental positional offset, correctly
+                        # rejected downstream as a dtype conflict that was
+                        # never real. This loop has no basis to guess which
+                        # actual belongs to which formal here; leave the
+                        # call for _harmonize_call_argument_shapes (or a
+                        # human, via its own precise error) rather than
+                        # unify types over a pairing that is not even
+                        # claimed to correspond.
                         continue
                     for actual, formal in zip(instruction.args, callee.args):
                         actual_rank = max(
@@ -20570,10 +21609,55 @@ def _class_surface_ssa_program(
                             and formal_dtype != "unknown"
                             and actual_dtype != formal_dtype
                         ):
+                            # This relabels the ACTUAL's own dtype to match
+                            # one contracted formal.  If the SAME actual value
+                            # is also passed to a DIFFERENT contracted formal
+                            # wanting a DIFFERENT dtype, relabeling here makes
+                            # that other call site wrong, which then relabels
+                            # it back next pass -- an unbreakable ping-pong
+                            # between two equally-authoritative call sites
+                            # (this is what silently spun for hours on the
+                            # managed tire's build on 2026-09-03; the fixed
+                            # point never had a way to reach agreement,
+                            # because neither side ever concedes and neither
+                            # is wrong to hold its ground).  A truly shared
+                            # value genuinely bound to two dtypes needs a real
+                            # conversion at one call site, which this pass
+                            # does not synthesize; detect the conflict and
+                            # name both sites instead of cycling forever.
+                            actual_accounting = dict(actual.accounting or {})
+                            previous_link_source = actual_accounting.get(
+                                "link_storage_dtype_source"
+                            )
+                            this_link_source = (
+                                str(caller.name), str(callee.name), formal_dtype,
+                            )
+                            if (
+                                previous_link_source is not None
+                                and tuple(previous_link_source) != this_link_source
+                                and str(previous_link_source[2]) != formal_dtype
+                            ):
+                                raise ValueError(
+                                    "call rank/dtype unification: actual value "
+                                    f"{int(actual.id)} is bound to two contracted "
+                                    f"formals wanting different dtypes: "
+                                    f"{previous_link_source[0]!r}->"
+                                    f"{previous_link_source[1]!r} wants "
+                                    f"{previous_link_source[2]!r}, "
+                                    f"{caller.name!r}->{callee.name!r} wants "
+                                    f"{formal_dtype!r}; this value needs an "
+                                    "explicit conversion at one of these call "
+                                    "sites, which the authored program does "
+                                    "not provide. Value accounting: "
+                                    f"{ {k: v for k, v in actual_accounting.items() if k not in ('link_storage_dtype_source',)} !r}. "
+                                    "Formal accounting (this callee): "
+                                    f"{ {k: v for k, v in formal_accounting.items()} !r}"
+                                )
                             actual.dtype = formal.dtype
                             actual.accounting = {
-                                **dict(actual.accounting or {}),
+                                **actual_accounting,
                                 "ssa_call_dtype": formal_dtype,
+                                "link_storage_dtype_source": this_link_source,
                             }
                             changed_call_types = True
                             call_type_pass_changes.append(
@@ -20706,6 +21790,17 @@ def _class_surface_ssa_program(
                     instruction.attributes.get("callee") or ""
                 ))
                 if callee is None:
+                    continue
+                if len(instruction.args) != len(callee.args):
+                    # Same authority as the dtype-unification loop above:
+                    # `_harmonize_call_argument_shapes` deliberately leaves a
+                    # call unrealigned when its identified actual/formal sets
+                    # do not match exactly. zip() would then pair by raw index
+                    # and this loop WRITES dtype/shape/device plus
+                    # `ssa_call_dtype` onto whichever formal happens to share
+                    # the index -- silently retyping an unrelated parameter
+                    # that every native backend then trusts. A pairing the
+                    # harmonizer never claimed is not a correspondence.
                     continue
                 for actual, formal in zip(instruction.args, callee.args):
                     if id(actual) not in exact_result_values:
@@ -21339,8 +22434,26 @@ def _class_surface_ssa_program(
         for block in function.blocks.values():
             for instruction in block.instrs:
                 owner_name = instruction.attributes.get("keyed_lookup_owner")
-                if owner_name is None or len(instruction.args) < 6:
+                if owner_name is None:
                     continue
+                # Both keyed helpers share the leading (keys, values,
+                # length, capacity) storage; `lookup` then takes a status
+                # cell and the key, `contains` only the key. Their helper
+                # formals follow the same order, so the dtype table is the
+                # lookup table with the status entry removed.
+                sequence_operation = str(
+                    instruction.attributes.get("ssa_sequence_operation") or ""
+                )
+                if sequence_operation == "contains":
+                    if len(instruction.args) < 5:
+                        continue
+                    helper_dtypes = (
+                        *_keyed_helper_dtypes[:4], _keyed_helper_dtypes[5],
+                    )
+                else:
+                    if len(instruction.args) < 6:
+                        continue
+                    helper_dtypes = _keyed_helper_dtypes
                 parts = parts_by_owner.get(str(owner_name))
                 if parts is None or any(
                     name not in parts
@@ -21360,7 +22473,7 @@ def _class_surface_ssa_program(
                 if helper is not None:
                     typed: dict[int, str] = {}
                     for argument, (dtype, shape) in zip(
-                        helper.args, _keyed_helper_dtypes
+                        helper.args, helper_dtypes
                     ):
                         if argument.dtype in {None, "unknown", "None"}:
                             argument.dtype = dtype
@@ -22329,6 +23442,20 @@ def _class_surface_ssa_program(
                     instruction.attributes.get("callee") or ""
                 ))
                 if callee is None:
+                    continue
+                if len(instruction.args) != len(callee.args):
+                    # A deferred record row that the expansion pass could not
+                    # resolve (identity mismatch, layout width, missing caller
+                    # value -- it records the row in
+                    # `unresolved_record_sequence_rows` and moves on) leaves
+                    # this sequence call holding `storage... + one semantic
+                    # record` while the helper from
+                    # `ir_sequence_tables.lower_sequence_insert` has one
+                    # formal per column. zip() would pair the semantic record
+                    # with column 0's formal and the loop below then retypes
+                    # EVERY occurrence of that record id in the caller to a
+                    # column dtype. The unresolved-row record is already the
+                    # precise diagnostic; do not retype on top of it.
                     continue
                 for actual, formal in zip(instruction.args, callee.args):
                     dtype = str(formal.dtype or "")

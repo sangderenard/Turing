@@ -101,6 +101,178 @@ _UNARY: dict[str, str] = {
     "ZExt": "{out} = zext i32 {0} to i64",
 }
 
+# --- fused elementwise lanes -------------------------------------------------
+# A batched law lowers to hundreds of repository calls (binary_double,
+# binary_scalar_double, unary_double), each one full pass over the batch
+# through a per-element switch on an opcode that is a CONSTANT at the call
+# site, with a heap buffer for every intermediate.  That is numpy's execution
+# structure restated in C, and it measured slower than numpy.  A run of such
+# calls over one element count is instead emitted as ONE loop: each element's
+# chain is computed in registers with the scalar spelling below, and only the
+# values something outside the run reads are ever stored.  The spellings are
+# the C ones from ctensor_ops.c, operation by operation (maximum is the
+# ``a > b ? a : b`` conditional, not maxnum; mod is ``a - floor(a/b)*b``), so
+# the fused lane is bit-identical to the kernel it replaces.  Opcodes without
+# a spelling here end a run and keep the kernel call.
+_FUSED_BINARY: dict[str, str] = {
+    "ADD": "{out} = fadd double {0}, {1}",
+    "SUB": "{out} = fsub double {0}, {1}",
+    "MUL": "{out} = fmul double {0}, {1}",
+    "DIV": "{out} = fdiv double {0}, {1}",
+    "POW": "{out} = call double @llvm.pow.f64(double {0}, double {1})",
+    "MOD": (
+        "{out}.q = fdiv double {0}, {1}\n"
+        "{out}.f = call double @llvm.floor.f64(double {out}.q)\n"
+        "{out}.m = fmul double {out}.f, {1}\n"
+        "{out} = fsub double {0}, {out}.m"
+    ),
+    "FLOORDIV": (
+        "{out}.q = fdiv double {0}, {1}\n"
+        "{out} = call double @llvm.floor.f64(double {out}.q)"
+    ),
+    "LT": "{out}.c = fcmp olt double {0}, {1}\n{out} = uitofp i1 {out}.c to double",
+    "LE": "{out}.c = fcmp ole double {0}, {1}\n{out} = uitofp i1 {out}.c to double",
+    "GT": "{out}.c = fcmp ogt double {0}, {1}\n{out} = uitofp i1 {out}.c to double",
+    "GE": "{out}.c = fcmp oge double {0}, {1}\n{out} = uitofp i1 {out}.c to double",
+    "EQ": "{out}.c = fcmp oeq double {0}, {1}\n{out} = uitofp i1 {out}.c to double",
+    "NE": "{out}.c = fcmp une double {0}, {1}\n{out} = uitofp i1 {out}.c to double",
+    "MAXIMUM": (
+        "{out}.c = fcmp ogt double {0}, {1}\n"
+        "{out} = select i1 {out}.c, double {0}, double {1}"
+    ),
+    "MINIMUM": (
+        "{out}.c = fcmp olt double {0}, {1}\n"
+        "{out} = select i1 {out}.c, double {0}, double {1}"
+    ),
+    "LOGICAL_AND": (
+        "{out}.a = fcmp une double {0}, 0.0\n"
+        "{out}.b = fcmp une double {1}, 0.0\n"
+        "{out}.c = and i1 {out}.a, {out}.b\n"
+        "{out} = uitofp i1 {out}.c to double"
+    ),
+    "LOGICAL_OR": (
+        "{out}.a = fcmp une double {0}, 0.0\n"
+        "{out}.b = fcmp une double {1}, 0.0\n"
+        "{out}.c = or i1 {out}.a, {out}.b\n"
+        "{out} = uitofp i1 {out}.c to double"
+    ),
+}
+
+_FUSED_UNARY: dict[str, str] = {
+    "SQRT": "{out} = call double @llvm.sqrt.f64(double {0})",
+    "EXP": "{out} = call double @llvm.exp.f64(double {0})",
+    "LOG": "{out} = call double @llvm.log.f64(double {0})",
+    "NEG": "{out} = fneg double {0}",
+    "ABS": "{out} = call double @llvm.fabs.f64(double {0})",
+    "ROUND": "{out} = call double @llvm.round.f64(double {0})",
+    "TRUNC": "{out} = call double @llvm.trunc.f64(double {0})",
+    "FLOOR": "{out} = call double @llvm.floor.f64(double {0})",
+    "CEIL": "{out} = call double @llvm.ceil.f64(double {0})",
+    "TANH": "{out} = call double @tanh(double {0})",
+    "SIN": "{out} = call double @llvm.sin.f64(double {0})",
+    "COS": "{out} = call double @llvm.cos.f64(double {0})",
+    "LOGICAL_NOT": (
+        "{out}.c = fcmp oeq double {0}, 0.0\n"
+        "{out} = uitofp i1 {out}.c to double"
+    ),
+}
+
+
+def _fused_opcode_name(opcode: int) -> str | None:
+    from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        C_TENSOR_OPCODE_ORDER,
+    )
+
+    try:
+        return str(C_TENSOR_OPCODE_ORDER[int(opcode)])
+    except (IndexError, ValueError, TypeError):
+        return None
+
+
+def _fusable_elementwise(
+    instruction: _Any,
+    constants: dict[int, str],
+) -> tuple[str, str, list[_Any], list[_Any], int, bool] | None:
+    """Describe one repository elementwise call as a fusable lane step.
+
+    Returns ``(kind, spelling, array_operands, scalar_operands, count,
+    reverse)`` or ``None`` when the call is not a constant-opcode elementwise
+    step over doubles with a scalar spelling.  ``kind`` is "binary",
+    "scalar" or "unary".  Array operands carry ``count`` elements; scalar
+    operands are single cells read once before the loop.
+    """
+
+    callee = instruction.attributes.get("callee")
+    if callee not in {"binary_double", "binary_scalar_double", "unary_double"}:
+        return None
+    result = instruction.res
+    if result is None or _value_llvm_type(result) != "double":
+        return None
+    output_argument = instruction.attributes.get("ssa_output_argument")
+    arguments = list(instruction.args)
+    if output_argument is not None:
+        position = int(output_argument)
+        if position >= len(arguments) or int(arguments[position].id) != int(result.id):
+            return None
+        del arguments[position]
+    else:
+        return None
+
+    def constant(value: _Any) -> int | None:
+        text = constants.get(int(value.id))
+        if text is None:
+            return None
+        try:
+            return int(float(text))
+        except ValueError:
+            return None
+
+    count = _value_element_count(result)
+    if callee == "unary_double":
+        if len(arguments) != 3:
+            return None
+        source, count_value, opcode_value = arguments
+        if constant(count_value) != count:
+            return None
+        opcode_name = _fused_opcode_name(constant(opcode_value))
+        spelling = _FUSED_UNARY.get(opcode_name or "")
+        if spelling is None or _value_llvm_type(source) != "double":
+            return None
+        if _value_element_count(source) != count:
+            return None
+        return "unary", spelling, [source], [], count, False
+    if callee == "binary_double":
+        if len(arguments) != 4:
+            return None
+        left, right, count_value, opcode_value = arguments
+        if constant(count_value) != count:
+            return None
+        opcode_name = _fused_opcode_name(constant(opcode_value))
+        spelling = _FUSED_BINARY.get(opcode_name or "")
+        if spelling is None:
+            return None
+        if _value_llvm_type(left) != "double" or _value_llvm_type(right) != "double":
+            return None
+        if _value_element_count(left) != count or _value_element_count(right) != count:
+            return None
+        return "binary", spelling, [left, right], [], count, False
+    if len(arguments) != 5:
+        return None
+    source, scalar, count_value, opcode_value, reverse_value = arguments
+    if constant(count_value) != count:
+        return None
+    opcode_name = _fused_opcode_name(constant(opcode_value))
+    spelling = _FUSED_BINARY.get(opcode_name or "")
+    reverse = constant(reverse_value)
+    if spelling is None or reverse is None:
+        return None
+    if _value_llvm_type(source) != "double" or _value_llvm_type(scalar) != "double":
+        return None
+    if _value_element_count(source) != count or _value_element_count(scalar) != 1:
+        return None
+    return "scalar", spelling, [source], [scalar], count, bool(reverse)
+
+
 def _intrinsic_declarations_from_templates(
     *tables: dict[str, str],
 ) -> dict[str, str]:
@@ -665,6 +837,9 @@ _LLVM_INTRINSIC_DECLARATIONS: dict[str, str] = {
     "llvm.memset.p0.i64": (
         "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1 immarg)"
     ),
+    # Entry-frame storage past ``_FRAME_HEAP_BYTES`` lives on the heap.
+    "malloc": "declare ptr @malloc(i64)",
+    "free": "declare void @free(ptr)",
 }
 
 
@@ -749,6 +924,43 @@ def _align(llvm_type: _Any) -> int:
     """
 
     return _LLVM_TYPE_BYTES.get(str(llvm_type), 8)
+
+
+#: Largest entry-frame value kept on the stack.  A value whose element count
+#: follows the contract's batch axis (every intermediate of a batched law) is
+#: batch-sized, and a kernel holds many of them at once: a hundred temporaries
+#: of 25 600 doubles is 20 MB, twenty times the Windows main-thread stack, and
+#: the call faulted with "stack overflow" on the first batched tyre bead step.
+#: Past this size the slot is malloc'd in the entry block -- which dominates
+#: every use exactly as an alloca would -- and freed before every return.
+_FRAME_HEAP_BYTES = 16 * 1024
+
+
+def _frame_slot(
+    register: str, llvm_type: str, count: int,
+    allocas: list[str], frees: list[str],
+) -> None:
+    """Emit entry-frame storage for one value: stack when small, heap when large."""
+
+    byte_count = int(count) * _LLVM_TYPE_BYTES.get(str(llvm_type), 8)
+    if byte_count <= _FRAME_HEAP_BYTES:
+        allocas.append(f"  {register} = alloca {llvm_type}, i64 {count}, align 8")
+        return
+    allocas.append(f"  {register} = call ptr @malloc(i64 {byte_count})")
+    frees.append(f"  call void @free(ptr {register})")
+
+
+def _release_frame_before_returns(lines: list[str], frees: list[str]) -> None:
+    """Place the frame's heap releases before every ``ret`` of a body, in place."""
+
+    if not frees:
+        return
+    released: list[str] = []
+    for line in lines:
+        if line.strip().startswith("ret "):
+            released.extend(frees)
+        released.append(line)
+    lines[:] = released
 
 
 def _value_llvm_type(value: _Any) -> str:
@@ -1471,6 +1683,7 @@ def _emit_repository_call_module(
         ]
         body: list[str] = []
         entry_allocas: list[str] = []
+        entry_frees: list[str] = []
         pointers: dict[int, str] = {
             int(value.id): f"%arg.{index}"
             for index, value in enumerate(function.args)
@@ -1504,9 +1717,7 @@ def _emit_repository_call_module(
                 llvm_type = _value_llvm_type(watched_value)
                 count = _value_element_count(watched_value)
                 slot = f"%watch.{watched_id}"
-                entry_allocas.append(
-                    f"  {slot} = alloca {llvm_type}, i64 {count}, align 8"
-                )
+                _frame_slot(slot, llvm_type, count, entry_allocas, entry_frees)
                 watch_shadows[watched_id] = slot
         # The ring and its counter are ordinary outputs, so they already have
         # %out slots; bind them by id here so the phi capture can address them.
@@ -1551,9 +1762,7 @@ def _emit_repository_call_module(
             count = _value_element_count(value)
             register = f"%value.{value_id}"
             if value_id not in allocated:
-                entry_allocas.append(
-                    f"  {register} = alloca {llvm_type}, i64 {count}, align 8"
-                )
+                _frame_slot(register, llvm_type, count, entry_allocas, entry_frees)
                 allocated.add(value_id)
             pointers[value_id] = register
             return register
@@ -1657,7 +1866,23 @@ def _emit_repository_call_module(
         # never publishes (only live positions have out cells).  Skip both;
         # a CONSUMED projection without a member stays a named shortfall.
         function_use_counts: dict[int, int] = {}
+        # Scalar constants by value id, for the fused elementwise lanes: a
+        # repository call's element count, opcode and direction are Const
+        # operands, constant at the call site even though the generic call
+        # path renders them through memory cells.
+        fused_constants: dict[int, str] = {}
+        fused_handled: set[int] = set()
+        fused_groups = 0
         for _pre_block, pre_instruction in scheduled_instructions:
+            if (
+                str(pre_instruction.op) == "Const"
+                and pre_instruction.res is not None
+                and pre_instruction.attributes.get("constant") is not None
+                and not isinstance(
+                    pre_instruction.attributes.get("constant"), (tuple, list))
+            ):
+                fused_constants[int(pre_instruction.res.id)] = str(
+                    pre_instruction.attributes["constant"])
             for argument in pre_instruction.args:
                 function_use_counts[int(argument.id)] = (
                     function_use_counts.get(int(argument.id), 0) + 1
@@ -1841,6 +2066,120 @@ def _emit_repository_call_module(
             result = instruction.res
             result_id = int(result.id) if result is not None else None
             tag = f"{instruction_index}.{result_id if result_id is not None else 'v'}"
+
+            if instruction_index in fused_handled:
+                continue
+            fused_step = _fusable_elementwise(instruction, fused_constants)
+            if fused_step is not None:
+                # Gather the maximal run of fusable steps over this element
+                # count that follows in the same block.
+                run: list[tuple[int, _Any, tuple]] = [
+                    (instruction_index, instruction, fused_step)]
+                lane_count = int(fused_step[4])
+                probe = instruction_index + 1
+                while probe < len(scheduled_instructions):
+                    probe_block, probe_instruction = scheduled_instructions[probe]
+                    if probe_block != block_name:
+                        break
+                    probe_step = _fusable_elementwise(
+                        probe_instruction, fused_constants)
+                    if probe_step is None or int(probe_step[4]) != lane_count:
+                        break
+                    run.append((probe, probe_instruction, probe_step))
+                    probe += 1
+                run_ids = {int(step_instruction.res.id) for _i, step_instruction, _s in run}
+                # Uses of each produced value INSIDE the run (excluding its
+                # own out-argument self reference): what remains is read by
+                # something outside, and only that needs a store.
+                inside_uses: dict[int, int] = {}
+                for _i, step_instruction, step in run:
+                    for operand in (*step[2], *step[3]):
+                        operand_id = int(operand.id)
+                        if operand_id in run_ids:
+                            inside_uses[operand_id] = inside_uses.get(operand_id, 0) + 1
+                fused_groups += 1
+                lane = f"fuse.{fused_groups}"
+                predecessor = next(
+                    (line[:-1] for line in reversed(body) if line.endswith(":")),
+                    None,
+                )
+                if predecessor is None:
+                    body.insert(0, "entry:")
+                    predecessor = "entry"
+                # Scalar operands read once, before the loop.
+                hoisted: dict[int, str] = {}
+                for _i, step_instruction, step in run:
+                    for operand in step[3]:
+                        operand_id = int(operand.id)
+                        if operand_id in run_ids or operand_id in hoisted:
+                            continue
+                        hoisted[operand_id] = load_as(
+                            operand, "double", f"{lane}.s{operand_id}")
+                body.append(f"  br label %{lane}.header")
+                body.append(f"{lane}.header:")
+                body.append(
+                    f"  %{lane}.i = phi i64 [ 0, %{predecessor} ], "
+                    f"[ %{lane}.next, %{lane}.body ]"
+                )
+                body.append(f"  %{lane}.go = icmp ult i64 %{lane}.i, {lane_count}")
+                body.append(
+                    f"  br i1 %{lane}.go, label %{lane}.body, label %{lane}.exit")
+                body.append(f"{lane}.body:")
+                registers: dict[int, str] = {}
+
+                def lane_element(operand: _Any) -> str:
+                    operand_id = int(operand.id)
+                    known = registers.get(operand_id)
+                    if known is not None:
+                        return known
+                    known = hoisted.get(operand_id)
+                    if known is not None:
+                        return known
+                    address = f"%{lane}.p{operand_id}"
+                    loaded = f"%{lane}.v{operand_id}"
+                    body.append(
+                        f"  {address} = getelementptr double, ptr "
+                        f"{pointer(operand)}, i64 %{lane}.i"
+                    )
+                    body.append(f"  {loaded} = load double, ptr {address}, align 8")
+                    registers[operand_id] = loaded
+                    return loaded
+
+                for step_index, step_instruction, step in run:
+                    kind, spelling, arrays, scalars, _count, reverse = step
+                    step_result = step_instruction.res
+                    step_id = int(step_result.id)
+                    if kind == "unary":
+                        operands = [lane_element(arrays[0])]
+                    elif kind == "binary":
+                        operands = [lane_element(arrays[0]), lane_element(arrays[1])]
+                    else:
+                        operands = [lane_element(arrays[0]), lane_element(scalars[0])]
+                        if reverse:
+                            operands.reverse()
+                    out = f"%{lane}.r{step_id}"
+                    for line in spelling.format(*operands, out=out).split("\n"):
+                        body.append("  " + line)
+                    registers[step_id] = out
+                    outside_uses = (
+                        function_use_counts.get(step_id, 0)
+                        - inside_uses.get(step_id, 0)
+                        - 1  # the out-argument self reference
+                    )
+                    if outside_uses > 0 or step_id in output_pointer:
+                        address = f"%{lane}.o{step_id}"
+                        body.append(
+                            f"  {address} = getelementptr double, ptr "
+                            f"{pointer(step_result)}, i64 %{lane}.i"
+                        )
+                        body.append(f"  store double {out}, ptr {address}, align 8")
+                    fused_handled.add(step_index)
+                body.append(f"  %{lane}.next = add i64 %{lane}.i, 1")
+                body.append(f"  br label %{lane}.header")
+                body.append(f"{lane}.exit:")
+                block_exit_label[active_block] = f"{lane}.exit"
+                register_cache.clear()
+                continue
 
             if operation in {"Const", "StaticRef"} and result is not None:
                 if operation == "StaticRef":
@@ -3121,6 +3460,7 @@ def _emit_repository_call_module(
             0,
         )
         body[entry_label_index + 1:entry_label_index + 1] = entry_allocas
+        _release_frame_before_returns(body, entry_frees)
         emitted_functions.append("\n".join((
             # ``internal``: these helpers exist only for the exported entry
             # wrapper below, and saying so is what LETS the optimizer inline
@@ -3185,6 +3525,7 @@ def _emit_repository_call_module(
         wrapper.append(f"  {address} = getelementptr ptr, ptr %buffers, i64 {slot}")
         wrapper.append(f"  {loaded} = load ptr, ptr {address}, align 8")
         public_pointer[value_id] = loaded
+    wrapper_frees: list[str] = []
     for storage_index, value in enumerate(root_internal_storage):
         llvm_type = _value_llvm_type(value)
         requirement = storage_requirements.get(int(value.id))
@@ -3194,9 +3535,7 @@ def _emit_repository_call_module(
             else _value_element_count(value)
         )
         local = f"%root.frame.{storage_index}"
-        wrapper.append(
-            f"  {local} = alloca {llvm_type}, i64 {count}, align 8"
-        )
+        _frame_slot(local, llvm_type, count, wrapper, wrapper_frees)
         public_pointer[int(value.id)] = local
     internal_call_records.append((
         None,
@@ -3217,6 +3556,7 @@ def _emit_repository_call_module(
         ))
         + ")"
     )
+    wrapper.extend(wrapper_frees)
     wrapper.append("  ret void")
 
     definitions: dict[str, str] = {}

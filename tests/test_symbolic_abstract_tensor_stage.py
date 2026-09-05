@@ -18,7 +18,36 @@ from src.compiler.vehicle_python_compilation import (
     symbolic_law_compilations,
     vehicle_python_runtime_bindings,
 )
-from tools.frame_parity import python_backend
+
+
+def _vectorized_reference(compilation):
+    import functools
+
+    import sympy
+
+    metadata = compilation.function.metadata
+    by_name = {str(equation.lhs): equation.rhs for equation in compilation.equations}
+    # A single explicit namespace (no "numpy" printer): sympy's NumPy printer
+    # spells Max/Min as amax/amin over a stacked list, which is not
+    # elementwise; these are, and they evaluate the whole column at once.
+    modules = [{
+        "Max": lambda *xs: functools.reduce(np.maximum, xs),
+        "Min": lambda *xs: functools.reduce(np.minimum, xs),
+        "Abs": np.abs, "sqrt": np.sqrt, "tanh": np.tanh, "exp": np.exp,
+        "sin": np.sin, "cos": np.cos, "log": np.log, "pi": np.pi, "E": np.e,
+    }]
+    function = sympy.lambdify(
+        tuple(sympy.Symbol(name) for name in metadata["argument_names"]),
+        tuple(by_name[name] for name in metadata["output_names"]),
+        modules=modules, cse=True,
+    )
+
+    def evaluate(*columns):
+        outputs = function(*columns)
+        return [np.broadcast_to(np.asarray(value, dtype=np.float64), columns[0].shape)
+                for value in outputs]
+
+    return evaluate
 
 
 def _law(name):
@@ -41,8 +70,10 @@ def test_tensor_stage_matches_the_sympy_reference_on_batch_columns(law):
     stage = (vehicle_python_runtime_bindings()[law] if law != "abstract_ui_wheel_contact"
              else _abstract_tensor_stage_callable(compilation, law))
     got = stage(*(columns[name] for name in names))
-    reference = python_backend(compilation)
-    want = np.stack([reference(batch[lane]) for lane in range(batch.shape[0])], axis=1)
+    # The sympy reference evaluated on the whole batch column at once: a
+    # vectorized lambdify over numpy arrays, no lane loop anywhere.
+    reference = _vectorized_reference(compilation)
+    want = np.stack(reference(*(batch[:, i] for i in range(len(names)))), axis=0)
 
     assert len(got) == len(outputs)
     for index, value in enumerate(got):

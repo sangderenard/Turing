@@ -6,7 +6,7 @@ each nested scope is an explicit closure with an explicit capture set.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import Any, Mapping
 
@@ -108,6 +108,91 @@ PREDICATE_OPERATIONS: frozenset[str] = frozenset({
     "Eq", "Ne", "Lt", "Le", "Gt", "Ge", "ULt", "ULe",
     "LAnd", "LOr", "LNot", "LXor",
 })
+
+
+def plan_value_id_watermark(plan: PlanClosure) -> int:
+    """First value id above every id the plan (recursively) mentions."""
+
+    watermark = 0
+    for value_id, _shape, _dtype in plan.value_shapes:
+        watermark = max(watermark, int(value_id) + 1)
+    for item in plan.items:
+        if isinstance(item, PlanLine):
+            for value_id in (*item.inputs, *item.outputs):
+                watermark = max(watermark, int(value_id) + 1)
+        elif isinstance(item, PlanClosure):
+            watermark = max(watermark, plan_value_id_watermark(item))
+        elif isinstance(item, PlanCall):
+            for value_id in (
+                *item.argument_value_ids, *item.result_value_ids,
+                *(caller for caller, _callee in item.argument_bindings),
+                *(caller for _callee, caller in item.result_bindings),
+            ):
+                watermark = max(watermark, int(value_id) + 1)
+    return watermark
+
+
+def expand_plan_regions(
+    plan: PlanClosure, *, first_free_value_id: int = 0,
+) -> dict[tuple[str, int], tuple[Instr, ...]]:
+    """Lower every top-level ``region_*`` closure of ``plan`` exactly once.
+
+    A region's lowering may synthesize temporaries an authored graph never
+    named (the binary ``Max`` chain of a variadic ``max(a, b, c)``).  Those
+    temporaries live in the SAME value-id space as every other id of the
+    function, so they are allocated from one watermark that starts above
+    every id the function already has in play (``first_free_value_id``:
+    the plan alone is not the function -- control-only graph values such as
+    an ``is not None`` test are never plan lines) and advances past each
+    region's synthesized ids: no two regions coin the same temporary, and
+    no temporary lands on an authored id (region 2's ``max`` chain coined
+    50 while region 5's authored ``Div`` was 50, and the emitted function
+    defined one result twice).  Every consumer of a region's instructions
+    must read this one expansion so all stages agree on which ids the
+    region defines.
+    """
+
+    watermark = max(int(first_free_value_id), plan_value_id_watermark(plan))
+    expanded: dict[tuple[str, int], tuple[Instr, ...]] = {}
+    for item in plan.items:
+        if not (
+            isinstance(item, PlanClosure) and item.name.startswith("region_")
+        ):
+            continue
+        instructions = plan_region_to_ssa_instrs(
+            item, first_free_value_id=watermark,
+        )
+        for instruction in instructions:
+            for value in (
+                *instruction.args,
+                *((instruction.res,) if instruction.res is not None else ()),
+            ):
+                watermark = max(watermark, int(value.id) + 1)
+        expanded[(str(item.name), int(item.closure_id))] = instructions
+    return expanded
+
+
+def copy_region_instructions(
+    instructions: tuple[Instr, ...],
+) -> list[Instr]:
+    """Fresh instruction and value objects carrying the same identities.
+
+    Stages retype a region's occurrences in place; each stage works on its
+    own copies so one stage's view never leaks into another's.
+    """
+
+    return [
+        replace(
+            instruction,
+            args=[replace(value) for value in instruction.args],
+            res=(
+                None if instruction.res is None else replace(instruction.res)
+            ),
+            arg_roles=list(instruction.arg_roles),
+            attributes=dict(instruction.attributes),
+        )
+        for instruction in instructions
+    ]
 
 
 def plan_region_to_ssa_instrs(

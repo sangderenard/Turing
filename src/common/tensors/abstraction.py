@@ -1032,7 +1032,14 @@ class AbstractTensor:
         # elementwise ops through it instead of NumPy; when it is not,
         # NodusTensorOperations falls back to the inherited NumPy behaviour
         # per-op, so preferring it here costs nothing when nodus is absent.
-        for backend_name in ("nodus", "numpy", "torch", "pure_python"):
+        # ABSTRACT_TENSOR_BACKEND names the backend to try first, process
+        # wide, without touching code: e.g. "numpy" to keep an eager run on
+        # plain NumPy while the nodus arena is connected.
+        requested = os.environ.get("ABSTRACT_TENSOR_BACKEND", "").strip().lower()
+        order = ("nodus", "numpy", "torch", "pure_python")
+        if requested:
+            order = (requested,) + tuple(name for name in order if name != requested)
+        for backend_name in order:
             backend_cls = BACKEND_REGISTRY.get(backend_name)
             if backend_cls is not None:
                 cls = backend_cls

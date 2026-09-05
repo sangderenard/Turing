@@ -9,6 +9,8 @@ control flow.
 from __future__ import annotations
 
 import ast
+import os
+import sys
 import copy
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -166,6 +168,40 @@ class LoopDescriptor:
     state_effects: tuple[LoopStateEffect, ...] = ()
     iteration_outputs: tuple[LoopIterationOutput, ...] = ()
     backpressured_output: bool = False
+    # Every source ``return`` with a value inside this loop's body:
+    # (return-value node id, guard chain ((predicate id, expect_true), ...
+    # outermost first), per-slot value ids in function-output order).
+    # Unlike ``return_nodes`` (the sole-root "terminal loop exit" special
+    # case), these carry the return's OWN values so the function exit can
+    # merge them per slot (control-aware result merging).
+    return_controls: tuple[
+        tuple[int, tuple[tuple[int, bool], ...], tuple[int | None, ...]], ...
+    ] = ()
+    # Every source break/continue in this loop's body:
+    # (statement node id, action, guard chain outermost-first,
+    #  ((pre-loop identity, value at the site), ...), arm_owned).
+    # The last element is the enclosing ``if`` arm's (first, last) source
+    # line when the statement ends that arm.  Such a site is ARM-OWNED when
+    # a value it carries is produced by a body region INSIDE the arm (the
+    # value dominates the exit edge only there): the conditional program
+    # places it inside that arm and the loop schedule must not place it a
+    # second time.  Otherwise (a bare ``if c: break``, an arm that only
+    # rebinds constants/parameters, or values computed before the ``if``)
+    # the lexical placement under the full guard chain is exact and a
+    # region-less conditional program would have nothing to nest it into
+    # the loop.
+    control_sites: tuple[
+        tuple[
+            int, str, tuple[tuple[int, bool], ...],
+            tuple[tuple[int, int], ...], tuple[int, int] | None,
+        ], ...
+    ] = ()
+    # Names bound ONLY on break paths (never on the fall-through path):
+    # (name, pre-loop identity, continuation identity).  The continuation
+    # is the last break site's value; port materialization rewires its
+    # post-loop consumers onto a LoopResult port whose exit Phi merges the
+    # zero-trip/normal value with every break edge's value.
+    break_bindings: tuple[tuple[str, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -361,6 +397,293 @@ def _rebuild_graph_edges(graph: Any) -> None:
     }
 
 
+_CACHED_VALUE_ID_LEDGERS = (
+    "aggregate_leaf_value_ids",
+    "materialized_source_value_ids",
+    "materialized_value_ids",
+)
+
+
+def _retarget_cached_value_ids(
+    data: dict[str, Any],
+    old_value_id: int,
+    replacements: tuple[int, ...],
+) -> None:
+    """Keep a node's cached id copies equal to its (about to be) rewritten edges.
+
+    Several node attributes are verbatim copies of parent edges or of other
+    nodes' ids -- the leaf ledgers (`aggregate_leaf_value_ids`,
+    `materialized_source_value_ids`, `materialized_value_ids`), a port's
+    `value_source_id`, and a loop node's own `loop_carried_bindings` /
+    `loop_target_initials` / `loop_state_effects` /
+    `loop_iteration_outputs`. Every consumer that prefers the cache over the
+    edge (region capture expansion, iterable trip counts, the retained-loop
+    port builder itself, `_tensor_descriptor`'s identity check) reads the
+    PRE-rewrite id forever if only the edge moves. The canonical relabel in
+    `topological_reducer._normalize_lexical_values` already remaps exactly
+    this set; the two edge rewriters here must too. `replacements` follows
+    `_replace_parent_value`: one id substitutes in place, several expand a
+    ledger entry the way an `elts`/`argN` edge is expanded.
+    """
+
+    old_value_id = int(old_value_id)
+    new_ids = tuple(int(value_id) for value_id in replacements)
+    if not new_ids:
+        return
+    single = new_ids[0] if len(new_ids) == 1 else None
+
+    def substitute(value_ids) -> tuple[int, ...]:
+        rewritten: list[int] = []
+        for value_id in value_ids:
+            if int(value_id) == old_value_id:
+                rewritten.extend(new_ids)
+            else:
+                rewritten.append(int(value_id))
+        return tuple(rewritten)
+
+    attributes = data.get("attributes")
+    if not isinstance(attributes, dict):
+        return
+    for ledger in _CACHED_VALUE_ID_LEDGERS:
+        entries = attributes.get(ledger)
+        if entries and any(int(entry) == old_value_id for entry in entries):
+            attributes[ledger] = substitute(entries)
+    if single is not None:
+        if attributes.get("value_source_id") == old_value_id:
+            attributes["value_source_id"] = single
+        carried = attributes.get("loop_carried_bindings")
+        if isinstance(carried, dict) and any(
+            int(initial) == old_value_id or int(updated) == old_value_id
+            for initial, updated in carried.values()
+        ):
+            attributes["loop_carried_bindings"] = {
+                name: (
+                    single if int(initial) == old_value_id else int(initial),
+                    single if int(updated) == old_value_id else int(updated),
+                )
+                for name, (initial, updated) in carried.items()
+            }
+        break_bindings = attributes.get("loop_break_bindings")
+        if isinstance(break_bindings, dict) and any(
+            int(initial) == old_value_id or int(continuation) == old_value_id
+            for initial, continuation in break_bindings.values()
+        ):
+            attributes["loop_break_bindings"] = {
+                name: (
+                    single if int(initial) == old_value_id else int(initial),
+                    single if int(continuation) == old_value_id
+                    else int(continuation),
+                )
+                for name, (initial, continuation) in break_bindings.items()
+            }
+        break_sites = attributes.get("loop_break_sites")
+        if isinstance(break_sites, dict) and any(
+            int(initial) == old_value_id or int(value) == old_value_id
+            for site_values in break_sites.values()
+            for initial, value in site_values.items()
+        ):
+            attributes["loop_break_sites"] = {
+                span: {
+                    (single if int(initial) == old_value_id else int(initial)):
+                    (single if int(value) == old_value_id else int(value))
+                    for initial, value in site_values.items()
+                }
+                for span, site_values in break_sites.items()
+            }
+        initials = attributes.get("loop_target_initials")
+        if isinstance(initials, dict) and any(
+            int(value_id) == old_value_id for value_id in initials.values()
+        ):
+            attributes["loop_target_initials"] = {
+                name: single if int(value_id) == old_value_id else int(value_id)
+                for name, value_id in initials.items()
+            }
+        effects = attributes.get("loop_state_effects")
+        if effects and any(
+            int(effect.get(key, -1)) == old_value_id
+            for effect in effects
+            for key in ("state_input_id", "effect_node_id")
+        ):
+            attributes["loop_state_effects"] = tuple(
+                {
+                    **effect,
+                    **{
+                        key: single
+                        for key in ("state_input_id", "effect_node_id")
+                        if int(effect.get(key, -1)) == old_value_id
+                    },
+                }
+                for effect in effects
+            )
+        outputs = attributes.get("loop_iteration_outputs")
+        if outputs and any(
+            int(output.get(key, -1)) == old_value_id
+            for output in outputs
+            for key in ("value_id", "result_value_id", "materializer_node_id")
+        ):
+            attributes["loop_iteration_outputs"] = tuple(
+                {
+                    **output,
+                    **{
+                        key: single
+                        for key in (
+                            "value_id", "result_value_id",
+                            "materializer_node_id",
+                        )
+                        if int(output.get(key, -1)) == old_value_id
+                    },
+                }
+                for output in outputs
+            )
+
+
+def _retarget_plan_value_ids(
+    plan: LoopPlan, old_value_id: int, new_value_id: int
+) -> LoopPlan:
+    """Return ``plan`` with every cached ``old_value_id`` renamed.
+
+    A plan is built from the loop node's attributes before any port exists
+    (`_loop_plans`), so its `state_input_id`s, carried initials and
+    iteration outputs are copies of graph values. Once an earlier loop's
+    `rewire_continuation` redirects those values' consumer edges, the copies
+    are stale exactly like a node attribute would be; `add_port` builds the
+    later loop's state port from the copy, so it must be renamed too.
+    """
+
+    old_value_id = int(old_value_id)
+    new_value_id = int(new_value_id)
+
+    def rename(value_id: int) -> int:
+        return new_value_id if int(value_id) == old_value_id else int(value_id)
+
+    def rename_effects(
+        effects: tuple[LoopStateEffect, ...],
+    ) -> tuple[LoopStateEffect, ...]:
+        return tuple(
+            replace(
+                effect,
+                state_input_id=rename(effect.state_input_id),
+                effect_node_id=rename(effect.effect_node_id),
+                argument_value_ids=tuple(
+                    rename(value_id) for value_id in effect.argument_value_ids
+                ),
+            )
+            if old_value_id in (
+                int(effect.state_input_id), int(effect.effect_node_id),
+                *map(int, effect.argument_value_ids),
+            )
+            else effect
+            for effect in effects
+        )
+
+    def rename_outputs(
+        outputs: tuple[LoopIterationOutput, ...],
+    ) -> tuple[LoopIterationOutput, ...]:
+        return tuple(
+            replace(
+                output,
+                value_id=rename(output.value_id),
+                result_value_id=rename(output.result_value_id),
+                materializer_node_id=rename(output.materializer_node_id),
+            )
+            if old_value_id in (
+                int(output.value_id), int(output.result_value_id),
+                int(output.materializer_node_id),
+            )
+            else output
+            for output in outputs
+        )
+
+    loop = plan.loop
+    carried = tuple(
+        (name, rename(initial), rename(updated))
+        for name, initial, updated in loop.carried_bindings
+    )
+    return_controls = tuple(
+        (
+            rename(node_id),
+            tuple((rename(predicate_id), expect_true) for predicate_id, expect_true in chain),
+            tuple(None if slot is None else rename(slot) for slot in slots),
+        )
+        for node_id, chain, slots in loop.return_controls
+    )
+    control_sites = tuple(
+        (
+            rename(site_id),
+            action,
+            tuple(
+                (rename(predicate_id), expect_true)
+                for predicate_id, expect_true in chain
+            ),
+            tuple(
+                (rename(initial), rename(value)) for initial, value in site_values
+            ),
+            arm_span,
+        )
+        for site_id, action, chain, site_values, arm_span in loop.control_sites
+    )
+    break_bindings = tuple(
+        (name, rename(initial), rename(continuation))
+        for name, initial, continuation in loop.break_bindings
+    )
+    renamed_loop = (
+        replace(
+            loop,
+            carried_bindings=carried,
+            state_effects=rename_effects(loop.state_effects),
+            iteration_outputs=rename_outputs(loop.iteration_outputs),
+            return_controls=return_controls,
+            control_sites=control_sites,
+            break_bindings=break_bindings,
+        )
+        if (
+            carried != tuple(loop.carried_bindings)
+            or return_controls != tuple(loop.return_controls)
+            or control_sites != tuple(loop.control_sites)
+            or break_bindings != tuple(loop.break_bindings)
+            or any(
+                old_value_id in (
+                    int(effect.state_input_id), int(effect.effect_node_id),
+                    *map(int, effect.argument_value_ids),
+                )
+                for effect in loop.state_effects
+            )
+            or any(
+                old_value_id in (
+                    int(output.value_id), int(output.result_value_id),
+                    int(output.materializer_node_id),
+                )
+                for output in loop.iteration_outputs
+            )
+        )
+        else loop
+    )
+    semantic = plan.semantic
+    renamed_semantic = semantic
+    if semantic is not None:
+        semantic_carried = tuple(
+            replace(
+                state,
+                initial_value_id=rename(state.initial_value_id),
+                next_value_id=rename(state.next_value_id),
+            )
+            if old_value_id in (
+                int(state.initial_value_id), int(state.next_value_id),
+            )
+            else state
+            for state in semantic.carried
+        )
+        renamed_semantic = replace(
+            semantic,
+            carried=semantic_carried,
+            state_effects=rename_effects(semantic.state_effects),
+            iteration_outputs=rename_outputs(semantic.iteration_outputs),
+        )
+    if renamed_loop is loop and renamed_semantic is semantic:
+        return plan
+    return replace(plan, loop=renamed_loop, semantic=renamed_semantic)
+
+
 def _replace_parent_value(
     graph: Any,
     old_value_id: int,
@@ -370,6 +693,7 @@ def _replace_parent_value(
 
     old_value_id = int(old_value_id)
     for _node_id, data in graph.G.nodes(data=True):
+        _retarget_cached_value_ids(data, old_value_id, replacements)
         parents = tuple(data.get("parents") or ())
         if not any(int(parent) == old_value_id for parent, _role in parents):
             continue
@@ -1214,12 +1538,40 @@ def materialize_retained_loop_ports(
                 )
                 for parent, role in data.get("parents") or ()
             ]
+            # Every cached copy of an id this edge rewrite touches -- a
+            # port's `value_source_id`, the leaf ledgers, and a not-yet
+            # materialized loop node's own carried/initial/state-effect
+            # records -- must move with the edge, or a later loop's rewire
+            # leaves an earlier loop's port (or a later loop's plan) naming
+            # the PRE-rewire value forever (diagnosed via
+            # tools/repro_step_with_dt_control_used.py: "loopstateport
+            # value-source identity conflicts with its semantic edge", and
+            # the parents-graph cycle behind it: loop A retargeted loop B's
+            # effect-node edge while B's pending plan still said
+            # state_input_id=8).
+            _retarget_cached_value_ids(data, old_value_id, (new_value_id,))
         graph.roots = [
             new_value_id if int(root) == old_value_id else int(root)
             for root in graph.roots
         ]
+        # The plan records of loops not yet materialized are the same cache
+        # one level up: `state_input_id`, a carried binding's initial, and an
+        # iteration output all name graph values whose consumer edges were
+        # just redirected. `add_port` for those loops reads the plan, not the
+        # edge, so retarget the plan the same way (and its semantic mirror).
+        for index in range(materialized_count[0], len(pending_plans)):
+            pending_plans[index] = _retarget_plan_value_ids(
+                pending_plans[index], old_value_id, new_value_id
+            )
 
-    for plan in tuple(plans):
+    # Plans still ahead in this list are retargeted by `rewire_continuation`
+    # as earlier loops redirect the values they name (see the helper); the
+    # plan actually processed is always read from the list at that moment.
+    pending_plans = list(plans)
+    materialized_count = [0]
+    for index in range(len(pending_plans)):
+        materialized_count[0] = index + 1
+        plan = pending_plans[index]
         if plan.strategy in {LoopStrategy.UNROLL, LoopStrategy.CONSTANT}:
             materialized_plans.append(plan)
             continue
@@ -1257,7 +1609,6 @@ def materialize_retained_loop_ports(
             *carried_update_cone,
             *(int(effect.effect_node_id) for effect in loop.state_effects),
         ))
-
         carried_results = {}
         for name, _initial, updated in loop.carried_bindings:
             result_id = add_port(
@@ -1275,6 +1626,28 @@ def materialize_retained_loop_ports(
             )
             rewire_continuation(
                 int(updated), result_id, owned_nodes
+            )
+            identities.setdefault(str(name), []).append(result_id)
+            carried_results[str(name)] = result_id
+        for name, initial, continuation in loop.break_bindings:
+            if str(name) in carried_results:
+                continue
+            result_id = add_port(
+                "LoopResult",
+                str(name),
+                (
+                    (int(continuation), "value"),
+                    (int(loop.node_id), "control"),
+                ),
+                {
+                    "binding_name": str(name),
+                    "loop_id": int(loop.node_id),
+                    "result_kind": "break_bound",
+                    "initial_value_id": int(initial),
+                },
+            )
+            rewire_continuation(
+                int(continuation), result_id, owned_nodes
             )
             identities.setdefault(str(name), []).append(result_id)
             carried_results[str(name)] = result_id
@@ -1859,6 +2232,37 @@ class LoopComposer:
             return None
 
         loop_controls: list[tuple[str, int, int | None, bool]] = []
+        control_sites: list[tuple[
+            int, str, tuple[tuple[int, bool], ...],
+            tuple[tuple[int, int], ...], bool,
+        ]] = []
+        loop_break_sites = dict(
+            (graph.G.nodes[int(node_id)].get("attributes") or {})
+            .get("loop_break_sites") or {}
+        ) if int(node_id) in graph.G else {}
+        # A later specialization prunes dead bindings.  A site VALUE that no
+        # longer exists names a binding nothing reads, so its pair is
+        # dropped.  A pre-loop identity may be pruned while still valid: a
+        # parameter's Input node has no consumer once the loop reads only
+        # the port, yet the identity table still declares it.
+        declared_identity_ids = {
+            int(value_id)
+            for history in (graph.G.graph.get("identity_table") or {}).values()
+            for value_id in history
+        }
+
+        def live_site_pair(initial: int, value: int) -> bool:
+            return int(value) in graph.G and (
+                int(initial) in graph.G or int(initial) in declared_identity_ids
+            )
+        # (return-value node id, guard chain, per-slot value ids): every
+        # ``return <value>`` in this loop's body, whatever its nesting.
+        return_controls: list[
+            tuple[int, tuple[tuple[int, bool], ...], tuple[int | None, ...]]
+        ] = []
+        return_slot_values = dict(
+            graph.G.graph.get("return_slot_values") or {}
+        )
 
         def terminal_return_expressions(
             statements: Iterable[ast.stmt],
@@ -1894,24 +2298,84 @@ class LoopComposer:
         def collect_loop_controls(
             statements: Iterable[ast.stmt],
             guard: tuple[int, bool] | None = None,
+            chain: tuple[tuple[int, bool], ...] = (),
+            arm: bool = False,
         ) -> None:
+            statements = list(statements)
             for statement in statements:
                 if isinstance(statement, (ast.For, ast.While, ast.AsyncFor)):
                     # Its break/continue edges belong to the nested loop.
                     continue
                 if isinstance(statement, (ast.Break, ast.Continue)):
                     statement_id = graph_node_for_ast(statement)
+                    action = (
+                        "break" if isinstance(statement, ast.Break)
+                        else "continue"
+                    )
                     if statement_id is not None:
                         loop_controls.append((
-                            "break" if isinstance(statement, ast.Break)
-                            else "continue",
+                            action,
                             statement_id,
                             None if guard is None else guard[0],
                             True if guard is None else guard[1],
                         ))
+                        site_values = loop_break_sites.get((
+                            int(getattr(statement, "lineno", -1)),
+                            int(getattr(statement, "col_offset", -1)),
+                            int(getattr(statement, "end_lineno", -1)),
+                            int(getattr(statement, "end_col_offset", -1)),
+                        )) or {}
+                        control_sites.append((
+                            int(statement_id),
+                            action,
+                            tuple(chain),
+                            # A later specialization prunes dead bindings;
+                            # an id that no longer exists names a value
+                            # nothing reads, so its pair is dropped here
+                            # (the builder applies the same filter).
+                            tuple(sorted(
+                                (int(initial), int(value))
+                                for initial, value in site_values.items()
+                                if live_site_pair(initial, value)
+                            )),
+                            # The enclosing ``if`` arm's source line span when
+                            # this statement ends that arm; whether the arm
+                            # OWNS the site is settled at body assembly,
+                            # where the body regions are known.
+                            (
+                                (
+                                    min(
+                                        int(getattr(item, "lineno", -1))
+                                        for item in statements
+                                    ),
+                                    max(
+                                        int(getattr(
+                                            item, "end_lineno",
+                                            getattr(item, "lineno", -1),
+                                        ))
+                                        for item in statements
+                                    ),
+                                )
+                                if arm and statement is statements[-1]
+                                else None
+                            ),
+                        ))
                     continue
                 if isinstance(statement, ast.Return) and statement.value is not None:
                     return_value_id = graph_node_for_ast(statement.value)
+                    returned = statement.value
+                    slot_values = return_slot_values.get((
+                        int(getattr(returned, "lineno", -1)),
+                        int(getattr(returned, "col_offset", -1)),
+                        int(getattr(returned, "end_lineno", -1)),
+                        int(getattr(returned, "end_col_offset", -1)),
+                    ))
+                    if return_value_id is not None and slot_values is not None:
+                        return_controls.append((
+                            int(return_value_id),
+                            tuple(chain),
+                            tuple(slot_values),
+                        ))
                     condition_id = (
                         graph_node_for_ast(expression.test)
                         if isinstance(expression, ast.While) else None
@@ -1947,13 +2411,29 @@ class LoopComposer:
                         guard if predicate_id is None
                         else (int(predicate_id), False)
                     )
-                    collect_loop_controls(statement.body, next_true)
-                    collect_loop_controls(statement.orelse, next_false)
+                    # ``guard`` keeps the innermost predicate only (the
+                    # legacy break/continue contract); ``chain`` keeps every
+                    # enclosing predicate outermost-first so a control two
+                    # ``if``s deep is guarded by both.
+                    true_chain = (
+                        chain if predicate_id is None
+                        else (*chain, (int(predicate_id), True))
+                    )
+                    false_chain = (
+                        chain if predicate_id is None
+                        else (*chain, (int(predicate_id), False))
+                    )
+                    collect_loop_controls(
+                        statement.body, next_true, true_chain, arm=True,
+                    )
+                    collect_loop_controls(
+                        statement.orelse, next_false, false_chain, arm=True,
+                    )
                     continue
                 for field in ("body", "orelse", "finalbody"):
                     nested = getattr(statement, field, None)
                     if isinstance(nested, list):
-                        collect_loop_controls(nested, guard)
+                        collect_loop_controls(nested, guard, chain)
 
         if isinstance(expression, (ast.For, ast.While)):
             collect_loop_controls(expression.body)
@@ -2046,6 +2526,26 @@ class LoopComposer:
                 line = int(line)
                 return any(start <= line <= end for start, end in body_lines)
 
+            # A synthesized effect node (the ``SetAttr`` minted for
+            # ``obj.field += v`` in the body) has no authored AST member, so
+            # ``graph_node_for_ast`` never proposes it as a candidate -- yet
+            # it IS the body's work and carries the writing statement's
+            # span. Left unowned, port materialization rewires the loop's
+            # own effect chain onto its own result port and closes a cycle
+            # through the loop (the 13-node SCC measured by
+            # tools/audit_ancestry_retained_loop_graph.py). Admit every
+            # node the lexical test itself accepts, not only the ones an
+            # AST walk happened to reach.
+            body_nodes = tuple(dict.fromkeys((
+                *body_nodes,
+                *(
+                    int(candidate)
+                    for candidate, candidate_data in graph.G.nodes(data=True)
+                    if candidate_data.get("expr_obj") is None
+                    and (candidate_data.get("source_span") or {}).get("line")
+                    is not None
+                ),
+            )))
             body_nodes = tuple(
                 candidate
                 for candidate in body_nodes
@@ -2417,6 +2917,15 @@ class LoopComposer:
                 for kind, node_id, predicate_id, expect_true in loop_controls
                 if kind == "loop-return"
             ),
+            return_controls=tuple(return_controls),
+            control_sites=tuple(control_sites),
+            break_bindings=tuple(sorted(
+                (str(name), int(binding[0]), int(binding[1]))
+                for name, binding in (
+                    attributes.get("loop_break_bindings") or {}
+                ).items()
+                if live_site_pair(binding[0], binding[1])
+            )),
             target_bindings=tuple(
                 (
                     str(name),
@@ -3360,9 +3869,21 @@ def analyze_shader_loop_reductions(
         # which have no correlated source expression.
         lexical_nodes: list[int] = []
         loop_expression = graph.G.nodes[int(loop.node_id)].get("expr_obj")
+        def source_order_walk(node: ast.AST):
+            """Pre-order: a statement's descendants before its successor.
+
+            ``ast.walk`` is breadth-first, so an arm's ``Break`` node sorted
+            BEFORE the arm's own assignment expressions and the exit edge
+            was taken before the value it carries was computed.
+            """
+
+            yield node
+            for child in ast.iter_child_nodes(node):
+                yield from source_order_walk(child)
+
         if isinstance(loop_expression, (ast.For, ast.AsyncFor, ast.While)):
             for statement in loop_expression.body:
-                for expression in ast.walk(statement):
+                for expression in source_order_walk(statement):
                     node_id = node_for_expression(expression)
                     if (
                         node_id is not None
@@ -3467,6 +3988,16 @@ def analyze_shader_loop_reductions(
             for index in body_region_indices
             for node_id in regions[index]
         }
+        # The same recursion-table control set the fusion reducer and
+        # `_topological_region_order` discount: the loop's own While /
+        # LoopStatePort / LoopResult / LoopExit nodes, through which raw
+        # ancestry wraps around to the previous iteration.
+        recursion_control_members = frozenset(
+            int(member)
+            for record in (graph.G.graph.get("recursion_table") or {}).values()
+            if record.get("control_ir", True)
+            for member in record.get("control_members", ())
+        )
         region_dependencies = nx.DiGraph()
         region_dependencies.add_nodes_from(body_region_indices)
         for index in body_region_indices:
@@ -3492,6 +4023,17 @@ def analyze_shader_loop_reductions(
                     if parent in seen or parent not in graph.G:
                         continue
                     seen.add(parent)
+                    if parent in recursion_control_members:
+                        # Walking through the loop's own control/port nodes
+                        # (While, LoopStatePort, LoopResult, LoopExit) wraps
+                        # around to the previous iteration and reports every
+                        # region as depending on every other. The fusion
+                        # reducer discounts exactly these nodes before its
+                        # own acyclicity check; do the same here, so the
+                        # condensation fallback below is reserved for
+                        # genuine same-iteration recursion instead of being
+                        # the normal path for any loop with a state effect.
+                        continue
                     producer = body_region_owner.get(parent)
                     if producer is not None:
                         if producer != index:
@@ -4009,6 +4551,26 @@ def analyze_shader_loop_reductions(
             # should not produce.
             and graph.G.nodes[int(updated)].get("type") != "IndexedStore"
         ))
+        def guarded_expression(
+            chain: tuple[tuple[int, bool], ...],
+        ) -> ControlExpression | None:
+            """Conjoin every enclosing predicate, outermost first."""
+
+            combined: ControlExpression | None = None
+            for predicate_value_id, expect_true in chain:
+                term = structured_control_expression(int(predicate_value_id))
+                if term is None:
+                    term = ControlExpression(
+                        "value", value_id=int(predicate_value_id)
+                    )
+                if not expect_true:
+                    term = ControlExpression("not", (term,))
+                combined = (
+                    term if combined is None
+                    else ControlExpression("and", (combined, term))
+                )
+            return combined
+
         body_items: list[tuple[int, object]] = [
             (
                 body_region_positions[region_index],
@@ -4016,25 +4578,87 @@ def analyze_shader_loop_reductions(
             )
             for region_index in body_region_indices
         ]
+        # A break/continue ending an ``if`` arm is placed inside that arm by
+        # the conditional program (the arm's values dominate the edge there);
+        # every other site is placed here at its lexical position, guarded
+        # by EVERY enclosing predicate (a site two ``if``s deep must not
+        # fire when the outer predicate is false).
+        body_region_nodes = {
+            int(member)
+            for index in body_region_indices
+            for member in regions[index]
+        }
+
+        def node_line(value_id: int) -> int | None:
+            data = graph.G.nodes.get(int(value_id)) or {}
+            line = (data.get("source_span") or {}).get("line")
+            if line is None:
+                line = getattr(data.get("expr_obj"), "lineno", None)
+            return None if line is None else int(line)
+
+        def arm_owned_site(
+            arm_span: tuple[int, int] | None,
+            site_values: tuple[tuple[int, int], ...],
+        ) -> bool:
+            if arm_span is None:
+                return False
+            first, last = arm_span
+            owned = False
+            for _initial, value in site_values:
+                if int(value) not in body_region_nodes:
+                    continue
+                line = node_line(value)
+                if line is not None and first <= line <= last:
+                    owned = True
+                    break
+            if os.environ.get("TURING_DEBUG_BREAK_EDGE"):
+                print(
+                    "DEBUG-ARM-OWNED composer "
+                    f"fn={graph.G.graph.get('function_name')} "
+                    f"loop={loop.node_id} arm_span={arm_span} "
+                    f"site_values={site_values} owned={owned}",
+                    file=sys.stderr, flush=True,
+                )
+            return owned
+
+        body_items.extend(
+            (
+                lexical_position[site_id],
+                LoopControlBlock(
+                    action,
+                    chain[-1][0] if chain else None,
+                    True,
+                    guarded_expression(chain),
+                    source_action=action,
+                    site_node_id=int(site_id),
+                    site_values=tuple(site_values),
+                ),
+            )
+            for site_id, action, chain, site_values, arm_span
+            in loop.control_sites
+            if site_id in lexical_position
+            and not arm_owned_site(arm_span, site_values)
+        )
+
+
+        # A source ``return`` inside the body is a loop exit that leaves the
+        # FUNCTION, carrying its own slot values: placed at its lexical
+        # position (like break/continue) so the non-returning path's later
+        # work never runs on the returning path, and guarded by every
+        # enclosing predicate rather than the innermost only.
         body_items.extend(
             (
                 lexical_position[node_id],
                 LoopControlBlock(
-                    "break" if action == "loop-return" else action,
-                    predicate_value_id,
-                    expect_true,
-                    (
-                        None if predicate_value_id is None
-                        else structured_control_expression(predicate_value_id)
-                    ),
-                    source_action=action,
+                    "return",
+                    chain[-1][0] if chain else None,
+                    True,
+                    guarded_expression(chain),
+                    source_action="return",
+                    return_value_ids=tuple(slot_values),
                 ),
             )
-            for action, controls in (
-                ("break", loop.break_nodes),
-                ("continue", loop.continue_nodes),
-            )
-            for node_id, predicate_value_id, expect_true in controls
+            for node_id, chain, slot_values in loop.return_controls
             if node_id in lexical_position
         )
         body_items.extend(
@@ -4112,10 +4736,23 @@ def analyze_shader_loop_reductions(
                     graph.G.nodes[int(loop.node_id)].get("attributes") or {}
                 ).get("loop_result_ports") or {}
             ) if int(loop.node_id) in graph.G else {}
-            result_ports = tuple(
-                (int(loop_ports[str(name)]), int(initial), int(updated))
-                for name, initial, updated in loop.carried_bindings
-                if str(name) in loop_ports
+            carried_names = {str(name) for name, _i, _u in loop.carried_bindings}
+            result_ports = (
+                *(
+                    (int(loop_ports[str(name)]), int(initial), int(updated))
+                    for name, initial, updated in loop.carried_bindings
+                    if str(name) in loop_ports
+                ),
+                # A break-bound port has no backedge version: its exit Phi
+                # merges the pre-loop identity with the break edges.
+                *(
+                    (int(loop_ports[str(name)]), int(initial), int(initial))
+                    for name, initial, _continuation in loop.break_bindings
+                    if str(name) in loop_ports and str(name) not in carried_names
+                ),
+            )
+            control_site_ids = tuple(
+                int(site_id) for site_id, _a, _c, _v, _o in loop.control_sites
             )
             # A carried seed that is a literal in the graph (``peak = 0.0``)
             # may be folded away by region planning; carry the literal so the
@@ -4148,6 +4785,7 @@ def analyze_shader_loop_reductions(
                     body=scheduled_body,
                     carried_aliases=carried_aliases,
                     result_ports=result_ports,
+                    control_site_ids=control_site_ids,
                     carried_seeds=carried_seeds,
                     recursion_region_id=recursion_region_id,
                     predicate_expression=while_predicate_expression,
@@ -4158,6 +4796,7 @@ def analyze_shader_loop_reductions(
             return LoopBlock(
                 induction=induction_name,
                 result_ports=result_ports,
+                control_site_ids=control_site_ids,
                 carried_seeds=carried_seeds,
                 start=(
                     bound_expressions.get("start", "0")
